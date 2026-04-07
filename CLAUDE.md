@@ -8,6 +8,15 @@ Rust 实现的 coding agent 项目记忆工具。单二进制，`cargo install m
 
 编写、审查、调试、重构 Rust 代码时，遵循该 skill 的四步工作流（理解 → 服从 → 释放 → 约束）和概念锚点框架。
 
+## 参考实现
+
+mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、AAAK 压缩），用 Rust 从零实现并修复其缺陷。以下两个本地项目是关键参考：
+
+- **MemPalace 源码**：`/Users/zhangalex/Work/Projects/AI/mempalace` — Python 原版实现，查看 `mempalace/` 目录下的 searcher.py、palace_graph.py、dialect.py、knowledge_graph.py 等模块了解原始设计
+- **MemPalace 书稿**：`/Users/zhangalex/Work/Projects/AI/mempalace-book` — 基于源码的设计分析书，`book/src/` 下 25 章 + 4 个附录，包含架构评估、AAAK 完整度分析、benchmark 诚实性审查等深度内容
+
+实现时遇到设计疑问，优先查阅书稿中的分析（特别是附录 C 的 AAAK 评估和附录 A/B 的 E2E Trace），而非直接复制 Python 代码。
+
 ## 设计文档
 
 `docs/specs/2026-04-08-mempal-design.md` — 完整架构设计，所有实现必须以此为准。
