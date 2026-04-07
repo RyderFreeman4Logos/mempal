@@ -63,6 +63,25 @@ agent-spec lint specs/p0-core-scaffold.spec.md --min-score 0.7
 # 开始实现前：读 spec → 理解 intent/decisions/boundaries → 按 scenarios 验收
 ```
 
+## 实现计划
+
+`docs/plans/2026-04-08-p0-implementation.md` — P0 关键路径的完整实现计划（10 个 Task，TDD 流程）。
+
+每个 Task 包含：写失败测试 → 验证失败 → 实现 → 验证通过 → 提交。按顺序执行：
+
+1. Workspace scaffold + stub crates
+2. Core data types
+3. SQLite Database + schema
+4. Config loading
+5. Embedder trait + ONNX
+6. Ingest — format detection + chunking
+7. Ingest — full pipeline with storage
+8. Search engine
+9. CLI — init, ingest, search, status
+10. Integration + cleanup
+
+开始实现时：**先读对应的 spec（`specs/p0-*.spec.md`），再按 plan 的 Task 步骤执行。**
+
 ## 关键架构约束
 
 - **存储**：SQLite + sqlite-vec，单文件 `~/.mempal/palace.db`
