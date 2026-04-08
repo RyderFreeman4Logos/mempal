@@ -9,3 +9,9 @@ anyhow.workspace = true
 mempal-core = { path = "../mempal-core" }
 mempal-embed = { path = "../mempal-embed" }
 serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile.workspace = true
