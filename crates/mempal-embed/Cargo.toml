@@ -10,3 +10,5 @@ async-trait.workspace = true
 mempal-core = { path = "../mempal-core" }
 ort.workspace = true
 reqwest.workspace = true
+tokenizers.workspace = true
+tokio.workspace = true
