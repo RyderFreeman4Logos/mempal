@@ -4,6 +4,8 @@ use serde_json::Value;
 pub enum Format {
     ClaudeJsonl,
     ChatGptJson,
+    CodexJsonl,
+    SlackJson,
     PlainText,
 }
 
@@ -12,11 +14,53 @@ pub fn detect_format(content: &str) -> Format {
         return Format::ClaudeJsonl;
     }
 
+    if is_codex_jsonl(content) {
+        return Format::CodexJsonl;
+    }
+
+    if is_slack_json(content) {
+        return Format::SlackJson;
+    }
+
     if is_chatgpt_json(content) {
         return Format::ChatGptJson;
     }
 
     Format::PlainText
+}
+
+fn is_codex_jsonl(content: &str) -> bool {
+    let mut has_session_meta = false;
+    let mut event_msg_count = 0;
+
+    for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("session_meta") => has_session_meta = true,
+            Some("event_msg") => event_msg_count += 1,
+            Some("response_item") => {} // skip but don't reject
+            _ => return false,
+        }
+    }
+
+    has_session_meta && event_msg_count >= 2
+}
+
+fn is_slack_json(content: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(content) else {
+        return false;
+    };
+    let Some(arr) = value.as_array() else {
+        return false;
+    };
+    // Slack messages have "type": "message" and "user"/"username" + "text"
+    arr.iter().take(5).any(|msg| {
+        msg.get("type").and_then(Value::as_str) == Some("message")
+            && (msg.get("user").is_some() || msg.get("username").is_some())
+            && msg.get("text").is_some()
+    })
 }
 
 fn is_claude_jsonl(content: &str) -> bool {

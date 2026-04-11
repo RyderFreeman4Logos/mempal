@@ -158,7 +158,9 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         }
     };
     let chunks = match format {
-        Format::ClaudeJsonl | Format::ChatGptJson => chunk_conversation(&normalized),
+        Format::ClaudeJsonl | Format::ChatGptJson | Format::CodexJsonl | Format::SlackJson => {
+            chunk_conversation(&normalized)
+        }
         Format::PlainText => chunk_text(&normalized, CHUNK_WINDOW, CHUNK_OVERLAP),
     };
     if chunks.is_empty() {
@@ -306,7 +308,9 @@ pub async fn ingest_dir_with_options<E: Embedder + ?Sized>(
 
 fn source_type_for(format: Format) -> SourceType {
     match format {
-        Format::ClaudeJsonl | Format::ChatGptJson => SourceType::Conversation,
+        Format::ClaudeJsonl | Format::ChatGptJson | Format::CodexJsonl | Format::SlackJson => {
+            SourceType::Conversation
+        }
         Format::PlainText => SourceType::Project,
     }
 }

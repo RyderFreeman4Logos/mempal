@@ -18,6 +18,8 @@ pub fn normalize_content(content: &str, format: Format) -> Result<String> {
         Format::PlainText => Ok(content.trim().to_string()),
         Format::ClaudeJsonl => normalize_claude_jsonl(content),
         Format::ChatGptJson => normalize_chatgpt_json(content),
+        Format::CodexJsonl => normalize_codex_jsonl(content),
+        Format::SlackJson => normalize_slack_json(content),
     }
 }
 
@@ -120,6 +122,75 @@ fn collect_messages_dfs(
             }
         }
     }
+}
+
+fn normalize_codex_jsonl(content: &str) -> Result<String> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let value: Value = serde_json::from_str(line)?;
+        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let msg_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        let message = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if message.is_empty() {
+            continue;
+        }
+        match msg_type {
+            "user_message" => pairs.push(("user".to_string(), message.to_string())),
+            "agent_message" => pairs.push(("assistant".to_string(), message.to_string())),
+            _ => {}
+        }
+    }
+
+    Ok(render_transcript(pairs))
+}
+
+fn normalize_slack_json(content: &str) -> Result<String> {
+    let value: Value = serde_json::from_str(content)?;
+    let messages = value
+        .as_array()
+        .ok_or(NormalizeError::UnsupportedChatGptShape)?;
+
+    let mut speakers: Vec<String> = Vec::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    for msg in messages {
+        if msg.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let speaker = msg
+            .get("user")
+            .or_else(|| msg.get("username"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let text = msg.get("text").and_then(Value::as_str).unwrap_or("").trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        // First speaker = user, second = assistant
+        if !speakers.contains(&speaker) {
+            speakers.push(speaker.clone());
+        }
+        let role = if speakers.first() == Some(&speaker) {
+            "user"
+        } else {
+            "assistant"
+        };
+        pairs.push((role.to_string(), text.to_string()));
+    }
+
+    Ok(render_transcript(pairs))
 }
 
 fn render_transcript(items: impl IntoIterator<Item = (String, String)>) -> String {
