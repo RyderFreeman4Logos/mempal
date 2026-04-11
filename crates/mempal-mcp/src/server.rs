@@ -17,9 +17,10 @@ use rmcp::{
 };
 
 use crate::tools::{
-    DeleteRequest, DeleteResponse, IngestRequest, IngestResponse, KgRequest, KgResponse,
-    ScopeCount, SearchRequest, SearchResponse, SearchResultDto, StatusResponse, TaxonomyEntryDto,
-    TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
+    DeleteRequest, DeleteResponse, DuplicateWarning, IngestRequest, IngestResponse, KgRequest,
+    KgResponse, KgStatsDto, ScopeCount, SearchRequest, SearchResponse, SearchResultDto,
+    StatusResponse, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto,
+    TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -146,7 +147,10 @@ impl MempalMcpServer {
         let drawer_id = build_drawer_id(&request.wing, room, &request.content);
 
         if request.dry_run.unwrap_or(false) {
-            return Ok(Json(IngestResponse { drawer_id }));
+            return Ok(Json(IngestResponse {
+                drawer_id,
+                duplicate_warning: None,
+            }));
         }
 
         let embedder = self.embedder_factory.build().await.map_err(|error| {
@@ -160,6 +164,9 @@ impl MempalMcpServer {
             .next()
             .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?;
         let db = self.open_db()?;
+
+        // Semantic dedup check: find most similar existing drawer
+        let duplicate_warning = check_semantic_duplicate(&db, &vector, &request.content);
 
         if !db.drawer_exists(&drawer_id).map_err(db_error)? {
             let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());
@@ -178,7 +185,10 @@ impl MempalMcpServer {
             db.insert_vector(&drawer_id, &vector).map_err(db_error)?;
         }
 
-        Ok(Json(IngestResponse { drawer_id }))
+        Ok(Json(IngestResponse {
+            drawer_id,
+            duplicate_warning,
+        }))
     }
 
     #[tool(
@@ -291,6 +301,7 @@ impl MempalMcpServer {
                 Ok(Json(KgResponse {
                     action: "add".to_string(),
                     triples: vec![triple_to_dto(&triple)],
+                    stats: None,
                 }))
             }
             "query" => {
@@ -306,6 +317,7 @@ impl MempalMcpServer {
                 Ok(Json(KgResponse {
                     action: "query".to_string(),
                     triples: triples.iter().map(triple_to_dto).collect(),
+                    stats: None,
                 }))
             }
             "invalidate" => {
@@ -321,6 +333,32 @@ impl MempalMcpServer {
                 Ok(Json(KgResponse {
                     action: message,
                     triples: vec![],
+                    stats: None,
+                }))
+            }
+            "timeline" => {
+                let entity = request.subject.ok_or_else(|| {
+                    ErrorData::invalid_params("missing subject for timeline", None)
+                })?;
+                let triples = db.timeline_for_entity(&entity).map_err(db_error)?;
+                Ok(Json(KgResponse {
+                    action: format!("timeline for {entity}"),
+                    triples: triples.iter().map(triple_to_dto).collect(),
+                    stats: None,
+                }))
+            }
+            "stats" => {
+                let stats = db.triple_stats().map_err(db_error)?;
+                Ok(Json(KgResponse {
+                    action: "stats".to_string(),
+                    triples: vec![],
+                    stats: Some(KgStatsDto {
+                        total: stats.total,
+                        active: stats.active,
+                        expired: stats.expired,
+                        entities: stats.entities,
+                        top_predicates: stats.top_predicates,
+                    }),
                 }))
             }
             action => Err(ErrorData::invalid_params(
@@ -361,6 +399,34 @@ impl ServerHandler for MempalMcpServer {
 
 fn db_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(format!("{error}"), None)
+}
+
+const DEDUP_THRESHOLD: f32 = 0.85;
+
+fn check_semantic_duplicate(
+    db: &Database,
+    vector: &[f32],
+    _content: &str,
+) -> Option<DuplicateWarning> {
+    use mempal_core::types::RouteDecision;
+
+    let route = RouteDecision {
+        wing: None,
+        room: None,
+        confidence: 0.0,
+        reason: "dedup check".to_string(),
+    };
+    let results = mempal_search::search_by_vector(db, vector, route, 1).ok()?;
+    let top = results.first()?;
+    if top.similarity >= DEDUP_THRESHOLD {
+        Some(DuplicateWarning {
+            similar_drawer_id: top.drawer_id.clone(),
+            similarity: top.similarity,
+            preview: top.content.chars().take(100).collect(),
+        })
+    } else {
+        None
+    }
 }
 
 fn triple_to_dto(triple: &Triple) -> TripleDto {

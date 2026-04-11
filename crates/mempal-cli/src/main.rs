@@ -127,6 +127,10 @@ enum KgCommands {
         #[arg(long)]
         all: bool,
     },
+    Timeline {
+        entity: String,
+    },
+    Stats,
     List,
 }
 
@@ -704,6 +708,42 @@ fn kg_command(db: &Database, command: KgCommands) -> Result<()> {
                     );
                 }
                 println!("\n{} triple(s)", triples.len());
+            }
+        }
+        KgCommands::Timeline { entity } => {
+            let triples = db
+                .timeline_for_entity(&entity)
+                .context("failed to get timeline")?;
+            if triples.is_empty() {
+                println!("no triples for '{entity}'");
+            } else {
+                for t in &triples {
+                    let valid = match (&t.valid_from, &t.valid_to) {
+                        (Some(from), Some(to)) => format!("{from}..{to}"),
+                        (Some(from), None) => format!("{from}..now"),
+                        _ => "always".to_string(),
+                    };
+                    let direction = if t.subject == entity {
+                        format!("({}) --[{}]--> ({})", t.subject, t.predicate, t.object)
+                    } else {
+                        format!("({}) <--[{}]-- ({})", entity, t.predicate, t.subject)
+                    };
+                    println!("{direction}  [{valid}]");
+                }
+                println!("\n{} event(s) for '{entity}'", triples.len());
+            }
+        }
+        KgCommands::Stats => {
+            let stats = db.triple_stats().context("failed to get KG stats")?;
+            println!("total: {}", stats.total);
+            println!("active: {}", stats.active);
+            println!("expired: {}", stats.expired);
+            println!("entities: {}", stats.entities);
+            if !stats.top_predicates.is_empty() {
+                println!("top predicates:");
+                for (pred, count) in &stats.top_predicates {
+                    println!("  {pred}: {count}");
+                }
             }
         }
         KgCommands::List => {

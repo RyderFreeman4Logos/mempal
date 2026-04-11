@@ -57,11 +57,22 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    when you answer: "according to drawer X from /path/to/file, we decided...".
    Citations are what separate memory from hallucination.
 
+5a. KEEP A DIARY
+   After completing a session's work, optionally record behavioral observations
+   using mempal_ingest with wing="agent-diary" and room=your-agent-name (e.g.
+   "claude", "codex"). Prefix entries with OBSERVATION:, LESSON:, or PATTERN:
+   to categorize. Diary entries help future sessions of any agent learn from
+   past behavioral patterns. Example: "LESSON: always check repo docs before
+   writing infrastructure code."
+
 TOOLS:
   mempal_status    — current state + this protocol + AAAK format spec
   mempal_search    — semantic search with wing/room filters, citation-bearing
-  mempal_ingest    — save a new drawer (wing required, room optional)
+  mempal_ingest    — save a new drawer (wing required, room optional, importance 0-5)
+  mempal_delete    — soft-delete a drawer by ID
   mempal_taxonomy  — list or edit routing keywords
+  mempal_kg        — knowledge graph: add/query/invalidate/timeline/stats triples
+  mempal_tunnels   — discover cross-wing room links
 
 Key invariant: mempal stores raw text verbatim. Every search result can be
 traced back to a source_file. If you cannot cite the source, you are guessing."#;

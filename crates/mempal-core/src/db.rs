@@ -6,7 +6,7 @@ use rusqlite::{Connection, params};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::types::{Drawer, SourceType, TaxonomyEntry, Triple};
+use crate::types::{Drawer, SourceType, TaxonomyEntry, Triple, TripleStats};
 
 const CURRENT_SCHEMA_VERSION: u32 = 4;
 
@@ -549,6 +549,70 @@ impl Database {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM triples", [], |row| row.get(0))?)
+    }
+
+    pub fn timeline_for_entity(&self, entity: &str) -> Result<Vec<Triple>, DbError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, subject, predicate, object, valid_from, valid_to, confidence, source_drawer
+            FROM triples
+            WHERE subject = ?1 OR object = ?1
+            ORDER BY COALESCE(valid_from, '0') ASC, id ASC
+            "#,
+        )?;
+        let rows = stmt
+            .query_map([entity], |row| {
+                Ok(Triple {
+                    id: row.get(0)?,
+                    subject: row.get(1)?,
+                    predicate: row.get(2)?,
+                    object: row.get(3)?,
+                    valid_from: row.get(4)?,
+                    valid_to: row.get(5)?,
+                    confidence: row.get(6)?,
+                    source_drawer: row.get(7)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn triple_stats(&self) -> Result<TripleStats, DbError> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM triples", [], |row| row.get(0))?;
+        let active: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM triples WHERE valid_to IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let expired = total - active;
+        let entities: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(DISTINCT entity) FROM (
+                SELECT subject AS entity FROM triples
+                UNION
+                SELECT object AS entity FROM triples
+            )
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+        let mut top_predicates_stmt = self.conn.prepare(
+            "SELECT predicate, COUNT(*) as cnt FROM triples GROUP BY predicate ORDER BY cnt DESC LIMIT 5",
+        )?;
+        let top_predicates = top_predicates_stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(TripleStats {
+            total,
+            active,
+            expired,
+            entities,
+            top_predicates,
+        })
     }
 
     // --- Tunnels (cross-Wing discovery) ---

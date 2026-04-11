@@ -43,6 +43,15 @@ pub struct TaxonomyEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TripleStats {
+    pub total: i64,
+    pub active: i64,
+    pub expired: i64,
+    pub entities: i64,
+    pub top_predicates: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteDecision {
     pub wing: Option<String>,
     pub room: Option<String>,

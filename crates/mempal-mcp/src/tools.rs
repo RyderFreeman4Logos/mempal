@@ -86,6 +86,15 @@ pub struct DeleteResponse {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct IngestResponse {
     pub drawer_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate_warning: Option<DuplicateWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DuplicateWarning {
+    pub similar_drawer_id: String,
+    pub similarity: f32,
+    pub preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -149,6 +158,17 @@ pub struct KgRequest {
 pub struct KgResponse {
     pub action: String,
     pub triples: Vec<TripleDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<KgStatsDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct KgStatsDto {
+    pub total: i64,
+    pub active: i64,
+    pub expired: i64,
+    pub entities: i64,
+    pub top_predicates: Vec<(String, i64)>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
