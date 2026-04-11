@@ -37,8 +37,8 @@ jobs:
         include:
           - label: default
             cargo_args: ""
-          - label: all-features
-            cargo_args: "--all-features"
+          - label: rest
+            cargo_args: "--features rest"
     steps:
       - uses: actions/checkout@v4
 

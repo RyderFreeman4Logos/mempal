@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::filter::build_filter_clause;
 
 pub mod filter;
+pub mod rerank;
 pub mod route;
 
 pub type Result<T> = std::result::Result<T, SearchError>;
