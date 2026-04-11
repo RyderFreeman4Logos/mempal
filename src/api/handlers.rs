@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use crate::state::ApiState;
+use super::state::ApiState;
 
 pub const DEFAULT_REST_ADDR: &str = "127.0.0.1:3080";
 
@@ -121,12 +121,12 @@ async fn search_handler(
     State(state): State<ApiState>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<SearchResultDto>>, ApiError> {
-    let embedder = state
+    let embedder: Box<dyn crate::embed::Embedder> = state
         .embedder_factory
         .build()
         .await
         .map_err(internal_error)?;
-    let query_vector = embedder
+    let query_vector: Vec<f32> = embedder
         .embed(&[query.q.as_str()])
         .await
         .map_err(internal_error)?
@@ -159,12 +159,12 @@ async fn ingest_handler(
     State(state): State<ApiState>,
     Json(request): Json<IngestRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let embedder = state
+    let embedder: Box<dyn crate::embed::Embedder> = state
         .embedder_factory
         .build()
         .await
         .map_err(internal_error)?;
-    let vector = embedder
+    let vector: Vec<f32> = embedder
         .embed(&[request.content.as_str()])
         .await
         .map_err(internal_error)?

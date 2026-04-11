@@ -20,7 +20,7 @@ path = "src/main.rs"
 default = ["model2vec"]
 model2vec = ["dep:model2vec-rs"]
 onnx = ["dep:ort", "dep:tokenizers"]
-rest = ["dep:axum", "dep:tower", "dep:tower-http"]
+rest = ["dep:axum", "dep:tower", "dep:tower-http", "model2vec"]
 
 [dependencies]
 anyhow = "1"
