@@ -29,7 +29,7 @@ fn test_db_init() {
     assert!(tables.contains(&"taxonomy".to_string()));
 
     let schema_version: u32 = db.schema_version().expect("schema version should load");
-    assert_eq!(schema_version, 3);
+    assert_eq!(schema_version, 4);
 
     let indexes: Vec<String> = db
         .conn()
@@ -59,6 +59,7 @@ fn test_db_idempotent() {
         source_type: SourceType::Manual,
         added_at: "2026-04-08".into(),
         chunk_index: None,
+        importance: 0,
     })
     .expect("drawer insert should succeed");
 
@@ -72,7 +73,7 @@ fn test_db_idempotent() {
         reopened
             .schema_version()
             .expect("schema version should load after reopen"),
-        3
+        4
     );
 }
 
@@ -105,7 +106,7 @@ fn test_db_migrates_legacy_schema_without_user_version() {
     assert_eq!(
         db.schema_version()
             .expect("schema version should be upgraded"),
-        3
+        4
     );
 
     let count: i64 = db
@@ -127,6 +128,7 @@ fn make_drawer(id: &str, wing: &str) -> Drawer {
         source_type: SourceType::Manual,
         added_at: "2026-04-10".into(),
         chunk_index: None,
+        importance: 0,
     }
 }
 
@@ -184,7 +186,7 @@ fn test_purge_deleted() {
 }
 
 #[test]
-fn test_recent_drawers_excludes_deleted() {
+fn test_top_drawers_excludes_deleted() {
     let dir = tempdir().expect("temp dir");
     let db = Database::open(&dir.path().join("test.db")).expect("db open");
 
@@ -193,7 +195,7 @@ fn test_recent_drawers_excludes_deleted() {
 
     db.soft_delete_drawer("d1").expect("delete d1");
 
-    let recent = db.recent_drawers(10).expect("recent");
+    let recent = db.top_drawers(10).expect("recent");
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0].id, "d2");
 }
@@ -350,8 +352,8 @@ fn test_tunnels_cross_wing() {
 // --- Schema version ---
 
 #[test]
-fn test_schema_version_is_3() {
+fn test_schema_version_is_4() {
     let dir = tempdir().expect("temp dir");
     let db = Database::open(&dir.path().join("test.db")).expect("db open");
-    assert_eq!(db.schema_version().expect("version"), 3);
+    assert_eq!(db.schema_version().expect("version"), 4);
 }

@@ -17,6 +17,9 @@ pub struct Drawer {
     pub source_type: SourceType,
     pub added_at: String,
     pub chunk_index: Option<i64>,
+    /// Importance ranking (0-5). Higher = more important for wake-up context.
+    #[serde(default)]
+    pub importance: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

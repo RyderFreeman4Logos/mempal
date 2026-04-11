@@ -73,6 +73,7 @@ fn insert_drawer(
         source_type: SourceType::Project,
         added_at: "2026-04-08".to_string(),
         chunk_index: Some(0),
+        importance: 0,
     })
     .expect("drawer insert should succeed");
 
@@ -98,6 +99,7 @@ fn insert_drawer_with_vector(
         source_type: SourceType::Project,
         added_at: "2026-04-08".to_string(),
         chunk_index: Some(0),
+        importance: 0,
     })
     .expect("drawer insert should succeed");
 

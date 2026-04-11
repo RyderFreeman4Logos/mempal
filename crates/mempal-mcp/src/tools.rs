@@ -62,6 +62,10 @@ pub struct IngestRequest {
     /// If true, return the drawer_id that WOULD be created without actually
     /// writing to the database. Use this to preview before committing.
     pub dry_run: Option<bool>,
+
+    /// Importance ranking (0-5). Higher values appear first in wake-up context.
+    /// Default 0. Use 3-5 for key decisions, architecture choices, and lessons learned.
+    pub importance: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

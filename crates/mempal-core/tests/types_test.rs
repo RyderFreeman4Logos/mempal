@@ -11,6 +11,7 @@ fn test_drawer_fields() {
         source_type: SourceType::Project,
         added_at: "2026-04-08T12:00:00Z".into(),
         chunk_index: Some(0),
+        importance: 0,
     };
 
     assert_eq!(drawer.wing, "myapp");

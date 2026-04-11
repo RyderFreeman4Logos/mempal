@@ -95,6 +95,7 @@ fn insert_drawer(db: &Database, id: &str, content: &str, wing: &str, room: Optio
         source_type: SourceType::Project,
         added_at: "1712640000".to_string(),
         chunk_index: Some(0),
+        importance: 0,
     })
     .expect("drawer insert should succeed");
 
@@ -119,6 +120,7 @@ fn insert_drawer_with_vector(
         source_type: SourceType::Project,
         added_at: "1712640000".to_string(),
         chunk_index: Some(0),
+        importance: 0,
     })
     .expect("drawer insert should succeed");
 
@@ -452,7 +454,7 @@ async fn test_mcp_status_and_taxonomy() -> anyhow::Result<()> {
         .expect("status payload should exist");
     assert_eq!(
         status_payload.get("schema_version").and_then(Value::as_u64),
-        Some(3)
+        Some(4)
     );
     assert_eq!(
         status_payload.get("drawer_count").and_then(Value::as_i64),

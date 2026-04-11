@@ -190,6 +190,7 @@ async fn ingest_handler(
             source_type: SourceType::Manual,
             added_at: current_timestamp(),
             chunk_index: Some(0),
+            importance: 0,
         })
         .map_err(internal_error)?;
         db.insert_vector(&drawer_id, &vector)

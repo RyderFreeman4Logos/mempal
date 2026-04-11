@@ -172,6 +172,7 @@ impl MempalMcpServer {
                 source_type: SourceType::Manual,
                 added_at: current_timestamp(),
                 chunk_index: Some(0),
+                importance: request.importance.unwrap_or(0),
             })
             .map_err(db_error)?;
             db.insert_vector(&drawer_id, &vector).map_err(db_error)?;

@@ -424,10 +424,10 @@ fn wake_up_command(db: &Database, format: Option<&str>) -> Result<()> {
 
     let drawer_count = db.drawer_count().context("failed to count drawers")?;
     let taxonomy_count = db.taxonomy_count().context("failed to count taxonomy")?;
-    let recent_drawers = db
-        .recent_drawers(5)
+    let top_drawers = db
+        .top_drawers(5)
         .context("failed to load recent drawers for wake-up")?;
-    let token_estimate = estimate_tokens(&recent_drawers);
+    let token_estimate = estimate_tokens(&top_drawers);
 
     // L0: identity + global stats
     println!("## L0 — Identity");
@@ -446,10 +446,10 @@ fn wake_up_command(db: &Database, format: Option<&str>) -> Result<()> {
     // L1: recent context
     println!();
     println!("## L1 — Recent Context");
-    if recent_drawers.is_empty() {
+    if top_drawers.is_empty() {
         println!("no recent drawers");
     } else {
-        for drawer in &recent_drawers {
+        for drawer in &top_drawers {
             println!(
                 "- {}/{} {}",
                 drawer.wing,
@@ -484,23 +484,23 @@ fn read_identity_file() -> String {
 }
 
 fn wake_up_aaak_command(db: &Database) -> Result<()> {
-    let recent_drawers = db
-        .recent_drawers(5)
+    let top_drawers = db
+        .top_drawers(5)
         .context("failed to load recent drawers for AAAK wake-up")?;
-    let text = if recent_drawers.is_empty() {
+    let text = if top_drawers.is_empty() {
         "mempal wake-up: no recent drawers".to_string()
     } else {
-        recent_drawers
+        top_drawers
             .iter()
             .map(|drawer| drawer.content.as_str())
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let wing = recent_drawers
+    let wing = top_drawers
         .first()
         .map(|drawer| drawer.wing.as_str())
         .unwrap_or("mempal");
-    let room = recent_drawers
+    let room = top_drawers
         .first()
         .and_then(|drawer| drawer.room.as_deref())
         .unwrap_or("default");

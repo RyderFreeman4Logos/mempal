@@ -222,6 +222,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             source_type: source_type_for(format),
             added_at: current_timestamp(),
             chunk_index: Some(chunk_index as i64),
+            importance: 0,
         };
 
         db.insert_drawer(&drawer)

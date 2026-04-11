@@ -38,6 +38,7 @@ fn insert_drawer(db: &Database, id: &str, wing: &str, room: Option<&str>, conten
         source_type: SourceType::Project,
         added_at: "1712640000".to_string(),
         chunk_index: Some(0),
+        importance: 0,
     })
     .expect("drawer insert should succeed");
 }

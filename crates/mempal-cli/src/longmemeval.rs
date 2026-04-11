@@ -453,6 +453,7 @@ async fn ingest_corpus<E: Embedder + ?Sized>(
             source_type: SourceType::Conversation,
             added_at: item.timestamp.clone(),
             chunk_index: Some(0),
+            importance: 0,
         })
         .with_context(|| format!("failed to insert drawer {}", item.drawer_id))?;
         db.insert_vector(&item.drawer_id, vector)

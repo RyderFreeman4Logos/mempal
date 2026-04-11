@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::types::{Drawer, SourceType, TaxonomyEntry, Triple};
 
-const CURRENT_SCHEMA_VERSION: u32 = 3;
+const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 const V1_SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -128,9 +128,10 @@ impl Database {
                 source_file,
                 source_type,
                 added_at,
-                chunk_index
+                chunk_index,
+                importance
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
             params![
                 drawer.id,
@@ -141,6 +142,7 @@ impl Database {
                 source_type_as_str(&drawer.source_type),
                 drawer.added_at,
                 drawer.chunk_index,
+                drawer.importance,
             ],
         )?;
 
@@ -196,15 +198,17 @@ impl Database {
         Ok(())
     }
 
-    pub fn recent_drawers(&self, limit: usize) -> Result<Vec<Drawer>, DbError> {
+    /// Returns top drawers sorted by importance (descending), then recency.
+    pub fn top_drawers(&self, limit: usize) -> Result<Vec<Drawer>, DbError> {
         let limit = i64::try_from(limit)
             .map_err(|_| rusqlite::Error::InvalidParameterName("limit".to_string()))?;
         let mut statement = self.conn.prepare(
             r#"
-            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index
+            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
+                   COALESCE(importance, 0) as importance
             FROM drawers
             WHERE deleted_at IS NULL
-            ORDER BY CAST(added_at AS INTEGER) DESC, id DESC
+            ORDER BY importance DESC, CAST(added_at AS INTEGER) DESC, id DESC
             LIMIT ?1
             "#,
         )?;
@@ -218,12 +222,23 @@ impl Database {
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<i64>>(7)?,
+                row.get::<_, i32>(8)?,
             ))
         })?;
 
         let mut drawers = Vec::new();
         for row in rows {
-            let (id, content, wing, room, source_file, source_type, added_at, chunk_index) = row?;
+            let (
+                id,
+                content,
+                wing,
+                room,
+                source_file,
+                source_type,
+                added_at,
+                chunk_index,
+                importance,
+            ) = row?;
             drawers.push(Drawer {
                 id,
                 content,
@@ -233,6 +248,7 @@ impl Database {
                 source_type: source_type_from_str(&source_type)?,
                 added_at,
                 chunk_index,
+                importance,
             });
         }
 
@@ -317,7 +333,8 @@ impl Database {
     pub fn get_drawer(&self, drawer_id: &str) -> Result<Option<Drawer>, DbError> {
         let mut statement = self.conn.prepare(
             r#"
-            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index
+            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
+                   COALESCE(importance, 0) as importance
             FROM drawers
             WHERE id = ?1 AND deleted_at IS NULL
             "#,
@@ -332,13 +349,23 @@ impl Database {
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<i64>>(7)?,
+                row.get::<_, i32>(8)?,
             ))
         })?;
 
         match rows.next() {
             Some(row) => {
-                let (id, content, wing, room, source_file, source_type, added_at, chunk_index) =
-                    row?;
+                let (
+                    id,
+                    content,
+                    wing,
+                    room,
+                    source_file,
+                    source_type,
+                    added_at,
+                    chunk_index,
+                    importance,
+                ) = row?;
                 Ok(Some(Drawer {
                     id,
                     content,
@@ -348,6 +375,7 @@ impl Database {
                     source_type: source_type_from_str(&source_type)?,
                     added_at,
                     chunk_index,
+                    importance,
                 }))
             }
             None => Ok(None),
@@ -687,9 +715,17 @@ fn migrations() -> &'static [Migration] {
             version: 3,
             sql: V3_MIGRATION_SQL,
         },
+        Migration {
+            version: 4,
+            sql: V4_MIGRATION_SQL,
+        },
     ];
     MIGRATIONS
 }
+
+const V4_MIGRATION_SQL: &str = r#"
+ALTER TABLE drawers ADD COLUMN importance INTEGER DEFAULT 0;
+"#;
 
 struct Migration {
     version: u32,
