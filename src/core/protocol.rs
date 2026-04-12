@@ -65,17 +65,69 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    past behavioral patterns. Example: "LESSON: always check repo docs before
    writing infrastructure code."
 
+8. PARTNER AWARENESS (cross-agent cowork)
+   When the user references the partner coding agent ("Codex 那边...",
+   "ask Claude what...", "partner is working on...", "handoff..."), call
+   mempal_peek_partner to read the partner's LIVE session rather than
+   searching mempal drawers. Live conversation is transient and stays in
+   session logs, not mempal. Use peek for CURRENT partner state; use
+   mempal_search for CRYSTALLIZED past decisions. Don't conflate the two.
+   Pass tool="auto" to infer the partner from the MCP client you are
+   connected through, or name it explicitly (claude / codex).
+
+9. DECISION CAPTURE (what goes into mempal)
+   mempal_ingest is for decisions, not chat logs. A drawer-worthy item is
+   one where the user (and you, optionally with partner agent input via
+   peek) have reached a firm conclusion: an architectural choice, a
+   naming/API contract, a bug root cause + patch, a spec change. Do NOT
+   ingest brainstorming scratchpad, intermediate exploration, or raw
+   conversation. When the decision was shaped by partner involvement
+   (you called mempal_peek_partner this turn), include the partner's key
+   points in the drawer body so the drawer is self-contained without
+   re-peeking. Cite the partner session file path in source_file alongside
+   your own citation.
+
 TOOLS:
-  mempal_status    — current state + this protocol + AAAK format spec
-  mempal_search    — semantic search with wing/room filters, citation-bearing
-  mempal_ingest    — save a new drawer (wing required, room optional, importance 0-5)
-  mempal_delete    — soft-delete a drawer by ID
-  mempal_taxonomy  — list or edit routing keywords
-  mempal_kg        — knowledge graph: add/query/invalidate/timeline/stats triples
-  mempal_tunnels   — discover cross-wing room links
+  mempal_status        — current state + this protocol + AAAK format spec
+  mempal_search        — semantic search with wing/room filters, citation-bearing
+  mempal_ingest        — save a new drawer (wing required, room optional, importance 0-5)
+  mempal_delete        — soft-delete a drawer by ID
+  mempal_taxonomy      — list or edit routing keywords
+  mempal_kg            — knowledge graph: add/query/invalidate/timeline/stats triples
+  mempal_tunnels       — discover cross-wing room links
+  mempal_peek_partner  — read partner agent's live session (Claude ↔ Codex), pure read
 
 Key invariant: mempal stores raw text verbatim. Every search result can be
 traced back to a source_file. If you cannot cite the source, you are guessing."#;
 
 /// The default identity text shown when `~/.mempal/identity.txt` does not exist.
 pub const DEFAULT_IDENTITY_HINT: &str = "(identity not set — create ~/.mempal/identity.txt to define your role, projects, and working style)";
+
+#[cfg(test)]
+mod tests {
+    use super::MEMORY_PROTOCOL;
+
+    #[test]
+    fn contains_rule_8_partner_awareness() {
+        assert!(
+            MEMORY_PROTOCOL.contains("8. PARTNER AWARENESS"),
+            "MEMORY_PROTOCOL must include Rule 8 PARTNER AWARENESS"
+        );
+    }
+
+    #[test]
+    fn contains_rule_9_decision_capture() {
+        assert!(
+            MEMORY_PROTOCOL.contains("9. DECISION CAPTURE"),
+            "MEMORY_PROTOCOL must include Rule 9 DECISION CAPTURE"
+        );
+    }
+
+    #[test]
+    fn contains_peek_partner_tool_name() {
+        assert!(
+            MEMORY_PROTOCOL.contains("mempal_peek_partner"),
+            "MEMORY_PROTOCOL must mention the mempal_peek_partner tool"
+        );
+    }
+}
