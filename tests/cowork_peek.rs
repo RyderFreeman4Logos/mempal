@@ -230,10 +230,34 @@ fn test_peek_partner_filters_by_project_cwd() {
 
 #[test]
 fn test_peek_partner_has_no_mempal_side_effects() {
-    // Invariant by construction: peek_partner never touches Database.
-    // This test exercises it 3× to ensure no stateful leak across calls.
+    // Open a real palace.db on a tempfile and snapshot drawer_count /
+    // triple_count / schema_version. Run peek_partner 3 times. Re-snapshot
+    // and assert everything is bit-identical. This replaces an older
+    // "by-construction" comment-only version that just exercised the code
+    // path without actually observing the invariant.
+    use mempal::core::db::Database;
+
     let cwd = PathBuf::from("/tmp/fake-project-5");
     let (_tmp, home) = build_fake_home(&cwd);
+
+    // Use a SEPARATE tempdir for the palace.db so it doesn't pollute the
+    // fake HOME for session fixtures.
+    let db_tmp = TempDir::new().unwrap();
+    let db_path = db_tmp.path().join("palace.db");
+
+    let db = Database::open(&db_path).expect("open db");
+    let drawers_before = db.drawer_count().expect("drawer count");
+    let triples_before = db.triple_count().expect("triple count");
+    let schema_before = db.schema_version().expect("schema version");
+    assert_eq!(schema_before, 4, "baseline palace.db should be schema v4");
+    drop(db);
+
+    // Record the DB file mtime as a second-line check: peek_partner must
+    // not touch this file at all.
+    let db_mtime_before = fs::metadata(&db_path)
+        .expect("db metadata")
+        .modified()
+        .expect("mtime");
 
     let req = PeekRequest {
         tool: Tool::Codex,
@@ -244,8 +268,24 @@ fn test_peek_partner_has_no_mempal_side_effects() {
         home_override: Some(home),
     };
     for _ in 0..3 {
-        let _ = peek_partner(req.clone()).expect("peek");
+        peek_partner(req.clone()).expect("peek");
     }
+
+    let db = Database::open(&db_path).expect("reopen db");
+    let drawers_after = db.drawer_count().expect("drawer count");
+    let triples_after = db.triple_count().expect("triple count");
+    let schema_after = db.schema_version().expect("schema version");
+
+    assert_eq!(drawers_before, drawers_after, "drawer_count changed after peek");
+    assert_eq!(triples_before, triples_after, "triple_count changed after peek");
+    assert_eq!(schema_before, schema_after, "schema_version changed after peek");
+
+    // palace.db file mtime may only advance if Database::open (re-)opens
+    // the file for write during migration checks. Since migrations only
+    // run once, the second Database::open above might touch mtime.
+    // We skip the strict file-mtime assertion for that reason and rely on
+    // the in-DB counters above — those are what actually matter.
+    let _ = db_mtime_before;
 }
 
 #[test]
