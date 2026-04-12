@@ -235,6 +235,27 @@ fn test_peek_partner_has_no_mempal_side_effects() {
     // and assert everything is bit-identical. This replaces an older
     // "by-construction" comment-only version that just exercised the code
     // path without actually observing the invariant.
+    //
+    // KNOWN COVERAGE LIMITATION (Codex review round 2, finding 3):
+    //
+    // This test snapshots a TEMPFILE palace.db that peek_partner is never
+    // configured to touch. If a future refactor accidentally made peek
+    // write to some OTHER filesystem path — most worryingly the user's
+    // real ~/.mempal/palace.db — this test would still pass.
+    //
+    // We considered extending the test to also snapshot the default
+    // ~/.mempal/palace.db but rejected that option: Database::open is not
+    // a pure read — it runs migration checks and may create parent
+    // directories, i.e. it's a writable side-effect. Calling it on the
+    // user's real DB from a unit test would make the test non-hermetic,
+    // dependent on user state, and potentially racy with a concurrently-
+    // running MCP server. Codex: "这比 finding 3 本身更脏."
+    //
+    // The correct way to fully close this coverage gap is NOT to observe
+    // more paths from the test, but to make peek_partner's DB access
+    // point (currently none) explicitly injectable, so a testability
+    // refactor can assert "peek holds no Database handle and no
+    // writable filesystem capability". That's a future spec, not P6.
     use mempal::core::db::Database;
 
     let cwd = PathBuf::from("/tmp/fake-project-5");
