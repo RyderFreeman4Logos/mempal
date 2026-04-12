@@ -6,4 +6,4 @@ pub mod claude;
 pub mod codex;
 pub mod peek;
 
-// Re-exports are added in Task 2 once the types exist.
+pub use peek::{PeekError, PeekMessage, PeekRequest, PeekResponse, Tool, peek_partner};
