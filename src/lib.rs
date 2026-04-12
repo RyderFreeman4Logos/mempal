@@ -4,6 +4,7 @@ pub mod aaak;
 #[cfg(feature = "rest")]
 pub mod api;
 pub mod core;
+pub mod cowork;
 pub mod embed;
 pub mod ingest;
 pub mod mcp;
