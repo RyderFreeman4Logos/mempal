@@ -1,0 +1,8 @@
+{"timestamp":"2026-04-13T12:00:00Z","type":"session_meta","payload":{"id":"fake","timestamp":"2026-04-13T12:00:00Z","cwd":"/tmp/fake-project","originator":"codex-tui","cli_version":"0.118.0"}}
+{"timestamp":"2026-04-13T12:00:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex: hello"}]}}
+{"timestamp":"2026-04-13T12:00:11Z","type":"event_msg","payload":{"type":"user_message","message":"codex: hello"}}
+{"timestamp":"2026-04-13T12:00:15Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"..."}}
+{"timestamp":"2026-04-13T12:00:20Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"codex: hi back"}],"phase":"commentary"}}
+{"timestamp":"2026-04-13T12:00:30Z","type":"event_msg","payload":{"type":"token_count","info":null}}
+{"timestamp":"2026-04-13T12:00:35Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex: continue"}]}}
+{"timestamp":"2026-04-13T12:00:40Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"codex: continuing"}]}}
