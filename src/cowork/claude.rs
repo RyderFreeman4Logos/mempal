@@ -1,6 +1,6 @@
 //! Claude Code session reader.
 
-use crate::cowork::peek::{PeekError, PeekMessage};
+use crate::cowork::peek::{PeekError, PeekMessage, parse_rfc3339};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -51,6 +51,17 @@ pub fn parse_jsonl_messages(
     since: Option<&str>,
     limit: usize,
 ) -> Result<(Vec<PeekMessage>, bool), PeekError> {
+    // Pre-parse the `since` cutoff once into epoch seconds. Compare in
+    // instant semantics, not lexicographic string order — string compare is
+    // broken across timezone offsets (e.g. "10:00+08:00" vs "02:00Z" look
+    // unequal but are the same instant).
+    let since_cutoff: Option<i64> = match since {
+        Some(raw) => Some(parse_rfc3339(raw).ok_or_else(|| {
+            PeekError::Parse(format!("invalid `since` RFC3339 timestamp: {raw}"))
+        })?),
+        None => None,
+    };
+
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut all: Vec<PeekMessage> = Vec::new();
@@ -65,9 +76,13 @@ pub fn parse_jsonl_messages(
             Err(_) => continue,
         };
         if let Some(msg) = extract_message(&val) {
-            if let Some(cutoff) = since {
-                if msg.at.as_str() <= cutoff {
-                    continue;
+            if let Some(cutoff) = since_cutoff {
+                // Messages whose timestamp can't be parsed are kept (safer
+                // default than silently dropping them).
+                if let Some(msg_ts) = parse_rfc3339(&msg.at) {
+                    if msg_ts <= cutoff {
+                        continue;
+                    }
                 }
             }
             all.push(msg);
@@ -187,6 +202,33 @@ mod tests {
         assert_eq!(messages[0].text, "Second user message");
         assert_eq!(messages[1].text, "Second assistant reply");
         assert!(truncated);
+    }
+
+    #[test]
+    fn since_filter_compares_instants_not_strings() {
+        // Cross-timezone regression: `since` with a +08:00 offset represents
+        // UTC 02:00:00. Messages at UTC 02:30:00Z and UTC 05:00:00Z are both
+        // strictly newer than that instant, so they MUST be returned. The
+        // message at UTC 01:00:00Z is older and must be dropped.
+        //
+        // With a naive lexicographic string compare, `"...01:00:00Z"`,
+        // `"...02:30:00Z"`, `"...05:00:00Z"` are all textually less than
+        // `"...10:00:00+08:00"`, so the broken implementation drops all 3.
+        let fixture = Path::new("tests/fixtures/cowork/claude_since/session.jsonl");
+        let since = Some("2026-04-13T10:00:00+08:00");
+        let (messages, _) =
+            parse_jsonl_messages(fixture, since, 30).expect("parse");
+        assert_eq!(
+            messages.len(),
+            2,
+            "expected 2 messages strictly newer than the +08:00 cutoff \
+             (UTC 02:00), got {}: {:?}",
+            messages.len(),
+            messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        assert!(messages.iter().any(|m| m.text.contains("02:30")));
+        assert!(messages.iter().any(|m| m.text.contains("05:00")));
+        assert!(!messages.iter().any(|m| m.text.contains("01:00")));
     }
 
     #[test]

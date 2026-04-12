@@ -145,6 +145,103 @@ fn days_to_ymd(mut days: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
+/// Howard Hinnant's days_from_civil — inverse of days_to_ymd.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m = m as u64;
+    let d = d as u64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+/// Parse an RFC3339 timestamp into epoch seconds (UTC).
+///
+/// Supports: `YYYY-MM-DDTHH:MM:SS[.fraction][Z|±HH:MM]`. Fractional seconds
+/// are accepted but discarded (sub-second precision is not needed for the
+/// peek filter). Returns `None` for anything that doesn't match exactly.
+///
+/// Used to compare `since` cutoffs and message `at` timestamps in instant
+/// semantics, not as lexicographic strings (which breaks across timezone
+/// offsets).
+pub(crate) fn parse_rfc3339(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 20 {
+        return None;
+    }
+    // Expected date/time separators
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u32 = s.get(11..13)?.parse().ok()?;
+    let minute: u32 = s.get(14..16)?.parse().ok()?;
+    let second: u32 = s.get(17..19)?.parse().ok()?;
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+
+    // Optional fractional seconds.
+    let mut i = 19;
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        let frac_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == frac_start {
+            return None; // dot with no digits
+        }
+    }
+
+    // Timezone offset.
+    if i >= bytes.len() {
+        return None;
+    }
+    let offset_secs: i64 = match bytes[i] {
+        b'Z' => {
+            if i + 1 != bytes.len() {
+                return None;
+            }
+            0
+        }
+        b'+' | b'-' => {
+            let sign: i64 = if bytes[i] == b'+' { 1 } else { -1 };
+            if i + 6 != bytes.len() || bytes[i + 3] != b':' {
+                return None;
+            }
+            let oh: u32 = s.get(i + 1..i + 3)?.parse().ok()?;
+            let om: u32 = s.get(i + 4..i + 6)?.parse().ok()?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            sign * (oh as i64 * 3600 + om as i64 * 60)
+        }
+        _ => return None,
+    };
+
+    let days = days_from_civil(year, month, day);
+    let local_secs =
+        days * 86400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    Some(local_secs - offset_secs)
+}
+
 fn resolve_home(request: &PeekRequest) -> Result<PathBuf, PeekError> {
     if let Some(h) = &request.home_override {
         return Ok(h.clone());
@@ -293,6 +390,52 @@ mod tests {
         let old = SystemTime::now() - Duration::from_secs(45 * 60);
         assert!(is_active(recent));
         assert!(!is_active(old));
+    }
+
+    #[test]
+    fn rfc3339_parses_utc_z() {
+        let ts = parse_rfc3339("2026-04-13T02:00:00Z").unwrap();
+        // Epoch seconds for 2026-04-13T02:00:00 UTC.
+        // Not checking exact value; checking invariants via cross-comparison.
+        let later = parse_rfc3339("2026-04-13T02:30:00Z").unwrap();
+        assert!(later > ts);
+        let much_later = parse_rfc3339("2026-04-13T05:00:00Z").unwrap();
+        assert!(much_later > later);
+    }
+
+    #[test]
+    fn rfc3339_handles_positive_and_negative_offsets() {
+        // Same instant: 10:00 in +08 equals 02:00 in UTC.
+        let plus_08 = parse_rfc3339("2026-04-13T10:00:00+08:00").unwrap();
+        let utc = parse_rfc3339("2026-04-13T02:00:00Z").unwrap();
+        assert_eq!(plus_08, utc);
+
+        // Same instant: 21:00 in -05 equals 02:00 next day in UTC.
+        let minus_05 = parse_rfc3339("2026-04-12T21:00:00-05:00").unwrap();
+        assert_eq!(minus_05, utc);
+    }
+
+    #[test]
+    fn rfc3339_handles_fractional_seconds() {
+        // Fractional component is accepted but truncated to whole seconds.
+        let a = parse_rfc3339("2026-04-13T02:00:00.000Z").unwrap();
+        let b = parse_rfc3339("2026-04-13T02:00:00.999Z").unwrap();
+        let c = parse_rfc3339("2026-04-13T02:00:00Z").unwrap();
+        assert_eq!(a, c);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn rfc3339_rejects_malformed_inputs() {
+        assert!(parse_rfc3339("").is_none());
+        assert!(parse_rfc3339("2026-04-13").is_none()); // date only
+        assert!(parse_rfc3339("2026-04-13T02:00:00").is_none()); // no tz
+        assert!(parse_rfc3339("2026-04-13 02:00:00Z").is_none()); // space separator
+        assert!(parse_rfc3339("2026-04-13T02:00:00ZZ").is_none()); // trailing garbage
+        assert!(parse_rfc3339("2026-13-01T02:00:00Z").is_none()); // month out of range
+        assert!(parse_rfc3339("2026-04-13T25:00:00Z").is_none()); // hour out of range
+        assert!(parse_rfc3339("2026-04-13T02:00:00.Z").is_none()); // dot with no digits
+        assert!(parse_rfc3339("2026-04-13T02:00:00+0800").is_none()); // missing colon in offset
     }
 
     #[test]

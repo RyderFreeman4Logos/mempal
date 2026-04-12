@@ -1,6 +1,6 @@
 //! Codex session reader.
 
-use crate::cowork::peek::{PeekError, PeekMessage};
+use crate::cowork::peek::{PeekError, PeekMessage, parse_rfc3339};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -78,6 +78,14 @@ pub fn parse_codex_jsonl(
     since: Option<&str>,
     limit: usize,
 ) -> Result<(Vec<PeekMessage>, bool), PeekError> {
+    // Pre-parse the `since` cutoff once; see claude.rs for rationale.
+    let since_cutoff: Option<i64> = match since {
+        Some(raw) => Some(parse_rfc3339(raw).ok_or_else(|| {
+            PeekError::Parse(format!("invalid `since` RFC3339 timestamp: {raw}"))
+        })?),
+        None => None,
+    };
+
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut all: Vec<PeekMessage> = Vec::new();
@@ -127,9 +135,13 @@ pub fn parse_codex_jsonl(
             .unwrap_or("")
             .to_string();
 
-        if let Some(cutoff) = since {
-            if at.as_str() <= cutoff {
-                continue;
+        if let Some(cutoff) = since_cutoff {
+            // Same safety rule as Claude adapter: unparseable msg timestamps
+            // are kept rather than silently dropped.
+            if let Some(msg_ts) = parse_rfc3339(&at) {
+                if msg_ts <= cutoff {
+                    continue;
+                }
             }
         }
 

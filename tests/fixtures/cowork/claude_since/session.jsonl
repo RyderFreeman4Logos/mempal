@@ -1,0 +1,3 @@
+{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"Before cutoff (UTC 01:00)"},"uuid":"u1","timestamp":"2026-04-13T01:00:00Z","cwd":"/tmp/since-proj"}
+{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Reply at UTC 02:30 — after the +08:00 cutoff instant"}]},"uuid":"a1","timestamp":"2026-04-13T02:30:00Z","cwd":"/tmp/since-proj"}
+{"parentUuid":"a1","isSidechain":false,"type":"user","message":{"role":"user","content":"Later UTC 05:00"},"uuid":"u2","timestamp":"2026-04-13T05:00:00Z","cwd":"/tmp/since-proj"}
