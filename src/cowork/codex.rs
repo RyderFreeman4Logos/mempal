@@ -46,8 +46,20 @@ pub fn find_latest_session_for_cwd(
 }
 
 /// Testable variant of `find_latest_session_for_cwd` that accepts an
-/// explicit "now" in epoch seconds. Same window semantics — scans the
-/// day `floor(now / 86400)` and the 6 preceding days.
+/// explicit "now" in epoch seconds.
+///
+/// Scans `[UTC_today - 7, UTC_today + 1]` (9 date directories) to cover
+/// "last 7 local days" regardless of the user's timezone offset. Codex
+/// names session directories by the LOCAL wall-clock date, not UTC:
+///   * For **positive** offsets (e.g. Asia/Shanghai +08:00), during
+///     early-morning hours the live session lives in `UTC_today + 1`.
+///   * For **negative** offsets (e.g. America/Los_Angeles -08:00),
+///     during late-evening hours the live session lives in `UTC_today - 1`,
+///     so 7 local days back is `UTC_today - 7`.
+/// The 9-day UTC window is the smallest that provably covers both cases
+/// without parsing timezone data. It replaces an earlier 7-day UTC window
+/// that silently missed live sessions in UTC+ timezones during the
+/// ~8-hour post-UTC-midnight local-morning period (caught by Codex review).
 pub(crate) fn find_latest_session_for_cwd_at(
     base: &Path,
     target_cwd: &str,
@@ -56,7 +68,7 @@ pub(crate) fn find_latest_session_for_cwd_at(
     let today_days = now_epoch_secs.div_euclid(86400);
     let mut candidates: Vec<(PathBuf, SystemTime)> = Vec::new();
 
-    for offset in 0..7i64 {
+    for offset in -1i64..=7i64 {
         let (year, month, day) = days_to_ymd(today_days - offset);
         let day_dir = base
             .join(format!("{year:04}"))
@@ -268,21 +280,56 @@ mod tests {
     }
 
     #[test]
-    fn seven_day_window_excludes_sessions_older_than_7_days() {
-        // Fixture 2026/04/12 is 1 day before "now" (2026-04-13), IN window.
-        // Fixture 2026/04/06 would be 7 days before "now", OUT of window.
-        // Simulate an "8-day-old" session by advancing the injected now
-        // to 2026-04-20T00:00:00Z: days window becomes 04/14..04/20, and
-        // the 04/13 fixture (valid cwd match) falls OUT of the window.
+    fn scan_window_covers_utc_tomorrow_for_positive_offset_tz() {
+        // Regression for the UTC-vs-local-date bug caught by Codex review:
+        // Codex session directories are named by LOCAL wall-clock date,
+        // not UTC. In Asia/Shanghai (UTC+8) at 05:00 local on 2026-04-13,
+        // the current session's directory is 2026/04/13, but UTC is still
+        // 2026-04-12T21:00. A naive "days since epoch" scan anchored at
+        // UTC_today would scan 2026/04/06..2026/04/12 and MISS the live
+        // 2026/04/13 directory entirely during the ~8 hour early-morning
+        // window in UTC+ timezones.
+        //
+        // The fix widens the scan to [UTC_today - 7, UTC_today + 1] so
+        // "UTC tomorrow" (which is "local today" for positive offsets) is
+        // always included.
         let base = Path::new("tests/fixtures/cowork/codex");
-        // 2026-04-20T00:00:00Z → days_from_civil(2026, 4, 20) = 20563
-        let now_epoch = 20563_i64 * 86400;
+        // 2026-04-12T21:00Z = 2026-04-13T05:00 in Asia/Shanghai.
+        // days_from_civil(2026, 4, 12) = 20555.
+        let now_epoch = 20555_i64 * 86400 + 21 * 3600;
+        let result =
+            find_latest_session_for_cwd_at(base, "/tmp/fake-project", now_epoch)
+                .expect("find session");
+        assert!(
+            result.is_some(),
+            "expected to find the 2026/04/13 fixture at UTC 2026-04-12T21:00 \
+             (= 05:00 local in +08:00)"
+        );
+        let (path, _) = result.unwrap();
+        assert!(
+            path.to_string_lossy().contains("2026/04/13"),
+            "expected the 04/13 fixture (local today), got {path:?}"
+        );
+    }
+
+    #[test]
+    fn scan_window_excludes_sessions_outside_the_9_day_span() {
+        // With the new [UTC_today - 7, UTC_today + 1] window, a fixture
+        // at 2026/04/13 falls OUT of the window only when UTC_today is
+        // advanced past 2026-04-21 (2026-04-13 would be UTC_today - 9
+        // on 2026-04-22, i.e. one day older than the window floor of
+        // UTC_today - 7). Use UTC_today = 2026-04-22:
+        //   window = [2026-04-15, 2026-04-23]
+        //   fixture 2026-04-13 is 2 days OLDER than the floor → excluded.
+        let base = Path::new("tests/fixtures/cowork/codex");
+        // days_from_civil(2026, 4, 22) = 20565
+        let now_epoch = 20565_i64 * 86400;
         let result =
             find_latest_session_for_cwd_at(base, "/tmp/fake-project", now_epoch)
                 .expect("find session");
         assert!(
             result.is_none(),
-            "04/13 fixture must fall outside the 04/14..04/20 window, got {result:?}"
+            "04/13 fixture must fall outside the 04/15..04/23 window, got {result:?}"
         );
     }
 }

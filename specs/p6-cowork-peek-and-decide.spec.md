@@ -21,7 +21,7 @@ Rule 9 DECISION CAPTURE）。设计文档见 `docs/specs/2026-04-13-cowork-peek-
 - 项目隔离由调用方 cwd（`std::env::current_dir`）决定，不暴露独立的 project 参数；每次调用都以当前 cwd 为准
 - Claude session adapter 路径：`~/.claude/projects/<encoded_cwd>/*.jsonl`，`encoded_cwd = cwd.replace('/', "-")`；选 mtime 最新的 `.jsonl`
 - Claude jsonl 真实 schema：每行是 `{"type":"user"|"assistant","message":{"role":...,"content": string | [{type:text|tool_use|tool_result,...}]}, "isMeta":bool, "timestamp":..., "cwd":...}`；adapter 跳过 `isMeta:true`，从 `message.content` 提取 text 块（拼接），忽略 tool_use / tool_result 块
-- Codex session adapter 路径：`~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl`；扫最近 7 天的目录，按 mtime 倒排，读每个文件首行 `session_meta.payload.cwd` 过滤出当前项目，取第一个命中
+- Codex session adapter 路径：`~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl`；Codex 用 LOCAL 日期命名目录，所以 adapter 扫 `[UTC_today - 7, UTC_today + 1]` 共 9 个 date 目录以覆盖"最近 7 local 天"在任意时区偏移下的情况（正偏移如 +08 的早晨，live session 在 `UTC_today + 1`；负偏移如 -08 的晚间，7 local 天前是 `UTC_today - 7`）。按 mtime 倒排，读每个文件首行 `session_meta.payload.cwd` 过滤出当前项目，取第一个命中
 - Codex jsonl 真实 schema：只处理 `type:"response_item"` 且 `payload.type:"message"` 的条目；`payload.role` 为 user/assistant；text 来自 `payload.content[].text`（其中 `type:"input_text"` 或 `"output_text"`）；跳过 `reasoning` payload 和 `event_msg` 条目
 - adapter 单次扫描返回 `(messages, truncated)`；`truncated=true` 当消息总数大于 `limit`；成功提取的 user/assistant 消息按升序返回，超出 `limit` 时取尾部
 - `tool = "auto"` 时使用 MCP `InitializeRequest.client_info.name`：含 "claude" → peek Codex；含 "codex" → peek Claude；其余 → 返回错误 "cannot infer partner; pass `tool` explicitly"
