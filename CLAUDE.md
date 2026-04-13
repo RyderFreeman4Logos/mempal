@@ -28,7 +28,7 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 ### 项目级 Spec
 - `specs/project.spec.md` — 项目约束（edition、依赖、编码规范、架构不变量）
 
-### 已完成的 Spec（P0-P6）
+### 已完成的 Spec（P0-P7）
 
 | Spec | 状态 | 范围 |
 |------|------|------|
@@ -46,10 +46,11 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 | `specs/p5-agent-diary.spec.md` | 完成 | Agent 日记 convention（协议层） |
 | `specs/p5-format-support.spec.md` | 完成 | Slack DM + Codex CLI 格式支持 |
 | `specs/p6-cowork-peek-and-decide.spec.md` | 完成 | Claude↔Codex 协作：live session peek（`mempal_peek_partner`）+ Rule 8/9 |
+| `specs/p7-search-structured-signals.spec.md` | 完成 | `mempal_search` 响应每条结果附带 5 个 AAAK-derived 结构化字段（`entities` / `topics` / `flags` / `emotions` / `importance_stars`），`content` 保持 raw |
 
 ### 当前 Spec
 
-（无，P6 已完成）
+（无，P7 已完成）
 
 ### 实现计划
 
@@ -57,6 +58,7 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 - `docs/plans/2026-04-09-p1-p4-implementation.md` — P1-P4（已完成）
 - `docs/plans/2026-04-11-p5-implementation.md` — P5（已完成）
 - `docs/plans/2026-04-13-p6-implementation.md` — P6（已完成）
+- `docs/plans/2026-04-13-p7-implementation.md` — P7（已完成）
 
 ### Spec 使用方式
 
@@ -82,7 +84,7 @@ agent-spec lint specs/p6-cowork-peek-and-decide.spec.md --min-score 0.7
 | 工具 | 作用 |
 |------|------|
 | `mempal_status` | 状态 + 协议 + AAAK spec |
-| `mempal_search` | 混合检索（BM25 + 向量 + RRF + tunnel hints） |
+| `mempal_search` | 混合检索（BM25 + 向量 + RRF + tunnel hints）+ AAAK 结构化 signals（P7） |
 | `mempal_ingest` | 写记忆（支持 dry_run） |
 | `mempal_delete` | soft-delete（+ audit） |
 | `mempal_taxonomy` | Wing/Room 路由关键词管理 |
