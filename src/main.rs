@@ -95,6 +95,43 @@ enum Commands {
         mcp: bool,
     },
     Status,
+    /// Drain cowork inbox messages for the given target. Always exits 0
+    /// (hook graceful degrade). Intended to be called from a UserPromptSubmit
+    /// hook on each user turn — never blocks the user's prompt.
+    CoworkDrain {
+        /// Which agent's inbox to drain ("claude" or "codex"). Use "$MY_TOOL".
+        #[arg(long)]
+        target: String,
+
+        /// Project cwd. Exactly ONE of --cwd or --cwd-source must be set.
+        /// Use this for Claude Code hook (pass ${CLAUDE_PROJECT_CWD:-$PWD}).
+        #[arg(long, conflicts_with = "cwd_source")]
+        cwd: Option<PathBuf>,
+
+        /// Alternative cwd source for hooks whose runtime provides a
+        /// structured input payload. Currently supported: "stdin-json"
+        /// (reads stdin as JSON and extracts the `cwd` field, per Codex's
+        /// UserPromptSubmitCommandInput schema).
+        #[arg(long, conflicts_with = "cwd")]
+        cwd_source: Option<String>,
+
+        /// Output format: "plain" for Claude Code hook (prepend to prompt),
+        /// or "codex-hook-json" for Codex native hook envelope.
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// Show current cowork inbox state for both targets at the given cwd
+    /// (read-only — does NOT drain).
+    CoworkStatus {
+        #[arg(long)]
+        cwd: PathBuf,
+    },
+    /// Install cowork hooks: Claude Code (project-level .claude/hooks)
+    /// and optionally Codex (global ~/.codex/hooks.json merge).
+    CoworkInstallHooks {
+        #[arg(long, default_value_t = false)]
+        global_codex: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -167,6 +204,29 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // Cowork commands must graceful-degrade without requiring palace.db
+    // or config to exist. Dispatch them BEFORE Config::load / Database::open
+    // so a missing mempal_home never breaks the hook path.
+    match cli.command {
+        Commands::CoworkDrain {
+            target,
+            cwd,
+            cwd_source,
+            format,
+        } => {
+            return cowork_drain_command(target, cwd, cwd_source, format);
+        }
+        Commands::CoworkStatus { cwd } => {
+            return cowork_status_command(cwd);
+        }
+        Commands::CoworkInstallHooks { global_codex } => {
+            return cowork_install_hooks_command(global_codex);
+        }
+        // All other commands fall through to the db-backed dispatch below.
+        _ => {}
+    }
+
     let config = Config::load().context("failed to load config")?;
     let db = Database::open(&expand_home(&config.db_path)).context("failed to open database")?;
 
@@ -207,6 +267,10 @@ async fn run() -> Result<()> {
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
         Commands::Serve { mcp } => serve_command(&config, mcp).await,
         Commands::Status => status_command(&db),
+        // Cowork commands were already dispatched above and returned early.
+        Commands::CoworkDrain { .. }
+        | Commands::CoworkStatus { .. }
+        | Commands::CoworkInstallHooks { .. } => unreachable!(),
     }
 }
 
@@ -954,6 +1018,191 @@ fn expand_home(path: &str) -> PathBuf {
     }
 
     PathBuf::from(path)
+}
+
+/// `mempal cowork-drain` — called by UserPromptSubmit hooks. Always exits
+/// 0 (even on error), so any failure in this path never blocks the user's
+/// prompt submission. Errors go to stderr; stdout is left empty on failure.
+fn cowork_drain_command(
+    target: String,
+    cwd: Option<PathBuf>,
+    cwd_source: Option<String>,
+    format: String,
+) -> Result<()> {
+    use mempal::cowork::Tool;
+    use mempal::cowork::inbox;
+
+    let inner: Result<(), Box<dyn std::error::Error>> = (|| {
+        let target_tool = Tool::from_str_ci(&target)
+            .ok_or_else(|| format!("invalid target `{target}`: expected claude|codex"))?;
+        let mempal_home = inbox::mempal_home();
+
+        let resolved_cwd: PathBuf = match (cwd, cwd_source.as_deref()) {
+            (Some(path), None) => path,
+            (None, Some("stdin-json")) => {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                let payload: serde_json::Value = serde_json::from_str(&buf)?;
+                let cwd_str = payload
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .ok_or("stdin JSON payload missing `cwd` string field")?;
+                PathBuf::from(cwd_str)
+            }
+            (None, Some(other)) => {
+                return Err(format!("unsupported --cwd-source: {other}").into());
+            }
+            (None, None) => return Err("must provide --cwd or --cwd-source".into()),
+            (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
+        };
+
+        let messages = inbox::drain(&mempal_home, target_tool, &resolved_cwd)?;
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let partner = target_tool
+            .partner()
+            .ok_or("target has no partner (auto)")?;
+        let out = match format.as_str() {
+            "plain" => inbox::format_plain(partner, &messages),
+            "codex-hook-json" => inbox::format_codex_hook_json(partner, &messages)?,
+            _ => return Err(format!("unknown format: {format}").into()),
+        };
+        print!("{out}");
+        Ok(())
+    })();
+
+    if let Err(e) = inner {
+        eprintln!("mempal cowork-drain: {e}");
+    }
+    Ok(())
+}
+
+/// `mempal cowork-status` — print current inbox state for both targets at
+/// the given cwd. Read-only; does NOT drain.
+fn cowork_status_command(cwd: PathBuf) -> Result<()> {
+    use mempal::cowork::Tool;
+    use mempal::cowork::inbox;
+
+    let mempal_home = inbox::mempal_home();
+    println!("Project: {}", cwd.display());
+    println!();
+    for target in [Tool::Claude, Tool::Codex] {
+        let path = match inbox::inbox_path(&mempal_home, target, &cwd) {
+            Ok(p) => p,
+            Err(_) => {
+                println!("{} inbox:  <invalid cwd>", target.dir_name());
+                continue;
+            }
+        };
+        if !path.exists() {
+            println!("{} inbox:  0 messages", target.dir_name());
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let count = content.lines().filter(|l| !l.trim().is_empty()).count();
+        let bytes = content.len();
+        println!(
+            "{} inbox:  {} message{}, {} B",
+            target.dir_name(),
+            count,
+            if count == 1 { "" } else { "s" },
+            bytes
+        );
+        for line in content.lines().take(3) {
+            if let Ok(msg) = serde_json::from_str::<inbox::InboxMessage>(line) {
+                println!("  from {} @ {}: {}", msg.from, msg.pushed_at, msg.content);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `mempal cowork-install-hooks` — install Claude Code project-level hook
+/// script and optionally merge Codex global hooks.json entry.
+fn cowork_install_hooks_command(global_codex: bool) -> Result<()> {
+    let inner: Result<(), Box<dyn std::error::Error>> = (|| {
+        // Claude Code hook (project-local)
+        let cwd = std::env::current_dir()?;
+        let claude_dir = cwd.join(".claude/hooks");
+        std::fs::create_dir_all(&claude_dir)?;
+        let claude_script = claude_dir.join("user-prompt-submit.sh");
+        let claude_content = r#"#!/bin/bash
+# mempal cowork inbox drain — prepends partner handoff messages to user prompt
+# Graceful degrade: any failure exits 0 with empty stdout
+mempal cowork-drain --target claude --cwd "${CLAUDE_PROJECT_CWD:-$PWD}" 2>/dev/null || true
+"#;
+        std::fs::write(&claude_script, claude_content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&claude_script)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&claude_script, perms)?;
+        }
+        println!("✓ installed Claude Code hook at {}", claude_script.display());
+
+        if global_codex {
+            // Do NOT introduce `dirs` crate — use env::var_os("HOME") directly.
+            let home = match std::env::var_os("HOME") {
+                Some(h) => PathBuf::from(h),
+                None => return Err("cannot resolve $HOME env var".into()),
+            };
+            let codex_dir = home.join(".codex");
+            std::fs::create_dir_all(&codex_dir)?;
+            let hooks_path = codex_dir.join("hooks.json");
+
+            let mut root: serde_json::Value = if hooks_path.exists() {
+                let s = std::fs::read_to_string(&hooks_path)?;
+                serde_json::from_str(&s)?
+            } else {
+                serde_json::json!({ "hooks": {} })
+            };
+            if !root.is_object() {
+                root = serde_json::json!({ "hooks": {} });
+            }
+            let hooks_field = root
+                .as_object_mut()
+                .ok_or("hooks.json root is not object")?
+                .entry("hooks")
+                .or_insert_with(|| serde_json::json!({}));
+            let hooks_obj = hooks_field
+                .as_object_mut()
+                .ok_or("hooks field is not object")?;
+            let event_arr = hooks_obj
+                .entry("UserPromptSubmit")
+                .or_insert_with(|| serde_json::json!([]));
+            let event_arr = event_arr
+                .as_array_mut()
+                .ok_or("UserPromptSubmit is not array")?;
+
+            event_arr.push(serde_json::json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": "mempal cowork-drain --target codex --format codex-hook-json --cwd-source stdin-json",
+                    "statusMessage": "mempal cowork drain"
+                }]
+            }));
+
+            std::fs::write(&hooks_path, serde_json::to_string_pretty(&root)?)?;
+            println!("✓ merged Codex hook into {}", hooks_path.display());
+        }
+
+        println!();
+        println!("Next steps:");
+        println!("  1. Restart Claude Code and Codex TUI so new hooks take effect");
+        println!("  2. Test: ask Claude to push a test message to codex;");
+        println!("     then in Codex, type anything — the message should be prepended");
+
+        Ok(())
+    })();
+
+    if let Err(e) = inner {
+        eprintln!("mempal cowork-install-hooks: {e}");
+        return Err(anyhow::anyhow!("cowork-install-hooks failed"));
+    }
+    Ok(())
 }
 
 fn parse_keywords_arg(keywords: &str) -> Vec<String> {

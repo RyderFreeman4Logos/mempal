@@ -12,8 +12,13 @@ use mempal::cowork::Tool;
 use mempal::cowork::inbox::{InboxMessage, drain, push};
 use std::fs;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tempfile::TempDir;
+
+fn mempal_bin() -> String {
+    env!("CARGO_BIN_EXE_mempal").to_string()
+}
 
 fn setup_repo(tmp: &TempDir, name: &str) -> PathBuf {
     let repo = tmp.path().join(name);
@@ -125,4 +130,138 @@ async fn push_and_drain_have_no_palace_db_side_effects() {
         schema_before,
         "schema_version changed after push/drain"
     );
+}
+
+#[test]
+fn cowork_drain_cli_graceful_degrade_when_mempal_home_missing() {
+    let tmp = TempDir::new().unwrap();
+    // HOME points to an empty dir with NO .mempal/ subdirectory.
+    // mempal CLI will resolve mempal_home to tmp/.mempal, which doesn't exist.
+    // Drain must gracefully return empty stdout + exit 0.
+    let output = Command::new(mempal_bin())
+        .args([
+            "cowork-drain",
+            "--target",
+            "claude",
+            "--cwd",
+            "/tmp/fake-project",
+        ])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("spawn");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should be empty on graceful degrade, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn cowork_drain_reads_cwd_from_stdin_json_codex_path() {
+    let tmp = TempDir::new().unwrap();
+    // HOME=tmp → mempal_home resolves to tmp/.mempal, seed inbox there.
+    let mempal_home = tmp.path().join(".mempal");
+    let repo = setup_repo(&tmp, "proj-delta");
+
+    push(
+        &mempal_home,
+        Tool::Claude,
+        Tool::Codex,
+        &repo,
+        "stdin json test".into(),
+        "2026-04-15T04:00:00Z".into(),
+    )
+    .unwrap();
+
+    let stdin_payload = format!(
+        r#"{{"session_id":"s1","turn_id":"t1","transcript_path":null,"cwd":"{}","hook_event_name":"UserPromptSubmit","model":"gpt-5-codex","permission_mode":"workspace-write","prompt":"继续"}}"#,
+        repo.display()
+    );
+
+    let mut child = Command::new(mempal_bin())
+        .args([
+            "cowork-drain",
+            "--target",
+            "codex",
+            "--format",
+            "codex-hook-json",
+            "--cwd-source",
+            "stdin-json",
+        ])
+        .env("HOME", tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout_str.contains("stdin json test"),
+        "stdout should contain seeded message, got: {stdout_str}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_str).unwrap();
+    assert_eq!(
+        parsed["hookSpecificOutput"]["hookEventName"],
+        "UserPromptSubmit"
+    );
+}
+
+#[test]
+fn cowork_drain_stdin_json_malformed_payload_graceful_degrade() {
+    let tmp = TempDir::new().unwrap();
+    let bad_inputs = [
+        "not json at all".to_string(),
+        r#"{"session_id":"s","prompt":"继续"}"#.to_string(), // missing cwd
+        r#"{"cwd":42}"#.to_string(),                          // wrong type
+    ];
+    for payload in &bad_inputs {
+        let mut child = Command::new(mempal_bin())
+            .args([
+                "cowork-drain",
+                "--target",
+                "codex",
+                "--format",
+                "codex-hook-json",
+                "--cwd-source",
+                "stdin-json",
+            ])
+            .env("HOME", tmp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "malformed payload {payload:?} must exit 0"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "stdout must be empty for malformed payload {payload:?}, got {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }
