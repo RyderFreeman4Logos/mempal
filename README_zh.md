@@ -206,6 +206,6 @@ mempal reindex
 - 设计文档：[`docs/specs/2026-04-08-mempal-design.md`](docs/specs/2026-04-08-mempal-design.md)
 - 使用指南：[`docs/usage.md`](docs/usage.md)
 - AAAK 方言：[`docs/aaak-dialect.md`](docs/aaak-dialect.md)
-- Spec 体系：[`specs/`](specs)
-- 实现计划：[`docs/plans/`](docs/plans)
+- Spec 体系（仓库内部 agent-spec 合约，GitHub 查看）：<https://github.com/ZhangHanDong/mempal/tree/main/specs>
+- 实现计划（仓库内部实现计划，GitHub 查看）：<https://github.com/ZhangHanDong/mempal/tree/main/docs/plans>
 - Benchmark：[`benchmarks/longmemeval_s_summary.md`](benchmarks/longmemeval_s_summary.md)

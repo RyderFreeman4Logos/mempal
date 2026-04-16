@@ -247,8 +247,8 @@ mempal reindex
 - Design: [`docs/specs/2026-04-08-mempal-design.md`](docs/specs/2026-04-08-mempal-design.md)
 - Usage guide: [`docs/usage.md`](docs/usage.md)
 - AAAK dialect: [`docs/aaak-dialect.md`](docs/aaak-dialect.md)
-- Specs: [`specs/`](specs)
-- Plans: [`docs/plans/`](docs/plans)
+- Specs (internal agent-spec contracts, on GitHub): <https://github.com/ZhangHanDong/mempal/tree/main/specs>
+- Plans (internal implementation plans, on GitHub): <https://github.com/ZhangHanDong/mempal/tree/main/docs/plans>
 - Benchmark: [`benchmarks/longmemeval_s_summary.md`](benchmarks/longmemeval_s_summary.md) — includes the older 384d baseline and the newer model2vec 256d run
 
 ## Book: MemPalace — Reforging Memory in Rust

@@ -11,6 +11,18 @@ rust-version = "1.85"
 readme = "README.md"
 keywords = ["memory", "mcp", "sqlite", "agents", "search"]
 categories = ["command-line-utilities", "development-tools"]
+# Keep the published crate tarball focused on runtime + downstream-facing
+# docs. Everything below is maintainer-only repo material that should never
+# ship to crates.io. See release tag notes for rationale.
+exclude = [
+    ".claude/**",     # local Claude Code config + hooks (hard blocker if shipped)
+    ".mcp.json",      # local MCP server registration for this repo
+    "AGENTS.md",      # repo-only agent working rules
+    "CLAUDE.md",      # repo-only agent working rules (same content as AGENTS.md)
+    "hooks/**",       # legacy project-level hooks; not part of mempal runtime
+    "specs/**",       # internal agent-spec Task Contracts (README links redirected to GitHub)
+    "docs/plans/**",  # internal implementation plans (README links redirected to GitHub)
+]
 
 [[bin]]
 name = "mempal"
