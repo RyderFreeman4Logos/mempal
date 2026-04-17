@@ -48,6 +48,8 @@ estimate: 1d
 - payload schema 是**宽松的**：tool_calls 字段可缺失，messages 必须有；解析失败 → `mark_failed` 走 retry
 - `metadata` 字段的**最终决策**：**不新增侧表、不 bump schema**。用 drawer content 末尾的 `\n\n--- session_metadata ---\nsession_id: X\nlinked_drawer_ids: Y, Z` 段做标记，字符串解析；后续需要 structured metadata 时再独立起 spec 升级
   - 这个段使用 sentinel `--- session_metadata ---` 作为 AAAK signal 提取器的可识别边界
+  - **解析顺序必须从 content 末尾反向查找 sentinel**（`rfind("\n\n--- session_metadata ---\n")`），不是从头扫——assistant message 正文中偶发出现该字面量也不破坏 metadata 段；解析时要求 sentinel **后紧跟** 至少一个形如 `key: value\n` 的行，否则判为正文内容。合法 metadata 段必须出现在 content 的**最后一个**分隔块位置
+  - sentinel 样例中的 `---` 数量（3 个短横线）刻意与 Markdown `hr` 区分——前后必有 `--- session_metadata ---` 带显式 tag，纯 `---` 分隔线不会被误识别
   - 本 spec **零 schema 迁移**；v8 被 `p10-project-vector-isolation.spec.md` 独占使用，本 spec 与其无 schema 冲突
 - MCP `mempal_search` 天然能召回 session-reviews wing 的 drawer（向量+FTS+RRF 不区分 wing）
 - 引入便利过滤器：未来 `mempal_search(wing_filter="session-reviews")` 可一键查 session reviews；本 spec 不实现 wing_filter，留给 P10 `p10-cli-dashboard.spec.md`

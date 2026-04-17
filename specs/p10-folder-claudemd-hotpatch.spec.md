@@ -24,7 +24,7 @@ status: optional
 - Suggestion 生成逻辑：
   1. 从 drawer payload 提取涉及的文件路径（`tool_input.file_path`、`tool_input.files[]` 等常见字段）
   2. 对每个路径，沿目录向上找第一个含 CLAUDE.md（或 AGENTS.md / GEMINI.md，按配置）的目录 `<D>`
-  3. 计算 `<D>` 的稳定 hash（SHA-256 截前 12 字符）作为 suggestion 文件名：`~/.mempal/hotpatch/CLAUDE-<hash>.md`
+  3. 先把 `<D>` 标准化为**绝对路径**（`std::fs::canonicalize(<D>)?`；解析符号链接、消除 `..` / `.` 段），再对标准化结果计算稳定 hash（SHA-256 截前 12 字符）作为 suggestion 文件名：`~/.mempal/hotpatch/CLAUDE-<hash>.md`。**未规范化直接 hash 相对路径是禁止的**——同一物理目录被不同 cwd 访问会产生不同 hash，污染建议池并让 `mempal hotpatch apply --dir <D>` 找不到对应 suggestion。若 `canonicalize` 失败（路径不存在 / 权限不足）→ fail-fast 并在 daemon log warn，**不**回退为相对路径 hash
   4. 生成 suggestion 行（可选 AAAK signal 辅助）：`- <importance_stars 星> <topic>: <一句话摘要 (≤ 80 字符)> [drawer:<id[:8]>]`
   5. append 到 suggestion 文件（去重：若同 drawer_id 已存在，skip）
 - Suggestion 文件结构：

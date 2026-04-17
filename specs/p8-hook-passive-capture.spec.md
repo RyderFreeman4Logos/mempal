@@ -35,7 +35,7 @@ estimate: 2d
      - `payload_preview` 限制 **4KB 而非 9MB** 是故意的——marker drawer 的目的是让用户知道"这里有个超大事件"而非保存其内容；更小的 preview 压缩了 secret 字面值的暴露面和存储放大
      - 截断**必须在 UTF-8 char 边界**（`str::floor_char_boundary` 或手写边界探测）；直接字节切 `&s[..4096]` 切中多字节字符会触发 `&str` slicing panic 导致 CLI 崩溃
      - 如果首 4KB 全是合法 UTF-8 但截断点落在字符中间，向前回退到最近的 char 起点
-     - `original_size_bytes` **必须等于 stdin 真实字节数**（不是 `take(10_000_001).read_to_end` 得到的 buffer 长度——那会被限幅为 10MB+1，丢失真实 N）；实现方式：从 10MB+1 位置开始继续 `read` 到小丢弃 buffer（`io::copy(&mut stdin, &mut io::sink())`-like 循环或手工 `[u8; 8192]` 轮转 buffer）并累加字节数，直到 EOF；最终 `original_size_bytes = min(preview_limit, 实际累加)` **错**——正确公式 `original_size_bytes = 真实 stdin 总字节数`，`payload_preview` 独立 4KB truncate
+     - `original_size_bytes` **限额记录而非真实读尽**：若 `take(10_000_001).read_to_end` 达到 10MB+1 上限，则**立即停止读取 stdin**（不再向 `io::sink` 排空剩余字节），`original_size_bytes = 10_000_001` 作为 `"10MB+"` 哨兵值（marker drawer 里标为 `"original_size_bytes: 10_000_001 (sentinel: >= 10MB)"`）。**禁止**为了拿到真实总长度继续 drain 剩余 stdin——恶意 agent 可以发送无限流或 1GB 数据让 hook 挂起，违反 L42 sub-50ms SLO 并阻塞主 agent；真实 N 不是必要信号，"≥10MB" 已足够触发人工审计。`payload_preview` 独立 4KB UTF-8 安全 truncate 不受影响
   3. open 或 reuse db connection
   4. `PendingMessageStore::enqueue(event_kind, payload)`
   5. flush, exit 0

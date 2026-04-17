@@ -60,7 +60,7 @@ estimate: 1.5d
 - `mempal_peek_partner` MCP 工具保留，但 CLI `mempal peek` 子命令以 human-readable 方式展示（简单 print，避免 agent 独占）——**本 spec 不新增 peek 子命令**，仅列出方向，由未来 spec 承担
 - 所有 CLI 子命令只读 palace.db（`SELECT` only），绝不写入
 - 子命令若 palace.db 不存在 → 友好错误："run mempal init first"
-- `mempal tail --follow` 默认用 `inotify` / `fsevents` 监听 db 文件变化（更高效）；不可用时 fallback poll（2s interval）
+- `mempal tail --follow` 默认用 `inotify` / `fsevents` 监听 db **所在目录**（非单文件 `palace.db`）+ 按文件名过滤 `palace.db*` 模式，捕获 `palace.db` / `palace.db-wal` / `palace.db-shm` 三种事件；理由：WAL 模式（`p8-pending-message-store.spec.md`）下写入先落到 `-wal` 文件，主 db 文件 mtime 只在 checkpoint 时更新，单文件 watch 会漏事件；此外 SQLite 原子保存可能 rename 导致 inode 变——watch 目录更鲁棒。不可用时 fallback poll（2s interval）
 - **不**启动 daemon / service；每次子命令独立进程、独立退出
 
 ## Boundaries
