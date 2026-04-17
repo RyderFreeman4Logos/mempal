@@ -27,14 +27,14 @@ estimate: 1.5d
 - **不引入任何 HTTP Server**（no axum / hyper / warp）——没有 bind 端口
 - 输出默认 ANSI-colored text；`--format json` 切 JSON lines（ndjson）；`--no-color` 禁色
 - `mempal tail`：
-  - 默认展示最近 20 条（按 `created_at DESC`）
-  - `--follow` 每 2s 轮询 `SELECT ... WHERE created_at > last_seen_ts`，append 新行
+  - 默认展示最近 20 条（按 `added_at DESC`——codebase 既有列名是 `added_at`，见 `src/core/db.rs`；本 spec 全文其他 `added_at` 字样均指此列；未来若 P9 novelty 的 `updated_at` 列存在则 `--sort-by updated_at` 可选）
+  - `--follow` 每 2s 轮询 `SELECT ... WHERE id > ?last_seen_id ORDER BY id ASC`，append 新行；**用 ULID id 而非 timestamp 做游标**，规避同毫秒内多条 insert 被漏读的竞态（ULID 是 monotonically increasing，timestamp 会 tie）
   - 每行格式 `<timestamp> <flag>  <wing>/<room>  <drawer_id[:8]>  <preview(120 chars)>`
-  - `--wing` / `--room` / `--since "7d"` 精细过滤
+  - `--wing` / `--room` / `--since "7d"` 精细过滤（`--since` 仍走 `added_at`，仅 follow 游标用 id）
   - SIGINT 优雅退出
 - `mempal timeline`：
   - 类似 `tail` 但不 follow，扫指定时间窗内所有 drawer
-  - 分组显示按天（`=== 2026-04-16 ===`），drawer 按 importance 降序 + created_at 升序
+  - 分组显示按天（`=== 2026-04-16 ===`），drawer 按 importance 降序 + added_at 升序
   - `--format json` 输出 `{timestamp, drawer_id, wing, room, importance_stars, flags, preview}` 数组
 - `mempal stats`：
   - 顶部显示 schema_version + db 大小
@@ -47,7 +47,7 @@ estimate: 1.5d
   - 向量 dim + 数量
   - `--verbose` 加时间序列（7d 逐日 ingest rate）
 - `mempal view <drawer_id>`：
-  - header 区：`drawer_id` / `wing/room` / `created_at` / `updated_at` / `merge_count` / `importance_stars` / `flags` / `entities` / `topics` / `source_file`
+  - header 区：`drawer_id` / `wing/room` / `added_at` / `updated_at` / `merge_count` / `importance_stars` / `flags` / `entities` / `topics` / `source_file`
   - body 区：`content`（默认 UTF-8 pretty print，AAAK signal 词汇高亮彩显；`--raw` 不高亮不截断）
   - 底部 hint：`linked_drawer_ids`（若 content 中含 session_metadata sentinel 段）
   - `--json` 输出结构化 JSON
@@ -103,10 +103,10 @@ Scenario: mempal tail 默认打印最近 20 条 drawer
     Filter: test_tail_default_prints_recent_20
     Level: integration
     Targets: crates/mempal-cli/src/observability/tail.rs
-  Given palace.db 中 50 条 drawer，按 created_at 分布
+  Given palace.db 中 50 条 drawer，按 added_at 分布
   When 运行 `mempal tail`
   Then stdout 含 20 行 drawer 记录
-  And 第一行是最新（按 created_at DESC）
+  And 第一行是最新（按 added_at DESC）
   And 每行含 timestamp / wing/room / drawer_id[:8] / preview
 
 Scenario: mempal tail --wing 过滤

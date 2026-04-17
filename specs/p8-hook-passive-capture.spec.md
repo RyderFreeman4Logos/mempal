@@ -24,6 +24,7 @@ estimate: 2d
 - CLI 新增子命令：
   - `mempal hook <event-type>` — 从 stdin 读 JSON，enqueue 后退出（退出码永远 0 除非 db 不可达）
   - `mempal daemon [--foreground]` — 启动 worker；默认 detach 走 `daemonize` crate（或等价专用 daemonization 库）；**禁止**在 tokio 多线程 runtime 启动后手动 `fork`——libc `fork` 在多线程 tokio 进程中高概率引起子进程 mutex 死锁或未定义行为（POSIX async-signal-safety 限制）；daemonize 必须发生在 **tokio runtime 初始化之前**；setsid + pid 文件 `~/.mempal/daemon.pid` 仍保留，由 daemonize crate 内部处理
+  - **实现约束**：`crates/mempal-cli/src/main.rs` 顶层**不可**使用 `#[tokio::main]`（该宏会在 `main` 进入前先 build 多线程 runtime，导致 daemonize 无法发生在 runtime-init 之前）。替代：`fn main() -> anyhow::Result<()>` + 在每个子命令 handler 内按需手动 `tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async { ... })`；`daemon` handler 必须在调用 `daemonize()` **之后** 才构造 runtime
   - `mempal daemon stop` — 读 pid 文件发 SIGTERM
   - `mempal daemon status` — 看 pid 文件存活 + 读 `pending_messages` stats 报告
   - `mempal hook install --target <T> [--dry-run]` — 写对应工具的 settings 文件注入 hook 配置
@@ -34,6 +35,7 @@ estimate: 2d
      - `payload_preview` 限制 **4KB 而非 9MB** 是故意的——marker drawer 的目的是让用户知道"这里有个超大事件"而非保存其内容；更小的 preview 压缩了 secret 字面值的暴露面和存储放大
      - 截断**必须在 UTF-8 char 边界**（`str::floor_char_boundary` 或手写边界探测）；直接字节切 `&s[..4096]` 切中多字节字符会触发 `&str` slicing panic 导致 CLI 崩溃
      - 如果首 4KB 全是合法 UTF-8 但截断点落在字符中间，向前回退到最近的 char 起点
+     - `original_size_bytes` **必须等于 stdin 真实字节数**（不是 `take(10_000_001).read_to_end` 得到的 buffer 长度——那会被限幅为 10MB+1，丢失真实 N）；实现方式：从 10MB+1 位置开始继续 `read` 到小丢弃 buffer（`io::copy(&mut stdin, &mut io::sink())`-like 循环或手工 `[u8; 8192]` 轮转 buffer）并累加字节数，直到 EOF；最终 `original_size_bytes = min(preview_limit, 实际累加)` **错**——正确公式 `original_size_bytes = 真实 stdin 总字节数`，`payload_preview` 独立 4KB truncate
   3. open 或 reuse db connection
   4. `PendingMessageStore::enqueue(event_kind, payload)`
   5. flush, exit 0

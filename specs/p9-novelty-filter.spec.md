@@ -45,8 +45,9 @@ estimate: 1d
 - 去重触发后 write 到 `novelty_audit` 表（schema v7 新增）：`{ id, candidate_hash, decision, near_drawer_id, cosine, created_at }`，`mempal status` 汇总
 - 对 `mempal_ingest` MCP 工具调用方：返回 response metadata 含 `novelty_decision: "inserted" | "merged" | "dropped"`, `near_drawer_id`（如适用）；content 语义保持 raw，不影响字段形态
 - schema v6 → v7 bump：
-  - `drawers` 表加 `merge_count INTEGER NOT NULL DEFAULT 0`
+  - `drawers` 表加 `merge_count INTEGER NOT NULL DEFAULT 0` 和 `updated_at TEXT`（NULLABLE；仅 merge 发生时写入，未 merge 的 drawer 保持 NULL 以显式区分 added_at vs 后续变动）
   - 新建 `novelty_audit` 表
+  - 注意：codebase 既有列名为 `added_at`（见 `src/core/db.rs`），**不是** `created_at`；novelty merge 场景新增的列名为 `updated_at` 以明确语义（last_merge_at 的意味），不重命名 `added_at`
 - 错误处理：novelty filter 失败（embedder/db 错误）→ fail-open，当作 `Insert`
 - cosine 实现：纯 Rust f32 点积 / norm 乘积，不引入新依赖
 - 对 `IngestCandidate` 结构和 `Embedder` trait 无变更

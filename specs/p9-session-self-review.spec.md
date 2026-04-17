@@ -46,9 +46,9 @@ estimate: 1d
   wing = "session-reviews"     # 存储 wing（可覆盖）
   ```
 - payload schema 是**宽松的**：tool_calls 字段可缺失，messages 必须有；解析失败 → `mark_failed` 走 retry
-- `metadata` 字段——mempal drawer 如果没有专门 JSON metadata 列，用 `source_file` 走 ULID 前缀 + 侧表 `drawer_metadata (drawer_id, key, value)`（schema v7 → v8）
-  - **简化决策**：不新增侧表。用 drawer content 末尾的 `\n\n--- session_metadata ---\nsession_id: X\nlinked_drawer_ids: Y, Z` 段做标记，字符串解析；后续需要 structured metadata 时再升级
+- `metadata` 字段的**最终决策**：**不新增侧表、不 bump schema**。用 drawer content 末尾的 `\n\n--- session_metadata ---\nsession_id: X\nlinked_drawer_ids: Y, Z` 段做标记，字符串解析；后续需要 structured metadata 时再独立起 spec 升级
   - 这个段使用 sentinel `--- session_metadata ---` 作为 AAAK signal 提取器的可识别边界
+  - 本 spec **零 schema 迁移**；v8 被 `p10-project-vector-isolation.spec.md` 独占使用，本 spec 与其无 schema 冲突
 - MCP `mempal_search` 天然能召回 session-reviews wing 的 drawer（向量+FTS+RRF 不区分 wing）
 - 引入便利过滤器：未来 `mempal_search(wing_filter="session-reviews")` 可一键查 session reviews；本 spec 不实现 wing_filter，留给 P10 `p10-cli-dashboard.spec.md`
 - 生成 self-review 的失败（payload 格式错 / 无 assistant message）不阻塞其他 hook 处理——handler 返回 error，daemon `mark_failed` retry
