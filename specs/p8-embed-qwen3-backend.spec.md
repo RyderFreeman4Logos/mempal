@@ -115,7 +115,7 @@ estimate: 2d
   - `mempal_ingest`、`mempal_kg` action=add|invalidate、`mempal_tunnels` action=add|invalidate
   - 直接返回 MCP error：
     ```
-    { code: -32000, message: "mempal embed backend degraded (N failures since T).
+    { code: -32000, message: "mempal embed backend degraded (N failures since last success at T).
       Writes are paused to preserve data integrity. Please pause your write
       workflow until recovery. Read operations (search, peek, status) remain
       available with BM25-only fallback." }

@@ -13,7 +13,7 @@ estimate: 1.5d
 2. `mempal timeline [--wing <W>] [--since <dur>] [--format text|json]` — 按时间线展开 drawer 摘要视图
 3. `mempal stats [--verbose]` — 一屏面板：总 drawer / 按 wing 分组 / 向量维度 / 队列 stats / gating 命中 / novelty 去重 / FTS 大小 / 最近 24h 增长
 4. `mempal view <drawer_id> [--raw]` — 打印单 drawer 完整信息，默认带 AAAK signal 高亮；`--raw` 纯原文
-5. `mempal audit [--kind novelty|gating|privacy] [--since <dur>]` — 查 gating_audit、novelty_audit、scrub 命中历史
+5. `mempal audit [--kind novelty|gating] [--since <dur>]` — 查 gating_audit、novelty_audit 命中历史（privacy 累计汇总见 `mempal stats`，不作为 `--kind`——Decisions L54-58 解释了数据源缺失的理由）
 
 **动机**：claude-mem `src/ui/viewer/` 的 React + SSE Dashboard 对人类审计 auto-capture 效果极好，但硬依赖 HTTP Server + 前端构建链。mempal 坚守纯 CLI 单二进制哲学，用子命令覆盖相同审计场景——零 HTTP 端口、零前端资产、零构建链膨胀。
 
