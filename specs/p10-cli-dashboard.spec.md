@@ -52,10 +52,11 @@ estimate: 1.5d
   - 底部 hint：`linked_drawer_ids`（若 content 中含 session_metadata sentinel 段）
   - `--json` 输出结构化 JSON
 - `mempal audit`：
-  - `--kind novelty` 读 `novelty_audit` 表最近 `--since` 时长
-  - `--kind gating` 读 `gating_audit`
-  - `--kind privacy` 读 `mempal status` 的 scrub 计数历史（P8 已累计）
-  - 默认 kind = all，三类分段输出
+  - `--kind novelty` 读 `novelty_audit` 表最近 `--since` 时长（数据源：P9 novelty filter 产生的 per-event 审计表）
+  - `--kind gating` 读 `gating_audit`（数据源：P9 gating 产生的 per-event 审计表）
+  - **不**提供 `--kind privacy`：P8 `p8-privacy-scrubbing.spec.md` 仅存累计 `ScrubStats`（per-pattern 计数）且显式把独立审计表列为 out-of-scope（L61-64）；P10 又禁止改 schema。两者相互锁定使时间窗 privacy 审计无合法数据源。若未来需要 privacy 时间窗审计，需独立 spec（如 `p11-privacy-event-log`）扩 schema 加 `privacy_scrub_events` 表
+  - 默认 kind = all，两类分段输出（novelty + gating）
+  - privacy 命中的累计汇总通过 `mempal stats` 输出（见 L45 `privacy scrub stats（按 pattern 7d 命中）`）
 - `mempal_peek_partner` MCP 工具保留，但 CLI `mempal peek` 子命令以 human-readable 方式展示（简单 print，避免 agent 独占）——**本 spec 不新增 peek 子命令**，仅列出方向，由未来 spec 承担
 - 所有 CLI 子命令只读 palace.db（`SELECT` only），绝不写入
 - 子命令若 palace.db 不存在 → 友好错误："run mempal init first"

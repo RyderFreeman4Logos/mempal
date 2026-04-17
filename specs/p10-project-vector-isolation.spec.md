@@ -21,12 +21,14 @@ estimate: 1d
   - `triples` 表加 `project_id TEXT`（未来 KG 隔离用，本 spec 不用）
 - `project_id` 识别：
   - CLI: `mempal ingest ... --project <id>`；默认从 `git rev-parse --show-toplevel` basename 推断（`mempal-dev` → `"mempal"`），或配置 `[project] id = "..."`
-  - MCP: `mempal_ingest` / `mempal_search` input schema 加可选 `project_id` 字段；未提供时从 `[project]` config 回退
+  - MCP: `mempal_ingest` / `mempal_search` input schema 加可选 `project_id` 字段；`mempal_search` 额外加可选 `include_global: bool`（默认 `false`）；未提供 `project_id` 时从 `[project]` config 回退
   - `mempal-hook` / `daemon`: 从 payload `workspace_path` 或 env（`MEMPAL_PROJECT_ID`）推断
 - Search filter 语义：
-  - `mempal_search(project_id: Some("X"))` → 只返回 `drawers.project_id == "X" OR drawers.project_id IS NULL` 的结果（NULL 代表"跨项目记忆"，不被隔离）
-  - `mempal_search(project_id: None)` → 全库搜（向下兼容）
+  - `mempal_search(project_id: Some("X"), include_global: false)` → **硬过滤**：只返回 `drawers.project_id == "X"` 的结果（default；与 Intent "硬隔离" 对齐，彻底消除 NULL 记录在 top-k 的 crowd-out）
+  - `mempal_search(project_id: Some("X"), include_global: true)` → 返回 `drawers.project_id == "X" OR drawers.project_id IS NULL`，并在结果 DTO 标 `source: "project" | "global"` 让调用方看清命中来源（透明 opt-in，不是默认 soft pass-through）
+  - `mempal_search(project_id: None)` → 全库搜（向下兼容），结果同样带 `source` 标记（避免调用方无法判别命中来自哪项目）
   - 新配置 `[search] strict_project_isolation = false`；`true` 时 `project_id: None` 也只返回 `IS NULL` 记录，禁止跨项目
+  - `include_global` 默认 `false` 是 Intent "硬隔离" 的正确默认值——默认放行 NULL 会让既有 palace.db（migration 后所有记录 `project_id=NULL`）继续污染每一次 project-filtered 查询，crowd-out 不会真正消除
 - BM25 (FTS5) 侧过滤：
   - FTS5 contentless table 无法直接 join —— 用 `drawers` 外部表 JOIN FTS5 的 rowid，JOIN 条件加 `project_id`
   - 或预先查出 `project_id=X` 的 drawer id 列表，传给 FTS5 查询做 `rowid IN (...)` 子句（性能在数千 drawer 规模 OK）
@@ -63,7 +65,7 @@ estimate: 1d
 - 不要在 `mempal_peek_partner` 加 project filter（跨项目协同是其本义）
 - 不要让 project_id 参与 AAAK 编码
 - 不要改 RRF 权重策略（仅改候选集合过滤，不改排序公式）
-- 不要在 search 结果 DTO 里 expose `project_id`——隔离是内部机制，不增加 response 体积
+- 不要在 search 结果 DTO 里 expose 其他项目的 `project_id` 字符串（避免跨项目侧漏）；允许返回 `source: "project" | "global"` 二值标记——用户隐式知道自己查的是哪个项目，不需暴露具体 id 字符串，但需要知道命中来自本项目还是跨项目共享记忆
 
 ## Out of Scope
 
@@ -100,15 +102,27 @@ Scenario: ingest 带 --project 时 project_id 被持久化
   Then `drawers` 新增行 `project_id == "proj-A"`
   And `drawer_vectors` 对应行 `project_id == "proj-A"`
 
-Scenario: search with project_id 仅返回同项目 drawer + NULL drawer
+Scenario: search with project_id 硬过滤（默认 include_global=false）只返回同项目 drawer
   Test:
-    Filter: test_search_filters_by_project_id
+    Filter: test_search_hard_filters_by_project_id
     Level: integration
     Targets: crates/mempal-search/src/hybrid.rs
   Given drawer A.project_id="proj-A"、B.project_id="proj-B"、C.project_id=NULL（全部含 query 词）
-  When 调 `mempal_search({query: "foo", project_id: "proj-A"})`
+  When 调 `mempal_search({query: "foo", project_id: "proj-A"})`（include_global 未传，默认 false）
+  Then 返回结果仅含 A
+  And 不含 B、不含 C
+  And 每条结果 DTO `source == "project"`
+
+Scenario: search with project_id + include_global=true 返回同项目 + NULL 并标 source
+  Test:
+    Filter: test_search_include_global_returns_project_and_null
+    Level: integration
+    Targets: crates/mempal-search/src/hybrid.rs
+  Given drawer A.project_id="proj-A"、B.project_id="proj-B"、C.project_id=NULL（全部含 query 词）
+  When 调 `mempal_search({query: "foo", project_id: "proj-A", include_global: true})`
   Then 返回结果含 A 和 C
   And 不含 B
+  And A 的 DTO `source == "project"`，C 的 DTO `source == "global"`
 
 Scenario: search without project_id 默认全库（非严格模式）
   Test:
@@ -139,7 +153,7 @@ Scenario: 大项目不挤占小项目召回槽位
   Given proj-A 含 "1000" 条 drawer（高噪音），proj-B 含 "5" 条 drawer（含 query 精确匹配）
   When 调 `mempal_search({query: "精确匹配词", project_id: "proj-B", top_k: 5})`
   Then 返回结果长度 <= 5
-  And 所有结果 `project_id == "proj-B" OR IS NULL`
+  And 所有结果 `project_id == "proj-B"`（默认硬过滤，NULL 记录不参与）
   And 若 proj-B 中有精确匹配 drawer，其排名 <= 2（即高排位被保护）
 
 Scenario: project_id 从 git repo 自动推断

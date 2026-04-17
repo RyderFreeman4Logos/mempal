@@ -30,7 +30,7 @@ estimate: 2d
 - Hook payload 格式：透传 agent 发来的 raw JSON，不做 schema 约束（容错优先）；`kind` 字段映射为 queue 的 `kind` 列（`hook_session_start`, `hook_pre_tool`, `hook_post_tool`, `hook_user_prompt`, `hook_session_end`）
 - `mempal hook` 执行路径：
   1. parse CLI args 得到 `event_type`
-  2. `read_to_string(stdin)` 得 payload（最多 10MB，超过截断并记 warn）
+  2. `read_to_string(stdin)` 得 payload（最多 10MB）；**超过时不截断原 JSON**（截断几乎必产非法 JSON，毒消息进队列后每次 handler 解析都失败、走 `mark_failed` 走指数退避无限重试）。改为 envelope-wrap 成始终合法的 JSON：`{"_truncated": true, "event_type": "<kind>", "original_size_bytes": N, "payload_preview": "<首 9MB of stdin>"}` 再 enqueue；stderr 记 warn
   3. open 或 reuse db connection
   4. `PendingMessageStore::enqueue(event_kind, payload)`
   5. flush, exit 0
@@ -47,6 +47,7 @@ estimate: 2d
   - `hook_user_prompt` → drawer（wing=`hooks-raw`，room=`user-prompt`）
   - `hook_session_start` / `hook_session_end` → drawer（wing=`hooks-raw`，room=`session-lifecycle`）
   - **不**处理 `hook_pre_tool`（仅 audit 无新信息，skip）
+  - **truncated envelope**（`_truncated: true`）→ 直接落 warn 日志 + 产出 drawer（wing=`hooks-raw`，room=`truncated`），content 放 envelope JSON 原文，**不**尝试解析 `payload` 字段，立即 `confirm`（不走 `mark_failed` → 不进重试循环）
 - 所有 handler 都走完整 ingest 管道，自动应用 P8 privacy scrub；gating（P9）未到时自动禁用
 - `mempal hook install --target claude-code` 写入 `~/.claude/settings.json` 的 `hooks` key：
   ```json
@@ -201,16 +202,30 @@ Scenario: daemon SIGTERM 优雅退出
   And `~/.mempal/daemon.pid` 被清理
   And 无任何 pending_messages 卡在 `claimed` 状态（都 confirm 或回退到 pending）
 
-Scenario: mempal hook 对 >10MB payload 截断并 warn
+Scenario: mempal hook 对 >10MB payload envelope-wrap 而非截断原 JSON
   Test:
-    Filter: test_hook_truncates_oversized_payload
+    Filter: test_hook_envelopes_oversized_payload
     Level: integration
     Targets: crates/mempal-cli/src/hook.rs
   Given stdin 输入 11MB JSON payload
   When 执行 `mempal hook hook_post_tool`
   Then 命令仍退出码 "0"
-  And stderr 含 "payload truncated" 或等价 warning
-  And 队列中该消息 payload 长度 <= 10MB + 元数据开销
+  And stderr 含 "payload envelope-wrapped" 或等价 warning
+  And 队列中该消息 payload 是合法 JSON（`serde_json::from_str::<Value>` 成功）
+  And 解析后的 JSON 含 `_truncated == true`、`original_size_bytes > 10_000_000`、`payload_preview` 三字段
+  And `payload_preview` 长度 <= 9MB
+  And 队列中**不存在**任何无法被 `serde_json` 解析的 payload
+
+Scenario: daemon 处理 truncated envelope 时产出 marker drawer，不进入重试循环
+  Test:
+    Filter: test_daemon_handles_truncated_envelope_without_retry
+    Level: integration
+    Targets: crates/mempal-cli/src/daemon.rs
+  Given 队列 1 条消息 payload == `{"_truncated": true, "event_type": "hook_post_tool", "original_size_bytes": 20000000, "payload_preview": "..."}`
+  When 启动 `mempal daemon --foreground` 并等 5s
+  Then `drawers` 表新增 1 行，`wing == "hooks-raw"`，`room == "truncated"`
+  And 该 drawer `content` 含 `"_truncated": true` 标记
+  And `pending_messages` 表该行不存在（走 confirm，不走 `mark_failed`，retry_count 未递增）
 
 Scenario: hook 子命令不污染 stdout
   Test:

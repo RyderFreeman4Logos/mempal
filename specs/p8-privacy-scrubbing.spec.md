@@ -21,7 +21,7 @@ estimate: 1d
 - 新建 `crates/mempal-ingest/src/privacy.rs` 模块，暴露 `fn scrub(text: &str, cfg: &PrivacyConfig) -> (String, ScrubStats)`
 - `PrivacyConfig` 含 `enabled: bool`、`strip_tags: Vec<String>`、`scrub_patterns: Vec<ScrubPattern>`
 - `ScrubPattern { name: String, pattern: String, replacement: String }`，`pattern` 在 config 加载时编译成 `regex::Regex`，编译失败 fail-fast
-- 清洗发生在 `ingest::pipeline` 的 format-detect 和 chunking **之后**、embedding/FTS/drawer 插入**之前**（order 很重要：chunking 才能正确切分段落，但 embedding 必须接收已清洗的文本）
+- 清洗发生在 `ingest::pipeline` 的 format-detect / 归一化**之后**、chunking **之前**（order 很重要：必须在完整归一化文本上先 scrub，chunking 之后再 scrub 会让跨 chunk 边界的 secret / `<private>` 标签漏网——单 chunk 内 regex 匹配不到整条凭证或跨段标签。scrubbing 以 `[REDACTED:<kind>]` 替换并不破坏 chunking 段落结构）
 - 内置默认 pattern 库（all opt-in）：`openai_key` (`sk-[A-Za-z0-9]{32,}`)、`aws_access` (`AKIA[0-9A-Z]{16}`)、`bearer_token` (`Bearer\s+[A-Za-z0-9\-_\.]{20,}`)、`hex_token` (`\b[a-f0-9]{32,}\b`)、`anthropic_key` (`sk-ant-[A-Za-z0-9_\-]{64,}`)
 - `strip_tags` 默认 `["private"]`，匹配 `<private>...</private>`（greedy single-line + multi-line，flags `(?s)`）
 - 清洗统计（命中 pattern 名称 + 计数）挂到返回值，由 `mempal_ingest` handler 和 CLI 汇总到 `mempal status` 输出

@@ -41,7 +41,7 @@ estimate: 2d
   - `reclaim_stale(older_than_secs: i64) -> Result<u64>` 把 `claimed` 但 `claimed_at < now - older_than_secs` 的消息回滚到 `pending`（进程崩溃恢复）
 - 指数退避公式：`backoff(n) = min(base_delay_secs * 2^n, max_delay_secs)`，默认 `base=5`, `max=3600`, `max_retries=10`
 - Claim atomicity：用单一 `UPDATE ... WHERE id = (SELECT id FROM ... ORDER BY next_attempt_at LIMIT 1) RETURNING *` 或等价 txn 保证无两 worker 抢同一消息
-- SQLite 必须在 WAL 模式（`PRAGMA journal_mode=WAL`）——这是 `mempal-core` 已有的 db init 行为，此 spec 复用
+- SQLite 必须在 WAL 模式（`PRAGMA journal_mode=WAL`）。**事实核查**：截至 P7，`crates/mempal-core/src/db.rs` 的 `Database::open` 仅设 `PRAGMA foreign_keys=ON`，**未**启用 WAL。本 spec 同时在 `Database::open` 初始化路径追加 `PRAGMA journal_mode=WAL` 和 `PRAGMA synchronous=NORMAL`（后者是 WAL 下的推荐性能档：崩溃保 WAL 不保最后一次 commit 到磁盘，写入并发显著提升）；不追加 WAL 就谈不上队列无锁竞争
 - `rusqlite` 作为同步接口，但队列操作包在 `tokio::task::spawn_blocking` 内给异步调用方；不引入 `sqlx`
 - 启动时调一次 `reclaim_stale(claim_ttl_secs)` 自动恢复上次崩溃的 claimed 消息
 - 队列 stats 通过 `stats() -> QueueStats { pending, claimed, failed, oldest_pending_age_secs }` 暴露给 `mempal status`
@@ -56,7 +56,7 @@ estimate: 2d
 - `crates/mempal-core/src/queue.rs`（新建）
 - `crates/mempal-core/src/lib.rs`（`pub mod queue` + re-export）
 - `crates/mempal-core/src/db/schema.rs` 或等价（migration v4 → v5 + `pending_messages` DDL）
-- `crates/mempal-core/src/db/mod.rs`（启动时调 `reclaim_stale`）
+- `crates/mempal-core/src/db.rs` 或 `db/mod.rs`（`Database::open` 追加 `PRAGMA journal_mode=WAL` + `PRAGMA synchronous=NORMAL`；启动时调 `reclaim_stale`）
 - `crates/mempal-core/Cargo.toml`（添加 `thiserror`、`ulid` workspace dep，若尚未有）
 - `crates/mempal-cli/src/main.rs`（`mempal status` 加队列 stats 行）
 - `tests/queue_crash_safety.rs`（新建集成测试文件）
