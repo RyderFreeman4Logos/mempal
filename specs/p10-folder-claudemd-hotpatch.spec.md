@@ -85,7 +85,7 @@ status: optional
 - 不要给 apply 后的 CLAUDE.md 加 mempal 专有 metadata 头——保持干净
 - 不要把 suggestion 自动 propagate 到 parent 目录的 CLAUDE.md（只关注 nearest ancestor）
 - **不要违反 rule 034（claude-md-compactness）**：apply 时若待追加条目会让 CLAUDE.md 单段超过合理篇幅（> ~10 行），**必须**拒绝合并并在 stderr 报错，提示用户走 rule 034 的 `.agents/project-rules-ref/` 分拆路径；hotpatch 不得把长文一次性塞进 CLAUDE.md
-- **不要违反 rule 036（no-commit-ai-config）**：若目标 CLAUDE.md 路径命中 `~/.gitignore_noai`（通过读文件列表判断）或是 symlink 指向 `drafts/` / 其他受保护路径，apply 操作**必须**定位到 symlink target 的真实路径去写（不得把 symlink 替换为 regular file），并且 stderr 提示用户这是 `drafts/` 路径的真实写入
+- **不要违反 rule 036（no-commit-ai-config）**：若目标 CLAUDE.md 路径命中 `~/.gitignore_noai`（通过读文件列表判断）或是 symlink 指向 `drafts/` / 其他受保护路径，apply 操作**必须**定位到 symlink target 的真实路径去写（不得把 symlink 替换为 regular file）；**安全要求**：写入 symlink 解析后的真实路径前，必须 `std::fs::canonicalize` 该路径并校验其落在 **白名单前缀**内（从 `[hotpatch] allowed_target_prefixes` 读取，默认含当前 workspace 根 + `$HOME/drafts/` + `$HOME/s/llm/` 等用户显式列出的 AI-config 目录）；若解析后路径逃出白名单 → fail-fast 拒绝写入并报错（防止恶意或误构造的 symlink 被利用成任意文件写入攻击面）；stderr 提示用户这是 symlink target 的真实路径写入
 
 ## Out of Scope
 

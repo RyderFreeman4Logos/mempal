@@ -129,7 +129,7 @@ estimate: 2d
 
 ### 配置热重载
 
-- `mempal daemon` 启动时 `notify::RecommendedWatcher` watch `~/.mempal/config.toml`
+- `mempal daemon` 启动时 `notify::RecommendedWatcher` watch `~/.mempal/` **目录**并在 event handler 里 filter `event.paths` 是否等于 `~/.mempal/config.toml`——不能直接 watch 单文件，因为许多编辑器走 atomic save（写新文件 + rename 覆盖），inode 变化让文件级 watcher 失联（macOS `FSEvents`、Linux `inotify IN_MOVE_SELF` 表现各异，目录级 watch 是跨平台稳妥选）
 - 变化事件 debounce 500ms 后 re-parse 整个 config
 - **只** apply 以下 section 的热重载变化：
   - `[embed.retry]`

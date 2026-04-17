@@ -36,6 +36,7 @@ estimate: 1d
 - 查询策略：用 candidate embedding 做 `sqlite-vec` 的 top-k vector search，限定 `wing`（依 `wing_scope`）；对返回的 k 个结果取 cosine max
 - Merge 实现：
   - 既有 drawer `content` 末尾追加分隔符 `\n---\nSUPPLEMENTARY ({timestamp}):\n` + candidate content
+  - **硬上限防无界增长**：配置 `[novelty] max_merges_per_drawer`（默认 10）和 `max_content_bytes_per_drawer`（默认 65536 ≈ 64KB，LLM context 友好）；任一上限触发（`merge_count >= max_merges_per_drawer` 或 `len(merged_content) > max_content_bytes_per_drawer`）→ 该次去判决**降级为 Insert**（新建 drawer），不再继续往旧 drawer append；`novelty_audit` 写入 decision=`"insert_due_to_merge_cap"` 便于审计
   - `updated_at = now()`
   - `merge_count` 列 +1（schema v7 新增）
   - **重新计算** embedding（合并后内容变化，旧 embedding 不再准确）：embed new `content`，UPDATE `drawer_vectors`

@@ -23,14 +23,14 @@ estimate: 2d
 - 或者作为 `crates/mempal-cli` 的子模块 `src/hook.rs`——**本 spec 选后者**，理由：避免分裂二进制，维持 `cargo install mempal` 单入口；如果未来需要独立 `mempal-hook` 二进制再拆
 - CLI 新增子命令：
   - `mempal hook <event-type>` — 从 stdin 读 JSON，enqueue 后退出（退出码永远 0 除非 db 不可达）
-  - `mempal daemon [--foreground]` — 启动 worker；默认 detach（fork + setsid + 写 pid 到 `~/.mempal/daemon.pid`）
+  - `mempal daemon [--foreground]` — 启动 worker；默认 detach 走 `daemonize` crate（或等价专用 daemonization 库）；**禁止**在 tokio 多线程 runtime 启动后手动 `fork`——libc `fork` 在多线程 tokio 进程中高概率引起子进程 mutex 死锁或未定义行为（POSIX async-signal-safety 限制）；daemonize 必须发生在 **tokio runtime 初始化之前**；setsid + pid 文件 `~/.mempal/daemon.pid` 仍保留，由 daemonize crate 内部处理
   - `mempal daemon stop` — 读 pid 文件发 SIGTERM
   - `mempal daemon status` — 看 pid 文件存活 + 读 `pending_messages` stats 报告
   - `mempal hook install --target <T> [--dry-run]` — 写对应工具的 settings 文件注入 hook 配置
 - Hook payload 格式：透传 agent 发来的 raw JSON，不做 schema 约束（容错优先）；`kind` 字段映射为 queue 的 `kind` 列（`hook_session_start`, `hook_pre_tool`, `hook_post_tool`, `hook_user_prompt`, `hook_session_end`）
 - `mempal hook` 执行路径：
   1. parse CLI args 得到 `event_type`
-  2. `read_to_string(stdin)` 得 payload（最多 10MB）；**超过时不截断原 JSON**（截断几乎必产非法 JSON，毒消息进队列后每次 handler 解析都失败、走 `mark_failed` 走指数退避无限重试）。改为 envelope-wrap 成始终合法的 JSON：`{"_truncated": true, "event_type": "<kind>", "original_size_bytes": N, "payload_preview": "<首 4KB of stdin>"}` 再 enqueue；stderr 记 warn。**约束**：
+  2. 用 `stdin.take(10_000_001).read_to_end(&mut buf)` 限额读 stdin 到 byte 缓冲（**不得用 `read_to_string`**——`read_to_string` 无 pre-emptive 上限带 DoS/OOM 风险，且遇到 binary tool output 的非法 UTF-8 字节会直接 fail）；然后用 `String::from_utf8_lossy(&buf)` 转 `Cow<str>`（非法 UTF-8 替换为 U+FFFD，不 fail）；若 `buf.len() > 10_000_000`，走 envelope-wrap（**不截断原 JSON**——截断几乎必产非法 JSON，毒消息进队列后每次 handler 解析都失败、走 `mark_failed` 走指数退避无限重试）：envelope 为始终合法的 JSON `{"_truncated": true, "event_type": "<kind>", "original_size_bytes": N, "payload_preview": "<首 4KB of stdin>"}` 再 enqueue；stderr 记 warn。**约束**：
      - `payload_preview` 限制 **4KB 而非 9MB** 是故意的——marker drawer 的目的是让用户知道"这里有个超大事件"而非保存其内容；更小的 preview 压缩了 secret 字面值的暴露面和存储放大
      - 截断**必须在 UTF-8 char 边界**（`str::floor_char_boundary` 或手写边界探测）；直接字节切 `&s[..4096]` 切中多字节字符会触发 `&str` slicing panic 导致 CLI 崩溃
      - 如果首 4KB 全是合法 UTF-8 但截断点落在字符中间，向前回退到最近的 char 起点

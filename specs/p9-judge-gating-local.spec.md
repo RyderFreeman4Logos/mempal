@@ -45,7 +45,7 @@ estimate: 2d
   - max >= threshold → `Keep { tier: 2, label }`
   - max < threshold → `Skip { tier: 2, reason: "below_threshold" }`
 - 内置默认 prototypes（用户可覆盖）：`architectural-decision`, `bug-discovery`, `user-preference`, `experiment-result`, `anti-pattern`, `user-correction`, `library-pick`
-- 向量 dim 必须和 embedder 输出 dim 一致，编译时 check
+- 向量 dim 必须和 embedder 输出 dim 一致——由于 embedder 及其 dim 是 runtime 经 `config.toml` 配置，**编译期无从静态断言**；改为 prototypes 初始化阶段 runtime check：`assert_eq!(prototype_vector.len(), embedder.dim())`；不一致 fail-fast（`GatingError::DimMismatch`），拒绝进入 gating 路径并提示用户切后端后跑 `mempal reindex`
 - Gating stats：`GatingStats { tier1_kept, tier1_skipped, tier2_kept, tier2_skipped, unclassified }`，暴露到 `mempal status` 和新 CLI `mempal gating stats [--since <duration>]`
 - Gating 决策写入 `gating_audit` 表（`id`, `candidate_hash`, `decision`, `tier`, `label`, `created_at`, `retained_until` 默认 7d 滚动清理）供 `mempal gating stats` 查询
 - schema bump v5 → v6（新增 `gating_audit` 表）
