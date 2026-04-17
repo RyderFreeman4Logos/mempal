@@ -26,7 +26,14 @@ impl Tool {
     pub fn from_str_ci(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "claude_code" => Some(Tool::Claude),
-            "codex" | "codex-cli" | "codex_cli" | "codex-tui" => Some(Tool::Codex),
+            // `codex-mcp-client` is what `codex-rs/codex-mcp/src/mcp_connection_manager.rs:1458`
+            // sends as `ClientInfo.name` on the MCP `initialize` handshake — the string
+            // every mempal MCP server actually observes when Codex connects. Before it was
+            // recognized here, `mempal_cowork_push` rejected every push originating from
+            // Codex with "cannot infer caller tool" even when `target_tool` was explicit.
+            "codex" | "codex-cli" | "codex_cli" | "codex-tui" | "codex-mcp-client" => {
+                Some(Tool::Codex)
+            }
             "auto" => Some(Tool::Auto),
             _ => None,
         }
@@ -391,6 +398,27 @@ mod tests {
         assert_eq!(Tool::from_str_ci("claude-code"), Some(Tool::Claude));
         assert_eq!(Tool::from_str_ci("codex-cli"), Some(Tool::Codex));
         assert_eq!(Tool::from_str_ci("codex-tui"), Some(Tool::Codex));
+    }
+
+    #[test]
+    fn tool_recognizes_codex_mcp_client_identity() {
+        // 0.3.1 bug fix: `codex-rs/codex-mcp/src/mcp_connection_manager.rs:1458`
+        // sends `ClientInfo.name = "codex-mcp-client"` on MCP initialize. Before
+        // 0.3.1 this string was not in the recognized list, so mempal_cowork_push
+        // rejected every Codex push with "cannot infer caller tool" even when the
+        // target_tool parameter was explicit. Observed live in the Codex ↔ Claude
+        // Code cowork E2E and cross-referenced against the upstream source.
+        assert_eq!(
+            Tool::from_str_ci("codex-mcp-client"),
+            Some(Tool::Codex),
+            "canonical ClientInfo.name from codex-mcp-client"
+        );
+
+        // Case-insensitive: `from_str_ci` lower-cases before matching, so any
+        // capitalization variant Codex or a downstream fork might emit is
+        // accepted without another patch.
+        assert_eq!(Tool::from_str_ci("Codex-MCP-Client"), Some(Tool::Codex));
+        assert_eq!(Tool::from_str_ci("CODEX-MCP-CLIENT"), Some(Tool::Codex));
     }
 
     #[test]
