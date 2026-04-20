@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::core::{
+    config::ConfigHandle,
     db::Database,
     types::{Drawer, SourceType, Triple},
     utils::{build_drawer_id, build_triple_id, current_timestamp, source_file_or_synthetic},
@@ -73,7 +74,8 @@ impl MempalMcpServer {
         name = "mempal_status",
         description = "Return schema version, drawer counts, taxonomy counts, database size, scope breakdown, the AAAK format spec, and the memory protocol. Call once at session start if you haven't seen the protocol yet."
     )]
-    async fn mempal_status(&self) -> std::result::Result<Json<StatusResponse>, ErrorData> {
+    pub async fn mempal_status(&self) -> std::result::Result<Json<StatusResponse>, ErrorData> {
+        let cfg_meta = ConfigHandle::snapshot_meta();
         let db = self.open_db()?;
         let schema_version = db.schema_version().map_err(db_error)?;
         let drawer_count = db.drawer_count().map_err(db_error)?;
@@ -95,6 +97,8 @@ impl MempalMcpServer {
             drawer_count,
             taxonomy_count,
             db_size_bytes,
+            config_version: cfg_meta.version,
+            config_loaded_at_unix_ms: cfg_meta.loaded_at_unix_ms,
             scopes,
             aaak_spec: crate::aaak::generate_spec(),
             memory_protocol: crate::core::protocol::MEMORY_PROTOCOL.to_string(),
@@ -105,10 +109,11 @@ impl MempalMcpServer {
         name = "mempal_search",
         description = "Search persistent project memory via vector embedding with optional wing/room filters. PREFER THIS over grepping files or guessing from general knowledge when answering ANY project-specific question — past decisions, design rationale, implementation details, bug history, how a component works, why something was built a certain way, or any other project knowledge. Every result includes drawer_id and source_file for citation, plus structured AAAK-derived signals (`entities`, `topics`, `flags`, `emotions`, `importance_stars`) for filtering and ranking."
     )]
-    async fn mempal_search(
+    pub async fn mempal_search(
         &self,
         Parameters(request): Parameters<SearchRequest>,
     ) -> std::result::Result<Json<SearchResponse>, ErrorData> {
+        let _cfg = ConfigHandle::current();
         let embedder = self.embedder_factory.build().await.map_err(|error| {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
         })?;
@@ -148,12 +153,14 @@ impl MempalMcpServer {
         name = "mempal_ingest",
         description = "Persist a decision, bug fix, or design insight to project memory. Call this when a decision is reached in conversation — include the rationale, not just the outcome. Wing is required; let mempal auto-route the room. Set dry_run=true to preview the drawer_id without writing."
     )]
-    async fn mempal_ingest(
+    pub async fn mempal_ingest(
         &self,
         Parameters(request): Parameters<IngestRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        let cfg = ConfigHandle::current();
+        let scrubbed_content = cfg.scrub_content(&request.content);
         let room = request.room.as_deref();
-        let drawer_id = build_drawer_id(&request.wing, room, &request.content);
+        let drawer_id = build_drawer_id(&request.wing, room, &scrubbed_content);
 
         if request.dry_run.unwrap_or(false) {
             return Ok(Json(IngestResponse {
@@ -167,7 +174,7 @@ impl MempalMcpServer {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
         })?;
         let vector = embedder
-            .embed(&[request.content.as_str()])
+            .embed(&[scrubbed_content.as_str()])
             .await
             .map_err(|error| ErrorData::internal_error(format!("embedding failed: {error}"), None))?
             .into_iter()
@@ -193,13 +200,13 @@ impl MempalMcpServer {
         let lock_wait_ms = Some(lock_guard.wait_duration().as_millis() as u64);
 
         // Semantic dedup check: find most similar existing drawer
-        let duplicate_warning = check_semantic_duplicate(&db, &vector, &request.content);
+        let duplicate_warning = check_semantic_duplicate(&db, &vector, &scrubbed_content);
 
         if !db.drawer_exists(&drawer_id).map_err(db_error)? {
             let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());
             db.insert_drawer(&Drawer {
                 id: drawer_id.clone(),
-                content: request.content,
+                content: scrubbed_content,
                 wing: request.wing,
                 room: request.room,
                 source_file: Some(source_file),
@@ -226,10 +233,11 @@ impl MempalMcpServer {
         name = "mempal_delete",
         description = "Soft-delete a drawer by ID. The drawer is marked with a deleted_at timestamp and excluded from search results, but not physically removed. Use the CLI `mempal purge` to permanently remove soft-deleted drawers. Returns the drawer_id and whether it was found."
     )]
-    async fn mempal_delete(
+    pub async fn mempal_delete(
         &self,
         Parameters(request): Parameters<DeleteRequest>,
     ) -> std::result::Result<Json<DeleteResponse>, ErrorData> {
+        let _cfg = ConfigHandle::current();
         let db = self.open_db()?;
         let deleted = db
             .soft_delete_drawer(&request.drawer_id)
@@ -250,10 +258,11 @@ impl MempalMcpServer {
         name = "mempal_taxonomy",
         description = "List or edit wing/room taxonomy entries that drive query routing keywords."
     )]
-    async fn mempal_taxonomy(
+    pub async fn mempal_taxonomy(
         &self,
         Parameters(request): Parameters<TaxonomyRequest>,
     ) -> std::result::Result<Json<TaxonomyResponse>, ErrorData> {
+        let _cfg = ConfigHandle::current();
         let db = self.open_db()?;
         match request.action.as_str() {
             "list" => {
@@ -301,10 +310,11 @@ impl MempalMcpServer {
         name = "mempal_kg",
         description = "Knowledge graph: add, query, or invalidate triples (subject-predicate-object). Use 'add' to record structured relationships between entities. Use 'query' to find relationships by subject, predicate, or object. Use 'invalidate' to mark a triple as no longer valid."
     )]
-    async fn mempal_kg(
+    pub async fn mempal_kg(
         &self,
         Parameters(request): Parameters<KgRequest>,
     ) -> std::result::Result<Json<KgResponse>, ErrorData> {
+        let _cfg = ConfigHandle::current();
         let db = self.open_db()?;
         match request.action.as_str() {
             "add" => {

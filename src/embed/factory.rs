@@ -45,7 +45,7 @@ impl EmbedderFactory for ConfiguredEmbedderFactory {
             "api" => Ok(Box::new(ApiEmbedder::new(
                 self.config
                     .embed
-                    .api_endpoint
+                    .base_url
                     .clone()
                     .unwrap_or_else(|| "http://localhost:11434/api/embeddings".to_string()),
                 self.config.embed.api_model.clone(),

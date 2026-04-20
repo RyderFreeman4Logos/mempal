@@ -12,7 +12,7 @@ use mempal::aaak::{AaakCodec, AaakMeta};
 #[cfg(feature = "rest")]
 use mempal::api::{ApiState, DEFAULT_REST_ADDR, serve as serve_rest_api};
 use mempal::core::{
-    config::Config,
+    config::{Config, ConfigHandle, default_config_path},
     db::Database,
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
     types::TaxonomyEntry,
@@ -243,7 +243,9 @@ async fn run() -> Result<()> {
         _ => {}
     }
 
-    let config = Config::load().context("failed to load config")?;
+    let config_path = default_config_path();
+    ConfigHandle::bootstrap(&config_path).context("failed to bootstrap config hot reload")?;
+    let config = ConfigHandle::current();
     let db = Database::open(&expand_home(&config.db_path)).context("failed to open database")?;
 
     match cli.command {
@@ -253,7 +255,7 @@ async fn run() -> Result<()> {
             wing,
             format,
             dry_run,
-        } => ingest_command(&db, &config, &dir, &wing, format, dry_run).await,
+        } => ingest_command(&db, config.as_ref(), &dir, &wing, format, dry_run).await,
         Commands::Search {
             query,
             wing,
@@ -263,7 +265,7 @@ async fn run() -> Result<()> {
         } => {
             search_command(
                 &db,
-                &config,
+                config.as_ref(),
                 &query,
                 wing.as_deref(),
                 room.as_deref(),
@@ -276,12 +278,12 @@ async fn run() -> Result<()> {
         Commands::Purge { before } => purge_command(&db, before.as_deref()),
         Commands::WakeUp { format } => wake_up_command(&db, format.as_deref()),
         Commands::Compress { text } => compress_command(&text),
-        Commands::Bench { command } => bench_command(&config, command).await,
-        Commands::Reindex => reindex_command(&db, &config).await,
+        Commands::Bench { command } => bench_command(config.as_ref(), command).await,
+        Commands::Reindex => reindex_command(&db, config.as_ref()).await,
         Commands::Kg { command } => kg_command(&db, command),
         Commands::Tunnels => tunnels_command(&db),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
-        Commands::Serve { mcp } => serve_command(&config, mcp).await,
+        Commands::Serve { mcp } => serve_command(config.as_ref(), mcp).await,
         Commands::Status => status_command(&db),
         Commands::FactCheck {
             path,
@@ -953,6 +955,7 @@ fn fact_check_command(
 }
 
 fn status_command(db: &Database) -> Result<()> {
+    let cfg_meta = ConfigHandle::snapshot_meta();
     let schema_version = db
         .schema_version()
         .context("failed to read schema version")?;
@@ -978,6 +981,10 @@ fn status_command(db: &Database) -> Result<()> {
         println!("triples: {triple_count}");
     }
     println!("db_size_bytes: {db_size_bytes}");
+    println!(
+        "config: version={} loaded_unix_ms={}",
+        cfg_meta.version, cfg_meta.loaded_at_unix_ms
+    );
 
     let counts = db.scope_counts().context("failed to query scope counts")?;
 
