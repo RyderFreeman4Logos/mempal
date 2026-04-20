@@ -9,23 +9,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use super::config::{Config, ConfigError, ConfigSnapshotMeta};
+use super::config::{CompiledPrivacyConfig, Config, ConfigError, ConfigSnapshotMeta};
 
 const MAX_EVENT_LOG: usize = 64;
 
 #[derive(Debug)]
 struct ConfigSnapshot {
     config: Arc<Config>,
+    compiled_privacy: Arc<CompiledPrivacyConfig>,
     version: String,
     loaded_at_unix_ms: u64,
 }
 
 impl ConfigSnapshot {
     fn from_config(config: Config) -> Result<Self, ConfigError> {
+        let compiled_privacy = Arc::new(config.compile_privacy()?);
         Ok(Self {
             version: config.effective_hash()?,
             loaded_at_unix_ms: now_unix_ms(),
             config: Arc::new(config),
+            compiled_privacy,
         })
     }
 }
@@ -105,6 +108,18 @@ impl HotReloadState {
 
     pub fn current(&self) -> Arc<Config> {
         Arc::clone(&self.snapshot.load_full().config)
+    }
+
+    pub fn current_compiled_privacy(&self) -> Arc<CompiledPrivacyConfig> {
+        Arc::clone(&self.snapshot.load_full().compiled_privacy)
+    }
+
+    pub fn current_privacy_snapshot(&self) -> (Arc<Config>, Arc<CompiledPrivacyConfig>) {
+        let snapshot = self.snapshot.load_full();
+        (
+            Arc::clone(&snapshot.config),
+            Arc::clone(&snapshot.compiled_privacy),
+        )
     }
 
     pub fn snapshot_meta(&self) -> ConfigSnapshotMeta {
@@ -299,12 +314,16 @@ impl HotReloadState {
             return;
         }
 
-        let loaded_at_unix_ms = now_unix_ms();
-        self.snapshot.store(Arc::new(ConfigSnapshot {
-            config: Arc::new(effective),
-            version: next_version.clone(),
-            loaded_at_unix_ms,
-        }));
+        let next_snapshot = match ConfigSnapshot::from_config(effective) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.push_event(format!(
+                    "config hot-reload: parse failed, keeping previous version: {error}"
+                ));
+                return;
+            }
+        };
+        self.snapshot.store(Arc::new(next_snapshot));
         self.push_event(format!(
             "config hot-reload: version changed from {} to {}",
             previous.version, next_version

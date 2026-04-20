@@ -157,8 +157,7 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<IngestRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        let cfg = ConfigHandle::current();
-        let scrubbed_content = cfg.scrub_content(&request.content);
+        let scrubbed_content = ConfigHandle::scrub_content(&request.content);
         let room = request.room.as_deref();
         let drawer_id = build_drawer_id(&request.wing, room, &scrubbed_content);
 
@@ -170,22 +169,10 @@ impl MempalMcpServer {
             }));
         }
 
-        let embedder = self.embedder_factory.build().await.map_err(|error| {
-            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
-        })?;
-        let vector = embedder
-            .embed(&[scrubbed_content.as_str()])
-            .await
-            .map_err(|error| ErrorData::internal_error(format!("embedding failed: {error}"), None))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?;
         let db = self.open_db()?;
 
-        // P9-B: per-source ingest lock guards the dedup/insert critical
-        // section. Lock key derives from the drawer_id (content-addressed,
-        // filesystem-safe). Two concurrent mempal_ingest calls with the
-        // same content serialize here.
+        // Same-content manual ingests should serialize before the expensive
+        // embedder call so concurrent duplicates do not race past the lock.
         let mempal_home = db
             .path()
             .parent()
@@ -198,6 +185,17 @@ impl MempalMcpServer {
         )
         .map_err(|e| ErrorData::internal_error(format!("ingest lock: {e}"), None))?;
         let lock_wait_ms = Some(lock_guard.wait_duration().as_millis() as u64);
+
+        let embedder = self.embedder_factory.build().await.map_err(|error| {
+            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
+        })?;
+        let vector = embedder
+            .embed(&[scrubbed_content.as_str()])
+            .await
+            .map_err(|error| ErrorData::internal_error(format!("embedding failed: {error}"), None))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?;
 
         // Semantic dedup check: find most similar existing drawer
         let duplicate_warning = check_semantic_duplicate(&db, &vector, &scrubbed_content);
