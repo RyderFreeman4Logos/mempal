@@ -32,6 +32,17 @@ CREATE INDEX IF NOT EXISTS idx_pending_source_hash
     ON pending_messages(source_hash);
 "#;
 
+pub const FORK_EXT_V2_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS reindex_progress (
+    source_path TEXT PRIMARY KEY,
+    last_processed_chunk_id INTEGER,
+    embedder_name TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running', 'paused', 'done', 'failed'))
+);
+"#;
+
 struct Migration {
     version: u32,
     up: fn(&Connection) -> rusqlite::Result<()>,
@@ -80,14 +91,24 @@ pub fn set_fork_ext_version(conn: &Connection, v: u32) -> rusqlite::Result<()> {
 }
 
 fn fork_ext_migrations() -> &'static [Migration] {
-    &[Migration {
-        version: 1,
-        up: apply_v1,
-    }]
+    &[
+        Migration {
+            version: 1,
+            up: apply_v1,
+        },
+        Migration {
+            version: 2,
+            up: apply_v2,
+        },
+    ]
 }
 
 fn apply_v1(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V1_SCHEMA_SQL)
+}
+
+fn apply_v2(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V2_SCHEMA_SQL)
 }
 
 pub fn apply_fork_ext_migrations(conn: &Connection) -> rusqlite::Result<()> {

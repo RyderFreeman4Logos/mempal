@@ -15,10 +15,12 @@ use mempal::core::{
     config::{Config, ConfigHandle, default_config_path},
     db::Database,
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
+    reindex::ReindexProgressStore,
     types::TaxonomyEntry,
     utils::{build_triple_id, current_timestamp},
 };
-use mempal::embed::{ConfiguredEmbedderFactory, Embedder};
+use mempal::embed::build_backend_from_name;
+use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
 use mempal::ingest::{IngestOptions, IngestStats, ingest_dir, ingest_dir_with_options};
 use mempal::mcp::MempalMcpServer;
 use mempal::search::search;
@@ -80,7 +82,12 @@ enum Commands {
         #[arg(long)]
         before: Option<String>,
     },
-    Reindex,
+    Reindex {
+        #[arg(long)]
+        embedder: String,
+        #[arg(long, default_value_t = false)]
+        resume: bool,
+    },
     Kg {
         #[command(subcommand)]
         command: KgCommands,
@@ -279,7 +286,9 @@ async fn run() -> Result<()> {
         Commands::WakeUp { format } => wake_up_command(&db, format.as_deref()),
         Commands::Compress { text } => compress_command(&text),
         Commands::Bench { command } => bench_command(config.as_ref(), command).await,
-        Commands::Reindex => reindex_command(&db, config.as_ref()).await,
+        Commands::Reindex { embedder, resume } => {
+            reindex_command(&db, config.as_ref(), &embedder, resume).await
+        }
         Commands::Kg { command } => kg_command(&db, command),
         Commands::Tunnels => tunnels_command(&db),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
@@ -625,45 +634,112 @@ fn compress_command(text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn reindex_command(db: &Database, config: &Config) -> Result<()> {
-    let embedder = build_embedder(config).await?;
+async fn reindex_command(
+    db: &Database,
+    config: &Config,
+    embedder_name: &str,
+    resume: bool,
+) -> Result<()> {
+    let embedder = build_specific_embedder(config, embedder_name).await?;
     let new_dim = embedder.dimensions();
-    let current_dim = db.embedding_dim().context("failed to read embedding dim")?;
+    let current_dim = current_vector_dim(db).context("failed to read embedding dim")?;
+    let progress_store = ReindexProgressStore::new(db.path());
+    let resume_checkpoint = if resume {
+        progress_store
+            .latest_resumable(Some(embedder_name))
+            .context("failed to load reindex checkpoint")?
+    } else {
+        None
+    };
 
-    println!("embedder: {} ({}d)", embedder.name(), new_dim);
+    println!("embedder: {} ({}d)", embedder_name, new_dim);
     if let Some(dim) = current_dim {
         println!("current vector dim: {dim}");
     } else {
         println!("current vector dim: (empty table)");
     }
 
-    // Recreate vectors table with new dimension
-    println!("recreating drawer_vectors with {new_dim} dimensions...");
-    db.recreate_vectors_table(new_dim)
-        .context("failed to recreate vectors table")?;
+    if resume_checkpoint.is_none() {
+        println!("recreating drawer_vectors with {new_dim} dimensions...");
+        db.recreate_vectors_table(new_dim)
+            .context("failed to recreate vectors table")?;
+    } else {
+        println!("resume checkpoint found; preserving existing drawer_vectors table");
+    }
 
-    // Re-embed all active drawers
-    let drawers = db
-        .all_active_drawers()
-        .context("failed to load active drawers")?;
+    let drawers = reindex_rows(db).context("failed to load active drawers for reindex")?;
     let total = drawers.len();
     println!("re-embedding {total} drawers...");
 
-    let batch_size = 64;
     let mut done = 0;
-    for chunk in drawers.chunks(batch_size) {
-        let texts: Vec<&str> = chunk.iter().map(|(_, content)| content.as_str()).collect();
-        let vectors = embedder.embed(&texts).await.context("embedding failed")?;
+    let mut last_processed: Option<(String, i64)> = None;
+    let mut active_source: Option<String> = None;
+    let test_stop_after = std::env::var("MEMPAL_TEST_REINDEX_STOP_AFTER")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
 
-        for ((id, _), vector) in chunk.iter().zip(vectors.iter()) {
-            db.insert_vector(id, vector)
-                .with_context(|| format!("failed to insert vector for {id}"))?;
+    for row in drawers {
+        if should_skip_reindex_row(
+            resume_checkpoint.as_ref(),
+            &row.source_path,
+            row.chunk_index,
+        ) {
+            done += 1;
+            last_processed = Some((row.source_path.clone(), row.chunk_index));
+            active_source = Some(row.source_path.clone());
+            continue;
         }
 
-        done += chunk.len();
-        if total > batch_size {
-            println!("  {done}/{total}");
+        if let Some(previous_source) = active_source.as_ref()
+            && previous_source != &row.source_path
+            && let Some((source_path, chunk_index)) = last_processed.as_ref()
+            && source_path == previous_source
+        {
+            progress_store
+                .mark_done(source_path, Some(*chunk_index), embedder_name)
+                .context("failed to mark completed reindex source")?;
         }
+        active_source = Some(row.source_path.clone());
+
+        let single_input = [row.content.as_str()];
+        let embed_future = embedder.embed(&single_input);
+        let vectors = tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                if let Some((source_path, chunk_index)) = last_processed.as_ref() {
+                    progress_store
+                        .mark_paused(source_path, Some(*chunk_index), embedder_name)
+                        .context("failed to persist paused reindex checkpoint")?;
+                }
+                bail!("reindex interrupted; resume with `mempal reindex --embedder {embedder_name} --resume`");
+            }
+            result = embed_future => result.context("embedding failed during reindex")?,
+        };
+        let vector = vectors
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("embedder returned no vector during reindex"))?;
+        db.insert_vector(&row.id, &vector)
+            .with_context(|| format!("failed to insert vector for {}", row.id))?;
+        progress_store
+            .upsert_running(&row.source_path, Some(row.chunk_index), embedder_name)
+            .context("failed to persist reindex checkpoint")?;
+
+        done += 1;
+        last_processed = Some((row.source_path.clone(), row.chunk_index));
+        println!("  {done}/{total}");
+
+        if test_stop_after.is_some_and(|limit| done >= limit) {
+            progress_store
+                .mark_paused(&row.source_path, Some(row.chunk_index), embedder_name)
+                .context("failed to persist paused reindex checkpoint")?;
+            bail!("reindex interrupted for test after {done} drawers");
+        }
+    }
+
+    if let Some((source_path, chunk_index)) = last_processed.as_ref() {
+        progress_store
+            .mark_done(source_path, Some(*chunk_index), embedder_name)
+            .context("failed to finalize reindex checkpoint")?;
     }
 
     println!("reindex complete: {total} drawers, {new_dim}d vectors");
@@ -956,6 +1032,11 @@ fn fact_check_command(
 
 fn status_command(db: &Database) -> Result<()> {
     let cfg_meta = ConfigHandle::snapshot_meta();
+    let embed_status = global_embed_status().snapshot();
+    let queue_stats = mempal::core::queue::PendingMessageStore::new(db.path())
+        .context("failed to open pending message store")?
+        .stats()
+        .context("failed to query pending message stats")?;
     let schema_version = db
         .schema_version()
         .context("failed to read schema version")?;
@@ -996,6 +1077,17 @@ fn status_command(db: &Database) -> Result<()> {
         "config: version={} loaded_unix_ms={}",
         cfg_meta.version, cfg_meta.loaded_at_unix_ms
     );
+    println!("embed_fail_count: {}", embed_status.fail_count);
+    println!("embed_degraded: {}", embed_status.degraded);
+    if let Some(last_error) = embed_status.last_error {
+        println!("embed_last_error: {last_error}");
+    }
+    if let Some(last_success_at) = embed_status.last_success_at_unix_ms {
+        println!("embed_last_success_at_unix_ms: {last_success_at}");
+    }
+    println!("queue_pending: {}", queue_stats.pending);
+    println!("queue_claimed: {}", queue_stats.claimed);
+    println!("queue_failed: {}", queue_stats.failed);
 
     let counts = db.scope_counts().context("failed to query scope counts")?;
 
@@ -1089,6 +1181,102 @@ async fn build_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
         .build()
         .await
         .context("failed to initialize embedder")
+}
+
+async fn build_specific_embedder(config: &Config, backend: &str) -> Result<Box<dyn Embedder>> {
+    let mut selected = config.clone();
+    selected.embed.backend = backend.to_string();
+    selected.embed.fallback = None;
+    build_backend_from_name(&selected, backend)
+        .await
+        .context("failed to initialize requested embedder")
+}
+
+#[derive(Debug, Clone)]
+struct ReindexRow {
+    id: String,
+    content: String,
+    source_path: String,
+    chunk_index: i64,
+}
+
+fn reindex_rows(db: &Database) -> Result<Vec<ReindexRow>> {
+    let mut statement = db
+        .conn()
+        .prepare(
+            r#"
+            SELECT
+                id,
+                content,
+                COALESCE(source_file, id) AS source_path,
+                COALESCE(chunk_index, 0) AS chunk_index
+            FROM drawers
+            WHERE deleted_at IS NULL
+            ORDER BY source_path ASC, chunk_index ASC, id ASC
+            "#,
+        )
+        .context("failed to prepare reindex query")?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ReindexRow {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                source_path: row.get(2)?,
+                chunk_index: row.get(3)?,
+            })
+        })
+        .context("failed to query reindex rows")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect reindex rows")?;
+    Ok(rows)
+}
+
+fn should_skip_reindex_row(
+    checkpoint: Option<&mempal::core::reindex::ReindexProgressRow>,
+    source_path: &str,
+    chunk_index: i64,
+) -> bool {
+    let Some(checkpoint) = checkpoint else {
+        return false;
+    };
+    if source_path < checkpoint.source_path.as_str() {
+        return true;
+    }
+    if source_path > checkpoint.source_path.as_str() {
+        return false;
+    }
+    checkpoint
+        .last_processed_chunk_id
+        .is_some_and(|last| chunk_index <= last)
+}
+
+fn current_vector_dim(db: &Database) -> Result<Option<usize>> {
+    use rusqlite::OptionalExtension;
+
+    let exists: bool = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to query vector table presence")?;
+    if !exists {
+        return Ok(None);
+    }
+
+    let dimension = db
+        .conn()
+        .query_row(
+            "SELECT vec_length(embedding) FROM drawer_vectors LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .context("failed to read vector dimension")?
+        .map(|value| value as usize);
+    Ok(dimension)
 }
 
 fn expand_home(path: &str) -> PathBuf {

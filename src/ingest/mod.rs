@@ -7,6 +7,8 @@ pub mod normalize;
 
 use std::path::{Path, PathBuf};
 
+use rusqlite::OptionalExtension;
+
 use crate::core::{
     config::ConfigHandle,
     db::Database,
@@ -101,6 +103,10 @@ pub enum IngestError {
         #[source]
         source: crate::core::db::DbError,
     },
+    #[error(
+        "embedding dimension mismatch: drawer_vectors uses {current_dim}d but embedder returned {new_dim}d; run `mempal reindex --embedder <name>` before ingesting more content"
+    )]
+    VectorDimensionMismatch { current_dim: usize, new_dim: usize },
     #[error("failed to acquire ingest lock: {0}")]
     Lock(#[from] lock::LockError),
     #[error("failed to read directory {path}")]
@@ -249,6 +255,22 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             path: path.to_path_buf(),
             source,
         })?;
+    if let Some(first_vector) = vectors.first()
+        && let Some(current_dim) =
+            current_vector_dim(db).map_err(|source| IngestError::InsertVector {
+                drawer_id: pending
+                    .first()
+                    .map(|(_, _, drawer_id)| drawer_id.clone())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                source,
+            })?
+        && current_dim != first_vector.len()
+    {
+        return Err(IngestError::VectorDimensionMismatch {
+            current_dim,
+            new_dim: first_vector.len(),
+        });
+    }
 
     for ((chunk_index, chunk, drawer_id), vector) in pending.into_iter().zip(vectors.into_iter()) {
         let drawer = Drawer {
@@ -356,6 +378,30 @@ fn should_skip_dir(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .map(|name| matches!(name, ".git" | "target" | "node_modules"))
         .unwrap_or(false)
+}
+
+fn current_vector_dim(
+    db: &Database,
+) -> std::result::Result<Option<usize>, crate::core::db::DbError> {
+    let exists: bool = db.conn().query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+
+    let dimension = db
+        .conn()
+        .query_row(
+            "SELECT vec_length(embedding) FROM drawer_vectors LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|value| value as usize);
+    Ok(dimension)
 }
 
 fn normalize_source_file(path: &Path, source_root: Option<&Path>) -> String {
