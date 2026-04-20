@@ -1,3 +1,4 @@
+#[rustfmt::skip] #[path = "db_fork_ext.rs"] mod db_fork_ext;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -102,6 +103,7 @@ impl Database {
 
         let conn = Connection::open(path)?;
         apply_migrations(&conn)?;
+        db_fork_ext::apply_fork_ext_migrations(&conn)?;
 
         Ok(Self {
             conn,
