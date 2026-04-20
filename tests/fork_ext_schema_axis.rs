@@ -29,12 +29,12 @@ fn current_schema_version() -> u32 {
 }
 
 #[test]
-fn test_fork_ext_version_is_zero_on_fresh_db() {
+fn test_fork_ext_version_is_one_on_fresh_db_after_phase2() {
     let (_tmp, _db_path, db) = new_test_db();
 
     let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read fork-ext version");
 
-    assert_eq!(version, 0);
+    assert_eq!(version, 1);
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn test_fork_ext_migrations_idempotent() {
     db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("second apply");
 
     let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read fork-ext version");
-    assert_eq!(version, 0);
+    assert_eq!(version, 1);
 }
 
 #[test]
