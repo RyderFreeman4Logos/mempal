@@ -38,6 +38,19 @@ estimate: 1d
 - 现有 drawer 的 backfill：
   - migration 时自动把所有 `project_id` 设为 NULL（兼容）
   - 提供 `mempal project migrate --project <id> [--wing <W>]` 子命令把指定 wing 下 drawer 的 `project_id` 批量 UPDATE
+  - **Batched UPDATE 避免长锁**（CSA debate 2026-04-20 R7 validated）：一次性 `UPDATE drawers SET project_id = ? WHERE ...` 对十万行大库会拿 SQLite 写锁数分钟，阻塞 daemon ingest 和 MCP search。改用**分批循环**：
+    ```sql
+    BEGIN IMMEDIATE;
+    UPDATE drawers SET project_id = ? WHERE id IN (
+      SELECT id FROM drawers WHERE project_id IS NULL AND wing = ? LIMIT 1000
+    );
+    COMMIT;
+    ```
+    循环直到 `changes() == 0`，每批 commit 后让出锁 ~10ms 让其它 writer 插入
+    - `BEGIN IMMEDIATE` fail-fast：若此时有其它 writer 持锁，立刻返回 `SQLITE_BUSY` 而非等待，migrate 子命令可选重试 backoff（500ms / 1s / 2s）或输出进度让用户看到"暂时让路"
+    - 并发 ingest 可能在 migrate 期间继续插入 `project_id IS NULL` 的新行——LIMIT loop 会在后续批次把它们也捕获，最终收敛（`changes() == 0` 时结束）
+    - 同步更新 `drawer_vectors` 表的 `project_id` 冗余列时，采用同样分批策略（对每个已 UPDATE 的 drawer id）
+  - `mempal project migrate` 子命令 stdout 逐批打印进度 `"batch 3: 1000 drawers updated, 42000 remaining"`，让用户能判断是否卡住
 - `project_id` 不参与 AAAK signal 提取（project 是元数据轴，非内容轴）
 - `mempal status` 加 "project breakdown" 行：`drawers per project: {proj-A:42, proj-B:18, NULL:7}`
 - `mempal tail` / `mempal timeline`（P10 CLI）支持 `--project <id>` 过滤
@@ -90,9 +103,9 @@ Scenario: schema 迁移 v9 → v10 添加 project_id 列
     Filter: test_migration_v9_to_v10_adds_project_id
     Level: integration
     Targets: crates/mempal-core/src/db/schema.rs
-  Given palace.db schema_version == "7"
+  Given palace.db schema_version == "9"
   When 启动 mempal
-  Then schema_version == "8"
+  Then schema_version == "10"
   And `drawers`, `drawer_vectors`, `triples` 三表均有 `project_id` 列
   And 存在索引 `idx_drawers_project_id`
   And 既有 drawer 的 `project_id` 全部为 NULL
@@ -198,6 +211,31 @@ Scenario: mempal project migrate 批量迁移既有 drawer
   Then 该 wing 的 20 条 drawer `project_id == "proj-A"`
   And 其他 wing 的 drawer 不变
   And `drawer_vectors` 同步更新
+
+Scenario: project migrate 用分批 UPDATE 不长时阻塞 ingest
+  Test:
+    Filter: test_project_migrate_batched_does_not_block_ingest
+    Level: integration
+    Targets: crates/mempal-cli/src/project_migrate.rs
+  Given palace.db 含 **5000** 条 `project_id IS NULL` 的 drawer（wing=code-memory）
+  And 后台开启一个轻量 writer 线程，每 50ms 往 wing=logs 写一条 drawer（与 migrate 目标 wing 不同，模拟并发 ingest）
+  When 执行 `mempal project migrate --project proj-A --wing code-memory`
+  Then 命令在合理时间内完成（例如 < 10s）
+  And 后台 writer 期间的每次 ingest latency p99 < 200ms（未被长锁阻塞到秒级）
+  And 命令结束时 wing=code-memory 全部 5000 条 `project_id == "proj-A"`
+  And stdout 至少打印了 5 条 batch progress 行（5000 / 1000 批 = 5 批）
+
+Scenario: project migrate 遇到繁忙写锁时 BEGIN IMMEDIATE fail-fast 并重试
+  Test:
+    Filter: test_project_migrate_begin_immediate_fails_fast
+    Level: integration
+    Targets: crates/mempal-cli/src/project_migrate.rs
+  Given 另一进程持有写锁（模拟长事务）1 秒
+  When 执行 `mempal project migrate --project proj-A --wing code-memory`
+  Then 第一批 `BEGIN IMMEDIATE` 立即（< 100ms）返回 `SQLITE_BUSY`
+  And migrate 输出 `"batch busy, retrying in 500ms"` 类提示
+  And 持锁进程释放后 migrate 成功完成
+  And 没有死锁、没有线程悬挂
 
 Scenario: mempal status 显示 project breakdown
   Test:

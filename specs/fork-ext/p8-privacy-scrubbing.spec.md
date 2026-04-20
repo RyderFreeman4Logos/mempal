@@ -160,6 +160,20 @@ Scenario: 清洗不影响 drawer 计数和 vector 维度
   Then `drawer` 条数为 "5"（scrub 不触发丢弃）
   And 每条 `drawer_vectors` 维度一致（256d for potion-multilingual-128M）
 
+Scenario: 跨 chunk 边界的 secret 仍被 scrub（pre-chunk 顺序断言）
+  Test:
+    Filter: test_scrub_catches_cross_chunk_secret
+    Level: integration
+    Targets: crates/mempal-ingest/src/pipeline.rs, crates/mempal-ingest/src/privacy.rs
+  Given `enabled = true` 且默认 `openai_key` pattern 启用
+  And chunk 上限调小到 50 字节（测试夹具强制触发分块）
+  And ingest payload：`"long preamble of ~48 bytes then sk-abcdef1234567890abcdef1234567890abcd rest..."` — 关键 secret **恰好跨越 chunk 边界**（48 字节前缀 + sk-key）
+  When 走 `ingest::pipeline::ingest`
+  Then 所有产生的 chunk 文本均不含 `sk-abcdef1234567890abcdef1234567890abcd` 原字面
+  And 至少一个 chunk 含 `[REDACTED:openai_key]`
+  And `embedder` 收到的每个 chunk 输入也不含原 secret 字面
+  And `ScrubStats.pattern_matches["openai_key"]` >= 1
+
 Scenario: 无新增外部运行时依赖
   Test:
     Filter: test_no_new_runtime_dependencies_introduced

@@ -40,7 +40,16 @@ estimate: 1d
   - `updated_at = now()`
   - `merge_count` 列 +1（schema v9 新增）
   - **重新计算** embedding（合并后内容变化，旧 embedding 不再准确）：embed new `content`，UPDATE `drawer_vectors`
-  - FTS5 index 自动随 `drawers.content` UPDATE 触发同步（如现有 trigger 已覆盖）
+  - FTS5 index 显式 trigger 保证同步（CSA debate 2026-04-20 R4 validated），v8→v9 migration 中 `DROP TRIGGER IF EXISTS drawers_au_fts;` 再创建，保证幂等重入：
+    ```sql
+    DROP TRIGGER IF EXISTS drawers_au_fts;
+    CREATE TRIGGER drawers_au_fts AFTER UPDATE OF content ON drawers BEGIN
+      DELETE FROM drawers_fts WHERE rowid = old.id;
+      INSERT INTO drawers_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+    ```
+    **为什么 DELETE-then-INSERT 而非 UPDATE**：DELETE-then-INSERT 是 SQLite 官方推荐给 FTS5 contentless / external-content 表的更新模式（索引结构保证一致性），直接 UPDATE contentless 行会让 FTS 内部 segment 与 base 表 rowid 映射漂移
+    **与 upstream 已有 trigger 的关系**：若 upstream 已注册同名 trigger（例如 P5 `p5-semantic-dedup.spec.md` 相关），`DROP ... IF EXISTS` 保证 migration 不因前置状态 fail；migration 每次 idempotent 可重入
   - **保留** drawer ID 不变（KG triples 引用稳定）
 - 去重触发后 write 到 `novelty_audit` 表（schema v9 新增）：`{ id, candidate_hash, decision, near_drawer_id, cosine, created_at }`，`mempal status` 汇总
 - 对 `mempal_ingest` MCP 工具调用方：返回 response metadata 含 `novelty_decision: "inserted" | "merged" | "dropped"`, `near_drawer_id`（如适用）；content 语义保持 raw，不影响字段形态
@@ -192,11 +201,24 @@ Scenario: schema 迁移 v8 → v9 加 merge_count 和 novelty_audit
     Filter: test_migration_v8_to_v9_schema
     Level: integration
     Targets: crates/mempal-core/src/db/schema.rs
-  Given palace.db schema_version == "6"
+  Given palace.db schema_version == "8"
   When 启动 mempal
-  Then schema_version == "7"
+  Then schema_version == "9"
   And `drawers` 表有 `merge_count` 列，默认值 0
   And `novelty_audit` 表存在
+  And trigger `drawers_au_fts` 存在（`SELECT name FROM sqlite_master WHERE type='trigger' AND name='drawers_au_fts'` 返回一行）
+
+Scenario: v8 → v9 migration 在存在同名旧 trigger 时幂等
+  Test:
+    Filter: test_migration_v8_to_v9_idempotent_trigger
+    Level: integration
+    Targets: crates/mempal-core/src/db/schema.rs
+  Given palace.db schema_version == "8"
+  And 在 migration 前人工 `CREATE TRIGGER drawers_au_fts AFTER UPDATE ON drawers BEGIN SELECT 1; END` 注册一个同名但不同逻辑的 trigger
+  When 启动 mempal
+  Then migration 成功（不返回 `SQLITE_ERROR` 或 `trigger drawers_au_fts already exists`）
+  And schema_version == "9"
+  And trigger `drawers_au_fts` 的 SQL 等于 spec Decisions 里给出的 DELETE-then-INSERT 版本（可通过 `SELECT sql FROM sqlite_master WHERE name='drawers_au_fts'` 断言）
 
 Scenario: merge 后 FTS5 搜索能命中新增内容
   Test:
