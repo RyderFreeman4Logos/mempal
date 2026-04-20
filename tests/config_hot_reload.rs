@@ -469,6 +469,12 @@ async fn test_status_prints_config_version_and_loaded_at() {
         .expect("run mempal status");
     assert!(output.status.success(), "status failed: {output:?}");
     let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.trim() == "fork_ext_version: 1"),
+        "fork_ext_version line missing from status: {stdout}"
+    );
     let line = stdout
         .lines()
         .find(|line| line.starts_with("config: version="))

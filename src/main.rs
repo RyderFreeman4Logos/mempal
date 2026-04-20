@@ -959,6 +959,16 @@ fn status_command(db: &Database) -> Result<()> {
     let schema_version = db
         .schema_version()
         .context("failed to read schema version")?;
+    let fork_ext_version = db
+        .conn()
+        .query_row(
+            "SELECT value FROM fork_ext_meta WHERE key = 'fork_ext_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
     let drawer_count = db.drawer_count().context("failed to count drawers")?;
     let taxonomy_count = db.taxonomy_count().context("failed to count taxonomy")?;
     let db_size_bytes = db
@@ -970,6 +980,7 @@ fn status_command(db: &Database) -> Result<()> {
         .context("failed to count deleted drawers")?;
 
     println!("schema_version: {schema_version}");
+    println!("fork_ext_version: {fork_ext_version}");
     println!("drawer_count: {drawer_count}");
     if deleted_count > 0 {
         println!("deleted_drawers: {deleted_count} (use `mempal purge` to remove)");
