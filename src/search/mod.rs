@@ -9,6 +9,7 @@ use crate::embed::{EmbedError, Embedder};
 use thiserror::Error;
 
 use crate::search::filter::build_filter_clause;
+use rusqlite::OptionalExtension;
 
 pub mod filter;
 pub mod rerank;
@@ -40,6 +41,10 @@ pub enum SearchError {
     LoadTaxonomy(#[source] crate::core::db::DbError),
     #[error("failed to run keyword search")]
     KeywordSearch(#[source] crate::core::db::DbError),
+    #[error(
+        "embedding dimension mismatch: drawer_vectors uses {current_dim}d but embedder returned {new_dim}d; run `mempal reindex --embedder <name>` before searching with this backend"
+    )]
+    VectorDimensionMismatch { current_dim: usize, new_dim: usize },
 }
 
 pub async fn search<E: Embedder + ?Sized>(
@@ -64,8 +69,40 @@ pub async fn search<E: Embedder + ?Sized>(
         .into_iter()
         .next()
         .ok_or(SearchError::MissingQueryVector)?;
+    if let Some(current_dim) = current_vector_dim(db).map_err(SearchError::KeywordSearch)?
+        && current_dim != query_vector.len()
+    {
+        return Err(SearchError::VectorDimensionMismatch {
+            current_dim,
+            new_dim: query_vector.len(),
+        });
+    }
 
     search_with_vector(db, query, &query_vector, route, top_k)
+}
+
+fn current_vector_dim(
+    db: &Database,
+) -> std::result::Result<Option<usize>, crate::core::db::DbError> {
+    let exists: bool = db.conn().query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+
+    let dimension = db
+        .conn()
+        .query_row(
+            "SELECT vec_length(embedding) FROM drawer_vectors LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|value| value as usize);
+    Ok(dimension)
 }
 
 pub fn search_with_vector(

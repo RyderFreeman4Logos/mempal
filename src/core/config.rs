@@ -8,9 +8,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_DB_PATH: &str = "~/.mempal/palace.db";
-const DEFAULT_EMBED_BACKEND: &str = "model2vec";
+const DEFAULT_EMBED_BACKEND: &str = "openai_compat";
 const DEFAULT_HOT_RELOAD_DEBOUNCE_MS: u64 = 250;
 const DEFAULT_HOT_RELOAD_POLL_FALLBACK_SECS: u64 = 5;
+const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_OPENAI_DIM: usize = 4096;
+const DEFAULT_RETRY_INTERVAL_SECS: u64 = 2;
+const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 5;
+const DEFAULT_ALERT_EVERY_N_FAILURES: u64 = 100;
+const DEFAULT_DEGRADE_AFTER_N_FAILURES: u64 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
@@ -64,6 +70,26 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.embed.retry.interval_secs == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "embed.retry.interval_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.embed.retry.search_deadline_secs == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "embed.retry.search_deadline_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.embed.alert.alert_every_n_failures == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "embed.alert.alert_every_n_failures must be greater than 0".to_string(),
+            ));
+        }
+        if self.embed.degradation.degrade_after_n_failures == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "embed.degradation.degrade_after_n_failures must be greater than 0".to_string(),
+            ));
+        }
         let _ = self.compile_privacy()?;
         Ok(())
     }
@@ -129,6 +155,9 @@ impl Config {
         if self.embed.backend != other.embed.backend {
             fields.push("embedder.backend");
         }
+        if self.embed.fallback != other.embed.fallback {
+            fields.push("embedder.fallback");
+        }
         if self.embed.base_url != other.embed.base_url {
             fields.push("embedder.base_url");
         }
@@ -138,13 +167,35 @@ impl Config {
         if self.embed.api_model != other.embed.api_model {
             fields.push("embedder.api_model");
         }
+        if self.embed.openai_compat.base_url != other.embed.openai_compat.base_url {
+            fields.push("embedder.openai_compat.base_url");
+        }
+        if self.embed.openai_compat.model != other.embed.openai_compat.model {
+            fields.push("embedder.openai_compat.model");
+        }
+        if self.embed.openai_compat.api_key_env != other.embed.openai_compat.api_key_env {
+            fields.push("embedder.openai_compat.api_key_env");
+        }
+        if self.embed.openai_compat.request_timeout_secs
+            != other.embed.openai_compat.request_timeout_secs
+        {
+            fields.push("embedder.openai_compat.request_timeout_secs");
+        }
+        if self.embed.openai_compat.dim != other.embed.openai_compat.dim {
+            fields.push("embedder.openai_compat.dim");
+        }
         fields
     }
 
     pub fn merge_runtime_allowed(&self, candidate: &Self) -> Self {
         let mut effective = candidate.clone();
         effective.db_path = self.db_path.clone();
-        effective.embed = self.embed.clone();
+        effective.embed.backend = self.embed.backend.clone();
+        effective.embed.fallback = self.embed.fallback.clone();
+        effective.embed.model = self.embed.model.clone();
+        effective.embed.base_url = self.embed.base_url.clone();
+        effective.embed.api_model = self.embed.api_model.clone();
+        effective.embed.openai_compat = self.embed.openai_compat.clone();
         effective
     }
 }
@@ -153,20 +204,129 @@ impl Config {
 #[serde(default)]
 pub struct EmbedConfig {
     pub backend: String,
+    pub fallback: Option<String>,
     /// Model identifier (e.g., "minishlab/potion-multilingual-128M" for model2vec).
     pub model: Option<String>,
     #[serde(alias = "api_endpoint")]
     pub base_url: Option<String>,
     pub api_model: Option<String>,
+    pub openai_compat: OpenAiCompatConfig,
+    pub retry: RetryConfig,
+    pub alert: AlertConfig,
+    pub degradation: DegradationConfig,
 }
 
 impl Default for EmbedConfig {
     fn default() -> Self {
         Self {
             backend: DEFAULT_EMBED_BACKEND.to_string(),
+            fallback: None,
             model: None,
             base_url: None,
             api_model: None,
+            openai_compat: OpenAiCompatConfig::default(),
+            retry: RetryConfig::default(),
+            alert: AlertConfig::default(),
+            degradation: DegradationConfig::default(),
+        }
+    }
+}
+
+impl EmbedConfig {
+    pub fn resolved_openai_base_url(&self) -> Option<&str> {
+        self.openai_compat
+            .base_url
+            .as_deref()
+            .or(self.base_url.as_deref())
+    }
+
+    pub fn resolved_openai_model(&self) -> Option<&str> {
+        self.openai_compat
+            .model
+            .as_deref()
+            .or(self.api_model.as_deref())
+    }
+
+    pub fn resolved_api_key_env(&self) -> Option<&str> {
+        self.openai_compat
+            .api_key_env
+            .as_deref()
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn resolved_openai_dim(&self) -> usize {
+        self.openai_compat.dim.unwrap_or(DEFAULT_OPENAI_DIM)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OpenAiCompatConfig {
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
+    pub request_timeout_secs: u64,
+    pub dim: Option<usize>,
+}
+
+impl Default for OpenAiCompatConfig {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            model: None,
+            api_key_env: None,
+            request_timeout_secs: DEFAULT_OPENAI_TIMEOUT_SECS,
+            dim: Some(DEFAULT_OPENAI_DIM),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RetryConfig {
+    pub interval_secs: u64,
+    pub search_deadline_secs: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: DEFAULT_RETRY_INTERVAL_SECS,
+            search_deadline_secs: DEFAULT_SEARCH_DEADLINE_SECS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AlertConfig {
+    pub enabled: bool,
+    pub script_path: Option<String>,
+    pub alert_every_n_failures: u64,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            script_path: None,
+            alert_every_n_failures: DEFAULT_ALERT_EVERY_N_FAILURES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DegradationConfig {
+    pub degrade_after_n_failures: u64,
+    pub block_writes_when_degraded: bool,
+}
+
+impl Default for DegradationConfig {
+    fn default() -> Self {
+        Self {
+            degrade_after_n_failures: DEFAULT_DEGRADE_AFTER_N_FAILURES,
+            block_writes_when_degraded: true,
         }
     }
 }
@@ -288,6 +448,8 @@ pub enum ConfigError {
         #[source]
         source: toml::ser::Error,
     },
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }
 
 pub fn default_config_path() -> PathBuf {

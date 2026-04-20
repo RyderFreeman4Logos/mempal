@@ -28,6 +28,8 @@ pub struct SearchRequest {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SearchResponse {
     pub results: Vec<SearchResultDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -91,6 +93,8 @@ pub struct DeleteResponse {
     pub drawer_id: String,
     pub deleted: bool,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -103,6 +107,8 @@ pub struct IngestResponse {
     /// concurrent ingest of the same content serialized with this call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lock_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -123,6 +129,29 @@ pub struct StatusResponse {
     pub scopes: Vec<ScopeCount>,
     pub aaak_spec: String,
     pub memory_protocol: String,
+    pub embed_status: EmbedStatusDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EmbedStatusDto {
+    pub pending_count: u64,
+    pub claimed_count: u64,
+    pub failed_count: u64,
+    pub degraded: bool,
+    pub fail_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SystemWarning {
+    pub level: String,
+    pub message: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -144,6 +173,8 @@ pub struct TaxonomyRequest {
 pub struct TaxonomyResponse {
     pub action: String,
     pub entries: Vec<TaxonomyEntryDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -177,6 +208,8 @@ pub struct KgResponse {
     pub triples: Vec<TripleDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<KgStatsDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -205,6 +238,8 @@ pub struct TripleDto {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct TunnelsResponse {
     pub tunnels: Vec<TunnelDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -239,6 +274,8 @@ pub struct PeekPartnerResponse {
     pub partner_active: bool,
     pub messages: Vec<PeekMessageDto>,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -282,6 +319,8 @@ pub struct CoworkPushResponse {
     pub inbox_path: String,
     pub pushed_at: String,
     pub inbox_size_after: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -303,6 +342,8 @@ pub struct FactCheckResponse {
     pub issues: Vec<crate::factcheck::FactIssue>,
     pub checked_entities: Vec<String>,
     pub kg_triples_scanned: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
 }
 
 impl SearchResultDto {

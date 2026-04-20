@@ -8,7 +8,7 @@ use crate::core::{
     utils::{build_drawer_id, build_triple_id, current_timestamp, source_file_or_synthetic},
 };
 use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
-use crate::embed::EmbedderFactory;
+use crate::embed::{EmbedderFactory, global_embed_status};
 use crate::search::{resolve_route, search_with_vector};
 use anyhow::Context;
 use rmcp::{
@@ -20,10 +20,10 @@ use rmcp::{
 
 use super::tools::{
     CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DuplicateWarning,
-    FactCheckRequest, FactCheckResponse, IngestRequest, IngestResponse, KgRequest, KgResponse,
-    KgStatsDto, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, ScopeCount, SearchRequest,
-    SearchResponse, SearchResultDto, StatusResponse, TaxonomyEntryDto, TaxonomyRequest,
-    TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
+    EmbedStatusDto, FactCheckRequest, FactCheckResponse, IngestRequest, IngestResponse, KgRequest,
+    KgResponse, KgStatsDto, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, ScopeCount,
+    SearchRequest, SearchResponse, SearchResultDto, StatusResponse, SystemWarning,
+    TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -77,6 +77,15 @@ impl MempalMcpServer {
     pub async fn mempal_status(&self) -> std::result::Result<Json<StatusResponse>, ErrorData> {
         let cfg_meta = ConfigHandle::snapshot_meta();
         let db = self.open_db()?;
+        let queue_stats = crate::core::queue::PendingMessageStore::new(db.path())
+            .map_err(|error| {
+                ErrorData::internal_error(format!("queue init failed: {error}"), None)
+            })?
+            .stats()
+            .map_err(|error| {
+                ErrorData::internal_error(format!("queue stats failed: {error}"), None)
+            })?;
+        let embed_snapshot = global_embed_status().snapshot();
         let schema_version = db.schema_version().map_err(db_error)?;
         let drawer_count = db.drawer_count().map_err(db_error)?;
         let taxonomy_count = db.taxonomy_count().map_err(db_error)?;
@@ -102,6 +111,16 @@ impl MempalMcpServer {
             scopes,
             aaak_spec: crate::aaak::generate_spec(),
             memory_protocol: crate::core::protocol::MEMORY_PROTOCOL.to_string(),
+            embed_status: EmbedStatusDto {
+                pending_count: queue_stats.pending,
+                claimed_count: queue_stats.claimed,
+                failed_count: queue_stats.failed,
+                degraded: embed_snapshot.degraded,
+                fail_count: embed_snapshot.fail_count,
+                last_error: embed_snapshot.last_error,
+                last_success_at_unix_ms: embed_snapshot.last_success_at_unix_ms,
+            },
+            system_warnings: current_system_warnings(),
         }))
     }
 
@@ -146,6 +165,7 @@ impl MempalMcpServer {
                 .into_iter()
                 .map(SearchResultDto::with_signals_from_result)
                 .collect(),
+            system_warnings: current_system_warnings(),
         }))
     }
 
@@ -166,7 +186,12 @@ impl MempalMcpServer {
                 drawer_id,
                 duplicate_warning: None,
                 lock_wait_ms: None,
+                system_warnings: current_system_warnings(),
             }));
+        }
+
+        if global_embed_status().should_block_writes() {
+            return Err(degraded_write_error());
         }
 
         let db = self.open_db()?;
@@ -196,6 +221,7 @@ impl MempalMcpServer {
             .into_iter()
             .next()
             .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?;
+        ensure_vector_dim_matches(&db, vector.len())?;
 
         // Semantic dedup check: find most similar existing drawer
         let duplicate_warning = check_semantic_duplicate(&db, &vector, &scrubbed_content);
@@ -224,6 +250,7 @@ impl MempalMcpServer {
             drawer_id,
             duplicate_warning,
             lock_wait_ms,
+            system_warnings: current_system_warnings(),
         }))
     }
 
@@ -249,6 +276,7 @@ impl MempalMcpServer {
             drawer_id: request.drawer_id,
             deleted,
             message,
+            system_warnings: current_system_warnings(),
         }))
     }
 
@@ -273,6 +301,7 @@ impl MempalMcpServer {
                 Ok(Json(TaxonomyResponse {
                     action: "list".to_string(),
                     entries,
+                    system_warnings: current_system_warnings(),
                 }))
             }
             "edit" => {
@@ -295,6 +324,7 @@ impl MempalMcpServer {
                 Ok(Json(TaxonomyResponse {
                     action: "edit".to_string(),
                     entries: vec![TaxonomyEntryDto::from(entry)],
+                    system_warnings: current_system_warnings(),
                 }))
             }
             action => Err(ErrorData::invalid_params(
@@ -313,9 +343,13 @@ impl MempalMcpServer {
         Parameters(request): Parameters<KgRequest>,
     ) -> std::result::Result<Json<KgResponse>, ErrorData> {
         let _cfg = ConfigHandle::current();
+        let block_writes = global_embed_status().should_block_writes();
         let db = self.open_db()?;
         match request.action.as_str() {
             "add" => {
+                if block_writes {
+                    return Err(degraded_write_error());
+                }
                 let subject = request
                     .subject
                     .ok_or_else(|| ErrorData::invalid_params("missing subject", None))?;
@@ -341,6 +375,7 @@ impl MempalMcpServer {
                     action: "add".to_string(),
                     triples: vec![triple_to_dto(&triple)],
                     stats: None,
+                    system_warnings: current_system_warnings(),
                 }))
             }
             "query" => {
@@ -357,9 +392,13 @@ impl MempalMcpServer {
                     action: "query".to_string(),
                     triples: triples.iter().map(triple_to_dto).collect(),
                     stats: None,
+                    system_warnings: current_system_warnings(),
                 }))
             }
             "invalidate" => {
+                if block_writes {
+                    return Err(degraded_write_error());
+                }
                 let triple_id = request
                     .triple_id
                     .ok_or_else(|| ErrorData::invalid_params("missing triple_id", None))?;
@@ -373,6 +412,7 @@ impl MempalMcpServer {
                     action: message,
                     triples: vec![],
                     stats: None,
+                    system_warnings: current_system_warnings(),
                 }))
             }
             "timeline" => {
@@ -384,6 +424,7 @@ impl MempalMcpServer {
                     action: format!("timeline for {entity}"),
                     triples: triples.iter().map(triple_to_dto).collect(),
                     stats: None,
+                    system_warnings: current_system_warnings(),
                 }))
             }
             "stats" => {
@@ -398,6 +439,7 @@ impl MempalMcpServer {
                         entities: stats.entities,
                         top_predicates: stats.top_predicates,
                     }),
+                    system_warnings: current_system_warnings(),
                 }))
             }
             action => Err(ErrorData::invalid_params(
@@ -419,7 +461,10 @@ impl MempalMcpServer {
             .into_iter()
             .map(|(room, wings)| TunnelDto { room, wings })
             .collect();
-        Ok(Json(TunnelsResponse { tunnels }))
+        Ok(Json(TunnelsResponse {
+            tunnels,
+            system_warnings: current_system_warnings(),
+        }))
     }
 
     #[tool(
@@ -479,6 +524,7 @@ impl MempalMcpServer {
                 .map(PeekMessageDto::from)
                 .collect(),
             truncated: resp.truncated,
+            system_warnings: current_system_warnings(),
         }))
     }
 
@@ -546,6 +592,7 @@ impl MempalMcpServer {
             inbox_path: path.to_string_lossy().to_string(),
             pushed_at,
             inbox_size_after: size,
+            system_warnings: current_system_warnings(),
         }))
     }
 
@@ -578,6 +625,7 @@ impl MempalMcpServer {
             issues: report.issues,
             checked_entities: report.checked_entities,
             kg_triples_scanned: report.kg_triples_scanned,
+            system_warnings: current_system_warnings(),
         }))
     }
 }
@@ -647,6 +695,69 @@ fn fact_check_error(error: crate::factcheck::FactCheckError) -> ErrorData {
             ErrorData::internal_error(format!("fact_check: {error}"), None)
         }
     }
+}
+
+fn ensure_vector_dim_matches(
+    db: &Database,
+    actual_dim: usize,
+) -> std::result::Result<(), ErrorData> {
+    let Some(current_dim) = current_vector_dim(db).map_err(db_error)? else {
+        return Ok(());
+    };
+    if current_dim == actual_dim {
+        return Ok(());
+    }
+    Err(ErrorData::internal_error(
+        format!(
+            "embedding dimension mismatch: drawer_vectors uses {current_dim}d but embedder returned {actual_dim}d; run `mempal reindex --embedder <name>` before ingesting more content"
+        ),
+        None,
+    ))
+}
+
+fn current_vector_dim(
+    db: &Database,
+) -> std::result::Result<Option<usize>, crate::core::db::DbError> {
+    use rusqlite::OptionalExtension;
+
+    let exists: bool = db.conn().query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+
+    let dimension = db
+        .conn()
+        .query_row(
+            "SELECT vec_length(embedding) FROM drawer_vectors LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|value| value as usize);
+    Ok(dimension)
+}
+
+fn degraded_write_error() -> ErrorData {
+    let warnings = current_system_warnings();
+    let message = "mempal embed backend degraded; writes are paused until recovery. Read operations remain available.";
+    let data = serde_json::to_value(&warnings).ok();
+    ErrorData::internal_error(message, data)
+}
+
+fn current_system_warnings() -> Vec<SystemWarning> {
+    global_embed_status()
+        .collect_warnings()
+        .into_iter()
+        .map(|warning| SystemWarning {
+            level: warning.level.to_string(),
+            message: warning.message,
+            source: warning.source.to_string(),
+        })
+        .collect()
 }
 
 const DEDUP_THRESHOLD: f32 = 0.85;

@@ -4,4 +4,4 @@ mod server;
 mod tools;
 
 pub use server::MempalMcpServer;
-pub use tools::{IngestRequest, IngestResponse, StatusResponse};
+pub use tools::{IngestRequest, IngestResponse, SearchRequest, SearchResponse, StatusResponse};
