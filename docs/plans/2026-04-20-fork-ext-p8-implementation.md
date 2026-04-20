@@ -18,6 +18,23 @@
 
 ---
 
+## D0. Upstream-Sync 摩擦最小化约束（写代码前必读）
+
+**来源**：gemini-cli 2026-04-20 tier-3-complex 策略审查（session `01KPP36SKKNQ5T3C5JEFR9VN61`）。用户目标：`claude-mem` 执行 `sync-upstream` 时尽可能少花 token，fork 与 upstream 共存**永久化**。
+
+以下三条是 fork-ext 所有源码落点的**硬约束**，任何 PR 提审前自查：
+
+- **R1 — `src/core/config.rs` 保持单文件**。不拆 `config/{mod,schema,hot_reload}.rs` 子目录。upstream 每加一个 `Config` 字段会落在 `config.rs`，子目录拆分让 "加字段" 放大成树重构级冲突。fork 的热重载逻辑单独放新文件 `src/core/hot_reload.rs`。
+- **R2 — `src/core/db.rs` 只改一行**。所有 fork-ext DDL 常量 (`FORK_EXT_V*_SCHEMA_SQL`)、迁移数组、runner / reader / setter 全部落在**新文件** `src/core/db_fork_ext.rs`。`db.rs` 仅加 `mod db_fork_ext;` 和 `Database::open` 里一行 `db_fork_ext::apply_fork_ext_migrations(&conn)?;`。理由：`db.rs` 是 upstream 高频变更区，每次 schema 升级必改，fork 的大段 SQL 常量插在中间会让每次 merge 都爆冲突。
+- **R3 — fork-only MCP handler 只追加到末尾**。`src/mcp/server.rs` / `src/mcp/tools.rs` 里新 handler / 新工具枚举项必须放在**文件/match arm 最底部**，禁插在既有 upstream handler 之间。upstream 新增工具通常加在自己顺序位，fork 放底部让 git 能自动 3-way-merge。
+
+pre-flight 自查 checklist：
+- [ ] `grep -rn "config/\(mod\|schema\|hot_reload\)\.rs" src/` 空 → R1 ✅
+- [ ] `git diff main -- src/core/db.rs` 只含 `mod db_fork_ext;` 和一行 `apply_fork_ext_migrations` 调用 → R2 ✅
+- [ ] fork 新增 MCP handler 全部 `git diff main -- src/mcp/` 显示在既有 handler 之后（尾部）→ R3 ✅
+
+---
+
 ## Key Decisions（开工前已定）
 
 ### D1. 实际代码结构 ≠ spec 路径
@@ -153,17 +170,21 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 
 ### File Structure
 
+> **Upstream-sync 摩擦约束**（gemini 2026-04-20 策略审查 R2）：fork-ext DDL 常量 / 迁移数组 / runner / reader / setter 全部落在**新文件 `src/core/db_fork_ext.rs`**，不内联到 `src/core/db.rs`。理由：`db.rs` 是 upstream 高频变更区（每次 schema 升级都要改），把 fork 的 `FORK_EXT_V*_SCHEMA_SQL` 大段 SQL 常量插在中间会让每次 merge 都炸。`db.rs` 只做一件事：`mod db_fork_ext;` + `Database::open` 里调 `apply_fork_ext_migrations` 一行。
+
 | 文件 | 动作 | 职责 |
 |------|------|------|
-| `src/core/db.rs` | modify | 新增 `FORK_EXT_SCHEMA_VERSION` 常量、`fork_ext_migrations()`、`read_fork_ext_version`、`set_fork_ext_version`、`apply_fork_ext_migrations`；`open()` 里调用一次 |
+| `src/core/db.rs` | modify（极小） | 顶部加 `mod db_fork_ext;`；`Database::open` 在 upstream `apply_migrations` 之后调 `db_fork_ext::apply_fork_ext_migrations(&conn)?;`——**仅此两行改动** |
+| `src/core/db_fork_ext.rs` (new) | create | `FORK_EXT_SCHEMA_VERSION` 常量、`Migration` struct、`fork_ext_migrations()` 返回数组（Phase 0 为空）、`read_fork_ext_version`、`set_fork_ext_version`、`apply_fork_ext_migrations`、`FORK_EXT_META_DDL`（`CREATE TABLE IF NOT EXISTS fork_ext_meta ...`）|
+| `src/core/mod.rs` | unchanged | `db_fork_ext` 是 `db` 的子模块，不用 re-export |
 | `tests/fork_ext_schema_axis.rs` (new) | create | 3 scenarios：fresh DB → ext_v=0，bootstrap → ext_v=0，独立于 user_version |
 
 ### Tasks
 
 - [ ] **T0.1** 写失败测试 `test_fork_ext_version_is_zero_on_fresh_db`（fresh DB → `apply_fork_ext_migrations` 跑完 → `fork_ext_version=0`，因为 Phase 0 只建表不注册业务 migration）
-- [ ] **T0.2** 实现 `fork_ext_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)` 表创建 + `read_fork_ext_version` / `set_fork_ext_version` helpers（表不存在时视为 0，便于幂等首次 bootstrap）
-- [ ] **T0.3** 实现 `apply_fork_ext_migrations(conn)`：建 `fork_ext_meta`（IF NOT EXISTS）→ 读 `fork_ext_version` → 遍历 `fork_ext_migrations()` 数组跑未应用的 → 写回 `fork_ext_version`；Phase 0 里数组是**空的**，`fork_ext_version` 保持 0
-- [ ] **T0.4** 在 `Database::open` 里调 upstream `apply_migrations` 之后调用 `apply_fork_ext_migrations`
+- [ ] **T0.2** 在**新文件** `src/core/db_fork_ext.rs` 实现 `fork_ext_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)` 表创建 + `read_fork_ext_version` / `set_fork_ext_version` helpers（表不存在时视为 0，便于幂等首次 bootstrap）
+- [ ] **T0.3** 在 `db_fork_ext.rs` 实现 `apply_fork_ext_migrations(conn)`：建 `fork_ext_meta`（IF NOT EXISTS）→ 读 `fork_ext_version` → 遍历 `fork_ext_migrations()` 数组跑未应用的 → 写回 `fork_ext_version`；Phase 0 里数组是**空的**，`fork_ext_version` 保持 0
+- [ ] **T0.4** 在 `src/core/db.rs` 顶部加 `mod db_fork_ext;`；`Database::open` 在 upstream `apply_migrations` 之后一行调用 `db_fork_ext::apply_fork_ext_migrations(&conn)?;`
 - [ ] **T0.5** 写测试 `test_apply_fork_ext_migrations_idempotent`（调两次，`fork_ext_meta` 不重复建、`fork_ext_version` 不错误升）
 - [ ] **T0.6** 写测试 `test_upstream_user_version_unchanged_after_fork_ext_bootstrap`（`PRAGMA user_version` 仍 = 4）
 - [ ] **T0.7** `cargo clippy --all-targets --all-features -- -D warnings` + `cargo fmt`
@@ -192,23 +213,23 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 
 ### File Structure
 
+> **Upstream-sync 摩擦约束**（gemini 2026-04-20 策略审查 R1）：**不拆** `src/core/config.rs` 成 `config/{mod,schema,hot_reload}.rs` 子目录。理由：upstream 未来每加一个 `Config` 字段都会落在 `config.rs`，子目录拆分会把 "加字段" 放大成 "删除旧文件 + 创建新文件" 级的树结构冲突。保留单文件 + 独立 `hot_reload.rs` 是冲突最小的结构。
+
 | 文件 | 动作 | 职责 |
 |------|------|------|
-| `src/core/config.rs` | **重写 + 拆模块** | 从 2.1KB 扩充，拆为 `config/{mod,schema,hot_reload}.rs` |
-| `src/core/config/mod.rs` (new) | create | `pub use` + `ConfigHandle` 公开 API |
-| `src/core/config/schema.rs` (new) | create | `Config` struct + `serde::Deserialize` + 字段属性 `#[hot_reload]` / `#[restart_required]` |
-| `src/core/config/hot_reload.rs` (new) | create | `ArcSwap<Config>` + `notify::Watcher` + debounce 任务 + blake3 hash + fallback poll |
-| `src/core/mod.rs` | modify | `pub mod config;`（目录模式） |
+| `src/core/config.rs` | modify | **保持单文件**；`Config` struct 在此 + 字段属性 `#[hot_reload]` / `#[restart_required]` marker（宏或 attribute 常量表）；新增 `pub struct ConfigHandle` 对外 API |
+| `src/core/hot_reload.rs` (new) | create | `ArcSwap<Config>` + `notify::Watcher` + 250ms debounce 任务 + blake3 hash + fallback poll；不包含 `Config` schema 定义 |
+| `src/core/mod.rs` | modify | `pub mod hot_reload;`（`config` 已存在） |
 | `src/main.rs` | modify | 启动时 `ConfigHandle::bootstrap(path)`；`mempal status` 打印 `config: version=... loaded=...` |
 | `src/mcp/tools.rs` | modify | `StatusResponse` 加 `config_version: String`、`config_loaded_at_unix_ms: u64` |
-| `src/mcp/server.rs` | modify | 每个 handler 入口 `let cfg = ConfigHandle::current();` |
+| `src/mcp/server.rs` | modify | 每个 handler 入口 `let cfg = ConfigHandle::current();`；新 handler 追加**末尾**，禁插在既有 upstream handler 之间（R3） |
 | `Cargo.toml` | modify | 加 `arc-swap`, `notify`, `blake3` |
 | `tests/config_hot_reload.rs` (new) | create | 10 scenarios |
 
 ### Tasks
 
 - [ ] **T1.1** 加依赖 + `cargo check`（`arc-swap` / `notify` / `blake3`）
-- [ ] **T1.2** 拆 `src/core/config.rs` → `config/{mod,schema,hot_reload}.rs`（先**不动功能**，纯 move），`cargo test` 全绿
+- [ ] **T1.2** 在 `src/core/config.rs` 单文件内扩充 `Config` struct + `ConfigHandle` 公开 API（**不拆目录**——R1 约束），新建 `src/core/hot_reload.rs` 空骨架；`cargo test` 全绿
 - [ ] **T1.3** 写失败测试 `test_privacy_pattern_hot_reload_applies_on_next_ingest`（scenario §Completion Criteria 第 1 条）
 - [ ] **T1.4** 实现 `ArcSwap<Config>` + `ConfigHandle::current()`，T1.3 转绿
 - [ ] **T1.5** 实现 `notify::RecommendedWatcher` + 250ms debounce task
@@ -237,7 +258,7 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 | 文件 | 动作 | 职责 |
 |------|------|------|
 | `src/core/queue.rs` (new) | create | `PendingMessageStore` + `enqueue` / `claim_next` / `confirm` / `mark_failed` / `refresh_heartbeat` / `reclaim_stale` |
-| `src/core/db.rs` | modify | 定义 `FORK_EXT_V1_SCHEMA_SQL` 常量（`pending_messages` 表 + indexes DDL）；往 `fork_ext_migrations()` 数组追加 `Migration { version: 1, sql: FORK_EXT_V1_SCHEMA_SQL }`——`fork_ext_meta` 表 / runner / reader / setter 已由 Phase 0 就位，T2 这里**不再碰 infra** |
+| `src/core/db_fork_ext.rs` | modify | 定义 `FORK_EXT_V1_SCHEMA_SQL` 常量（`pending_messages` 表 + indexes DDL）；往 `fork_ext_migrations()` 数组追加 `Migration { version: 1, sql: FORK_EXT_V1_SCHEMA_SQL }`——`fork_ext_meta` 表 / runner / reader / setter 已由 Phase 0 就位，T2 这里**不再碰 infra**；**`src/core/db.rs` 不变**（R2 约束） |
 | `src/core/mod.rs` | modify | `pub mod queue;` |
 | `Cargo.toml` | modify | 无新 dep（rusqlite 已有） |
 | `tests/queue_claim_confirm.rs` (new) | create | scenarios from spec §Completion Criteria |
@@ -245,7 +266,7 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 
 ### Tasks
 
-- [ ] **T2.1** 定义 `FORK_EXT_V1_SCHEMA_SQL` 常量（pending_messages DDL），往 `fork_ext_migrations()` 数组追加 `Migration { version: 1, sql: FORK_EXT_V1_SCHEMA_SQL }`——runner / reader / setter 已由 Phase 0 就位，本任务**不碰 `fork_ext_meta` 表结构**
+- [ ] **T2.1** 在 `src/core/db_fork_ext.rs` 定义 `FORK_EXT_V1_SCHEMA_SQL` 常量（pending_messages DDL），往 `fork_ext_migrations()` 数组追加 `Migration { version: 1, sql: FORK_EXT_V1_SCHEMA_SQL }`——runner / reader / setter 已由 Phase 0 就位，本任务**不碰 `fork_ext_meta` 表结构**，**也不碰 `src/core/db.rs`**（R2）
 - [ ] **T2.2** 写失败测试 `test_enqueue_claim_confirm_basic`
 - [ ] **T2.3** 写 v0→v1 migration（CREATE TABLE pending_messages + indexes）
 - [ ] **T2.4** 实现 `PendingMessageStore::enqueue` / `claim_next` / `confirm` / `mark_failed`
@@ -271,7 +292,7 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 |------|------|------|
 | `src/ingest/privacy.rs` (new) | create | `scrub(text, cfg) -> (String, ScrubStats)` + 默认 pattern 库 |
 | `src/ingest/mod.rs` | modify | pipeline 里 normalize 之后、chunk 之前调 privacy::scrub |
-| `src/core/config/schema.rs` | modify | 加 `PrivacyConfig` struct（`#[hot_reload]`） |
+| `src/core/config.rs` | modify | 加 `PrivacyConfig` struct（`#[hot_reload]`） |
 | `Cargo.toml` | modify | 加 `regex = "1"`（若 baseline 未依赖；如已在 sha2 / jieba 依赖链中可传递，verify first） |
 | `tests/privacy_scrubbing.rs` (new) | create | 9 scenarios from spec |
 
@@ -279,7 +300,7 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 
 - [ ] **T3.1** verify `regex` crate is available（`cargo tree | grep regex`）；如无则加到 `Cargo.toml`
 - [ ] **T3.2** 写失败测试 `test_privacy_disabled_preserves_content_byte_identical`
-- [ ] **T3.3** 实现 `PrivacyConfig` 在 `config/schema.rs` + 标记 hot-reload
+- [ ] **T3.3** 实现 `PrivacyConfig` 在 `src/core/config.rs`（单文件，R1）+ 标记 hot-reload
 - [ ] **T3.4** 实现 `privacy::scrub` + 默认 pattern 库
 - [ ] **T3.5** 挂到 ingest pipeline（**关键顺序**：normalize → scrub → chunk）
 - [ ] **T3.6** 跑新增 `test_scrub_catches_cross_chunk_secret`（CSA R1 新 scenario）确认 pre-chunk 时机正确
@@ -304,8 +325,8 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 | `src/embed/retry.rs` (new) | create | 2s 固定间隔 retry loop + heartbeat callback |
 | `src/embed/alerting.rs` (new) | create | 阈值告警 + 脚本执行（热重载脚本路径） |
 | `src/embed/mod.rs` | modify | 默认改为 `OpenAiCompatibleEmbedder`；`model2vec-rs` 保留为 offline fallback |
-| `src/core/config/schema.rs` | modify | 加 `EmbedderConfig`（restart-required）+ `AlertingConfig`（hot-reload） |
-| `src/core/db.rs` | modify | 定义 `FORK_EXT_V2_SCHEMA_SQL`（`reindex_progress` 表 DDL）；往 `fork_ext_migrations()` 追加 `Migration { version: 2, sql: FORK_EXT_V2_SCHEMA_SQL }` |
+| `src/core/config.rs` | modify | 加 `EmbedderConfig`（restart-required）+ `AlertingConfig`（hot-reload）；**R1 单文件约束** |
+| `src/core/db_fork_ext.rs` | modify | 定义 `FORK_EXT_V2_SCHEMA_SQL`（`reindex_progress` 表 DDL）；往 `fork_ext_migrations()` 追加 `Migration { version: 2, sql: FORK_EXT_V2_SCHEMA_SQL }`；**`src/core/db.rs` 不变**（R2） |
 | `src/core/reindex.rs` (new) | create | `ReindexProgressStore` CRUD（resume checkpoint） |
 | `src/main.rs` | modify | `mempal reindex --embedder <name> [--resume]` 子命令 |
 | `tests/openai_compat_embedder.rs` (new) | create | scenarios |
@@ -317,7 +338,7 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 - [ ] **T4.1** 加 `reqwest` client 适配（已在 deps）
 - [ ] **T4.2** 写失败测试 `test_openai_compat_embed_happy_path`（mock server）
 - [ ] **T4.3** 实现 `OpenAiCompatibleEmbedder`（`/v1/embeddings` POST + `Qwen/Qwen3-Embedding-8B` model name）
-- [ ] **T4.4** 定义 `FORK_EXT_V2_SCHEMA_SQL` + `fork_ext_migrations()` 追加 ext-v2 entry（`reindex_progress` 表 DDL）；写 migration 测试
+- [ ] **T4.4** 在 `src/core/db_fork_ext.rs` 定义 `FORK_EXT_V2_SCHEMA_SQL` + `fork_ext_migrations()` 追加 ext-v2 entry（`reindex_progress` 表 DDL）；写 migration 测试；**不碰 `db.rs`**（R2）
 - [ ] **T4.5** 实现 2s 固定重试 + 每轮调 heartbeat callback（从 queue store 注入）
 - [ ] **T4.6** 实现 degraded 状态 + MCP `system_warnings` 注入
 - [ ] **T4.7** 实现告警阈值 + 脚本执行 + 路径热重载（消费 Phase 1 机制）
@@ -346,7 +367,7 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 | `src/daemon_bootstrap.rs` (new) | create | `DaemonContext::bootstrap()`（daemonize → runtime → db → tracing） |
 | `src/hook_install.rs` (new) | create | `mempal hook install --target <claude-code\|gemini-cli\|codex>` |
 | `src/main.rs` | modify | 顶层**禁用** `#[tokio::main]`；手动 `block_on` per-handler |
-| `src/core/config/schema.rs` | modify | `HooksConfig` + `HooksSessionEndConfig` |
+| `src/core/config.rs` | modify | `HooksConfig` + `HooksSessionEndConfig` |
 | `Cargo.toml` | modify | 加 `daemonize = "0.5"`；`libc`, `nix` verify 已在 deps |
 | `tests/hook_enqueue.rs` (new) | create | hook payload envelope + enqueue scenarios |
 | `tests/daemon_lifecycle.rs` (new) | create | start/stop/SIGTERM/reclaim_stale/DaemonContext 启动序检查 |
@@ -362,11 +383,16 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 - [ ] **T5.6** 实现 `mempal daemon` worker loop + handler 映射
 - [ ] **T5.7** 实现 truncated envelope → marker drawer path（不走重试）
 - [ ] **T5.8** 实现 privacy scrub 对 envelope preview 生效（验证跨 spec 集成）
-- [ ] **T5.9** 实现 `mempal hook install --target claude-code`（**关键**：append-to-array，**不**覆盖 upstream cowork hook）
+- [ ] **T5.9** 实现 `mempal hook install --target claude-code`——**关键三点**（gemini 2026-04-20 Part 1 + Part 3 #3）：
+  - **本地优先**：若 `<cwd>/.claude/settings.json` 存在（无论是 regular file 还是 symlink），写入本地；否则 fallback 写 `~/.claude/settings.json`（原设计）。理由：upstream `215b62f` 已将本地 `.claude/settings.json` 作为 tracked blob commit 到仓库，本地优先会直接被 Claude Code pick up 且不被 global shadow
+  - **symlink 感知**：若目标是 symlink，`canonicalize()` 到真实文件再读写。尊重用户习惯（用户常用 `git config core.excludesfile ~/.gitignore_noai` + `.claude/settings.json` 软链到独立 tracked 仓库）
+  - **append-to-array**：`hooks.UserPromptSubmit` / `hooks.PostToolUse` 等是数组，**push** fork 的 entry，**不覆盖** upstream 的 `mempal cowork-drain` entry
 - [ ] **T5.10** 实现 install --dry-run / uninstall（可选，stretch）
 - [ ] **T5.11** integration test：daemon crash → reclaim_stale
 - [ ] **T5.12** integration test：SIGTERM 优雅退出
-- [ ] **T5.13** integration test：hook install 合并 existing settings 且与 `mempal cowork-install-hooks` 共存
+- [ ] **T5.13** integration test `test_hook_install_respects_project_local_settings`：在 repo 里有 `.claude/settings.json`（tracked）时，install 写本地不写全局
+- [ ] **T5.13b** integration test `test_hook_install_follows_symlink_target`：`.claude/settings.json` 是 symlink 到 `drafts/claude-settings.json`，install 编辑目标文件不破坏 symlink
+- [ ] **T5.13c** integration test `test_hook_install_coexists_with_upstream_cowork_entry`：已含 upstream `user-prompt-submit.sh` 的 UserPromptSubmit 数组，install 后既有 entry 保留 + fork entry 追加
 - [ ] **T5.14** clippy / fmt / PR
 
 **Done when**: `mempal hook hook_post_tool < payload.json` enqueue；`mempal daemon --foreground` 消费并写 drawer；`mempal hook install --target claude-code` 注入不覆盖。
