@@ -8,6 +8,7 @@ pub mod normalize;
 use std::path::{Path, PathBuf};
 
 use crate::core::{
+    config::ConfigHandle,
     db::Database,
     types::{Drawer, SourceType},
     utils::{build_drawer_id, current_timestamp, route_room_from_taxonomy},
@@ -164,6 +165,8 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             path: path.to_path_buf(),
             source,
         })?;
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let scrubbed = config.scrub_content_with_compiled(&normalized, compiled_privacy.as_ref());
     let resolved_room = match options.room {
         Some(room) => room.to_string(),
         None => {
@@ -173,14 +176,14 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
                     wing: wing.to_string(),
                     source,
                 })?;
-            route_room_from_taxonomy(&normalized, wing, &taxonomy)
+            route_room_from_taxonomy(&scrubbed, wing, &taxonomy)
         }
     };
     let chunks = match format {
         Format::ClaudeJsonl | Format::ChatGptJson | Format::CodexJsonl | Format::SlackJson => {
-            chunk_conversation(&normalized)
+            chunk_conversation(&scrubbed)
         }
-        Format::PlainText => chunk_text(&normalized, CHUNK_WINDOW, CHUNK_OVERLAP),
+        Format::PlainText => chunk_text(&scrubbed, CHUNK_WINDOW, CHUNK_OVERLAP),
     };
     if chunks.is_empty() {
         return Ok(IngestStats {

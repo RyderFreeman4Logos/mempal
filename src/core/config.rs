@@ -64,30 +64,54 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        for pattern in &self.privacy.scrub_patterns {
-            Regex::new(&pattern.pattern).map_err(|source| ConfigError::InvalidRegex {
-                name: pattern.name.clone(),
-                source,
-            })?;
-        }
+        let _ = self.compile_privacy()?;
         Ok(())
     }
 
+    pub fn compile_privacy(&self) -> Result<CompiledPrivacyConfig, ConfigError> {
+        let patterns = self
+            .privacy
+            .scrub_patterns
+            .iter()
+            .map(|pattern| {
+                Regex::new(&pattern.pattern)
+                    .map(|regex| (pattern.name.clone(), regex))
+                    .map_err(|source| ConfigError::InvalidRegex {
+                        name: pattern.name.clone(),
+                        source,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(CompiledPrivacyConfig {
+            enabled: self.privacy.enabled,
+            patterns,
+        })
+    }
+
     pub fn scrub_content(&self, input: &str) -> String {
-        if !self.privacy.enabled {
+        match self.compile_privacy() {
+            Ok(compiled) => self.scrub_content_with_compiled(input, &compiled),
+            Err(_) => input.to_string(),
+        }
+    }
+
+    pub fn scrub_content_with_compiled(
+        &self,
+        input: &str,
+        compiled: &CompiledPrivacyConfig,
+    ) -> String {
+        if !self.privacy.enabled || !compiled.enabled || compiled.patterns.is_empty() {
             return input.to_string();
         }
 
-        self.privacy
-            .scrub_patterns
+        compiled
+            .patterns
             .iter()
-            .fold(input.to_string(), |content, pattern| {
-                match Regex::new(&pattern.pattern) {
-                    Ok(regex) => regex
-                        .replace_all(&content, format!("[REDACTED:{}]", pattern.name))
-                        .into_owned(),
-                    Err(_) => content,
-                }
+            .fold(input.to_string(), |content, (name, regex)| {
+                regex
+                    .replace_all(&content, format!("[REDACTED:{name}]"))
+                    .into_owned()
             })
     }
 
@@ -147,11 +171,51 @@ impl Default for EmbedConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PrivacyConfig {
     pub enabled: bool,
     pub scrub_patterns: Vec<ScrubPattern>,
+}
+
+impl PrivacyConfig {
+    fn default_scrub_patterns() -> Vec<ScrubPattern> {
+        vec![
+            ScrubPattern {
+                name: "private_tag".to_string(),
+                pattern: r"(?is)<private>.*?</private>".to_string(),
+            },
+            ScrubPattern {
+                name: "openai_key".to_string(),
+                pattern: r"sk-[A-Za-z0-9]{32,}".to_string(),
+            },
+            ScrubPattern {
+                name: "anthropic_key".to_string(),
+                pattern: r"sk-ant-[A-Za-z0-9_-]{64,}".to_string(),
+            },
+            ScrubPattern {
+                name: "aws_access".to_string(),
+                pattern: r"AKIA[0-9A-Z]{16}".to_string(),
+            },
+            ScrubPattern {
+                name: "bearer_token".to_string(),
+                pattern: r"Bearer\s+[A-Za-z0-9._-]{20,}".to_string(),
+            },
+            ScrubPattern {
+                name: "hex_token".to_string(),
+                pattern: r"\b[a-f0-9]{32,}\b".to_string(),
+            },
+        ]
+    }
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scrub_patterns: Self::default_scrub_patterns(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -159,6 +223,12 @@ pub struct ScrubPattern {
     pub name: String,
     #[serde(alias = "regex")]
     pub pattern: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledPrivacyConfig {
+    enabled: bool,
+    patterns: Vec<(String, Regex)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -242,6 +312,19 @@ impl ConfigHandle {
 
     pub fn current() -> Arc<Config> {
         super::hot_reload::global_hot_reload_state().current()
+    }
+
+    pub fn current_compiled_privacy() -> Arc<CompiledPrivacyConfig> {
+        super::hot_reload::global_hot_reload_state().current_compiled_privacy()
+    }
+
+    pub fn current_privacy_snapshot() -> (Arc<Config>, Arc<CompiledPrivacyConfig>) {
+        super::hot_reload::global_hot_reload_state().current_privacy_snapshot()
+    }
+
+    pub fn scrub_content(input: &str) -> String {
+        let (config, compiled) = Self::current_privacy_snapshot();
+        config.scrub_content_with_compiled(input, compiled.as_ref())
     }
 
     pub fn snapshot_meta() -> ConfigSnapshotMeta {
