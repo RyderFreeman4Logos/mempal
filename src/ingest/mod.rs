@@ -2,6 +2,7 @@
 
 pub mod chunk;
 pub mod detect;
+pub mod lock;
 pub mod normalize;
 
 use std::path::{Path, PathBuf};
@@ -23,11 +24,27 @@ use crate::ingest::{
 const CHUNK_WINDOW: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
 
+/// Max wait for per-source ingest lock before returning LockError::Timeout.
+const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Derive `mempal_home` from the DB path by taking the parent of
+/// `palace.db`. Falls back to `./` on unusual layouts.
+fn mempal_home_from_db(db: &Database) -> PathBuf {
+    db.path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IngestStats {
     pub files: usize,
     pub chunks: usize,
     pub skipped: usize,
+    /// Time waited acquiring the per-source ingest lock (P9-B). `None`
+    /// when the lock was bypassed (e.g. dry-run) or when no wait was
+    /// needed and the path took the fast exit before lock acquisition.
+    pub lock_wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -83,6 +100,8 @@ pub enum IngestError {
         #[source]
         source: crate::core::db::DbError,
     },
+    #[error("failed to acquire ingest lock: {0}")]
+    Lock(#[from] lock::LockError),
     #[error("failed to read directory {path}")]
     ReadDir {
         path: PathBuf,
@@ -175,6 +194,20 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         ..IngestStats::default()
     };
     let source_file = normalize_source_file(path, options.source_root);
+
+    // Per-source ingest lock (P9-B). Guards dedup-check + insert critical
+    // section against concurrent Claude↔Codex ingests of the same source.
+    // Skip in dry-run — no writes happen there, so race is impossible.
+    let _lock_guard = if options.dry_run {
+        None
+    } else {
+        let home = mempal_home_from_db(db);
+        let key = lock::source_key(Path::new(&source_file));
+        let guard = lock::acquire_source_lock(&home, &key, LOCK_TIMEOUT)?;
+        stats.lock_wait_ms = Some(guard.wait_duration().as_millis() as u64);
+        Some(guard)
+    };
+
     let mut pending = Vec::new();
 
     for (chunk_index, chunk) in chunks.iter().enumerate() {

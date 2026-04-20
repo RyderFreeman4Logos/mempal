@@ -98,6 +98,11 @@ pub struct IngestResponse {
     pub drawer_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate_warning: Option<DuplicateWarning>,
+    /// Milliseconds spent waiting for the per-source ingest lock (P9-B).
+    /// Omitted in dry-run and when lock was not acquired. When > 0, a
+    /// concurrent ingest of the same content serialized with this call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -249,6 +254,53 @@ impl From<crate::cowork::PeekMessage> for PeekMessageDto {
             text: m.text,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CoworkPushRequest {
+    /// The message content to deliver. Maximum 8 KB. Short status updates,
+    /// decision summaries, or drawer_id pointers. Do NOT push search results
+    /// or large reasoning blocks — see Rule 10 in MEMORY_PROTOCOL.
+    pub content: String,
+
+    /// Target agent: "claude" or "codex". OMIT to infer partner from MCP
+    /// client identity (Claude → Codex, Codex → Claude). Self-push is rejected.
+    #[serde(default)]
+    pub target_tool: Option<String>,
+
+    /// Absolute filesystem path of the project cwd this push is scoped to.
+    /// Internally normalized to git repo root via `project_identity()` so
+    /// subdirectory callers land on the same inbox as repo-root callers.
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkPushResponse {
+    pub target_tool: String,
+    pub inbox_path: String,
+    pub pushed_at: String,
+    pub inbox_size_after: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct FactCheckRequest {
+    /// Text to check for contradictions against KG triples + known entities.
+    pub text: String,
+    /// Optional wing filter for known-entity scope. OMIT unless you have
+    /// already seen the exact wing name via mempal_status.
+    pub wing: Option<String>,
+    /// Optional room filter within a wing. OMIT unless explicitly named.
+    pub room: Option<String>,
+    /// Optional RFC3339 timestamp for the `now` cutoff used by
+    /// StaleFact detection. OMIT to use current UTC time.
+    pub now: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FactCheckResponse {
+    pub issues: Vec<crate::factcheck::FactIssue>,
+    pub checked_entities: Vec<String>,
+    pub kg_triples_scanned: usize,
 }
 
 impl SearchResultDto {

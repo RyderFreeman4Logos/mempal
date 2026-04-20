@@ -434,15 +434,19 @@ mempal serve --mcp
 
 If `mempal` was built without the `rest` feature, plain `mempal serve` behaves the same way.
 
-The MCP server exposes seven tools:
+The MCP server exposes nine tools:
 
 - `mempal_status` — state + protocol + AAAK spec
-- `mempal_search` — hybrid search (BM25 + vector + RRF) with tunnel hints
+- `mempal_search` — hybrid search (BM25 + vector + RRF) with tunnel hints and AAAK-derived structured signals (`entities` / `topics` / `flags` / `emotions` / `importance_stars`)
 - `mempal_ingest` — store memories with optional importance (0-5) and dry_run
 - `mempal_delete` — soft-delete with audit
 - `mempal_taxonomy` — list or edit routing keywords
 - `mempal_kg` — knowledge graph: add/query/invalidate/timeline/stats
 - `mempal_tunnels` — cross-wing room discovery
+- `mempal_peek_partner` — read the partner coding agent's live session (Claude ↔ Codex); pure read, never writes to mempal
+- `mempal_cowork_push` — send a short handoff message (≤ 8 KB) to the partner agent's inbox; delivered at the partner's next UserPromptSubmit via a drain hook
+
+The server also embeds MEMORY_PROTOCOL (10 behavioral rules) in the MCP `initialize.instructions` field so any MCP client learns the workflow on connect — zero configuration.
 
 Example request shapes:
 
@@ -493,6 +497,46 @@ Soft-delete a drawer:
 ```
 
 `mempal_status` also returns the self-describing memory protocol and a dynamically generated AAAK spec so AI clients can learn the tool without a hardcoded prompt.
+
+## Agent Cowork (peek + push)
+
+Two coding agents running on the same repo — typically Claude Code and Codex — can collaborate through two primitives:
+
+- **`mempal_peek_partner`** (P6) — read the partner's live session file without storing anything in mempal. Use for "what is partner currently doing" questions.
+- **`mempal_cowork_push`** (P8) — send a short handoff (≤ 8 KB) to the partner's inbox. The partner sees it prepended to their next user prompt via a UserPromptSubmit hook. Use for "make sure partner notices X" status updates that are too transient for an ingest drawer.
+
+### Install hooks
+
+Hooks land the pushed message into the partner's next prompt automatically. Install once per repo (run at the repo root):
+
+```bash
+mempal cowork-install-hooks --global-codex
+```
+
+This writes two Claude-side artifacts (both required — Claude Code does not auto-discover bare hook scripts):
+
+- `.claude/hooks/user-prompt-submit.sh` — the drain script
+- an entry in `.claude/settings.json` under `hooks.UserPromptSubmit` registering the script
+
+and merges the equivalent entry into `~/.codex/hooks.json` (top-level `hooks.UserPromptSubmit` with `{type:"command", command:"mempal cowork-drain --target codex --format codex-hook-json --cwd-source stdin-json"}`).
+
+Re-running is idempotent and self-heals stale/wrong drain entries from prior mempal versions, preserving any unrelated hooks already in those files.
+
+### Check current state
+
+```bash
+mempal cowork-status --cwd "$PWD"
+```
+
+Lists both inbox targets (`claude` and `codex`) for the given cwd along with message counts, byte sizes, and a preview. Read-only — does not drain.
+
+### Known limitations
+
+- **Codex `codex_hooks` feature flag**: Codex's hooks runtime is gated behind the `codex_hooks` feature flag ("under development" in current shipped `codex-cli`). If the flag is off, Codex silently ignores `~/.codex/hooks.json`. `install-hooks` detects this and prints an activation prompt (`codex features enable codex_hooks`).
+- **TUI restart required on Codex side**: Codex caches `config.toml` + `hooks.json` at TUI startup only. After changing the feature flag or running `install-hooks`, fully quit and relaunch Codex before new hooks take effect.
+- **MCP server re-spawn required in Claude Code**: Claude Code spawns the mempal MCP server at client startup. After upgrading the mempal binary, restart Claude Code so the MCP server respawns with the new tool list (notably `mempal_cowork_push`).
+- **Claude ↔ Codex scope**: `mempal_cowork_push` requires the MCP client to identify itself as `claude-code` or `codex` (or their recognized aliases). Generic MCP clients cannot push because caller identity is required to fill the message `from` field and enforce self-push rejection. This is by design for the Claude ↔ Codex pair.
+- **At-next-submit, not real-time**: a push is visible on the partner's *next* user prompt turn — never mid-turn. Codex's TUI will not re-render to inject a message on an external trigger.
 
 ## REST Server
 

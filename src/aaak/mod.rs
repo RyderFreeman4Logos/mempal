@@ -1,6 +1,6 @@
 #![warn(clippy::all)]
 
-mod codec;
+pub(crate) mod codec;
 mod model;
 mod parse;
 pub mod signals;
