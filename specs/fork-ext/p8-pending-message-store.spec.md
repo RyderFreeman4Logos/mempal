@@ -29,16 +29,19 @@ estimate: 2d
       next_attempt_at INTEGER NOT NULL, -- unix seconds; indexed
       last_error TEXT,                  -- latest error message
       created_at INTEGER NOT NULL,
+      heartbeat_at INTEGER,             -- unix seconds; worker refresh while processing (NULL if pending)
       CHECK (status IN ('pending','claimed','failed'))
   );
   CREATE INDEX idx_pending_next_attempt ON pending_messages(status, next_attempt_at);
+  CREATE INDEX idx_pending_heartbeat ON pending_messages(status, heartbeat_at) WHERE status='claimed';
   ```
 - 公共 API：
   - `enqueue(kind: &str, payload: &str) -> Result<String>` 返回新消息 ULID，写入时 `status='pending'`, `next_attempt_at=now`
   - `claim_next(worker_id: &str, claim_ttl_secs: i64) -> Result<Option<ClaimedMessage>>` 原子更新（SELECT + UPDATE in txn）一条 `status='pending' AND next_attempt_at <= now` 的消息，标为 `claimed`
   - `confirm(id: &str) -> Result<()>` 处理成功，DELETE 该行
   - `mark_failed(id: &str, error: &str) -> Result<()>` 处理失败，`retry_count += 1`，`next_attempt_at = now + backoff(retry_count)`，`status='pending'`（重新可领取）；超过 `max_retries` 时 `status='failed'` 永久保留供审计
-  - `reclaim_stale(older_than_secs: i64) -> Result<u64>` 把 `claimed` 但 `claimed_at < now - older_than_secs` 的消息回滚到 `pending`（进程崩溃恢复）
+  - `refresh_heartbeat(id: &str, worker_id: &str) -> Result<()>` 把 `heartbeat_at` 更新到 now；**必须**在 worker 每次 embedder 重试循环、每次慢处理等耗时步骤之间调用（建议频率 2-5s），否则 `reclaim_stale` 会把消息视为崩溃回滚。Worker 如持续 "正在重试" 必须持续 heartbeat——这就是嵌入器 2s 固定间隔重试与队列 claim TTL 共存的唯一正确协议（见 `p8-embed-qwen3-backend.spec.md` Intent "与 pending-message-store 的协议")。
+  - `reclaim_stale(stale_secs: i64) -> Result<u64>` 把 `claimed` 但 `heartbeat_at IS NULL OR heartbeat_at < now - stale_secs` 的消息回滚到 `pending`（**仅在 heartbeat 静默超阈值时触发，不再用 `claimed_at`**；rationale：嵌入器 2s 固定重试下，worker 处理时长可能远超 claim TTL，用 heartbeat 判 "worker 是否还活着" 才是正确不变量——CSA tier-4 design review 2026-04-20 识别的 blocker 1 修复）
 - 指数退避公式：`backoff(n) = min(base_delay_secs * 2^n, max_delay_secs)`，默认 `base=5`, `max=3600`, `max_retries=10`
 - Claim atomicity：用单一 `UPDATE ... WHERE id = (SELECT id FROM ... ORDER BY next_attempt_at LIMIT 1) RETURNING *` 或等价 txn 保证无两 worker 抢同一消息
 - SQLite 必须在 WAL 模式（`PRAGMA journal_mode=WAL`）。**事实核查**：截至 P7，`crates/mempal-core/src/db.rs` 的 `Database::open` 仅设 `PRAGMA foreign_keys=ON`，**未**启用 WAL。本 spec 同时在 `Database::open` 初始化路径追加 `PRAGMA journal_mode=WAL` 和 `PRAGMA synchronous=NORMAL`（后者是 WAL 下的推荐性能档：崩溃保 WAL 不保最后一次 commit 到磁盘，写入并发显著提升）；不追加 WAL 就谈不上队列无锁竞争
@@ -129,16 +132,26 @@ Scenario: mark_failed 指数退避
   And `status == 'pending'`（可重新被 claim）
   And `last_error == "timeout"`
 
-Scenario: reclaim_stale 把崩溃 worker 的 claim 回滚
+Scenario: reclaim_stale 把 heartbeat 静默的 worker claim 回滚（崩溃恢复）
   Test:
-    Filter: test_reclaim_stale_rolls_back_expired_claims
+    Filter: test_reclaim_stale_rolls_back_on_heartbeat_silence
     Level: integration
     Targets: crates/mempal-core/src/queue.rs
-  Given 一条被 claim 的消息，`claimed_at = now - 120`
+  Given 一条被 claim 的消息，`heartbeat_at = now - 120`（worker 进程崩溃，heartbeat 静默）
   When 调 `store.reclaim_stale(60)`
   Then 返回值 == "1"
-  And 该行 `status == 'pending'` 且 `claimed_at IS NULL`
+  And 该行 `status == 'pending'` 且 `claimed_at IS NULL` 且 `heartbeat_at IS NULL`
   And 该行 `retry_count` 未变
+
+Scenario: reclaim_stale 不回滚正在 heartbeat 的 claim（嵌入器重试期间保护）
+  Test:
+    Filter: test_reclaim_stale_preserves_heartbeating_claim
+    Level: integration
+    Targets: crates/mempal-core/src/queue.rs
+  Given 一条被 claim 的消息，`claimed_at = now - 300`（claim 已 300s）但 `heartbeat_at = now - 3`（3s 前刚 heartbeat 过——embedder 还在重试中）
+  When 调 `store.reclaim_stale(60)`
+  Then 返回值 == "0"（不回滚）
+  And 该行 `status == 'claimed'` 不变
 
 Scenario: 超过 max_retries 后状态变为 failed 永久保留
   Test:
