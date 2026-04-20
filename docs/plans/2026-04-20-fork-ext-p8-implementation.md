@@ -58,33 +58,41 @@ src/
 
 ### D2. Schema 版本冲突——采用 Fork Namespace 方案
 
-**事实**：
-- fork main 和 upstream main 当前都在 `CURRENT_SCHEMA_VERSION = 4`
+**事实**（已 verify `src/core/db.rs`，2026-04-20）：
+- fork main 和 upstream main 都在 `const CURRENT_SCHEMA_VERSION: u32 = 4;`（`src/core/db.rs` line 11）
+- upstream 版本控制用的是 **SQLite 内置 `PRAGMA user_version`（单 u32 槽位）**，**没有 `schema_meta` 表**。`read_user_version` / `set_user_version` 位于 `db.rs` line 727/732
+- 迁移链线性：V1（全量 schema）→ V2（`deleted_at`）→ V3（FTS5 + triggers）→ V4（`importance` 列）
 - upstream `specs/p10-explicit-tunnels.spec.md` 计划 v5，`specs/p10-normalize-version.spec.md` 计划 v6——但**都是 draft 未 ship**
-- fork-ext chain 计划 v7(queue) → v8(gating) → v9(novelty) → v10(vector-iso)
+- fork-ext chain 计划 ext-v1(queue) → ext-v2(gating) → ext-v3(novelty) → ext-v4(vector-iso)
 
-**选定方案：独立版本号命名空间**（其他方案见下方 "Rejected Alternatives"）：
+**选定方案：独立版本号命名空间 + 新建 fork_ext_meta K-V 表**（其他方案见下方 "Rejected Alternatives"）：
 
 ```rust
 // src/core/db.rs
-const UPSTREAM_SCHEMA_VERSION: u32 = 4;       // upstream's axis
-const FORK_EXT_SCHEMA_VERSION: u32 = 0;       // fork-ext's axis, starts at 0 (= no fork migrations applied)
-                                               // P8-queue bumps to 1; P9-gating to 2; P9-novelty to 3; P10-vector-iso to 4
+const CURRENT_SCHEMA_VERSION: u32 = 4;        // upstream axis —— 不改，继续由 PRAGMA user_version 管
+const FORK_EXT_SCHEMA_VERSION: u32 = 0;       // fork-ext axis，bootstrap 落在 fork_ext_meta
+                                               // ext-v1=queue; ext-v2=gating; ext-v3=novelty; ext-v4=vector-iso
 ```
 
-- `schema_meta` 表加 `fork_ext_version INTEGER NOT NULL DEFAULT 0` 列（在一个 v4→v5 无副作用的 upstream 兼容 migration 里）
-  - 或更干脆：复用既有 `schema_meta.key='fork_ext_version'` K-V 存（mempal 现有结构允许）
-- migration runner 分两条链：upstream 链走 `schema_version`，fork-ext 链走 `fork_ext_version`；两者独立 idempotent 升
-- Upstream 将来 ship v5 `explicit-tunnels`、v6 `normalize-version` 时，fork sync 过来**无冲突**（独立 axis）
-- 当前 `drawers` / `drawer_vectors` 等既有表由 upstream axis 管理；pending_messages / gating_audit / novelty_audit / `drawers.project_id` 列由 fork_ext axis 管理
-  - 例外：`drawers.project_id` 是对 upstream 表的列添加——这一条归 fork_ext 链，加列时 `ALTER TABLE drawers ADD COLUMN project_id TEXT` 独立于 upstream 链
+- 新建 `fork_ext_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)` K-V 表，作为 **fork-ext 轴的 bootstrap**
+  - 读写 `fork_ext_version`：`SELECT value FROM fork_ext_meta WHERE key='fork_ext_version'`（缺失视为 0）
+  - 该表 DDL 本身是 fork-ext ext-v0 → ext-v1 迁移的一部分——幂等 `CREATE TABLE IF NOT EXISTS`，首次即建好
+  - 未来 fork 独有的元数据（比如 degraded 状态时间戳、config_version 持久化等）也能塞这张 K-V 表，无需 ALTER
+- migration runner **两套独立函数**：
+  - `apply_migrations(conn)` —— 既有，读写 `PRAGMA user_version`，upstream 链
+  - `apply_fork_ext_migrations(conn)` —— 新增，读写 `fork_ext_meta`，fork-ext 链
+  - `open()` 里先调 upstream，再调 fork-ext（或反之，顺序不重要——两者无交叉依赖，idempotent）
+- Upstream 将来 ship v5/v6 时，fork sync 过来**零冲突**（独立 axis，`PRAGMA user_version` 完全不动）
+- `drawers` / `drawer_vectors` / `triples` / `taxonomy` 等既有表由 upstream axis 管理；pending_messages / gating_audit / novelty_audit / fork_ext_meta 由 fork_ext axis 管理
+  - 例外：`drawers.project_id` 是对 upstream 表的 `ALTER TABLE ADD COLUMN`——由 fork_ext ext-v4 执行，独立于 upstream 链（`ALTER ADD COLUMN` 天然向前兼容，不会阻挡 upstream 将来 v5/v6）
 
 **Rejected Alternatives**：
 
 - (A) 等 upstream 先 ship v5/v6 — fork 无限期阻塞，不可接受
 - (B) 插 v5/v6 placeholder no-op migration — 当 upstream 真 ship v5/v6 时，已 passed-through 的 fork db 永远拿不到 upstream 的真实 DDL（除非再写 retrofit 脚本），复杂且脆弱
 - (C) renumber fork chain 到 v9/v10/v11/v12 留出 upstream 空间 — upstream 未来的 v7/v8 还是可能再撞
-- (D, 选定) 独立 axis — 一次性根除整类冲突，infrastructure 成本 ~40 LoC
+- (D-naive) 复用 `PRAGMA user_version` 高低位（前 16 位 fork、后 16 位 upstream）— 脆弱、对 upstream 不透明，一旦 upstream 直接写 `PRAGMA user_version = 5` 就把 fork 位覆盖
+- (E, 选定) 独立 axis + 新建 `fork_ext_meta` K-V 表 — 一次性根除整类冲突，infrastructure 成本 ~50 LoC，下一节 Phase 0 交付
 
 ### D3. 实现顺序：`config-hot-reload` 最先
 
@@ -102,13 +110,21 @@ const FORK_EXT_SCHEMA_VERSION: u32 = 0;       // fork-ext's axis, starts at 0 (=
 
 | Crate | 版本 | 用途 | 阶段 |
 |-------|------|------|------|
-| `arc-swap` | `1.7` | `ArcSwap<Config>` lock-free atomic replacement | 1 |
-| `notify` | `6` | fs-watch for config.toml | 1 |
-| `blake3` | `1.5` | config_version hash | 1 |
-| `daemonize` | `0.5` | fork + setsid + fd redirect（Unix only，Windows fallback no-op） | 5 |
-| `libc` | `0.2` | flock 已用（p9-ingest-lock），daemonize 用到 sigaction | 5（已间接依赖） |
+| `arc-swap` | `1` | `ArcSwap<Config>` lock-free atomic replacement（当前 1.9.1） | 1 |
+| `notify` | `8` | fs-watch for config.toml（当前 stable 8.2.0，9.x 仍 RC） | 1 |
+| `blake3` | `1` | config_version hash（当前 1.8.4） | 1 |
+| `daemonize` | `0.5` | fork + setsid + fd redirect（Unix only；Windows 分支 cfg-off） | 5 |
+| `libc` | `0.2` | daemonize 用到 sigaction；既有 `flock` 使用路径需重新声明（目前通过 rusqlite 间接取） | 5 |
 
 Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[workspace.dependencies]`）。新依赖直接加到 `[dependencies]`。
+
+**Resolution 验证**（`cargo add --dry-run arc-swap@1 notify@8 blake3@1 daemonize@0.5`，2026-04-20）：4 个 crate 与现有依赖（rusqlite 0.37、serde 1、tokio 1、reqwest 0.12、rmcp 1.3、model2vec-rs 0.1、sqlite-vec 0.1.9 等）无 version 冲突，MSRV 1.85 满足。
+
+**Features 默认取值**：
+- `notify = "8"` → 默认启用 `fsevent-sys` + `macos_fsevent`（macOS），Linux 走 `inotify` 无额外 feature；**不启 `serde`**（配置 parse 独立走 `toml`）；考虑是否启 `crossbeam-channel` 代替默认 `std::sync::mpsc`（留 T1.5 实现时决定，默认不启）
+- `blake3 = "1"` → 默认启 `std`；**不启 `rayon`**（配置文件 < 10KB，并行 overhead 不值）
+- `arc-swap = "1"` → 默认无 feature
+- `daemonize = "0.5"` → 无 feature 开关
 
 ### D5. TDD 节奏 = 沿用 P5-P9 upstream
 
@@ -118,9 +134,50 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 
 ### D6. 分支策略
 
-- `feat/fork-ext/p8-config-hot-reload` → PR → merge → 下一条
-- 5 个 spec 5 个 PR，顺序线性 merge
+- `feat/fork-ext/foundation-schema-axis` → Phase 0
+- `feat/fork-ext/p8-config-hot-reload` → Phase 1 → merge → 下一条
+- 1（Phase 0）+ 5（Phase 1-5 specs）= 6 个 PR，顺序线性 merge
 - **不开 epic 分支**（epic branch 会让 reviewer 看不到增量，且 schema 迁移在 epic 里容易出乱）
+
+---
+
+## Phase 0 — Fork-ext 版本轴 Foundation（0.5d）
+
+**Source**: 本 plan D2（不对应单独 spec——纯 infrastructure）
+**Branch**: `feat/fork-ext/foundation-schema-axis`
+**Rationale**: 先把 fork-ext 迁移轴的脚手架搭好，Phase 2 起每个 spec 只需往 `fork_ext_migrations()` 数组塞一行 + 一段 SQL，不再碰 infrastructure。单独开 PR 让 reviewer 看到纯净的版本轴变更，与功能变更解耦。
+
+### File Structure
+
+| 文件 | 动作 | 职责 |
+|------|------|------|
+| `src/core/db.rs` | modify | 新增 `FORK_EXT_SCHEMA_VERSION` 常量、`fork_ext_migrations()`、`read_fork_ext_version`、`set_fork_ext_version`、`apply_fork_ext_migrations`；`open()` 里调用一次 |
+| `tests/fork_ext_schema_axis.rs` (new) | create | 3 scenarios：fresh DB → ext_v=0，bootstrap → ext_v=0，独立于 user_version |
+
+### Tasks
+
+- [ ] **T0.1** 写失败测试 `test_fork_ext_version_is_zero_on_fresh_db`（fresh DB → `apply_fork_ext_migrations` 跑完 → `fork_ext_version=0`，因为 Phase 0 只建表不注册业务 migration）
+- [ ] **T0.2** 实现 `fork_ext_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)` 表创建 + `read_fork_ext_version` / `set_fork_ext_version` helpers（表不存在时视为 0，便于幂等首次 bootstrap）
+- [ ] **T0.3** 实现 `apply_fork_ext_migrations(conn)`：建 `fork_ext_meta`（IF NOT EXISTS）→ 读 `fork_ext_version` → 遍历 `fork_ext_migrations()` 数组跑未应用的 → 写回 `fork_ext_version`；Phase 0 里数组是**空的**，`fork_ext_version` 保持 0
+- [ ] **T0.4** 在 `Database::open` 里调 upstream `apply_migrations` 之后调用 `apply_fork_ext_migrations`
+- [ ] **T0.5** 写测试 `test_apply_fork_ext_migrations_idempotent`（调两次，`fork_ext_meta` 不重复建、`fork_ext_version` 不错误升）
+- [ ] **T0.6** 写测试 `test_upstream_user_version_unchanged_after_fork_ext_bootstrap`（`PRAGMA user_version` 仍 = 4）
+- [ ] **T0.7** `cargo clippy --all-targets --all-features -- -D warnings` + `cargo fmt`
+- [ ] **T0.8** commit + push + PR：`feat(fork-ext): introduce independent schema version axis`
+
+**Done-when**：
+- `fork_ext_meta` 表存在，fresh DB + 既有 ingest/search tests 全绿（upstream 行为零回归）
+- `SELECT value FROM fork_ext_meta WHERE key='fork_ext_version'` → `'0'`（Phase 0 内无业务 migration）
+- `PRAGMA user_version` 仍 = 4
+- Phase 2 起每个 spec 在 `fork_ext_migrations()` 数组追加一行 `Migration { version, sql }` 即完成 schema 部分，不再动 runner / reader / setter
+
+**此后 Phase 2-5 的版本号映射**：
+- Phase 2 `p8-queue`：ext_v1（pending_messages 表）
+- Phase 3 `p8-privacy`：无 schema 变更
+- Phase 4 `p8-embed-qwen3`：无 schema 变更
+- Phase 5 `p8-hook`：无 schema 变更
+- 未来 `p9-gating`：ext_v2；`p9-novelty`：ext_v3；`p10-vector-iso`：ext_v4
+- spec 文档里写的 `schema_version == "7"/"8"/"9"/"10"` 在 impl 时统一翻译为 "fork_ext_version == 1/2/3/4"；spec 本身不动（保持上游 debate 产出的文字稳定），plan→impl 阶段建 migration ID 对照表
 
 ---
 
