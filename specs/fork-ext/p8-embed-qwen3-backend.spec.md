@@ -149,6 +149,10 @@ estimate: 2d
 - fork-ext `fork_ext_version` `1 → 2`：加 `reindex_progress` 表（fork-ext 独立版本轴；queue 先占 ext_v1）
 - reindex 也走固定 2s 重试策略
 - **reindex 失败不触发 degraded**（degraded 只针对常规 ingest / search 路径）——reindex 是一次性批处理
+- **reindex 运行中的并发读写协议**（gemini 2026-04-20 策略审查 Part 3 #2）：`reindex_progress.reindex_in_progress = true` 期间 dim 可能混用（一部分 drawer 是新 dim，一部分还是老 dim），若让 search / ingest 继续走向量路径会 crash（dim 不匹配）或静默返回错乱分数。必须：
+  - **search 路径**：跳过向量打分，fallback 到 BM25-only，`system_warnings` 明示 `"reindex_in_progress: search degraded to BM25 until completion"`。**禁止静默截断**——必须把 BM25 召回的全部 top-k 返回，否则 agent 会把"索引重建中"误判为"记忆不存在"（幻觉风险）
+  - **ingest 路径**：直接拒绝（`status = "rejected"` + `system_warnings`），提示调用方 reindex 完后重试。**不允许**用老 dim 或新 dim 写入"半新半旧"污染向量表
+  - **queue 路径**（若 hook / daemon 走 `PendingMessageStore`）：enqueue 照常，daemon 检测到 `reindex_in_progress` 暂停 claim，等 reindex 结束后一次处理——与 P8 queue spec 的 heartbeat 协议兼容（长等时 heartbeat 保活不被 reclaim）
 
 ### 默认值
 
@@ -411,6 +415,26 @@ Scenario: `mempal reindex` 全库 re-embed + resume
   And 再执行 `mempal reindex --embedder openai_compat --resume`
   Then 全 50 条 drawer 完成 re-embed，dim=4096
   And `fork_ext_version == "2"`
+
+Scenario: reindex 跑到一半时并发 search 走 BM25 fallback + ingest 要求重试
+  Test:
+    Filter: test_search_and_ingest_during_partial_reindex
+    Level: integration
+    Test Double: mock_http_server + paused_reindex_at_50_percent
+    Targets: crates/mempal-cli/src/reindex.rs, crates/mempal-search/src/hybrid.rs, crates/mempal-ingest/src/pipeline.rs
+  Given 100 条旧 drawer (dim=256)
+  And `reindex_progress` 表显示 `reindex_in_progress = true`，已完成 50/100 条（新 dim=4096），剩 50 条仍 dim=256
+  When **并发**执行 `mempal_search "foo"`（MCP 调用）
+  Then response 正常返回（不崩溃、不 timeout），`system_warnings` 含 `"reindex_in_progress: search degraded to BM25 until completion"`
+  And 向量打分部分**完全跳过**（否则 dim 混用会 crash 或返回错乱 score）——结果仅来自 BM25 + tunnel hints
+  And 返回结果集不静默截断（MUST 把 BM25 召回的全部 top-k 正常返回，否则 agent 会误判"记忆不存在"）
+  When **并发**执行 `mempal_ingest payload.md`
+  Then response 返回 `status = "rejected"` + `system_warnings` 含 `"reindex_in_progress: ingest paused, retry after completion"`
+  And payload **不**被写入 `drawers`（避免 dim 不匹配的"半新半旧"向量污染）
+  And `pending_messages`（若走 queue 路径）仍正常 enqueue，等 reindex 完成后 daemon 一次处理（协议兼容 P8 queue spec）
+  When reindex 完成（剩 50 条 re-embed 完，`reindex_in_progress = false`）
+  Then 后续 `mempal_search` 恢复向量 + BM25 混合检索，无 `system_warnings`
+  And 后续 `mempal_ingest` 恢复正常写入
 
 Scenario: 配置首次启动若缺 base_url/model 则 fail-fast
   Test:
