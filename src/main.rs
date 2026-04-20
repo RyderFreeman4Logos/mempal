@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "rest")]
@@ -155,6 +156,14 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         global_codex: bool,
     },
+    Hook {
+        #[command(subcommand)]
+        command: mempal::hook::HookCommands,
+    },
+    Daemon {
+        #[arg(long, default_value_t = false)]
+        foreground: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -214,9 +223,8 @@ enum BenchCommands {
     },
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    if let Err(error) = run() {
         eprintln!("error: {error}");
         for cause in error.chain().skip(1) {
             eprintln!("  caused by: {cause}");
@@ -225,7 +233,7 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<()> {
+fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Cowork commands must graceful-degrade without requiring palace.db
@@ -246,6 +254,12 @@ async fn run() -> Result<()> {
         Commands::CoworkInstallHooks { global_codex } => {
             return cowork_install_hooks_command(global_codex);
         }
+        Commands::Hook { command } => {
+            return mempal::hook::run_command(command);
+        }
+        Commands::Daemon { foreground } => {
+            return mempal::daemon::run_command(default_config_path(), foreground);
+        }
         // All other commands fall through to the db-backed dispatch below.
         _ => {}
     }
@@ -262,37 +276,41 @@ async fn run() -> Result<()> {
             wing,
             format,
             dry_run,
-        } => ingest_command(&db, config.as_ref(), &dir, &wing, format, dry_run).await,
+        } => block_on_result(ingest_command(
+            &db,
+            config.as_ref(),
+            &dir,
+            &wing,
+            format,
+            dry_run,
+        )),
         Commands::Search {
             query,
             wing,
             room,
             top_k,
             json,
-        } => {
-            search_command(
-                &db,
-                config.as_ref(),
-                &query,
-                wing.as_deref(),
-                room.as_deref(),
-                top_k,
-                json,
-            )
-            .await
-        }
+        } => block_on_result(search_command(
+            &db,
+            config.as_ref(),
+            &query,
+            wing.as_deref(),
+            room.as_deref(),
+            top_k,
+            json,
+        )),
         Commands::Delete { drawer_id } => delete_command(&db, &drawer_id),
         Commands::Purge { before } => purge_command(&db, before.as_deref()),
         Commands::WakeUp { format } => wake_up_command(&db, format.as_deref()),
         Commands::Compress { text } => compress_command(&text),
-        Commands::Bench { command } => bench_command(config.as_ref(), command).await,
+        Commands::Bench { command } => block_on_result(bench_command(config.as_ref(), command)),
         Commands::Reindex { embedder, resume } => {
-            reindex_command(&db, config.as_ref(), &embedder, resume).await
+            block_on_result(reindex_command(&db, config.as_ref(), &embedder, resume))
         }
         Commands::Kg { command } => kg_command(&db, command),
         Commands::Tunnels => tunnels_command(&db),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
-        Commands::Serve { mcp } => serve_command(config.as_ref(), mcp).await,
+        Commands::Serve { mcp } => block_on_result(serve_command(config.as_ref(), mcp)),
         Commands::Status => status_command(&db),
         Commands::FactCheck {
             path,
@@ -303,8 +321,19 @@ async fn run() -> Result<()> {
         // Cowork commands were already dispatched above and returned early.
         Commands::CoworkDrain { .. }
         | Commands::CoworkStatus { .. }
-        | Commands::CoworkInstallHooks { .. } => unreachable!(),
+        | Commands::CoworkInstallHooks { .. }
+        | Commands::Hook { .. }
+        | Commands::Daemon { .. } => unreachable!(),
     }
+}
+
+fn block_on_result<F, T>(future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::runtime::Runtime::new()
+        .context("failed to construct tokio runtime")?
+        .block_on(future)
 }
 
 async fn bench_command(config: &Config, command: BenchCommands) -> Result<()> {
