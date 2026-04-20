@@ -2,11 +2,21 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Bash",
         "hooks": [
           {
-            "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -q 'git commit'; then echo 'MEMPAL REMINDER: You just committed code. Call mempal_ingest to save the decision context (what was built, why, what was considered). Rule 4: SAVE AFTER DECISIONS.'; fi"
+            "command": "if echo \"$TOOL_INPUT\" | grep -q 'git commit'; then echo 'MEMPAL REMINDER: You just committed code. Call mempal_ingest to save the decision context (what was built, why, what was considered). Rule 4: SAVE AFTER DECISIONS.'; fi",
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "bash .claude/hooks/user-prompt-submit.sh",
+            "type": "command"
           }
         ]
       }

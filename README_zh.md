@@ -79,23 +79,30 @@ api_model = "nomic-embed-text"
 | `mempal reindex` | 切换模型后重新嵌入所有 drawer |
 | `mempal status` | 数据库统计、schema 版本、scope 分布 |
 | `mempal serve [--mcp]` | MCP 服务器（+ REST） |
+| `mempal cowork-install-hooks [--global-codex]` | 一键安装 Claude Code + Codex 的 UserPromptSubmit hook |
+| `mempal cowork-drain --target <claude\|codex>` | 排空 inbox（供 hook 调用，任意错误均 exit 0） |
+| `mempal cowork-status --cwd <PATH>` | 只读查看双方 inbox 当前状态 |
+| `mempal fact-check [PATH\|-] [--wing W] [--room R] [--now <UNIX_SECS>]` | 离线矛盾检查（对照 KG 三元组 + 已知 entity） |
 | `mempal bench longmemeval <FILE>` | LongMemEval 检索 benchmark |
 
-## MCP 服务器（7 个工具）
+## MCP 服务器（10 个工具）
 
 `mempal serve --mcp` 通过 Model Context Protocol 暴露：
 
 | 工具 | 用途 |
 |------|------|
 | `mempal_status` | 状态 + 协议 + AAAK spec（首次调用即教会 agent） |
-| `mempal_search` | 混合检索 + tunnel 提示 + 引用 |
-| `mempal_ingest` | 存记忆（可选 importance 0-5 + dry_run） |
+| `mempal_search` | 混合检索 + tunnel 提示 + 引用 + P7 的 AAAK 结构化 signals |
+| `mempal_ingest` | 存记忆（可选 importance 0-5 + dry_run）；并发写入时返回 `lock_wait_ms` |
 | `mempal_delete` | 软删除 + 审计 |
 | `mempal_taxonomy` | 路由关键词管理 |
 | `mempal_kg` | 知识图谱：add/query/invalidate/timeline/stats |
 | `mempal_tunnels` | 跨 Wing room 发现 |
+| `mempal_peek_partner` | 读 partner agent 当前 session（Claude ↔ Codex），纯只读 |
+| `mempal_cowork_push` | 向 partner agent inbox 投递短消息（at-next-submit 交付） |
+| `mempal_fact_check` | 离线矛盾检测（相似名 / 关系对立 / 时态失效，纯本地无 LLM） |
 
-服务器在 MCP `initialize.instructions` 中嵌入 MEMORY_PROTOCOL（9 条行为规则），任何 MCP 客户端自动接收。
+服务器在 MCP `initialize.instructions` 中嵌入 MEMORY_PROTOCOL（11 条行为规则），任何 MCP 客户端自动接收。
 
 ## 记忆协议
 
@@ -108,7 +115,33 @@ mempal 通过自描述教 agent 这些规则：
 3a. **翻译为英文** — 非英文查询先翻译再搜索
 4. **决策后保存** — 保存理由，不仅是结果
 5. **引用一切** — 引用 drawer_id 和 source_file
-5a. **记日记** — 在 wing="agent-diary" 记录行为观察
+5a. **记日记** — session 结束时在 `wing="agent-diary"` 下记行为观察
+8. **Partner 感知** — 问 partner 当前状态用 `mempal_peek_partner`（live session），问已沉淀决策才用 `mempal_search`
+9. **决策沉淀** — `mempal_ingest` 只存已达成的硬决策；partner 参与时要把 partner 的关键贡献带进 drawer 正文
+10. **COWORK PUSH** — `mempal_cowork_push` 是 SEND 原语，at-next-submit 交付、非实时；别用它做该 ingest 的事
+11. **入库前校验** — 在 ingest 含 entity 关系断言的决策前调 `mempal_fact_check`，它抓相似名拼错、KG 关系矛盾、以及 `valid_to` 已过期的 stale fact
+
+## 并发 Ingest 安全（P9-B）
+
+两个 agent 同时向同一个 source 写入以前是 TOCTOU race：两边都通过 dedup 检查、都 insert，结果重复 drawer 或 vector 错配。从 0.4.0 起 `mempal_ingest` 和 `ingest_file_with_options` 在进入 dedup + insert 临界区前获取 per-source 建议锁。
+
+- 锁文件 `~/.mempal/locks/<16-hex>.lock`，懒建，guard drop 时 OS 自动释放
+- 默认 5s 超时，50ms 重试 + jitter；超时返回 `LockError::Timeout`
+- 非 dry-run 的 ingest response 携带 `lock_wait_ms: Option<u64>`，agent 可据此察觉并发
+- dry-run 不占锁（零写入，零 race）
+- 0.4.0 仅覆盖 Unix（`flock` 内联 extern，不引 libc crate）；Windows 暂为 no-op 占位，后续用 `LockFileEx` 补齐
+
+## 离线事实核查（P9-A）
+
+`mempal_fact_check`（以及 CLI `mempal fact-check`）对一段文本在现有 KG `triples` + 最近 drawer 聚合的 entity registry 上做比对，标记三类确定性问题（不调 LLM、不走网络）：
+
+| 问题类型 | 触发条件 |
+|----------|---------|
+| `SimilarNameConflict` | 文本中的名字与已知 entity Levenshtein 距离 ≤ 2 且不相等 |
+| `RelationContradiction` | 文本断言的 predicate 与 KG 中同 `(subject, object)` 的现存 triple 在不兼容字典中 |
+| `StaleFact` | 文本断言的三元组在 KG 中 `valid_to < now`（Unix 秒） |
+
+文本 → 三元组当前支持三种窄模式："X is Y's ROLE"、"X works at / for Y"、"X is [the|a|an] ROLE of Y"。不认得的句型静默返回空，倾向少报不多报。协议 Rule 11 指导 agent 在 ingest 含实体关系断言的决策前跑一次。完整契约见 `specs/p9-fact-checker.spec.md`。
 
 ## 检索架构
 
@@ -206,6 +239,6 @@ mempal reindex
 - 设计文档：[`docs/specs/2026-04-08-mempal-design.md`](docs/specs/2026-04-08-mempal-design.md)
 - 使用指南：[`docs/usage.md`](docs/usage.md)
 - AAAK 方言：[`docs/aaak-dialect.md`](docs/aaak-dialect.md)
-- Spec 体系：[`specs/`](specs)
-- 实现计划：[`docs/plans/`](docs/plans)
+- Spec 体系（仓库内部 agent-spec 合约，GitHub 查看）：<https://github.com/ZhangHanDong/mempal/tree/main/specs>
+- 实现计划（仓库内部实现计划，GitHub 查看）：<https://github.com/ZhangHanDong/mempal/tree/main/docs/plans>
 - Benchmark：[`benchmarks/longmemeval_s_summary.md`](benchmarks/longmemeval_s_summary.md)

@@ -19,12 +19,38 @@ pub enum Tool {
 
 impl Tool {
     /// Case-insensitive parse from a string; used for ClientInfo.name matching.
+    ///
+    /// Accepts `"auto"` for peek's auto-inference mode. **Do not use this for
+    /// cowork push/drain target parsing** — those paths require a concrete
+    /// `claude|codex` and must reject `"auto"`. Use `from_target_str` instead.
     pub fn from_str_ci(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "claude_code" => Some(Tool::Claude),
-            "codex" | "codex-cli" | "codex_cli" | "codex-tui" => Some(Tool::Codex),
+            // `codex-mcp-client` is what `codex-rs/codex-mcp/src/mcp_connection_manager.rs:1458`
+            // sends as `ClientInfo.name` on the MCP `initialize` handshake — the string
+            // every mempal MCP server actually observes when Codex connects. Before it was
+            // recognized here, `mempal_cowork_push` rejected every push originating from
+            // Codex with "cannot infer caller tool" even when `target_tool` was explicit.
+            "codex" | "codex-cli" | "codex_cli" | "codex-tui" | "codex-mcp-client" => {
+                Some(Tool::Codex)
+            }
             "auto" => Some(Tool::Auto),
             _ => None,
+        }
+    }
+
+    /// Strict parser for cowork push/drain **explicit target_tool** values.
+    ///
+    /// Rejects `"auto"` and anything else that is not a concrete agent. This
+    /// is the guard that keeps a `target_tool="auto"` push from silently
+    /// writing to an orphan `~/.mempal/cowork-inbox/auto/…` file that no
+    /// partner will ever drain. Per spec
+    /// `specs/p8-cowork-inbox-push.spec.md:37,39` target is limited to
+    /// `claude|codex`.
+    pub fn from_target_str(s: &str) -> Option<Self> {
+        match Self::from_str_ci(s) {
+            Some(Tool::Auto) => None,
+            other => other,
         }
     }
 
@@ -33,6 +59,32 @@ impl Tool {
             Tool::Claude => "claude",
             Tool::Codex => "codex",
             Tool::Auto => "auto",
+        }
+    }
+
+    /// Returns the canonical directory name used under
+    /// `~/.mempal/cowork-inbox/<dir_name>/`.
+    ///
+    /// Semantic note: `Tool::Auto` maps to `"auto"` — this is syntactically
+    /// valid but unreachable under the current push/drain API because
+    /// `partner()` returns `None` for `Auto`, so `Auto` cannot flow into
+    /// `inbox_path` in the handler or CLI paths. The `"auto"` return is
+    /// dead defensive output kept for completeness.
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Tool::Claude => "claude",
+            Tool::Codex => "codex",
+            Tool::Auto => "auto",
+        }
+    }
+
+    /// Returns the partner tool for push addressing.
+    /// Claude → Codex, Codex → Claude, Auto → None.
+    pub fn partner(self) -> Option<Self> {
+        match self {
+            Tool::Claude => Some(Tool::Codex),
+            Tool::Codex => Some(Tool::Claude),
+            Tool::Auto => None,
         }
     }
 }
@@ -346,6 +398,48 @@ mod tests {
         assert_eq!(Tool::from_str_ci("claude-code"), Some(Tool::Claude));
         assert_eq!(Tool::from_str_ci("codex-cli"), Some(Tool::Codex));
         assert_eq!(Tool::from_str_ci("codex-tui"), Some(Tool::Codex));
+    }
+
+    #[test]
+    fn tool_recognizes_codex_mcp_client_identity() {
+        // 0.3.1 bug fix: `codex-rs/codex-mcp/src/mcp_connection_manager.rs:1458`
+        // sends `ClientInfo.name = "codex-mcp-client"` on MCP initialize. Before
+        // 0.3.1 this string was not in the recognized list, so mempal_cowork_push
+        // rejected every Codex push with "cannot infer caller tool" even when the
+        // target_tool parameter was explicit. Observed live in the Codex ↔ Claude
+        // Code cowork E2E and cross-referenced against the upstream source.
+        assert_eq!(
+            Tool::from_str_ci("codex-mcp-client"),
+            Some(Tool::Codex),
+            "canonical ClientInfo.name from codex-mcp-client"
+        );
+
+        // Case-insensitive: `from_str_ci` lower-cases before matching, so any
+        // capitalization variant Codex or a downstream fork might emit is
+        // accepted without another patch.
+        assert_eq!(Tool::from_str_ci("Codex-MCP-Client"), Some(Tool::Codex));
+        assert_eq!(Tool::from_str_ci("CODEX-MCP-CLIENT"), Some(Tool::Codex));
+    }
+
+    #[test]
+    fn from_target_str_rejects_auto_and_unknown() {
+        // Concrete targets accepted, with case-insensitive and compound-name
+        // handling inherited from `from_str_ci`.
+        assert_eq!(Tool::from_target_str("claude"), Some(Tool::Claude));
+        assert_eq!(Tool::from_target_str("CODEX"), Some(Tool::Codex));
+        assert_eq!(Tool::from_target_str("claude-code"), Some(Tool::Claude));
+        assert_eq!(Tool::from_target_str("codex-tui"), Some(Tool::Codex));
+
+        // "auto" is the key rejection case — explicit target must be a
+        // concrete agent, otherwise a push would land in an orphan
+        // ~/.mempal/cowork-inbox/auto/*.jsonl file that nothing drains.
+        assert_eq!(Tool::from_target_str("auto"), None);
+        assert_eq!(Tool::from_target_str("AUTO"), None);
+        assert_eq!(Tool::from_target_str("Auto"), None);
+
+        // Unknown garbage still rejected.
+        assert_eq!(Tool::from_target_str("bogus"), None);
+        assert_eq!(Tool::from_target_str(""), None);
     }
 
     #[test]

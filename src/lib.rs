@@ -6,6 +6,7 @@ pub mod api;
 pub mod core;
 pub mod cowork;
 pub mod embed;
+pub mod factcheck;
 pub mod ingest;
 pub mod mcp;
 pub mod search;

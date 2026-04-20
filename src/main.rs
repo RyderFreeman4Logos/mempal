@@ -95,6 +95,59 @@ enum Commands {
         mcp: bool,
     },
     Status,
+    /// Run offline contradiction check on text against KG triples +
+    /// known-entity registry. Pure read, no LLM, no network.
+    FactCheck {
+        /// File path or `-` for stdin. Omit for stdin.
+        path: Option<PathBuf>,
+        /// Optional wing filter for known-entity scope.
+        #[arg(long)]
+        wing: Option<String>,
+        /// Optional room filter within the wing.
+        #[arg(long)]
+        room: Option<String>,
+        /// RFC3339 timestamp for the `now` cutoff (stale-fact detection).
+        /// Defaults to the current UTC time.
+        #[arg(long)]
+        now: Option<String>,
+    },
+    /// Drain cowork inbox messages for the given target. Always exits 0
+    /// (hook graceful degrade). Intended to be called from a UserPromptSubmit
+    /// hook on each user turn — never blocks the user's prompt.
+    CoworkDrain {
+        /// Which agent's inbox to drain ("claude" or "codex"). Use "$MY_TOOL".
+        #[arg(long)]
+        target: String,
+
+        /// Project cwd. Exactly ONE of --cwd or --cwd-source must be set.
+        /// Use this for Claude Code hook (pass ${CLAUDE_PROJECT_CWD:-$PWD}).
+        #[arg(long, conflicts_with = "cwd_source")]
+        cwd: Option<PathBuf>,
+
+        /// Alternative cwd source for hooks whose runtime provides a
+        /// structured input payload. Currently supported: "stdin-json"
+        /// (reads stdin as JSON and extracts the `cwd` field, per Codex's
+        /// UserPromptSubmitCommandInput schema).
+        #[arg(long, conflicts_with = "cwd")]
+        cwd_source: Option<String>,
+
+        /// Output format: "plain" for Claude Code hook (prepend to prompt),
+        /// or "codex-hook-json" for Codex native hook envelope.
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// Show current cowork inbox state for both targets at the given cwd
+    /// (read-only — does NOT drain).
+    CoworkStatus {
+        #[arg(long)]
+        cwd: PathBuf,
+    },
+    /// Install cowork hooks: Claude Code (project-level .claude/hooks)
+    /// and optionally Codex (global ~/.codex/hooks.json merge).
+    CoworkInstallHooks {
+        #[arg(long, default_value_t = false)]
+        global_codex: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -167,6 +220,29 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // Cowork commands must graceful-degrade without requiring palace.db
+    // or config to exist. Dispatch them BEFORE Config::load / Database::open
+    // so a missing mempal_home never breaks the hook path.
+    match cli.command {
+        Commands::CoworkDrain {
+            target,
+            cwd,
+            cwd_source,
+            format,
+        } => {
+            return cowork_drain_command(target, cwd, cwd_source, format);
+        }
+        Commands::CoworkStatus { cwd } => {
+            return cowork_status_command(cwd);
+        }
+        Commands::CoworkInstallHooks { global_codex } => {
+            return cowork_install_hooks_command(global_codex);
+        }
+        // All other commands fall through to the db-backed dispatch below.
+        _ => {}
+    }
+
     let config = Config::load().context("failed to load config")?;
     let db = Database::open(&expand_home(&config.db_path)).context("failed to open database")?;
 
@@ -207,6 +283,16 @@ async fn run() -> Result<()> {
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
         Commands::Serve { mcp } => serve_command(&config, mcp).await,
         Commands::Status => status_command(&db),
+        Commands::FactCheck {
+            path,
+            wing,
+            room,
+            now,
+        } => fact_check_command(&db, path.as_deref(), wing.as_deref(), room.as_deref(), now),
+        // Cowork commands were already dispatched above and returned early.
+        Commands::CoworkDrain { .. }
+        | Commands::CoworkStatus { .. }
+        | Commands::CoworkInstallHooks { .. } => unreachable!(),
     }
 }
 
@@ -825,6 +911,47 @@ fn taxonomy_edit_command(db: &Database, wing: &str, room: &str, keywords: &str) 
     Ok(())
 }
 
+fn fact_check_command(
+    db: &Database,
+    path: Option<&Path>,
+    wing: Option<&str>,
+    room: Option<&str>,
+    now: Option<String>,
+) -> Result<()> {
+    use std::io::Read;
+
+    let text = match path {
+        Some(p) if p.as_os_str() == "-" => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("failed to read stdin")?;
+            buf
+        }
+        Some(p) => {
+            std::fs::read_to_string(p).with_context(|| format!("failed to read {}", p.display()))?
+        }
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("failed to read stdin")?;
+            buf
+        }
+    };
+
+    let now_secs = mempal::factcheck::resolve_now(now.as_deref())?;
+    let scope = mempal::factcheck::validate_scope(wing, room)?;
+
+    let report =
+        mempal::factcheck::check(&text, db, now_secs, scope).context("fact check failed")?;
+
+    let json =
+        serde_json::to_string_pretty(&report).context("failed to serialize fact-check report")?;
+    println!("{json}");
+    Ok(())
+}
+
 fn status_command(db: &Database) -> Result<()> {
     let schema_version = db
         .schema_version()
@@ -954,6 +1081,418 @@ fn expand_home(path: &str) -> PathBuf {
     }
 
     PathBuf::from(path)
+}
+
+/// `mempal cowork-drain` — called by UserPromptSubmit hooks. Always exits
+/// 0 (even on error), so any failure in this path never blocks the user's
+/// prompt submission. Errors go to stderr; stdout is left empty on failure.
+fn cowork_drain_command(
+    target: String,
+    cwd: Option<PathBuf>,
+    cwd_source: Option<String>,
+    format: String,
+) -> Result<()> {
+    use mempal::cowork::Tool;
+    use mempal::cowork::inbox;
+
+    let inner: Result<(), Box<dyn std::error::Error>> = (|| {
+        let target_tool = Tool::from_target_str(&target)
+            .ok_or_else(|| format!("invalid target `{target}`: expected claude|codex"))?;
+        let mempal_home = inbox::mempal_home();
+
+        let resolved_cwd: PathBuf = match (cwd, cwd_source.as_deref()) {
+            (Some(path), None) => path,
+            (None, Some("stdin-json")) => {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                let payload: serde_json::Value = serde_json::from_str(&buf)?;
+                let cwd_str = payload
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .ok_or("stdin JSON payload missing `cwd` string field")?;
+                PathBuf::from(cwd_str)
+            }
+            (None, Some(other)) => {
+                return Err(format!("unsupported --cwd-source: {other}").into());
+            }
+            (None, None) => return Err("must provide --cwd or --cwd-source".into()),
+            (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
+        };
+
+        let messages = inbox::drain(&mempal_home, target_tool, &resolved_cwd)?;
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let partner = target_tool
+            .partner()
+            .ok_or("target has no partner (auto)")?;
+        let out = match format.as_str() {
+            "plain" => inbox::format_plain(partner, &messages),
+            "codex-hook-json" => inbox::format_codex_hook_json(partner, &messages)?,
+            _ => return Err(format!("unknown format: {format}").into()),
+        };
+        print!("{out}");
+        Ok(())
+    })();
+
+    if let Err(e) = inner {
+        eprintln!("mempal cowork-drain: {e}");
+    }
+    Ok(())
+}
+
+/// `mempal cowork-status` — print current inbox state for both targets at
+/// the given cwd. Read-only; does NOT drain.
+fn cowork_status_command(cwd: PathBuf) -> Result<()> {
+    use mempal::cowork::Tool;
+    use mempal::cowork::inbox;
+
+    let mempal_home = inbox::mempal_home();
+    println!("Project: {}", cwd.display());
+    println!();
+    for target in [Tool::Claude, Tool::Codex] {
+        let path = match inbox::inbox_path(&mempal_home, target, &cwd) {
+            Ok(p) => p,
+            Err(_) => {
+                println!("{} inbox:  <invalid cwd>", target.dir_name());
+                continue;
+            }
+        };
+        if !path.exists() {
+            println!("{} inbox:  0 messages", target.dir_name());
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let count = content.lines().filter(|l| !l.trim().is_empty()).count();
+        let bytes = content.len();
+        println!(
+            "{} inbox:  {} message{}, {} B",
+            target.dir_name(),
+            count,
+            if count == 1 { "" } else { "s" },
+            bytes
+        );
+        for line in content.lines().take(3) {
+            if let Ok(msg) = serde_json::from_str::<inbox::InboxMessage>(line) {
+                println!("  from {} @ {}: {}", msg.from, msg.pushed_at, msg.content);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `mempal cowork-install-hooks` — install Claude Code project-level hook
+/// script and optionally merge Codex global hooks.json entry.
+fn cowork_install_hooks_command(global_codex: bool) -> Result<()> {
+    let inner: Result<(), Box<dyn std::error::Error>> = (|| {
+        // Claude Code hook (project-local) — TWO artifacts are needed:
+        //   1. `.claude/hooks/user-prompt-submit.sh`  (the drain script)
+        //   2. `.claude/settings.json` hooks.UserPromptSubmit entry
+        //      registering that script with Claude Code's hook system.
+        //
+        // Claude Code does NOT auto-discover shell files by filename; a hook
+        // must be declared in settings.json with type=command + command=path.
+        // Dropping only the script file silently leaves the hook dead —
+        // that was the P8 install-hooks ship bug surfaced by the first real
+        // E2E run. This install now handles both artifacts with the same
+        // self-heal classification used on the Codex side.
+        let cwd = std::env::current_dir()?;
+        let claude_dir = cwd.join(".claude/hooks");
+        std::fs::create_dir_all(&claude_dir)?;
+        let claude_script = claude_dir.join("user-prompt-submit.sh");
+        let claude_content = r#"#!/bin/bash
+# mempal cowork inbox drain — prepends partner handoff messages to user prompt
+# Graceful degrade: any failure exits 0 with empty stdout
+mempal cowork-drain --target claude --cwd "${CLAUDE_PROJECT_CWD:-$PWD}" 2>/dev/null || true
+"#;
+        std::fs::write(&claude_script, claude_content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&claude_script)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&claude_script, perms)?;
+        }
+        println!(
+            "✓ installed Claude Code hook at {}",
+            claude_script.display()
+        );
+
+        // Merge the hook registration into .claude/settings.json.
+        const CANONICAL_CLAUDE_CMD: &str = "bash .claude/hooks/user-prompt-submit.sh";
+        let settings_path = cwd.join(".claude/settings.json");
+        let mut settings: serde_json::Value = if settings_path.exists() {
+            let s = std::fs::read_to_string(&settings_path)?;
+            serde_json::from_str(&s).map_err(|e| {
+                format!(
+                    "refusing to overwrite existing .claude/settings.json — \
+                     file is not valid JSON: {e}. Fix the file by hand and re-run."
+                )
+            })?
+        } else {
+            serde_json::json!({ "hooks": {} })
+        };
+        if !settings.is_object() {
+            return Err(
+                "refusing to overwrite .claude/settings.json — top-level value is not an object"
+                    .into(),
+            );
+        }
+        let hooks_field = settings
+            .as_object_mut()
+            .ok_or("settings.json root is not object")?
+            .entry("hooks")
+            .or_insert_with(|| serde_json::json!({}));
+        if !hooks_field.is_object() {
+            return Err("`hooks` field in .claude/settings.json is not an object".into());
+        }
+        let hooks_obj = hooks_field
+            .as_object_mut()
+            .ok_or("hooks field is not object")?;
+        let event_arr = hooks_obj
+            .entry("UserPromptSubmit")
+            .or_insert_with(|| serde_json::json!([]));
+        let event_arr = event_arr
+            .as_array_mut()
+            .ok_or("UserPromptSubmit in .claude/settings.json is not array")?;
+
+        let entry_has_drain_command = |entry: &serde_json::Value| -> Option<bool> {
+            let hooks = entry.get("hooks")?.as_array()?;
+            for handler in hooks {
+                let cmd = handler.get("command")?.as_str()?;
+                if cmd == CANONICAL_CLAUDE_CMD {
+                    return Some(true);
+                }
+                // Treat any UserPromptSubmit entry pointing at our script
+                // path OR invoking `mempal cowork-drain` directly as a
+                // stale/older-version install that must be healed.
+                if cmd.contains("user-prompt-submit.sh") || cmd.contains("mempal cowork-drain") {
+                    return Some(false);
+                }
+            }
+            None
+        };
+
+        let mut canonical_count = 0usize;
+        let mut has_stale = false;
+        for entry in event_arr.iter() {
+            match entry_has_drain_command(entry) {
+                Some(true) => canonical_count += 1,
+                Some(false) => has_stale = true,
+                None => {}
+            }
+        }
+
+        let needs_rewrite = has_stale || canonical_count != 1;
+        if !needs_rewrite {
+            println!(
+                "= Claude Code hook already registered in {} (no-op)",
+                settings_path.display()
+            );
+        } else {
+            event_arr.retain(|entry| entry_has_drain_command(entry).is_none());
+            event_arr.push(serde_json::json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": CANONICAL_CLAUDE_CMD,
+                }]
+            }));
+            std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+            if has_stale {
+                println!(
+                    "✓ healed stale Claude Code drain hook in {}",
+                    settings_path.display()
+                );
+            } else {
+                println!(
+                    "✓ registered Claude Code hook in {}",
+                    settings_path.display()
+                );
+            }
+        }
+
+        if global_codex {
+            // Do NOT introduce `dirs` crate — use env::var_os("HOME") directly.
+            let home = match std::env::var_os("HOME") {
+                Some(h) => PathBuf::from(h),
+                None => return Err("cannot resolve $HOME env var".into()),
+            };
+            let codex_dir = home.join(".codex");
+            std::fs::create_dir_all(&codex_dir)?;
+            let hooks_path = codex_dir.join("hooks.json");
+
+            let mut root: serde_json::Value = if hooks_path.exists() {
+                let s = std::fs::read_to_string(&hooks_path)?;
+                serde_json::from_str(&s)?
+            } else {
+                serde_json::json!({ "hooks": {} })
+            };
+            if !root.is_object() {
+                root = serde_json::json!({ "hooks": {} });
+            }
+            let hooks_field = root
+                .as_object_mut()
+                .ok_or("hooks.json root is not object")?
+                .entry("hooks")
+                .or_insert_with(|| serde_json::json!({}));
+            let hooks_obj = hooks_field
+                .as_object_mut()
+                .ok_or("hooks field is not object")?;
+            let event_arr = hooks_obj
+                .entry("UserPromptSubmit")
+                .or_insert_with(|| serde_json::json!([]));
+            let event_arr = event_arr
+                .as_array_mut()
+                .ok_or("UserPromptSubmit is not array")?;
+
+            // Exact-match idempotency + self-healing: spec line 48 pins the
+            // canonical command. Scan for any entry whose nested hooks
+            // contain a `mempal cowork-drain` command. Classify each match as
+            // either (a) exact-match of CANONICAL, or (b) stale/wrong drain
+            // entry that must be replaced. Unrelated entries (non-drain
+            // commands) are preserved untouched.
+            //
+            // Outcomes:
+            //  - exactly one canonical entry AND no stale entries → no-op
+            //  - any stale entry present OR canonical missing → remove every
+            //    mempal-drain entry and re-append canonical
+            //
+            // This way a user re-running install-hooks after upgrading mempal
+            // (where the command flags changed) gets their stale hook healed
+            // instead of silently left broken by a loose substring match.
+            const CANONICAL_CODEX_CMD: &str = "mempal cowork-drain --target codex --format codex-hook-json --cwd-source stdin-json";
+
+            let entry_has_drain_command = |entry: &serde_json::Value| -> Option<bool> {
+                // Returns Some(true) for exact canonical, Some(false) for
+                // stale drain, None for unrelated.
+                let hooks = entry.get("hooks")?.as_array()?;
+                for handler in hooks {
+                    let cmd = handler.get("command")?.as_str()?;
+                    if cmd == CANONICAL_CODEX_CMD {
+                        return Some(true);
+                    }
+                    if cmd.contains("mempal cowork-drain") {
+                        return Some(false);
+                    }
+                }
+                None
+            };
+
+            let mut canonical_count = 0usize;
+            let mut has_stale = false;
+            for entry in event_arr.iter() {
+                match entry_has_drain_command(entry) {
+                    Some(true) => canonical_count += 1,
+                    Some(false) => has_stale = true,
+                    None => {}
+                }
+            }
+
+            let needs_rewrite = has_stale || canonical_count != 1;
+
+            if !needs_rewrite {
+                println!(
+                    "= Codex hook already installed in {} (no-op)",
+                    hooks_path.display()
+                );
+            } else {
+                event_arr.retain(|entry| entry_has_drain_command(entry).is_none());
+                event_arr.push(serde_json::json!({
+                    "hooks": [{
+                        "type": "command",
+                        "command": CANONICAL_CODEX_CMD,
+                        "statusMessage": "mempal cowork drain"
+                    }]
+                }));
+
+                std::fs::write(&hooks_path, serde_json::to_string_pretty(&root)?)?;
+                if has_stale {
+                    println!(
+                        "✓ healed stale Codex drain hook in {}",
+                        hooks_path.display()
+                    );
+                } else {
+                    println!("✓ merged Codex hook into {}", hooks_path.display());
+                }
+            }
+
+            // Feature flag gate: Codex's hooks runtime is behind the
+            // `codex_hooks` feature flag, which is "under development" and
+            // OFF by default in shipped `codex-cli` (<= 0.120.0 at time of
+            // writing). When the flag is false, Codex silently ignores
+            // ~/.codex/hooks.json regardless of shape — the install above
+            // will appear to succeed but the hook will never fire. Surface
+            // this to the user so they can opt in explicitly with
+            // `codex features enable codex_hooks`.
+            if !codex_hooks_feature_enabled(&codex_dir) {
+                println!();
+                println!("⚠  Codex `codex_hooks` feature is currently disabled.");
+                println!("   This is an 'under development' feature in shipped Codex and is OFF");
+                println!("   by default. Without it, ~/.codex/hooks.json is silently ignored and");
+                println!("   the hook you just installed will never fire on user prompt submit.");
+                println!();
+                println!("   To activate:");
+                println!("     codex features enable codex_hooks");
+                println!();
+                println!("   Or equivalent: add `codex_hooks = true` under `[features]` in");
+                println!("     ~/.codex/config.toml");
+            }
+        }
+
+        println!();
+        println!("Next steps:");
+        println!(
+            "  1. Claude Code picks up settings.json changes on the next prompt — no restart needed"
+        );
+        println!(
+            "  2. Restart Codex TUI so it re-reads ~/.codex/hooks.json (session-scoped cache)"
+        );
+        println!("  3. Test: ask Claude to push a test message to codex;");
+        println!("     then in Codex, type anything — the message should be prepended");
+
+        Ok(())
+    })();
+
+    if let Err(e) = inner {
+        eprintln!("mempal cowork-install-hooks: {e}");
+        return Err(anyhow::anyhow!("cowork-install-hooks failed"));
+    }
+    Ok(())
+}
+
+/// Check whether the Codex `codex_hooks` feature flag is enabled in
+/// `<codex_dir>/config.toml`. Returns true only if the file contains a
+/// key `codex_hooks` (either as a bare key inside `[features]` or as a
+/// dotted top-level key `features.codex_hooks`) whose value is the literal
+/// `true`. Any other state — missing file, missing key, `false`, or
+/// unparseable — returns false and triggers the "install succeeded but
+/// Codex runtime will ignore it" warning in install-hooks.
+///
+/// This is a deliberate minimal string-scan parser. We do not pull in the
+/// `toml` crate because (a) the spec forbids new runtime dependencies and
+/// (b) a false warning is cheap while a false all-clear would hide the
+/// very bug this check exists to surface.
+fn codex_hooks_feature_enabled(codex_dir: &Path) -> bool {
+    let config_path = codex_dir.join("config.toml");
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return false;
+    };
+    for line in content.lines() {
+        // Drop any inline `#` comment tail. TOML doesn't allow `#` inside
+        // unquoted strings on the RHS of a key=value line, so this is safe
+        // for our narrow `codex_hooks = true` match.
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let bare_key = key.strip_prefix("features.").unwrap_or(key);
+        if bare_key == "codex_hooks" && val.trim() == "true" {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_keywords_arg(keywords: &str) -> Vec<String> {
