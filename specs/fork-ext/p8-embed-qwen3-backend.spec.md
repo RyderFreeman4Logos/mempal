@@ -6,9 +6,7 @@ estimate: 2d
 
 ## Intent
 
-增加 `OpenAiCompatibleEmbedder`：任何 OpenAI-style `/v1/embeddings` HTTP 后端都能作为 `Embedder` trait 的实现。**支持配置**（按推荐顺序）：(1) **LAN 自部署**（默认推荐，如 `http://gb10:18002/v1/` 跑 `Qwen/Qwen3-Embedding-8B` 4096d——mempal 存在的核心理由就是把 claude-mem 的所有好处在这档硬件上做到位）；(2) **localhost 监听端口**（用户自起 ollama / vllm / TEI 等本地 embedding server）。`model2vec-rs` 进程内 fallback 保留（offline / LAN 不可达时）。**URL / model 完全 config-driven**，不在代码里硬编码任何主机名。
-
-**非支持配置**：协议层面 `OpenAiCompatibleEmbedder` 也能把请求发给云端商业 API（OpenAI text-embedding-3-*、Cohere、Voyage AI、SiliconFlow 等）——**但这不是 mempal 支持的配置**。mempal 存在的价值主张之一就是**不让用户为嵌入再烧一份云端 quota**（与 claude-mem 等强依赖云端 LLM 的工具形成对照）。用户若自行把 `base_url` 指向云端，后果自负、且与文档/README/Release Notes 描述的项目边界不一致。如果想省 VRAM、不想架 LAN，请用 `model2vec` backend（offline，零 API 成本）。
+增加 `OpenAiCompatibleEmbedder`：任何 OpenAI-style `/v1/embeddings` HTTP 后端都能作为 `Embedder` trait 的实现。**推荐配置顺序**：(1) **LAN 自部署**（首选，如 `http://gb10:18002/v1/` 跑 `Qwen/Qwen3-Embedding-8B` 4096d——mempal 存在的核心价值主张就是把 claude-mem 的好特性搬到这档 LAN 硬件上、**消除云端 generative LLM 的 quota 花费**）；(2) **localhost 监听端口**（用户自起 ollama / vllm / TEI 等本地 embedding server）；(3) **云端商业 embedding API**（OpenAI text-embedding-3-*、Cohere、Voyage AI、SiliconFlow 等）——协议原生支持、可用作 LAN 不可达时的后备，成本比 generative chat 低约 100×，但**不是 mempal 的推荐主路径**：agent session 累积几千次 embedding 调用仍有显著成本，且与 "mempal = 零云端依赖的 claude-mem 替代" 的定位不一致。`model2vec-rs` 进程内 fallback 保留（offline / LAN 全断时的最后一档）。**URL / model 完全 config-driven**，不在代码里硬编码任何主机名。
 
 **失败语义**：
 - **Ingest 路径**：**固定 2 秒间隔** 无限重试（**不做指数退避**，用户明确偏好——压力可预测、故障恢复可观测），数据永不丢
@@ -24,7 +22,7 @@ estimate: 2d
 - Degraded 状态同时推给外部（脚本）+ agent（MCP response）：外部是异步告警（人类可稍后看），agent 是同步门控（立即暂停，保证系统一致性）
 
 **与 feedback 的对应**：
-- 符合 `feedback_no_llm_api_dependency.md`：**LAN 自部署 + localhost + model2vec offline** 是三档合规配置，覆盖从"有一张够大的 GPU"到"出差没网"的所有场景。云端 API 端点**不**是合规配置（见 Intent 中的"非支持配置"）；把 embedding 当作"轻量向量化所以云端随便调"是危险的滑坡，因为单次 agent session 的 embedding 调用量可达几千次，累积成本并非可忽略。
+- 符合 `feedback_no_llm_api_dependency.md`（"generative LLM 云端 API 禁令不含 embedding 云端服务"，embedding 成本 ≈ generative chat 的 1%）。本 spec 的立场：**LAN 自部署为默认首选**（与项目价值主张一致），云端 embedding API 作为**可配置的后备**（协议原生支持、用户显式指向时不阻塞），model2vec 进程内作**最后一档**（offline / 全部 HTTP 后端不可用时）。推荐顺序不是硬约束而是运维建议：单 agent session 的 embedding 调用会累积，即使按 $0.02/1M tokens 的低价也非完全可忽略。
 - 符合 `feedback_cli_over_web_ui.md`：无 UI，告警走脚本、状态走 MCP field
 
 ## Decisions
