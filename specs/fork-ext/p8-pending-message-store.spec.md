@@ -15,7 +15,7 @@ estimate: 2d
 ## Decisions
 
 - 新建 `crates/mempal-core/src/queue.rs` 模块，暴露 `PendingMessageStore` struct
-- 新建 schema migration，引入 `pending_messages` 表（字段见下），bump `CURRENT_SCHEMA_VERSION` v4 → v5
+- 新建 schema migration，引入 `pending_messages` 表（字段见下），bump `CURRENT_SCHEMA_VERSION` v6 → v7
 - 表结构：
   ```sql
   CREATE TABLE pending_messages (
@@ -58,7 +58,7 @@ estimate: 2d
 ### Allowed
 - `crates/mempal-core/src/queue.rs`（新建）
 - `crates/mempal-core/src/lib.rs`（`pub mod queue` + re-export）
-- `crates/mempal-core/src/db/schema.rs` 或等价（migration v4 → v5 + `pending_messages` DDL）
+- `crates/mempal-core/src/db/schema.rs` 或等价（migration v6 → v7 + `pending_messages` DDL）
 - `crates/mempal-core/src/db.rs` 或 `db/mod.rs`（`Database::open` 追加 `PRAGMA journal_mode=WAL` + `PRAGMA synchronous=NORMAL`；启动时调 `reclaim_stale`）
 - `crates/mempal-core/Cargo.toml`（添加 `thiserror`、`ulid` workspace dep，若尚未有）
 - `crates/mempal-cli/src/main.rs`（`mempal status` 加队列 stats 行）
@@ -183,7 +183,7 @@ Scenario: 并发 enqueue 在 WAL 模式下不阻塞
   Then 队列中恰好有 "800" 条 pending
   And 整体耗时 < 5 秒（naive upper bound，表明无严重锁竞争）
 
-Scenario: schema 迁移 v4 → v5 创建 pending_messages 表
+Scenario: schema 迁移 v6 → v7 创建 pending_messages 表
   Test:
     Filter: test_migration_v4_to_v5_creates_pending_messages_table
     Level: integration
