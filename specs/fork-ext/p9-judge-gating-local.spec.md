@@ -53,7 +53,7 @@ estimate: 2d
 - 向量 dim 必须和 embedder 输出 dim 一致——由于 embedder 及其 dim 是 runtime 经 `config.toml` 配置，**编译期无从静态断言**；改为 prototypes 初始化阶段 runtime check：`assert_eq!(prototype_vector.len(), embedder.dim())`；不一致 fail-fast（`GatingError::DimMismatch`），拒绝进入 gating 路径并提示用户切后端后跑 `mempal reindex`
 - Gating stats：`GatingStats { tier1_kept, tier1_skipped, tier2_kept, tier2_skipped, unclassified }`，暴露到 `mempal status` 和新 CLI `mempal gating stats [--since <duration>]`
 - Gating 决策写入 `gating_audit` 表（`id`, `candidate_hash`, `decision`, `tier`, `label`, `created_at`, `retained_until` 默认 7d 滚动清理）供 `mempal gating stats` 查询
-- schema bump v7 → v8（新增 `gating_audit` 表）
+- fork-ext `fork_ext_version` `2 → 3` bump（新增 `gating_audit` 表）
 - **禁止**任何 HTTP client 调用外部 LLM API——Tier 3 的 API backend 根本不实现；`GatingConfig` 解析时若见到 `[ingest_gating.llm_judge]` section 输出 warn 并忽略
 - 错误处理：`GatingError`（`thiserror`），embedder 失败时 `judge` 回退到 `Keep { tier: 0, label: "embedder_error" }`（fail-open，宁可多存也不丢）
 - judge 是 async（因为 embedder trait 是 async），在 ingest pipeline 中被 `.await` 调用
@@ -65,7 +65,7 @@ estimate: 2d
 - `crates/mempal-ingest/src/pipeline.rs`（插入 judge 调用点：privacy scrub 之后、chunking 之前）
 - `crates/mempal-ingest/src/lib.rs`（`pub mod gating`）
 - `crates/mempal-core/src/config.rs`（`GatingConfig` struct + `[ingest_gating]` parsing）
-- `crates/mempal-core/src/db/schema.rs`（v7 → v8 migration + `gating_audit` DDL）
+- `crates/mempal-core/src/db/schema.rs`（fork_ext_version `2 → 3` migration + `gating_audit` DDL）
 - `crates/mempal-cli/src/main.rs`（`mempal gating stats` 子命令）
 - `tests/gating_rules.rs`, `tests/gating_prototypes.rs`, `tests/gating_integration.rs`（新建）
 
@@ -182,14 +182,14 @@ Scenario: mempal gating stats 输出 kept/skipped 计数
   Then stdout 含 `kept: 10` 和 `skipped: 20`
   And 按 tier 分解
 
-Scenario: schema 迁移 v7 → v8 创建 gating_audit 表
+Scenario: fork-ext 迁移 v2 → v3 创建 gating_audit 表
   Test:
-    Filter: test_migration_v7_to_v8_creates_gating_audit
+    Filter: test_fork_ext_migration_v2_to_v3_creates_gating_audit
     Level: integration
     Targets: crates/mempal-core/src/db/schema.rs
-  Given palace.db schema_version == "7"
+  Given palace.db `fork_ext_version == "2"`（embed-qwen3 reindex_progress 已就位）
   When 启动 mempal
-  Then schema_version == "8"
+  Then `fork_ext_version == "3"`
   And `gating_audit` 表存在
 
 Scenario: prototype 初始化失败时 daemon fail-fast 退出

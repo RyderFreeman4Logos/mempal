@@ -51,9 +51,9 @@ estimate: 1d
     **为什么 DELETE-then-INSERT 而非 UPDATE**：DELETE-then-INSERT 是 SQLite 官方推荐给 FTS5 contentless / external-content 表的更新模式（索引结构保证一致性），直接 UPDATE contentless 行会让 FTS 内部 segment 与 base 表 rowid 映射漂移
     **与 upstream 已有 trigger 的关系**：若 upstream 已注册同名 trigger（例如 P5 `p5-semantic-dedup.spec.md` 相关），`DROP ... IF EXISTS` 保证 migration 不因前置状态 fail；migration 每次 idempotent 可重入
   - **保留** drawer ID 不变（KG triples 引用稳定）
-- 去重触发后 write 到 `novelty_audit` 表（schema v9 新增）：`{ id, candidate_hash, decision, near_drawer_id, cosine, created_at }`，`mempal status` 汇总
+- 去重触发后 write 到 `novelty_audit` 表（fork-ext ext_v4 新增）：`{ id, candidate_hash, decision, near_drawer_id, cosine, created_at }`，`mempal status` 汇总
 - 对 `mempal_ingest` MCP 工具调用方：返回 response metadata 含 `novelty_decision: "inserted" | "merged" | "dropped"`, `near_drawer_id`（如适用）；content 语义保持 raw，不影响字段形态
-- schema v8 → v9 bump：
+- fork-ext `fork_ext_version` `3 → 4` bump：
   - `drawers` 表加 `merge_count INTEGER NOT NULL DEFAULT 0` 和 `updated_at TEXT`（NULLABLE；仅 merge 发生时写入，未 merge 的 drawer 保持 NULL 以显式区分 added_at vs 后续变动）
   - 新建 `novelty_audit` 表
   - 注意：codebase 既有列名为 `added_at`（见 `src/core/db.rs`），**不是** `created_at`；novelty merge 场景新增的列名为 `updated_at` 以明确语义（last_merge_at 的意味），不重命名 `added_at`
@@ -68,7 +68,7 @@ estimate: 1d
 - `crates/mempal-ingest/src/pipeline.rs`（novelty filter 调用点：embedding 计算后、drawer 插入前）
 - `crates/mempal-ingest/src/lib.rs`（`pub mod novelty`）
 - `crates/mempal-core/src/config.rs`（`NoveltyConfig` struct）
-- `crates/mempal-core/src/db/schema.rs`（v8 → v9）
+- `crates/mempal-core/src/db/schema.rs`（fork_ext_version `3 → 4`）
 - `crates/mempal-mcp/src/tools.rs`（`IngestResponseDto` 加可选 `novelty_decision` / `near_drawer_id` 字段）
 - `crates/mempal-mcp/src/server.rs`（handler 传递 novelty 决策到 response）
 - `tests/novelty_filter.rs`（新建）
@@ -196,28 +196,28 @@ Scenario: embedder 错误时 fail-open 插入
   Then candidate 正常插入为新 drawer
   And stderr/log 含 warn
 
-Scenario: schema 迁移 v8 → v9 加 merge_count 和 novelty_audit
+Scenario: fork-ext 迁移 v3 → v4 加 merge_count 和 novelty_audit
   Test:
-    Filter: test_migration_v8_to_v9_schema
+    Filter: test_fork_ext_migration_v3_to_v4_schema
     Level: integration
     Targets: crates/mempal-core/src/db/schema.rs
-  Given palace.db schema_version == "8"
+  Given palace.db `fork_ext_version == "3"`
   When 启动 mempal
-  Then schema_version == "9"
+  Then `fork_ext_version == "4"`
   And `drawers` 表有 `merge_count` 列，默认值 0
   And `novelty_audit` 表存在
   And trigger `drawers_au_fts` 存在（`SELECT name FROM sqlite_master WHERE type='trigger' AND name='drawers_au_fts'` 返回一行）
 
-Scenario: v8 → v9 migration 在存在同名旧 trigger 时幂等
+Scenario: v3 → v4 migration 在存在同名旧 trigger 时幂等
   Test:
-    Filter: test_migration_v8_to_v9_idempotent_trigger
+    Filter: test_fork_ext_migration_v3_to_v4_idempotent_trigger
     Level: integration
     Targets: crates/mempal-core/src/db/schema.rs
-  Given palace.db schema_version == "8"
+  Given palace.db `fork_ext_version == "3"`
   And 在 migration 前人工 `CREATE TRIGGER drawers_au_fts AFTER UPDATE ON drawers BEGIN SELECT 1; END` 注册一个同名但不同逻辑的 trigger
   When 启动 mempal
   Then migration 成功（不返回 `SQLITE_ERROR` 或 `trigger drawers_au_fts already exists`）
-  And schema_version == "9"
+  And `fork_ext_version == "4"`
   And trigger `drawers_au_fts` 的 SQL 等于 spec Decisions 里给出的 DELETE-then-INSERT 版本（可通过 `SELECT sql FROM sqlite_master WHERE name='drawers_au_fts'` 断言）
 
 Scenario: merge 后 FTS5 搜索能命中新增内容

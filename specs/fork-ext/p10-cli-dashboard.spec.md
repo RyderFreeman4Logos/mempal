@@ -37,7 +37,7 @@ estimate: 1.5d
   - 分组显示按天（`=== 2026-04-16 ===`），drawer 按 importance 降序 + added_at 升序
   - `--format json` 输出 `{timestamp, drawer_id, wing, room, importance_stars, flags, preview}` 数组
 - `mempal stats`：
-  - 顶部显示 schema_version + db 大小
+  - 顶部显示 `schema_version`（upstream axis，来自 `PRAGMA user_version`）+ `fork_ext_version`（fork-ext axis，来自 `fork_ext_meta` K-V）+ db 大小
   - 主体：drawers total / per-wing count / per-room count / avg importance
   - `pending_messages` queue stats（pending / claimed / failed / oldest_pending_age）
   - `gating_audit` 7d stats（tier1_kept/skipped/tier2_kept/skipped）
@@ -166,7 +166,7 @@ Scenario: mempal stats 显示全量统计
     Targets: crates/mempal-cli/src/observability/stats.rs
   Given palace.db 含 drawers / pending_messages / gating_audit / novelty_audit 数据
   When 运行 `mempal stats`
-  Then stdout 含 "schema_version" 行
+  Then stdout 含 "schema_version" 行 和 "fork_ext_version" 行
   And 含 "drawers total" 行
   And 含 "queue" section
   And 含 "gating" section
