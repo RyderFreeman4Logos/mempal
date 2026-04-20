@@ -15,10 +15,39 @@ estimate: 1d
 ## Decisions
 
 - fork-ext `fork_ext_version` `4 → 5` 新 migration：
-  - `drawers` 表加 `project_id TEXT`（默认 NULL 兼容既有 drawer）
+  - `drawers` 表加 `project_id TEXT`（默认 NULL 兼容既有 drawer） —— 走 `ALTER TABLE ADD COLUMN`（regular table 支持）
   - 索引 `CREATE INDEX idx_drawers_project_id ON drawers(project_id)`
-  - `drawer_vectors` 表加 `project_id TEXT`（冗余列，为了 sqlite-vec filter 能直接过）
-  - `triples` 表加 `project_id TEXT`（未来 KG 隔离用，本 spec 不用）
+  - `drawer_vectors` 表加 `project_id TEXT` —— **不能用 `ALTER TABLE`**（gemini 2026-04-20 策略审查 Part 3 #1 critical finding）：sqlite-vec `vec0` 是 SQLite virtual table，**不支持 `ALTER TABLE ADD COLUMN`**（也不支持 `ALTER TABLE ADD` 任何形式的列修改，只支持 `RENAME`）。必须走 **DROP + CREATE + 全量 reinsert** 流程，且整个过程必须把既有向量数据**逐行读回内存再写回新表**，否则会静默丢失全部历史向量（导致 search 只剩 BM25 但不报错）。具体步骤见下条"vec0 recreate 迁移步骤"
+  - `triples` 表加 `project_id TEXT`（未来 KG 隔离用，本 spec 不用） —— regular table 走 `ALTER TABLE ADD COLUMN`
+- **vec0 recreate 迁移步骤**（保数据零丢失）：
+  ```
+  BEGIN IMMEDIATE;
+  -- 1. 把既有向量全量读出到一个临时 regular table（不是 vec0）
+  CREATE TEMP TABLE _drawer_vectors_backup (id TEXT PRIMARY KEY, embedding BLOB);
+  INSERT INTO _drawer_vectors_backup (id, embedding)
+    SELECT id, embedding FROM drawer_vectors;
+  -- 2. DROP 老 vec0 表
+  DROP TABLE drawer_vectors;
+  -- 3. 重建 vec0，声明 auxiliary column `+project_id TEXT`（vec0 语法要求 `+` 前缀声明非索引 metadata 列）
+  CREATE VIRTUAL TABLE drawer_vectors USING vec0(
+    id TEXT PRIMARY KEY,
+    embedding FLOAT[{DIM}],  -- DIM 取迁移前 SELECT vec_length(embedding) FROM _drawer_vectors_backup LIMIT 1
+    +project_id TEXT
+  );
+  -- 4. 把 backup 灌回新表，project_id 填 NULL（后续用 `mempal project migrate` 显式 backfill）
+  INSERT INTO drawer_vectors (id, embedding, project_id)
+    SELECT id, embedding, NULL FROM _drawer_vectors_backup;
+  -- 5. 断言行数一致
+  -- （代码侧检查：SELECT COUNT(*) FROM drawer_vectors 必须等于迁移前 COUNT(*)；不等则 ROLLBACK）
+  DROP TABLE _drawer_vectors_backup;
+  COMMIT;
+  ```
+  **关键不变量**：
+  - 整个迁移包在单个 `BEGIN IMMEDIATE ... COMMIT` 里——失败 `ROLLBACK` 后 `drawer_vectors` 恢复到迁移前状态（SQLite DDL 本身也支持事务）
+  - 行数 before/after 必须相等，否则立即 `ROLLBACK` + 返回 `MigrationError::VectorLossDetected { expected, got }` + fork_ext_version 不 bump
+  - 迁移期间 daemon / MCP 必须 pause 所有 ingest / search 写入（`mempal status` 显示 `migrating=true`，写入类 MCP 返回 `system_warnings` 要求 agent 重试）。读路径（search）在迁移期间 BM25-only，vector 部分静默跳过且在 `system_warnings` 标记
+  - 如果迁移前 `drawer_vectors` 表不存在（fresh DB 或 lazy-create 未触发），跳过 backup 步骤，直接 step 3 CREATE（带 `+project_id`）
+  - lazy-create 路径（`db.rs` `ensure_vector_table`）在 fork_ext_version >= 5 之后 MUST 带 `+project_id TEXT` 声明；schema drift 检测见 "`test_lazy_create_after_v5_has_project_id_column`" 新 scenario
 - `project_id` 识别：
   - CLI: `mempal ingest ... --project <id>`；默认从 `git rev-parse --show-toplevel` basename 推断（`mempal-dev` → `"mempal"`），或配置 `[project] id = "..."`
   - MCP: `mempal_ingest` / `mempal_search` input schema 加可选 `project_id` 字段；`mempal_search` 额外加可选 `include_global: bool`（默认 `false`）；未提供 `project_id` 时从 `[project]` config 回退
@@ -109,6 +138,43 @@ Scenario: fork-ext 迁移 v4 → v5 添加 project_id 列
   And `drawers`, `drawer_vectors`, `triples` 三表均有 `project_id` 列
   And 存在索引 `idx_drawers_project_id`
   And 既有 drawer 的 `project_id` 全部为 NULL
+
+Scenario: v4 → v5 迁移时 drawer_vectors DROP+CREATE 全程保留向量（零丢失）
+  Test:
+    Filter: test_v4_to_v5_migration_preserves_vectors_during_recreation
+    Level: integration
+    Targets: crates/mempal-core/src/db.rs, crates/mempal-core/src/db_fork_ext.rs
+  Given palace.db `fork_ext_version == "4"` 且 `drawer_vectors` 含 50 条向量（由过往 `mempal ingest` 真实写入，非 mock）
+  And 迁移前记录 `before_count = SELECT COUNT(*) FROM drawer_vectors`
+  And 迁移前为每条向量取 `(id, vec_length(embedding), vec_to_raw(embedding))` 元组存到测试内存
+  When 启动 mempal（触发 v4 → v5 migration）
+  Then `fork_ext_version == "5"`
+  And `SELECT COUNT(*) FROM drawer_vectors == before_count`（必须等于 50，否则 MigrationError::VectorLossDetected）
+  And 随机抽 5 个 drawer id，每个的 `(vec_length, vec_to_raw)` 字节级匹配迁移前记录（verbatim 不能丢精度）
+  And 新表 schema 含 `+project_id TEXT` auxiliary column（`PRAGMA table_info(drawer_vectors)` 或等价 vec0 metadata 检查）
+  And 所有 project_id 为 NULL（未 backfill）
+  And 迁移失败/ROLLBACK 时（模拟：mid-migration 写入权限被撤销）`drawer_vectors` **完整恢复**到迁移前状态（`COUNT` / 内容全部相同），`fork_ext_version` **不** bump
+
+Scenario: fresh DB 或 drawer_vectors 未 lazy-create 时 v4 → v5 跳过 backup 步骤
+  Test:
+    Filter: test_v4_to_v5_migration_skips_backup_when_table_absent
+    Level: integration
+    Targets: crates/mempal-core/src/db_fork_ext.rs
+  Given palace.db `fork_ext_version == "4"` 且 `drawer_vectors` 表不存在（`SELECT * FROM sqlite_master WHERE name='drawer_vectors'` 为空，即还没任何 ingest 触发 lazy-create）
+  When 启动 mempal
+  Then 迁移**不**尝试 `CREATE TEMP TABLE _drawer_vectors_backup`（空表 SELECT 会正常 no-op，但 spec 明确这一路径不依赖表存在）
+  And `fork_ext_version == "5"`
+  And 后续首次 ingest 触发 `ensure_vector_table` 时创建的 vec0 表**必须**含 `+project_id TEXT`（见下条 scenario）
+
+Scenario: lazy-create 路径在 fork_ext_version ≥ 5 后带 project_id auxiliary column
+  Test:
+    Filter: test_lazy_create_after_v5_has_project_id_column
+    Level: integration
+    Targets: crates/mempal-core/src/db.rs (ensure_vector_table)
+  Given palace.db `fork_ext_version == "5"` 且 `drawer_vectors` 表未建（fresh 或迁移后仍 zero ingest）
+  When 执行 `mempal ingest any.md --project proj-X`（触发首次 lazy-create + insert）
+  Then `drawer_vectors` schema 中**必须**含 auxiliary column `+project_id TEXT`（否则后续 KNN filter 会 planner 错误或静默全表扫）
+  And `SELECT project_id FROM drawer_vectors WHERE id=?` 返回 `"proj-X"`
 
 Scenario: ingest 带 --project 时 project_id 被持久化
   Test:
