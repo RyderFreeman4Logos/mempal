@@ -1,0 +1,10 @@
+# Lefthook — git hooks manager
+# Install: just install-hooks  (or: lefthook install)
+# Docs: https://github.com/evilmartians/lefthook
+
+pre-commit:
+  commands:
+    branch-protection:
+      run: scripts/hooks/branch-protection.sh
+    quality-gates:
+      run: just pre-commit
