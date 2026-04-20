@@ -25,6 +25,12 @@ estimate: 2d
   - `mempal hook <event-type>` — 从 stdin 读 JSON，enqueue 后退出（退出码永远 0 除非 db 不可达）
   - `mempal daemon [--foreground]` — 启动 worker；默认 detach 走 `daemonize` crate（或等价专用 daemonization 库）；**禁止**在 tokio 多线程 runtime 启动后手动 `fork`——libc `fork` 在多线程 tokio 进程中高概率引起子进程 mutex 死锁或未定义行为（POSIX async-signal-safety 限制）；daemonize 必须发生在 **tokio runtime 初始化之前**；setsid + pid 文件 `~/.mempal/daemon.pid` 仍保留，由 daemonize crate 内部处理
   - **实现约束**：`crates/mempal-cli/src/main.rs` 顶层**不可**使用 `#[tokio::main]`（该宏会在 `main` 进入前先 build 多线程 runtime，导致 daemonize 无法发生在 runtime-init 之前）。替代：`fn main() -> anyhow::Result<()>` + 在每个子命令 handler 内按需手动 `tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async { ... })`；`daemon` handler 必须在调用 `daemonize()` **之后** 才构造 runtime
+  - **Fork-unsafe 资源集中约束**（CSA debate 2026-04-20 round-3 identified）：除 tokio runtime 之外，以下资源同样**禁止**在 `daemonize()` **之前**初始化——fork 后子进程继承这些资源会导致 mutex 死锁、fd 泄漏、WAL 文件句柄悬空、tracing worker 线程不在子进程存活：
+    - `rusqlite::Connection::open`（任何到 `palace.db` 的连接都必须在 daemonize 后建立；pid 文件写入也要等 daemonize 结束）
+    - `tracing_subscriber::fmt().with_writer(file_writer).init()`（含 `tracing-appender` 的异步 worker 线程）
+    - 任何 `std::thread::spawn` / `tokio::task::spawn`
+  - **封装建议**：新建 `crates/mempal-cli/src/daemon_bootstrap.rs` 内 `DaemonContext::bootstrap()`，语义为"parse CLI → read config → daemonize (含 `working_directory`, `pid_file`, `stdout`→log, `stderr`→log, `umask=0o027`) → 返回 `DaemonContext { cfg, runtime, db, tracing_guard }`"。此函数内部的调用顺序即标准启动序，**所有 daemon 子命令** 都应走该入口以避免重复失误
+  - **fd 0/1/2 必须重定向**：`daemonize` crate 默认 close 0/1/2，但某些 libc 实现会让后续 `open()` 复用这些 fd 导致数据错乱（比如新 SQLite 连接拿到 fd 1 后，panic 的 stderr 写到 SQLite 文件）。必须显式把 stdin 重定向到 `/dev/null`、stdout+stderr 重定向到 `~/.mempal/daemon.log`（或 config 指定路径）；`daemonize` crate 的 `.stdout(file)` / `.stderr(file)` 参数完成此事；fallback 手动 `dup2(fd_dev_null, 0)` / `dup2(fd_log, 1)` / `dup2(fd_log, 2)`
   - `mempal daemon stop` — 读 pid 文件发 SIGTERM
   - `mempal daemon status` — 看 pid 文件存活 + 读 `pending_messages` stats 报告
   - `mempal hook install --target <T> [--dry-run]` — 写对应工具的 settings 文件注入 hook 配置
@@ -76,6 +82,7 @@ estimate: 2d
 ### Allowed
 - `crates/mempal-cli/src/hook.rs`（新建：`mempal hook <event>` 实现）
 - `crates/mempal-cli/src/daemon.rs`（新建：`mempal daemon` worker loop）
+- `crates/mempal-cli/src/daemon_bootstrap.rs`（新建：`DaemonContext::bootstrap()` 统一启动序——daemonize → runtime → db → tracing）
 - `crates/mempal-cli/src/hook_install.rs`（新建：各 target 的 settings 文件 patching）
 - `crates/mempal-cli/src/main.rs`（注册新子命令）
 - `crates/mempal-cli/Cargo.toml`（添加 `nix`/`libc` 仅用于 fork/setsid、signal 处理；`serde_json` 已有）
@@ -255,3 +262,26 @@ Scenario: hook 子命令不污染 stdout
   When 执行 `mempal hook hook_post_tool` 并捕获 stdout + stderr
   Then stdout 长度 == 0
   And stderr 可含 info/warn 日志但不 panic
+
+Scenario: DaemonContext::bootstrap 严格按 daemonize → runtime → db → tracing 顺序初始化
+  Test:
+    Filter: test_daemon_context_bootstrap_ordering
+    Level: integration
+    Targets: crates/mempal-cli/src/daemon_bootstrap.rs
+  Given 待启动的 daemon handler，测试通过 `tracing` pattern 记录每个资源的 init 时间戳
+  When 调 `DaemonContext::bootstrap(cli_args)`
+  Then 记录中 daemonize 完成时间戳 < runtime 构造时间戳
+  And runtime 构造时间戳 < rusqlite::Connection::open 时间戳
+  And runtime 构造时间戳 < tracing_subscriber init 时间戳
+  And fd 1 (stdout) 和 fd 2 (stderr) 不再指向 tty，而是指向配置的 daemon.log 文件（`readlink /proc/self/fd/1` 返回 log 路径）
+  And fd 0 (stdin) 指向 `/dev/null`
+
+Scenario: 禁止 daemonize 前 open SQLite 连接（静态检查）
+  Test:
+    Filter: test_no_sqlite_before_daemonize
+    Level: static
+    Targets: crates/mempal-cli/src/daemon.rs, crates/mempal-cli/src/daemon_bootstrap.rs
+  Given daemon handler 源码
+  When 用 `grep` / `cargo clippy` 检测在 `daemonize(…)` 调用**之前**是否存在 `rusqlite::Connection::open` 或 `crate::core::db::Database::open` 调用
+  Then 检测器不报警
+  And daemon_bootstrap.rs 的 `bootstrap()` 函数内，`daemonize` 调用位于 `Database::open` 上方

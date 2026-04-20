@@ -50,6 +50,7 @@ estimate: 1d
   - 这个段使用 sentinel `--- session_metadata ---` 作为 AAAK signal 提取器的可识别边界
   - **解析顺序必须从 content 末尾反向查找 sentinel**（`rfind("\n\n--- session_metadata ---\n")`），不是从头扫——assistant message 正文中偶发出现该字面量也不破坏 metadata 段；解析时要求 sentinel **后紧跟** 至少一个形如 `key: value\n` 的行，否则判为正文内容。合法 metadata 段必须出现在 content 的**最后一个**分隔块位置
   - sentinel 样例中的 `---` 数量（3 个短横线）刻意与 Markdown `hr` 区分——前后必有 `--- session_metadata ---` 带显式 tag，纯 `---` 分隔线不会被误识别
+  - **为何不改读 `.claude/sessions/<uuid>.jsonl` 取代此 sentinel 方案**（CSA debate 2026-04-20 R5 verdict: reject the switch）：把"session 真实文本"的获取从"hook payload 入参"改为"mempal 主动读 Claude Code 的内部文件"会把 mempal 耦合到 Claude Code 的未文档化 session 存储 schema，破坏跨 agent 兼容（Gemini CLI / Codex / 未来其他 agent 的 session 存储格式都不同）。正确路径是**要求 hook 脚本把 `messages` 数组打包进 hook payload**，mempal 只解析 payload 内存中的 `messages.iter().rfind(|m| m.role == "assistant")`——零磁盘 I/O，零 Claude Code 内部格式依赖。sentinel 方案的 `rfind` 假阳性风险由上面的 "sentinel + 后接 `key: value\n` 行" 双重校验消除
   - 本 spec **零 schema 迁移**；v8 被 `p10-project-vector-isolation.spec.md` 独占使用，本 spec 与其无 schema 冲突
 - MCP `mempal_search` 天然能召回 session-reviews wing 的 drawer（向量+FTS+RRF 不区分 wing）
 - 引入便利过滤器：未来 `mempal_search(wing_filter="session-reviews")` 可一键查 session reviews；本 spec 不实现 wing_filter，留给 P10 `p10-cli-dashboard.spec.md`
@@ -129,6 +130,17 @@ Scenario: trailing_messages=2 时拼接倒数 2 条 assistant 消息
   And messages 最后两条都是 assistant：`[..., {role:"assistant",content:"A"}, {role:"assistant",content:"B"}]`
   When 调 `session_review::extract`
   Then 返回的 content 含 "A" 和 "B" 之间有分隔符（如 `\n---\n`）
+
+Scenario: sentinel 在 assistant 正文中误出现时不触发 metadata 误解析
+  Test:
+    Filter: test_sentinel_false_positive_rejected_by_structure_check
+    Level: unit
+    Targets: crates/mempal-cli/src/session_review.rs
+  Given assistant message content 正文含字面字串 `"\n--- session_metadata ---\nthis is just an example in prose"`（后接非 `key: value` 格式的自由文本）
+  When 调用 session_review metadata 解析器
+  Then 解析器**不**把该 sentinel 视为 metadata 段起点（因为后接行不匹配 `^[a-z_]+: .+\n` 的 key:value 模式）
+  And 返回的 metadata 为空 `{}`（正文被视为纯 assistant message）
+  And drawer 被写入时该 sentinel 字面串保留在正文中，不被裁剪
 
 Scenario: linked_drawer_ids 写入 content 末尾 sentinel 段
   Test:

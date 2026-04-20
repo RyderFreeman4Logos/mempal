@@ -40,7 +40,12 @@ estimate: 2d
 - 多条规则**短路求值**：第一个 match 决定结果（`continue` 例外，会继续下一条）
 - Tier 2 原型分类器：
   - 配置 `[ingest_gating.embedding_classifier] enabled = true, threshold = 0.35, prototypes = [...]`
-  - 启动时 `Prototype { label, embed_vec }` 预计算（embed 阻塞一次）存内存
+  - 启动时 `Prototype { label, embed_vec }` **同步预计算**（embed 阻塞一次）存内存；**fail-fast**——任一 prototype embed 失败即阻止 daemon 启动并打印清晰错误（见下）
+  - **架构约束**（CSA debate 2026-04-20 R3 validated）：gating 只在 `mempal daemon` 后台 worker 路径运行（**不**在 `mempal hook` fast-path 调用，hook 只负责 enqueue），daemon 启动延迟对 agent 和用户完全不可见；因此**同步**预计算比 lazy / 后台预热 + ready flag 更稳：
+    - 消除 "first-request-too-slow" 尾延迟
+    - 消除 ready flag 的同步原语复杂度（arc-swap / OnceCell）
+    - fail-fast 让 misconfigured embedder 在 daemon 启动时立刻暴露，而非延迟到第一条 ingest 才崩（更易排查）
+    - 2-3 秒的 daemon 启动开销可接受（daemon 启动后持续运行）
   - 判决：计算 candidate embedding → 对每个 prototype 求 cosine → 取 max
   - max >= threshold → `Keep { tier: 2, label }`
   - max < threshold → `Skip { tier: 2, reason: "below_threshold" }`
@@ -72,7 +77,7 @@ estimate: 2d
 - 不要让 gating 决策进入 AAAK signal 提取结果
 - 不要在 MCP 工具（`mempal_ingest` 或其他）里暴露 "force skip gating" 参数——用户想强制就调 config 临时关 gating
 - 不要做 Tier 2 threshold 自适应（user-tuned 值即可，YAGNI）
-- 不要在 prototypes 初始化失败时崩溃进程——若 embedder 对某个 prototype embed 失败，log warn 并 skip 该 prototype
+- 不要对 prototypes 初始化失败选择 silently-skip——CSA debate 2026-04-20 R3 反转早期设计：若 embedder 对任一 prototype embed 失败，daemon 启动 fail-fast 并退出码 != 0，stderr 打印 `"gating prototype init failed: label='{name}', reason='{err}'. Check [ingest_gating.embedding_classifier.prototypes] and the embedder backend at {base_url}."`。silently-skip 会造成 gating 语义漂移（哪些 label 被滤掉是不可观测的），不如启动崩溃让用户立刻发现配置错
 
 ## Out of Scope
 
@@ -179,13 +184,26 @@ Scenario: mempal gating stats 输出 kept/skipped 计数
 
 Scenario: schema 迁移 v7 → v8 创建 gating_audit 表
   Test:
-    Filter: test_migration_v5_to_v6_creates_gating_audit
+    Filter: test_migration_v7_to_v8_creates_gating_audit
     Level: integration
     Targets: crates/mempal-core/src/db/schema.rs
-  Given palace.db schema_version == "5"
+  Given palace.db schema_version == "7"
   When 启动 mempal
-  Then schema_version == "6"
+  Then schema_version == "8"
   And `gating_audit` 表存在
+
+Scenario: prototype 初始化失败时 daemon fail-fast 退出
+  Test:
+    Filter: test_prototype_init_failure_fails_fast
+    Level: integration
+    Test Double: failing_embedder
+    Targets: crates/mempal-ingest/src/gating/prototypes.rs, crates/mempal-cli/src/daemon.rs
+  Given `ingest_gating.enabled = true`，`embedding_classifier.enabled = true`，3 个 prototype 其中第 2 个 embed 时返回 `Err`
+  When 启动 `mempal daemon --foreground`
+  Then 进程在 10 秒内退出，退出码 != 0
+  And stderr 含 `"gating prototype init failed"` 字样
+  And stderr 含失败 prototype 的 label 名
+  And `~/.mempal/daemon.pid` 不存在（未注册）
 
 Scenario: gating 不影响 drawer 维度一致性
   Test:

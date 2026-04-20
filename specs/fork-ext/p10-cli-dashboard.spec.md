@@ -28,7 +28,7 @@ estimate: 1.5d
 - 输出默认 ANSI-colored text；`--format json` 切 JSON lines（ndjson）；`--no-color` 禁色
 - `mempal tail`：
   - 默认展示最近 20 条（按 `added_at DESC`——codebase 既有列名是 `added_at`，见 `src/core/db.rs`；本 spec 全文其他 `added_at` 字样均指此列；未来若 P9 novelty 的 `updated_at` 列存在则 `--sort-by updated_at` 可选）
-  - `--follow` 每 2s 轮询 `SELECT ... WHERE id > ?last_seen_id ORDER BY id ASC`，append 新行；**用 ULID id 而非 timestamp 做游标**，规避同毫秒内多条 insert 被漏读的竞态（ULID 是 monotonically increasing，timestamp 会 tie）
+  - `--follow` 走 fs-watch + 250ms debounce 路径（详见下方 Decisions 里 "fs event 只作 wake-up 触发" 段）；fallback 无 inotify 时每 2s poll `SELECT ... WHERE id > ?last_seen_id ORDER BY id ASC`，append 新行；**用 ULID id 而非 timestamp 做游标**，规避同毫秒内多条 insert 被漏读的竞态（ULID 是 monotonically increasing，timestamp 会 tie）
   - 每行格式 `<timestamp> <flag>  <wing>/<room>  <drawer_id[:8]>  <preview(120 chars)>`
   - `--wing` / `--room` / `--since "7d"` 精细过滤（`--since` 仍走 `added_at`，仅 follow 游标用 id）
   - SIGINT 优雅退出
@@ -61,6 +61,13 @@ estimate: 1.5d
 - 所有 CLI 子命令只读 palace.db（`SELECT` only），绝不写入
 - 子命令若 palace.db 不存在 → 友好错误："run mempal init first"
 - `mempal tail --follow` 默认用 `inotify` / `fsevents` 监听 db **所在目录**（非单文件 `palace.db`）+ 按文件名过滤 `palace.db*` 模式，捕获 `palace.db` / `palace.db-wal` / `palace.db-shm` 三种事件；理由：WAL 模式（`p8-pending-message-store.spec.md`）下写入先落到 `-wal` 文件，主 db 文件 mtime 只在 checkpoint 时更新，单文件 watch 会漏事件；此外 SQLite 原子保存可能 rename 导致 inode 变——watch 目录更鲁棒。不可用时 fallback poll（2s interval）
+- **fs event 只作 wake-up 触发，不跟踪事件详情**（CSA debate 2026-04-20 R6 design）：
+  - tail --follow 维护 `last_seen_id: Option<Ulid>`（启动时 = 已显示的最后一条 drawer ulid）
+  - fs event 到达 → 进入 **250ms debounce 窗口**（`tokio::time::sleep(Duration::from_millis(250))`），窗口内所有后续 fs event 被直接丢弃（不再 reset 窗口避免无限推迟）
+  - 窗口结束 → 跑一次 `SELECT id, wing, room, added_at, content FROM drawers WHERE id > ? ORDER BY id ASC` (`?` = last_seen_id) → 打印新行 → 更新 last_seen_id
+  - 这个设计把 fs 事件的精确性从关键路径上移除——即使 ipmfs 漏报或重复发 event，SELECT 语句基于 db 真值；事件只是"该去查一次 db 了"的唤醒信号
+  - 优势：写高峰期一连串 fs 事件只触发一次 SELECT，避免 CPU 烧；ANSI 光标刷屏节奏稳定；无需区分 inotify 事件类型
+  - fallback poll 间隔保持 2s（inotify 不可用时的兜底）
 - **不**启动 daemon / service；每次子命令独立进程、独立退出
 
 ## Boundaries
@@ -128,6 +135,19 @@ Scenario: mempal tail --follow 响应新增 drawer
   When 主进程 `mempal_ingest` 新增一条 drawer
   Then follow 进程 5s 内 stdout 新增一行对应该 drawer
   And follow 进程仍在运行
+
+Scenario: tail --follow 在写入高峰下只触发一次 SELECT 而非每事件一次
+  Test:
+    Filter: test_tail_follow_coalesces_event_storm
+    Level: integration
+    Test Double: recording_sqlite
+    Targets: crates/mempal-cli/src/observability/tail.rs
+  Given `mempal tail --follow` 启动，启动后记录 `SELECT ... FROM drawers WHERE id > ?` 的调用次数（通过 SQLite 打点或 sqlite_trace）
+  When 在 200ms 内往 db 连续 ingest 20 条 drawer（触发 ~20 次 fs event）
+  Then 250ms debounce 窗口结束后发生 **1 次** 或 **2 次** SELECT（不是 20 次）
+  And 20 条 drawer 都被打印到 stdout
+  And 所有行按 ULID 升序排列（无重复、无遗漏）
+  And 总 CPU 时间显著低于每事件一次 SELECT 的基线（作为观察指标，不 assert 具体值）
 
 Scenario: mempal timeline 按天分组
   Test:
