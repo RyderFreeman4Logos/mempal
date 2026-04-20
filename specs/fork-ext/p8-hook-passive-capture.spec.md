@@ -63,7 +63,7 @@ estimate: 2d
     }
   }
   ```
-  非侵入式合并：读既有 JSON，merge `hooks` key，保留其他配置；若已有相同命令则跳过。
+  **非侵入式合并语义**（CSA design review 2026-04-20 识别的共存需求）：读既有 JSON，对每个 hook 事件（`PostToolUse` / `UserPromptSubmit` / `SessionEnd` 等）**追加到既有数组**，不覆盖；若既有条目的 `command` 字段已等于 `mempal hook <event>` 的命令则跳过，避免重复注入。**不能**把整个 `hooks.UserPromptSubmit` 数组替换掉——upstream `mempal cowork-install-hooks`（见根目录 `specs/p8-cowork-inbox-push.spec.md`）也往同一个数组注入 `mempal cowork-drain` 条目，必须共存（两条 hook 各自 fire，互不干扰）。实现上：`hooks.<event>` 是 `Vec<HookGroup>`，本命令的 merge 规则是 `existing.chain(new.filter(not already_present_by_command))`；**绝不**是赋值。
 - `--dry-run` 打印 diff 不写入
 - 配置项在 `[hooks]`：`enabled`, `capture` (Vec<String>), `wing`, `daemon_poll_interval_ms`, `daemon_claim_ttl_secs`
 - `enabled = false` 时 `mempal hook <event>` **仍然** enqueue（让用户可以先写 hook 配置，再翻开关）；`mempal daemon` 检查到 `enabled = false` 直接退出并打印 warning

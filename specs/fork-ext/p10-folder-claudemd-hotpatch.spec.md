@@ -26,7 +26,7 @@ status: optional
   2. 对每个路径，沿目录向上找第一个含 CLAUDE.md（或 AGENTS.md / GEMINI.md，按配置）的目录 `<D>`
   3. 先把 `<D>` 标准化为**绝对路径**（`std::fs::canonicalize(<D>)?`；解析符号链接、消除 `..` / `.` 段），再对标准化结果计算稳定 hash（SHA-256 截前 12 字符）作为 suggestion 文件名：`~/.mempal/hotpatch/CLAUDE-<hash>.md`。**未规范化直接 hash 相对路径是禁止的**——同一物理目录被不同 cwd 访问会产生不同 hash，污染建议池并让 `mempal hotpatch apply --dir <D>` 找不到对应 suggestion。若 `canonicalize` 失败（路径不存在 / 权限不足）→ fail-fast 并在 daemon log warn，**不**回退为相对路径 hash
   4. 生成 suggestion 行（可选 AAAK signal 辅助）：`- <importance_stars 星> <topic>: <一句话摘要 (≤ 80 字符)> [drawer:<id[:8]>]`
-  5. append 到 suggestion 文件（去重：若同 drawer_id 已存在，skip）
+  5. append 到 suggestion 文件（去重：若同 drawer_id 已存在，skip）。**必须 `flock`** 该 suggestion 文件（排他锁）再读、再 append、再 unlock——CSA design review 2026-04-20 识别的并发写问题：daemon 可能并行跑多个 worker（每个处理队列里一条消息），若同一目录下连续 hit 多个 drawer、触发多个 worker 同时 append 同一 `CLAUDE-<hash>.md` 文件，POSIX 文件系统下无锁 append 在 Linux 上未必原子（依赖 page cache 行为），更不用说 dedup 需要先 read 再 skip——read-then-append 的组合必须在锁内完成才能保证"同 drawer_id 不重复"的不变量
 - Suggestion 文件结构：
   ```md
   # mempal hotpatch suggestions for <dir-path>

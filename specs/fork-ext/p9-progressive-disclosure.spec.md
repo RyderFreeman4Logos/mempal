@@ -35,8 +35,8 @@ estimate: 1d
   - input schema: `{ drawer_ids: Vec<String>, max_count: Option<u32> }`（默认 max 20）
   - output: `{ drawers: Vec<DrawerDto>, not_found: Vec<String> }`
   - 批量读取，超过 `max_count` 截断并返回 warn 字段
-- `SearchResultDto.content` 在 `progressive_disclosure = true` 时是 preview；为区分，**新增 bool 字段 `content_truncated: bool`**（只在 progressive 模式下可能为 true）
-- P7 的 5 个 AAAK signal 字段（`entities` / `topics` / `flags` / `emotions` / `importance_stars`）**基于完整 content 计算**，即使 progressive 模式下 `content` 被截断，signals 仍反映原文（在截断前调用 `aaak::signals::analyze(&full_content)`）
+- `SearchResultDto.content` 在 `progressive_disclosure = true` 时是 preview；为区分，**必填 bool 字段 `content_truncated: bool`**——在 progressive 模式下只要 `content.len() < original.len()` 就置 `true`，**非 optional、非 default-false-而不序列化**，客户端 DTO deserializer 必须看到它。CSA design review 2026-04-20 识别：若字段被遗漏或 default-elide，agent 看到 preview 却不知其为 preview，在决策引用时会把 "截断位置之后的证据" 当成 "不存在的证据"。同时 DTO 里也带 `original_content_bytes: usize` 让 agent 评估是否值得后续 `mempal_read_drawer`（很小的 drawer 可能不值得追一次）。
+- P7 的 5 个 AAAK signal 字段（`entities` / `topics` / `flags` / `emotions` / `importance_stars`）**基于完整 content 计算**，即使 progressive 模式下 `content` 被截断，signals 仍反映原文（在截断前调用 `aaak::signals::analyze(&full_content)`）。当 `content_truncated=true` 但某个 signal 指向 preview 中不可见的证据时，这是预期行为（不是 bug）——agent 可通过 `mempal_read_drawer(drawer_id)` 拉全文验证信号来源。
 - MCP ServerInfo.instructions 新增 workflow rule（编号 `10.` 续 9 条后）：
   ```
   RULE 10 (progressive disclosure): When progressive mode is active (server announces
