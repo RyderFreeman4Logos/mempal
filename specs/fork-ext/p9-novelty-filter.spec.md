@@ -38,13 +38,13 @@ estimate: 1d
   - 既有 drawer `content` 末尾追加分隔符 `\n---\nSUPPLEMENTARY ({timestamp}):\n` + candidate content
   - **硬上限防无界增长**：配置 `[novelty] max_merges_per_drawer`（默认 10）和 `max_content_bytes_per_drawer`（默认 65536 ≈ 64KB，LLM context 友好）；任一上限触发（`merge_count >= max_merges_per_drawer` 或 `len(merged_content) > max_content_bytes_per_drawer`）→ 该次去判决**降级为 Insert**（新建 drawer），不再继续往旧 drawer append；`novelty_audit` 写入 decision=`"insert_due_to_merge_cap"` 便于审计
   - `updated_at = now()`
-  - `merge_count` 列 +1（schema v7 新增）
+  - `merge_count` 列 +1（schema v9 新增）
   - **重新计算** embedding（合并后内容变化，旧 embedding 不再准确）：embed new `content`，UPDATE `drawer_vectors`
   - FTS5 index 自动随 `drawers.content` UPDATE 触发同步（如现有 trigger 已覆盖）
   - **保留** drawer ID 不变（KG triples 引用稳定）
-- 去重触发后 write 到 `novelty_audit` 表（schema v7 新增）：`{ id, candidate_hash, decision, near_drawer_id, cosine, created_at }`，`mempal status` 汇总
+- 去重触发后 write 到 `novelty_audit` 表（schema v9 新增）：`{ id, candidate_hash, decision, near_drawer_id, cosine, created_at }`，`mempal status` 汇总
 - 对 `mempal_ingest` MCP 工具调用方：返回 response metadata 含 `novelty_decision: "inserted" | "merged" | "dropped"`, `near_drawer_id`（如适用）；content 语义保持 raw，不影响字段形态
-- schema v6 → v7 bump：
+- schema v8 → v9 bump：
   - `drawers` 表加 `merge_count INTEGER NOT NULL DEFAULT 0` 和 `updated_at TEXT`（NULLABLE；仅 merge 发生时写入，未 merge 的 drawer 保持 NULL 以显式区分 added_at vs 后续变动）
   - 新建 `novelty_audit` 表
   - 注意：codebase 既有列名为 `added_at`（见 `src/core/db.rs`），**不是** `created_at`；novelty merge 场景新增的列名为 `updated_at` 以明确语义（last_merge_at 的意味），不重命名 `added_at`
@@ -59,7 +59,7 @@ estimate: 1d
 - `crates/mempal-ingest/src/pipeline.rs`（novelty filter 调用点：embedding 计算后、drawer 插入前）
 - `crates/mempal-ingest/src/lib.rs`（`pub mod novelty`）
 - `crates/mempal-core/src/config.rs`（`NoveltyConfig` struct）
-- `crates/mempal-core/src/db/schema.rs`（v6 → v7）
+- `crates/mempal-core/src/db/schema.rs`（v8 → v9）
 - `crates/mempal-mcp/src/tools.rs`（`IngestResponseDto` 加可选 `novelty_decision` / `near_drawer_id` 字段）
 - `crates/mempal-mcp/src/server.rs`（handler 传递 novelty 决策到 response）
 - `tests/novelty_filter.rs`（新建）
@@ -187,9 +187,9 @@ Scenario: embedder 错误时 fail-open 插入
   Then candidate 正常插入为新 drawer
   And stderr/log 含 warn
 
-Scenario: schema 迁移 v6 → v7 加 merge_count 和 novelty_audit
+Scenario: schema 迁移 v8 → v9 加 merge_count 和 novelty_audit
   Test:
-    Filter: test_migration_v6_to_v7_schema
+    Filter: test_migration_v8_to_v9_schema
     Level: integration
     Targets: crates/mempal-core/src/db/schema.rs
   Given palace.db schema_version == "6"

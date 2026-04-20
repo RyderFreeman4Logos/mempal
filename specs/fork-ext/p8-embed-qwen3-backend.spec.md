@@ -6,11 +6,13 @@ estimate: 2d
 
 ## Intent
 
-增加 `OpenAiCompatibleEmbedder`：任何 OpenAI-style `/v1/embeddings` HTTP 后端都能作为 `Embedder` trait 的实现，涵盖三类部署——**LAN 自部署**（如 `http://gb10:18002/v1/`，默认推荐，`Qwen/Qwen3-Embedding-8B` 4096d）、**localhost 监听端口**（未来用户自起本地 embedding server）、**云端 API**（OpenAI text-embedding-3-*、Cohere、Voyage AI、SiliconFlow 等）。`model2vec-rs` 进程内 fallback 保留。**URL / model 完全 config-driven**，不在代码里硬编码任何主机名。
+增加 `OpenAiCompatibleEmbedder`：任何 OpenAI-style `/v1/embeddings` HTTP 后端都能作为 `Embedder` trait 的实现。**推荐配置顺序**：(1) **LAN 自部署**（首选，如 `http://gb10:18002/v1/` 跑 `Qwen/Qwen3-Embedding-8B` 4096d——mempal 存在的核心价值主张就是把 claude-mem 的好特性搬到这档 LAN 硬件上、**消除云端 generative LLM 的 quota 花费**）；(2) **localhost 监听端口**（用户自起 ollama / vllm / TEI 等本地 embedding server）；(3) **云端商业 embedding API**（OpenAI text-embedding-3-*、Cohere、Voyage AI、SiliconFlow 等）——协议原生支持、可用作 LAN 不可达时的后备，成本比 generative chat 低约 100×，但**不是 mempal 的推荐主路径**：agent session 累积几千次 embedding 调用仍有显著成本，且与 "mempal = 零云端依赖的 claude-mem 替代" 的定位不一致。`model2vec-rs` 进程内 fallback 保留（offline / LAN 全断时的最后一档）。**URL / model 完全 config-driven**，不在代码里硬编码任何主机名。
 
 **失败语义**：
 - **Ingest 路径**：**固定 2 秒间隔** 无限重试（**不做指数退避**，用户明确偏好——压力可预测、故障恢复可观测），数据永不丢
 - **Search 路径**：5s deadline 后 fallback 到 BM25-only，不阻塞用户
+
+**与 `pending-message-store` 的协议**（CSA design review 2026-04-20 blocker 1 修复）：embedder ingest 重试循环**必须**在每次 sleep(2s) 前后调用 `store.refresh_heartbeat(msg_id, worker_id)`——这是 "2s 无限重试 + 数据永不丢" 与 "claim TTL + reclaim_stale" 能并存的唯一正确协议。heartbeat 活着的 claim 不会被 reclaim_stale 回滚；只有 worker 进程真正崩溃（heartbeat 静默 > `stale_secs`，默认 10s）才触发回滚。这消除了 CSA 识别的 "worker 永久持有 claim → TTL 到期 → 第二 worker 双派发" 的死锁路径。
 - **告警**：累计失败每 `alert_every_n_failures` 次（默认 100，**配置文件可配且热重载**）调用用户预配置的绝对路径脚本（e.g., Telegram / Slack / email 推送）
 - **Agent 通知**：当累计失败超过 `degrade_after_n_failures`（默认 10），mempal 进入 **degraded 状态**，对所有 MCP tool response 注入 `system_warnings` 字段并**拒绝**写入类 MCP 工具（`mempal_ingest` / `mempal_kg` add|invalidate / `mempal_tunnels` add|invalidate），强制 agent 暂停写入；读类正常。一次成功 embed 退出 degraded 并清零计数
 
@@ -20,7 +22,7 @@ estimate: 2d
 - Degraded 状态同时推给外部（脚本）+ agent（MCP response）：外部是异步告警（人类可稍后看），agent 是同步门控（立即暂停，保证系统一致性）
 
 **与 feedback 的对应**：
-- 符合 `feedback_no_llm_api_dependency.md`：embedding API 不是 generative LLM API，轻量向量化，成本 100× 低于 chat 完成，同时 LAN 自部署 + 云端 API 都合规（embedding 专属例外）
+- 符合 `feedback_no_llm_api_dependency.md`（"generative LLM 云端 API 禁令不含 embedding 云端服务"，embedding 成本 ≈ generative chat 的 1%）。本 spec 的立场：**LAN 自部署为默认首选**（与项目价值主张一致），云端 embedding API 作为**可配置的后备**（协议原生支持、用户显式指向时不阻塞），model2vec 进程内作**最后一档**（offline / 全部 HTTP 后端不可用时）。推荐顺序不是硬约束而是运维建议：单 agent session 的 embedding 调用会累积，即使按 $0.02/1M tokens 的低价也非完全可忽略。
 - 符合 `feedback_cli_over_web_ui.md`：无 UI，告警走脚本、状态走 MCP field
 
 ## Decisions

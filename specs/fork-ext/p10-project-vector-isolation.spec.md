@@ -14,7 +14,7 @@ estimate: 1d
 
 ## Decisions
 
-- schema v7 → v8 新 migration：
+- schema v9 → v10 新 migration：
   - `drawers` 表加 `project_id TEXT`（默认 NULL 兼容既有 drawer）
   - 索引 `CREATE INDEX idx_drawers_project_id ON drawers(project_id)`
   - `drawer_vectors` 表加 `project_id TEXT`（冗余列，为了 sqlite-vec filter 能直接过）
@@ -42,11 +42,16 @@ estimate: 1d
 - `mempal status` 加 "project breakdown" 行：`drawers per project: {proj-A:42, proj-B:18, NULL:7}`
 - `mempal tail` / `mempal timeline`（P10 CLI）支持 `--project <id>` 过滤
 - 严格 project 隔离是**默认关闭**的（保持 P0-P9 语义），用户显式开才生效
+- **Tunnel resolver 豁免**（CSA design review 2026-04-20 识别的交互）：upstream `specs/p10-explicit-tunnels.spec.md`（未 fork-ext，是 upstream 提出的 wing-to-wing 链接 schema）的 tunnel-follow 路径**必须豁免** project hard-filter——tunnels 的存在本身就是"跨 wing / 跨 project 的显式桥"，如果 tunnel 的 target drawer 属于另一 project，严格过滤会把 follow 变成 404。具体实现：
+  - `mempal_tunnels follow <tunnel_id>` / `mempal_search tunnel_hints` 解析目标 drawer 时，走 **bypass 版** `drawers::get_by_id()` 不带 `project_id` 筛选
+  - Tunnel row 存储时必须保存 target drawer 的 `project_id`（若有），让调用方看清"这个 tunnel 把我引向另一 project"
+  - Tunnel-resolved 的结果 DTO 明确标 `source: "tunnel_cross_project"`（与正常搜索结果的 `source: "project" | "global"` 并列），让 agent 知道命中是"故意越界"
+  - 这是 **唯一** 允许绕过 project filter 的读路径；ingest / direct search / KG query 全部尊重 project filter
 
 ## Boundaries
 
 ### Allowed
-- `crates/mempal-core/src/db/schema.rs`（v7 → v8 migration）
+- `crates/mempal-core/src/db/schema.rs`（v9 → v10 migration）
 - `crates/mempal-core/src/project.rs`（新建：project_id 解析工具）
 - `crates/mempal-core/src/config.rs`（`[project] id`、`[search] strict_project_isolation`）
 - `crates/mempal-core/src/lib.rs`（`pub mod project`）
@@ -80,9 +85,9 @@ estimate: 1d
 
 ## Completion Criteria
 
-Scenario: schema 迁移 v7 → v8 添加 project_id 列
+Scenario: schema 迁移 v9 → v10 添加 project_id 列
   Test:
-    Filter: test_migration_v7_to_v8_adds_project_id
+    Filter: test_migration_v9_to_v10_adds_project_id
     Level: integration
     Targets: crates/mempal-core/src/db/schema.rs
   Given palace.db schema_version == "7"
