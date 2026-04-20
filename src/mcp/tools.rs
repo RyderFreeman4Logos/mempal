@@ -118,6 +118,8 @@ pub struct StatusResponse {
     pub drawer_count: i64,
     pub taxonomy_count: i64,
     pub db_size_bytes: u64,
+    pub config_version: String,
+    pub config_loaded_at_unix_ms: u64,
     pub scopes: Vec<ScopeCount>,
     pub aaak_spec: String,
     pub memory_protocol: String,
