@@ -60,7 +60,7 @@ estimate: 2d
   - **不**处理 `hook_pre_tool`（仅 audit 无新信息，skip）
   - **truncated envelope**（`_truncated: true`）→ 直接落 warn 日志 + 产出 drawer（wing=`hooks-raw`，room=`truncated`），content 放 envelope JSON 原文；**必须经 `ingest::pipeline` 写入**（关键安全要求：pipeline 会在 chunking 前对整个 envelope JSON 文本跑 privacy scrub——含 `payload_preview` 字段——由 P8 `p8-privacy-scrubbing.spec.md` L24 保证。4KB preview + scrub 双重兜底把残留 secret 暴露面压到最小）；**不**尝试解析 `payload` 字段，立即 `confirm`（不走 `mark_failed` → 不进重试循环）
 - 所有 handler 都走完整 ingest 管道，自动应用 P8 privacy scrub；gating（P9）未到时自动禁用
-- `mempal hook install --target claude-code` 写入 `~/.claude/settings.json` 的 `hooks` key：
+- `mempal hook install --target claude-code` 写入 Claude Code 的 `settings.json` 的 `hooks` key：
   ```json
   {
     "hooks": {
@@ -69,7 +69,12 @@ estimate: 2d
     }
   }
   ```
-  **非侵入式合并语义**（CSA design review 2026-04-20 识别的共存需求）：读既有 JSON，对每个 hook 事件（`PostToolUse` / `UserPromptSubmit` / `SessionEnd` 等）**追加到既有数组**，不覆盖；若既有条目的 `command` 字段已等于 `mempal hook <event>` 的命令则跳过，避免重复注入。**不能**把整个 `hooks.UserPromptSubmit` 数组替换掉——upstream `mempal cowork-install-hooks`（见根目录 `specs/p8-cowork-inbox-push.spec.md`）也往同一个数组注入 `mempal cowork-drain` 条目，必须共存（两条 hook 各自 fire，互不干扰）。实现上：`hooks.<event>` 是 `Vec<HookGroup>`，本命令的 merge 规则是 `existing.chain(new.filter(not already_present_by_command))`；**绝不**是赋值。
+  **写入目标选择（本地优先 → symlink 感知 → 全局 fallback）**（gemini 2026-04-20 策略审查 Part 1 + Part 3 #3）：
+  1. 先看 `<cwd>/.claude/settings.json` 是否存在。存在就写本地（**MUST**）。理由：upstream `215b62f` 把 `.claude/settings.json` + `.claude/hooks/user-prompt-submit.sh` 作为 tracked blob commit 进仓库根目录用来自装 `cowork-drain`；Claude Code 对同路径文件**本地优先于全局**，若此时往 `~/.claude/settings.json` 全局写，在该仓库下运行 Claude Code 会完全读不到本 fork 注入的 hook（**silent shadow**，bug 发现代价极高）
+  2. 本地文件是 symlink 时 `canonicalize()` 到真实文件再读写，尊重用户 `git config core.excludesfile ~/.gitignore_noai` + 软链到独立 tracked 仓库的工作习惯（直接 `fs::write` 会把 symlink 变成 regular file，污染用户的独立跟踪仓库）
+  3. 本地不存在则 fallback 写 `~/.claude/settings.json` 全局（原 P8 设计，对非 fork 仓库的普通用户场景仍适用）
+  
+  **非侵入式合并语义**（CSA design review 2026-04-20 识别的共存需求）：读既有 JSON，对每个 hook 事件（`PostToolUse` / `UserPromptSubmit` / `SessionEnd` 等）**追加到既有数组**，不覆盖；若既有条目的 `command` 字段已等于 `mempal hook <event>` 的命令则跳过，避免重复注入。**不能**把整个 `hooks.UserPromptSubmit` 数组替换掉——upstream `mempal cowork-install-hooks`（见根目录 `specs/p8-cowork-inbox-push.spec.md`）也往同一个数组注入 `mempal cowork-drain` 条目（upstream commit `215b62f` 已把这个数组内容 commit 进 `.claude/settings.json`），必须共存（两条 hook 各自 fire，互不干扰）。实现上：`hooks.<event>` 是 `Vec<HookGroup>`，本命令的 merge 规则是 `existing.chain(new.filter(not already_present_by_command))`；**绝不**是赋值。
 - `--dry-run` 打印 diff 不写入
 - 配置项在 `[hooks]`：`enabled`, `capture` (Vec<String>), `wing`, `daemon_poll_interval_ms`, `daemon_claim_ttl_secs`
 - `enabled = false` 时 `mempal hook <event>` **仍然** enqueue（让用户可以先写 hook 配置，再翻开关）；`mempal daemon` 检查到 `enabled = false` 直接退出并打印 warning
@@ -97,7 +102,8 @@ estimate: 2d
 - 不要改 `drawers` / `drawer_vectors` schema（新表已在 P8 queue spec 中独立 bump）
 - 不要在 `mempal-mcp` / `mempal-api` / `mempal-search` 任何 crate 引用 `mempal-cli::hook` 模块
 - 不要强制 hook 注入 auth token 或 HMAC 验证——目标是 localhost 工具链协同，非外网
-- 不要覆盖用户已有的 `~/.claude/settings.json` 内容；只 merge `hooks` 子树
+- 不要覆盖用户已有的 `.claude/settings.json`（本地或全局）内容；只 merge `hooks` 子树
+- `.claude/settings.json` 是 symlink 时**不**允许 `fs::write` 写目标路径（会把软链变 regular file）——必须 `canonicalize()` 后写真实文件
 - 不要做 systemd timer / cron 自动启动 daemon——用户显式调 `mempal daemon`
 - 不要在 `mempal hook <event>` 里输出 stdout（只能 stderr），避免干扰 agent 的 stdout 管道
 
@@ -192,6 +198,45 @@ Scenario: hook install --dry-run 不写文件
   When 执行 `mempal hook install --target claude-code --dry-run`
   Then stdout 输出 diff 预览
   And `~/.claude/settings.json` 仍不存在
+
+Scenario: hook install 本地优先——repo 内有 .claude/settings.json 时写本地
+  Test:
+    Filter: test_hook_install_respects_project_local_settings
+    Level: integration
+    Test Double: tempfile_cwd_with_local_settings
+    Targets: crates/mempal-cli/src/hook_install.rs
+  Given 临时 cwd 含 `.claude/settings.json`（regular file，JSON 内容 `{ "theme": "dark" }`）
+  And 临时 HOME 无 `.claude/settings.json`
+  When 执行 `mempal hook install --target claude-code`
+  Then `<cwd>/.claude/settings.json` 被修改，`theme == "dark"` 保留，`hooks.PostToolUse` 新增 `mempal hook hook_post_tool`
+  And `~/.claude/settings.json` **仍不存在**（全局路径 MUST NOT 被触碰，避免把 fork-only 配置写进 user 全局污染别的 repo）
+
+Scenario: hook install symlink 感知——edit target 不破坏软链
+  Test:
+    Filter: test_hook_install_follows_symlink_target
+    Level: integration
+    Test Double: tempfile_cwd_with_symlinked_settings
+    Targets: crates/mempal-cli/src/hook_install.rs
+  Given 临时 cwd 下 `.claude/settings.json` 是 symlink，指向 `<some-other-dir>/claude-settings.json`（真实文件）
+  And 真实目标 JSON `{ "theme": "dark" }`
+  When 执行 `mempal hook install --target claude-code`
+  Then `<cwd>/.claude/settings.json` 仍是 symlink（MUST `fs::symlink_metadata` → `is_symlink() == true`）
+  And symlink `readlink` 目标路径不变
+  And **真实目标文件** `<some-other-dir>/claude-settings.json` 被写入，含原 `theme` + 新 `hooks.PostToolUse` entry
+  And `fs::write` 未被直接调用在 symlink 路径（实现必须 `canonicalize` 后再写）
+
+Scenario: hook install 与 upstream cowork-drain entry 共存
+  Test:
+    Filter: test_hook_install_coexists_with_upstream_cowork_entry
+    Level: integration
+    Test Double: tempfile_cwd_with_upstream_committed_settings
+    Targets: crates/mempal-cli/src/hook_install.rs
+  Given 临时 cwd 下 `.claude/settings.json` 已含 upstream 注入的 `hooks.UserPromptSubmit = [{ "hooks": [{ "type": "command", "command": ".claude/hooks/user-prompt-submit.sh" }] }]`（来自 `mempal cowork-install-hooks`，upstream commit `215b62f`）
+  When 执行 `mempal hook install --target claude-code`
+  Then `hooks.UserPromptSubmit` 数组 **长度 = 2**（原 upstream entry 保留 + fork 新 entry 追加）
+  And 其中**必须**有一条 `command` 匹配 `.claude/hooks/user-prompt-submit.sh`（upstream 保留）
+  And 其中**必须**有另一条 `command == "mempal hook hook_user_prompt"`（fork 追加）
+  And 第二次执行同命令 **不再追加**（idempotent by command-string 匹配）
 
 Scenario: daemon status 报告运行状态和队列 stats
   Test:
