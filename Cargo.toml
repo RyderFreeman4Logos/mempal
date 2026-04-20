@@ -42,7 +42,9 @@ axum = { version = "0.8", optional = true }
 bimap = "0.6"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
+daemonize = "0.5"
 jieba-rs = "0.8"
+libc = "0.2"
 model2vec-rs = { version = "0.1", optional = true }
 notify = "8"
 ort = { version = "2.0.0-rc.9", optional = true }
@@ -59,6 +61,8 @@ thiserror = "2"
 tokenizers = { version = "0.22", optional = true }
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 

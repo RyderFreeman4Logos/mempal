@@ -17,6 +17,10 @@ const DEFAULT_RETRY_INTERVAL_SECS: u64 = 2;
 const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 5;
 const DEFAULT_ALERT_EVERY_N_FAILURES: u64 = 100;
 const DEFAULT_DEGRADE_AFTER_N_FAILURES: u64 = 10;
+const DEFAULT_HOOK_WING: &str = "agent-diary";
+const DEFAULT_HOOK_POLL_INTERVAL_MS: u64 = 500;
+const DEFAULT_HOOK_CLAIM_TTL_SECS: u64 = 120;
+const DEFAULT_DAEMON_LOG_PATH: &str = "~/.mempal/daemon.log";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
@@ -28,6 +32,8 @@ pub struct Config {
     pub config_hot_reload: ConfigHotReloadConfig,
     pub search: SearchConfig,
     pub ingest_gating: IngestGatingConfig,
+    pub hooks: HooksConfig,
+    pub daemon: DaemonConfig,
 }
 
 impl Default for Config {
@@ -39,6 +45,8 @@ impl Default for Config {
             config_hot_reload: ConfigHotReloadConfig::default(),
             search: SearchConfig::default(),
             ingest_gating: IngestGatingConfig::default(),
+            hooks: HooksConfig::default(),
+            daemon: DaemonConfig::default(),
         }
     }
 }
@@ -88,6 +96,16 @@ impl Config {
         if self.embed.degradation.degrade_after_n_failures == 0 {
             return Err(ConfigError::InvalidConfig(
                 "embed.degradation.degrade_after_n_failures must be greater than 0".to_string(),
+            ));
+        }
+        if self.hooks.daemon_poll_interval_ms == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "hooks.daemon_poll_interval_ms must be greater than 0".to_string(),
+            ));
+        }
+        if self.hooks.daemon_claim_ttl_secs == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "hooks.daemon_claim_ttl_secs must be greater than 0".to_string(),
             ));
         }
         let _ = self.compile_privacy()?;
@@ -184,6 +202,9 @@ impl Config {
         if self.embed.openai_compat.dim != other.embed.openai_compat.dim {
             fields.push("embedder.openai_compat.dim");
         }
+        if self.daemon.log_path != other.daemon.log_path {
+            fields.push("daemon.log_path");
+        }
         fields
     }
 
@@ -197,6 +218,61 @@ impl Config {
         effective.embed.api_model = self.embed.api_model.clone();
         effective.embed.openai_compat = self.embed.openai_compat.clone();
         effective
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HooksConfig {
+    pub enabled: bool,
+    pub capture: Vec<String>,
+    pub wing: String,
+    pub daemon_poll_interval_ms: u64,
+    pub daemon_claim_ttl_secs: u64,
+    pub session_end: HooksSessionEndConfig,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            capture: vec![
+                "PostToolUse".to_string(),
+                "UserPromptSubmit".to_string(),
+                "SessionStart".to_string(),
+                "SessionEnd".to_string(),
+            ],
+            wing: DEFAULT_HOOK_WING.to_string(),
+            daemon_poll_interval_ms: DEFAULT_HOOK_POLL_INTERVAL_MS,
+            daemon_claim_ttl_secs: DEFAULT_HOOK_CLAIM_TTL_SECS,
+            session_end: HooksSessionEndConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HooksSessionEndConfig {
+    pub enabled: bool,
+}
+
+impl Default for HooksSessionEndConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DaemonConfig {
+    pub log_path: String,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            log_path: DEFAULT_DAEMON_LOG_PATH.to_string(),
+        }
     }
 }
 
