@@ -63,7 +63,7 @@ src/
 - upstream 版本控制用的是 **SQLite 内置 `PRAGMA user_version`（单 u32 槽位）**，**没有 `schema_meta` 表**。`read_user_version` / `set_user_version` 位于 `db.rs` line 727/732
 - 迁移链线性：V1（全量 schema）→ V2（`deleted_at`）→ V3（FTS5 + triggers）→ V4（`importance` 列）
 - upstream `specs/p10-explicit-tunnels.spec.md` 计划 v5，`specs/p10-normalize-version.spec.md` 计划 v6——但**都是 draft 未 ship**
-- fork-ext chain 计划 ext-v1(queue) → ext-v2(gating) → ext-v3(novelty) → ext-v4(vector-iso)
+- fork-ext chain 计划 ext-v1(queue) → ext-v2(embed-qwen3) → ext-v3(gating) → ext-v4(novelty) → ext-v5(vector-iso)
 
 **选定方案：独立版本号命名空间 + 新建 fork_ext_meta K-V 表**（其他方案见下方 "Rejected Alternatives"）：
 
@@ -71,7 +71,11 @@ src/
 // src/core/db.rs
 const CURRENT_SCHEMA_VERSION: u32 = 4;        // upstream axis —— 不改，继续由 PRAGMA user_version 管
 const FORK_EXT_SCHEMA_VERSION: u32 = 0;       // fork-ext axis，bootstrap 落在 fork_ext_meta
-                                               // ext-v1=queue; ext-v2=gating; ext-v3=novelty; ext-v4=vector-iso
+                                               // ext-v1=queue (pending_messages)
+                                               // ext-v2=embed-qwen3 (reindex_progress)
+                                               // ext-v3=gating (gating_audit)
+                                               // ext-v4=novelty (merge_count col + novelty_audit + FTS5 trigger)
+                                               // ext-v5=vector-isolation (drawers.project_id)
 ```
 
 - 新建 `fork_ext_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)` K-V 表，作为 **fork-ext 轴的 bootstrap**
@@ -172,12 +176,12 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 - Phase 2 起每个 spec 在 `fork_ext_migrations()` 数组追加一行 `Migration { version, sql }` 即完成 schema 部分，不再动 runner / reader / setter
 
 **此后 Phase 2-5 的版本号映射**：
-- Phase 2 `p8-queue`：ext_v1（pending_messages 表）
+- Phase 2 `p8-queue`：**ext_v1**（pending_messages 表）
 - Phase 3 `p8-privacy`：无 schema 变更
-- Phase 4 `p8-embed-qwen3`：无 schema 变更
+- Phase 4 `p8-embed-qwen3`：**ext_v2**（reindex_progress 表——支持 `mempal reindex --resume`）
 - Phase 5 `p8-hook`：无 schema 变更
-- 未来 `p9-gating`：ext_v2；`p9-novelty`：ext_v3；`p10-vector-iso`：ext_v4
-- spec 文档里写的 `schema_version == "7"/"8"/"9"/"10"` 在 impl 时统一翻译为 "fork_ext_version == 1/2/3/4"；spec 本身不动（保持上游 debate 产出的文字稳定），plan→impl 阶段建 migration ID 对照表
+- 未来 `p9-gating`：ext_v3；`p9-novelty`：ext_v4；`p10-vector-iso`：ext_v5
+- fork-ext spec 已同步改写：原 `schema_version == "7"/"8"/"9"/"10"` 断言全部改为 `fork_ext_version == "1"/"2"/"3"/"4"/"5"`（见 `p8-pending-message-store.spec.md` / `p8-embed-qwen3-backend.spec.md` / `p9-judge-gating-local.spec.md` / `p9-novelty-filter.spec.md` / `p10-project-vector-isolation.spec.md`），spec 和 plan / impl 三者一致
 
 ---
 
@@ -301,24 +305,29 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 | `src/embed/alerting.rs` (new) | create | 阈值告警 + 脚本执行（热重载脚本路径） |
 | `src/embed/mod.rs` | modify | 默认改为 `OpenAiCompatibleEmbedder`；`model2vec-rs` 保留为 offline fallback |
 | `src/core/config/schema.rs` | modify | 加 `EmbedderConfig`（restart-required）+ `AlertingConfig`（hot-reload） |
-| `src/main.rs` | modify | `mempal reindex --embedder <name>` 子命令 |
+| `src/core/db.rs` | modify | 定义 `FORK_EXT_V2_SCHEMA_SQL`（`reindex_progress` 表 DDL）；往 `fork_ext_migrations()` 追加 `Migration { version: 2, sql: FORK_EXT_V2_SCHEMA_SQL }` |
+| `src/core/reindex.rs` (new) | create | `ReindexProgressStore` CRUD（resume checkpoint） |
+| `src/main.rs` | modify | `mempal reindex --embedder <name> [--resume]` 子命令 |
 | `tests/openai_compat_embedder.rs` (new) | create | scenarios |
 | `tests/embedder_retry_heartbeat.rs` (new) | create | 重试 + heartbeat 协议测试 |
+| `tests/reindex_progress.rs` (new) | create | reindex `--resume` 断点恢复 scenario |
 
 ### Tasks
 
 - [ ] **T4.1** 加 `reqwest` client 适配（已在 deps）
 - [ ] **T4.2** 写失败测试 `test_openai_compat_embed_happy_path`（mock server）
 - [ ] **T4.3** 实现 `OpenAiCompatibleEmbedder`（`/v1/embeddings` POST + `Qwen/Qwen3-Embedding-8B` model name）
-- [ ] **T4.4** 实现 2s 固定重试 + 每轮调 heartbeat callback（从 queue store 注入）
-- [ ] **T4.5** 实现 degraded 状态 + MCP `system_warnings` 注入
-- [ ] **T4.6** 实现告警阈值 + 脚本执行 + 路径热重载（消费 Phase 1 机制）
-- [ ] **T4.7** 实现 `mempal reindex --embedder <name>` 全库 re-embed
-- [ ] **T4.8** integration test：LAN 不可达时 fallback model2vec
-- [ ] **T4.9** integration test：切后端前后 `drawer_vectors` dim 不一致检测
-- [ ] **T4.10** clippy / fmt / PR
+- [ ] **T4.4** 定义 `FORK_EXT_V2_SCHEMA_SQL` + `fork_ext_migrations()` 追加 ext-v2 entry（`reindex_progress` 表 DDL）；写 migration 测试
+- [ ] **T4.5** 实现 2s 固定重试 + 每轮调 heartbeat callback（从 queue store 注入）
+- [ ] **T4.6** 实现 degraded 状态 + MCP `system_warnings` 注入
+- [ ] **T4.7** 实现告警阈值 + 脚本执行 + 路径热重载（消费 Phase 1 机制）
+- [ ] **T4.8** 实现 `mempal reindex --embedder <name> [--resume]` 全库 re-embed；checkpoint 写 `reindex_progress`
+- [ ] **T4.9** integration test：LAN 不可达时 fallback model2vec
+- [ ] **T4.10** integration test：切后端前后 `drawer_vectors` dim 不一致检测
+- [ ] **T4.11** integration test：reindex 20/50 时 SIGINT → `--resume` 从 20 继续；最终 `fork_ext_version == "2"`
+- [ ] **T4.12** clippy / fmt / PR
 
-**Done when**: 默认走 `OpenAiCompatibleEmbedder`；LAN 不可用时 fallback model2vec；`mempal reindex` 可用。
+**Done when**: 默认走 `OpenAiCompatibleEmbedder`；LAN 不可用时 fallback model2vec；`mempal reindex --resume` 可用；fork-ext axis 升到 ext_v2。
 
 ---
 
@@ -392,11 +401,11 @@ Cargo.toml 当前是**单 crate 结构**（`[dependencies]` 直接列，无 `[wo
 
 ## Post-P8 预告（不在本 plan 实施范围，记档）
 
-P8 完成后下一阶段是 fork-ext P9：`p9-judge-gating-local`（ext_v2）→ `p9-novelty-filter`（ext_v3）→ `p9-progressive-disclosure`（**不 bump**，纯 MCP / 响应侧，无 schema 变更）→ `p9-session-self-review`（**不 bump**，复用 drawer 表末尾 sentinel）。
+P8 完成后下一阶段是 fork-ext P9：`p9-judge-gating-local`（ext_v3）→ `p9-novelty-filter`（ext_v4）→ `p9-progressive-disclosure`（**不 bump**，纯 MCP / 响应侧，无 schema 变更）→ `p9-session-self-review`（**不 bump**，复用 drawer 表末尾 sentinel）。
 
-P10 阶段：`p10-project-vector-isolation`（ext_v4）→ `p10-cli-dashboard`（**不 bump**，只读 CLI）。
+P10 阶段：`p10-project-vector-isolation`（ext_v5）→ `p10-cli-dashboard`（**不 bump**，只读 CLI）。
 
-合计 fork-ext chain：Phase 0 bootstrap（ext_v0，runner + 空 migration array） → queue（ext_v1） → gating（ext_v2） → novelty（ext_v3） → vector-isolation（ext_v4）。与 D2 映射表一致。
+合计 fork-ext chain：Phase 0 bootstrap（ext_v0，runner + 空 migration array） → queue（ext_v1） → embed-qwen3（ext_v2，reindex_progress） → gating（ext_v3） → novelty（ext_v4） → vector-isolation（ext_v5）。与 D2 映射表、fork-ext spec 断言三者一致。
 
 ---
 

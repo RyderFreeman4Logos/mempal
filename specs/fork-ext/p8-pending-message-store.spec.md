@@ -15,7 +15,7 @@ estimate: 2d
 ## Decisions
 
 - 新建 `crates/mempal-core/src/queue.rs` 模块，暴露 `PendingMessageStore` struct
-- 新建 schema migration，引入 `pending_messages` 表（字段见下），bump `CURRENT_SCHEMA_VERSION` v6 → v7
+- 新建 fork-ext schema migration，引入 `pending_messages` 表（字段见下），bump `fork_ext_version` `0 → 1`（**fork-ext 独立版本轴**；upstream 的 `PRAGMA user_version` / `CURRENT_SCHEMA_VERSION` 保持不动，见 `docs/plans/2026-04-20-fork-ext-p8-implementation.md` §D2）
 - 表结构：
   ```sql
   CREATE TABLE pending_messages (
@@ -58,7 +58,7 @@ estimate: 2d
 ### Allowed
 - `crates/mempal-core/src/queue.rs`（新建）
 - `crates/mempal-core/src/lib.rs`（`pub mod queue` + re-export）
-- `crates/mempal-core/src/db/schema.rs` 或等价（migration v6 → v7 + `pending_messages` DDL）
+- `crates/mempal-core/src/db/schema.rs` 或等价（fork_ext_version `0 → 1` migration + `pending_messages` DDL）
 - `crates/mempal-core/src/db.rs` 或 `db/mod.rs`（`Database::open` 追加 `PRAGMA journal_mode=WAL` + `PRAGMA synchronous=NORMAL`；启动时调 `reclaim_stale`）
 - `crates/mempal-core/Cargo.toml`（添加 `thiserror`、`ulid` workspace dep，若尚未有）
 - `crates/mempal-cli/src/main.rs`（`mempal status` 加队列 stats 行）
@@ -183,14 +183,15 @@ Scenario: 并发 enqueue 在 WAL 模式下不阻塞
   Then 队列中恰好有 "800" 条 pending
   And 整体耗时 < 5 秒（naive upper bound，表明无严重锁竞争）
 
-Scenario: schema 迁移 v6 → v7 创建 pending_messages 表
+Scenario: fork-ext 迁移 v0 → v1 创建 pending_messages 表
   Test:
-    Filter: test_migration_v4_to_v5_creates_pending_messages_table
+    Filter: test_fork_ext_migration_v0_to_v1_creates_pending_messages_table
     Level: integration
     Targets: crates/mempal-core/src/db/schema.rs
-  Given 一个 schema_version == "4" 的 palace.db
-  When 启动 mempal 触发迁移
-  Then `schema_version` == "5"
+  Given 一个 `fork_ext_version == "0"` 的 palace.db（Phase 0 bootstrap 之后的初始状态）
+  When 启动 mempal 触发 fork-ext 迁移
+  Then `fork_ext_version == "1"`
+  And upstream 的 `PRAGMA user_version` 保持不变
   And `sqlite_master` 查询 `name='pending_messages'` 返回 1 行
   And `idx_pending_next_attempt` 索引存在
 

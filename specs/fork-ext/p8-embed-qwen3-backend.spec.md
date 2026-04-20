@@ -146,7 +146,7 @@ estimate: 2d
 
 - `drawer_vectors` 表动态 dim
 - 切后端 dim 不一致 → 拒绝启动 + 提示 `mempal reindex --embedder <name>`
-- schema v8 → v9 加 `reindex_progress` 表
+- fork-ext `fork_ext_version` `1 → 2`：加 `reindex_progress` 表（fork-ext 独立版本轴；queue 先占 ext_v1）
 - reindex 也走固定 2s 重试策略
 - **reindex 失败不触发 degraded**（degraded 只针对常规 ingest / search 路径）——reindex 是一次性批处理
 
@@ -166,7 +166,7 @@ estimate: 2d
 - `crates/mempal-embed/src/lib.rs`（re-exports + backend dispatch）
 - `crates/mempal-embed/Cargo.toml`（新增 `reqwest`、`notify`、`arc-swap`——workspace deps）
 - `crates/mempal-core/src/config.rs`（新 section struct）
-- `crates/mempal-core/src/db/schema.rs`（v8 → v9）
+- `crates/mempal-core/src/db/schema.rs`（fork_ext_version `1 → 2`）
 - `crates/mempal-mcp/src/tools.rs`（`SystemWarning` type + 每个 DTO 加字段）
 - `crates/mempal-mcp/src/server.rs`（handler 填字段 + 写类工具 degraded 拒绝 + RULE 11）
 - `crates/mempal-cli/src/main.rs`（`mempal reindex` + SIGHUP handler）
@@ -410,7 +410,7 @@ Scenario: `mempal reindex` 全库 re-embed + resume
   When 执行 `mempal reindex --embedder openai_compat`，在 20 条时 SIGINT
   And 再执行 `mempal reindex --embedder openai_compat --resume`
   Then 全 50 条 drawer 完成 re-embed，dim=4096
-  And schema_version == 9
+  And `fork_ext_version == "2"`
 
 Scenario: 配置首次启动若缺 base_url/model 则 fail-fast
   Test:

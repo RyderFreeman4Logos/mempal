@@ -14,7 +14,7 @@ estimate: 1d
 
 ## Decisions
 
-- schema v9 → v10 新 migration：
+- fork-ext `fork_ext_version` `4 → 5` 新 migration：
   - `drawers` 表加 `project_id TEXT`（默认 NULL 兼容既有 drawer）
   - 索引 `CREATE INDEX idx_drawers_project_id ON drawers(project_id)`
   - `drawer_vectors` 表加 `project_id TEXT`（冗余列，为了 sqlite-vec filter 能直接过）
@@ -64,7 +64,7 @@ estimate: 1d
 ## Boundaries
 
 ### Allowed
-- `crates/mempal-core/src/db/schema.rs`（v9 → v10 migration）
+- `crates/mempal-core/src/db/schema.rs`（fork_ext_version `4 → 5` migration）
 - `crates/mempal-core/src/project.rs`（新建：project_id 解析工具）
 - `crates/mempal-core/src/config.rs`（`[project] id`、`[search] strict_project_isolation`）
 - `crates/mempal-core/src/lib.rs`（`pub mod project`）
@@ -98,14 +98,14 @@ estimate: 1d
 
 ## Completion Criteria
 
-Scenario: schema 迁移 v9 → v10 添加 project_id 列
+Scenario: fork-ext 迁移 v4 → v5 添加 project_id 列
   Test:
-    Filter: test_migration_v9_to_v10_adds_project_id
+    Filter: test_fork_ext_migration_v4_to_v5_adds_project_id
     Level: integration
     Targets: crates/mempal-core/src/db/schema.rs
-  Given palace.db schema_version == "9"
+  Given palace.db `fork_ext_version == "4"`
   When 启动 mempal
-  Then schema_version == "10"
+  Then `fork_ext_version == "5"`
   And `drawers`, `drawer_vectors`, `triples` 三表均有 `project_id` 列
   And 存在索引 `idx_drawers_project_id`
   And 既有 drawer 的 `project_id` 全部为 NULL

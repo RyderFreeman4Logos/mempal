@@ -45,7 +45,7 @@ estimate: 1d
 
 ### Forbidden
 - 不要给 `drawers` / `drawer_vectors` / `triples` 加字段
-- 不要 bump `CURRENT_SCHEMA_VERSION`
+- 不要 bump `CURRENT_SCHEMA_VERSION` 也不要 bump `fork_ext_version`（privacy 无 schema 变更）
 - 不要引入 `regex-automata` 之外的新 regex 库
 - 不要在 `privacy.rs` 外 import `regex::Regex` 做凭证匹配（集中管理）
 - 不要在 `mempal-search` / `mempal-aaak` / `mempal-mcp` / `mempal-api` 任何 crate 里调 `privacy::scrub`——清洗只发生在 ingest 边

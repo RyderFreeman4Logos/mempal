@@ -49,7 +49,7 @@ estimate: 1d
 - `ServerInfo.instructions` 动态检测 `[search] progressive_disclosure` 开关，active 时注入 RULE 10，否则不注入
 - 向 `ServerInfo` 扩展一个 `progressive_disclosure_active: bool` 字段（也可以挂在 `caps`）
 - Preview 生成是 `O(content.len())` 纯字符串切片，不触发任何 db / embedding / LLM 调用
-- 无 schema 变更（不 bump `CURRENT_SCHEMA_VERSION`）
+- 无 schema 变更（不 bump `CURRENT_SCHEMA_VERSION` 也不 bump `fork_ext_version`）
 
 ## Boundaries
 
@@ -64,7 +64,7 @@ estimate: 1d
 
 ### Forbidden
 - 不要修改 `drawers` / `drawer_vectors` / `triples` schema
-- 不要 bump `CURRENT_SCHEMA_VERSION`
+- 不要 bump `CURRENT_SCHEMA_VERSION` 也不要 bump `fork_ext_version`
 - 不要让 progressive mode 影响 `mempal_read_drawer` 的返回（永远 full）
 - 不要在 preview 逻辑里调 AAAK compress（P7 证明 AAAK 非 byte-level 压缩，不减 token）
 - 不要把 preview 字符串缓存到 db——每次 search 都现算
