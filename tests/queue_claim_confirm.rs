@@ -58,7 +58,7 @@ fn test_fork_ext_migration_v0_to_v2_creates_pending_messages_table() {
 
 #[test]
 fn test_enqueue_claim_confirm_basic() {
-    let (_tmp, _db_path, store) = new_store();
+    let (_tmp, db_path, store) = new_store();
 
     let id = store
         .enqueue("hook_event", r#"{"tool":"Bash"}"#)
@@ -77,8 +77,17 @@ fn test_enqueue_claim_confirm_basic() {
     let stats = store.stats().expect("stats");
     assert_eq!(stats.pending, 0);
     assert_eq!(stats.claimed, 0);
-    assert_eq!(stats.done, 1);
     assert_eq!(stats.failed, 0);
+
+    let remaining = Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT COUNT(*) FROM pending_messages WHERE id = ?1",
+            [&claimed.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count confirmed row");
+    assert_eq!(remaining, 0);
 }
 
 #[test]

@@ -59,7 +59,6 @@ async fn test_mcp_status_surfaces_queue_stats() {
 
     assert_eq!(response.queue_stats.pending, 1);
     assert_eq!(response.queue_stats.claimed, 0);
-    assert_eq!(response.queue_stats.done, 1);
     assert_eq!(response.queue_stats.failed, 0);
     assert!(response.queue_stats.oldest_pending_age_secs.is_some());
 }

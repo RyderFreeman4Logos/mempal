@@ -123,7 +123,6 @@ impl MempalMcpServer {
             queue_stats: QueueStatsDto {
                 pending: queue_stats.pending,
                 claimed: queue_stats.claimed,
-                done: queue_stats.done,
                 failed: queue_stats.failed,
                 oldest_pending_age_secs: queue_stats.oldest_pending_age_secs,
             },

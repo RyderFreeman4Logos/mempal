@@ -89,7 +89,6 @@ fn test_queue_stats_reflects_current_state() {
     let stats = store.stats().expect("stats");
     assert_eq!(stats.pending, 1);
     assert_eq!(stats.claimed, 1);
-    assert_eq!(stats.done, 1);
     assert_eq!(stats.failed, 1);
     assert!(
         stats.oldest_pending_age_secs.is_some_and(|age| age >= 100),
@@ -114,7 +113,6 @@ fn test_oldest_pending_age_none_when_empty() {
     let stats = store.stats().expect("stats");
     assert_eq!(stats.pending, 0);
     assert_eq!(stats.claimed, 0);
-    assert_eq!(stats.done, 0);
     assert_eq!(stats.failed, 0);
     assert_eq!(stats.oldest_pending_age_secs, None);
 }
@@ -174,7 +172,6 @@ fn test_cli_status_prints_queue_section() {
     assert!(stdout.contains("Queue:"), "{stdout}");
     assert!(stdout.contains("pending: 1"), "{stdout}");
     assert!(stdout.contains("claimed: 1"), "{stdout}");
-    assert!(stdout.contains("done: 1"), "{stdout}");
     assert!(stdout.contains("failed: 1"), "{stdout}");
     assert!(stdout.contains("oldest_pending_age_secs:"), "{stdout}");
 }

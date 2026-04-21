@@ -34,7 +34,6 @@ pub struct ClaimedMessage {
 pub struct QueueStats {
     pub pending: u64,
     pub claimed: u64,
-    pub done: u64,
     pub failed: u64,
     pub oldest_pending_age_secs: Option<u64>,
 }
@@ -167,16 +166,7 @@ impl PendingMessageStore {
 
     pub fn confirm(&self, id: &str) -> Result<()> {
         let conn = self.open_connection()?;
-        let updated = conn.execute(
-            r#"
-            UPDATE pending_messages
-            SET status = 'done',
-                claim_token = NULL,
-                heartbeat_at = NULL
-            WHERE id = ?1
-            "#,
-            [id],
-        )?;
+        let updated = conn.execute("DELETE FROM pending_messages WHERE id = ?1", [id])?;
         if updated == 0 {
             return Err(QueueError::MessageNotFound(id.to_string()));
         }
@@ -255,7 +245,6 @@ impl PendingMessageStore {
         let conn = self.open_connection()?;
         let mut pending = 0;
         let mut claimed = 0;
-        let mut done = 0;
         let mut failed = 0;
 
         let mut statement = conn.prepare(
@@ -273,7 +262,6 @@ impl PendingMessageStore {
             match status.as_str() {
                 "pending" => pending = count,
                 "claimed" => claimed = count,
-                "done" => done = count,
                 "failed" => failed = count,
                 _ => {}
             }
@@ -293,14 +281,16 @@ impl PendingMessageStore {
         Ok(QueueStats {
             pending: i64_to_u64(pending),
             claimed: i64_to_u64(claimed),
-            done: i64_to_u64(done),
             failed: i64_to_u64(failed),
             oldest_pending_age_secs,
         })
     }
 
     fn open_connection(&self) -> Result<Connection> {
-        Ok(Connection::open(&self.db_path)?)
+        let conn = Connection::open(&self.db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(conn)
     }
 
     fn compute_backoff_ms(&self, retry_count: u32) -> i64 {

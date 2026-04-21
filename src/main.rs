@@ -1117,7 +1117,6 @@ fn status_command(db: &Database) -> Result<()> {
     println!("Queue:");
     println!("  pending: {}", queue_stats.pending);
     println!("  claimed: {}", queue_stats.claimed);
-    println!("  done: {}", queue_stats.done);
     println!("  failed: {}", queue_stats.failed);
     match queue_stats.oldest_pending_age_secs {
         Some(age) => println!("  oldest_pending_age_secs: {age}"),

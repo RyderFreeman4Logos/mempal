@@ -139,7 +139,6 @@ pub struct StatusResponse {
 pub struct QueueStatsDto {
     pub pending: u64,
     pub claimed: u64,
-    pub done: u64,
     pub failed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_pending_age_secs: Option<u64>,
