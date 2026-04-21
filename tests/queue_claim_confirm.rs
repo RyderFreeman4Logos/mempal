@@ -75,7 +75,10 @@ fn test_enqueue_claim_confirm_basic() {
 
     store.confirm(&claimed.id).expect("confirm");
     let stats = store.stats().expect("stats");
-    assert_eq!(stats.pending + stats.claimed + stats.failed, 0);
+    assert_eq!(stats.pending, 0);
+    assert_eq!(stats.claimed, 0);
+    assert_eq!(stats.done, 1);
+    assert_eq!(stats.failed, 0);
 }
 
 #[test]

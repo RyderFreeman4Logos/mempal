@@ -34,7 +34,9 @@ pub struct ClaimedMessage {
 pub struct QueueStats {
     pub pending: u64,
     pub claimed: u64,
+    pub done: u64,
     pub failed: u64,
+    pub oldest_pending_age_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,8 +167,17 @@ impl PendingMessageStore {
 
     pub fn confirm(&self, id: &str) -> Result<()> {
         let conn = self.open_connection()?;
-        let deleted = conn.execute("DELETE FROM pending_messages WHERE id = ?1", [id])?;
-        if deleted == 0 {
+        let updated = conn.execute(
+            r#"
+            UPDATE pending_messages
+            SET status = 'done',
+                claim_token = NULL,
+                heartbeat_at = NULL
+            WHERE id = ?1
+            "#,
+            [id],
+        )?;
+        if updated == 0 {
             return Err(QueueError::MessageNotFound(id.to_string()));
         }
         Ok(())
@@ -242,22 +253,49 @@ impl PendingMessageStore {
 
     pub fn stats(&self) -> Result<QueueStats> {
         let conn = self.open_connection()?;
-        let (pending, claimed, failed): (i64, i64, i64) = conn.query_row(
+        let mut pending = 0;
+        let mut claimed = 0;
+        let mut done = 0;
+        let mut failed = 0;
+
+        let mut statement = conn.prepare(
             r#"
-            SELECT
-                COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN status = 'claimed' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
+            SELECT status, COUNT(*)
             FROM pending_messages
+            GROUP BY status
             "#,
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (status, count) = row?;
+            match status.as_str() {
+                "pending" => pending = count,
+                "claimed" => claimed = count,
+                "done" => done = count,
+                "failed" => failed = count,
+                _ => {}
+            }
+        }
+
+        let oldest_pending_created_at = conn
+            .query_row(
+                "SELECT MIN(created_at) FROM pending_messages WHERE status = 'pending'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        let oldest_pending_age_secs = oldest_pending_created_at
+            .map(|created_at| i64_to_u64(now_secs().saturating_sub(created_at)));
 
         Ok(QueueStats {
             pending: i64_to_u64(pending),
             claimed: i64_to_u64(claimed),
+            done: i64_to_u64(done),
             failed: i64_to_u64(failed),
+            oldest_pending_age_secs,
         })
     }
 
