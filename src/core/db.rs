@@ -102,6 +102,8 @@ impl Database {
         register_sqlite_vec()?;
 
         let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         apply_migrations(&conn)?;
         db_fork_ext::apply_fork_ext_migrations(&conn)?;
 
@@ -279,20 +281,9 @@ impl Database {
     /// Ensure drawer_vectors table exists with the right dimension.
     /// Creates it on first call; errors on dimension mismatch.
     fn ensure_vectors_table(&self, dim: usize) -> Result<(), DbError> {
-        // Check if table exists
-        let exists: bool = self
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
-                [],
-                |row| row.get(0),
-            )?;
-
-        if !exists {
-            self.conn.execute_batch(&format!(
-                "CREATE VIRTUAL TABLE drawer_vectors USING vec0(id TEXT PRIMARY KEY, embedding FLOAT[{dim}]);"
-            ))?;
-        }
+        self.conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS drawer_vectors USING vec0(id TEXT PRIMARY KEY, embedding FLOAT[{dim}]);"
+        ))?;
         Ok(())
     }
 
