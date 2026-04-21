@@ -71,12 +71,19 @@ pub fn run_command(config: &Config, mempal_home: &Path, command: HotpatchCommand
 }
 
 pub(crate) fn short_drawer_id(drawer_id: &str) -> &str {
-    let len = drawer_id
-        .char_indices()
-        .nth(8)
-        .map(|(idx, _)| idx)
-        .unwrap_or(drawer_id.len());
-    &drawer_id[..len]
+    drawer_id
+        .rsplit_once('_')
+        .map(|(_, suffix)| suffix)
+        .or_else(|| {
+            let start = drawer_id
+                .char_indices()
+                .rev()
+                .nth(7)
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            drawer_id.get(start..)
+        })
+        .unwrap_or(drawer_id)
 }
 
 pub(crate) struct FileLock {

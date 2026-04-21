@@ -107,6 +107,22 @@ allowed_target_prefixes = ["{}"]
     }
 }
 
+fn expected_short_drawer_id(drawer_id: &str) -> String {
+    drawer_id
+        .rsplit_once('_')
+        .map(|(_, suffix)| suffix.to_string())
+        .unwrap_or_else(|| {
+            drawer_id
+                .chars()
+                .rev()
+                .take(8)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect()
+        })
+}
+
 fn drawer_hash(db_path: &Path, drawer_id: &str) -> String {
     let db = Database::open(db_path).expect("open db");
     let details = db
@@ -186,7 +202,10 @@ fn test_high_importance_drawer_generates_suggestion() {
     assert_eq!(entries.len(), 1);
     let content = fs::read_to_string(entries[0].path()).expect("read suggestion file");
     assert!(content.contains("mempal hotpatch suggestions for"));
-    assert!(content.contains("[drawer:drawer-h]"));
+    assert!(content.contains(&format!(
+        "[drawer:{}]",
+        expected_short_drawer_id("drawer-high-0001")
+    )));
     assert!(content.contains("decision: use Arc<Mutex<>>"));
 }
 
@@ -264,7 +283,67 @@ fn test_duplicate_drawer_id_not_re_appended() {
         .expect("collect entries");
     let content = fs::read_to_string(entries[0].path()).expect("read suggestion file");
     assert_eq!(outcome.appended, 0);
-    assert_eq!(content.matches("[drawer:drawer-d]").count(), 1);
+    assert_eq!(
+        content
+            .matches(&format!(
+                "[drawer:{}]",
+                expected_short_drawer_id("drawer-dup-0001")
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_distinct_drawers_with_shared_prefix_do_not_collide() {
+    let env = HotpatchEnv::new();
+    let file_path = env.project_dir.join("src/lib.rs");
+    fs::write(&file_path, "pub fn demo() {}\n").expect("write source");
+    let payload_path = env.write_hook_payload("prefix", &file_path);
+    env.insert_drawer(
+        "drawer_hooks_raw_edit_deadbeef",
+        "Decision: first suggestion survives",
+        5,
+        &payload_path,
+        Some("project-alpha"),
+    );
+    env.insert_drawer(
+        "drawer_hooks_raw_edit_cafebabe",
+        "Decision: second suggestion must also survive",
+        5,
+        &payload_path,
+        Some("project-alpha"),
+    );
+
+    let config = env.config(true, "");
+    let db = Database::open(&env.db_path).expect("open db");
+    let first = suggest_for_drawer(
+        &db,
+        &config,
+        &env.mempal_home,
+        "drawer_hooks_raw_edit_deadbeef",
+        GenerationOptions::default(),
+    )
+    .expect("first suggest");
+    let second = suggest_for_drawer(
+        &db,
+        &config,
+        &env.mempal_home,
+        "drawer_hooks_raw_edit_cafebabe",
+        GenerationOptions::default(),
+    )
+    .expect("second suggest");
+
+    let entries = fs::read_dir(env.hotpatch_file())
+        .expect("list hotpatch")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect entries");
+    let content = fs::read_to_string(entries[0].path()).expect("read suggestion file");
+
+    assert_eq!(first.appended, 1);
+    assert_eq!(second.appended, 1);
+    assert!(content.contains("[drawer:deadbeef]"));
+    assert!(content.contains("[drawer:cafebabe]"));
 }
 
 #[test]

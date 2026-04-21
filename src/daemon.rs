@@ -8,6 +8,7 @@ use std::{future::Future, pin::Pin};
 
 use crate::core::{
     db::Database,
+    project::resolve_project_id,
     queue::{ClaimedMessage, PendingMessageStore},
     types::{Drawer, SourceType},
     utils::{current_timestamp, synthetic_source_file},
@@ -264,6 +265,7 @@ struct DrawerRecord {
     content: String,
     importance: i32,
     bypass_novelty: bool,
+    project_id: Option<String>,
 }
 
 fn build_drawer_records(
@@ -290,6 +292,7 @@ fn build_drawer_records(
                 content: config.scrub_content(&review.content),
                 importance: review.importance,
                 bypass_novelty: true,
+                project_id: resolve_hook_project_id(envelope, config)?,
             }),
             SessionReviewOutcome::Skipped(reason) => {
                 tracing::info!(?reason, "session self-review skipped");
@@ -322,6 +325,7 @@ fn build_audit_drawer_record(
     config: &crate::core::config::Config,
     mempal_home: &Path,
 ) -> Result<DrawerRecord> {
+    let project_id = resolve_hook_project_id(envelope, config)?;
     if envelope.truncated {
         let preview = config.scrub_content(envelope.payload_preview.as_deref().unwrap_or_default());
         let content = serde_json::to_string(&json!({
@@ -346,6 +350,7 @@ fn build_audit_drawer_record(
             content,
             importance: 0,
             bypass_novelty: false,
+            project_id,
         });
     }
 
@@ -373,7 +378,16 @@ fn build_audit_drawer_record(
         content,
         importance: 0,
         bypass_novelty: false,
+        project_id,
     })
+}
+
+fn resolve_hook_project_id(
+    envelope: &CapturedHookEnvelope,
+    config: &crate::core::config::Config,
+) -> Result<Option<String>> {
+    resolve_project_id(None, config, Some(Path::new(&envelope.claude_cwd)))
+        .map_err(anyhow::Error::from)
 }
 
 fn audit_target_for_event(
@@ -425,7 +439,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             &record.wing,
             Some(record.room.as_str()),
             &record.content,
-            None,
+            record.project_id.as_deref(),
         )
         .with_context(|| {
             format!(
@@ -451,7 +465,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     {
         context
             .db
-            .record_gating_audit(&drawer_id, decision, None)
+            .record_gating_audit(&drawer_id, decision, record.project_id.as_deref())
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
         return Ok(drawer_id);
     }
@@ -484,7 +498,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         );
         context
             .db
-            .record_gating_audit(&drawer_id, &decision, None)
+            .record_gating_audit(&drawer_id, &decision, record.project_id.as_deref())
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
         gating_audit_recorded = true;
         if decision.is_rejected() {
@@ -496,7 +510,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
         context
             .db
-            .record_gating_audit(&drawer_id, decision, None)
+            .record_gating_audit(&drawer_id, decision, record.project_id.as_deref())
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
     }
 
@@ -531,7 +545,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         novelty.near_drawer_id.as_deref(),
                         novelty.cosine,
                         novelty.audit_decision,
-                        None,
+                        record.project_id.as_deref(),
                     )
                     .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
             }
@@ -548,7 +562,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         novelty.near_drawer_id.as_deref(),
                         novelty.cosine,
                         novelty.audit_decision,
-                        None,
+                        record.project_id.as_deref(),
                     )
                     .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
             }
@@ -604,7 +618,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         Some(target_id.as_str()),
                         novelty.cosine,
                         Some("insert_due_to_merge_cap"),
-                        None,
+                        record.project_id.as_deref(),
                     )
                     .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
                 insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
@@ -621,7 +635,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         Some(target_id.as_str()),
                         novelty.cosine,
                         novelty.audit_decision,
-                        None,
+                        record.project_id.as_deref(),
                     )
                     .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
                 let mut db_for_merge = Database::open(context.db.path())
@@ -664,9 +678,9 @@ fn insert_drawer_with_vector(
         chunk_index: Some(0),
         importance: record.importance,
     };
-    db.insert_drawer(&drawer)
+    db.insert_drawer_with_project(&drawer, record.project_id.as_deref())
         .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
-    db.insert_vector(&drawer.id, vector)
+    db.insert_vector_with_project(&drawer.id, vector, record.project_id.as_deref())
         .with_context(|| format!("failed to insert hook vector {}", drawer.id))?;
     Ok(())
 }
