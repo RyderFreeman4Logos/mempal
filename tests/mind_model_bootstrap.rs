@@ -311,6 +311,34 @@ fn test_migration_backfills_legacy_drawers_with_bootstrap_defaults() {
             ),
         )
         .expect("insert legacy drawer");
+        conn.execute(
+            r#"
+            INSERT INTO drawers (
+                id,
+                content,
+                wing,
+                room,
+                source_file,
+                source_type,
+                added_at,
+                chunk_index,
+                importance
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            (
+                "drawer_legacy_002",
+                "Legacy conversation note",
+                "mempal",
+                Some("bootstrap"),
+                Some("session://legacy"),
+                "conversation",
+                "1710000001",
+                Some(1_i64),
+                1_i32,
+            ),
+        )
+        .expect("insert legacy conversation drawer");
     }
 
     let db = Database::open(&db_path).expect("migrate db to latest");
@@ -337,44 +365,28 @@ fn test_migration_backfills_legacy_drawers_with_bootstrap_defaults() {
     assert!(drawer.verification_refs.is_empty());
     assert_eq!(drawer.scope_constraints, None);
     assert_eq!(drawer.trigger_hints, None);
+
+    let conversation_drawer = db
+        .get_drawer("drawer_legacy_002")
+        .expect("load conversation drawer")
+        .expect("conversation drawer exists");
+    assert_eq!(conversation_drawer.memory_kind, MemoryKind::Evidence);
+    assert_eq!(conversation_drawer.provenance, Some(Provenance::Human));
 }
 
-#[test]
-fn test_global_anchor_rejected_for_non_global_domain() {
-    let tmp = TempDir::new().expect("tempdir");
-    let db_path = tmp.path().join("palace.db");
-    let db = Database::open(&db_path).expect("open db");
-
-    let drawer = Drawer {
-        id: "drawer_invalid_anchor".to_string(),
-        content: "repo-local note".to_string(),
-        wing: "mempal".to_string(),
-        room: Some("bootstrap".to_string()),
-        source_file: Some("tests://mind-model".to_string()),
-        source_type: SourceType::Manual,
-        added_at: "1710001234".to_string(),
-        chunk_index: None,
-        importance: 0,
-        memory_kind: MemoryKind::Evidence,
-        domain: MemoryDomain::Project,
-        field: "general".to_string(),
-        anchor_kind: AnchorKind::Global,
-        anchor_id: "global://all".to_string(),
-        parent_anchor_id: None,
-        provenance: Some(Provenance::Human),
-        statement: None,
-        tier: None,
-        status: None,
-        supporting_refs: Vec::new(),
-        counterexample_refs: Vec::new(),
-        teaching_refs: Vec::new(),
-        verification_refs: Vec::new(),
-        scope_constraints: None,
-        trigger_hints: None,
-    };
-
-    let error = db
-        .insert_drawer(&drawer)
+#[tokio::test]
+async fn test_global_anchor_rejected_for_non_global_domain() {
+    let (_tmp, _db, server) = setup_mcp_server();
+    let error = server
+        .ingest_json_for_test(json!({
+            "content": "repo-local note",
+            "wing": "mempal",
+            "memory_kind": "evidence",
+            "domain": "project",
+            "anchor_kind": "global",
+            "anchor_id": "global://all"
+        }))
+        .await
         .expect_err("global anchor should reject non-global domain");
     let message = error.to_string();
     assert!(
@@ -553,7 +565,7 @@ async fn test_evidence_drawer_rejects_knowledge_only_fields() {
             "content": "Evidence should not carry knowledge governance metadata",
             "wing": "mempal",
             "memory_kind": "evidence",
-            "scope_constraints": "Task 2 only"
+            "tier": "qi"
         }))
         .await
         .expect_err("knowledge-only fields should be rejected");
