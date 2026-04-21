@@ -29,12 +29,12 @@ fn current_schema_version() -> u32 {
 }
 
 #[test]
-fn test_fork_ext_version_is_five_after_project_isolation_phase() {
+fn test_fork_ext_version_is_six_after_audit_project_scope_phase() {
     let (_tmp, _db_path, db) = new_test_db();
 
     let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read fork-ext version");
 
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn test_fork_ext_migrations_idempotent() {
     db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("second apply");
 
     let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read fork-ext version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[test]
@@ -106,4 +106,29 @@ fn test_novelty_audit_table_exists_after_ext_v4() {
         .expect("query sqlite_master");
 
     assert_eq!(exists, 1);
+}
+
+#[test]
+fn test_audit_tables_store_project_scope_after_ext_v6() {
+    let (_tmp, _db_path, db) = new_test_db();
+
+    let gating_columns = db
+        .conn()
+        .prepare("PRAGMA table_info(gating_audit)")
+        .expect("prepare gating pragma")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query gating pragma")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect gating columns");
+    assert!(gating_columns.iter().any(|name| name == "project_id"));
+
+    let novelty_columns = db
+        .conn()
+        .prepare("PRAGMA table_info(novelty_audit)")
+        .expect("prepare novelty pragma")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query novelty pragma")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect novelty columns");
+    assert!(novelty_columns.iter().any(|name| name == "project_id"));
 }

@@ -13,6 +13,7 @@ use crate::search::filter::{build_filter_clause, build_vector_search_sql};
 use rusqlite::OptionalExtension;
 
 pub mod filter;
+pub mod preview;
 pub mod rerank;
 pub mod route;
 

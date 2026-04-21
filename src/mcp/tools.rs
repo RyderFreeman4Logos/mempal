@@ -38,6 +38,10 @@ pub struct SearchRequest {
 
     /// Opt-in override to search across all projects for this request.
     pub all_projects: Option<bool>,
+
+    /// Return full verbatim content for this call even when progressive
+    /// disclosure is enabled globally.
+    pub disable_progressive: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -51,6 +55,8 @@ pub struct SearchResponse {
 pub struct SearchResultDto {
     pub drawer_id: String,
     pub content: String,
+    pub content_truncated: bool,
+    pub original_content_bytes: u64,
     pub wing: String,
     pub room: Option<String>,
     pub source_file: String,
@@ -78,6 +84,37 @@ pub struct RouteDecisionDto {
     pub room: Option<String>,
     pub confidence: f32,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReadDrawerRequest {
+    pub drawer_id: String,
+
+    /// Optional explicit project scope. When omitted, mempal resolves the
+    /// current project from config/env/git root and scopes the read there by
+    /// default. Set `all_projects=true` to bypass project scoping.
+    pub project_id: Option<String>,
+
+    /// Include legacy/global drawers (`project_id IS NULL`) alongside the
+    /// current project. Ignored when `all_projects=true`.
+    pub include_global: Option<bool>,
+
+    /// Opt-in override to read across all projects for this request.
+    pub all_projects: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReadDrawerResponse {
+    pub drawer_id: String,
+    pub content: String,
+    pub wing: String,
+    pub room: Option<String>,
+    pub source_file: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    pub merge_count: u32,
+    pub importance_stars: u8,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -398,19 +435,45 @@ pub struct FactCheckResponse {
 }
 
 impl SearchResultDto {
-    pub fn with_signals_from_result(value: SearchResult) -> Self {
-        let signals = crate::aaak::analyze(&value.content);
+    pub fn with_signals_from_result(
+        value: SearchResult,
+        progressive_disclosure: bool,
+        preview_chars: usize,
+    ) -> Self {
+        let crate::core::types::SearchResult {
+            drawer_id,
+            content,
+            wing,
+            room,
+            source_file,
+            source,
+            similarity,
+            route,
+            tunnel_hints,
+        } = value;
+        let signals = crate::aaak::analyze(&content);
+        let original_content_bytes = content.len() as u64;
+        let preview = if progressive_disclosure {
+            crate::search::preview::truncate(&content, preview_chars)
+        } else {
+            crate::search::preview::PreviewText {
+                content,
+                truncated: false,
+            }
+        };
 
         Self {
-            drawer_id: value.drawer_id,
-            content: value.content,
-            wing: value.wing,
-            room: value.room,
-            source_file: value.source_file,
-            source: value.source.as_str().to_string(),
-            similarity: value.similarity,
-            route: value.route.into(),
-            tunnel_hints: value.tunnel_hints,
+            drawer_id,
+            content: preview.content,
+            content_truncated: preview.truncated,
+            original_content_bytes,
+            wing,
+            room,
+            source_file,
+            source: source.as_str().to_string(),
+            similarity,
+            route: route.into(),
+            tunnel_hints,
             entities: signals.entities,
             topics: signals.topics,
             flags: signals.flags,
@@ -470,9 +533,11 @@ mod tests {
     #[test]
     fn test_with_signals_preserves_raw_content_and_citations() {
         let original = "We decided to use Arc<Mutex<>> for state because shared ownership mattered";
-        let dto = SearchResultDto::with_signals_from_result(sample_result(original));
+        let dto = SearchResultDto::with_signals_from_result(sample_result(original), false, 120);
 
         assert_eq!(dto.content, original);
+        assert!(!dto.content_truncated);
+        assert_eq!(dto.original_content_bytes, original.len() as u64);
         assert!(!dto.content.starts_with("V1|"));
         assert!(!dto.content.contains('★'));
         assert_eq!(dto.drawer_id, "drawer-1");
@@ -485,12 +550,24 @@ mod tests {
 
     #[test]
     fn test_with_signals_applies_empty_content_sentinels() {
-        let dto = SearchResultDto::with_signals_from_result(sample_result(""));
+        let dto = SearchResultDto::with_signals_from_result(sample_result(""), false, 120);
 
         assert_eq!(dto.entities, vec!["UNK".to_string()]);
         assert_eq!(dto.flags, vec!["CORE".to_string()]);
         assert_eq!(dto.emotions, vec!["determ".to_string()]);
         assert!(dto.topics.is_empty());
         assert_eq!(dto.importance_stars, 2);
+    }
+
+    #[test]
+    fn test_with_signals_truncates_preview_but_keeps_full_signal_analysis() {
+        let original = "prefix ".repeat(40)
+            + "We decided to keep signals computed from the full drawer content because the preview is only a projection.";
+        let dto = SearchResultDto::with_signals_from_result(sample_result(&original), true, 32);
+
+        assert!(dto.content_truncated);
+        assert!(dto.content.ends_with('…'));
+        assert_eq!(dto.original_content_bytes, original.len() as u64);
+        assert!(dto.flags.contains(&"DECISION".to_string()));
     }
 }

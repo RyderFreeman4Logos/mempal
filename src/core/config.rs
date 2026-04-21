@@ -15,6 +15,7 @@ const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_OPENAI_DIM: usize = 4096;
 const DEFAULT_RETRY_INTERVAL_SECS: u64 = 2;
 const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 5;
+const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
 const DEFAULT_ALERT_EVERY_N_FAILURES: u64 = 100;
 const DEFAULT_DEGRADE_AFTER_N_FAILURES: u64 = 10;
 const DEFAULT_HOOK_WING: &str = "agent-diary";
@@ -95,6 +96,11 @@ impl Config {
         if self.embed.retry.search_deadline_secs == 0 {
             return Err(ConfigError::InvalidConfig(
                 "embed.retry.search_deadline_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.search.preview_chars == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "search.preview_chars must be greater than 0".to_string(),
             ));
         }
         if self.embed.alert.alert_every_n_failures == 0 {
@@ -576,10 +582,22 @@ impl Default for ConfigHotReloadConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SearchConfig {
     pub strict_project_isolation: bool,
+    pub progressive_disclosure: bool,
+    pub preview_chars: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            strict_project_isolation: false,
+            progressive_disclosure: false,
+            preview_chars: DEFAULT_SEARCH_PREVIEW_CHARS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
