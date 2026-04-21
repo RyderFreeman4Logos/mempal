@@ -60,6 +60,8 @@ pub struct HotReloadState {
     runtime: Mutex<Option<RuntimeControl>>,
     event_log: Mutex<VecDeque<String>>,
     parse_attempts: AtomicUsize,
+    // harness-point: PR0 — counts successful reload applications (version changes)
+    reload_count: Arc<AtomicUsize>,
     runtime_prototypes: ArcSwap<Vec<String>>,
 }
 
@@ -73,6 +75,7 @@ impl HotReloadState {
             runtime: Mutex::new(None),
             event_log: Mutex::new(VecDeque::new()),
             parse_attempts: AtomicUsize::new(0),
+            reload_count: Arc::new(AtomicUsize::new(0)),
             runtime_prototypes: ArcSwap::from_pointee(
                 initial.ingest_gating.embedding_classifier.prototypes,
             ),
@@ -132,6 +135,17 @@ impl HotReloadState {
 
     pub fn parse_attempts(&self) -> usize {
         self.parse_attempts.load(Ordering::SeqCst)
+    }
+
+    /// Number of successful reloads (version actually changed).
+    // harness-point: PR0
+    pub fn reload_count(&self) -> usize {
+        self.reload_count.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    pub fn reload_counter_arc(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.reload_count)
     }
 
     pub fn recent_events(&self) -> Vec<String> {
@@ -324,6 +338,8 @@ impl HotReloadState {
             }
         };
         self.snapshot.store(Arc::new(next_snapshot));
+        // harness-point: PR0 — increment reload counter on successful version change
+        self.reload_count.fetch_add(1, Ordering::SeqCst);
         self.push_event(format!(
             "config hot-reload: version changed from {} to {}",
             previous.version, next_version

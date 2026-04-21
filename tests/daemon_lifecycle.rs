@@ -1,28 +1,18 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use mempal::bootstrap_events::BootstrapEvent;
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
-use mempal::daemon_bootstrap::{BootstrapObserver, DaemonContext, Stage};
+use mempal::daemon_bootstrap::DaemonContext;
 use mempal::hook::{CapturedHookEnvelope, HookEvent};
 use mockito::Server;
 use tempfile::TempDir;
 
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
-}
-
-struct RecordingObserver {
-    stages: Mutex<Vec<Stage>>,
-}
-
-impl BootstrapObserver for RecordingObserver {
-    fn record(&self, stage: Stage) {
-        self.stages.lock().expect("observer mutex").push(stage);
-    }
 }
 
 fn setup_daemon_home() -> (TempDir, PathBuf, PathBuf) {
@@ -59,23 +49,32 @@ log_path = "{}"
 #[test]
 fn test_daemon_context_bootstrap_ordering() {
     let (_tmp, _db_path, config_path) = setup_daemon_home();
-    let observer = Box::leak(Box::new(RecordingObserver {
-        stages: Mutex::new(Vec::new()),
-    }));
+    let runtime = tokio::runtime::Runtime::new().expect("bootstrap runtime");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
-    let context = DaemonContext::bootstrap_with_observer(config_path.clone(), true, observer)
+    let context = DaemonContext::bootstrap_with_events(config_path.clone(), true, Some(tx))
         .expect("bootstrap");
-    let stages = observer.stages.lock().expect("observer mutex").clone();
+    let mut stages = Vec::new();
+    runtime.block_on(async {
+        while let Ok(Some(stage)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+        {
+            stages.push(stage);
+            if matches!(stages.last(), Some(BootstrapEvent::Ready)) {
+                break;
+            }
+        }
+    });
     let pid_path = context.mempal_home.join("daemon.pid");
 
     assert_eq!(
         stages,
         vec![
-            Stage::Daemonize,
-            Stage::Runtime,
-            Stage::ConfigHandleBootstrap,
-            Stage::Database,
-            Stage::Tracing,
+            BootstrapEvent::Daemonize,
+            BootstrapEvent::RuntimeInit,
+            BootstrapEvent::ConfigHandleBootstrap,
+            BootstrapEvent::DbOpen,
+            BootstrapEvent::TracingInit,
+            BootstrapEvent::Ready,
         ]
     );
     assert!(

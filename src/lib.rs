@@ -3,6 +3,7 @@
 pub mod aaak;
 #[cfg(feature = "rest")]
 pub mod api;
+pub mod bootstrap_events;
 pub mod core;
 pub mod cowork;
 pub mod daemon;

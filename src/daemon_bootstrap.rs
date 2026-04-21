@@ -2,21 +2,14 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
+use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
     config::{Config, ConfigHandle},
     db::Database,
     queue::PendingMessageStore,
 };
 use anyhow::{Context, Result};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage {
-    Daemonize,
-    Runtime,
-    ConfigHandleBootstrap,
-    Database,
-    Tracing,
-}
+use tokio::sync::mpsc;
 
 pub struct DaemonContext {
     pub runtime: tokio::runtime::Runtime,
@@ -30,33 +23,22 @@ pub struct DaemonContext {
 
 impl DaemonContext {
     pub fn bootstrap(config_path: PathBuf, foreground: bool) -> Result<Self> {
-        bootstrap_inner(config_path, foreground, BootstrapObserverRef::default())
+        bootstrap_inner(config_path, foreground, None)
     }
 
-    pub fn bootstrap_with_observer(
+    pub fn bootstrap_with_events(
         config_path: PathBuf,
         foreground: bool,
-        observer: &'static dyn BootstrapObserver,
+        bootstrap_events: Option<mpsc::Sender<BootstrapEvent>>,
     ) -> Result<Self> {
-        bootstrap_inner(
-            config_path,
-            foreground,
-            BootstrapObserverRef(Some(observer)),
-        )
+        bootstrap_inner(config_path, foreground, bootstrap_events)
     }
 }
-
-pub trait BootstrapObserver: Send + Sync {
-    fn record(&self, stage: Stage);
-}
-
-#[derive(Clone, Copy, Default)]
-struct BootstrapObserverRef(Option<&'static dyn BootstrapObserver>);
 
 fn bootstrap_inner(
     config_path: PathBuf,
     foreground: bool,
-    observer: BootstrapObserverRef,
+    bootstrap_events: Option<mpsc::Sender<BootstrapEvent>>,
 ) -> Result<DaemonContext> {
     let bootstrap_config =
         Config::load_from(&config_path).context("failed to load daemon config")?;
@@ -70,27 +52,37 @@ fn bootstrap_inner(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    record_stage(observer, Stage::Daemonize);
+    // harness-point: PR0
+    emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::Daemonize);
     perform_daemonize(foreground, &mempal_home, &log_path)?;
 
-    record_stage(observer, Stage::Runtime);
+    // harness-point: PR0
+    emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::RuntimeInit);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build daemon runtime")?;
 
-    record_stage(observer, Stage::ConfigHandleBootstrap);
+    // harness-point: PR0
+    emit_bootstrap_event(
+        bootstrap_events.as_ref(),
+        BootstrapEvent::ConfigHandleBootstrap,
+    );
     ConfigHandle::bootstrap(&config_path).context("failed to bootstrap config hot reload")?;
     let config = ConfigHandle::current();
 
-    record_stage(observer, Stage::Database);
+    // harness-point: PR0
+    emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::DbOpen);
     let db = Database::open(&db_path).context("failed to open daemon database")?;
     let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
 
-    record_stage(observer, Stage::Tracing);
+    // harness-point: PR0
+    emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::TracingInit);
     init_tracing_subscriber();
 
     let pid_guard = PidFileGuard::create(mempal_home.join("daemon.pid"))?;
+    // harness-point: PR0
+    emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::Ready);
 
     Ok(DaemonContext {
         runtime,
@@ -191,9 +183,12 @@ fn expand_home_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn record_stage(observer: BootstrapObserverRef, stage: Stage) {
-    if let Some(observer) = observer.0 {
-        observer.record(stage);
+fn emit_bootstrap_event(
+    bootstrap_events: Option<&mpsc::Sender<BootstrapEvent>>,
+    event: BootstrapEvent,
+) {
+    if let Some(tx) = bootstrap_events {
+        let _ = tx.blocking_send(event);
     }
 }
 
