@@ -43,6 +43,21 @@ CREATE TABLE IF NOT EXISTS reindex_progress (
 );
 "#;
 
+pub const FORK_EXT_V3_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS gating_audit (
+    id TEXT PRIMARY KEY,
+    candidate_hash TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    explain_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gating_audit_created_at
+    ON gating_audit(created_at);
+CREATE INDEX IF NOT EXISTS idx_gating_audit_candidate_hash
+    ON gating_audit(candidate_hash);
+"#;
+
 struct Migration {
     version: u32,
     up: fn(&Connection) -> rusqlite::Result<()>,
@@ -100,6 +115,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 2,
             up: apply_v2,
         },
+        Migration {
+            version: 3,
+            up: apply_v3,
+        },
     ]
 }
 
@@ -109,6 +128,10 @@ fn apply_v1(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v2(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V2_SCHEMA_SQL)
+}
+
+fn apply_v3(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V3_SCHEMA_SQL)
 }
 
 pub fn apply_fork_ext_migrations(conn: &Connection) -> rusqlite::Result<()> {

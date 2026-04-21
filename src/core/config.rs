@@ -22,7 +22,7 @@ const DEFAULT_HOOK_POLL_INTERVAL_MS: u64 = 500;
 const DEFAULT_HOOK_CLAIM_TTL_SECS: u64 = 120;
 const DEFAULT_DAEMON_LOG_PATH: &str = "~/.mempal/daemon.log";
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub db_path: String,
@@ -559,16 +559,41 @@ pub struct SearchConfig {
     pub strict_project_isolation: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct IngestGatingConfig {
+    pub enabled: bool,
+    pub rules: Vec<GatingRuleConfig>,
     pub embedding_classifier: EmbeddingClassifierConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(default)]
+pub struct GatingRuleConfig {
+    pub action: String,
+    pub tool: Option<String>,
+    pub tool_in: Option<Vec<String>>,
+    pub content_bytes_lt: Option<usize>,
+    pub content_bytes_gt: Option<usize>,
+    pub exit_code_eq: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct EmbeddingClassifierConfig {
+    pub enabled: bool,
+    pub threshold: f32,
     pub prototypes: Vec<String>,
+}
+
+impl Default for EmbeddingClassifierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: 0.35,
+            prototypes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]

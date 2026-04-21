@@ -16,6 +16,10 @@ use crate::embed::{
     EmbedError, Embedder, build_backend_from_name, global_embed_status,
     retry::{HeartbeatCallback, retry_embed_operation},
 };
+use crate::ingest::gating::{
+    GatingDecision, IngestCandidate, PrototypeClassifier, compile_classifier_from_embedder,
+    evaluate_tier1, tier2_enabled,
+};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
@@ -38,6 +42,11 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     let embedder = DaemonEmbedder::from_config(context.config.as_ref())
         .await
         .context("failed to build daemon embedder")?;
+    let prototype_classifier =
+        compile_classifier_from_embedder(&embedder, &context.config.ingest_gating)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .context("gating prototype init failed")?;
     let worker_id = format!("mempal-daemon-{}", std::process::id());
     let claim_ttl_secs = context.config.hooks.daemon_claim_ttl_secs as i64;
     let poll_interval = Duration::from_millis(context.config.hooks.daemon_poll_interval_ms);
@@ -66,8 +75,11 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                     &worker_id,
                     &message,
                     &embedder,
-                    context.config.as_ref(),
-                    &context.mempal_home,
+                    DaemonIngestContext {
+                        prototype_classifier: prototype_classifier.as_ref(),
+                        config: context.config.as_ref(),
+                        mempal_home: &context.mempal_home,
+                    },
                 )
                 .await;
 
@@ -123,6 +135,12 @@ enum ClaimPollResult {
 
 type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+pub struct DaemonIngestContext<'a> {
+    pub prototype_classifier: Option<&'a PrototypeClassifier>,
+    pub config: &'a crate::core::config::Config,
+    pub mempal_home: &'a Path,
+}
+
 async fn poll_claim_next<'a, S>(
     store: &impl ClaimNextSource,
     worker_id: &str,
@@ -149,13 +167,30 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
     worker_id: &str,
     message: &ClaimedMessage,
     embedder: &E,
-    config: &crate::core::config::Config,
-    mempal_home: &Path,
+    context: DaemonIngestContext<'_>,
 ) -> Result<String> {
     let envelope: CapturedHookEnvelope =
         serde_json::from_str(&message.payload).context("failed to decode queued hook envelope")?;
 
-    let record = build_drawer_record(&envelope, config, mempal_home)?;
+    let record = build_drawer_record(&envelope, context.config, context.mempal_home)?;
+    let drawer_id = build_drawer_id(&record.wing, Some(record.room.as_str()), &record.content);
+    let candidate = build_gating_candidate(&envelope, &record);
+    let mut gating_decision = evaluate_tier1(&candidate, &context.config.ingest_gating);
+    if gating_decision.is_none() && !tier2_enabled(&context.config.ingest_gating) {
+        gating_decision = Some(GatingDecision::accepted(
+            0,
+            Some("tier2_disabled".to_string()),
+            None,
+        ));
+    }
+    if let Some(decision) = gating_decision.as_ref()
+        && decision.is_rejected()
+    {
+        db.record_gating_audit(&drawer_id, decision)
+            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        return Ok(drawer_id);
+    }
+
     let heartbeat_store = store.clone();
     let heartbeat_message_id = message.id.clone();
     let heartbeat_worker_id = worker_id.to_string();
@@ -166,8 +201,30 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         Ok(())
     };
 
-    let vector = embed_text_with_heartbeat(embedder, &record.content, Some(&heartbeat)).await?;
-    let drawer_id = build_drawer_id(&record.wing, Some(record.room.as_str()), &record.content);
+    let mut vector = None;
+    let mut gating_audit_recorded = false;
+    if let Some(classifier) = context.prototype_classifier {
+        let candidate_vector =
+            embed_text_with_heartbeat(embedder, &record.content, Some(&heartbeat)).await?;
+        let decision = classifier.decide(&candidate_vector);
+        db.record_gating_audit(&drawer_id, &decision)
+            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        gating_audit_recorded = true;
+        if decision.is_rejected() {
+            return Ok(drawer_id);
+        }
+        gating_decision = Some(decision);
+        vector = Some(candidate_vector);
+    }
+    if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
+        db.record_gating_audit(&drawer_id, decision)
+            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+    }
+
+    let vector = match vector {
+        Some(vector) => vector,
+        None => embed_text_with_heartbeat(embedder, &record.content, Some(&heartbeat)).await?,
+    };
     let drawer = Drawer {
         id: drawer_id.clone(),
         content: record.content,
@@ -183,8 +240,35 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
     db.insert_vector(&drawer.id, &vector)
         .with_context(|| format!("failed to insert hook vector {}", drawer.id))?;
-
     Ok(drawer_id)
+}
+
+fn build_gating_candidate(
+    envelope: &CapturedHookEnvelope,
+    record: &DrawerRecord,
+) -> IngestCandidate {
+    let mut tool_name = None;
+    let mut exit_code = None;
+
+    if envelope.event == crate::hook::HookEvent::PostToolUse.display_name()
+        && let Some(payload) = envelope.payload.as_deref()
+        && let Ok(value) = serde_json::from_str::<Value>(payload)
+    {
+        tool_name = value
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        exit_code = value
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+    }
+
+    IngestCandidate {
+        content: record.content.clone(),
+        tool_name,
+        exit_code,
+    }
 }
 
 async fn embed_text_with_heartbeat<E: Embedder + ?Sized>(

@@ -9,6 +9,9 @@ use crate::core::{
 };
 use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
 use crate::embed::{EmbedderFactory, global_embed_status};
+use crate::ingest::gating::{
+    GatingDecision, GatingRuntime, IngestCandidate, evaluate_tier1, evaluate_tier2, tier2_enabled,
+};
 use crate::search::{resolve_route, search_with_vector};
 use anyhow::Context;
 use rmcp::{
@@ -30,6 +33,8 @@ use super::tools::{
 #[derive(Clone)]
 pub struct MempalMcpServer {
     db_path: PathBuf,
+    config: crate::core::config::Config,
+    gating_runtime: Arc<GatingRuntime>,
     embedder_factory: Arc<dyn EmbedderFactory>,
     tool_router: ToolRouter<Self>,
     /// Captured via `initialize` override so `auto` peek mode can infer the
@@ -39,15 +44,30 @@ pub struct MempalMcpServer {
 
 impl MempalMcpServer {
     pub fn new(db_path: PathBuf, config: crate::core::config::Config) -> Self {
-        Self::new_with_factory(
+        Self::new_with_factory_and_config(
             db_path,
+            config.clone(),
             Arc::new(crate::embed::ConfiguredEmbedderFactory::new(config)),
         )
     }
 
     pub fn new_with_factory(db_path: PathBuf, embedder_factory: Arc<dyn EmbedderFactory>) -> Self {
+        Self::new_with_factory_and_config(
+            db_path,
+            crate::core::config::Config::default(),
+            embedder_factory,
+        )
+    }
+
+    pub fn new_with_factory_and_config(
+        db_path: PathBuf,
+        config: crate::core::config::Config,
+        embedder_factory: Arc<dyn EmbedderFactory>,
+    ) -> Self {
         Self {
             db_path,
+            config: config.clone(),
+            gating_runtime: Arc::new(GatingRuntime::new(config, Arc::clone(&embedder_factory))),
             embedder_factory,
             tool_router: Self::tool_router(),
             client_name: Arc::new(Mutex::new(None)),
@@ -57,6 +77,10 @@ impl MempalMcpServer {
     pub async fn serve_stdio(
         self,
     ) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleServer, Self>> {
+        self.gating_runtime
+            .initialize()
+            .await
+            .context("failed to initialize ingest gating")?;
         self.serve(rmcp::transport::stdio())
             .await
             .context("failed to initialize MCP stdio transport")
@@ -191,6 +215,7 @@ impl MempalMcpServer {
         if request.dry_run.unwrap_or(false) {
             return Ok(Json(IngestResponse {
                 drawer_id,
+                gating_decision: None,
                 duplicate_warning: None,
                 lock_wait_ms: None,
                 system_warnings: current_system_warnings(),
@@ -199,6 +224,36 @@ impl MempalMcpServer {
 
         if global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
+        }
+
+        let candidate = IngestCandidate {
+            content: scrubbed_content.clone(),
+            tool_name: None,
+            exit_code: None,
+        };
+        let mut gating_decision = evaluate_tier1(&candidate, &self.config.ingest_gating);
+        if gating_decision.is_none() && !tier2_enabled(&self.config.ingest_gating) {
+            gating_decision = Some(GatingDecision::accepted(
+                0,
+                Some("tier2_disabled".to_string()),
+                None,
+            ));
+        }
+        if let Some(decision) = gating_decision.as_ref()
+            && decision.is_rejected()
+        {
+            let db = self.open_db()?;
+            db.record_gating_audit(&drawer_id, decision)
+                .map_err(db_error)?;
+            return Ok(Json(IngestResponse {
+                // TODO(spec ambiguity): rejected ingests have no persisted drawer.
+                // Return the candidate-derived drawer_id for audit correlation.
+                drawer_id,
+                gating_decision,
+                duplicate_warning: None,
+                lock_wait_ms: None,
+                system_warnings: current_system_warnings(),
+            }));
         }
 
         let db = self.open_db()?;
@@ -223,25 +278,62 @@ impl MempalMcpServer {
         let embedder = self.embedder_factory.build().await.map_err(|error| {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
         })?;
-        let vector = embedder
-            .embed(&[scrubbed_content.as_str()])
-            .await
-            .map_err(|error| ErrorData::internal_error(format!("embedding failed: {error}"), None))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?;
+        let mut vector = None;
+        let mut gating_audit_recorded = false;
+        if tier2_enabled(&self.config.ingest_gating) {
+            let classifier = self
+                .gating_runtime
+                .classifier()
+                .await
+                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            if let Some(classifier) = classifier {
+                let tier2 = evaluate_tier2(&candidate, &classifier, embedder.as_ref()).await;
+                db.record_gating_audit(&drawer_id, &tier2.decision)
+                    .map_err(db_error)?;
+                gating_audit_recorded = true;
+                vector = tier2.vector;
+                gating_decision = Some(tier2.decision);
+            }
+        }
+        if let Some(decision) = gating_decision.as_ref()
+            && decision.is_rejected()
+        {
+            drop(lock_guard);
+            return Ok(Json(IngestResponse {
+                drawer_id,
+                gating_decision,
+                duplicate_warning: None,
+                lock_wait_ms,
+                system_warnings: current_system_warnings(),
+            }));
+        }
+        if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
+            db.record_gating_audit(&drawer_id, decision)
+                .map_err(db_error)?;
+        }
+        let vector = match vector {
+            Some(vector) => vector,
+            None => embedder
+                .embed(&[scrubbed_content.as_str()])
+                .await
+                .map_err(|error| {
+                    ErrorData::internal_error(format!("embedding failed: {error}"), None)
+                })?
+                .into_iter()
+                .next()
+                .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?,
+        };
         ensure_vector_dim_matches(&db, vector.len())?;
 
         // Semantic dedup check: find most similar existing drawer
         let duplicate_warning = check_semantic_duplicate(&db, &vector, &scrubbed_content);
-
         if !db.drawer_exists(&drawer_id).map_err(db_error)? {
             let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());
             db.insert_drawer(&Drawer {
                 id: drawer_id.clone(),
-                content: scrubbed_content,
-                wing: request.wing,
-                room: request.room,
+                content: scrubbed_content.clone(),
+                wing: request.wing.clone(),
+                room: request.room.clone(),
                 source_file: Some(source_file),
                 source_type: SourceType::Manual,
                 added_at: current_timestamp(),
@@ -257,6 +349,7 @@ impl MempalMcpServer {
 
         Ok(Json(IngestResponse {
             drawer_id,
+            gating_decision,
             duplicate_warning,
             lock_wait_ms,
             system_warnings: current_system_warnings(),

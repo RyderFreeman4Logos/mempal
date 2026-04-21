@@ -2,12 +2,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use thiserror::Error;
 
 use super::types::{Drawer, SourceType, TaxonomyEntry, Triple, TripleStats};
+use crate::ingest::gating::GatingDecision;
 
 const CURRENT_SCHEMA_VERSION: u32 = 4;
 
@@ -150,6 +152,40 @@ impl Database {
             ],
         )?;
 
+        Ok(())
+    }
+
+    pub fn record_gating_audit(
+        &self,
+        candidate_hash: &str,
+        decision: &GatingDecision,
+    ) -> Result<(), DbError> {
+        let explain_json = serde_json::to_string(decision)?;
+        let created_at = super::utils::current_timestamp()
+            .parse::<i64>()
+            .unwrap_or_default();
+        let unique_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let id_seed = format!(
+            "{candidate_hash}:{created_at}:{unique_nanos}:{}",
+            explain_json
+        );
+        let id = format!("gating_{}", blake3::hash(id_seed.as_bytes()).to_hex());
+        self.conn.execute(
+            r#"
+            INSERT INTO gating_audit (id, candidate_hash, decision, explain_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                id,
+                candidate_hash,
+                decision.decision,
+                explain_json,
+                created_at,
+            ],
+        )?;
         Ok(())
     }
 

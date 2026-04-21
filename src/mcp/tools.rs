@@ -1,4 +1,5 @@
 use crate::core::types::{RouteDecision, SearchResult, TaxonomyEntry};
+use crate::ingest::gating::GatingDecision;
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -101,6 +102,8 @@ pub struct DeleteResponse {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct IngestResponse {
     pub drawer_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gating_decision: Option<GatingDecision>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate_warning: Option<DuplicateWarning>,
     /// Milliseconds spent waiting for the per-source ingest lock (P9-B).
