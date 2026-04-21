@@ -28,6 +28,7 @@ const DEFAULT_SESSION_REVIEW_MIN_LENGTH: usize = 100;
 const DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES: usize = 1;
 const DEFAULT_HOTPATCH_MIN_IMPORTANCE_STARS: i32 = 4;
 const DEFAULT_HOTPATCH_MAX_SUGGESTION_LENGTH: usize = 80;
+static DEFAULT_SENSITIVE_SCRUBBER: OnceLock<Option<CompiledPrivacyConfig>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
@@ -298,6 +299,25 @@ impl Config {
         effective.embed.openai_compat = self.embed.openai_compat.clone();
         effective
     }
+}
+
+pub(crate) fn scrub_sensitive_text(input: &str) -> String {
+    let compiled = DEFAULT_SENSITIVE_SCRUBBER.get_or_init(|| {
+        let mut config = Config::default();
+        config.privacy.enabled = true;
+        config.compile_privacy().ok()
+    });
+    let Some(compiled) = compiled.as_ref() else {
+        return input.to_string();
+    };
+
+    let mut content = input.to_string();
+    for (name, regex) in &compiled.patterns {
+        content = regex
+            .replace_all(&content, format!("[REDACTED:{name}]"))
+            .into_owned();
+    }
+    content
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

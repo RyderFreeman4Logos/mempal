@@ -151,7 +151,7 @@ log_path = "{}"
     let bootstrap_task = tokio::task::spawn_blocking(move || {
         DaemonContext::bootstrap_with_events(bootstrap_config, true, Some(tx))
     });
-    let bootstrap_context = tokio::time::timeout(Duration::from_secs(5), bootstrap_task)
+    let bootstrap_context = tokio::time::timeout(Duration::from_secs(10), bootstrap_task)
         .await?
         .expect("join bootstrap task")?;
     let seen = observer

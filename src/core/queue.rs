@@ -6,7 +6,11 @@ use blake3::Hasher;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 
+use super::config::scrub_sensitive_text;
+
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+const STARTUP_RECLAIM_STALE_SECS: i64 = 60;
+pub const LAST_ERROR_MAX_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error)]
 pub enum QueueError {
@@ -67,10 +71,12 @@ impl PendingMessageStore {
     }
 
     pub fn with_config(path: impl AsRef<Path>, config: QueueConfig) -> Result<Self> {
-        Ok(Self {
+        let store = Self {
             db_path: path.as_ref().to_path_buf(),
             config,
-        })
+        };
+        store.reclaim_stale(STARTUP_RECLAIM_STALE_SECS)?;
+        Ok(store)
     }
 
     pub fn enqueue(&self, kind: &str, payload: &str) -> Result<String> {
@@ -176,6 +182,7 @@ impl PendingMessageStore {
     pub fn mark_failed(&self, id: &str, error: &str) -> Result<()> {
         let mut conn = self.open_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let redacted_error = sanitize_last_error(error);
         let current_retry = tx
             .query_row(
                 "SELECT retry_count FROM pending_messages WHERE id = ?1",
@@ -205,7 +212,14 @@ impl PendingMessageStore {
                 last_error = ?6
             WHERE id = ?1
             "#,
-            params![id, next_retry, backoff_ms, next_attempt_at, status, error],
+            params![
+                id,
+                next_retry,
+                backoff_ms,
+                next_attempt_at,
+                status,
+                redacted_error
+            ],
         )?;
         if updated == 0 {
             return Err(QueueError::MessageNotFound(id.to_string()));
@@ -372,4 +386,21 @@ fn div_ceil(lhs: i64, rhs: i64) -> i64 {
 
 fn i64_to_u64(value: i64) -> u64 {
     if value <= 0 { 0 } else { value as u64 }
+}
+
+fn sanitize_last_error(error: &str) -> String {
+    truncate_to_byte_limit(scrub_sensitive_text(error), LAST_ERROR_MAX_BYTES)
+}
+
+fn truncate_to_byte_limit(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut truncate_at = max_bytes;
+    while truncate_at > 0 && !value.is_char_boundary(truncate_at) {
+        truncate_at -= 1;
+    }
+    value.truncate(truncate_at);
+    value
 }

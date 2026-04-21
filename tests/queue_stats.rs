@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mempal::core::db::Database;
+use mempal::core::db::{Database, apply_fork_ext_migrations_to};
 use mempal::core::queue::{PendingMessageStore, QueueConfig};
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -44,6 +44,52 @@ db_path = "{}"
     )
     .expect("write config");
     (tmp, db_path)
+}
+
+#[test]
+fn test_fork_ext_migration_v0_to_v1_creates_pending_messages_table() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+
+    let upstream_user_version_before = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .expect("read initial user_version");
+    assert_eq!(upstream_user_version_before, 0);
+
+    apply_fork_ext_migrations_to(&conn, 1).expect("apply ext v1 migration");
+
+    let fork_ext_version = conn
+        .query_row(
+            "SELECT value FROM fork_ext_meta WHERE key = 'fork_ext_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read fork_ext_version");
+    assert_eq!(fork_ext_version, "1");
+
+    let upstream_user_version_after = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .expect("read final user_version");
+    assert_eq!(upstream_user_version_after, 0);
+
+    let table_exists = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pending_messages'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query pending_messages table");
+    assert_eq!(table_exists, 1);
+
+    let index_exists = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_pending_next_attempt'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query pending_messages index");
+    assert_eq!(index_exists, 1);
 }
 
 #[test]
@@ -118,7 +164,7 @@ fn test_oldest_pending_age_none_when_empty() {
 }
 
 #[test]
-fn test_cli_status_prints_queue_section() {
+fn test_status_command_shows_queue_stats() {
     let (home, db_path) = setup_home();
     let store = PendingMessageStore::with_config(
         &db_path,
@@ -174,4 +220,22 @@ fn test_cli_status_prints_queue_section() {
     assert!(stdout.contains("claimed: 1"), "{stdout}");
     assert!(stdout.contains("failed: 1"), "{stdout}");
     assert!(stdout.contains("oldest_pending_age_secs:"), "{stdout}");
+}
+
+#[test]
+fn test_queue_module_no_unwrap() {
+    let queue_source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/core/queue.rs");
+    let content = fs::read_to_string(&queue_source).expect("read queue source");
+    let offenders = content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.contains("// SAFETY:") && line.contains(".unwrap()"))
+        .map(|(index, line)| format!("{}:{}", index + 1, line.trim()))
+        .collect::<Vec<_>>();
+
+    assert!(
+        offenders.is_empty(),
+        "queue module contains .unwrap():\n{}",
+        offenders.join("\n")
+    );
 }

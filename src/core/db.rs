@@ -1,12 +1,16 @@
 #[rustfmt::skip] #[path = "db_fork_ext.rs"] mod db_fork_ext;
 // harness-point: PR0 — re-export MigrationHook trait + hooked migration runner for tests
-pub use db_fork_ext::{MigrationHook, apply_fork_ext_migrations_with_hook};
+pub use db_fork_ext::{
+    FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL, FORK_EXT_V3_SCHEMA_SQL,
+    MigrationHook, apply_fork_ext_migrations, apply_fork_ext_migrations_to,
+    apply_fork_ext_migrations_with_hook, read_fork_ext_version, set_fork_ext_version,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -95,25 +99,54 @@ pub struct Database {
     path: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+enum OpenMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl OpenMode {
+    fn allows_write(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|source| DbError::CreateDir {
-                path: parent.to_path_buf(),
-                source,
-            })?;
+        Self::open_with_mode(path, OpenMode::ReadWrite)
+    }
+
+    pub fn open_read_only(path: &Path) -> Result<Self, DbError> {
+        Self::open_with_mode(path, OpenMode::ReadOnly)
+    }
+
+    fn open_with_mode(path: &Path, mode: OpenMode) -> Result<Self, DbError> {
+        if mode.allows_write() {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).map_err(|source| DbError::CreateDir {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
         }
 
         register_sqlite_vec()?;
 
-        let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        apply_migrations(&conn)?;
-        db_fork_ext::apply_fork_ext_migrations(&conn)?;
+        let conn = match mode {
+            OpenMode::ReadOnly => {
+                Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
+            }
+            OpenMode::ReadWrite => Connection::open(path)?,
+        };
+        if mode.allows_write() {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            apply_migrations(&conn)?;
+            db_fork_ext::apply_fork_ext_migrations(&conn)?;
+        }
 
         Ok(Self {
             conn,

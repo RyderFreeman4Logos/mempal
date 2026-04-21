@@ -5,7 +5,10 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use mempal::core::config::{Config, ConfigHandle};
-use mempal::core::db::Database;
+use mempal::core::db::{
+    Database, FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL,
+    FORK_EXT_V3_SCHEMA_SQL, apply_fork_ext_migrations, set_fork_ext_version,
+};
 use mempal::core::types::{Drawer, SourceType};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::ingest::lock::acquire_source_lock;
@@ -15,9 +18,6 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::{Duration, sleep};
-
-#[path = "../src/core/db_fork_ext.rs"]
-mod db_fork_ext;
 
 async fn test_guard() -> OwnedMutexGuard<()> {
     static GUARD: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
@@ -416,15 +416,12 @@ END;
 "#,
     )
     .expect("create upstream schema");
-    conn.execute_batch(db_fork_ext::FORK_EXT_META_DDL)
+    conn.execute_batch(FORK_EXT_META_DDL)
         .expect("fork ext meta");
-    conn.execute_batch(db_fork_ext::FORK_EXT_V1_SCHEMA_SQL)
-        .expect("ext v1");
-    conn.execute_batch(db_fork_ext::FORK_EXT_V2_SCHEMA_SQL)
-        .expect("ext v2");
-    conn.execute_batch(db_fork_ext::FORK_EXT_V3_SCHEMA_SQL)
-        .expect("ext v3");
-    db_fork_ext::set_fork_ext_version(&conn, 3).expect("set version 3");
+    conn.execute_batch(FORK_EXT_V1_SCHEMA_SQL).expect("ext v1");
+    conn.execute_batch(FORK_EXT_V2_SCHEMA_SQL).expect("ext v2");
+    conn.execute_batch(FORK_EXT_V3_SCHEMA_SQL).expect("ext v3");
+    set_fork_ext_version(&conn, 3).expect("set version 3");
     conn.execute_batch(
         r#"
 CREATE TRIGGER drawers_fts_after_update
@@ -435,8 +432,8 @@ END;
     )
     .expect("create stale trigger");
 
-    db_fork_ext::apply_fork_ext_migrations(&conn).expect("first apply");
-    db_fork_ext::apply_fork_ext_migrations(&conn).expect("second apply");
+    apply_fork_ext_migrations(&conn).expect("first apply");
+    apply_fork_ext_migrations(&conn).expect("second apply");
 
     let trigger_count = conn
         .query_row(
