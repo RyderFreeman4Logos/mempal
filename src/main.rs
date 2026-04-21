@@ -30,6 +30,7 @@ use mempal::mcp::MempalMcpServer;
 use mempal::search::search;
 
 mod longmemeval;
+mod observability;
 
 use crate::longmemeval::{BenchMode, LongMemEvalArgs, LongMemEvalGranularity, default_top_k};
 
@@ -129,6 +130,36 @@ enum Commands {
         mcp: bool,
     },
     Status,
+    Tail {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long)]
+        room: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+    },
+    Timeline {
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+    },
+    Stats,
+    View {
+        drawer_id: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    Audit {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// Run offline contradiction check on text against KG triples +
     /// known-entity registry. Pure read, no LLM, no network.
     FactCheck {
@@ -359,6 +390,48 @@ fn run() -> Result<()> {
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
         Commands::Serve { mcp } => block_on_result(serve_command(config.as_ref(), mcp)),
         Commands::Status => status_command(&db),
+        Commands::Tail {
+            limit,
+            follow,
+            wing,
+            room,
+            since,
+        } => observability::tail_command(
+            &db,
+            config.as_ref(),
+            observability::TailOptions {
+                limit,
+                follow,
+                wing: wing.as_deref(),
+                room: room.as_deref(),
+                since: since.as_deref(),
+            },
+        ),
+        Commands::Timeline { wing, since } => observability::timeline_command(
+            &db,
+            config.as_ref(),
+            observability::TimelineOptions {
+                wing: wing.as_deref(),
+                since: since.as_deref(),
+            },
+        ),
+        Commands::Stats => observability::stats_command(&db, config.as_ref()),
+        Commands::View { drawer_id, raw } => observability::view_command(
+            &db,
+            config.as_ref(),
+            observability::ViewOptions {
+                drawer_id: &drawer_id,
+                raw,
+            },
+        ),
+        Commands::Audit { kind, since } => observability::audit_command(
+            &db,
+            config.as_ref(),
+            observability::AuditOptions {
+                kind: kind.as_deref(),
+                since: since.as_deref(),
+            },
+        ),
         Commands::FactCheck {
             path,
             wing,
