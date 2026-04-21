@@ -1,4 +1,6 @@
-use mempal::core::db::{Database, apply_fork_ext_migrations, read_fork_ext_version};
+use mempal::core::db::{
+    CURRENT_FORK_EXT_VERSION, Database, apply_fork_ext_migrations, read_fork_ext_version,
+};
 use tempfile::TempDir;
 
 fn new_test_db() -> (TempDir, Database) {
@@ -13,7 +15,7 @@ fn test_fork_ext_v4_migration() {
     let (_tmp, db) = new_test_db();
 
     let version = read_fork_ext_version(db.conn()).expect("read version");
-    assert_eq!(version, 6);
+    assert_eq!(version, CURRENT_FORK_EXT_VERSION);
 
     let table_exists = db
         .conn()
@@ -54,5 +56,5 @@ fn test_fork_ext_v4_migration_is_idempotent() {
     apply_fork_ext_migrations(db.conn()).expect("second apply");
 
     let version = read_fork_ext_version(db.conn()).expect("read version");
-    assert_eq!(version, 6);
+    assert_eq!(version, CURRENT_FORK_EXT_VERSION);
 }

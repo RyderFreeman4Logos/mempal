@@ -131,7 +131,7 @@ fn record_gating_audit(db_path: &Path, drawer_id: &str, accepted: bool, project_
     let decision = if accepted {
         GatingDecision::accepted(1, Some("keep".to_string()), Some(0.9))
     } else {
-        GatingDecision::rejected(1, Some("drop".to_string()), None)
+        GatingDecision::rejected(1, Some("drop".to_string()), None, None)
     };
     db.record_gating_audit(drawer_id, &decision, project_id)
         .expect("record gating audit");
@@ -660,5 +660,5 @@ fn test_mempal_stats_counts_project_scoped_audit_rows_without_drawer_rows() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("gating:"));
-    assert!(stdout.contains("  rejected: 1"));
+    assert!(stdout.contains("  skip: 1"));
 }

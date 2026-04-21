@@ -3,11 +3,15 @@ use std::sync::Arc;
 use crate::core::config::{
     Config, EmbeddingClassifierConfig, GatingRuleConfig, IngestGatingConfig,
 };
-use crate::embed::{EmbedError, Embedder, EmbedderFactory};
+use crate::embed::{EmbedError, Embedder, EmbedderFactory, build_backend_from_name};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::OnceCell;
+
+const MIN_SIGNAL_BYTES: usize = 12;
+const MAX_PROTOTYPE_COUNT: usize = 64;
+const MAX_PROTOTYPE_LEN_BYTES: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct IngestCandidate {
@@ -27,6 +31,8 @@ pub struct GatingDecision {
     pub decision: String,
     pub tier: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gating_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f32>,
@@ -39,16 +45,23 @@ impl GatingDecision {
         Self {
             decision: "accepted".to_string(),
             tier,
+            gating_reason: None,
             label: label.into(),
             score,
             matched_pattern: None,
         }
     }
 
-    pub fn rejected(tier: u8, matched_pattern: Option<String>, score: Option<f32>) -> Self {
+    pub fn rejected(
+        tier: u8,
+        gating_reason: impl Into<Option<String>>,
+        matched_pattern: Option<String>,
+        score: Option<f32>,
+    ) -> Self {
         Self {
             decision: "rejected".to_string(),
             tier,
+            gating_reason: gating_reason.into(),
             label: None,
             score,
             matched_pattern,
@@ -57,6 +70,14 @@ impl GatingDecision {
 
     pub fn is_rejected(&self) -> bool {
         self.decision == "rejected"
+    }
+
+    pub fn drop_reason(&self) -> Option<&str> {
+        if self.is_rejected() {
+            self.gating_reason.as_deref()
+        } else {
+            None
+        }
     }
 }
 
@@ -77,13 +98,30 @@ pub struct PrototypeClassifier {
     prototypes: Vec<EmbeddedPrototype>,
 }
 
+struct Prototypes;
+
 impl PrototypeClassifier {
     pub fn decide(&self, vector: &[f32], threshold: f32) -> GatingDecision {
         let (label, score) = self.classify(vector);
         if score >= threshold {
+            if let Some(label) = label
+                && prototype_reject_reason(label).is_some()
+            {
+                return GatingDecision::rejected(
+                    2,
+                    prototype_reject_reason(label),
+                    None,
+                    Some(score),
+                );
+            }
             GatingDecision::accepted(2, label.map(ToOwned::to_owned), Some(score))
         } else {
-            GatingDecision::rejected(2, None, Some(score))
+            GatingDecision::rejected(
+                2,
+                Some("prototype_below_threshold".to_string()),
+                None,
+                Some(score),
+            )
         }
     }
 
@@ -109,7 +147,17 @@ impl PrototypeClassifier {
 pub enum GatingInitError {
     #[error("failed to build gating embedder")]
     BuildEmbedder(#[source] EmbedError),
-    #[error("gating prototype init failed: label='{label}', reason='{source}'")]
+    #[error("gating prototype init failed: prototype_count={actual} exceeds limit {limit}")]
+    PrototypeCountLimit { actual: usize, limit: usize },
+    #[error(
+        "gating prototype init failed: label='{label}', length={actual_bytes} exceeds limit {limit_bytes}"
+    )]
+    PrototypeTooLong {
+        label: String,
+        actual_bytes: usize,
+        limit_bytes: usize,
+    },
+    #[error("gating prototype init failed: label='{label}', reason='embedder_error'")]
     PrototypeEmbed {
         label: String,
         #[source]
@@ -145,6 +193,12 @@ impl GatingRuntime {
         Ok(())
     }
 
+    pub async fn initialize_from_config(&self) -> Result<(), GatingInitError> {
+        let classifier = compile_classifier_from_config(&self.config).await?;
+        let _ = self.classifier.set(classifier);
+        Ok(())
+    }
+
     pub async fn classifier(&self) -> Result<Option<PrototypeClassifier>, GatingInitError> {
         let classifier = self
             .classifier
@@ -170,9 +224,41 @@ pub fn evaluate_tier1(
     gating: &IngestGatingConfig,
 ) -> Option<GatingDecision> {
     if !gating.enabled {
-        return Some(GatingDecision::accepted(
-            0,
-            Some("gating_disabled".to_string()),
+        return None;
+    }
+
+    if candidate.tool_name.as_deref() == Some("Read") {
+        return Some(GatingDecision::rejected(
+            1,
+            Some("read_tool".to_string()),
+            Some("Read".to_string()),
+            None,
+        ));
+    }
+
+    if is_too_short(candidate) {
+        return Some(GatingDecision::rejected(
+            1,
+            Some("too_short".to_string()),
+            None,
+            None,
+        ));
+    }
+
+    if is_boilerplate(candidate) {
+        return Some(GatingDecision::rejected(
+            1,
+            Some("boilerplate".to_string()),
+            None,
+            None,
+        ));
+    }
+
+    if is_low_signal(candidate) {
+        return Some(GatingDecision::rejected(
+            1,
+            Some("low_signal".to_string()),
+            None,
             None,
         ));
     }
@@ -183,6 +269,7 @@ pub fn evaluate_tier1(
             RuleAction::Reject => {
                 return Some(GatingDecision::rejected(
                     1,
+                    Some(matched_pattern.to_string()),
                     Some(matched_pattern.to_string()),
                     None,
                 ));
@@ -211,6 +298,22 @@ pub async fn compile_classifier_from_embedder<E: Embedder + ?Sized>(
     gating: &IngestGatingConfig,
 ) -> Result<Option<PrototypeClassifier>, GatingInitError> {
     compile_classifier(&gating.embedding_classifier, embedder).await
+}
+
+pub async fn compile_classifier_from_config(
+    config: &Config,
+) -> Result<Option<PrototypeClassifier>, GatingInitError> {
+    if !tier2_enabled(&config.ingest_gating) {
+        return Ok(None);
+    }
+    let embedder = build_backend_from_name(config, config.embed.backend.as_str())
+        .await
+        .map_err(GatingInitError::BuildEmbedder)?;
+    compile_classifier(
+        &config.ingest_gating.embedding_classifier,
+        embedder.as_ref(),
+    )
+    .await
 }
 
 pub async fn evaluate_tier2<E: Embedder + ?Sized>(
@@ -253,36 +356,63 @@ async fn compile_classifier<E: Embedder + ?Sized>(
     config: &EmbeddingClassifierConfig,
     embedder: &E,
 ) -> Result<Option<PrototypeClassifier>, GatingInitError> {
-    if !config.enabled || config.prototypes.is_empty() {
-        return Ok(None);
-    }
+    Prototypes::load(config, embedder).await
+}
 
-    let mut prototypes = Vec::with_capacity(config.prototypes.len());
-    for label in &config.prototypes {
-        let vectors = embedder.embed(&[label.as_str()]).await.map_err(|source| {
-            GatingInitError::PrototypeEmbed {
-                label: label.clone(),
-                source,
-            }
-        })?;
-        if let Some(vector) = vectors.into_iter().next() {
-            let actual = vector.len();
-            let expected = embedder.dimensions();
-            if actual != expected {
-                return Err(GatingInitError::PrototypeDimMismatch {
-                    label: label.clone(),
-                    expected,
-                    actual,
-                });
-            }
-            prototypes.push(EmbeddedPrototype {
-                label: label.clone(),
-                vector,
+impl Prototypes {
+    async fn load<E: Embedder + ?Sized>(
+        config: &EmbeddingClassifierConfig,
+        embedder: &E,
+    ) -> Result<Option<PrototypeClassifier>, GatingInitError> {
+        if !config.enabled || config.prototypes.is_empty() {
+            return Ok(None);
+        }
+
+        if config.prototypes.len() > MAX_PROTOTYPE_COUNT {
+            return Err(GatingInitError::PrototypeCountLimit {
+                actual: config.prototypes.len(),
+                limit: MAX_PROTOTYPE_COUNT,
             });
         }
-    }
 
-    Ok(Some(PrototypeClassifier { prototypes }))
+        let mut prototypes = Vec::with_capacity(config.prototypes.len());
+        for (index, raw_label) in config.prototypes.iter().enumerate() {
+            let label = prototype_display_label(index, raw_label);
+            let actual_bytes = raw_label.len();
+            if actual_bytes > MAX_PROTOTYPE_LEN_BYTES {
+                return Err(GatingInitError::PrototypeTooLong {
+                    label,
+                    actual_bytes,
+                    limit_bytes: MAX_PROTOTYPE_LEN_BYTES,
+                });
+            }
+
+            let vectors = embedder
+                .embed(&[raw_label.as_str()])
+                .await
+                .map_err(|source| GatingInitError::PrototypeEmbed {
+                    label: label.clone(),
+                    source,
+                })?;
+            if let Some(vector) = vectors.into_iter().next() {
+                let actual = vector.len();
+                let expected = embedder.dimensions();
+                if actual != expected {
+                    return Err(GatingInitError::PrototypeDimMismatch {
+                        label,
+                        expected,
+                        actual,
+                    });
+                }
+                prototypes.push(EmbeddedPrototype {
+                    label: raw_label.clone(),
+                    vector,
+                });
+            }
+        }
+
+        Ok(Some(PrototypeClassifier { prototypes }))
+    }
 }
 
 fn match_rule<'a>(candidate: &IngestCandidate, rule: &'a GatingRuleConfig) -> Option<&'a str> {
@@ -360,4 +490,68 @@ fn normalize_rule_action(action: &str) -> RuleAction {
         "accept" | "keep" => RuleAction::Accept,
         _ => RuleAction::Continue,
     }
+}
+
+fn is_too_short(candidate: &IngestCandidate) -> bool {
+    candidate.content.trim().len() < MIN_SIGNAL_BYTES
+}
+
+fn is_boilerplate(candidate: &IngestCandidate) -> bool {
+    let trimmed = candidate.content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.matches("successfully completed").count() >= 2
+}
+
+fn is_low_signal(candidate: &IngestCandidate) -> bool {
+    let trimmed = candidate.content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.chars().all(|ch| {
+        ch.is_ascii_hexdigit()
+            || matches!(
+                ch,
+                ':' | '-' | '+' | '.' | ',' | 'x' | 'X' | ' ' | '\n' | '\r' | '\t'
+            )
+    }) && trimmed.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn prototype_reject_reason(label: &str) -> Option<String> {
+    let normalized = normalize_prototype_label(label);
+    let noise_like = ["noise", "boilerplate", "low_signal", "drop", "ignore"];
+    noise_like
+        .iter()
+        .any(|needle| normalized.contains(needle))
+        .then(|| format!("prototype.{normalized}"))
+}
+
+fn normalize_prototype_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut last_was_sep = false;
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn prototype_display_label(index: usize, raw_label: &str) -> String {
+    let trimmed = raw_label.trim();
+    if !trimmed.is_empty()
+        && trimmed.len() <= 48
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return trimmed.to_string();
+    }
+    format!("prototype#{}", index + 1)
 }

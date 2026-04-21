@@ -471,7 +471,10 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
 
     let candidate = build_gating_candidate(context.envelope, &record);
     let mut gating_decision = evaluate_tier1(&candidate, &context.daemon.config.ingest_gating);
-    if gating_decision.is_none() && !tier2_enabled(&context.daemon.config.ingest_gating) {
+    if gating_decision.is_none()
+        && context.daemon.config.ingest_gating.enabled
+        && !tier2_enabled(&context.daemon.config.ingest_gating)
+    {
         gating_decision = Some(GatingDecision::accepted(
             0,
             Some("tier2_disabled".to_string()),
