@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use mempal::core::{db::Database, queue::PendingMessageStore};
-use mempal::daemon::process_claimed_message_with_embedder;
+use mempal::daemon::{DaemonIngestContext, process_claimed_message_with_embedder};
 use mempal::embed::{EmbedError, Embedder};
 use mempal::hook::{CapturedHookEnvelope, HookEvent};
 use rusqlite::Connection;
@@ -97,8 +97,11 @@ async fn test_daemon_heartbeat_fires_during_embed_retry() {
         "worker-heartbeat",
         &claimed,
         &embedder,
-        &config,
-        &mempal_home,
+        DaemonIngestContext {
+            prototype_classifier: None,
+            config: &config,
+            mempal_home: &mempal_home,
+        },
     )
     .await
     .expect("process message");

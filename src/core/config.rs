@@ -22,7 +22,7 @@ const DEFAULT_HOOK_POLL_INTERVAL_MS: u64 = 500;
 const DEFAULT_HOOK_CLAIM_TTL_SECS: u64 = 120;
 const DEFAULT_DAEMON_LOG_PATH: &str = "~/.mempal/daemon.log";
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub db_path: String,
@@ -559,16 +559,68 @@ pub struct SearchConfig {
     pub strict_project_isolation: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct IngestGatingConfig {
+    pub enabled: bool,
+    pub rules: Vec<GatingRuleConfig>,
     pub embedding_classifier: EmbeddingClassifierConfig,
+    pub novelty: NoveltyConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(default)]
+pub struct GatingRuleConfig {
+    pub action: String,
+    pub tool: Option<String>,
+    pub tool_in: Option<Vec<String>>,
+    pub content_bytes_lt: Option<usize>,
+    pub content_bytes_gt: Option<usize>,
+    pub exit_code_eq: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct EmbeddingClassifierConfig {
+    pub enabled: bool,
+    pub threshold: f32,
     pub prototypes: Vec<String>,
+}
+
+impl Default for EmbeddingClassifierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: 0.35,
+            prototypes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct NoveltyConfig {
+    pub enabled: bool,
+    pub duplicate_threshold: f32,
+    pub merge_threshold: f32,
+    pub wing_scope: String,
+    pub top_k_candidates: usize,
+    pub max_merges_per_drawer: u32,
+    pub max_content_bytes_per_drawer: usize,
+}
+
+impl Default for NoveltyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            duplicate_threshold: 0.95,
+            merge_threshold: 0.80,
+            wing_scope: "same_wing".to_string(),
+            top_k_candidates: 5,
+            max_merges_per_drawer: 10,
+            max_content_bytes_per_drawer: 65_536,
+        }
+    }
 }
 
 #[derive(Debug, Error)]

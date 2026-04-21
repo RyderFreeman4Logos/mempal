@@ -2,8 +2,10 @@
 
 pub mod chunk;
 pub mod detect;
+pub mod gating;
 pub mod lock;
 pub mod normalize;
+pub mod novelty;
 
 use std::path::{Path, PathBuf};
 
