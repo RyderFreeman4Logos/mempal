@@ -108,6 +108,19 @@ impl Config {
                 "hooks.daemon_claim_ttl_secs must be greater than 0".to_string(),
             ));
         }
+        if let Some(path) = self
+            .embed
+            .alert
+            .script_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            && !Path::new(path).is_absolute()
+        {
+            eprintln!(
+                "warning: alerting script_path is not absolute: {}; CWD at invocation may differ from expectation",
+                path
+            );
+        }
         let _ = self.compile_privacy()?;
         Ok(())
     }

@@ -25,6 +25,15 @@ pub struct EmbedHealthSnapshot {
     pub fallback_warning: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryConfigSnapshot {
+    pub retry_interval_secs: u64,
+    pub alert_threshold: u64,
+    pub degrade_threshold: u64,
+    pub alert_script: Option<PathBuf>,
+    pub alert_enabled: bool,
+}
+
 pub struct EmbedStatus {
     fail_count: AtomicU64,
     degraded: AtomicBool,
@@ -93,6 +102,23 @@ impl EmbedStatus {
         self.alert_script.store(alert_script);
     }
 
+    pub fn retry_config_snapshot(&self) -> RetryConfigSnapshot {
+        let config = ConfigHandle::current();
+        RetryConfigSnapshot {
+            retry_interval_secs: config.embed.retry.interval_secs,
+            alert_threshold: config.embed.alert.alert_every_n_failures,
+            degrade_threshold: config.embed.degradation.degrade_after_n_failures,
+            alert_script: config
+                .embed
+                .alert
+                .script_path
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from),
+            alert_enabled: config.embed.alert.enabled,
+        }
+    }
+
     pub fn retry_interval_secs(&self) -> u64 {
         self.sync_from_config();
         **self.retry_interval_secs.load()
@@ -109,6 +135,21 @@ impl EmbedStatus {
             self.degraded.store(true, Ordering::SeqCst);
         }
         self.maybe_fire_alert(fail_count, &message);
+    }
+
+    pub fn record_failure_with_snapshot(
+        &self,
+        error: &impl std::fmt::Display,
+        snapshot: &RetryConfigSnapshot,
+    ) {
+        let message = error.to_string();
+        self.last_error
+            .store(Some(std::sync::Arc::new(message.clone())));
+        let fail_count = self.fail_count.fetch_add(1, Ordering::SeqCst) + 1;
+        if fail_count > snapshot.degrade_threshold {
+            self.degraded.store(true, Ordering::SeqCst);
+        }
+        self.maybe_fire_alert_with_snapshot(snapshot, fail_count, &message);
     }
 
     pub fn record_primary_success(&self) {
@@ -196,6 +237,24 @@ impl EmbedStatus {
         };
         alerting::fire_alert(&path, fail_count, error_message);
     }
+
+    fn maybe_fire_alert_with_snapshot(
+        &self,
+        snapshot: &RetryConfigSnapshot,
+        fail_count: u64,
+        error_message: &str,
+    ) {
+        if !snapshot.alert_enabled {
+            return;
+        }
+        if snapshot.alert_threshold == 0 || fail_count % snapshot.alert_threshold != 0 {
+            return;
+        }
+        let Some(path) = snapshot.alert_script.as_ref() else {
+            return;
+        };
+        alerting::fire_alert(path, fail_count, error_message);
+    }
 }
 
 pub fn global_embed_status() -> &'static EmbedStatus {
@@ -205,7 +264,7 @@ pub fn global_embed_status() -> &'static EmbedStatus {
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 

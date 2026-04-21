@@ -101,13 +101,15 @@ pub fn install_claude_code(
         let event_array = ensure_hook_event_array(&mut root, event_name)?;
         let before_len = event_array.len();
         event_array.retain(|entry| !entry_contains_command(entry, command));
-        removed_commands += before_len.saturating_sub(event_array.len());
+        let removed = before_len.saturating_sub(event_array.len());
+        removed_commands += removed;
 
-        if !uninstall
+        let inserted = !uninstall
             && !event_array
                 .iter()
-                .any(|entry| entry_contains_command(entry, command))
-        {
+                .any(|entry| entry_contains_command(entry, command));
+
+        if inserted {
             event_array.push(json!({
                 "hooks": [{
                     "type": "command",
@@ -116,8 +118,7 @@ pub fn install_claude_code(
             }));
         }
 
-        changed |=
-            before_len != event_array.len() || (!uninstall && before_len == event_array.len());
+        changed |= removed > 0 || inserted;
     }
 
     let rendered =

@@ -9,6 +9,15 @@ use crate::core::{
 };
 use anyhow::{Context, Result};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Daemonize,
+    Runtime,
+    ConfigHandleBootstrap,
+    Database,
+    Tracing,
+}
+
 pub struct DaemonContext {
     pub runtime: tokio::runtime::Runtime,
     pub db: Database,
@@ -38,7 +47,7 @@ impl DaemonContext {
 }
 
 pub trait BootstrapObserver: Send + Sync {
-    fn record(&self, stage: &str);
+    fn record(&self, stage: Stage);
 }
 
 #[derive(Clone, Copy, Default)]
@@ -61,23 +70,24 @@ fn bootstrap_inner(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    record_stage(observer, "daemonize");
+    record_stage(observer, Stage::Daemonize);
     perform_daemonize(foreground, &mempal_home, &log_path)?;
 
-    record_stage(observer, "runtime");
+    record_stage(observer, Stage::Runtime);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build daemon runtime")?;
 
-    record_stage(observer, "database");
-    let db = Database::open(&db_path).context("failed to open daemon database")?;
-
+    record_stage(observer, Stage::ConfigHandleBootstrap);
     ConfigHandle::bootstrap(&config_path).context("failed to bootstrap config hot reload")?;
     let config = ConfigHandle::current();
+
+    record_stage(observer, Stage::Database);
+    let db = Database::open(&db_path).context("failed to open daemon database")?;
     let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
 
-    record_stage(observer, "tracing");
+    record_stage(observer, Stage::Tracing);
     init_tracing_subscriber();
 
     let pid_guard = PidFileGuard::create(mempal_home.join("daemon.pid"))?;
@@ -181,7 +191,7 @@ fn expand_home_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn record_stage(observer: BootstrapObserverRef, stage: &str) {
+fn record_stage(observer: BootstrapObserverRef, stage: Stage) {
     if let Some(observer) = observer.0 {
         observer.record(stage);
     }
