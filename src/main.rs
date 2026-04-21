@@ -1249,6 +1249,7 @@ fn fact_check_command(
 fn status_command(db: &Database) -> Result<()> {
     let cfg_meta = ConfigHandle::snapshot_meta();
     let scrub_stats = ConfigHandle::scrub_stats();
+    let runtime_warnings = ConfigHandle::collect_runtime_warnings();
     let embed_status = global_embed_status().snapshot();
     let queue_stats = mempal::core::queue::PendingMessageStore::new(db.path())
         .context("failed to open pending message store")?
@@ -1326,6 +1327,17 @@ fn status_command(db: &Database) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ");
         println!("  redactions_per_pattern: {per_pattern}");
+    }
+    if !runtime_warnings.is_empty() {
+        println!("Warnings:");
+        for warning in runtime_warnings {
+            println!(
+                "  [{}] {} ({})",
+                warning.level.to_ascii_uppercase(),
+                warning.message,
+                warning.source
+            );
+        }
     }
 
     let counts = db.scope_counts().context("failed to query scope counts")?;

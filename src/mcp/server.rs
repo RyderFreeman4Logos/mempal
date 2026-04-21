@@ -1104,7 +1104,7 @@ fn degraded_write_error() -> ErrorData {
 }
 
 fn current_system_warnings() -> Vec<SystemWarning> {
-    global_embed_status()
+    let mut warnings = global_embed_status()
         .collect_warnings()
         .into_iter()
         .map(|warning| SystemWarning {
@@ -1112,7 +1112,17 @@ fn current_system_warnings() -> Vec<SystemWarning> {
             message: warning.message,
             source: warning.source.to_string(),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    warnings.extend(
+        ConfigHandle::collect_runtime_warnings()
+            .into_iter()
+            .map(|warning| SystemWarning {
+                level: warning.level.to_string(),
+                message: warning.message,
+                source: warning.source.to_string(),
+            }),
+    );
+    warnings
 }
 
 const DEDUP_THRESHOLD: f32 = 0.85;

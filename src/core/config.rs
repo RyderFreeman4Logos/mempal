@@ -224,8 +224,13 @@ impl Config {
                 .map(|matched| matched.as_str().len() as u64)
                 .sum::<u64>();
             stats.record_match(name, matched_count, bytes_redacted);
+            let replacement = if name == "private_tag" {
+                String::new()
+            } else {
+                format!("[REDACTED:{name}]")
+            };
             content = regex
-                .replace_all(&content, format!("[REDACTED:{name}]"))
+                .replace_all(&content, regex::NoExpand(replacement.as_str()))
                 .into_owned();
         }
 
@@ -299,6 +304,18 @@ impl Config {
         effective.embed.openai_compat = self.embed.openai_compat.clone();
         effective
     }
+
+    pub fn collect_runtime_warnings(&self) -> Vec<RuntimeWarning> {
+        let mut warnings = Vec::new();
+        if self.hooks.enabled && !self.privacy.enabled {
+            warnings.push(RuntimeWarning {
+                level: "warn",
+                source: "privacy",
+                message: "hooks capture is enabled while privacy scrubbing is disabled; captured content may persist secrets. Set [privacy].enabled = true or disable [hooks].enabled.".to_string(),
+            });
+        }
+        warnings
+    }
 }
 
 pub(crate) fn scrub_sensitive_text(input: &str) -> String {
@@ -313,8 +330,9 @@ pub(crate) fn scrub_sensitive_text(input: &str) -> String {
 
     let mut content = input.to_string();
     for (name, regex) in &compiled.patterns {
+        let replacement = format!("[REDACTED:{name}]");
         content = regex
-            .replace_all(&content, format!("[REDACTED:{name}]"))
+            .replace_all(&content, regex::NoExpand(replacement.as_str()))
             .into_owned();
     }
     content
@@ -567,6 +585,13 @@ pub struct ScrubPattern {
     pub name: String,
     #[serde(alias = "regex")]
     pub pattern: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWarning {
+    pub level: &'static str,
+    pub message: String,
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -823,6 +848,10 @@ impl ConfigHandle {
 
     pub fn recent_events() -> Vec<String> {
         super::hot_reload::global_hot_reload_state().recent_events()
+    }
+
+    pub fn collect_runtime_warnings() -> Vec<RuntimeWarning> {
+        Self::current().collect_runtime_warnings()
     }
 
     pub fn runtime_prototypes() -> Vec<String> {
