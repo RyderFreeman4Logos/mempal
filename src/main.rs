@@ -1114,9 +1114,14 @@ fn status_command(db: &Database) -> Result<()> {
     if let Some(last_success_at) = embed_status.last_success_at_unix_ms {
         println!("embed_last_success_at_unix_ms: {last_success_at}");
     }
-    println!("queue_pending: {}", queue_stats.pending);
-    println!("queue_claimed: {}", queue_stats.claimed);
-    println!("queue_failed: {}", queue_stats.failed);
+    println!("Queue:");
+    println!("  pending: {}", queue_stats.pending);
+    println!("  claimed: {}", queue_stats.claimed);
+    println!("  failed: {}", queue_stats.failed);
+    match queue_stats.oldest_pending_age_secs {
+        Some(age) => println!("  oldest_pending_age_secs: {age}"),
+        None => println!("  oldest_pending_age_secs: none"),
+    }
 
     let counts = db.scope_counts().context("failed to query scope counts")?;
 

@@ -21,8 +21,8 @@ use rmcp::{
 use super::tools::{
     CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DuplicateWarning,
     EmbedStatusDto, FactCheckRequest, FactCheckResponse, IngestRequest, IngestResponse, KgRequest,
-    KgResponse, KgStatsDto, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, ScopeCount,
-    SearchRequest, SearchResponse, SearchResultDto, StatusResponse, SystemWarning,
+    KgResponse, KgStatsDto, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto,
+    ScopeCount, SearchRequest, SearchResponse, SearchResultDto, StatusResponse, SystemWarning,
     TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
 };
 
@@ -119,6 +119,12 @@ impl MempalMcpServer {
                 fail_count: embed_snapshot.fail_count,
                 last_error: embed_snapshot.last_error,
                 last_success_at_unix_ms: embed_snapshot.last_success_at_unix_ms,
+            },
+            queue_stats: QueueStatsDto {
+                pending: queue_stats.pending,
+                claimed: queue_stats.claimed,
+                failed: queue_stats.failed,
+                oldest_pending_age_secs: queue_stats.oldest_pending_age_secs,
             },
             system_warnings: current_system_warnings(),
         }))

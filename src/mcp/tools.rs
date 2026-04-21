@@ -130,8 +130,18 @@ pub struct StatusResponse {
     pub aaak_spec: String,
     pub memory_protocol: String,
     pub embed_status: EmbedStatusDto,
+    pub queue_stats: QueueStatsDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct QueueStatsDto {
+    pub pending: u64,
+    pub claimed: u64,
+    pub failed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_age_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
