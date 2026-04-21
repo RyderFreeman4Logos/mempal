@@ -8,11 +8,13 @@ use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
 use mempal::core::types::{Drawer, SourceType};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
+use mempal::ingest::lock::acquire_source_lock;
 use mempal::mcp::{IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::time::{Duration, sleep};
 
 #[path = "../src/core/db_fork_ext.rs"]
 mod db_fork_ext;
@@ -312,6 +314,56 @@ async fn test_merge_preserves_raw_verbatim() {
     assert!(
         !content.contains("summary"),
         "merge must preserve raw verbatim"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_novelty_merge_waits_for_target_lock() {
+    let _guard = test_guard().await;
+    let tmp = TempDir::new().expect("tempdir");
+    let mempal_home = tmp.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
+    let db_path = mempal_home.join("palace.db");
+    let config_path = mempal_home.join("config.toml");
+    Database::open(&db_path).expect("open db");
+    write_config(&config_path, &db_path);
+    insert_existing_drawer(&db_path, "Decision: use Arc<Mutex<>>", &[1.0, 0.0]);
+
+    let target_lock = acquire_source_lock(&mempal_home, "existing", Duration::from_secs(1))
+        .expect("acquire existing drawer lock");
+    let server = build_server(
+        &db_path,
+        &config_path,
+        HashMap::from([(
+            "Also: use RwLock when reads dominate".to_string(),
+            vec![0.85, 0.5267827],
+        )]),
+    );
+
+    let task = tokio::spawn(async move {
+        server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "Also: use RwLock when reads dominate".to_string(),
+                wing: "code-memory".to_string(),
+                room: Some("novelty".to_string()),
+                source: None,
+                dry_run: Some(false),
+                importance: None,
+            }))
+            .await
+    });
+
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !task.is_finished(),
+        "merge should wait while the target drawer lock is held"
+    );
+    drop(target_lock);
+
+    let response = task.await.expect("join task").expect("merge response").0;
+    assert_eq!(
+        response.novelty_action,
+        Some(mempal::ingest::novelty::NoveltyAction::Merge)
     );
 }
 

@@ -10,7 +10,7 @@ use crate::core::{
 use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
 use crate::embed::{EmbedderFactory, global_embed_status};
 use crate::ingest::gating::{
-    GatingDecision, GatingRuntime, IngestCandidate, evaluate_tier1, evaluate_tier2, tier2_enabled,
+    GatingDecision, GatingRuntime, IngestCandidate, evaluate_tier1, evaluate_tier2,
 };
 use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
 use crate::search::{resolve_route, search_with_vector};
@@ -34,7 +34,6 @@ use super::tools::{
 #[derive(Clone)]
 pub struct MempalMcpServer {
     db_path: PathBuf,
-    config: crate::core::config::Config,
     gating_runtime: Arc<GatingRuntime>,
     embedder_factory: Arc<dyn EmbedderFactory>,
     tool_router: ToolRouter<Self>,
@@ -67,7 +66,6 @@ impl MempalMcpServer {
     ) -> Self {
         Self {
             db_path,
-            config: config.clone(),
             gating_runtime: Arc::new(GatingRuntime::new(config, Arc::clone(&embedder_factory))),
             embedder_factory,
             tool_router: Self::tool_router(),
@@ -209,7 +207,9 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<IngestRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        let scrubbed_content = ConfigHandle::scrub_content(&request.content);
+        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let scrubbed_content =
+            config.scrub_content_with_compiled(&request.content, compiled_privacy.as_ref());
         let room = request.room.as_deref();
         let drawer_id = build_drawer_id(&request.wing, room, &scrubbed_content);
 
@@ -234,14 +234,7 @@ impl MempalMcpServer {
             tool_name: None,
             exit_code: None,
         };
-        let mut gating_decision = evaluate_tier1(&candidate, &self.config.ingest_gating);
-        if gating_decision.is_none() && !tier2_enabled(&self.config.ingest_gating) {
-            gating_decision = Some(GatingDecision::accepted(
-                0,
-                Some("tier2_disabled".to_string()),
-                None,
-            ));
-        }
+        let mut gating_decision = evaluate_tier1(&candidate, &config.ingest_gating);
         if let Some(decision) = gating_decision.as_ref()
             && decision.is_rejected()
         {
@@ -285,19 +278,36 @@ impl MempalMcpServer {
         })?;
         let mut vector = None;
         let mut gating_audit_recorded = false;
-        if tier2_enabled(&self.config.ingest_gating) {
-            let classifier = self
-                .gating_runtime
-                .classifier()
-                .await
-                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-            if let Some(classifier) = classifier {
-                let tier2 = evaluate_tier2(&candidate, &classifier, embedder.as_ref()).await;
+        if gating_decision.is_none() {
+            let tier2_classifier = if config.ingest_gating.enabled
+                && config.ingest_gating.embedding_classifier.enabled
+            {
+                self.gating_runtime
+                    .classifier()
+                    .await
+                    .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
+            } else {
+                None
+            };
+            if let Some(classifier) = tier2_classifier.as_ref() {
+                let tier2 = evaluate_tier2(
+                    &candidate,
+                    classifier,
+                    embedder.as_ref(),
+                    config.ingest_gating.embedding_classifier.threshold,
+                )
+                .await;
                 db.record_gating_audit(&drawer_id, &tier2.decision)
                     .map_err(db_error)?;
                 gating_audit_recorded = true;
                 vector = tier2.vector;
                 gating_decision = Some(tier2.decision);
+            } else {
+                gating_decision = Some(GatingDecision::accepted(
+                    0,
+                    Some("tier2_disabled".to_string()),
+                    None,
+                ));
             }
         }
         if let Some(decision) = gating_decision.as_ref()
@@ -342,7 +352,7 @@ impl MempalMcpServer {
             &db,
             &novelty_candidate,
             &vector,
-            &self.config.ingest_gating.novelty,
+            &config.ingest_gating.novelty,
         );
         let mut response_drawer_id = drawer_id.clone();
         let (novelty_action, near_drawer_id);
@@ -398,6 +408,20 @@ impl MempalMcpServer {
                 let target_id = novelty.near_drawer_id.clone().ok_or_else(|| {
                     ErrorData::internal_error("novelty merge missing target", None)
                 })?;
+                let _target_lock = if target_id == drawer_id {
+                    None
+                } else {
+                    Some(
+                        crate::ingest::lock::acquire_source_lock(
+                            &mempal_home,
+                            &target_id,
+                            std::time::Duration::from_secs(5),
+                        )
+                        .map_err(|e| {
+                            ErrorData::internal_error(format!("merge target lock: {e}"), None)
+                        })?,
+                    )
+                };
                 let (existing_content, merge_count) = db
                     .drawer_merge_state(&target_id)
                     .map_err(db_error)?
@@ -408,13 +432,9 @@ impl MempalMcpServer {
                 let merged_content = format!(
                     "{existing_content}\n---\nSUPPLEMENTARY ({merged_at}):\n{scrubbed_content}"
                 );
-                let capped = merge_count >= self.config.ingest_gating.novelty.max_merges_per_drawer
+                let capped = merge_count >= config.ingest_gating.novelty.max_merges_per_drawer
                     || merged_content.len()
-                        > self
-                            .config
-                            .ingest_gating
-                            .novelty
-                            .max_content_bytes_per_drawer;
+                        > config.ingest_gating.novelty.max_content_bytes_per_drawer;
                 if capped {
                     db.record_novelty_audit(
                         &drawer_id,

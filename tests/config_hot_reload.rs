@@ -221,6 +221,21 @@ prototypes = ["A", "B", "C"]
     )
 }
 
+fn config_with_tier1_reject_short(db_path: &Path) -> String {
+    base_config(db_path).replace(
+        "[ingest_gating.embedding_classifier]\nprototypes = [\"A\", \"B\", \"C\"]",
+        r#"[ingest_gating]
+enabled = true
+
+[[ingest_gating.rules]]
+action = "reject"
+content_bytes_lt = 12
+
+[ingest_gating.embedding_classifier]
+enabled = false"#,
+    )
+}
+
 async fn ingest(server: &MempalMcpServer, content: &str) -> String {
     let response = server
         .mempal_ingest(Parameters(IngestRequest {
@@ -285,6 +300,56 @@ async fn test_privacy_pattern_hot_reload_applies_on_next_ingest() {
     assert!(latest_event_contains(
         "config hot-reload: version changed from"
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_gating_hot_reload_applies_without_server_restart() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(&base_config(&PathBuf::from("/tmp/placeholder")));
+    let config = base_config(&env.db_path);
+    write_config_atomic(&env.config_path, &config);
+    ConfigHandle::bootstrap(&env.config_path).expect("rebootstrap config");
+
+    let factory = Arc::new(RecordingEmbedderFactory {
+        vector: vec![0.1, 0.2, 0.3],
+        delay: Duration::ZERO,
+        seen_inputs: Arc::new(Mutex::new(Vec::new())),
+        entered_tx: Arc::new(Mutex::new(None)),
+    });
+    let server = env.server(factory);
+
+    let first_id = ingest(&server, "this stays accepted before reload").await;
+    assert!(
+        env.db()
+            .get_drawer(&first_id)
+            .expect("get first drawer")
+            .is_some()
+    );
+
+    let previous = ConfigHandle::version();
+    write_config_atomic(
+        &env.config_path,
+        &config_with_tier1_reject_short(&env.db_path),
+    );
+    wait_for_version_change(&previous);
+
+    let response = server
+        .mempal_ingest(Parameters(IngestRequest {
+            content: "tiny".to_string(),
+            wing: "mempal".to_string(),
+            room: Some("config-hot-reload".to_string()),
+            source: None,
+            dry_run: None,
+            importance: None,
+        }))
+        .await
+        .expect("ingest should return structured reject")
+        .0;
+
+    let decision = response.gating_decision.expect("tier-1 decision");
+    assert_eq!(decision.decision, "rejected");
+    assert_eq!(decision.tier, 1);
+    assert_eq!(env.db().drawer_count().expect("drawer count"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

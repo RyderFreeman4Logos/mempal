@@ -74,14 +74,13 @@ struct EmbeddedPrototype {
 
 #[derive(Debug, Clone)]
 pub struct PrototypeClassifier {
-    threshold: f32,
     prototypes: Vec<EmbeddedPrototype>,
 }
 
 impl PrototypeClassifier {
-    pub fn decide(&self, vector: &[f32]) -> GatingDecision {
+    pub fn decide(&self, vector: &[f32], threshold: f32) -> GatingDecision {
         let (label, score) = self.classify(vector);
-        if score >= self.threshold {
+        if score >= threshold {
             GatingDecision::accepted(2, label.map(ToOwned::to_owned), Some(score))
         } else {
             GatingDecision::rejected(2, None, Some(score))
@@ -218,13 +217,14 @@ pub async fn evaluate_tier2<E: Embedder + ?Sized>(
     candidate: &IngestCandidate,
     classifier: &PrototypeClassifier,
     embedder: &E,
+    threshold: f32,
 ) -> Tier2Outcome {
     match embedder.embed(&[candidate.content.as_str()]).await {
         Ok(vectors) => {
             let vector = vectors.into_iter().next();
             match vector {
                 Some(vector) => {
-                    let decision = classifier.decide(&vector);
+                    let decision = classifier.decide(&vector, threshold);
                     Tier2Outcome {
                         decision,
                         vector: Some(vector),
@@ -282,10 +282,7 @@ async fn compile_classifier<E: Embedder + ?Sized>(
         }
     }
 
-    Ok(Some(PrototypeClassifier {
-        threshold: config.threshold,
-        prototypes,
-    }))
+    Ok(Some(PrototypeClassifier { prototypes }))
 }
 
 fn match_rule<'a>(candidate: &IngestCandidate, rule: &'a GatingRuleConfig) -> Option<&'a str> {

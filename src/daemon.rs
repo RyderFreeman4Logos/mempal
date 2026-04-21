@@ -204,10 +204,15 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
 
     let mut vector = None;
     let mut gating_audit_recorded = false;
-    if let Some(classifier) = context.prototype_classifier {
+    if gating_decision.is_none()
+        && let Some(classifier) = context.prototype_classifier
+    {
         let candidate_vector =
             embed_text_with_heartbeat(embedder, &record.content, Some(&heartbeat)).await?;
-        let decision = classifier.decide(&candidate_vector);
+        let decision = classifier.decide(
+            &candidate_vector,
+            context.config.ingest_gating.embedding_classifier.threshold,
+        );
         db.record_gating_audit(&drawer_id, &decision)
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
         gating_audit_recorded = true;
@@ -282,6 +287,18 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
                 .near_drawer_id
                 .clone()
                 .unwrap_or_else(|| drawer_id.clone());
+            let _target_lock = if target_id == drawer_id {
+                None
+            } else {
+                Some(
+                    crate::ingest::lock::acquire_source_lock(
+                        context.mempal_home,
+                        &target_id,
+                        Duration::from_secs(5),
+                    )
+                    .with_context(|| format!("failed to lock merge target {}", target_id))?,
+                )
+            };
             let (existing_content, merge_count) = db
                 .drawer_merge_state(&target_id)
                 .with_context(|| format!("failed to load merge target {}", target_id))?
