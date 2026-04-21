@@ -173,6 +173,7 @@ impl Database {
         &self,
         candidate_hash: &str,
         decision: &GatingDecision,
+        project_id: Option<&str>,
     ) -> Result<(), DbError> {
         let explain_json = serde_json::to_string(decision)?;
         let created_at = super::utils::current_timestamp()
@@ -189,8 +190,8 @@ impl Database {
         let id = format!("gating_{}", blake3::hash(id_seed.as_bytes()).to_hex());
         self.conn.execute(
             r#"
-            INSERT INTO gating_audit (id, candidate_hash, decision, explain_json, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO gating_audit (id, candidate_hash, decision, explain_json, created_at, project_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
             params![
                 id,
@@ -198,6 +199,7 @@ impl Database {
                 decision.decision,
                 explain_json,
                 created_at,
+                project_id,
             ],
         )?;
         Ok(())
@@ -257,6 +259,7 @@ impl Database {
         near_drawer_id: Option<&str>,
         cosine: Option<f32>,
         audit_decision: Option<&str>,
+        project_id: Option<&str>,
     ) -> Result<(), DbError> {
         let created_at = super::utils::current_timestamp()
             .parse::<i64>()
@@ -276,10 +279,18 @@ impl Database {
         let id = format!("novelty_{}", blake3::hash(id_seed.as_bytes()).to_hex());
         self.conn.execute(
             r#"
-            INSERT INTO novelty_audit (id, candidate_hash, decision, near_drawer_id, cosine, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO novelty_audit (id, candidate_hash, decision, near_drawer_id, cosine, created_at, project_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
-            params![id, candidate_hash, decision, near_drawer_id, cosine, created_at],
+            params![
+                id,
+                candidate_hash,
+                decision,
+                near_drawer_id,
+                cosine,
+                created_at,
+                project_id
+            ],
         )?;
         Ok(())
     }

@@ -228,13 +228,14 @@ impl MempalMcpServer {
         Parameters(request): Parameters<ReadDrawerRequest>,
     ) -> std::result::Result<Json<ReadDrawerResponse>, ErrorData> {
         let config = ConfigHandle::current();
-        let project_id = resolve_project_id(None, config.as_ref(), None).map_err(|error| {
+        let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
+            .map_err(|error| {
             ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
         })?;
         let scope = ProjectSearchScope::from_request(
             project_id,
-            false,
-            false,
+            request.include_global.unwrap_or(false),
+            request.all_projects.unwrap_or(false),
             config.search.strict_project_isolation,
         );
         let db = self.open_db()?;
@@ -323,7 +324,7 @@ impl MempalMcpServer {
         if let Some(decision) = gating_decision.as_ref()
             && decision.is_rejected()
         {
-            db.record_gating_audit(&drawer_id, decision)
+            db.record_gating_audit(&drawer_id, decision, project_id.as_deref())
                 .map_err(db_error)?;
             return Ok(Json(IngestResponse {
                 // TODO(spec ambiguity): rejected ingests have no persisted drawer.
@@ -384,7 +385,7 @@ impl MempalMcpServer {
                     config.ingest_gating.embedding_classifier.threshold,
                 )
                 .await;
-                db.record_gating_audit(&drawer_id, &tier2.decision)
+                db.record_gating_audit(&drawer_id, &tier2.decision, project_id.as_deref())
                     .map_err(db_error)?;
                 gating_audit_recorded = true;
                 vector = tier2.vector;
@@ -412,7 +413,7 @@ impl MempalMcpServer {
             }));
         }
         if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
-            db.record_gating_audit(&drawer_id, decision)
+            db.record_gating_audit(&drawer_id, decision, project_id.as_deref())
                 .map_err(db_error)?;
         }
         let vector = match vector {
@@ -453,6 +454,7 @@ impl MempalMcpServer {
                         novelty.near_drawer_id.as_deref(),
                         novelty.cosine,
                         novelty.audit_decision,
+                        project_id.as_deref(),
                     )
                     .map_err(db_error)?;
                 }
@@ -488,6 +490,7 @@ impl MempalMcpServer {
                         novelty.near_drawer_id.as_deref(),
                         novelty.cosine,
                         novelty.audit_decision,
+                        project_id.as_deref(),
                     )
                     .map_err(db_error)?;
                 }
@@ -533,6 +536,7 @@ impl MempalMcpServer {
                         Some(target_id.as_str()),
                         novelty.cosine,
                         Some("insert_due_to_merge_cap"),
+                        project_id.as_deref(),
                     )
                     .map_err(db_error)?;
                     novelty_action = Some(NoveltyAction::Insert);
@@ -584,6 +588,7 @@ impl MempalMcpServer {
                         Some(target_id.as_str()),
                         novelty.cosine,
                         novelty.audit_decision,
+                        project_id.as_deref(),
                     )
                     .map_err(db_error)?;
                     novelty_action = Some(NoveltyAction::Merge);

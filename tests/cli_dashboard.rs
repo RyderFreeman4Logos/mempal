@@ -126,21 +126,33 @@ fn insert_drawer(db_path: &Path, seed: DrawerSeed<'_>) {
         .expect("update drawer project");
 }
 
-fn record_gating_audit(db_path: &Path, drawer_id: &str, accepted: bool) {
+fn record_gating_audit(db_path: &Path, drawer_id: &str, accepted: bool, project_id: Option<&str>) {
     let db = Database::open(db_path).expect("open db");
     let decision = if accepted {
         GatingDecision::accepted(1, Some("keep".to_string()), Some(0.9))
     } else {
         GatingDecision::rejected(1, Some("drop".to_string()), None)
     };
-    db.record_gating_audit(drawer_id, &decision)
+    db.record_gating_audit(drawer_id, &decision, project_id)
         .expect("record gating audit");
 }
 
-fn record_novelty_audit(db_path: &Path, drawer_id: &str, action: NoveltyAction) {
+fn record_novelty_audit(
+    db_path: &Path,
+    drawer_id: &str,
+    action: NoveltyAction,
+    project_id: Option<&str>,
+) {
     let db = Database::open(db_path).expect("open db");
-    db.record_novelty_audit(drawer_id, action, Some(drawer_id), Some(0.91), None)
-        .expect("record novelty audit");
+    db.record_novelty_audit(
+        drawer_id,
+        action,
+        Some(drawer_id),
+        Some(0.91),
+        None,
+        project_id,
+    )
+    .expect("record novelty audit");
 }
 
 fn read_lines_until(
@@ -463,8 +475,8 @@ fn test_mempal_stats_counts_drawers_by_wing_room() {
             project_id: None,
         },
     );
-    record_gating_audit(&env.db_path, "s1", true);
-    record_novelty_audit(&env.db_path, "s2", NoveltyAction::Merge);
+    record_gating_audit(&env.db_path, "s1", true, None);
+    record_novelty_audit(&env.db_path, "s2", NoveltyAction::Merge, None);
 
     let output = run_mempal(&env.home, env.cwd(), &["stats"]);
     assert!(
@@ -536,8 +548,13 @@ fn test_mempal_audit_respects_project_isolation() {
             project_id: Some("proj-B"),
         },
     );
-    record_novelty_audit(&env.db_path, "audit-a", NoveltyAction::Insert);
-    record_novelty_audit(&env.db_path, "audit-b", NoveltyAction::Drop);
+    record_novelty_audit(
+        &env.db_path,
+        "audit-a",
+        NoveltyAction::Insert,
+        Some("proj-A"),
+    );
+    record_novelty_audit(&env.db_path, "audit-b", NoveltyAction::Drop, Some("proj-B"));
 
     let output = run_mempal(
         &env.home,
@@ -582,8 +599,8 @@ fn test_dashboard_commands_do_not_mutate_db() {
             project_id: None,
         },
     );
-    record_gating_audit(&env.db_path, "d1", true);
-    record_novelty_audit(&env.db_path, "d2", NoveltyAction::Merge);
+    record_gating_audit(&env.db_path, "d1", true, None);
+    record_novelty_audit(&env.db_path, "d2", NoveltyAction::Merge, None);
 
     let before = snapshot_db(&env.db_path);
 
@@ -604,4 +621,44 @@ fn test_dashboard_commands_do_not_mutate_db() {
 
     let after = snapshot_db(&env.db_path);
     assert_eq!(before, after);
+}
+
+#[test]
+fn test_mempal_audit_keeps_project_scoped_rejects_without_drawer_rows() {
+    let env = DashboardEnv::new(Some("proj-A"), true);
+    record_gating_audit(&env.db_path, "candidate-a", false, Some("proj-A"));
+    record_gating_audit(&env.db_path, "candidate-b", false, Some("proj-B"));
+
+    let output = run_mempal(
+        &env.home,
+        env.cwd(),
+        &["audit", "--kind", "gating", "--since", "7d"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("candidate-a"));
+    assert!(!stdout.contains("candidate-b"));
+}
+
+#[test]
+fn test_mempal_stats_counts_project_scoped_audit_rows_without_drawer_rows() {
+    let env = DashboardEnv::new(Some("proj-A"), true);
+    record_gating_audit(&env.db_path, "candidate-a", false, Some("proj-A"));
+    record_gating_audit(&env.db_path, "candidate-b", false, Some("proj-B"));
+
+    let output = run_mempal(&env.home, env.cwd(), &["stats"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("gating:"));
+    assert!(stdout.contains("  rejected: 1"));
 }

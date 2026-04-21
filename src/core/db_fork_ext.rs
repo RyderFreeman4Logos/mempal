@@ -158,6 +158,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 5,
             up: apply_v5,
         },
+        Migration {
+            version: 6,
+            up: apply_v6,
+        },
     ]
 }
 
@@ -184,6 +188,32 @@ fn apply_v5(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_drawers_project_id ON drawers(project_id);",
     )?;
     recreate_drawer_vectors_with_project_id(conn)?;
+    Ok(())
+}
+
+fn apply_v6(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_project_column(conn, "gating_audit", "TEXT")?;
+    ensure_project_column(conn, "novelty_audit", "TEXT")?;
+    conn.execute_batch(
+        r#"
+        UPDATE gating_audit
+        SET project_id = (
+            SELECT project_id FROM drawers WHERE drawers.id = gating_audit.candidate_hash
+        )
+        WHERE project_id IS NULL;
+
+        UPDATE novelty_audit
+        SET project_id = (
+            SELECT project_id FROM drawers WHERE drawers.id = novelty_audit.candidate_hash
+        )
+        WHERE project_id IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_gating_audit_project_created_at
+            ON gating_audit(project_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_novelty_audit_project_created_at
+            ON novelty_audit(project_id, created_at);
+        "#,
+    )?;
     Ok(())
 }
 

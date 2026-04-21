@@ -312,6 +312,9 @@ async fn test_mempal_read_drawer_returns_raw_full_content() {
         .server()
         .mempal_read_drawer(Parameters(mempal::mcp::ReadDrawerRequest {
             drawer_id: "drawer-read".to_string(),
+            project_id: None,
+            include_global: None,
+            all_projects: None,
         }))
         .await
         .expect("read drawer should succeed")
@@ -339,6 +342,9 @@ async fn test_mempal_read_drawer_respects_project_isolation() {
         .server()
         .mempal_read_drawer(Parameters(mempal::mcp::ReadDrawerRequest {
             drawer_id: "drawer-b".to_string(),
+            project_id: None,
+            include_global: None,
+            all_projects: None,
         }))
         .await;
     let error = match result {
@@ -350,6 +356,105 @@ async fn test_mempal_read_drawer_respects_project_isolation() {
         error.to_string().contains("project"),
         "expected project isolation error, got: {error}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mempal_read_drawer_supports_all_projects_scope() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(Some("proj-A"), true, true, 16);
+    let content =
+        "cross-project drawer should stay readable when the caller explicitly widens scope.";
+    insert_drawer(
+        &env.db_path,
+        "drawer-cross",
+        content,
+        "code",
+        Some("preview"),
+        "/tmp/cross.md",
+        Some("proj-B"),
+    );
+
+    let search = env
+        .server()
+        .mempal_search(Parameters(SearchRequest {
+            query: "cross-project".to_string(),
+            wing: None,
+            room: None,
+            top_k: Some(10),
+            project_id: None,
+            include_global: None,
+            all_projects: Some(true),
+            disable_progressive: None,
+        }))
+        .await
+        .expect("search should succeed")
+        .0;
+    assert_eq!(search.results[0].drawer_id, "drawer-cross");
+    assert!(search.results[0].content_truncated);
+
+    let response = env
+        .server()
+        .mempal_read_drawer(Parameters(mempal::mcp::ReadDrawerRequest {
+            drawer_id: "drawer-cross".to_string(),
+            project_id: None,
+            include_global: None,
+            all_projects: Some(true),
+        }))
+        .await
+        .expect("cross-project read should succeed when scope is widened")
+        .0;
+
+    assert_eq!(response.drawer_id, "drawer-cross");
+    assert_eq!(response.content, content);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mempal_read_drawer_supports_include_global_scope() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(Some("proj-A"), true, true, 16);
+    let content = "global drawer should stay readable when include_global is requested.";
+    insert_drawer(
+        &env.db_path,
+        "drawer-global",
+        content,
+        "code",
+        Some("preview"),
+        "/tmp/global.md",
+        None,
+    );
+
+    let search = env
+        .server()
+        .mempal_search(Parameters(SearchRequest {
+            query: "global drawer".to_string(),
+            wing: None,
+            room: None,
+            top_k: Some(10),
+            project_id: None,
+            include_global: Some(true),
+            all_projects: None,
+            disable_progressive: None,
+        }))
+        .await
+        .expect("search should succeed")
+        .0;
+    assert_eq!(search.results[0].drawer_id, "drawer-global");
+    assert!(search.results[0].content_truncated);
+
+    let response = env
+        .server()
+        .mempal_read_drawer(Parameters(mempal::mcp::ReadDrawerRequest {
+            drawer_id: "drawer-global".to_string(),
+            project_id: None,
+            include_global: Some(true),
+            all_projects: None,
+        }))
+        .await
+        .expect("global read should succeed when include_global is set")
+        .0;
+
+    assert_eq!(response.drawer_id, "drawer-global");
+    assert_eq!(response.content, content);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

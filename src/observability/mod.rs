@@ -506,7 +506,8 @@ fn load_audit_records(
     let sql = match kind {
         "gating" => {
             r#"
-            SELECT a.id, a.candidate_hash, a.decision, a.created_at, d.project_id
+            SELECT a.id, a.candidate_hash, a.decision, a.created_at,
+                   COALESCE(a.project_id, d.project_id)
             FROM gating_audit a
             LEFT JOIN drawers d ON d.id = a.candidate_hash
             ORDER BY a.created_at DESC, a.id DESC
@@ -514,7 +515,8 @@ fn load_audit_records(
         }
         "novelty" => {
             r#"
-            SELECT a.id, a.candidate_hash, a.decision, a.created_at, d.project_id
+            SELECT a.id, a.candidate_hash, a.decision, a.created_at,
+                   COALESCE(a.project_id, d.project_id)
             FROM novelty_audit a
             LEFT JOIN drawers d ON d.id = a.candidate_hash
             ORDER BY a.created_at DESC, a.id DESC

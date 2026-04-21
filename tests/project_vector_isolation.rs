@@ -319,7 +319,7 @@ fn test_ext_v5_migration_adds_project_id_column() {
     let db = Database::open(&db_path).expect("open db");
 
     let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 
     let drawer_columns = column_names(db.conn(), "drawers");
     assert!(
@@ -353,7 +353,7 @@ fn test_ext_v5_migration_idempotent() {
     db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("reapply twice");
 
     let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     assert_eq!(before_drawers, column_names(db.conn(), "drawers"));
     assert_eq!(
         before_vectors,

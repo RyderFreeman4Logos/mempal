@@ -89,6 +89,18 @@ pub struct RouteDecisionDto {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReadDrawerRequest {
     pub drawer_id: String,
+
+    /// Optional explicit project scope. When omitted, mempal resolves the
+    /// current project from config/env/git root and scopes the read there by
+    /// default. Set `all_projects=true` to bypass project scoping.
+    pub project_id: Option<String>,
+
+    /// Include legacy/global drawers (`project_id IS NULL`) alongside the
+    /// current project. Ignored when `all_projects=true`.
+    pub include_global: Option<bool>,
+
+    /// Opt-in override to read across all projects for this request.
+    pub all_projects: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

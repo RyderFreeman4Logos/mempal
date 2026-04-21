@@ -440,7 +440,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     {
         context
             .db
-            .record_gating_audit(&drawer_id, decision)
+            .record_gating_audit(&drawer_id, decision, None)
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
         return Ok(drawer_id);
     }
@@ -473,7 +473,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         );
         context
             .db
-            .record_gating_audit(&drawer_id, &decision)
+            .record_gating_audit(&drawer_id, &decision, None)
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
         gating_audit_recorded = true;
         if decision.is_rejected() {
@@ -485,7 +485,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
         context
             .db
-            .record_gating_audit(&drawer_id, decision)
+            .record_gating_audit(&drawer_id, decision, None)
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
     }
 
@@ -520,6 +520,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         novelty.near_drawer_id.as_deref(),
                         novelty.cosine,
                         novelty.audit_decision,
+                        None,
                     )
                     .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
             }
@@ -536,6 +537,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         novelty.near_drawer_id.as_deref(),
                         novelty.cosine,
                         novelty.audit_decision,
+                        None,
                     )
                     .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
             }
@@ -591,6 +593,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         Some(target_id.as_str()),
                         novelty.cosine,
                         Some("insert_due_to_merge_cap"),
+                        None,
                     )
                     .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
                 insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
@@ -607,6 +610,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         Some(target_id.as_str()),
                         novelty.cosine,
                         novelty.audit_decision,
+                        None,
                     )
                     .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
                 let mut db_for_merge = Database::open(context.db.path())
