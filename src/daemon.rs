@@ -23,7 +23,7 @@ use crate::ingest::gating::{
     evaluate_tier1, tier2_enabled,
 };
 use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -48,7 +48,8 @@ pub fn run_command_with_bootstrap_events(
 
 async fn run_loop(context: &DaemonContext) -> Result<()> {
     if !context.config.hooks.enabled {
-        bail!("hooks not enabled");
+        eprintln!("hooks not enabled; daemon exiting without starting worker loop");
+        return Ok(());
     }
 
     install_shutdown_handlers()?;
@@ -339,6 +340,12 @@ fn build_audit_drawer_record(
     let project_id = resolve_hook_project_id(envelope, config)?;
     if envelope.truncated {
         let preview = config.scrub_content(envelope.payload_preview.as_deref().unwrap_or_default());
+        tracing::warn!(
+            event = %envelope.event,
+            original_size_bytes = envelope.original_size_bytes,
+            payload_preview = %preview,
+            "processing truncated hook envelope"
+        );
         let content = serde_json::to_string(&json!({
             "_truncated": true,
             "event": envelope.event,

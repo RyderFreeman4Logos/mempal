@@ -7,12 +7,14 @@ use clap::ValueEnum;
 use serde_json::{Value, json};
 
 const CLAUDE_SETTINGS_RELATIVE: &str = ".claude/settings.json";
+const CLAUDE_SETTINGS_DIR: &str = ".claude";
+const CLAUDE_SETTINGS_FILE: &str = "settings.json";
 const FORBIDDEN_TARGET_NAMES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", "GEMINI.md"];
-const HOOK_COMMANDS: [(&str, &str); 4] = [
-    ("PostToolUse", "mempal hook hook_post_tool"),
-    ("UserPromptSubmit", "mempal hook hook_user_prompt"),
-    ("SessionStart", "mempal hook hook_session_start"),
-    ("SessionEnd", "mempal hook hook_session_end"),
+const HOOK_COMMAND_EVENTS: [(&str, &str); 4] = [
+    ("PostToolUse", "hook_post_tool"),
+    ("UserPromptSubmit", "hook_user_prompt"),
+    ("SessionStart", "hook_session_start"),
+    ("SessionEnd", "hook_session_end"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -93,11 +95,12 @@ pub fn install_claude_code(
     uninstall: bool,
 ) -> Result<InstallOutcome> {
     let resolved = resolve_claude_settings_path(cwd, home)?;
+    let hook_commands = hook_commands()?;
     let mut root = read_settings_json(&resolved.write_path)?;
     let mut removed_commands = 0usize;
     let mut changed = false;
 
-    for (event_name, command) in HOOK_COMMANDS {
+    for (event_name, command) in &hook_commands {
         let event_array = ensure_hook_event_array(&mut root, event_name)?;
         let before_len = event_array.len();
         event_array.retain(|entry| !entry_contains_command(entry, command));
@@ -160,7 +163,7 @@ fn resolve_claude_settings_path(cwd: &Path, home: &Path) -> Result<ResolvedSetti
     let local_path = cwd.join(CLAUDE_SETTINGS_RELATIVE);
     if local_path.exists() || is_symlink(&local_path)? {
         let write_path = canonicalize_if_symlink(&local_path)?;
-        validate_write_target(&write_path)?;
+        validate_write_target(cwd, home, &write_path)?;
         return Ok(ResolvedSettingsPath {
             display_path: local_path,
             write_path,
@@ -169,7 +172,7 @@ fn resolve_claude_settings_path(cwd: &Path, home: &Path) -> Result<ResolvedSetti
 
     let global_path = home.join(CLAUDE_SETTINGS_RELATIVE);
     let write_path = canonicalize_if_symlink(&global_path)?;
-    validate_write_target(&write_path)?;
+    validate_write_target(cwd, home, &write_path)?;
     Ok(ResolvedSettingsPath {
         display_path: global_path.clone(),
         write_path,
@@ -237,7 +240,7 @@ fn canonicalize_if_symlink(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-fn validate_write_target(path: &Path) -> Result<()> {
+fn validate_write_target(cwd: &Path, home: &Path, path: &Path) -> Result<()> {
     if path
         .file_name()
         .and_then(|name| name.to_str())
@@ -258,5 +261,74 @@ fn validate_write_target(path: &Path) -> Result<()> {
         }
     }
 
+    let parent_name = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    let file_name = path.file_name().and_then(|name| name.to_str());
+    if parent_name != Some(CLAUDE_SETTINGS_DIR) || file_name != Some(CLAUDE_SETTINGS_FILE) {
+        bail!(
+            "refusing to edit non-canonical Claude settings target {}",
+            path.display()
+        );
+    }
+
+    let allowed_roots = [
+        cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()),
+        home.canonicalize().unwrap_or_else(|_| home.to_path_buf()),
+    ];
+    if !allowed_roots
+        .iter()
+        .any(|root| path.starts_with(root) || path == root)
+    {
+        bail!(
+            "refusing to edit settings target outside allowed roots {}",
+            path.display()
+        );
+    }
+
     Ok(())
+}
+
+fn hook_commands() -> Result<Vec<(&'static str, String)>> {
+    let binary = shell_escape_path(&resolve_mempal_binary()?);
+    Ok(HOOK_COMMAND_EVENTS
+        .iter()
+        .map(|(event_name, subcommand)| (*event_name, format!("{binary} hook {subcommand}")))
+        .collect())
+}
+
+fn resolve_mempal_binary() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("CARGO_BIN_EXE_mempal") {
+        let path = PathBuf::from(path);
+        return Ok(path.canonicalize().unwrap_or(path));
+    }
+
+    let current = env::current_exe().context("failed to resolve current executable path")?;
+    if current.file_name().and_then(|name| name.to_str()) == Some("mempal") {
+        return current
+            .canonicalize()
+            .context("failed to canonicalize current executable path");
+    }
+
+    if let Some(candidate) = current
+        .parent()
+        .and_then(Path::parent)
+        .map(|dir| dir.join("mempal"))
+        .filter(|candidate| candidate.exists())
+    {
+        return Ok(candidate.canonicalize().unwrap_or(candidate));
+    }
+
+    current
+        .canonicalize()
+        .context("failed to canonicalize current executable path")
+}
+
+fn shell_escape_path(path: &Path) -> String {
+    let rendered = path.to_string_lossy();
+    if !rendered.contains([' ', '\t', '\n', '\'', '"']) {
+        return rendered.into_owned();
+    }
+    format!("'{}'", rendered.replace('\'', r"'\''"))
 }

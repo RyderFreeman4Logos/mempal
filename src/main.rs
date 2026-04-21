@@ -1315,6 +1315,20 @@ fn status_command(db: &Database) -> Result<()> {
     let deleted_count = db
         .deleted_drawer_count()
         .context("failed to count deleted drawers")?;
+    let daemon_pid = read_daemon_pid(db.path())?;
+    let daemon_running = daemon_pid
+        .map(process_is_running)
+        .transpose()
+        .context("failed to probe daemon pid liveness")?
+        .unwrap_or(false);
+    let last_heartbeat = db
+        .conn()
+        .query_row(
+            "SELECT MAX(heartbeat_at) FROM pending_messages WHERE heartbeat_at IS NOT NULL",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .context("failed to query daemon heartbeat")?;
 
     println!("schema_version: {schema_version}");
     println!("fork_ext_version: {fork_ext_version}");
@@ -1340,6 +1354,16 @@ fn status_command(db: &Database) -> Result<()> {
     }
     if let Some(last_success_at) = embed_status.last_success_at_unix_ms {
         println!("embed_last_success_at_unix_ms: {last_success_at}");
+    }
+    println!("Daemon:");
+    println!("  running: {daemon_running}");
+    match daemon_pid {
+        Some(pid) => println!("  pid: {pid}"),
+        None => println!("  pid: none"),
+    }
+    match last_heartbeat {
+        Some(heartbeat) => println!("  last_heartbeat_unix_secs: {heartbeat}"),
+        None => println!("  last_heartbeat_unix_secs: none"),
     }
     println!("Queue:");
     println!("  pending: {}", queue_stats.pending);
@@ -1390,6 +1414,45 @@ fn status_command(db: &Database) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_daemon_pid(db_path: &Path) -> Result<Option<i32>> {
+    let Some(mempal_home) = db_path.parent() else {
+        return Ok(None);
+    };
+    let pid_path = mempal_home.join("daemon.pid");
+    let content = match std::fs::read_to_string(&pid_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read daemon pid file {}", pid_path.display()));
+        }
+    };
+    let pid = content
+        .trim()
+        .parse::<i32>()
+        .with_context(|| format!("invalid daemon pid in {}", pid_path.display()))?;
+    Ok(Some(pid))
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: i32) -> Result<bool> {
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error).with_context(|| format!("failed to probe process {pid}")),
+    }
+}
+
+#[cfg(not(unix))]
+fn process_is_running(_pid: i32) -> Result<bool> {
+    Ok(false)
 }
 
 async fn serve_command(config: &Config, mcp: bool) -> Result<()> {

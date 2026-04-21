@@ -77,6 +77,35 @@ fn test_hook_post_tool_enqueues_to_queue() {
 }
 
 #[test]
+fn test_hook_writes_nothing_to_stdout() {
+    let (home, _db_path) = setup_home();
+    let payload = r#"{"tool_name":"Bash","input":"ls","exit_code":0,"output":"ok"}"#;
+
+    let mut child = Command::new(mempal_bin())
+        .args(["hook", "hook_post_tool"])
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook command");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write payload");
+    let output = child.wait_with_output().expect("wait output");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn test_hook_envelopes_oversized_payload() {
     let (home, db_path) = setup_home();
     let mut oversized = String::from("{\"payload\":\"");
