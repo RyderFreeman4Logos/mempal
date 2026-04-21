@@ -1061,6 +1061,7 @@ fn fact_check_command(
 
 fn status_command(db: &Database) -> Result<()> {
     let cfg_meta = ConfigHandle::snapshot_meta();
+    let scrub_stats = ConfigHandle::scrub_stats();
     let embed_status = global_embed_status().snapshot();
     let queue_stats = mempal::core::queue::PendingMessageStore::new(db.path())
         .context("failed to open pending message store")?
@@ -1121,6 +1122,23 @@ fn status_command(db: &Database) -> Result<()> {
     match queue_stats.oldest_pending_age_secs {
         Some(age) => println!("  oldest_pending_age_secs: {age}"),
         None => println!("  oldest_pending_age_secs: none"),
+    }
+    println!("Scrub:");
+    println!(
+        "  total_patterns_matched: {}",
+        scrub_stats.total_patterns_matched
+    );
+    println!("  bytes_redacted: {}", scrub_stats.bytes_redacted);
+    if scrub_stats.redactions_per_pattern.is_empty() {
+        println!("  redactions_per_pattern: none");
+    } else {
+        let per_pattern = scrub_stats
+            .redactions_per_pattern
+            .iter()
+            .map(|(pattern_name, count)| format!("{pattern_name}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  redactions_per_pattern: {per_pattern}");
     }
 
     let counts = db.scope_counts().context("failed to query scope counts")?;

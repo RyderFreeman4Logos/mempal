@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -136,7 +136,13 @@ impl Config {
     pub fn scrub_content(&self, input: &str) -> String {
         match self.compile_privacy() {
             Ok(compiled) => self.scrub_content_with_compiled(input, &compiled),
-            Err(_) => input.to_string(),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "scrub_content regex compile failed, falling back to no-op"
+                );
+                input.to_string()
+            }
         }
     }
 
@@ -149,14 +155,34 @@ impl Config {
             return input.to_string();
         }
 
-        compiled
-            .patterns
-            .iter()
-            .fold(input.to_string(), |content, (name, regex)| {
-                regex
-                    .replace_all(&content, format!("[REDACTED:{name}]"))
-                    .into_owned()
-            })
+        let mut content = input.to_string();
+        let mut stats = ScrubStats::default();
+
+        for (name, regex) in &compiled.patterns {
+            let matches = regex.find_iter(&content).collect::<Vec<_>>();
+            if matches.is_empty() {
+                continue;
+            }
+
+            let matched_count = matches.len() as u64;
+            let bytes_redacted = matches
+                .iter()
+                .map(|matched| matched.as_str().len() as u64)
+                .sum::<u64>();
+            stats.record_match(name, matched_count, bytes_redacted);
+            content = regex
+                .replace_all(&content, format!("[REDACTED:{name}]"))
+                .into_owned();
+        }
+
+        if stats.total_patterns_matched > 0 {
+            global_scrub_stats()
+                .lock()
+                .expect("scrub stats mutex poisoned")
+                .merge(&stats);
+        }
+
+        content
     }
 
     pub fn effective_hash(&self) -> Result<String, ConfigError> {
@@ -467,6 +493,35 @@ pub struct CompiledPrivacyConfig {
     patterns: Vec<(String, Regex)>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ScrubStats {
+    pub total_patterns_matched: u64,
+    pub bytes_redacted: u64,
+    pub redactions_per_pattern: std::collections::BTreeMap<String, u64>,
+}
+
+impl ScrubStats {
+    fn record_match(&mut self, pattern_name: &str, matched_count: u64, bytes_redacted: u64) {
+        self.total_patterns_matched += matched_count;
+        self.bytes_redacted += bytes_redacted;
+        *self
+            .redactions_per_pattern
+            .entry(pattern_name.to_string())
+            .or_default() += matched_count;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.total_patterns_matched += other.total_patterns_matched;
+        self.bytes_redacted += other.bytes_redacted;
+        for (pattern_name, count) in &other.redactions_per_pattern {
+            *self
+                .redactions_per_pattern
+                .entry(pattern_name.clone())
+                .or_default() += count;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ConfigHotReloadConfig {
@@ -569,6 +624,13 @@ impl ConfigHandle {
         super::hot_reload::global_hot_reload_state().snapshot_meta()
     }
 
+    pub fn scrub_stats() -> ScrubStats {
+        global_scrub_stats()
+            .lock()
+            .expect("scrub stats mutex poisoned")
+            .clone()
+    }
+
     pub fn version() -> String {
         Self::snapshot_meta().version
     }
@@ -592,4 +654,9 @@ impl ConfigHandle {
     pub fn simulate_notify_failure() {
         super::hot_reload::global_hot_reload_state().simulate_notify_failure();
     }
+}
+
+fn global_scrub_stats() -> &'static Mutex<ScrubStats> {
+    static SCRUB_STATS: OnceLock<Mutex<ScrubStats>> = OnceLock::new();
+    SCRUB_STATS.get_or_init(|| Mutex::new(ScrubStats::default()))
 }

@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,7 +11,9 @@ use mempal::core::db::Database;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::mcp::{IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::{model::CallToolRequestParams, serve_client};
 use tempfile::TempDir;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 fn mempal_bin() -> String {
@@ -496,6 +498,10 @@ async fn test_status_prints_config_version_and_loaded_at() {
         .expect("system time after epoch")
         .as_millis() as u64;
     assert!(now_ms.saturating_sub(loaded_ms) < 600_000);
+    assert!(stdout.contains("Scrub:\n"));
+    assert!(stdout.contains("  total_patterns_matched: 0"));
+    assert!(stdout.contains("  bytes_redacted: 0"));
+    assert!(stdout.contains("  redactions_per_pattern: none"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -527,6 +533,76 @@ async fn test_mcp_status_returns_config_version() {
     let second = server.mempal_status().await.expect("status").0;
     assert_ne!(first.config_version, second.config_version);
     assert!(second.config_loaded_at_unix_ms >= first.config_loaded_at_unix_ms);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mcp_stdio_child_hot_reloads() {
+    let _guard = test_guard().await;
+    let tmp = TempDir::new().expect("tempdir");
+    let mempal_home = tmp.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
+    let db_path = mempal_home.join("palace.db");
+    Database::open(&db_path).expect("open db");
+    let config_path = mempal_home.join("config.toml");
+    let initial_config = base_config(&db_path);
+    write_config_atomic(&config_path, &initial_config);
+
+    let mut child = TokioCommand::new(mempal_bin())
+        .arg("serve")
+        .arg("--mcp")
+        .env("HOME", tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mempal serve --mcp");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let stdin = child.stdin.take().expect("child stdin");
+    let client = serve_client((), (stdout, stdin))
+        .await
+        .expect("initialize mcp stdio client");
+
+    let first: serde_json::Value = client
+        .call_tool(CallToolRequestParams::new("mempal_status"))
+        .await
+        .expect("first mempal_status call")
+        .into_typed()
+        .expect("decode first status");
+    let first_version = first
+        .get("config_version")
+        .and_then(serde_json::Value::as_str)
+        .expect("first config_version");
+    assert_eq!(first_version.len(), 12);
+
+    let changed = initial_config.replace(
+        "strict_project_isolation = false",
+        "strict_project_isolation = true",
+    );
+    write_config_atomic(&config_path, &changed);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let second: serde_json::Value = client
+        .call_tool(CallToolRequestParams::new("mempal_status"))
+        .await
+        .expect("second mempal_status call")
+        .into_typed()
+        .expect("decode second status");
+    let second_version = second
+        .get("config_version")
+        .and_then(serde_json::Value::as_str)
+        .expect("second config_version");
+    assert_ne!(first_version, second_version);
+
+    client.cancel().await.expect("cancel mcp client");
+    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(status)) => assert!(status.success(), "child exited with {status}"),
+        Ok(Err(err)) => panic!("failed waiting for child: {err}"),
+        Err(_) => {
+            child.kill().await.expect("kill stuck child");
+            panic!("mcp stdio child did not exit after client shutdown");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

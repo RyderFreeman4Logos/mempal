@@ -1,6 +1,7 @@
 use crate::core::types::{RouteDecision, SearchResult, TaxonomyEntry};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchRequest {
@@ -131,8 +132,26 @@ pub struct StatusResponse {
     pub memory_protocol: String,
     pub embed_status: EmbedStatusDto,
     pub queue_stats: QueueStatsDto,
+    pub scrub_stats: ScrubStatsDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ScrubStatsDto {
+    pub total_patterns_matched: u64,
+    pub bytes_redacted: u64,
+    pub redactions_per_pattern: BTreeMap<String, u64>,
+}
+
+impl From<crate::core::config::ScrubStats> for ScrubStatsDto {
+    fn from(value: crate::core::config::ScrubStats) -> Self {
+        Self {
+            total_patterns_matched: value.total_patterns_matched,
+            bytes_redacted: value.bytes_redacted,
+            redactions_per_pattern: value.redactions_per_pattern,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
