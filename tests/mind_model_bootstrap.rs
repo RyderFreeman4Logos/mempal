@@ -16,7 +16,7 @@ use mempal::core::{anchor, db::Database};
 use mempal::embed::{Embedder, EmbedderFactory};
 use mempal::mcp::MempalMcpServer;
 use rusqlite::Connection;
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn create_v4_db(path: &std::path::Path) {
@@ -176,12 +176,16 @@ fn setup_cli_home() -> (TempDir, Database) {
     (tmp, db)
 }
 
-fn start_openai_embedding_stub(vector: Vec<f32>) -> (String, thread::JoinHandle<()>) {
+fn start_openai_embedding_stub(
+    expected_query: &str,
+    vector: Vec<f32>,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding stub");
     listener
         .set_nonblocking(true)
         .expect("set embedding stub nonblocking");
     let address = listener.local_addr().expect("local addr");
+    let expected_query = expected_query.to_string();
 
     let handle = thread::spawn(move || {
         let (mut stream, _) = (0..50)
@@ -196,10 +200,21 @@ fn start_openai_embedding_stub(vector: Vec<f32>) -> (String, thread::JoinHandle<
             .expect("embedding stub timed out waiting for request");
         let mut request = [0_u8; 4096];
         let bytes_read = stream.read(&mut request).expect("read embedding request");
-        assert!(
-            bytes_read > 0 && String::from_utf8_lossy(&request[..bytes_read]).contains("POST"),
-            "expected HTTP POST request"
-        );
+        assert!(bytes_read > 0, "expected non-empty HTTP request");
+        let request = String::from_utf8_lossy(&request[..bytes_read]);
+        let (headers, body) = request
+            .split_once("\r\n\r\n")
+            .expect("request should contain HTTP headers and JSON body");
+        let request_line = headers.lines().next().expect("request line");
+        assert_eq!(request_line, "POST /v1/embeddings HTTP/1.1");
+
+        let payload: Value = serde_json::from_str(body).expect("parse embedding request body");
+        assert_eq!(payload["model"], "test-model");
+        let input = payload["input"]
+            .as_array()
+            .expect("input should be an array");
+        assert_eq!(input.len(), 1, "expected a single embedding query");
+        assert_eq!(input[0], expected_query);
 
         let body = serde_json::to_string(&json!({
             "data": [{ "embedding": vector }]
@@ -220,6 +235,65 @@ fn start_openai_embedding_stub(vector: Vec<f32>) -> (String, thread::JoinHandle<
 
 fn vector_of(dimensions: usize, value: f32) -> Vec<f32> {
     vec![value; dimensions]
+}
+
+fn write_cli_api_config(home: &Path, endpoint: &str) {
+    let config_path = home.join(".mempal").join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[embed]\nbackend = \"api\"\napi_endpoint = \"{endpoint}\"\napi_model = \"test-model\"\n"
+        ),
+    )
+    .expect("write cli config");
+    let config = mempal::core::config::Config::load_from(&config_path).expect("load cli config");
+    assert_eq!(config.embed.backend, "api");
+}
+
+fn run_cli_search_json(home: &Path, query: &str, extra_args: &[&str]) -> Vec<Value> {
+    let (endpoint, server_handle) = start_openai_embedding_stub(query, vector_of(384, 0.25));
+    write_cli_api_config(home, &endpoint);
+
+    let mut args = vec![
+        "search".to_string(),
+        query.to_string(),
+        "--wing".to_string(),
+        "mempal".to_string(),
+        "--room".to_string(),
+        "bootstrap".to_string(),
+    ];
+    args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
+    args.extend(["--top-k".to_string(), "5".to_string(), "--json".to_string()]);
+
+    let output = Command::new(mempal_bin())
+        .args(&args)
+        .env("HOME", home)
+        .output()
+        .expect("run mempal search");
+
+    assert!(
+        output.status.success(),
+        "search command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server_handle.join().expect("join embedding stub");
+
+    serde_json::from_slice(&output.stdout).expect("parse cli search json")
+}
+
+fn assert_cli_filter_selects_only(
+    query: &str,
+    extra_args: &[&str],
+    target: &Drawer,
+    distractor: &Drawer,
+) {
+    let (tmp, db) = setup_cli_home();
+    insert_search_fixture(&db, target, &vector_of(384, 0.25));
+    insert_search_fixture(&db, distractor, &vector_of(384, 0.25));
+
+    let results = run_cli_search_json(tmp.path(), query, extra_args);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["drawer_id"], target.id);
 }
 
 fn bootstrap_drawer(
@@ -339,6 +413,34 @@ fn test_migration_backfills_legacy_drawers_with_bootstrap_defaults() {
             ),
         )
         .expect("insert legacy conversation drawer");
+        conn.execute(
+            r#"
+            INSERT INTO drawers (
+                id,
+                content,
+                wing,
+                room,
+                source_file,
+                source_type,
+                added_at,
+                chunk_index,
+                importance
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            (
+                "drawer_legacy_003",
+                "Legacy manual note",
+                "mempal",
+                Some("bootstrap"),
+                Some("manual://legacy"),
+                "manual",
+                "1710000002",
+                Some(2_i64),
+                2_i32,
+            ),
+        )
+        .expect("insert legacy manual drawer");
     }
 
     let db = Database::open(&db_path).expect("migrate db to latest");
@@ -372,6 +474,13 @@ fn test_migration_backfills_legacy_drawers_with_bootstrap_defaults() {
         .expect("conversation drawer exists");
     assert_eq!(conversation_drawer.memory_kind, MemoryKind::Evidence);
     assert_eq!(conversation_drawer.provenance, Some(Provenance::Human));
+
+    let manual_drawer = db
+        .get_drawer("drawer_legacy_003")
+        .expect("load manual drawer")
+        .expect("manual drawer exists");
+    assert_eq!(manual_drawer.memory_kind, MemoryKind::Evidence);
+    assert_eq!(manual_drawer.provenance, Some(Provenance::Human));
 }
 
 #[tokio::test]
@@ -1318,18 +1427,6 @@ async fn test_search_filters_by_domain_field_status_and_anchor_kind() {
 #[test]
 fn test_cli_search_json_exposes_bootstrap_metadata_fields() {
     let (tmp, db) = setup_cli_home();
-    let (endpoint, server_handle) = start_openai_embedding_stub(vector_of(384, 0.25));
-    let config_path = tmp.path().join(".mempal").join("config.toml");
-    fs::write(
-        &config_path,
-        format!(
-            "[embed]\nbackend = \"api\"\napi_endpoint = \"{endpoint}\"\napi_model = \"test-model\"\n"
-        ),
-    )
-    .expect("write cli config");
-    let config = mempal::core::config::Config::load_from(&config_path).expect("load cli config");
-    assert_eq!(config.embed.backend, "api");
-
     let target = Drawer {
         domain: MemoryDomain::Skill,
         field: "debugging".to_string(),
@@ -1344,60 +1441,12 @@ fn test_cli_search_json_exposes_bootstrap_metadata_fields() {
             Some("CLI statement stays separate."),
         )
     };
-    let distractor = Drawer {
-        domain: MemoryDomain::Agent,
-        field: "tooling".to_string(),
-        anchor_kind: AnchorKind::Worktree,
-        anchor_id: "worktree:///tmp/cli-distractor".to_string(),
-        ..bootstrap_drawer(
-            "drawer_cli_distractor",
-            "cli metadata focus cli metadata focus",
-            MemoryKind::Knowledge,
-            Some(KnowledgeTier::Qi),
-            Some(KnowledgeStatus::Candidate),
-            Some("Distractor statement."),
-        )
-    };
-
     insert_search_fixture(&db, &target, &vector_of(384, 0.25));
-    insert_search_fixture(&db, &distractor, &vector_of(384, 0.5));
-
-    let output = Command::new(mempal_bin())
-        .args([
-            "search",
-            "cli metadata focus",
-            "--wing",
-            "mempal",
-            "--room",
-            "bootstrap",
-            "--memory-kind",
-            "knowledge",
-            "--domain",
-            "skill",
-            "--field",
-            "debugging",
-            "--status",
-            "promoted",
-            "--anchor-kind",
-            "repo",
-            "--top-k",
-            "5",
-            "--json",
-        ])
-        .env("HOME", tmp.path())
-        .output()
-        .expect("run mempal search");
-
-    assert!(
-        output.status.success(),
-        "search command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+    let results = run_cli_search_json(
+        tmp.path(),
+        "cli metadata focus cli metadata focus",
+        &["--memory-kind", "knowledge"],
     );
-    server_handle.join().expect("join embedding stub");
-
-    let results: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("parse cli search json");
-    let results = results.as_array().expect("json result array");
     assert_eq!(results.len(), 1, "expected one filtered search result");
     let result = &results[0];
 
@@ -1412,4 +1461,179 @@ fn test_cli_search_json_exposes_bootstrap_metadata_fields() {
     assert_eq!(result["anchor_kind"], "repo");
     assert_eq!(result["anchor_id"], "repo://cli-metadata");
     assert!(result["parent_anchor_id"].is_null());
+}
+
+#[test]
+fn test_cli_search_json_filters_are_wired_individually() {
+    let memory_kind_target = bootstrap_drawer(
+        "drawer_cli_memory_kind_target",
+        "memorykindtoken",
+        MemoryKind::Knowledge,
+        Some(KnowledgeTier::Shu),
+        Some(KnowledgeStatus::Promoted),
+        Some("Memory-kind target"),
+    );
+    let memory_kind_distractor = bootstrap_drawer(
+        "drawer_cli_memory_kind_distractor",
+        "memorykindtoken",
+        MemoryKind::Evidence,
+        None,
+        None,
+        None,
+    );
+
+    let domain_target = Drawer {
+        domain: MemoryDomain::Skill,
+        ..bootstrap_drawer(
+            "drawer_cli_domain_target",
+            "domaintoken",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Domain target"),
+        )
+    };
+    let domain_distractor = Drawer {
+        domain: MemoryDomain::Agent,
+        ..bootstrap_drawer(
+            "drawer_cli_domain_distractor",
+            "domaintoken",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Domain distractor"),
+        )
+    };
+
+    let field_target = Drawer {
+        field: "debugging".to_string(),
+        ..bootstrap_drawer(
+            "drawer_cli_field_target",
+            "fieldtoken",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Field target"),
+        )
+    };
+    let field_distractor = Drawer {
+        field: "tooling".to_string(),
+        ..bootstrap_drawer(
+            "drawer_cli_field_distractor",
+            "fieldtoken",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Field distractor"),
+        )
+    };
+
+    let tier_target = Drawer {
+        tier: Some(KnowledgeTier::Shu),
+        ..bootstrap_drawer(
+            "drawer_cli_tier_target",
+            "tiertoken",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Tier target"),
+        )
+    };
+    let tier_distractor = Drawer {
+        tier: Some(KnowledgeTier::Qi),
+        status: Some(KnowledgeStatus::Candidate),
+        ..bootstrap_drawer(
+            "drawer_cli_tier_distractor",
+            "tiertoken",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Qi),
+            Some(KnowledgeStatus::Candidate),
+            Some("Tier distractor"),
+        )
+    };
+
+    let status_target = Drawer {
+        status: Some(KnowledgeStatus::Promoted),
+        ..bootstrap_drawer(
+            "drawer_cli_status_target",
+            "statustoken",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Status target"),
+        )
+    };
+    let status_distractor = Drawer {
+        status: Some(KnowledgeStatus::Retired),
+        ..bootstrap_drawer(
+            "drawer_cli_status_distractor",
+            "statustoken",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Retired),
+            Some("Status distractor"),
+        )
+    };
+
+    let anchor_target = Drawer {
+        anchor_kind: AnchorKind::Repo,
+        anchor_id: "repo://cli-anchor-target".to_string(),
+        ..bootstrap_drawer(
+            "drawer_cli_anchor_target",
+            "anchortoken",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Anchor target"),
+        )
+    };
+    let anchor_distractor = Drawer {
+        anchor_kind: AnchorKind::Worktree,
+        anchor_id: "worktree:///tmp/cli-anchor-distractor".to_string(),
+        ..bootstrap_drawer(
+            "drawer_cli_anchor_distractor",
+            "anchortoken",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Anchor distractor"),
+        )
+    };
+
+    assert_cli_filter_selects_only(
+        "memorykindtoken",
+        &["--memory-kind", "knowledge"],
+        &memory_kind_target,
+        &memory_kind_distractor,
+    );
+    assert_cli_filter_selects_only(
+        "domaintoken",
+        &["--domain", "skill"],
+        &domain_target,
+        &domain_distractor,
+    );
+    assert_cli_filter_selects_only(
+        "fieldtoken",
+        &["--field", "debugging"],
+        &field_target,
+        &field_distractor,
+    );
+    assert_cli_filter_selects_only(
+        "tiertoken",
+        &["--tier", "shu"],
+        &tier_target,
+        &tier_distractor,
+    );
+    assert_cli_filter_selects_only(
+        "statustoken",
+        &["--status", "promoted"],
+        &status_target,
+        &status_distractor,
+    );
+    assert_cli_filter_selects_only(
+        "anchortoken",
+        &["--anchor-kind", "repo"],
+        &anchor_target,
+        &anchor_distractor,
+    );
 }
