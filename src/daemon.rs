@@ -10,7 +10,7 @@ use crate::core::{
     db::Database,
     queue::{ClaimedMessage, PendingMessageStore},
     types::{Drawer, SourceType},
-    utils::{build_drawer_id, current_timestamp, synthetic_source_file},
+    utils::{current_timestamp, synthetic_source_file},
 };
 use crate::embed::{
     EmbedError, Embedder, build_backend_from_name, global_embed_status,
@@ -408,12 +408,21 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     context: &DrawerIngestContext<'_, E>,
     record: DrawerRecord,
 ) -> Result<String> {
-    let drawer_id = build_drawer_id(&record.wing, Some(record.room.as_str()), &record.content);
-    if context
+    let (drawer_id, exists) = context
         .db
-        .drawer_exists(&drawer_id)
-        .with_context(|| format!("failed to check existing drawer {}", drawer_id))?
-    {
+        .resolve_ingest_drawer_id(
+            &record.wing,
+            Some(record.room.as_str()),
+            &record.content,
+            None,
+        )
+        .with_context(|| {
+            format!(
+                "failed to resolve drawer identity for {}/{}",
+                record.wing, record.room
+            )
+        })?;
+    if exists {
         return Ok(drawer_id);
     }
 

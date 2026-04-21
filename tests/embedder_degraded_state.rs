@@ -88,6 +88,7 @@ async fn test_degraded_state_blocks_mcp_writes() {
             wing: "test".to_string(),
             room: Some("room".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))
@@ -103,6 +104,9 @@ async fn test_degraded_state_blocks_mcp_writes() {
             wing: None,
             room: None,
             top_k: Some(5),
+            project_id: None,
+            include_global: None,
+            all_projects: None,
         }))
         .await
         .expect("search should still work")

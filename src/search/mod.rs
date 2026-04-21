@@ -2,13 +2,14 @@
 
 use crate::core::{
     db::Database,
+    project::{ProjectSearchScope, SearchResultSource},
     types::{RouteDecision, SearchResult},
     utils::source_file_or_synthetic,
 };
 use crate::embed::{EmbedError, Embedder};
 use thiserror::Error;
 
-use crate::search::filter::build_filter_clause;
+use crate::search::filter::{build_filter_clause, build_vector_search_sql};
 use rusqlite::OptionalExtension;
 
 pub mod filter;
@@ -53,6 +54,7 @@ pub async fn search<E: Embedder + ?Sized>(
     query: &str,
     wing: Option<&str>,
     room: Option<&str>,
+    scope: &ProjectSearchScope,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
     if top_k == 0 {
@@ -78,7 +80,7 @@ pub async fn search<E: Embedder + ?Sized>(
         });
     }
 
-    search_with_vector(db, query, &query_vector, route, top_k)
+    search_with_vector(db, query, &query_vector, route, scope, top_k)
 }
 
 fn current_vector_dim(
@@ -110,6 +112,7 @@ pub fn search_with_vector(
     query: &str,
     query_vector: &[f32],
     route: RouteDecision,
+    scope: &ProjectSearchScope,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
     if top_k == 0 {
@@ -117,27 +120,39 @@ pub fn search_with_vector(
     }
 
     // Hybrid search: vector + BM25, merged via RRF
-    let vector_results = search_by_vector(db, query_vector, route.clone(), top_k)?;
+    let vector_results = search_by_vector(db, query_vector, route.clone(), scope, top_k)?;
 
     let fts_ids = db
-        .search_fts(query, route.wing.as_deref(), route.room.as_deref(), top_k)
+        .search_fts(
+            query,
+            route.wing.as_deref(),
+            route.room.as_deref(),
+            scope.mode_param(),
+            scope.project_id.as_deref(),
+            top_k,
+        )
         .map_err(SearchError::KeywordSearch)?;
 
     let mut results = if fts_ids.is_empty() {
         vector_results
     } else {
-        rrf_merge(vector_results, &fts_ids, &route, db, top_k)
+        rrf_merge(vector_results, &fts_ids, &route, scope, db, top_k)
     };
 
     // Inject tunnel hints: for each result, check if its room exists in other wings
-    inject_tunnel_hints(db, &mut results);
+    inject_tunnel_hints_and_results(db, &mut results, scope);
 
     Ok(results)
 }
 
 /// For each search result, check if its room appears in other wings (tunnel).
-/// If so, add the other wing names as tunnel_hints.
-fn inject_tunnel_hints(db: &Database, results: &mut [SearchResult]) {
+/// If so, add the other wing names as tunnel_hints and append any explicit
+/// cross-project tunnel targets without applying the project filter.
+fn inject_tunnel_hints_and_results(
+    db: &Database,
+    results: &mut Vec<SearchResult>,
+    scope: &ProjectSearchScope,
+) {
     let tunnels = match db.find_tunnels() {
         Ok(t) => t,
         Err(_) => return,
@@ -152,6 +167,11 @@ fn inject_tunnel_hints(db: &Database, results: &mut [SearchResult]) {
         .map(|(room, wings)| (room.as_str(), wings.as_slice()))
         .collect();
 
+    let mut tunnel_results = Vec::new();
+    let mut seen_ids = results
+        .iter()
+        .map(|result| result.drawer_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     for result in results.iter_mut() {
         if let Some(room) = result.room.as_deref() {
             if let Some(wings) = tunnel_map.get(room) {
@@ -161,8 +181,31 @@ fn inject_tunnel_hints(db: &Database, results: &mut [SearchResult]) {
                     .cloned()
                     .collect();
             }
+            if let Ok(drawers) =
+                db.tunnel_drawers_for_room(room, &result.drawer_id, scope.project_id.as_deref())
+            {
+                for (drawer, _) in drawers {
+                    if seen_ids.insert(drawer.id.clone()) {
+                        tunnel_results.push(SearchResult {
+                            drawer_id: drawer.id.clone(),
+                            content: drawer.content,
+                            wing: drawer.wing,
+                            room: drawer.room,
+                            source_file: source_file_or_synthetic(
+                                &drawer.id,
+                                drawer.source_file.as_deref(),
+                            ),
+                            source: SearchResultSource::TunnelCrossProject,
+                            similarity: result.similarity,
+                            route: result.route.clone(),
+                            tunnel_hints: vec![],
+                        });
+                    }
+                }
+            }
         }
     }
+    results.extend(tunnel_results);
 }
 
 /// Reciprocal Rank Fusion: merge vector and BM25 ranked lists.
@@ -171,6 +214,7 @@ fn rrf_merge(
     vector_results: Vec<SearchResult>,
     fts_ids: &[(String, f64)],
     route: &RouteDecision,
+    scope: &ProjectSearchScope,
     db: &Database,
     top_k: usize,
 ) -> Vec<SearchResult> {
@@ -204,6 +248,8 @@ fn rrf_merge(
                         wing: drawer.wing,
                         room: drawer.room,
                         source_file: source_file_or_synthetic(id, drawer.source_file.as_deref()),
+                        source: scope
+                            .classify_row(db.drawer_project_id(id).ok().flatten().as_deref()),
                         similarity: 0.0, // will be overwritten below
                         route: route.clone(),
                         tunnel_hints: vec![],
@@ -235,6 +281,7 @@ pub fn search_by_vector(
     db: &Database,
     query_vector: &[f32],
     route: RouteDecision,
+    scope: &ProjectSearchScope,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
     if top_k == 0 {
@@ -246,11 +293,20 @@ pub fn search_by_vector(
 
     let count_sql = format!(
         "SELECT COUNT(*) FROM drawers d {}",
-        build_filter_clause("d", 1, 2)
+        build_filter_clause("d", 1, 2, 3, 4)
     );
     let candidate_count: i64 = db
         .conn()
-        .query_row(&count_sql, (applied_wing, applied_room), |row| row.get(0))
+        .query_row(
+            &count_sql,
+            (
+                applied_wing,
+                applied_room,
+                scope.mode_param(),
+                scope.project_id.as_deref(),
+            ),
+            |row| row.get(0),
+        )
         .map_err(SearchError::CountCandidateDrawers)?;
     if candidate_count == 0 {
         return Ok(Vec::new());
@@ -268,23 +324,7 @@ pub fn search_by_vector(
         serde_json::to_string(query_vector).map_err(SearchError::SerializeQueryVector)?;
     let top_k = i64::try_from(top_k).map_err(|_| SearchError::InvalidTopK)?;
 
-    let search_sql = format!(
-        r#"
-        WITH matches AS (
-            SELECT id, distance
-            FROM drawer_vectors
-            WHERE embedding MATCH vec_f32(?1)
-              AND k = ?2
-        )
-        SELECT d.id, d.content, d.wing, d.room, d.source_file, matches.distance
-        FROM matches
-        JOIN drawers d ON d.id = matches.id
-        {}
-        ORDER BY matches.distance ASC
-        LIMIT ?5
-        "#,
-        build_filter_clause("d", 3, 4)
-    );
+    let search_sql = build_vector_search_sql();
 
     let mut statement = db
         .conn()
@@ -295,20 +335,24 @@ pub fn search_by_vector(
             (
                 query_json.as_str(),
                 total_count,
+                scope.mode_param(),
+                scope.project_id.as_deref(),
                 applied_wing,
                 applied_room,
                 top_k,
             ),
             |row| {
-                let distance: f64 = row.get(5)?;
+                let distance: f64 = row.get(6)?;
                 let drawer_id: String = row.get(0)?;
                 let source_file = row.get::<_, Option<String>>(4)?;
+                let row_project_id = row.get::<_, Option<String>>(5)?;
                 Ok(SearchResult {
                     drawer_id: drawer_id.clone(),
                     content: row.get(1)?,
                     wing: row.get(2)?,
                     room: row.get(3)?,
                     source_file: source_file_or_synthetic(&drawer_id, source_file.as_deref()),
+                    source: scope.classify_row(row_project_id.as_deref()),
                     similarity: (1.0_f64 - distance) as f32,
                     route: route.clone(),
                     tunnel_hints: vec![],

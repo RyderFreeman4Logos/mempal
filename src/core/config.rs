@@ -31,6 +31,7 @@ pub struct Config {
     pub db_path: String,
     #[serde(alias = "embedder")]
     pub embed: EmbedConfig,
+    pub project: ProjectConfig,
     pub privacy: PrivacyConfig,
     pub config_hot_reload: ConfigHotReloadConfig,
     pub search: SearchConfig,
@@ -44,6 +45,7 @@ impl Default for Config {
         Self {
             db_path: DEFAULT_DB_PATH.to_string(),
             embed: EmbedConfig::default(),
+            project: ProjectConfig::default(),
             privacy: PrivacyConfig::default(),
             config_hot_reload: ConfigHotReloadConfig::default(),
             search: SearchConfig::default(),
@@ -81,6 +83,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(project_id) = self.project.id.as_deref() {
+            super::project::validate_project_id(project_id)
+                .map_err(|error| ConfigError::InvalidConfig(error.to_string()))?;
+        }
         if self.embed.retry.interval_secs == 0 {
             return Err(ConfigError::InvalidConfig(
                 "embed.retry.interval_secs must be greater than 0".to_string(),
@@ -574,6 +580,12 @@ impl Default for ConfigHotReloadConfig {
 #[serde(default)]
 pub struct SearchConfig {
     pub strict_project_isolation: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct ProjectConfig {
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]

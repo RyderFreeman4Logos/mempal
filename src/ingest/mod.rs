@@ -57,6 +57,7 @@ pub struct IngestOptions<'a> {
     pub room: Option<&'a str>,
     pub source_root: Option<&'a Path>,
     pub dry_run: bool,
+    pub project_id: Option<&'a str>,
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -141,6 +142,7 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             room,
             source_root: path.parent(),
             dry_run: false,
+            project_id: None,
         },
     )
     .await
@@ -222,14 +224,18 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
     let mut pending = Vec::new();
 
     for (chunk_index, chunk) in chunks.iter().enumerate() {
-        let drawer_id = build_drawer_id(wing, Some(resolved_room.as_str()), chunk);
-        if db
-            .drawer_exists(&drawer_id)
+        let (drawer_id, exists) = db
+            .resolve_ingest_drawer_id(
+                wing,
+                Some(resolved_room.as_str()),
+                chunk,
+                options.project_id,
+            )
             .map_err(|source| IngestError::CheckDrawer {
-                drawer_id: drawer_id.clone(),
+                drawer_id: build_drawer_id(wing, Some(resolved_room.as_str()), chunk),
                 source,
-            })?
-        {
+            })?;
+        if exists {
             stats.skipped += 1;
             continue;
         }
@@ -287,12 +293,12 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             importance: 0,
         };
 
-        db.insert_drawer(&drawer)
+        db.insert_drawer_with_project(&drawer, options.project_id)
             .map_err(|source| IngestError::InsertDrawer {
                 drawer_id: drawer.id.clone(),
                 source,
             })?;
-        db.insert_vector(&drawer_id, &vector)
+        db.insert_vector_with_project(&drawer_id, &vector, options.project_id)
             .map_err(|source| IngestError::InsertVector {
                 drawer_id: drawer.id.clone(),
                 source,
@@ -319,6 +325,7 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             room,
             source_root: Some(dir),
             dry_run: false,
+            project_id: None,
         },
     )
     .await

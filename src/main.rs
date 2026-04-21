@@ -15,6 +15,9 @@ use mempal::api::{ApiState, DEFAULT_REST_ADDR, serve as serve_rest_api};
 use mempal::core::{
     config::{Config, ConfigHandle, default_config_path},
     db::Database,
+    project::{
+        ProjectMigrationEvent, ProjectSearchScope, migrate_null_project_ids, resolve_project_id,
+    },
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
     reindex::ReindexProgressStore,
     types::TaxonomyEntry,
@@ -22,7 +25,7 @@ use mempal::core::{
 };
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
-use mempal::ingest::{IngestOptions, IngestStats, ingest_dir, ingest_dir_with_options};
+use mempal::ingest::{IngestOptions, IngestStats, ingest_dir_with_options};
 use mempal::mcp::MempalMcpServer;
 use mempal::search::search;
 
@@ -35,6 +38,17 @@ use crate::longmemeval::{BenchMode, LongMemEvalArgs, LongMemEvalGranularity, def
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+struct SearchCommandOptions<'a> {
+    query: &'a str,
+    wing: Option<&'a str>,
+    room: Option<&'a str>,
+    top_k: usize,
+    project: Option<&'a str>,
+    include_global: bool,
+    all_projects: bool,
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -51,6 +65,8 @@ enum Commands {
         #[arg(long)]
         format: Option<String>,
         #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
         dry_run: bool,
     },
     Search {
@@ -62,7 +78,17 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         top_k: usize,
         #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = false)]
+        include_global: bool,
+        #[arg(long, default_value_t = false)]
+        all_projects: bool,
+        #[arg(long)]
         json: bool,
+    },
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
     },
     WakeUp {
         #[arg(long)]
@@ -204,6 +230,16 @@ enum KgCommands {
 }
 
 #[derive(Subcommand)]
+enum ProjectCommands {
+    Migrate {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        wing: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum BenchCommands {
     #[command(name = "longmemeval")]
     LongMemEval {
@@ -275,6 +311,7 @@ fn run() -> Result<()> {
             dir,
             wing,
             format,
+            project,
             dry_run,
         } => block_on_result(ingest_command(
             &db,
@@ -282,6 +319,7 @@ fn run() -> Result<()> {
             &dir,
             &wing,
             format,
+            project.as_deref(),
             dry_run,
         )),
         Commands::Search {
@@ -289,16 +327,25 @@ fn run() -> Result<()> {
             wing,
             room,
             top_k,
+            project,
+            include_global,
+            all_projects,
             json,
         } => block_on_result(search_command(
             &db,
             config.as_ref(),
-            &query,
-            wing.as_deref(),
-            room.as_deref(),
-            top_k,
-            json,
+            SearchCommandOptions {
+                query: &query,
+                wing: wing.as_deref(),
+                room: room.as_deref(),
+                top_k,
+                project: project.as_deref(),
+                include_global,
+                all_projects,
+                json,
+            },
         )),
+        Commands::Project { command } => project_command(&db, command),
         Commands::Delete { drawer_id } => delete_command(&db, &drawer_id),
         Commands::Purge { before } => purge_command(&db, before.as_deref()),
         Commands::WakeUp { format } => wake_up_command(&db, format.as_deref()),
@@ -405,6 +452,7 @@ async fn ingest_command(
     dir: &Path,
     wing: &str,
     format: Option<String>,
+    project: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
     if let Some(format) = format.as_deref()
@@ -413,6 +461,8 @@ async fn ingest_command(
         bail!("unsupported --format value: {format}");
     }
 
+    let project_id = resolve_project_id(project, config, Some(dir))
+        .context("failed to resolve ingest project id")?;
     let stats = if dry_run {
         ingest_dir_with_options(
             db,
@@ -423,12 +473,25 @@ async fn ingest_command(
                 room: None,
                 source_root: Some(dir),
                 dry_run: true,
+                project_id: project_id.as_deref(),
             },
         )
         .await?
     } else {
         let embedder = build_embedder(config).await?;
-        ingest_dir(db, &*embedder, dir, wing, None).await?
+        ingest_dir_with_options(
+            db,
+            &*embedder,
+            dir,
+            wing,
+            IngestOptions {
+                room: None,
+                source_root: Some(dir),
+                dry_run: false,
+                project_id: project_id.as_deref(),
+            },
+        )
+        .await?
     };
 
     append_ingest_audit_log(db, dir, wing, format.as_deref(), dry_run, stats)
@@ -500,16 +563,30 @@ fn append_ingest_audit_log(
 async fn search_command(
     db: &Database,
     config: &Config,
-    query: &str,
-    wing: Option<&str>,
-    room: Option<&str>,
-    top_k: usize,
-    json: bool,
+    options: SearchCommandOptions<'_>,
 ) -> Result<()> {
+    let current_dir = env::current_dir().ok();
+    let resolved_project = resolve_project_id(options.project, config, current_dir.as_deref())
+        .context("failed to resolve search project id")?;
+    let scope = ProjectSearchScope::from_request(
+        resolved_project,
+        options.include_global,
+        options.all_projects,
+        config.search.strict_project_isolation,
+    );
     let embedder = build_embedder(config).await?;
-    let results = search(db, &*embedder, query, wing, room, top_k).await?;
+    let results = search(
+        db,
+        &*embedder,
+        options.query,
+        options.wing,
+        options.room,
+        &scope,
+        options.top_k,
+    )
+    .await?;
 
-    if json {
+    if options.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&results).context("failed to serialize search results")?
@@ -530,6 +607,7 @@ async fn search_command(
             result.similarity, result.wing, room, result.drawer_id
         );
         println!("source: {source_file}");
+        println!("scope: {}", result.source.as_str());
         if !result.tunnel_hints.is_empty() {
             println!("tunnel: also in {}", result.tunnel_hints.join(", "));
         }
@@ -538,6 +616,27 @@ async fn search_command(
     }
 
     Ok(())
+}
+
+fn project_command(db: &Database, command: ProjectCommands) -> Result<()> {
+    match command {
+        ProjectCommands::Migrate { project, wing } => {
+            migrate_null_project_ids(db.path(), &project, wing.as_deref(), |event| match event {
+                ProjectMigrationEvent::Busy { delay_ms } => {
+                    println!("batch busy, retrying in {delay_ms}ms");
+                    let _ = std::io::stdout().flush();
+                }
+                ProjectMigrationEvent::Progress(progress) => {
+                    println!(
+                        "batch {}: {} drawers updated, {} remaining",
+                        progress.batch_index, progress.updated, progress.remaining
+                    );
+                    let _ = std::io::stdout().flush();
+                }
+            })
+            .context("failed to migrate project ids")
+        }
+    }
 }
 
 fn wake_up_command(db: &Database, format: Option<&str>) -> Result<()> {

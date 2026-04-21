@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::core::project::SearchResultSource;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceType {
     Project,
@@ -66,6 +68,7 @@ pub struct SearchResult {
     pub wing: String,
     pub room: Option<String>,
     pub source_file: String,
+    pub source: SearchResultSource,
     pub similarity: f32,
     pub route: RouteDecision,
     /// Other wings that share this result's room (tunnel hints).

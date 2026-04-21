@@ -243,6 +243,7 @@ async fn ingest(server: &MempalMcpServer, content: &str) -> String {
             wing: "mempal".to_string(),
             room: Some("config-hot-reload".to_string()),
             source: None,
+            project_id: None,
             dry_run: None,
             importance: None,
         }))
@@ -339,6 +340,7 @@ async fn test_ingest_gating_hot_reload_applies_without_server_restart() {
             wing: "mempal".to_string(),
             room: Some("config-hot-reload".to_string()),
             source: None,
+            project_id: None,
             dry_run: None,
             importance: None,
         }))
@@ -539,7 +541,7 @@ async fn test_status_prints_config_version_and_loaded_at() {
     assert!(
         stdout
             .lines()
-            .any(|line| line.trim() == "fork_ext_version: 4"),
+            .any(|line| line.trim() == "fork_ext_version: 5"),
         "fork_ext_version line missing from status: {stdout}"
     );
     let line = stdout

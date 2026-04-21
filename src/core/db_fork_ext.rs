@@ -154,6 +154,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 4,
             up: apply_v4,
         },
+        Migration {
+            version: 5,
+            up: apply_v5,
+        },
     ]
 }
 
@@ -171,6 +175,118 @@ fn apply_v3(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v4(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V4_SCHEMA_SQL)
+}
+
+fn apply_v5(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_project_column(conn, "drawers", "TEXT")?;
+    ensure_project_column(conn, "triples", "TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_drawers_project_id ON drawers(project_id);",
+    )?;
+    recreate_drawer_vectors_with_project_id(conn)?;
+    Ok(())
+}
+
+fn ensure_project_column(conn: &Connection, table: &str, ty: &str) -> rusqlite::Result<()> {
+    if table_has_column(conn, table, "project_id")? {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN project_id {ty};"))
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|name| name == column))
+}
+
+fn recreate_drawer_vectors_with_project_id(conn: &Connection) -> rusqlite::Result<()> {
+    let table_sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drawer_vectors'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+    if table_sql.contains("project_id") {
+        return Ok(());
+    }
+
+    let dimension = vector_dimension(conn, &table_sql)?;
+    let expected_count = conn.query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS _drawer_vectors_backup;
+        CREATE TEMP TABLE _drawer_vectors_backup (
+            id TEXT PRIMARY KEY,
+            embedding BLOB NOT NULL
+        );
+        INSERT INTO _drawer_vectors_backup (id, embedding)
+            SELECT id, embedding FROM drawer_vectors;
+        DROP TABLE drawer_vectors;
+        "#,
+    )?;
+    conn.execute_batch(&format!(
+        r#"
+        CREATE VIRTUAL TABLE drawer_vectors USING vec0(
+            id TEXT PRIMARY KEY,
+            embedding FLOAT[{dimension}],
+            +project_id TEXT
+        );
+        "#
+    ))?;
+    conn.execute_batch(
+        r#"
+        INSERT INTO drawer_vectors (id, embedding, project_id)
+            SELECT id, embedding, NULL FROM _drawer_vectors_backup;
+        "#,
+    )?;
+
+    let actual_count = conn.query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    if actual_count != expected_count {
+        return Err(rusqlite::Error::ExecuteReturnedResults);
+    }
+
+    conn.execute_batch("DROP TABLE _drawer_vectors_backup;")?;
+    Ok(())
+}
+
+fn vector_dimension(conn: &Connection, table_sql: &str) -> rusqlite::Result<usize> {
+    let by_row = conn
+        .query_row(
+            "SELECT vec_length(embedding) FROM drawer_vectors LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|value| value as usize);
+    if let Some(by_row) = by_row {
+        return Ok(by_row);
+    }
+
+    let marker = "FLOAT[";
+    let Some(start) = table_sql.find(marker) else {
+        return Err(rusqlite::Error::InvalidQuery);
+    };
+    let rest = &table_sql[start + marker.len()..];
+    let Some(end) = rest.find(']') else {
+        return Err(rusqlite::Error::InvalidQuery);
+    };
+    rest[..end]
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| rusqlite::Error::InvalidQuery)
 }
 
 pub fn apply_fork_ext_migrations(conn: &Connection) -> rusqlite::Result<()> {

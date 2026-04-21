@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use crate::core::{
     config::ConfigHandle,
     db::Database,
+    project::{ProjectSearchScope, resolve_project_id},
     types::{Drawer, SourceType, Triple},
-    utils::{build_drawer_id, build_triple_id, current_timestamp, source_file_or_synthetic},
+    utils::{build_triple_id, current_timestamp, source_file_or_synthetic},
 };
 use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
 use crate::embed::{EmbedderFactory, global_embed_status};
@@ -163,6 +164,17 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<SearchRequest>,
     ) -> std::result::Result<Json<SearchResponse>, ErrorData> {
+        let config = ConfigHandle::current();
+        let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
+            .map_err(|error| {
+            ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
+        })?;
+        let scope = ProjectSearchScope::from_request(
+            project_id,
+            request.include_global.unwrap_or(false),
+            request.all_projects.unwrap_or(false),
+            config.search.strict_project_isolation,
+        );
         let embedder = self.embedder_factory.build().await.map_err(|error| {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
         })?;
@@ -186,6 +198,7 @@ impl MempalMcpServer {
             &request.query,
             &query_vector,
             route,
+            &scope,
             request.top_k.unwrap_or(10),
         )
         .map_err(|error| ErrorData::internal_error(format!("search failed: {error}"), None))?;
@@ -208,10 +221,22 @@ impl MempalMcpServer {
         Parameters(request): Parameters<IngestRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
+            .map_err(|error| {
+            ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
+        })?;
         let scrubbed_content =
             config.scrub_content_with_compiled(&request.content, compiled_privacy.as_ref());
         let room = request.room.as_deref();
-        let drawer_id = build_drawer_id(&request.wing, room, &scrubbed_content);
+        let db = self.open_db()?;
+        let (drawer_id, _drawer_exists) = db
+            .resolve_ingest_drawer_id(
+                &request.wing,
+                room,
+                &scrubbed_content,
+                project_id.as_deref(),
+            )
+            .map_err(db_error)?;
 
         if request.dry_run.unwrap_or(false) {
             return Ok(Json(IngestResponse {
@@ -238,7 +263,6 @@ impl MempalMcpServer {
         if let Some(decision) = gating_decision.as_ref()
             && decision.is_rejected()
         {
-            let db = self.open_db()?;
             db.record_gating_audit(&drawer_id, decision)
                 .map_err(db_error)?;
             return Ok(Json(IngestResponse {
@@ -254,7 +278,7 @@ impl MempalMcpServer {
             }));
         }
 
-        let mut db = self.open_db()?;
+        let mut db = db;
 
         // P9-B reordered this path so the same-content lock is acquired
         // before the expensive embedder call. That keeps concurrent manual
@@ -272,6 +296,9 @@ impl MempalMcpServer {
         )
         .map_err(|e| ErrorData::internal_error(format!("ingest lock: {e}"), None))?;
         let lock_wait_ms = Some(lock_guard.wait_duration().as_millis() as u64);
+        // Re-check after waiting: another request may have inserted this drawer
+        // while we were blocked on the same drawer_id lock.
+        let drawer_exists = db.drawer_exists(&drawer_id).map_err(db_error)?;
 
         let embedder = self.embedder_factory.build().await.map_err(|error| {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
@@ -371,22 +398,26 @@ impl MempalMcpServer {
                 }
                 novelty_action = Some(NoveltyAction::Insert);
                 near_drawer_id = novelty.near_drawer_id.clone();
-                if !db.drawer_exists(&drawer_id).map_err(db_error)? {
+                if !drawer_exists {
                     let source_file =
                         source_file_or_synthetic(&drawer_id, request.source.as_deref());
-                    db.insert_drawer(&Drawer {
-                        id: drawer_id.clone(),
-                        content: scrubbed_content.clone(),
-                        wing: request.wing.clone(),
-                        room: request.room.clone(),
-                        source_file: Some(source_file),
-                        source_type: SourceType::Manual,
-                        added_at: current_timestamp(),
-                        chunk_index: Some(0),
-                        importance: request.importance.unwrap_or(0),
-                    })
+                    db.insert_drawer_with_project(
+                        &Drawer {
+                            id: drawer_id.clone(),
+                            content: scrubbed_content.clone(),
+                            wing: request.wing.clone(),
+                            room: request.room.clone(),
+                            source_file: Some(source_file),
+                            source_type: SourceType::Manual,
+                            added_at: current_timestamp(),
+                            chunk_index: Some(0),
+                            importance: request.importance.unwrap_or(0),
+                        },
+                        project_id.as_deref(),
+                    )
                     .map_err(db_error)?;
-                    db.insert_vector(&drawer_id, &vector).map_err(db_error)?;
+                    db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
+                        .map_err(db_error)?;
                 }
             }
             NoveltyAction::Drop => {
@@ -446,22 +477,26 @@ impl MempalMcpServer {
                     .map_err(db_error)?;
                     novelty_action = Some(NoveltyAction::Insert);
                     near_drawer_id = Some(target_id);
-                    if !db.drawer_exists(&drawer_id).map_err(db_error)? {
+                    if !drawer_exists {
                         let source_file =
                             source_file_or_synthetic(&drawer_id, request.source.as_deref());
-                        db.insert_drawer(&Drawer {
-                            id: drawer_id.clone(),
-                            content: scrubbed_content.clone(),
-                            wing: request.wing.clone(),
-                            room: request.room.clone(),
-                            source_file: Some(source_file),
-                            source_type: SourceType::Manual,
-                            added_at: current_timestamp(),
-                            chunk_index: Some(0),
-                            importance: request.importance.unwrap_or(0),
-                        })
+                        db.insert_drawer_with_project(
+                            &Drawer {
+                                id: drawer_id.clone(),
+                                content: scrubbed_content.clone(),
+                                wing: request.wing.clone(),
+                                room: request.room.clone(),
+                                source_file: Some(source_file),
+                                source_type: SourceType::Manual,
+                                added_at: current_timestamp(),
+                                chunk_index: Some(0),
+                                importance: request.importance.unwrap_or(0),
+                            },
+                            project_id.as_deref(),
+                        )
                         .map_err(db_error)?;
-                        db.insert_vector(&drawer_id, &vector).map_err(db_error)?;
+                        db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
+                            .map_err(db_error)?;
                     }
                 } else {
                     let merged_vector = embedder
@@ -1030,7 +1065,8 @@ fn check_semantic_duplicate(
         confidence: 0.0,
         reason: "dedup check".to_string(),
     };
-    let results = crate::search::search_by_vector(db, vector, route, 1).ok()?;
+    let scope = ProjectSearchScope::all_projects();
+    let results = crate::search::search_by_vector(db, vector, route, &scope, 1).ok()?;
     let top = results.first()?;
     if top.similarity >= DEDUP_THRESHOLD {
         Some(DuplicateWarning {
@@ -1221,6 +1257,9 @@ mod tests {
                 wing: wing.map(str::to_string),
                 room: room.map(str::to_string),
                 top_k: Some(top_k),
+                project_id: None,
+                include_global: None,
+                all_projects: None,
             }))
             .await
             .expect("search should succeed")
@@ -1432,6 +1471,7 @@ mod tests {
             wing: "mempal".to_string(),
             room: Some("review".to_string()),
             source: None,
+            project_id: None,
             importance: None,
             dry_run: None,
         };
