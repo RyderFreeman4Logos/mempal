@@ -98,20 +98,24 @@ fn seed_drawers(db_path: &Path, count: usize, vector_dim: usize) {
     let db = Database::open(db_path).expect("open db");
     for index in 0..count {
         let id = format!("drawer-{index:02}");
-        db.insert_drawer(&Drawer {
-            id: id.clone(),
-            content: format!("drawer content {index}"),
-            wing: "test".to_string(),
-            room: Some("reindex".to_string()),
-            source_file: Some("fixtures/source.txt".to_string()),
-            source_type: SourceType::Project,
-            added_at: format!("17130000{index:02}"),
-            chunk_index: Some(index as i64),
-            importance: 0,
-        })
+        db.insert_drawer_with_project(
+            &Drawer {
+                id: id.clone(),
+                content: format!("drawer content {index}"),
+                wing: "test".to_string(),
+                room: Some("reindex".to_string()),
+                source_file: Some("fixtures/source.txt".to_string()),
+                source_type: SourceType::Project,
+                added_at: format!("17130000{index:02}"),
+                chunk_index: Some(index as i64),
+                importance: 0,
+            },
+            Some("default"),
+        )
         .expect("insert drawer");
         let vector = vec![0.1_f32; vector_dim];
-        db.insert_vector(&id, &vector).expect("insert vector");
+        db.insert_vector_with_project(&id, &vector, Some("default"))
+            .expect("insert vector");
     }
 }
 

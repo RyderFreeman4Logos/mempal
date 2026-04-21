@@ -28,8 +28,10 @@ pub struct SearchRequest {
     pub top_k: Option<usize>,
 
     /// Optional explicit project scope. When omitted, mempal resolves the
-    /// current project from config/env/git root and scopes the query there by
-    /// default. Set `all_projects=true` to bypass project scoping.
+    /// current project from `[project]` config or MCP roots and scopes the
+    /// query there by default. If neither resolves, search runs unscoped
+    /// unless strict isolation is enabled. Set `all_projects=true` to bypass
+    /// project scoping.
     pub project_id: Option<String>,
 
     /// Include legacy/global drawers (`project_id IS NULL`) alongside the
@@ -91,8 +93,9 @@ pub struct ReadDrawerRequest {
     pub drawer_id: String,
 
     /// Optional explicit project scope. When omitted, mempal resolves the
-    /// current project from config/env/git root and scopes the read there by
-    /// default. Set `all_projects=true` to bypass project scoping.
+    /// current project from `[project]` config or MCP roots and scopes the
+    /// read there by default. Set `all_projects=true` to bypass project
+    /// scoping.
     pub project_id: Option<String>,
 
     /// Include legacy/global drawers (`project_id IS NULL`) alongside the

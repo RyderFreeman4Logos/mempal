@@ -142,17 +142,20 @@ async fn test_search_deadline_bm25_fallback() {
     );
     let config = Config::load_from(&env.config_path).expect("load config");
     let db = Database::open(&env.db_path).expect("open db");
-    db.insert_drawer(&Drawer {
-        id: "bm25-hit".to_string(),
-        content: "fallback keyword memory".to_string(),
-        wing: "test".to_string(),
-        room: Some("fallback".to_string()),
-        source_file: Some("fixtures/fallback.txt".to_string()),
-        source_type: SourceType::Project,
-        added_at: "1713000000".to_string(),
-        chunk_index: Some(0),
-        importance: 2,
-    })
+    db.insert_drawer_with_project(
+        &Drawer {
+            id: "bm25-hit".to_string(),
+            content: "fallback keyword memory".to_string(),
+            wing: "test".to_string(),
+            room: Some("fallback".to_string()),
+            source_file: Some("fixtures/fallback.txt".to_string()),
+            source_type: SourceType::Project,
+            added_at: "1713000000".to_string(),
+            chunk_index: Some(0),
+            importance: 2,
+        },
+        Some("default"),
+    )
     .expect("insert drawer");
 
     let server = MempalMcpServer::new(env.db_path.clone(), config);

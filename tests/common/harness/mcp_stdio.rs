@@ -20,6 +20,7 @@ pub struct McpStdio {
     stderr_lines: Arc<Mutex<Vec<String>>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     next_id: u64,
+    roots: Vec<String>,
 }
 
 impl McpStdio {
@@ -111,16 +112,26 @@ log_path = "{}"
             stderr_lines,
             stderr_task: Some(stderr_task),
             next_id: 1,
+            roots: Vec::new(),
         })
     }
 
     pub async fn initialize(&mut self) -> Result<ServerInfo> {
+        self.initialize_with_roots(&[]).await
+    }
+
+    pub async fn initialize_with_roots(&mut self, roots: &[&str]) -> Result<ServerInfo> {
+        self.roots = roots.iter().map(|root| root.to_string()).collect();
         let result = self
             .call(
                 "initialize",
                 json!({
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {},
+                    "capabilities": if roots.is_empty() {
+                        json!({})
+                    } else {
+                        json!({"roots": {"listChanged": true}})
+                    },
                     "clientInfo": {
                         "name": "pr0-harness",
                         "version": "0.0.0"
@@ -128,7 +139,24 @@ log_path = "{}"
                 }),
             )
             .await?;
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .await?;
         serde_json::from_value(result).context("decode MCP initialize result")
+    }
+
+    pub fn set_roots(&mut self, roots: &[&str]) {
+        self.roots = roots.iter().map(|root| root.to_string()).collect();
+    }
+
+    pub async fn notify_roots_list_changed(&mut self) -> Result<()> {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/roots/list_changed"
+        }))
+        .await
     }
 
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -188,6 +216,30 @@ log_path = "{}"
             }
             let message: Value =
                 serde_json::from_str(line.trim()).context("parse JSON-RPC response line")?;
+
+            if let Some(method) = message.get("method").and_then(Value::as_str) {
+                let request_id = message
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .context("JSON-RPC request missing numeric id")?;
+                match method {
+                    "roots/list" => {
+                        let roots = self
+                            .roots
+                            .iter()
+                            .map(|uri| json!({ "uri": uri }))
+                            .collect::<Vec<_>>();
+                        self.send(json!({
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "result": { "roots": roots },
+                        }))
+                        .await?;
+                        continue;
+                    }
+                    _ => bail!("unexpected JSON-RPC request: {message}"),
+                }
+            }
 
             if message.get("id").is_none() {
                 continue;

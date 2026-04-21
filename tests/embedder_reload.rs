@@ -350,6 +350,7 @@ async fn test_sighup_triggers_reload() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dim_mismatch_fail_fast() {
     let _guard = test_guard().await;
+    global_embed_status().reset_for_tests();
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     let db = Database::open(&db_path).expect("open db");

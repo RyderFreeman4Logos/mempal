@@ -224,7 +224,7 @@ async fn test_search_result_has_content_truncated_field() {
         "code",
         Some("preview"),
         "/tmp/short.md",
-        None,
+        Some("default"),
     );
 
     let json = search_response_json(&env.server(), "short").await;
@@ -252,7 +252,7 @@ async fn test_search_preview_length_cap_applied() {
         "code",
         Some("preview"),
         "/tmp/long.md",
-        None,
+        Some("default"),
     );
 
     let json = search_response_json(&env.server(), "deterministic").await;
@@ -279,7 +279,7 @@ async fn test_search_short_content_untruncated() {
         "code",
         Some("preview"),
         "/tmp/short.md",
-        None,
+        Some("default"),
     );
 
     let json = search_response_json(&env.server(), "whole").await;
@@ -305,7 +305,7 @@ async fn test_mempal_read_drawer_returns_raw_full_content() {
         "code",
         Some("preview"),
         "/tmp/read.md",
-        None,
+        Some("default"),
     );
 
     let response = env
@@ -469,7 +469,7 @@ async fn test_progressive_disclosure_hot_reload_applies_without_restart() {
         "code",
         Some("preview"),
         "/tmp/hot.md",
-        None,
+        Some("default"),
     );
 
     let before = search_response_json(&env.server(), "preview").await;

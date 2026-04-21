@@ -212,7 +212,8 @@ fn inject_tunnel_hints_and_results(
             if let Ok(drawers) =
                 db.tunnel_drawers_for_room(room, &result.drawer_id, scope.project_id.as_deref())
             {
-                for (drawer, _) in drawers {
+                for tunnel in drawers {
+                    let drawer = tunnel.drawer;
                     if seen_ids.insert(drawer.id.clone()) {
                         tunnel_results.push(SearchResult {
                             drawer_id: drawer.id.clone(),
