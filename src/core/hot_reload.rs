@@ -12,6 +12,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use super::config::{CompiledPrivacyConfig, Config, ConfigError, ConfigSnapshotMeta};
 
 const MAX_EVENT_LOG: usize = 64;
+const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 struct ConfigSnapshot {
@@ -38,6 +39,36 @@ enum WatchMessage {
     NotifyFailed,
     Stop,
 }
+
+#[cfg(unix)]
+static SIGHUP_PENDING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+static SIGHUP_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn hot_reload_sighup_handler(_signal: i32) {
+    SIGHUP_PENDING.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_sighup_handler_once() {
+    if SIGHUP_HANDLER_INSTALLED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    // SAFETY: the handler only flips an AtomicBool, which is signal-safe.
+    unsafe {
+        let handler = hot_reload_sighup_handler as *const () as usize;
+        let _ = libc::signal(libc::SIGHUP, handler);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_sighup_handler_once() {}
 
 struct RuntimeControl {
     stop: Arc<AtomicBool>,
@@ -99,6 +130,9 @@ impl HotReloadState {
             existing.stop();
         }
         if config.config_hot_reload.enabled {
+            install_sighup_handler_once();
+            #[cfg(unix)]
+            SIGHUP_PENDING.store(false, Ordering::SeqCst);
             *runtime = Some(self.start_runtime(
                 path.to_path_buf(),
                 config.config_hot_reload.debounce_ms,
@@ -221,7 +255,23 @@ impl HotReloadState {
                 let _ = start_failure_tx.send(WatchMessage::NotifyFailed);
             }
 
-            while let Ok(message) = control_rx.recv() {
+            loop {
+                let message = match control_rx.recv_timeout(SIGNAL_POLL_INTERVAL) {
+                    Ok(message) => message,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        #[cfg(unix)]
+                        if SIGHUP_PENDING.swap(false, Ordering::SeqCst) {
+                            WatchMessage::FileChanged
+                        } else {
+                            continue;
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            continue;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 match message {
                     WatchMessage::Stop => break,
                     WatchMessage::NotifyFailed => {

@@ -106,12 +106,29 @@ pub enum EmbedError {
     UnsupportedBackend(String),
     #[error("missing embed configuration: {0}")]
     MissingConfiguration(String),
+    #[error("invalid embed configuration: {0}")]
+    InvalidConfiguration(String),
     #[error("failed to read embed API key from env var {var}")]
     ReadApiKeyEnv {
         var: String,
         #[source]
         source: std::env::VarError,
     },
+}
+
+impl EmbedError {
+    pub fn is_retryable(&self) -> bool {
+        !matches!(
+            self,
+            Self::InvalidResponse(_)
+                | Self::EmptyVectors
+                | Self::InvalidDimensions { .. }
+                | Self::UnsupportedBackend(_)
+                | Self::MissingConfiguration(_)
+                | Self::InvalidConfiguration(_)
+                | Self::ReadApiKeyEnv { .. }
+        )
+    }
 }
 
 #[async_trait::async_trait]

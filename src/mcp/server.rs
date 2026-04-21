@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::core::{
     config::ConfigHandle,
@@ -14,7 +15,7 @@ use crate::ingest::gating::{
     GatingDecision, GatingRuntime, IngestCandidate, evaluate_tier1, evaluate_tier2,
 };
 use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
-use crate::search::{resolve_route, search_with_vector};
+use crate::search::{resolve_route, search_bm25_only, search_with_vector};
 use anyhow::Context;
 use rmcp::{
     ErrorData, Json, ServerHandler, ServiceExt,
@@ -101,6 +102,7 @@ impl MempalMcpServer {
     )]
     pub async fn mempal_status(&self) -> std::result::Result<Json<StatusResponse>, ErrorData> {
         let cfg_meta = ConfigHandle::snapshot_meta();
+        let config = ConfigHandle::current();
         let db = self.open_db()?;
         let queue_stats = crate::core::queue::PendingMessageStore::new(db.path())
             .map_err(|error| {
@@ -137,11 +139,17 @@ impl MempalMcpServer {
             aaak_spec: crate::aaak::generate_spec(),
             memory_protocol: crate::core::protocol::MEMORY_PROTOCOL.to_string(),
             embed_status: EmbedStatusDto {
+                backend: config.embed.backend.clone(),
+                base_url: config
+                    .embed
+                    .resolved_openai_base_url()
+                    .map(ToOwned::to_owned),
                 pending_count: queue_stats.pending,
                 claimed_count: queue_stats.claimed,
                 failed_count: queue_stats.failed,
                 degraded: embed_snapshot.degraded,
                 fail_count: embed_snapshot.fail_count,
+                failure_count: embed_snapshot.fail_count,
                 last_error: embed_snapshot.last_error,
                 last_success_at_unix_ms: embed_snapshot.last_success_at_unix_ms,
             },
@@ -175,16 +183,6 @@ impl MempalMcpServer {
             request.all_projects.unwrap_or(false),
             config.search.strict_project_isolation,
         );
-        let embedder = self.embedder_factory.build().await.map_err(|error| {
-            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
-        })?;
-        let query_vector = embedder
-            .embed(&[request.query.as_str()])
-            .await
-            .map_err(|error| ErrorData::internal_error(format!("embedding failed: {error}"), None))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
         let db = self.open_db()?;
         let route = resolve_route(
             &db,
@@ -193,15 +191,65 @@ impl MempalMcpServer {
             request.room.as_deref(),
         )
         .map_err(|error| ErrorData::internal_error(format!("routing failed: {error}"), None))?;
-        let results = search_with_vector(
-            &db,
-            &request.query,
-            &query_vector,
-            route,
-            &scope,
-            request.top_k.unwrap_or(10),
+        let top_k = request.top_k.unwrap_or(10);
+        let mut extra_warnings = Vec::new();
+        let embedder = self.embedder_factory.build().await.map_err(|error| {
+            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
+        })?;
+        let results = match tokio::time::timeout(
+            Duration::from_secs(config.embed.retry.search_deadline_secs),
+            embedder.embed(&[request.query.as_str()]),
         )
-        .map_err(|error| ErrorData::internal_error(format!("search failed: {error}"), None))?;
+        .await
+        {
+            Ok(Ok(vectors)) => {
+                let query_vector = vectors.into_iter().next().ok_or_else(|| {
+                    ErrorData::internal_error("embedder returned no query vector", None)
+                })?;
+                search_with_vector(
+                    &db,
+                    &request.query,
+                    &query_vector,
+                    route.clone(),
+                    &scope,
+                    top_k,
+                )
+                .map_err(|error| {
+                    ErrorData::internal_error(format!("search failed: {error}"), None)
+                })?
+            }
+            Ok(Err(error)) => {
+                extra_warnings.push(SystemWarning {
+                    level: "warn".to_string(),
+                    message: "vector unavailable, BM25 fallback".to_string(),
+                    source: "embed".to_string(),
+                });
+                search_bm25_only(&db, &request.query, route, &scope, top_k).map_err(|bm25_error| {
+                    ErrorData::internal_error(
+                        format!(
+                            "search failed after vector fallback: {error}; bm25 fallback failed: {bm25_error}"
+                        ),
+                        None,
+                    )
+                })?
+            }
+            Err(_) => {
+                extra_warnings.push(SystemWarning {
+                    level: "warn".to_string(),
+                    message: "vector unavailable, BM25 fallback".to_string(),
+                    source: "embed".to_string(),
+                });
+                search_bm25_only(&db, &request.query, route, &scope, top_k).map_err(|error| {
+                    ErrorData::internal_error(
+                        format!("search deadline fallback failed: {error}"),
+                        None,
+                    )
+                })?
+            }
+        };
+
+        let mut system_warnings = current_system_warnings();
+        system_warnings.extend(extra_warnings);
 
         Ok(Json(SearchResponse {
             results: results
@@ -215,7 +263,7 @@ impl MempalMcpServer {
                     )
                 })
                 .collect(),
-            system_warnings: current_system_warnings(),
+            system_warnings,
         }))
     }
 
@@ -1009,8 +1057,14 @@ impl ServerHandler for MempalMcpServer {
         // means every client (Claude Code, Codex, Cursor, Continue, ...) sees
         // it without needing to call any tool first. This is the primary
         // mechanism; `mempal_status` keeps the same text as a fallback/reference.
+        let mut instructions = crate::core::protocol::MEMORY_PROTOCOL.to_string();
+        if global_embed_status().is_degraded() {
+            instructions.push_str(
+                "\n\n11a. DEGRADED EMBED BACKEND\nWhen system_warnings mention an embed degradation, stop write operations and use read-only tools until recovery.",
+            );
+        }
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(crate::core::protocol::MEMORY_PROTOCOL)
+            .with_instructions(instructions)
     }
 
     fn initialize(

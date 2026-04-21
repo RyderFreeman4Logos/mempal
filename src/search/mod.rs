@@ -146,6 +146,33 @@ pub fn search_with_vector(
     Ok(results)
 }
 
+pub fn search_bm25_only(
+    db: &Database,
+    query: &str,
+    route: RouteDecision,
+    scope: &ProjectSearchScope,
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
+    if top_k == 0 {
+        return Ok(Vec::new());
+    }
+
+    let fts_ids = db
+        .search_fts(
+            query,
+            route.wing.as_deref(),
+            route.room.as_deref(),
+            scope.mode_param(),
+            scope.project_id.as_deref(),
+            top_k,
+        )
+        .map_err(SearchError::KeywordSearch)?;
+
+    let mut results = rrf_merge(Vec::new(), &fts_ids, &route, scope, db, top_k);
+    inject_tunnel_hints_and_results(db, &mut results, scope);
+    Ok(results)
+}
+
 /// For each search result, check if its room appears in other wings (tunnel).
 /// If so, add the other wing names as tunnel_hints and append any explicit
 /// cross-project tunnel targets without applying the project filter.

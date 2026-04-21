@@ -5,6 +5,7 @@ use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 use anyhow::Result;
 use hyper::body::to_bytes;
@@ -26,7 +27,10 @@ struct Inner {
     paused: AtomicBool,
     pause_notify: Notify,
     fail_mode: Mutex<FailMode>,
+    per_item_dims: Mutex<Option<Vec<u32>>>,
     request_count: AtomicU32,
+    request_times: Mutex<Vec<Duration>>,
+    start_at: tokio::time::Instant,
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
 }
 
@@ -57,6 +61,14 @@ impl MockEmbedHandle {
         self.inner.request_count.load(Ordering::SeqCst)
     }
 
+    pub async fn set_per_item_dims(&self, dims: Option<Vec<u32>>) {
+        *self.inner.per_item_dims.lock().await = dims;
+    }
+
+    pub async fn request_times(&self) -> Vec<Duration> {
+        self.inner.request_times.lock().await.clone()
+    }
+
     pub async fn shutdown(&self) {
         if let Some(tx) = self.inner.shutdown_tx.lock().await.take() {
             let _ = tx.send(());
@@ -70,7 +82,10 @@ pub async fn start(port: u16) -> Result<(SocketAddr, MockEmbedHandle)> {
         paused: AtomicBool::new(false),
         pause_notify: Notify::new(),
         fail_mode: Mutex::new(FailMode::Ok),
+        per_item_dims: Mutex::new(None),
         request_count: AtomicU32::new(0),
+        request_times: Mutex::new(Vec::new()),
+        start_at: tokio::time::Instant::now(),
         shutdown_tx: Mutex::new(None),
     });
 
@@ -110,6 +125,11 @@ async fn handle_request(
     request: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
     inner.request_count.fetch_add(1, Ordering::SeqCst);
+    inner
+        .request_times
+        .lock()
+        .await
+        .push(inner.start_at.elapsed());
 
     if request.method() != Method::POST || request.uri().path() != "/v1/embeddings" {
         return Ok(response(
@@ -149,10 +169,15 @@ async fn handle_request(
         Some(_) => 1,
         None => 1,
     };
-    let dim = inner.dim.load(Ordering::SeqCst) as usize;
-    let embedding = vec![0.0_f32; dim];
+    let default_dim = inner.dim.load(Ordering::SeqCst) as usize;
+    let per_item_dims = inner.per_item_dims.lock().await.clone();
     let data = (0..count)
         .map(|index| {
+            let dim = per_item_dims
+                .as_ref()
+                .and_then(|dims| dims.get(index).copied())
+                .unwrap_or(default_dim as u32) as usize;
+            let embedding = vec![0.0_f32; dim];
             json!({
                 "index": index,
                 "embedding": embedding,

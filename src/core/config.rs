@@ -84,7 +84,11 @@ impl Config {
     }
 
     pub fn parse(contents: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(contents)?;
+        let root: toml::Value = toml::from_str(contents)?;
+        let mut config: Self = toml::from_str(contents)?;
+        if root.get("embed").is_none() && root.get("embedder").is_none() {
+            config.embed.backend = "model2vec".to_string();
+        }
         config.validate()?;
         Ok(config)
     }
@@ -851,7 +855,18 @@ impl ConfigHandle {
     }
 
     pub fn collect_runtime_warnings() -> Vec<RuntimeWarning> {
-        Self::current().collect_runtime_warnings()
+        let mut warnings = Self::current().collect_runtime_warnings();
+        let mut seen = std::collections::BTreeSet::new();
+        for event in Self::recent_events() {
+            if event.contains("requires restart, change ignored") && seen.insert(event.clone()) {
+                warnings.push(RuntimeWarning {
+                    level: "warn",
+                    source: "config",
+                    message: event,
+                });
+            }
+        }
+        warnings
     }
 
     pub fn runtime_prototypes() -> Vec<String> {
