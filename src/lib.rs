@@ -11,6 +11,7 @@ pub mod embed;
 pub mod factcheck;
 pub mod hook;
 pub mod hook_install;
+pub mod hotpatch;
 pub mod ingest;
 pub mod mcp;
 pub mod search;

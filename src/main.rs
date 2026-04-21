@@ -217,6 +217,10 @@ enum Commands {
         #[command(subcommand)]
         command: mempal::hook::HookCommands,
     },
+    Hotpatch {
+        #[command(subcommand)]
+        command: mempal::hotpatch::HotpatchCommands,
+    },
     Daemon {
         #[arg(long, default_value_t = false)]
         foreground: bool,
@@ -302,6 +306,7 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let config_path = default_config_path();
 
     // Cowork commands must graceful-degrade without requiring palace.db
     // or config to exist. Dispatch them BEFORE Config::load / Database::open
@@ -324,6 +329,16 @@ fn run() -> Result<()> {
         Commands::Hook { command } => {
             return mempal::hook::run_command(command);
         }
+        Commands::Hotpatch { command } => {
+            let config = Config::load_from(&config_path)
+                .with_context(|| format!("failed to load config {}", config_path.display()))?;
+            let db_path = expand_home(&config.db_path);
+            let mempal_home = db_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            return mempal::hotpatch::run_command(&config, &mempal_home, command);
+        }
         Commands::Daemon { foreground } => {
             return mempal::daemon::run_command(default_config_path(), foreground);
         }
@@ -331,7 +346,6 @@ fn run() -> Result<()> {
         _ => {}
     }
 
-    let config_path = default_config_path();
     ConfigHandle::bootstrap(&config_path).context("failed to bootstrap config hot reload")?;
     let config = ConfigHandle::current();
     let db = Database::open(&expand_home(&config.db_path)).context("failed to open database")?;
@@ -443,6 +457,7 @@ fn run() -> Result<()> {
         | Commands::CoworkStatus { .. }
         | Commands::CoworkInstallHooks { .. }
         | Commands::Hook { .. }
+        | Commands::Hotpatch { .. }
         | Commands::Daemon { .. } => unreachable!(),
     }
 }
