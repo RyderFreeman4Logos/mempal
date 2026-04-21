@@ -9,7 +9,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::{
-    types::{Drawer, SourceType, TaxonomyEntry, Triple, TripleStats},
+    types::{Drawer, DrawerDetails, SourceType, TaxonomyEntry, Triple, TripleStats},
     utils::{build_drawer_id, build_scoped_drawer_id},
 };
 use crate::ingest::gating::GatingDecision;
@@ -596,6 +596,72 @@ impl Database {
                     added_at,
                     chunk_index,
                     importance,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_drawer_details(&self, drawer_id: &str) -> Result<Option<DrawerDetails>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
+                   COALESCE(importance, 0) as importance,
+                   updated_at,
+                   COALESCE(merge_count, 0) as merge_count,
+                   project_id
+            FROM drawers
+            WHERE id = ?1 AND deleted_at IS NULL
+            "#,
+        )?;
+        let mut rows = statement.query_map([drawer_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, i32>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, u32>(10)?,
+                row.get::<_, Option<String>>(11)?,
+            ))
+        })?;
+
+        match rows.next() {
+            Some(row) => {
+                let (
+                    id,
+                    content,
+                    wing,
+                    room,
+                    source_file,
+                    source_type,
+                    added_at,
+                    chunk_index,
+                    importance,
+                    updated_at,
+                    merge_count,
+                    project_id,
+                ) = row?;
+                Ok(Some(DrawerDetails {
+                    drawer: Drawer {
+                        id,
+                        content,
+                        wing,
+                        room,
+                        source_file,
+                        source_type: source_type_from_str(&source_type)?,
+                        added_at,
+                        chunk_index,
+                        importance,
+                    },
+                    updated_at,
+                    merge_count,
+                    project_id,
                 }))
             }
             None => Ok(None),

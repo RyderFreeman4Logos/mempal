@@ -95,6 +95,17 @@ impl ProjectSearchScope {
         self.mode.as_sql_mode()
     }
 
+    pub fn allows_row(&self, row_project_id: Option<&str>) -> bool {
+        match self.mode {
+            ProjectFilterMode::AllProjects => true,
+            ProjectFilterMode::ProjectScoped => row_project_id == self.project_id.as_deref(),
+            ProjectFilterMode::ProjectPlusGlobal => {
+                row_project_id.is_none() || row_project_id == self.project_id.as_deref()
+            }
+            ProjectFilterMode::NullOnly => row_project_id.is_none(),
+        }
+    }
+
     pub fn classify_row(&self, row_project_id: Option<&str>) -> SearchResultSource {
         match row_project_id {
             Some(_) => SearchResultSource::Project,

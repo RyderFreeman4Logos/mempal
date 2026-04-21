@@ -27,9 +27,9 @@ use super::tools::{
     CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DuplicateWarning,
     EmbedStatusDto, FactCheckRequest, FactCheckResponse, IngestRequest, IngestResponse, KgRequest,
     KgResponse, KgStatsDto, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto,
-    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, StatusResponse,
-    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto,
-    TunnelsResponse,
+    ReadDrawerRequest, ReadDrawerResponse, ScopeCount, ScrubStatsDto, SearchRequest,
+    SearchResponse, SearchResultDto, StatusResponse, SystemWarning, TaxonomyEntryDto,
+    TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -206,9 +206,69 @@ impl MempalMcpServer {
         Ok(Json(SearchResponse {
             results: results
                 .into_iter()
-                .map(SearchResultDto::with_signals_from_result)
+                .map(|result| {
+                    SearchResultDto::with_signals_from_result(
+                        result,
+                        config.search.progressive_disclosure
+                            && !request.disable_progressive.unwrap_or(false),
+                        config.search.preview_chars,
+                    )
+                })
                 .collect(),
             system_warnings: current_system_warnings(),
+        }))
+    }
+
+    #[tool(
+        name = "mempal_read_drawer",
+        description = "Fetch one drawer's full raw verbatim content by drawer_id. Use this after mempal_search returns a truncated preview and you decide the specific drawer is worth reading in full."
+    )]
+    pub async fn mempal_read_drawer(
+        &self,
+        Parameters(request): Parameters<ReadDrawerRequest>,
+    ) -> std::result::Result<Json<ReadDrawerResponse>, ErrorData> {
+        let config = ConfigHandle::current();
+        let project_id = resolve_project_id(None, config.as_ref(), None).map_err(|error| {
+            ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
+        })?;
+        let scope = ProjectSearchScope::from_request(
+            project_id,
+            false,
+            false,
+            config.search.strict_project_isolation,
+        );
+        let db = self.open_db()?;
+        let details = db
+            .get_drawer_details(&request.drawer_id)
+            .map_err(db_error)?
+            .ok_or_else(|| {
+                ErrorData::invalid_params(format!("drawer {} not found", request.drawer_id), None)
+            })?;
+        if !scope.allows_row(details.project_id.as_deref()) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "drawer {} is outside the current project scope",
+                    request.drawer_id
+                ),
+                None,
+            ));
+        }
+
+        let signals = crate::aaak::analyze(&details.drawer.content);
+        let drawer = details.drawer;
+        Ok(Json(ReadDrawerResponse {
+            drawer_id: drawer.id,
+            content: drawer.content,
+            wing: drawer.wing,
+            room: drawer.room,
+            source_file: source_file_or_synthetic(
+                &request.drawer_id,
+                drawer.source_file.as_deref(),
+            ),
+            created_at: drawer.added_at,
+            updated_at: details.updated_at,
+            merge_count: details.merge_count,
+            importance_stars: signals.importance_stars,
         }))
     }
 
@@ -1260,6 +1320,7 @@ mod tests {
                 project_id: None,
                 include_global: None,
                 all_projects: None,
+                disable_progressive: None,
             }))
             .await
             .expect("search should succeed")

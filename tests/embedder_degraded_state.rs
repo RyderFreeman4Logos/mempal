@@ -107,6 +107,7 @@ async fn test_degraded_state_blocks_mcp_writes() {
             project_id: None,
             include_global: None,
             all_projects: None,
+            disable_progressive: None,
         }))
         .await
         .expect("search should still work")

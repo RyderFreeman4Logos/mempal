@@ -24,6 +24,14 @@ pub struct Drawer {
     pub importance: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawerDetails {
+    pub drawer: Drawer,
+    pub updated_at: Option<String>,
+    pub merge_count: u32,
+    pub project_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Triple {
     pub id: String,

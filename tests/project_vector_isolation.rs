@@ -262,6 +262,7 @@ async fn search_response_json(server: &MempalMcpServer, query: &str) -> serde_js
             project_id: None,
             include_global: None,
             all_projects: None,
+            disable_progressive: None,
         },
     )
     .await
@@ -648,6 +649,7 @@ async fn test_ingest_allows_same_content_in_different_projects() {
             project_id: Some("proj-B".to_string()),
             include_global: None,
             all_projects: None,
+            disable_progressive: None,
         },
     )
     .await;
