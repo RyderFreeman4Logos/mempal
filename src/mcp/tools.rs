@@ -26,6 +26,18 @@ pub struct SearchRequest {
 
     /// Maximum number of results to return. Defaults to 10 when omitted.
     pub top_k: Option<usize>,
+
+    /// Optional explicit project scope. When omitted, mempal resolves the
+    /// current project from config/env/git root and scopes the query there by
+    /// default. Set `all_projects=true` to bypass project scoping.
+    pub project_id: Option<String>,
+
+    /// Include legacy/global drawers (`project_id IS NULL`) alongside the
+    /// current project. Ignored when `all_projects=true`.
+    pub include_global: Option<bool>,
+
+    /// Opt-in override to search across all projects for this request.
+    pub all_projects: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -42,6 +54,7 @@ pub struct SearchResultDto {
     pub wing: String,
     pub room: Option<String>,
     pub source_file: String,
+    pub source: String,
     pub similarity: f32,
     pub route: RouteDecisionDto,
     /// Other wings sharing this room (tunnel cross-references).
@@ -73,6 +86,7 @@ pub struct IngestRequest {
     pub wing: String,
     pub room: Option<String>,
     pub source: Option<String>,
+    pub project_id: Option<String>,
 
     /// If true, return the drawer_id that WOULD be created without actually
     /// writing to the database. Use this to preview before committing.
@@ -393,6 +407,7 @@ impl SearchResultDto {
             wing: value.wing,
             room: value.room,
             source_file: value.source_file,
+            source: value.source.as_str().to_string(),
             similarity: value.similarity,
             route: value.route.into(),
             tunnel_hints: value.tunnel_hints,
@@ -440,6 +455,7 @@ mod tests {
             wing: "mempal".to_string(),
             room: Some("signals".to_string()),
             source_file: "/tmp/signals.md".to_string(),
+            source: crate::core::project::SearchResultSource::Project,
             similarity: 0.91,
             route: RouteDecision {
                 wing: Some("mempal".to_string()),

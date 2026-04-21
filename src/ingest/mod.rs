@@ -57,6 +57,7 @@ pub struct IngestOptions<'a> {
     pub room: Option<&'a str>,
     pub source_root: Option<&'a Path>,
     pub dry_run: bool,
+    pub project_id: Option<&'a str>,
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -141,6 +142,7 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             room,
             source_root: path.parent(),
             dry_run: false,
+            project_id: None,
         },
     )
     .await
@@ -287,12 +289,12 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             importance: 0,
         };
 
-        db.insert_drawer(&drawer)
+        db.insert_drawer_with_project(&drawer, options.project_id)
             .map_err(|source| IngestError::InsertDrawer {
                 drawer_id: drawer.id.clone(),
                 source,
             })?;
-        db.insert_vector(&drawer_id, &vector)
+        db.insert_vector_with_project(&drawer_id, &vector, options.project_id)
             .map_err(|source| IngestError::InsertVector {
                 drawer_id: drawer.id.clone(),
                 source,
@@ -319,6 +321,7 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             room,
             source_root: Some(dir),
             dry_run: false,
+            project_id: None,
         },
     )
     .await

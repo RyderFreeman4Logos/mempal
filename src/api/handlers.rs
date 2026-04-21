@@ -1,5 +1,7 @@
 use crate::core::{
+    config::Config,
     db::Database,
+    project::{ProjectSearchScope, resolve_project_id},
     types::{Drawer, RouteDecision, SearchResult, SourceType, TaxonomyEntry},
     utils::{build_drawer_id, current_timestamp, source_file_or_synthetic},
 };
@@ -60,6 +62,9 @@ struct SearchQuery {
     wing: Option<String>,
     room: Option<String>,
     top_k: Option<usize>,
+    project_id: Option<String>,
+    include_global: Option<bool>,
+    all_projects: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +73,7 @@ struct IngestRequest {
     wing: String,
     room: Option<String>,
     source: Option<String>,
+    project_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,6 +103,7 @@ struct SearchResultDto {
     wing: String,
     room: Option<String>,
     source_file: String,
+    source: String,
     similarity: f32,
     route: RouteDecisionDto,
 }
@@ -141,11 +148,19 @@ async fn search_handler(
     let db = Database::open(&state.db_path).map_err(internal_error)?;
     let route = resolve_route(&db, &query.q, query.wing.as_deref(), query.room.as_deref())
         .map_err(internal_error)?;
+    let config = Config::default();
+    let scope = ProjectSearchScope::from_request(
+        resolve_project_id(query.project_id.as_deref(), &config, None).map_err(internal_error)?,
+        query.include_global.unwrap_or(false),
+        query.all_projects.unwrap_or(false),
+        false,
+    );
     let results = search_with_vector(
         &db,
         &query.q,
         &query_vector,
         route,
+        &scope,
         query.top_k.unwrap_or(10),
     )
     .map_err(internal_error)?;
@@ -178,22 +193,28 @@ async fn ingest_handler(
         })?;
     let db = Database::open(&state.db_path).map_err(internal_error)?;
     let drawer_id = build_drawer_id(&request.wing, request.room.as_deref(), &request.content);
+    let config = Config::default();
+    let project_id =
+        resolve_project_id(request.project_id.as_deref(), &config, None).map_err(internal_error)?;
 
     if !db.drawer_exists(&drawer_id).map_err(internal_error)? {
         let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());
-        db.insert_drawer(&Drawer {
-            id: drawer_id.clone(),
-            content: request.content,
-            wing: request.wing,
-            room: request.room,
-            source_file: Some(source_file),
-            source_type: SourceType::Manual,
-            added_at: current_timestamp(),
-            chunk_index: Some(0),
-            importance: 0,
-        })
+        db.insert_drawer_with_project(
+            &Drawer {
+                id: drawer_id.clone(),
+                content: request.content,
+                wing: request.wing,
+                room: request.room,
+                source_file: Some(source_file),
+                source_type: SourceType::Manual,
+                added_at: current_timestamp(),
+                chunk_index: Some(0),
+                importance: 0,
+            },
+            project_id.as_deref(),
+        )
         .map_err(internal_error)?;
-        db.insert_vector(&drawer_id, &vector)
+        db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
             .map_err(internal_error)?;
     }
 
@@ -276,6 +297,7 @@ impl From<SearchResult> for SearchResultDto {
             wing: value.wing,
             room: value.room,
             source_file: value.source_file,
+            source: value.source.as_str().to_string(),
             similarity: value.similarity,
             route: value.route.into(),
         }

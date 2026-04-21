@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -125,6 +125,14 @@ impl Database {
     }
 
     pub fn insert_drawer(&self, drawer: &Drawer) -> Result<(), DbError> {
+        self.insert_drawer_with_project(drawer, None)
+    }
+
+    pub fn insert_drawer_with_project(
+        &self,
+        drawer: &Drawer,
+        project_id: Option<&str>,
+    ) -> Result<(), DbError> {
         self.conn.execute(
             r#"
             INSERT INTO drawers (
@@ -136,9 +144,10 @@ impl Database {
                 source_type,
                 added_at,
                 chunk_index,
-                importance
+                importance,
+                project_id
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
             params![
                 drawer.id,
@@ -150,6 +159,7 @@ impl Database {
                 drawer.added_at,
                 drawer.chunk_index,
                 drawer.importance,
+                project_id,
             ],
         )?;
 
@@ -224,9 +234,14 @@ impl Database {
             params![drawer_id, merged_content, updated_at],
         )?;
         transaction.execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])?;
+        let project_id = transaction.query_row(
+            "SELECT project_id FROM drawers WHERE id = ?1",
+            [drawer_id],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
         transaction.execute(
-            "INSERT INTO drawer_vectors (id, embedding) VALUES (?1, vec_f32(?2))",
-            params![drawer_id, vector_json],
+            "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
+            params![drawer_id, vector_json, project_id],
         )?;
         transaction.commit()?;
         Ok(())
@@ -382,11 +397,20 @@ impl Database {
     }
 
     pub fn insert_vector(&self, drawer_id: &str, vector: &[f32]) -> Result<(), DbError> {
+        self.insert_vector_with_project(drawer_id, vector, None)
+    }
+
+    pub fn insert_vector_with_project(
+        &self,
+        drawer_id: &str,
+        vector: &[f32],
+        project_id: Option<&str>,
+    ) -> Result<(), DbError> {
         self.ensure_vectors_table(vector.len())?;
         let vector_json = serde_json::to_string(vector)?;
         self.conn.execute(
-            "INSERT INTO drawer_vectors (id, embedding) VALUES (?1, vec_f32(?2))",
-            (drawer_id, vector_json.as_str()),
+            "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
+            params![drawer_id, vector_json.as_str(), project_id],
         )?;
         Ok(())
     }
@@ -441,8 +465,14 @@ impl Database {
     /// Ensure drawer_vectors table exists with the right dimension.
     /// Creates it on first call; errors on dimension mismatch.
     fn ensure_vectors_table(&self, dim: usize) -> Result<(), DbError> {
+        let fork_ext_version = db_fork_ext::read_fork_ext_version(&self.conn)?;
+        let project_column = if fork_ext_version >= 5 {
+            ", +project_id TEXT"
+        } else {
+            ""
+        };
         self.conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS drawer_vectors USING vec0(id TEXT PRIMARY KEY, embedding FLOAT[{dim}]);"
+            "CREATE VIRTUAL TABLE IF NOT EXISTS drawer_vectors USING vec0(id TEXT PRIMARY KEY, embedding FLOAT[{dim}]{project_column});"
         ))?;
         Ok(())
     }
@@ -535,6 +565,18 @@ impl Database {
         }
     }
 
+    pub fn drawer_project_id(&self, drawer_id: &str) -> Result<Option<String>, DbError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT project_id FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+                [drawer_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(value.flatten())
+    }
+
     pub fn soft_delete_drawer(&self, drawer_id: &str) -> Result<bool, DbError> {
         let timestamp = super::utils::current_timestamp();
         let affected = self.conn.execute(
@@ -598,6 +640,8 @@ impl Database {
         query: &str,
         wing: Option<&str>,
         room: Option<&str>,
+        project_mode: &str,
+        project_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, f64)>, DbError> {
         let Some(match_query) = build_fts_match_query(query) else {
@@ -605,25 +649,113 @@ impl Database {
         };
         let limit =
             i64::try_from(limit).map_err(|_| DbError::InvalidSourceType("limit".to_string()))?;
+        let mut stmt = self
+            .conn
+            .prepare(&crate::search::filter::build_fts_runtime_sql())?;
+        let rows = stmt
+            .query_map(
+                (
+                    match_query.as_str(),
+                    wing,
+                    room,
+                    project_mode,
+                    project_id,
+                    limit,
+                ),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn project_breakdown(&self) -> Result<Vec<(Option<String>, i64)>, DbError> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT d.id, fts.rank
-            FROM drawers_fts fts
-            JOIN drawers d ON d.rowid = fts.rowid
-            WHERE drawers_fts MATCH ?1
-              AND d.deleted_at IS NULL
-              AND (?2 IS NULL OR d.wing = ?2)
-              AND (?3 IS NULL OR d.room = ?3)
-            ORDER BY fts.rank
-            LIMIT ?4
+            SELECT project_id, COUNT(*)
+            FROM drawers
+            WHERE deleted_at IS NULL
+            GROUP BY project_id
+            ORDER BY project_id
             "#,
         )?;
         let rows = stmt
-            .query_map((match_query.as_str(), wing, room, limit), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            .query_map([], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn tunnel_drawers_for_room(
+        &self,
+        room: &str,
+        exclude_drawer_id: &str,
+        current_project_id: Option<&str>,
+    ) -> Result<Vec<(Drawer, Option<String>)>, DbError> {
+        let Some(current_project_id) = current_project_id else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
+                   COALESCE(importance, 0) as importance, project_id
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND room = ?1
+              AND id != ?2
+              AND project_id IS NOT NULL
+              AND project_id != ?3
+            ORDER BY CAST(added_at AS INTEGER) DESC, id DESC
+            "#,
+        )?;
+        let rows = stmt
+            .query_map([room, exclude_drawer_id, current_project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, i32>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    content,
+                    wing,
+                    room,
+                    source_file,
+                    source_type,
+                    added_at,
+                    chunk_index,
+                    importance,
+                    project_id,
+                )| {
+                    Ok((
+                        Drawer {
+                            id,
+                            content,
+                            wing,
+                            room,
+                            source_file,
+                            source_type: source_type_from_str(&source_type)?,
+                            added_at,
+                            chunk_index,
+                            importance,
+                        },
+                        project_id,
+                    ))
+                },
+            )
+            .collect()
     }
 
     // --- Triples (Knowledge Graph) ---
@@ -817,12 +949,18 @@ impl Database {
     /// Drop and recreate the drawer_vectors table with the specified dimension.
     /// All existing vectors are lost — caller must re-embed after this.
     pub fn recreate_vectors_table(&self, dim: usize) -> Result<(), DbError> {
+        let fork_ext_version = db_fork_ext::read_fork_ext_version(&self.conn)?;
+        let project_column = if fork_ext_version >= 5 {
+            ", +project_id TEXT"
+        } else {
+            ""
+        };
         self.conn.execute_batch(&format!(
             r#"
             DROP TABLE IF EXISTS drawer_vectors;
             CREATE VIRTUAL TABLE drawer_vectors USING vec0(
                 id TEXT PRIMARY KEY,
-                embedding FLOAT[{dim}]
+                embedding FLOAT[{dim}]{project_column}
             );
             "#
         ))?;

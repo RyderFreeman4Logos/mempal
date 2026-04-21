@@ -73,6 +73,7 @@ request_timeout_secs = 5
             wing: "test".to_string(),
             room: Some("room".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))

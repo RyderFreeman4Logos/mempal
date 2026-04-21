@@ -71,6 +71,7 @@ async fn test_embedder_fallback_to_model2vec_when_lan_unreachable() {
             wing: "test".to_string(),
             room: Some("fallback".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))

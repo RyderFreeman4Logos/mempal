@@ -9,6 +9,7 @@ use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::core::{
     config::Config,
     db::Database,
+    project::ProjectSearchScope,
     types::{Drawer, SourceType, TaxonomyEntry},
     utils::{build_drawer_id, route_room_from_taxonomy},
 };
@@ -277,9 +278,18 @@ async fn run_benchmark_with_embedder<E: Embedder + ?Sized>(
 
         ingest_corpus(&db, embedder, &corpus_items, args.mode).await?;
 
-        let results = search(&db, embedder, &entry.question, None, None, args.top_k)
-            .await
-            .with_context(|| format!("search failed for question {}", entry.question_id))?;
+        let scope = ProjectSearchScope::all_projects();
+        let results = search(
+            &db,
+            embedder,
+            &entry.question,
+            None,
+            None,
+            &scope,
+            args.top_k,
+        )
+        .await
+        .with_context(|| format!("search failed for question {}", entry.question_id))?;
         let rankings = map_results_to_rankings(&results, &corpus_items);
         let entry_metrics = score_entry(entry, &rankings, &corpus_items, &ks);
 

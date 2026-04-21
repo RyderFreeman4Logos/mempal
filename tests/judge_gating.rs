@@ -151,6 +151,7 @@ prototypes = ["accept"]
             wing: "code-memory".to_string(),
             room: Some("gating".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))
@@ -218,6 +219,7 @@ prototypes = ["accept-prototype"]
             wing: "code-memory".to_string(),
             room: Some("gating".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))
@@ -230,6 +232,7 @@ prototypes = ["accept-prototype"]
             wing: "code-memory".to_string(),
             room: Some("gating".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))
@@ -368,6 +371,7 @@ prototypes = ["accept-prototype"]
             wing: "code-memory".to_string(),
             room: Some("gating".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))

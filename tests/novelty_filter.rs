@@ -178,6 +178,7 @@ async fn test_novelty_drop_near_duplicate() {
             wing: "code-memory".to_string(),
             room: Some("novelty".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))
@@ -220,6 +221,7 @@ async fn test_novelty_merge_similar_but_extended() {
             wing: "code-memory".to_string(),
             room: Some("novelty".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))
@@ -262,6 +264,7 @@ async fn test_novelty_insert_distinct() {
             wing: "code-memory".to_string(),
             room: Some("novelty".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))
@@ -302,6 +305,7 @@ async fn test_merge_preserves_raw_verbatim() {
             wing: "code-memory".to_string(),
             room: Some("novelty".to_string()),
             source: None,
+            project_id: None,
             dry_run: Some(false),
             importance: None,
         }))
@@ -347,6 +351,7 @@ async fn test_novelty_merge_waits_for_target_lock() {
                 wing: "code-memory".to_string(),
                 room: Some("novelty".to_string()),
                 source: None,
+                project_id: None,
                 dry_run: Some(false),
                 importance: None,
             }))
@@ -385,6 +390,16 @@ CREATE TABLE drawers (
     chunk_index INTEGER,
     deleted_at TEXT,
     importance INTEGER DEFAULT 0
+);
+CREATE TABLE triples (
+    id TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    object TEXT NOT NULL,
+    valid_from TEXT,
+    valid_to TEXT,
+    confidence REAL DEFAULT 1.0,
+    source_drawer TEXT REFERENCES drawers(id)
 );
 CREATE VIRTUAL TABLE drawers_fts USING fts5(
     content,
