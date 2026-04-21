@@ -14,17 +14,35 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Vec<Vec<f32>>>>,
 {
-    let config = status.retry_config_snapshot();
     loop {
         match operation().await {
             Ok(vectors) => return Ok(vectors),
             Err(error) => {
+                let config = status.retry_config_snapshot();
                 status.record_failure_with_snapshot(&error, &config);
+                if !error.is_retryable() {
+                    return Err(error);
+                }
                 refresh_heartbeat(heartbeat);
-                tokio::time::sleep(Duration::from_secs(config.retry_interval_secs)).await;
-                refresh_heartbeat(heartbeat);
+                wait_for_next_retry(status, heartbeat).await;
             }
         }
+    }
+}
+
+async fn wait_for_next_retry(status: &EmbedStatus, heartbeat: Option<&HeartbeatCallback>) {
+    let started_at = tokio::time::Instant::now();
+    let tick = Duration::from_millis(50);
+    loop {
+        let retry_after = Duration::from_secs(status.retry_interval_secs());
+        let elapsed = started_at.elapsed();
+        if elapsed >= retry_after {
+            refresh_heartbeat(heartbeat);
+            return;
+        }
+
+        let remaining = retry_after.saturating_sub(elapsed).min(tick);
+        tokio::time::sleep(remaining).await;
     }
 }
 

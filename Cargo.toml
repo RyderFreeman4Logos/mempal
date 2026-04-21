@@ -59,7 +59,7 @@ sqlite-vec = "0.1.9"
 tempfile = "3"
 thiserror = "2"
 tokenizers = { version = "0.22", optional = true }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

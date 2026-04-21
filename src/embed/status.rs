@@ -126,12 +126,12 @@ impl EmbedStatus {
 
     pub fn record_failure(&self, error: &impl std::fmt::Display) {
         self.sync_from_config();
-        let message = error.to_string();
+        let message = crate::core::config::scrub_sensitive_text(&error.to_string());
         self.last_error
             .store(Some(std::sync::Arc::new(message.clone())));
         let fail_count = self.fail_count.fetch_add(1, Ordering::SeqCst) + 1;
         let degrade_after = **self.degrade_threshold.load();
-        if fail_count > degrade_after {
+        if fail_count >= degrade_after {
             self.degraded.store(true, Ordering::SeqCst);
         }
         self.maybe_fire_alert(fail_count, &message);
@@ -142,11 +142,11 @@ impl EmbedStatus {
         error: &impl std::fmt::Display,
         snapshot: &RetryConfigSnapshot,
     ) {
-        let message = error.to_string();
+        let message = crate::core::config::scrub_sensitive_text(&error.to_string());
         self.last_error
             .store(Some(std::sync::Arc::new(message.clone())));
         let fail_count = self.fail_count.fetch_add(1, Ordering::SeqCst) + 1;
-        if fail_count > snapshot.degrade_threshold {
+        if fail_count >= snapshot.degrade_threshold {
             self.degraded.store(true, Ordering::SeqCst);
         }
         self.maybe_fire_alert_with_snapshot(snapshot, fail_count, &message);

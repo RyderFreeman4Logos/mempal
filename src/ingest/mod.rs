@@ -263,8 +263,19 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             path: path.to_path_buf(),
             source,
         })?;
-    if let Some(first_vector) = vectors.first()
-        && let Some(current_dim) =
+    if let Some(first_vector) = vectors.first() {
+        let expected_dim = first_vector.len();
+        if let Some(actual_dim) = vectors
+            .iter()
+            .map(Vec::len)
+            .find(|dim| *dim != expected_dim)
+        {
+            return Err(IngestError::VectorDimensionMismatch {
+                current_dim: expected_dim,
+                new_dim: actual_dim,
+            });
+        }
+        if let Some(current_dim) =
             current_vector_dim(db).map_err(|source| IngestError::InsertVector {
                 drawer_id: pending
                     .first()
@@ -272,12 +283,13 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
                     .unwrap_or_else(|| "unknown".to_string()),
                 source,
             })?
-        && current_dim != first_vector.len()
-    {
-        return Err(IngestError::VectorDimensionMismatch {
-            current_dim,
-            new_dim: first_vector.len(),
-        });
+            && current_dim != expected_dim
+        {
+            return Err(IngestError::VectorDimensionMismatch {
+                current_dim,
+                new_dim: expected_dim,
+            });
+        }
     }
 
     for ((chunk_index, chunk, drawer_id), vector) in pending.into_iter().zip(vectors.into_iter()) {

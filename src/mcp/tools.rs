@@ -224,11 +224,15 @@ pub struct QueueStatsDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EmbedStatusDto {
+    pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     pub pending_count: u64,
     pub claimed_count: u64,
     pub failed_count: u64,
     pub degraded: bool,
     pub fail_count: u64,
+    pub failure_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

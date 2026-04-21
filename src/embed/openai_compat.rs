@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
@@ -22,11 +23,12 @@ impl OpenAiCompatibleEmbedder {
             .resolved_openai_base_url()
             .ok_or_else(|| {
                 EmbedError::MissingConfiguration(
-                    "embed.openai_compat.base_url (or legacy embed.base_url)".to_string(),
+                    "embed.openai_compat.base_url (or legacy embed.base_url) is required for backend=openai_compat; example: http://127.0.0.1:18002/v1 or http://gb10:18002/v1".to_string(),
                 )
             })?
             .trim_end_matches('/')
             .to_string();
+        validate_base_url(&base_url)?;
         let model = config
             .embed
             .resolved_openai_model()
@@ -68,6 +70,30 @@ impl OpenAiCompatibleEmbedder {
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
+}
+
+fn validate_base_url(base_url: &str) -> Result<()> {
+    let parsed = Url::parse(base_url).map_err(|error| {
+        EmbedError::InvalidConfiguration(format!("invalid embed base_url `{base_url}`: {error}"))
+    })?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(EmbedError::InvalidConfiguration(
+            "embed base_url must not include userinfo credentials; use api_key_env instead"
+                .to_string(),
+        ));
+    }
+    if parsed.query().is_some() {
+        return Err(EmbedError::InvalidConfiguration(
+            "embed base_url must not include query parameters; move secrets to api_key_env"
+                .to_string(),
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(EmbedError::InvalidConfiguration(
+            "embed base_url must not include URL fragments".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]

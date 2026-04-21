@@ -112,9 +112,13 @@ enum Commands {
     },
     Reindex {
         #[arg(long)]
-        embedder: String,
+        embedder: Option<String>,
+        #[arg(long, default_value_t = false)]
+        from_config: bool,
         #[arg(long, default_value_t = false)]
         resume: bool,
+        #[arg(long, default_value_t = false)]
+        stale: bool,
     },
     Kg {
         #[command(subcommand)]
@@ -396,8 +400,25 @@ fn run() -> Result<()> {
         Commands::WakeUp { format } => wake_up_command(&db, format.as_deref()),
         Commands::Compress { text } => compress_command(&text),
         Commands::Bench { command } => block_on_result(bench_command(config.as_ref(), command)),
-        Commands::Reindex { embedder, resume } => {
-            block_on_result(reindex_command(&db, config.as_ref(), &embedder, resume))
+        Commands::Reindex {
+            embedder,
+            from_config,
+            resume,
+            stale,
+        } => {
+            let backend = match (embedder.as_deref(), from_config) {
+                (Some(name), false) => name.to_string(),
+                (None, true) => config.embed.backend.clone(),
+                (Some(_), true) => bail!("use either --embedder <name> or --from-config, not both"),
+                (None, false) => bail!("reindex requires --embedder <name> or --from-config"),
+            };
+            block_on_result(reindex_command(
+                &db,
+                config.as_ref(),
+                &backend,
+                resume,
+                stale,
+            ))
         }
         Commands::Kg { command } => kg_command(&db, command),
         Commands::Tunnels => tunnels_command(&db),
@@ -855,11 +876,13 @@ async fn reindex_command(
     config: &Config,
     embedder_name: &str,
     resume: bool,
+    stale_only: bool,
 ) -> Result<()> {
     let embedder = build_specific_embedder(config, embedder_name).await?;
     let new_dim = embedder.dimensions();
     let current_dim = current_vector_dim(db).context("failed to read embedding dim")?;
     let progress_store = ReindexProgressStore::new(db.path());
+    let target_fingerprint = reindex_embedder_fingerprint(config, embedder_name, new_dim);
     let resume_checkpoint = if resume {
         progress_store
             .latest_resumable(Some(embedder_name))
@@ -875,15 +898,20 @@ async fn reindex_command(
         println!("current vector dim: (empty table)");
     }
 
-    if resume_checkpoint.is_none() {
+    if resume_checkpoint.is_none() && (!stale_only || current_dim != Some(new_dim)) {
         println!("recreating drawer_vectors with {new_dim} dimensions...");
         db.recreate_vectors_table(new_dim)
             .context("failed to recreate vectors table")?;
+    } else if stale_only {
+        println!("stale-only reindex preserving existing drawer_vectors table");
     } else {
         println!("resume checkpoint found; preserving existing drawer_vectors table");
     }
 
-    let drawers = reindex_rows(db).context("failed to load active drawers for reindex")?;
+    let mut drawers = reindex_rows(db).context("failed to load active drawers for reindex")?;
+    if stale_only {
+        drawers.retain(|row| reindex_row_is_stale(db, row, &target_fingerprint).unwrap_or(true));
+    }
     let total = drawers.len();
     println!("re-embedding {total} drawers...");
 
@@ -934,8 +962,18 @@ async fn reindex_command(
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("embedder returned no vector during reindex"))?;
+        db.conn()
+            .execute("DELETE FROM drawer_vectors WHERE id = ?1", [&row.id])
+            .with_context(|| format!("failed to clear existing vector for {}", row.id))?;
         db.insert_vector(&row.id, &vector)
             .with_context(|| format!("failed to insert vector for {}", row.id))?;
+        record_reindex_metadata(
+            db,
+            &row.id,
+            CURRENT_REINDEX_NORMALIZE_VERSION,
+            &target_fingerprint,
+        )
+        .with_context(|| format!("failed to record reindex metadata for {}", row.id))?;
         progress_store
             .upsert_running(&row.source_path, Some(row.chunk_index), embedder_name)
             .context("failed to persist reindex checkpoint")?;
@@ -1451,6 +1489,8 @@ struct ReindexRow {
     chunk_index: i64,
 }
 
+const CURRENT_REINDEX_NORMALIZE_VERSION: &str = "v1";
+
 fn reindex_rows(db: &Database) -> Result<Vec<ReindexRow>> {
     let mut statement = db
         .conn()
@@ -1528,6 +1568,82 @@ fn current_vector_dim(db: &Database) -> Result<Option<usize>> {
         .context("failed to read vector dimension")?
         .map(|value| value as usize);
     Ok(dimension)
+}
+
+fn reindex_embedder_fingerprint(config: &Config, backend: &str, dim: usize) -> String {
+    let base_url = config
+        .embed
+        .resolved_openai_base_url()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    let model = config.embed.resolved_openai_model().unwrap_or_default();
+    format!("{backend}:{model}:{base_url}:{dim}")
+}
+
+fn reindex_metadata_key(drawer_id: &str, field: &str) -> String {
+    format!("reindex:{drawer_id}:{field}")
+}
+
+fn load_reindex_metadata(db: &Database, drawer_id: &str, field: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+
+    db.conn()
+        .query_row(
+            "SELECT value FROM fork_ext_meta WHERE key = ?1",
+            [reindex_metadata_key(drawer_id, field)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("failed to load reindex metadata")
+}
+
+fn record_reindex_metadata(
+    db: &Database,
+    drawer_id: &str,
+    normalize_version: &str,
+    embedder_fingerprint: &str,
+) -> Result<()> {
+    db.conn()
+        .execute(
+            r#"
+            INSERT INTO fork_ext_meta (key, value)
+            VALUES (?1, ?2), (?3, ?4)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            rusqlite::params![
+                reindex_metadata_key(drawer_id, "normalize_version"),
+                normalize_version,
+                reindex_metadata_key(drawer_id, "embedder_fingerprint"),
+                embedder_fingerprint,
+            ],
+        )
+        .context("failed to write reindex metadata")?;
+    Ok(())
+}
+
+fn drawer_vector_exists(db: &Database, drawer_id: &str) -> Result<bool> {
+    let Some(_dim) = current_vector_dim(db)? else {
+        return Ok(false);
+    };
+    db.conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM drawer_vectors WHERE id = ?1)",
+            [drawer_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to query vector existence")
+}
+
+fn reindex_row_is_stale(db: &Database, row: &ReindexRow, target_fingerprint: &str) -> Result<bool> {
+    if !drawer_vector_exists(db, &row.id)? {
+        return Ok(true);
+    }
+    let normalize_version = load_reindex_metadata(db, &row.id, "normalize_version")?;
+    if normalize_version.as_deref() != Some(CURRENT_REINDEX_NORMALIZE_VERSION) {
+        return Ok(true);
+    }
+    let fingerprint = load_reindex_metadata(db, &row.id, "embedder_fingerprint")?;
+    Ok(fingerprint.as_deref() != Some(target_fingerprint))
 }
 
 fn expand_home(path: &str) -> PathBuf {
