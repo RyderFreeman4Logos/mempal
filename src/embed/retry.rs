@@ -14,13 +14,14 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Vec<Vec<f32>>>>,
 {
+    let config = status.retry_config_snapshot();
     loop {
         match operation().await {
             Ok(vectors) => return Ok(vectors),
             Err(error) => {
-                status.record_failure(&error);
+                status.record_failure_with_snapshot(&error, &config);
                 refresh_heartbeat(heartbeat);
-                tokio::time::sleep(Duration::from_secs(status.retry_interval_secs())).await;
+                tokio::time::sleep(Duration::from_secs(config.retry_interval_secs)).await;
                 refresh_heartbeat(heartbeat);
             }
         }

@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
-use mempal::daemon_bootstrap::{BootstrapObserver, DaemonContext};
+use mempal::daemon_bootstrap::{BootstrapObserver, DaemonContext, Stage};
 use mempal::hook::{CapturedHookEnvelope, HookEvent};
+use mockito::Server;
 use tempfile::TempDir;
 
 fn mempal_bin() -> String {
@@ -15,15 +16,12 @@ fn mempal_bin() -> String {
 }
 
 struct RecordingObserver {
-    stages: Mutex<Vec<String>>,
+    stages: Mutex<Vec<Stage>>,
 }
 
 impl BootstrapObserver for RecordingObserver {
-    fn record(&self, stage: &str) {
-        self.stages
-            .lock()
-            .expect("observer mutex")
-            .push(stage.to_string());
+    fn record(&self, stage: Stage) {
+        self.stages.lock().expect("observer mutex").push(stage);
     }
 }
 
@@ -70,7 +68,16 @@ fn test_daemon_context_bootstrap_ordering() {
     let stages = observer.stages.lock().expect("observer mutex").clone();
     let pid_path = context.mempal_home.join("daemon.pid");
 
-    assert_eq!(stages, vec!["daemonize", "runtime", "database", "tracing"]);
+    assert_eq!(
+        stages,
+        vec![
+            Stage::Daemonize,
+            Stage::Runtime,
+            Stage::ConfigHandleBootstrap,
+            Stage::Database,
+            Stage::Tracing,
+        ]
+    );
     assert!(
         pid_path.exists(),
         "pid file must exist during daemon lifetime"
@@ -83,6 +90,41 @@ fn test_daemon_context_bootstrap_ordering() {
 #[test]
 fn test_daemon_sigterm_graceful() {
     let (tmp, db_path, _config_path) = setup_daemon_home();
+    let mut server = Server::new();
+    let _mock = server
+        .mock("POST", "/embeddings")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#)
+        .create();
+    fs::write(
+        tmp.path().join(".mempal/config.toml"),
+        format!(
+            r#"
+db_path = "{}"
+
+[embed]
+backend = "openai_compat"
+
+[embed.openai_compat]
+base_url = "{}"
+model = "test-embed"
+dim = 3
+request_timeout_secs = 5
+
+[hooks]
+enabled = true
+daemon_poll_interval_ms = 100
+
+[daemon]
+log_path = "{}"
+"#,
+            db_path.display(),
+            server.url(),
+            tmp.path().join(".mempal/daemon.log").display()
+        ),
+    )
+    .expect("rewrite config");
     let store = PendingMessageStore::new(&db_path).expect("store");
     let envelope = CapturedHookEnvelope {
         event: HookEvent::SessionStart.display_name().to_string(),

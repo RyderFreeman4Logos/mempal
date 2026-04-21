@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use std::{future::Future, pin::Pin};
 
 use crate::core::{
     db::Database,
@@ -52,12 +53,12 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
             break;
         }
 
-        match context
-            .store
-            .claim_next(&worker_id, claim_ttl_secs)
-            .context("failed to claim next pending message")?
+        match poll_claim_next(&context.store, &worker_id, claim_ttl_secs, |duration| {
+            Box::pin(tokio::time::sleep(duration))
+        })
+        .await
         {
-            Some(message) => {
+            ClaimPollResult::Claimed(message) => {
                 let message_id = message.id.clone();
                 let result = process_claimed_message_with_embedder(
                     &context.db,
@@ -86,13 +87,60 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                     }
                 }
             }
-            None => {
+            ClaimPollResult::Idle => {
                 tokio::time::sleep(poll_interval).await;
             }
+            ClaimPollResult::RetryAfterError => continue,
         }
     }
 
     Ok(())
+}
+
+trait ClaimNextSource {
+    fn claim_next(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+    ) -> crate::core::queue::Result<Option<ClaimedMessage>>;
+}
+
+impl ClaimNextSource for PendingMessageStore {
+    fn claim_next(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+    ) -> crate::core::queue::Result<Option<ClaimedMessage>> {
+        PendingMessageStore::claim_next(self, worker_id, claim_ttl_secs)
+    }
+}
+
+enum ClaimPollResult {
+    Claimed(ClaimedMessage),
+    Idle,
+    RetryAfterError,
+}
+
+type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+async fn poll_claim_next<'a, S>(
+    store: &impl ClaimNextSource,
+    worker_id: &str,
+    claim_ttl_secs: i64,
+    sleep_on_error: S,
+) -> ClaimPollResult
+where
+    S: Fn(Duration) -> SleepFuture<'a>,
+{
+    match store.claim_next(worker_id, claim_ttl_secs) {
+        Ok(Some(message)) => ClaimPollResult::Claimed(message),
+        Ok(None) => ClaimPollResult::Idle,
+        Err(error) => {
+            tracing::warn!(?error, "claim_next failed");
+            sleep_on_error(Duration::from_secs(1)).await;
+            ClaimPollResult::RetryAfterError
+        }
+    }
 }
 
 pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
@@ -371,5 +419,85 @@ impl Embedder for DaemonEmbedder {
 
     fn name(&self) -> &str {
         self.primary.name()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::core::queue::{ClaimedMessage, QueueError};
+
+    use super::{ClaimNextSource, ClaimPollResult, poll_claim_next};
+
+    struct StubClaimSource {
+        responses: Mutex<VecDeque<Result<Option<ClaimedMessage>, QueueError>>>,
+    }
+
+    impl StubClaimSource {
+        fn new(responses: Vec<Result<Option<ClaimedMessage>, QueueError>>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    impl ClaimNextSource for StubClaimSource {
+        fn claim_next(
+            &self,
+            _worker_id: &str,
+            _claim_ttl_secs: i64,
+        ) -> crate::core::queue::Result<Option<ClaimedMessage>> {
+            self.responses
+                .lock()
+                .expect("responses mutex")
+                .pop_front()
+                .expect("stub response")
+        }
+    }
+
+    fn claimed_message(id: &str) -> ClaimedMessage {
+        ClaimedMessage {
+            id: id.to_string(),
+            kind: "hook_user_prompt".to_string(),
+            payload: "{}".to_string(),
+            retry_count: 0,
+            claim_token: "worker:claim".to_string(),
+            source_hash: "hash".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_daemon_survives_transient_claim_error() {
+        let store = StubClaimSource::new(vec![
+            Err(QueueError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseBusy,
+                    extended_code: rusqlite::ffi::SQLITE_BUSY,
+                },
+                Some("database is locked".to_string()),
+            ))),
+            Ok(Some(claimed_message("msg-1"))),
+        ]);
+        let slept = AtomicUsize::new(0);
+
+        let first = poll_claim_next(&store, "worker-a", 60, |_| {
+            slept.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(()))
+        })
+        .await;
+        let second =
+            poll_claim_next(&store, "worker-a", 60, |_| Box::pin(std::future::ready(()))).await;
+
+        assert!(matches!(first, ClaimPollResult::RetryAfterError));
+        assert_eq!(slept.load(Ordering::SeqCst), 1);
+        match second {
+            ClaimPollResult::Claimed(message) => assert_eq!(message.id, "msg-1"),
+            ClaimPollResult::Idle | ClaimPollResult::RetryAfterError => {
+                panic!("expected claimed message on retry")
+            }
+        }
     }
 }

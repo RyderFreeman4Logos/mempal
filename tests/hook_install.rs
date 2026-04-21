@@ -1,9 +1,9 @@
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
-use std::sync::{Mutex, OnceLock};
+use std::process::Command;
 
-use mempal::hook_install::{HookInstallTarget, install, install_claude_code};
+use mempal::hook_install::install_claude_code;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -11,12 +11,8 @@ fn parse_json(path: &std::path::Path) -> Value {
     serde_json::from_str(&fs::read_to_string(path).expect("read json")).expect("parse json")
 }
 
-fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    GUARD
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("env mutex")
+fn mempal_bin() -> String {
+    env!("CARGO_BIN_EXE_mempal").to_string()
 }
 
 #[test]
@@ -185,24 +181,23 @@ fn test_hook_install_refuses_agent_instruction_targets() {
 
 #[test]
 fn test_hook_install_public_wrapper_uses_home_env() {
-    let _guard = env_guard();
     let tmp = TempDir::new().expect("tempdir");
     let cwd = tmp.path().join("repo");
     let home = tmp.path().join("home");
     fs::create_dir_all(&cwd).expect("create cwd");
     fs::create_dir_all(&home).expect("create home");
 
-    let original_cwd = std::env::current_dir().expect("current dir");
-    let original_home = std::env::var_os("HOME");
-    std::env::set_current_dir(&cwd).expect("set current dir");
-    // SAFETY: the mutex above serializes process-global env mutation for this test.
-    unsafe { std::env::set_var("HOME", &home) };
-    install(HookInstallTarget::ClaudeCode, false, false).expect("wrapper install");
-    std::env::set_current_dir(original_cwd).expect("restore current dir");
-    if let Some(home) = original_home {
-        // SAFETY: guarded by the mutex above.
-        unsafe { std::env::set_var("HOME", home) };
-    }
+    let output = Command::new(mempal_bin())
+        .args(["hook", "install", "--target", "claude-code"])
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .output()
+        .expect("wrapper install");
+    assert!(
+        output.status.success(),
+        "install command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let parsed = parse_json(&home.join(".claude/settings.json"));
     assert_eq!(

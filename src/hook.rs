@@ -139,7 +139,7 @@ fn capture_stdin_payload(bytes: Vec<u8>, mempal_home: &Path) -> Result<CapturedP
     let original_size_bytes = bytes.len();
     if original_size_bytes <= MAX_INLINE_PAYLOAD_BYTES {
         return Ok(CapturedPayload {
-            inline_payload: Some(String::from_utf8_lossy(&bytes).to_string()),
+            inline_payload: Some(decode_stdin_bytes(&bytes)),
             payload_path: None,
             preview: None,
             original_size_bytes,
@@ -190,22 +190,47 @@ fn truncate_to_byte_boundary(input: &str, max_bytes: usize) -> &str {
     &input[..index]
 }
 
+fn decode_stdin_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(value) => value.to_owned(),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 fn infer_agent_name(payload: Option<&str>) -> String {
     let Some(payload) = payload else {
         return "claude".to_string();
     };
 
-    let lower = payload.to_ascii_lowercase();
-    if lower.contains("gpt-5-codex")
-        || lower.contains("\"originator\":\"codex")
-        || lower.contains("\"hook_event_name\":\"userpromptsubmit\"")
-    {
-        return "codex".to_string();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+        for field in ["agent", "originator", "model"] {
+            if let Some(name) = value.get(field).and_then(|value| value.as_str())
+                && let Some(inferred) = classify_agent_name(name)
+            {
+                return inferred.to_string();
+            }
+        }
+    }
+
+    if let Some(inferred) = classify_agent_name(payload) {
+        return inferred.to_string();
+    }
+
+    "claude".to_string()
+}
+
+fn classify_agent_name(value: &str) -> Option<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("codex") {
+        return Some("codex");
     }
     if lower.contains("gemini") {
-        return "gemini".to_string();
+        return Some("gemini");
     }
-    "claude".to_string()
+    if lower.contains("claude") {
+        return Some("claude");
+    }
+    None
 }
 
 fn current_working_directory() -> String {
