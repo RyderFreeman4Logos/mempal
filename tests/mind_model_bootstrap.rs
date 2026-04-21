@@ -1,6 +1,10 @@
 //! Integration tests for P12 stage-1 mind-model bootstrap schema/core work.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::process::Command;
 use std::sync::Arc;
+use std::thread;
 use std::{fs, path::Path};
 
 use async_trait::async_trait;
@@ -133,12 +137,89 @@ fn setup_mcp_server() -> (TempDir, Database, MempalMcpServer) {
     (tmp, db, server)
 }
 
+fn mempal_bin() -> String {
+    env!("CARGO_BIN_EXE_mempal").to_string()
+}
+
 fn init_git_repo(path: &Path) {
-    std::process::Command::new("git")
+    Command::new("git")
         .arg("init")
         .current_dir(path)
         .output()
         .expect("git init should run");
+    fs::write(path.join("README.md"), "seed\n").expect("write seed file");
+    Command::new("git")
+        .args(["add", "README.md"])
+        .current_dir(path)
+        .output()
+        .expect("git add should run");
+    Command::new("git")
+        .args([
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(path)
+        .output()
+        .expect("git commit should run");
+}
+
+fn setup_cli_home() -> (TempDir, Database) {
+    let tmp = TempDir::new().expect("tempdir");
+    let mempal_dir = tmp.path().join(".mempal");
+    fs::create_dir_all(&mempal_dir).expect("create mempal home");
+    let db = Database::open(&mempal_dir.join("palace.db")).expect("open cli db");
+    (tmp, db)
+}
+
+fn start_openai_embedding_stub(vector: Vec<f32>) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding stub");
+    listener
+        .set_nonblocking(true)
+        .expect("set embedding stub nonblocking");
+    let address = listener.local_addr().expect("local addr");
+
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = (0..50)
+            .find_map(|_| match listener.accept() {
+                Ok(connection) => Some(connection),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    None
+                }
+                Err(error) => panic!("accept request: {error}"),
+            })
+            .expect("embedding stub timed out waiting for request");
+        let mut request = [0_u8; 4096];
+        let bytes_read = stream.read(&mut request).expect("read embedding request");
+        assert!(
+            bytes_read > 0 && String::from_utf8_lossy(&request[..bytes_read]).contains("POST"),
+            "expected HTTP POST request"
+        );
+
+        let body = serde_json::to_string(&json!({
+            "data": [{ "embedding": vector }]
+        }))
+        .expect("serialize response body");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write embedding response");
+    });
+
+    (format!("http://{address}/v1/embeddings"), handle)
+}
+
+fn vector_of(dimensions: usize, value: f32) -> Vec<f32> {
+    vec![value; dimensions]
 }
 
 fn bootstrap_drawer(
@@ -428,6 +509,43 @@ async fn test_mcp_ingest_defaults_to_evidence_drawer_bootstrap_metadata() {
 }
 
 #[tokio::test]
+async fn test_knowledge_drawer_keeps_statement_separate_from_content() {
+    let (_tmp, db, server) = setup_mcp_server();
+    let statement = "Debug by reproducing before patching.";
+    let content = "Start from a concrete reproduction, then isolate scope before patching.";
+
+    let response = server
+        .ingest_json_for_test(json!({
+            "content": content,
+            "wing": "mempal",
+            "memory_kind": "knowledge",
+            "domain": "skill",
+            "field": "debugging",
+            "statement": statement,
+            "tier": "shu",
+            "status": "promoted",
+            "supporting_refs": ["drawer_ev_001"]
+        }))
+        .await
+        .expect("knowledge ingest should succeed");
+
+    let drawer = db
+        .get_drawer(&response.drawer_id)
+        .expect("load knowledge drawer")
+        .expect("knowledge drawer exists");
+
+    assert_eq!(drawer.memory_kind, MemoryKind::Knowledge);
+    assert_eq!(drawer.domain, MemoryDomain::Skill);
+    assert_eq!(drawer.field, "debugging");
+    assert_eq!(drawer.statement.as_deref(), Some(statement));
+    assert_eq!(drawer.content, content);
+    assert_ne!(drawer.statement.as_deref(), Some(drawer.content.as_str()));
+    assert_eq!(drawer.tier, Some(KnowledgeTier::Shu));
+    assert_eq!(drawer.status, Some(KnowledgeStatus::Promoted));
+    assert_eq!(drawer.supporting_refs, vec!["drawer_ev_001"]);
+}
+
+#[tokio::test]
 async fn test_evidence_drawer_rejects_knowledge_only_fields() {
     let (_tmp, _db, server) = setup_mcp_server();
     let error = server
@@ -652,24 +770,74 @@ async fn test_evidence_drawer_accepts_explicit_runtime_or_research_provenance() 
 }
 
 #[tokio::test]
-async fn test_anchor_derivation_handles_git_and_non_git_cwd() {
+async fn test_git_worktree_derives_worktree_anchor_and_repo_parent() {
     let (tmp, db, server) = setup_mcp_server();
-    let git_root = tmp.path().join("repo");
-    fs::create_dir_all(&git_root).expect("create git root");
-    init_git_repo(&git_root);
+    let repo_root = tmp.path().join("repo");
+    fs::create_dir_all(&repo_root).expect("create git root");
+    init_git_repo(&repo_root);
+    let worktree = tmp.path().join("repo-worktree");
+    let output = Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            "mind-model-bootstrap",
+            worktree.to_str().expect("utf8 worktree path"),
+        ])
+        .current_dir(&repo_root)
+        .output()
+        .expect("git worktree add should run");
+    assert!(
+        output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let non_git = tmp.path().join("standalone");
-    fs::create_dir_all(&non_git).expect("create standalone dir");
-
-    let git_response = server
+    let response = server
         .ingest_json_for_test(json!({
             "content": "Git anchored evidence",
             "wing": "mempal",
-            "cwd": git_root.to_string_lossy()
+            "cwd": worktree.to_string_lossy()
         }))
         .await
         .expect("git cwd ingest should succeed");
-    let non_git_response = server
+
+    let drawer = db
+        .get_drawer(&response.drawer_id)
+        .expect("load git drawer")
+        .expect("git drawer exists");
+
+    let expected_worktree = format!(
+        "worktree://{}",
+        worktree
+            .canonicalize()
+            .expect("canonicalize worktree")
+            .display()
+    );
+    let expected_repo_parent = format!(
+        "repo://{}",
+        repo_root
+            .join(".git")
+            .canonicalize()
+            .expect("canonicalize git dir")
+            .display()
+    );
+
+    assert_eq!(drawer.anchor_kind, AnchorKind::Worktree);
+    assert_eq!(drawer.anchor_id, expected_worktree);
+    assert_eq!(
+        drawer.parent_anchor_id.as_deref(),
+        Some(expected_repo_parent.as_str())
+    );
+}
+
+#[tokio::test]
+async fn test_non_git_cwd_falls_back_to_standalone_worktree_anchor() {
+    let (tmp, db, server) = setup_mcp_server();
+    let non_git = tmp.path().join("standalone");
+    fs::create_dir_all(&non_git).expect("create standalone dir");
+
+    let response = server
         .ingest_json_for_test(json!({
             "content": "Standalone anchored evidence",
             "wing": "mempal",
@@ -678,27 +846,22 @@ async fn test_anchor_derivation_handles_git_and_non_git_cwd() {
         .await
         .expect("non-git cwd ingest should succeed");
 
-    let git_drawer = db
-        .get_drawer(&git_response.drawer_id)
-        .expect("load git drawer")
-        .expect("git drawer exists");
-    let non_git_drawer = db
-        .get_drawer(&non_git_response.drawer_id)
+    let drawer = db
+        .get_drawer(&response.drawer_id)
         .expect("load non-git drawer")
         .expect("non-git drawer exists");
 
-    assert_eq!(git_drawer.anchor_kind, AnchorKind::Worktree);
-    assert!(git_drawer.anchor_id.starts_with("worktree://"));
-    assert!(
-        git_drawer
-            .parent_anchor_id
-            .as_deref()
-            .is_some_and(|value| value.starts_with("repo://"))
+    let expected_worktree = format!(
+        "worktree://{}",
+        non_git
+            .canonicalize()
+            .expect("canonicalize standalone dir")
+            .display()
     );
 
-    assert_eq!(non_git_drawer.anchor_kind, AnchorKind::Worktree);
-    assert!(non_git_drawer.anchor_id.starts_with("worktree://"));
-    assert_eq!(non_git_drawer.parent_anchor_id, None);
+    assert_eq!(drawer.anchor_kind, AnchorKind::Worktree);
+    assert_eq!(drawer.anchor_id, expected_worktree);
+    assert_eq!(drawer.parent_anchor_id, None);
 }
 
 #[tokio::test]
@@ -916,4 +1079,325 @@ async fn test_search_filters_by_memory_kind_and_tier_without_rerank_changes() {
         vec!["drawer_search_knowledge_shu", "drawer_search_knowledge_qi"]
     );
     assert_eq!(shu_only_ids, vec!["drawer_search_knowledge_shu"]);
+}
+
+#[tokio::test]
+async fn test_search_filters_by_domain_field_status_and_anchor_kind() {
+    let (_tmp, db, server) = setup_mcp_server();
+
+    let domain_skill = Drawer {
+        domain: MemoryDomain::Skill,
+        ..bootstrap_drawer(
+            "drawer_filter_domain_skill",
+            "domain focus domain focus",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Skill-domain statement"),
+        )
+    };
+    let domain_agent = Drawer {
+        domain: MemoryDomain::Agent,
+        ..bootstrap_drawer(
+            "drawer_filter_domain_agent",
+            "domain focus domain focus",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Agent-domain statement"),
+        )
+    };
+    let field_debugging = Drawer {
+        domain: MemoryDomain::Skill,
+        field: "debugging".to_string(),
+        ..bootstrap_drawer(
+            "drawer_filter_field_debugging",
+            "field focus field focus",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Debugging-field statement"),
+        )
+    };
+    let field_tooling = Drawer {
+        domain: MemoryDomain::Skill,
+        field: "tooling".to_string(),
+        ..bootstrap_drawer(
+            "drawer_filter_field_tooling",
+            "field focus field focus",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Tooling-field statement"),
+        )
+    };
+    let status_promoted = Drawer {
+        domain: MemoryDomain::Skill,
+        field: "debugging".to_string(),
+        status: Some(KnowledgeStatus::Promoted),
+        ..bootstrap_drawer(
+            "drawer_filter_status_promoted",
+            "status focus status focus",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Promoted-status statement"),
+        )
+    };
+    let status_retired = Drawer {
+        domain: MemoryDomain::Skill,
+        field: "debugging".to_string(),
+        status: Some(KnowledgeStatus::Retired),
+        ..bootstrap_drawer(
+            "drawer_filter_status_retired",
+            "status focus status focus",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Retired),
+            Some("Retired-status statement"),
+        )
+    };
+    let anchor_repo = Drawer {
+        domain: MemoryDomain::Skill,
+        field: "debugging".to_string(),
+        status: Some(KnowledgeStatus::Promoted),
+        anchor_kind: AnchorKind::Repo,
+        anchor_id: "repo://filter-anchor".to_string(),
+        ..bootstrap_drawer(
+            "drawer_filter_anchor_repo",
+            "anchor focus anchor focus",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Repo-anchor statement"),
+        )
+    };
+    let anchor_worktree = Drawer {
+        domain: MemoryDomain::Skill,
+        field: "debugging".to_string(),
+        status: Some(KnowledgeStatus::Promoted),
+        anchor_kind: AnchorKind::Worktree,
+        anchor_id: "worktree:///tmp/filter-anchor".to_string(),
+        ..bootstrap_drawer(
+            "drawer_filter_anchor_worktree",
+            "anchor focus anchor focus",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("Worktree-anchor statement"),
+        )
+    };
+
+    for (index, drawer) in [
+        &domain_skill,
+        &domain_agent,
+        &field_debugging,
+        &field_tooling,
+        &status_promoted,
+        &status_retired,
+        &anchor_repo,
+        &anchor_worktree,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        insert_search_fixture(&db, drawer, &[0.1 + index as f32, 0.2, 0.3]);
+    }
+
+    let domain_results = server
+        .search_json_for_test(json!({
+            "query": "domain focus",
+            "wing": "mempal",
+            "room": "bootstrap",
+            "domain": "skill",
+            "top_k": 5
+        }))
+        .await
+        .expect("domain-filtered search should succeed");
+    let field_results = server
+        .search_json_for_test(json!({
+            "query": "field focus",
+            "wing": "mempal",
+            "room": "bootstrap",
+            "field": "debugging",
+            "top_k": 5
+        }))
+        .await
+        .expect("field-filtered search should succeed");
+    let status_results = server
+        .search_json_for_test(json!({
+            "query": "status focus",
+            "wing": "mempal",
+            "room": "bootstrap",
+            "status": "promoted",
+            "top_k": 5
+        }))
+        .await
+        .expect("status-filtered search should succeed");
+    let anchor_results = server
+        .search_json_for_test(json!({
+            "query": "anchor focus",
+            "wing": "mempal",
+            "room": "bootstrap",
+            "anchor_kind": "repo",
+            "top_k": 5
+        }))
+        .await
+        .expect("anchor-filtered search should succeed");
+
+    let domain_ids: Vec<&str> = domain_results
+        .results
+        .iter()
+        .map(|result| result.drawer_id.as_str())
+        .collect();
+    let field_ids: Vec<&str> = field_results
+        .results
+        .iter()
+        .map(|result| result.drawer_id.as_str())
+        .collect();
+    let status_ids: Vec<&str> = status_results
+        .results
+        .iter()
+        .map(|result| result.drawer_id.as_str())
+        .collect();
+    let anchor_ids: Vec<&str> = anchor_results
+        .results
+        .iter()
+        .map(|result| result.drawer_id.as_str())
+        .collect();
+
+    assert!(domain_ids.contains(&"drawer_filter_domain_skill"));
+    assert!(!domain_ids.contains(&"drawer_filter_domain_agent"));
+    assert!(
+        domain_results
+            .results
+            .iter()
+            .all(|result| result.domain == "skill")
+    );
+
+    assert!(field_ids.contains(&"drawer_filter_field_debugging"));
+    assert!(!field_ids.contains(&"drawer_filter_field_tooling"));
+    assert!(
+        field_results
+            .results
+            .iter()
+            .all(|result| result.field == "debugging")
+    );
+
+    assert!(status_ids.contains(&"drawer_filter_status_promoted"));
+    assert!(!status_ids.contains(&"drawer_filter_status_retired"));
+    assert!(
+        status_results
+            .results
+            .iter()
+            .all(|result| result.status.as_deref() == Some("promoted"))
+    );
+
+    assert!(anchor_ids.contains(&"drawer_filter_anchor_repo"));
+    assert!(!anchor_ids.contains(&"drawer_filter_anchor_worktree"));
+    assert!(
+        anchor_results
+            .results
+            .iter()
+            .all(|result| result.anchor_kind == "repo")
+    );
+}
+
+#[test]
+fn test_cli_search_json_exposes_bootstrap_metadata_fields() {
+    let (tmp, db) = setup_cli_home();
+    let (endpoint, server_handle) = start_openai_embedding_stub(vector_of(384, 0.25));
+    let config_path = tmp.path().join(".mempal").join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[embed]\nbackend = \"api\"\napi_endpoint = \"{endpoint}\"\napi_model = \"test-model\"\n"
+        ),
+    )
+    .expect("write cli config");
+    let config = mempal::core::config::Config::load_from(&config_path).expect("load cli config");
+    assert_eq!(config.embed.backend, "api");
+
+    let target = Drawer {
+        domain: MemoryDomain::Skill,
+        field: "debugging".to_string(),
+        anchor_kind: AnchorKind::Repo,
+        anchor_id: "repo://cli-metadata".to_string(),
+        ..bootstrap_drawer(
+            "drawer_cli_metadata",
+            "cli metadata focus cli metadata focus",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Shu),
+            Some(KnowledgeStatus::Promoted),
+            Some("CLI statement stays separate."),
+        )
+    };
+    let distractor = Drawer {
+        domain: MemoryDomain::Agent,
+        field: "tooling".to_string(),
+        anchor_kind: AnchorKind::Worktree,
+        anchor_id: "worktree:///tmp/cli-distractor".to_string(),
+        ..bootstrap_drawer(
+            "drawer_cli_distractor",
+            "cli metadata focus cli metadata focus",
+            MemoryKind::Knowledge,
+            Some(KnowledgeTier::Qi),
+            Some(KnowledgeStatus::Candidate),
+            Some("Distractor statement."),
+        )
+    };
+
+    insert_search_fixture(&db, &target, &vector_of(384, 0.25));
+    insert_search_fixture(&db, &distractor, &vector_of(384, 0.5));
+
+    let output = Command::new(mempal_bin())
+        .args([
+            "search",
+            "cli metadata focus",
+            "--wing",
+            "mempal",
+            "--room",
+            "bootstrap",
+            "--memory-kind",
+            "knowledge",
+            "--domain",
+            "skill",
+            "--field",
+            "debugging",
+            "--status",
+            "promoted",
+            "--anchor-kind",
+            "repo",
+            "--top-k",
+            "5",
+            "--json",
+        ])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run mempal search");
+
+    assert!(
+        output.status.success(),
+        "search command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server_handle.join().expect("join embedding stub");
+
+    let results: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse cli search json");
+    let results = results.as_array().expect("json result array");
+    assert_eq!(results.len(), 1, "expected one filtered search result");
+    let result = &results[0];
+
+    assert_eq!(result["drawer_id"], "drawer_cli_metadata");
+    assert_eq!(result["content"], target.content);
+    assert_eq!(result["memory_kind"], "knowledge");
+    assert_eq!(result["domain"], "skill");
+    assert_eq!(result["field"], "debugging");
+    assert_eq!(result["statement"], "CLI statement stays separate.");
+    assert_eq!(result["tier"], "shu");
+    assert_eq!(result["status"], "promoted");
+    assert_eq!(result["anchor_kind"], "repo");
+    assert_eq!(result["anchor_id"], "repo://cli-metadata");
+    assert!(result["parent_anchor_id"].is_null());
 }
