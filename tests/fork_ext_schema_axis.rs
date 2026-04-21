@@ -29,12 +29,12 @@ fn current_schema_version() -> u32 {
 }
 
 #[test]
-fn test_fork_ext_version_is_three_after_gating_phase() {
+fn test_fork_ext_version_is_four_after_novelty_phase() {
     let (_tmp, _db_path, db) = new_test_db();
 
     let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read fork-ext version");
 
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn test_fork_ext_migrations_idempotent() {
     db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("second apply");
 
     let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read fork-ext version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 #[test]
@@ -84,6 +84,22 @@ fn test_gating_audit_table_exists_after_ext_v3() {
         .conn()
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gating_audit'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query sqlite_master");
+
+    assert_eq!(exists, 1);
+}
+
+#[test]
+fn test_novelty_audit_table_exists_after_ext_v4() {
+    let (_tmp, _db_path, db) = new_test_db();
+
+    let exists = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='novelty_audit'",
             [],
             |row| row.get::<_, i64>(0),
         )

@@ -12,11 +12,11 @@ fn new_test_db() -> (TempDir, Database) {
 }
 
 #[test]
-fn test_fork_ext_v3_migration() {
+fn test_fork_ext_v4_migration() {
     let (_tmp, db) = new_test_db();
 
     let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 
     let table_exists = db
         .conn()
@@ -37,15 +37,25 @@ fn test_fork_ext_v3_migration() {
         )
         .expect("query sqlite_master");
     assert_eq!(gating_exists, 1);
+
+    let novelty_exists = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='novelty_audit'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query sqlite_master");
+    assert_eq!(novelty_exists, 1);
 }
 
 #[test]
-fn test_fork_ext_v3_migration_is_idempotent() {
+fn test_fork_ext_v4_migration_is_idempotent() {
     let (_tmp, db) = new_test_db();
 
     db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("first apply");
     db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("second apply");
 
     let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }

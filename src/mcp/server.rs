@@ -12,6 +12,7 @@ use crate::embed::{EmbedderFactory, global_embed_status};
 use crate::ingest::gating::{
     GatingDecision, GatingRuntime, IngestCandidate, evaluate_tier1, evaluate_tier2, tier2_enabled,
 };
+use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
 use crate::search::{resolve_route, search_with_vector};
 use anyhow::Context;
 use rmcp::{
@@ -216,6 +217,8 @@ impl MempalMcpServer {
             return Ok(Json(IngestResponse {
                 drawer_id,
                 gating_decision: None,
+                novelty_action: None,
+                near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms: None,
                 system_warnings: current_system_warnings(),
@@ -250,13 +253,15 @@ impl MempalMcpServer {
                 // Return the candidate-derived drawer_id for audit correlation.
                 drawer_id,
                 gating_decision,
+                novelty_action: None,
+                near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms: None,
                 system_warnings: current_system_warnings(),
             }));
         }
 
-        let db = self.open_db()?;
+        let mut db = self.open_db()?;
 
         // P9-B reordered this path so the same-content lock is acquired
         // before the expensive embedder call. That keeps concurrent manual
@@ -302,6 +307,8 @@ impl MempalMcpServer {
             return Ok(Json(IngestResponse {
                 drawer_id,
                 gating_decision,
+                novelty_action: None,
+                near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms,
                 system_warnings: current_system_warnings(),
@@ -327,29 +334,158 @@ impl MempalMcpServer {
 
         // Semantic dedup check: find most similar existing drawer
         let duplicate_warning = check_semantic_duplicate(&db, &vector, &scrubbed_content);
-        if !db.drawer_exists(&drawer_id).map_err(db_error)? {
-            let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());
-            db.insert_drawer(&Drawer {
-                id: drawer_id.clone(),
-                content: scrubbed_content.clone(),
-                wing: request.wing.clone(),
-                room: request.room.clone(),
-                source_file: Some(source_file),
-                source_type: SourceType::Manual,
-                added_at: current_timestamp(),
-                chunk_index: Some(0),
-                importance: request.importance.unwrap_or(0),
-            })
-            .map_err(db_error)?;
-            db.insert_vector(&drawer_id, &vector).map_err(db_error)?;
+        let novelty_candidate = NoveltyCandidate {
+            wing: request.wing.clone(),
+            room: request.room.clone(),
+        };
+        let novelty = evaluate_novelty(
+            &db,
+            &novelty_candidate,
+            &vector,
+            &self.config.ingest_gating.novelty,
+        );
+        let mut response_drawer_id = drawer_id.clone();
+        let (novelty_action, near_drawer_id);
+
+        match novelty.action {
+            NoveltyAction::Insert => {
+                if novelty.should_audit {
+                    db.record_novelty_audit(
+                        &drawer_id,
+                        NoveltyAction::Insert,
+                        novelty.near_drawer_id.as_deref(),
+                        novelty.cosine,
+                        novelty.audit_decision,
+                    )
+                    .map_err(db_error)?;
+                }
+                novelty_action = Some(NoveltyAction::Insert);
+                near_drawer_id = novelty.near_drawer_id.clone();
+                if !db.drawer_exists(&drawer_id).map_err(db_error)? {
+                    let source_file =
+                        source_file_or_synthetic(&drawer_id, request.source.as_deref());
+                    db.insert_drawer(&Drawer {
+                        id: drawer_id.clone(),
+                        content: scrubbed_content.clone(),
+                        wing: request.wing.clone(),
+                        room: request.room.clone(),
+                        source_file: Some(source_file),
+                        source_type: SourceType::Manual,
+                        added_at: current_timestamp(),
+                        chunk_index: Some(0),
+                        importance: request.importance.unwrap_or(0),
+                    })
+                    .map_err(db_error)?;
+                    db.insert_vector(&drawer_id, &vector).map_err(db_error)?;
+                }
+            }
+            NoveltyAction::Drop => {
+                if novelty.should_audit {
+                    db.record_novelty_audit(
+                        &drawer_id,
+                        NoveltyAction::Drop,
+                        novelty.near_drawer_id.as_deref(),
+                        novelty.cosine,
+                        novelty.audit_decision,
+                    )
+                    .map_err(db_error)?;
+                }
+                novelty_action = Some(NoveltyAction::Drop);
+                near_drawer_id = novelty.near_drawer_id.clone();
+                response_drawer_id = novelty.near_drawer_id.unwrap_or(drawer_id.clone());
+            }
+            NoveltyAction::Merge => {
+                let target_id = novelty.near_drawer_id.clone().ok_or_else(|| {
+                    ErrorData::internal_error("novelty merge missing target", None)
+                })?;
+                let (existing_content, merge_count) = db
+                    .drawer_merge_state(&target_id)
+                    .map_err(db_error)?
+                    .ok_or_else(|| {
+                        ErrorData::internal_error("novelty merge target missing", None)
+                    })?;
+                let merged_at = current_timestamp();
+                let merged_content = format!(
+                    "{existing_content}\n---\nSUPPLEMENTARY ({merged_at}):\n{scrubbed_content}"
+                );
+                let capped = merge_count >= self.config.ingest_gating.novelty.max_merges_per_drawer
+                    || merged_content.len()
+                        > self
+                            .config
+                            .ingest_gating
+                            .novelty
+                            .max_content_bytes_per_drawer;
+                if capped {
+                    db.record_novelty_audit(
+                        &drawer_id,
+                        NoveltyAction::Insert,
+                        Some(target_id.as_str()),
+                        novelty.cosine,
+                        Some("insert_due_to_merge_cap"),
+                    )
+                    .map_err(db_error)?;
+                    novelty_action = Some(NoveltyAction::Insert);
+                    near_drawer_id = Some(target_id);
+                    if !db.drawer_exists(&drawer_id).map_err(db_error)? {
+                        let source_file =
+                            source_file_or_synthetic(&drawer_id, request.source.as_deref());
+                        db.insert_drawer(&Drawer {
+                            id: drawer_id.clone(),
+                            content: scrubbed_content.clone(),
+                            wing: request.wing.clone(),
+                            room: request.room.clone(),
+                            source_file: Some(source_file),
+                            source_type: SourceType::Manual,
+                            added_at: current_timestamp(),
+                            chunk_index: Some(0),
+                            importance: request.importance.unwrap_or(0),
+                        })
+                        .map_err(db_error)?;
+                        db.insert_vector(&drawer_id, &vector).map_err(db_error)?;
+                    }
+                } else {
+                    let merged_vector = embedder
+                        .embed(&[merged_content.as_str()])
+                        .await
+                        .map_err(|error| {
+                            ErrorData::internal_error(format!("embedding failed: {error}"), None)
+                        })?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            ErrorData::internal_error("embedder returned no vector", None)
+                        })?;
+                    ensure_vector_dim_matches(&db, merged_vector.len())?;
+                    db.update_drawer_after_merge(
+                        &target_id,
+                        &merged_content,
+                        &merged_at,
+                        &merged_vector,
+                    )
+                    .map_err(db_error)?;
+                    db.record_novelty_audit(
+                        &drawer_id,
+                        NoveltyAction::Merge,
+                        Some(target_id.as_str()),
+                        novelty.cosine,
+                        novelty.audit_decision,
+                    )
+                    .map_err(db_error)?;
+                    novelty_action = Some(NoveltyAction::Merge);
+                    near_drawer_id = Some(target_id.clone());
+                    response_drawer_id = target_id;
+                }
+            }
         }
 
         // lock_guard drops here, releasing the advisory lock.
         drop(lock_guard);
 
         Ok(Json(IngestResponse {
-            drawer_id,
+            drawer_id: response_drawer_id,
             gating_decision,
+            novelty_action,
+            near_drawer_id,
             duplicate_warning,
             lock_wait_ms,
             system_warnings: current_system_warnings(),

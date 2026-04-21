@@ -565,6 +565,7 @@ pub struct IngestGatingConfig {
     pub enabled: bool,
     pub rules: Vec<GatingRuleConfig>,
     pub embedding_classifier: EmbeddingClassifierConfig,
+    pub novelty: NoveltyConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -592,6 +593,32 @@ impl Default for EmbeddingClassifierConfig {
             enabled: false,
             threshold: 0.35,
             prototypes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct NoveltyConfig {
+    pub enabled: bool,
+    pub duplicate_threshold: f32,
+    pub merge_threshold: f32,
+    pub wing_scope: String,
+    pub top_k_candidates: usize,
+    pub max_merges_per_drawer: u32,
+    pub max_content_bytes_per_drawer: usize,
+}
+
+impl Default for NoveltyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            duplicate_threshold: 0.95,
+            merge_threshold: 0.80,
+            wing_scope: "same_wing".to_string(),
+            top_k_candidates: 5,
+            max_merges_per_drawer: 10,
+            max_content_bytes_per_drawer: 65_536,
         }
     }
 }

@@ -24,7 +24,7 @@ fn new_store() -> (TempDir, PathBuf, PendingMessageStore) {
 }
 
 #[test]
-fn test_fork_ext_migration_v0_to_v3_preserves_pending_messages_table() {
+fn test_fork_ext_migration_v0_to_v4_preserves_pending_messages_table() {
     let (_tmp, db_path, _store) = new_store();
     let conn = Connection::open(db_path).expect("open sqlite");
 
@@ -35,7 +35,7 @@ fn test_fork_ext_migration_v0_to_v3_preserves_pending_messages_table() {
             |row| row.get::<_, String>(0),
         )
         .expect("read fork_ext_version");
-    assert_eq!(version, "3");
+    assert_eq!(version, "4");
 
     let exists = conn
         .query_row(

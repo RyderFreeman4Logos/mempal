@@ -474,7 +474,7 @@ async fn test_status_prints_config_version_and_loaded_at() {
     assert!(
         stdout
             .lines()
-            .any(|line| line.trim() == "fork_ext_version: 3"),
+            .any(|line| line.trim() == "fork_ext_version: 4"),
         "fork_ext_version line missing from status: {stdout}"
     );
     let line = stdout

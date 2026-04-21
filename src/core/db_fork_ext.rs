@@ -58,6 +58,37 @@ CREATE INDEX IF NOT EXISTS idx_gating_audit_candidate_hash
     ON gating_audit(candidate_hash);
 "#;
 
+pub const FORK_EXT_V4_SCHEMA_SQL: &str = r#"
+ALTER TABLE drawers ADD COLUMN merge_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE drawers ADD COLUMN updated_at TEXT;
+
+CREATE TABLE IF NOT EXISTS novelty_audit (
+    id TEXT PRIMARY KEY,
+    candidate_hash TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    near_drawer_id TEXT,
+    cosine REAL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_novelty_audit_created_at
+    ON novelty_audit(created_at);
+CREATE INDEX IF NOT EXISTS idx_novelty_audit_candidate_hash
+    ON novelty_audit(candidate_hash);
+
+-- TODO(spec ambiguity): earlier spec drafts referred to this trigger as
+-- `drawers_au_fts`, while the task prompt provided the concrete
+-- `drawers_fts_after_update` name. Standardize on the prompt name here and
+-- drop the older draft name if it exists.
+DROP TRIGGER IF EXISTS drawers_au_fts;
+DROP TRIGGER IF EXISTS drawers_fts_after_update;
+CREATE TRIGGER drawers_fts_after_update
+AFTER UPDATE OF content ON drawers BEGIN
+    INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+    INSERT INTO drawers_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+"#;
+
 struct Migration {
     version: u32,
     up: fn(&Connection) -> rusqlite::Result<()>,
@@ -119,6 +150,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 3,
             up: apply_v3,
         },
+        Migration {
+            version: 4,
+            up: apply_v4,
+        },
     ]
 }
 
@@ -132,6 +167,10 @@ fn apply_v2(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v3(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V3_SCHEMA_SQL)
+}
+
+fn apply_v4(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V4_SCHEMA_SQL)
 }
 
 pub fn apply_fork_ext_migrations(conn: &Connection) -> rusqlite::Result<()> {

@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use super::types::{Drawer, SourceType, TaxonomyEntry, Triple, TripleStats};
 use crate::ingest::gating::GatingDecision;
+use crate::ingest::novelty::NoveltyAction;
 
 const CURRENT_SCHEMA_VERSION: u32 = 4;
 
@@ -189,6 +190,82 @@ impl Database {
         Ok(())
     }
 
+    pub fn drawer_merge_state(&self, drawer_id: &str) -> Result<Option<(String, u32)>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT content, COALESCE(merge_count, 0) FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+        )?;
+        let mut rows = statement.query_map([drawer_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn update_drawer_after_merge(
+        &mut self,
+        drawer_id: &str,
+        merged_content: &str,
+        updated_at: &str,
+        vector: &[f32],
+    ) -> Result<(), DbError> {
+        self.ensure_vectors_table(vector.len())?;
+        let vector_json = serde_json::to_string(vector)?;
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            r#"
+            UPDATE drawers
+            SET content = ?2,
+                updated_at = ?3,
+                merge_count = COALESCE(merge_count, 0) + 1
+            WHERE id = ?1
+            "#,
+            params![drawer_id, merged_content, updated_at],
+        )?;
+        transaction.execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])?;
+        transaction.execute(
+            "INSERT INTO drawer_vectors (id, embedding) VALUES (?1, vec_f32(?2))",
+            params![drawer_id, vector_json],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn record_novelty_audit(
+        &self,
+        candidate_hash: &str,
+        action: NoveltyAction,
+        near_drawer_id: Option<&str>,
+        cosine: Option<f32>,
+        audit_decision: Option<&str>,
+    ) -> Result<(), DbError> {
+        let created_at = super::utils::current_timestamp()
+            .parse::<i64>()
+            .unwrap_or_default();
+        let unique_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let decision = audit_decision
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| action.as_str().to_string());
+        let id_seed = format!(
+            "{candidate_hash}:{created_at}:{unique_nanos}:{decision}:{}:{}",
+            near_drawer_id.unwrap_or_default(),
+            cosine.unwrap_or_default()
+        );
+        let id = format!("novelty_{}", blake3::hash(id_seed.as_bytes()).to_hex());
+        self.conn.execute(
+            r#"
+            INSERT INTO novelty_audit (id, candidate_hash, decision, near_drawer_id, cosine, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![id, candidate_hash, decision, near_drawer_id, cosine, created_at],
+        )?;
+        Ok(())
+    }
+
     pub fn taxonomy_entries(&self) -> Result<Vec<TaxonomyEntry>, DbError> {
         let mut statement = self.conn.prepare(
             "SELECT wing, room, display_name, keywords FROM taxonomy ORDER BY wing, room",
@@ -312,6 +389,53 @@ impl Database {
             (drawer_id, vector_json.as_str()),
         )?;
         Ok(())
+    }
+
+    pub fn novelty_candidates(
+        &self,
+        query_vector: &[f32],
+        wing: Option<&str>,
+        room: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, f32)>, DbError> {
+        let vectors_exist: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !vectors_exist || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let query_json = serde_json::to_string(query_vector)?;
+        let limit =
+            i64::try_from(limit).map_err(|_| DbError::InvalidSourceType("limit".to_string()))?;
+        let mut statement = self.conn.prepare(
+            r#"
+            WITH matches AS (
+                SELECT id
+                FROM drawer_vectors
+                WHERE embedding MATCH vec_f32(?1)
+                  AND k = ?2
+            )
+            SELECT d.id,
+                   CAST(1.0 - vec_distance_cosine(v.embedding, vec_f32(?1)) AS REAL) AS similarity
+            FROM matches
+            JOIN drawer_vectors v ON v.id = matches.id
+            JOIN drawers d ON d.id = matches.id
+            WHERE d.deleted_at IS NULL
+              AND (?3 IS NULL OR d.wing = ?3)
+              AND (?4 IS NULL OR d.room = ?4)
+            ORDER BY similarity DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement
+            .query_map((query_json.as_str(), limit, wing, room), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Ensure drawer_vectors table exists with the right dimension.

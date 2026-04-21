@@ -20,6 +20,7 @@ use crate::ingest::gating::{
     GatingDecision, IngestCandidate, PrototypeClassifier, compile_classifier_from_embedder,
     evaluate_tier1, tier2_enabled,
 };
+use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
@@ -225,22 +226,128 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         Some(vector) => vector,
         None => embed_text_with_heartbeat(embedder, &record.content, Some(&heartbeat)).await?,
     };
-    let drawer = Drawer {
-        id: drawer_id.clone(),
-        content: record.content,
-        wing: record.wing,
-        room: Some(record.room),
-        source_file: Some(record.source_file),
-        source_type: SourceType::Manual,
-        added_at: current_timestamp(),
-        chunk_index: Some(0),
-        importance: 0,
-    };
-    db.insert_drawer(&drawer)
-        .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
-    db.insert_vector(&drawer.id, &vector)
-        .with_context(|| format!("failed to insert hook vector {}", drawer.id))?;
-    Ok(drawer_id)
+    let novelty = evaluate_novelty(
+        db,
+        &NoveltyCandidate {
+            wing: record.wing.clone(),
+            room: Some(record.room.clone()),
+        },
+        &vector,
+        &context.config.ingest_gating.novelty,
+    );
+    match novelty.action {
+        NoveltyAction::Insert => {
+            if novelty.should_audit {
+                db.record_novelty_audit(
+                    &drawer_id,
+                    NoveltyAction::Insert,
+                    novelty.near_drawer_id.as_deref(),
+                    novelty.cosine,
+                    novelty.audit_decision,
+                )
+                .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+            }
+            let drawer = Drawer {
+                id: drawer_id.clone(),
+                content: record.content,
+                wing: record.wing,
+                room: Some(record.room),
+                source_file: Some(record.source_file),
+                source_type: SourceType::Manual,
+                added_at: current_timestamp(),
+                chunk_index: Some(0),
+                importance: 0,
+            };
+            db.insert_drawer(&drawer)
+                .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
+            db.insert_vector(&drawer.id, &vector)
+                .with_context(|| format!("failed to insert hook vector {}", drawer.id))?;
+            Ok(drawer_id)
+        }
+        NoveltyAction::Drop => {
+            if novelty.should_audit {
+                db.record_novelty_audit(
+                    &drawer_id,
+                    NoveltyAction::Drop,
+                    novelty.near_drawer_id.as_deref(),
+                    novelty.cosine,
+                    novelty.audit_decision,
+                )
+                .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+            }
+            Ok(novelty.near_drawer_id.unwrap_or(drawer_id))
+        }
+        NoveltyAction::Merge => {
+            let target_id = novelty
+                .near_drawer_id
+                .clone()
+                .unwrap_or_else(|| drawer_id.clone());
+            let (existing_content, merge_count) = db
+                .drawer_merge_state(&target_id)
+                .with_context(|| format!("failed to load merge target {}", target_id))?
+                .ok_or_else(|| anyhow::anyhow!("novelty merge target missing: {}", target_id))?;
+            let merged_at = current_timestamp();
+            let merged_content = format!(
+                "{existing_content}\n---\nSUPPLEMENTARY ({merged_at}):\n{}",
+                record.content
+            );
+            let capped = merge_count >= context.config.ingest_gating.novelty.max_merges_per_drawer
+                || merged_content.len()
+                    > context
+                        .config
+                        .ingest_gating
+                        .novelty
+                        .max_content_bytes_per_drawer;
+            if capped {
+                db.record_novelty_audit(
+                    &drawer_id,
+                    NoveltyAction::Insert,
+                    Some(target_id.as_str()),
+                    novelty.cosine,
+                    Some("insert_due_to_merge_cap"),
+                )
+                .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+                let drawer = Drawer {
+                    id: drawer_id.clone(),
+                    content: record.content,
+                    wing: record.wing,
+                    room: Some(record.room),
+                    source_file: Some(record.source_file),
+                    source_type: SourceType::Manual,
+                    added_at: current_timestamp(),
+                    chunk_index: Some(0),
+                    importance: 0,
+                };
+                db.insert_drawer(&drawer)
+                    .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
+                db.insert_vector(&drawer.id, &vector)
+                    .with_context(|| format!("failed to insert hook vector {}", drawer.id))?;
+                Ok(drawer_id)
+            } else {
+                let merged_vector =
+                    embed_text_with_heartbeat(embedder, &merged_content, Some(&heartbeat)).await?;
+                db.record_novelty_audit(
+                    &drawer_id,
+                    NoveltyAction::Merge,
+                    Some(target_id.as_str()),
+                    novelty.cosine,
+                    novelty.audit_decision,
+                )
+                .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+                let mut db_for_merge = Database::open(db.path())
+                    .with_context(|| format!("failed to reopen db for merge {}", target_id))?;
+                db_for_merge
+                    .update_drawer_after_merge(
+                        &target_id,
+                        &merged_content,
+                        &merged_at,
+                        &merged_vector,
+                    )
+                    .with_context(|| format!("failed to merge hook drawer {}", target_id))?;
+                Ok(target_id)
+            }
+        }
+    }
 }
 
 fn build_gating_candidate(
