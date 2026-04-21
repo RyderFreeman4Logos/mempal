@@ -22,8 +22,9 @@ use super::tools::{
     CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DuplicateWarning,
     EmbedStatusDto, FactCheckRequest, FactCheckResponse, IngestRequest, IngestResponse, KgRequest,
     KgResponse, KgStatsDto, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto,
-    ScopeCount, SearchRequest, SearchResponse, SearchResultDto, StatusResponse, SystemWarning,
-    TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
+    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, StatusResponse,
+    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto,
+    TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -126,6 +127,7 @@ impl MempalMcpServer {
                 failed: queue_stats.failed,
                 oldest_pending_age_secs: queue_stats.oldest_pending_age_secs,
             },
+            scrub_stats: ScrubStatsDto::from(ConfigHandle::scrub_stats()),
             system_warnings: current_system_warnings(),
         }))
     }
@@ -138,7 +140,6 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<SearchRequest>,
     ) -> std::result::Result<Json<SearchResponse>, ErrorData> {
-        let _cfg = ConfigHandle::current();
         let embedder = self.embedder_factory.build().await.map_err(|error| {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
         })?;
@@ -202,8 +203,10 @@ impl MempalMcpServer {
 
         let db = self.open_db()?;
 
-        // Same-content manual ingests should serialize before the expensive
-        // embedder call so concurrent duplicates do not race past the lock.
+        // P9-B reordered this path so the same-content lock is acquired
+        // before the expensive embedder call. That keeps concurrent manual
+        // ingests from racing past the dedup gate and writing duplicate
+        // drawers/vectors for identical content.
         let mempal_home = db
             .path()
             .parent()
@@ -268,7 +271,6 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<DeleteRequest>,
     ) -> std::result::Result<Json<DeleteResponse>, ErrorData> {
-        let _cfg = ConfigHandle::current();
         let db = self.open_db()?;
         let deleted = db
             .soft_delete_drawer(&request.drawer_id)
@@ -294,7 +296,6 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<TaxonomyRequest>,
     ) -> std::result::Result<Json<TaxonomyResponse>, ErrorData> {
-        let _cfg = ConfigHandle::current();
         let db = self.open_db()?;
         match request.action.as_str() {
             "list" => {
@@ -348,7 +349,6 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<KgRequest>,
     ) -> std::result::Result<Json<KgResponse>, ErrorData> {
-        let _cfg = ConfigHandle::current();
         let block_writes = global_embed_status().should_block_writes();
         let db = self.open_db()?;
         match request.action.as_str() {
