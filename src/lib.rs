@@ -14,3 +14,4 @@ pub mod hook_install;
 pub mod ingest;
 pub mod mcp;
 pub mod search;
+pub mod session_review;
