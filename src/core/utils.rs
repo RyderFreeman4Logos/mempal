@@ -21,6 +21,29 @@ pub fn build_drawer_id(wing: &str, room: Option<&str>, content: &str) -> String 
     )
 }
 
+pub fn build_bootstrap_drawer_id(
+    wing: &str,
+    room: Option<&str>,
+    content: &str,
+    identity_components: &[String],
+) -> String {
+    let room = room.unwrap_or(DEFAULT_ROOM);
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    for component in identity_components {
+        hasher.update([0]);
+        hasher.update(component.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+
+    format!(
+        "drawer_{}_{}_{}",
+        sanitize_component(wing),
+        sanitize_component(room),
+        &digest[..8]
+    )
+}
+
 pub fn build_triple_id(subject: &str, predicate: &str, object: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(subject.as_bytes());

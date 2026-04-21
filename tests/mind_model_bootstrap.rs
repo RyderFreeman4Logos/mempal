@@ -1,6 +1,7 @@
 //! Integration tests for P12 stage-1 mind-model bootstrap schema/core work.
 
 use std::sync::Arc;
+use std::{fs, path::Path};
 
 use async_trait::async_trait;
 use mempal::core::types::{
@@ -130,6 +131,14 @@ fn setup_mcp_server() -> (TempDir, Database, MempalMcpServer) {
         }),
     );
     (tmp, db, server)
+}
+
+fn init_git_repo(path: &Path) {
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(path)
+        .output()
+        .expect("git init should run");
 }
 
 #[test]
@@ -413,6 +422,29 @@ async fn test_knowledge_drawer_requires_statement_and_supporting_refs() {
 }
 
 #[tokio::test]
+async fn test_knowledge_drawer_rejects_non_drawer_supporting_refs() {
+    let (_tmp, _db, server) = setup_mcp_server();
+    let error = server
+        .ingest_json_for_test(json!({
+            "content": "Knowledge body with malformed refs",
+            "wing": "mempal",
+            "memory_kind": "knowledge",
+            "statement": "Debug by reproducing before patching.",
+            "tier": "shu",
+            "status": "promoted",
+            "supporting_refs": ["not-a-drawer-id"]
+        }))
+        .await
+        .expect_err("knowledge drawers should reject malformed supporting refs");
+    let message = error.to_string();
+
+    assert!(
+        message.contains("supporting_refs") && message.contains("drawer"),
+        "unexpected error: {message}"
+    );
+}
+
+#[tokio::test]
 async fn test_dao_tian_rejects_noncanonical_status() {
     let (_tmp, _db, server) = setup_mcp_server();
     let error = server
@@ -435,4 +467,163 @@ async fn test_dao_tian_rejects_noncanonical_status() {
             && message.contains("demoted"),
         "unexpected error: {message}"
     );
+}
+
+#[tokio::test]
+async fn test_mcp_ingest_same_content_different_anchors_stays_distinct() {
+    let (_tmp, db, server) = setup_mcp_server();
+    let first = server
+        .ingest_json_for_test(json!({
+            "content": "Anchor-local memory body",
+            "wing": "mempal",
+            "memory_kind": "evidence",
+            "anchor_kind": "repo",
+            "anchor_id": "repo://anchor-a"
+        }))
+        .await
+        .expect("first ingest should succeed");
+    let second = server
+        .ingest_json_for_test(json!({
+            "content": "Anchor-local memory body",
+            "wing": "mempal",
+            "memory_kind": "knowledge",
+            "statement": "Anchor-local memory body.",
+            "tier": "shu",
+            "status": "promoted",
+            "supporting_refs": ["drawer_ev_001"],
+            "anchor_kind": "repo",
+            "anchor_id": "repo://anchor-b"
+        }))
+        .await
+        .expect("second ingest should succeed");
+
+    assert_ne!(first.drawer_id, second.drawer_id);
+    let first_drawer = db
+        .get_drawer(&first.drawer_id)
+        .expect("load first drawer")
+        .expect("first drawer exists");
+    let second_drawer = db
+        .get_drawer(&second.drawer_id)
+        .expect("load second drawer")
+        .expect("second drawer exists");
+    assert_ne!(first_drawer.anchor_id, second_drawer.anchor_id);
+    assert_ne!(first_drawer.memory_kind, second_drawer.memory_kind);
+}
+
+#[tokio::test]
+async fn test_evidence_drawer_accepts_explicit_runtime_or_research_provenance() {
+    let (_tmp, db, server) = setup_mcp_server();
+    let runtime = server
+        .ingest_json_for_test(json!({
+            "content": "Runtime evidence body",
+            "wing": "mempal",
+            "memory_kind": "evidence",
+            "provenance": "runtime",
+            "anchor_kind": "repo",
+            "anchor_id": "repo://runtime"
+        }))
+        .await
+        .expect("runtime provenance evidence should succeed");
+    let research = server
+        .ingest_json_for_test(json!({
+            "content": "Research evidence body",
+            "wing": "mempal",
+            "memory_kind": "evidence",
+            "provenance": "research",
+            "anchor_kind": "repo",
+            "anchor_id": "repo://research"
+        }))
+        .await
+        .expect("research provenance evidence should succeed");
+
+    assert_eq!(
+        db.get_drawer(&runtime.drawer_id)
+            .expect("load runtime drawer")
+            .expect("runtime drawer exists")
+            .provenance,
+        Some(Provenance::Runtime)
+    );
+    assert_eq!(
+        db.get_drawer(&research.drawer_id)
+            .expect("load research drawer")
+            .expect("research drawer exists")
+            .provenance,
+        Some(Provenance::Research)
+    );
+}
+
+#[tokio::test]
+async fn test_anchor_derivation_handles_git_and_non_git_cwd() {
+    let (tmp, db, server) = setup_mcp_server();
+    let git_root = tmp.path().join("repo");
+    fs::create_dir_all(&git_root).expect("create git root");
+    init_git_repo(&git_root);
+
+    let non_git = tmp.path().join("standalone");
+    fs::create_dir_all(&non_git).expect("create standalone dir");
+
+    let git_response = server
+        .ingest_json_for_test(json!({
+            "content": "Git anchored evidence",
+            "wing": "mempal",
+            "cwd": git_root.to_string_lossy()
+        }))
+        .await
+        .expect("git cwd ingest should succeed");
+    let non_git_response = server
+        .ingest_json_for_test(json!({
+            "content": "Standalone anchored evidence",
+            "wing": "mempal",
+            "cwd": non_git.to_string_lossy()
+        }))
+        .await
+        .expect("non-git cwd ingest should succeed");
+
+    let git_drawer = db
+        .get_drawer(&git_response.drawer_id)
+        .expect("load git drawer")
+        .expect("git drawer exists");
+    let non_git_drawer = db
+        .get_drawer(&non_git_response.drawer_id)
+        .expect("load non-git drawer")
+        .expect("non-git drawer exists");
+
+    assert_eq!(git_drawer.anchor_kind, AnchorKind::Worktree);
+    assert!(git_drawer.anchor_id.starts_with("worktree://"));
+    assert!(
+        git_drawer
+            .parent_anchor_id
+            .as_deref()
+            .is_some_and(|value| value.starts_with("repo://"))
+    );
+
+    assert_eq!(non_git_drawer.anchor_kind, AnchorKind::Worktree);
+    assert!(non_git_drawer.anchor_id.starts_with("worktree://"));
+    assert_eq!(non_git_drawer.parent_anchor_id, None);
+}
+
+#[tokio::test]
+async fn test_knowledge_drawer_gets_synthetic_knowledge_source_uri() {
+    let (_tmp, db, server) = setup_mcp_server();
+    let response = server
+        .ingest_json_for_test(json!({
+            "content": "Use source-backed verification before load-bearing claims.",
+            "wing": "mempal",
+            "memory_kind": "knowledge",
+            "domain": "skill",
+            "field": "debugging",
+            "statement": "Debug by reproducing before patching.",
+            "tier": "shu",
+            "status": "promoted",
+            "supporting_refs": ["drawer_ev_001"]
+        }))
+        .await
+        .expect("knowledge ingest should succeed");
+
+    let drawer = db
+        .get_drawer(&response.drawer_id)
+        .expect("load knowledge drawer")
+        .expect("knowledge drawer exists");
+    let source = drawer.source_file.expect("knowledge source uri");
+    assert!(source.starts_with("knowledge://skill/debugging/shu/"));
 }

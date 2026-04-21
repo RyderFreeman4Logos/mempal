@@ -9,7 +9,7 @@ use crate::core::{
         SourceType, TriggerHints, Triple,
     },
     utils::{
-        build_drawer_id, build_triple_id, current_timestamp, knowledge_source_file,
+        build_bootstrap_drawer_id, build_triple_id, current_timestamp, knowledge_source_file,
         source_file_or_synthetic,
     },
 };
@@ -106,6 +106,60 @@ struct ValidatedIngestMetadata {
     trigger_hints: Option<TriggerHints>,
 }
 
+impl ValidatedIngestMetadata {
+    fn identity_components(&self) -> Vec<String> {
+        let mut components = vec![
+            format!("memory_kind={}", memory_kind_slug(&self.memory_kind)),
+            format!("domain={}", domain_slug(&self.domain)),
+            format!("field={}", self.field),
+            format!("anchor_kind={}", anchor_kind_slug(&self.anchor_kind)),
+            format!("anchor_id={}", self.anchor_id),
+            format!(
+                "parent_anchor_id={}",
+                self.parent_anchor_id.as_deref().unwrap_or("")
+            ),
+            format!(
+                "provenance={}",
+                self.provenance.as_ref().map(provenance_slug).unwrap_or("")
+            ),
+            format!("statement={}", self.statement.as_deref().unwrap_or("")),
+            format!(
+                "tier={}",
+                self.tier.as_ref().map(knowledge_tier_slug).unwrap_or("")
+            ),
+            format!(
+                "status={}",
+                self.status
+                    .as_ref()
+                    .map(knowledge_status_slug)
+                    .unwrap_or("")
+            ),
+            format!(
+                "scope_constraints={}",
+                self.scope_constraints.as_deref().unwrap_or("")
+            ),
+            format!("supporting_refs={}", self.supporting_refs.join(",")),
+            format!("counterexample_refs={}", self.counterexample_refs.join(",")),
+            format!("teaching_refs={}", self.teaching_refs.join(",")),
+            format!("verification_refs={}", self.verification_refs.join(",")),
+        ];
+
+        if let Some(trigger_hints) = &self.trigger_hints {
+            components.push(format!(
+                "intent_tags={}",
+                trigger_hints.intent_tags.join(",")
+            ));
+            components.push(format!(
+                "workflow_bias={}",
+                trigger_hints.workflow_bias.join(",")
+            ));
+            components.push(format!("tool_needs={}", trigger_hints.tool_needs.join(",")));
+        }
+
+        components
+    }
+}
+
 fn validate_ingest_request(
     request: &IngestRequest,
     source_type: &SourceType,
@@ -131,12 +185,6 @@ fn validate_ingest_request(
 
     match memory_kind {
         MemoryKind::Evidence => {
-            if provenance.is_some() && !matches!(provenance, Some(Provenance::Human)) {
-                return Err(ErrorData::invalid_params(
-                    "evidence provenance must be omitted or use the default source-derived value",
-                    None,
-                ));
-            }
             if statement.is_some()
                 || tier.is_some()
                 || status.is_some()
@@ -207,6 +255,7 @@ fn validate_ingest_request(
                     None,
                 ));
             }
+            validate_supporting_refs(&supporting_refs)?;
 
             validate_tier_status(&tier, &status)?;
 
@@ -391,6 +440,25 @@ fn normalize_refs(values: Option<&[String]>) -> Vec<String> {
         .collect()
 }
 
+fn validate_supporting_refs(values: &[String]) -> std::result::Result<(), ErrorData> {
+    if values.iter().all(|value| looks_like_drawer_id(value)) {
+        Ok(())
+    } else {
+        Err(ErrorData::invalid_params(
+            "supporting_refs must contain drawer ids",
+            None,
+        ))
+    }
+}
+
+fn looks_like_drawer_id(value: &str) -> bool {
+    value.starts_with("drawer_")
+        && value.len() > "drawer_".len()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
 fn trigger_hints_from_dto(dto: &TriggerHintsDto) -> TriggerHints {
     TriggerHints {
         intent_tags: normalize_refs(Some(&dto.intent_tags)),
@@ -409,6 +477,57 @@ fn trim_to_owned(value: Option<&str>) -> Option<String> {
 
 fn anchor_error(error: anchor::AnchorError) -> ErrorData {
     ErrorData::invalid_params(error.to_string(), None)
+}
+
+fn memory_kind_slug(value: &MemoryKind) -> &'static str {
+    match value {
+        MemoryKind::Evidence => "evidence",
+        MemoryKind::Knowledge => "knowledge",
+    }
+}
+
+fn domain_slug(value: &MemoryDomain) -> &'static str {
+    match value {
+        MemoryDomain::Project => "project",
+        MemoryDomain::Agent => "agent",
+        MemoryDomain::Skill => "skill",
+        MemoryDomain::Global => "global",
+    }
+}
+
+fn anchor_kind_slug(value: &AnchorKind) -> &'static str {
+    match value {
+        AnchorKind::Global => "global",
+        AnchorKind::Repo => "repo",
+        AnchorKind::Worktree => "worktree",
+    }
+}
+
+fn provenance_slug(value: &Provenance) -> &'static str {
+    match value {
+        Provenance::Runtime => "runtime",
+        Provenance::Research => "research",
+        Provenance::Human => "human",
+    }
+}
+
+fn knowledge_tier_slug(value: &KnowledgeTier) -> &'static str {
+    match value {
+        KnowledgeTier::Qi => "qi",
+        KnowledgeTier::Shu => "shu",
+        KnowledgeTier::DaoRen => "dao_ren",
+        KnowledgeTier::DaoTian => "dao_tian",
+    }
+}
+
+fn knowledge_status_slug(value: &KnowledgeStatus) -> &'static str {
+    match value {
+        KnowledgeStatus::Candidate => "candidate",
+        KnowledgeStatus::Promoted => "promoted",
+        KnowledgeStatus::Canonical => "canonical",
+        KnowledgeStatus::Demoted => "demoted",
+        KnowledgeStatus::Retired => "retired",
+    }
 }
 
 #[tool_router(router = tool_router)]
@@ -497,8 +616,13 @@ impl MempalMcpServer {
         Parameters(request): Parameters<IngestRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let room = request.room.as_deref();
-        let drawer_id = build_drawer_id(&request.wing, room, &request.content);
         let metadata = validate_ingest_request(&request, &SourceType::Manual)?;
+        let drawer_id = build_bootstrap_drawer_id(
+            &request.wing,
+            room,
+            &request.content,
+            &metadata.identity_components(),
+        );
 
         if request.dry_run.unwrap_or(false) {
             return Ok(Json(IngestResponse {
@@ -1068,6 +1192,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::core::types::BootstrapEvidenceArgs;
     use crate::embed::Embedder;
 
     #[derive(Clone)]
