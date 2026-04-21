@@ -30,6 +30,14 @@ pub enum AnchorError {
         arg: &'static str,
         stderr: String,
     },
+    #[error(
+        "invalid explicit anchor for kind={kind}: expected prefix {expected_prefix}, got {anchor_id}"
+    )]
+    InvalidExplicitAnchor {
+        kind: &'static str,
+        expected_prefix: &'static str,
+        anchor_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +82,7 @@ pub fn derive_anchor_from_cwd(cwd: Option<&Path>) -> Result<DerivedAnchor, Ancho
 
     let worktree_root = match git_rev_parse(&canonical_cwd, "--show-toplevel") {
         Ok(root) => canonicalize_path(Path::new(root.trim()))?,
-        Err(AnchorError::Git { .. }) => {
+        Err(AnchorError::Git { stderr, .. }) if is_not_git_repository_stderr(&stderr) => {
             return Ok(DerivedAnchor {
                 anchor_kind: AnchorKind::Worktree,
                 anchor_id: worktree_anchor_id(&canonical_cwd),
@@ -103,6 +111,40 @@ pub fn validate_anchor_domain(
         return Err("global anchor requires domain=global");
     }
     Ok(())
+}
+
+pub fn validate_explicit_anchor(
+    anchor_kind: &AnchorKind,
+    anchor_id: &str,
+) -> Result<(), AnchorError> {
+    let (kind, prefix) = match anchor_kind {
+        AnchorKind::Global => ("global", "global://"),
+        AnchorKind::Repo => ("repo", "repo://"),
+        AnchorKind::Worktree => ("worktree", "worktree://"),
+    };
+
+    let Some(rest) = anchor_id.strip_prefix(prefix) else {
+        return Err(AnchorError::InvalidExplicitAnchor {
+            kind,
+            expected_prefix: prefix,
+            anchor_id: anchor_id.to_string(),
+        });
+    };
+
+    if rest.trim().is_empty() {
+        return Err(AnchorError::InvalidExplicitAnchor {
+            kind,
+            expected_prefix: prefix,
+            anchor_id: anchor_id.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+pub fn is_not_git_repository_stderr(stderr: &str) -> bool {
+    let normalized = stderr.to_ascii_lowercase();
+    normalized.contains("not a git repository")
 }
 
 fn worktree_anchor_id(path: &Path) -> String {
@@ -150,4 +192,29 @@ fn git_rev_parse(cwd: &Path, arg: &'static str) -> Result<String, AnchorError> {
         arg,
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AnchorKind, is_not_git_repository_stderr, validate_explicit_anchor};
+
+    #[test]
+    fn test_not_git_repository_classifier_is_narrow() {
+        assert!(is_not_git_repository_stderr(
+            "fatal: not a git repository (or any of the parent directories): .git"
+        ));
+        assert!(!is_not_git_repository_stderr(
+            "fatal: ambiguous argument '--git-common-dir'"
+        ));
+        assert!(!is_not_git_repository_stderr(
+            "fatal: detected dubious ownership in repository"
+        ));
+    }
+
+    #[test]
+    fn test_validate_explicit_anchor_rejects_mismatched_prefix() {
+        let error = validate_explicit_anchor(&AnchorKind::Worktree, "/tmp/repo")
+            .expect_err("raw path should be rejected");
+        assert!(error.to_string().contains("worktree://"));
+    }
 }

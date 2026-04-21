@@ -445,6 +445,32 @@ async fn test_knowledge_drawer_rejects_non_drawer_supporting_refs() {
 }
 
 #[tokio::test]
+async fn test_knowledge_drawer_rejects_non_drawer_other_ref_lists() {
+    let (_tmp, _db, server) = setup_mcp_server();
+    for field in ["counterexample_refs", "teaching_refs", "verification_refs"] {
+        let error = server
+            .ingest_json_for_test(json!({
+                "content": format!("Knowledge body with malformed {field}"),
+                "wing": "mempal",
+                "memory_kind": "knowledge",
+                "statement": "Debug by reproducing before patching.",
+                "tier": "shu",
+                "status": "promoted",
+                "supporting_refs": ["drawer_ev_001"],
+                field: ["not-a-drawer-id"]
+            }))
+            .await
+            .expect_err("knowledge drawers should reject malformed ref lists");
+        let message = error.to_string();
+
+        assert!(
+            message.contains(field) && message.contains("drawer"),
+            "unexpected error for {field}: {message}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_dao_tian_rejects_noncanonical_status() {
     let (_tmp, _db, server) = setup_mcp_server();
     let error = server
@@ -508,6 +534,26 @@ async fn test_mcp_ingest_same_content_different_anchors_stays_distinct() {
         .expect("second drawer exists");
     assert_ne!(first_drawer.anchor_id, second_drawer.anchor_id);
     assert_ne!(first_drawer.memory_kind, second_drawer.memory_kind);
+}
+
+#[tokio::test]
+async fn test_mcp_ingest_rejects_malformed_explicit_anchor() {
+    let (_tmp, _db, server) = setup_mcp_server();
+    let error = server
+        .ingest_json_for_test(json!({
+            "content": "Malformed explicit anchor",
+            "wing": "mempal",
+            "anchor_kind": "worktree",
+            "anchor_id": "/tmp/repo"
+        }))
+        .await
+        .expect_err("malformed explicit anchor should fail");
+    let message = error.to_string();
+
+    assert!(
+        message.contains("invalid explicit anchor") && message.contains("worktree://"),
+        "unexpected error: {message}"
+    );
 }
 
 #[tokio::test]
@@ -626,4 +672,60 @@ async fn test_knowledge_drawer_gets_synthetic_knowledge_source_uri() {
         .expect("knowledge drawer exists");
     let source = drawer.source_file.expect("knowledge source uri");
     assert!(source.starts_with("knowledge://skill/debugging/dao_tian/"));
+}
+
+#[tokio::test]
+async fn test_bootstrap_identity_ignores_ref_and_hint_order() {
+    let (_tmp, _db, server) = setup_mcp_server();
+    let first = server
+        .ingest_json_for_test(json!({
+            "content": "Order-insensitive bootstrap identity",
+            "wing": "mempal",
+            "memory_kind": "knowledge",
+            "domain": "skill",
+            "field": "debugging",
+            "statement": "Debug by reproducing before patching.",
+            "tier": "shu",
+            "status": "promoted",
+            "supporting_refs": ["drawer_ev_002", "drawer_ev_001"],
+            "counterexample_refs": ["drawer_cex_002", "drawer_cex_001"],
+            "teaching_refs": ["drawer_teach_002", "drawer_teach_001"],
+            "verification_refs": ["drawer_verify_002", "drawer_verify_001"],
+            "trigger_hints": {
+                "intent_tags": ["zeta", "alpha"],
+                "workflow_bias": ["later", "earlier"],
+                "tool_needs": ["tool-b", "tool-a"]
+            },
+            "anchor_kind": "repo",
+            "anchor_id": "repo://identity"
+        }))
+        .await
+        .expect("first dry-run-ish identity request should succeed");
+    let second = server
+        .ingest_json_for_test(json!({
+            "content": "Order-insensitive bootstrap identity",
+            "wing": "mempal",
+            "memory_kind": "knowledge",
+            "domain": "skill",
+            "field": "debugging",
+            "statement": "Debug by reproducing before patching.",
+            "tier": "shu",
+            "status": "promoted",
+            "supporting_refs": ["drawer_ev_001", "drawer_ev_002"],
+            "counterexample_refs": ["drawer_cex_001", "drawer_cex_002"],
+            "teaching_refs": ["drawer_teach_001", "drawer_teach_002"],
+            "verification_refs": ["drawer_verify_001", "drawer_verify_002"],
+            "trigger_hints": {
+                "intent_tags": ["alpha", "zeta"],
+                "workflow_bias": ["earlier", "later"],
+                "tool_needs": ["tool-a", "tool-b"]
+            },
+            "anchor_kind": "repo",
+            "anchor_id": "repo://identity",
+            "dry_run": true
+        }))
+        .await
+        .expect("second identity request should succeed");
+
+    assert_eq!(first.drawer_id, second.drawer_id);
 }

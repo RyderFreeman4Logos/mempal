@@ -108,6 +108,10 @@ struct ValidatedIngestMetadata {
 
 impl ValidatedIngestMetadata {
     fn identity_components(&self) -> Vec<String> {
+        let supporting_refs = normalized_sorted_strings(&self.supporting_refs);
+        let counterexample_refs = normalized_sorted_strings(&self.counterexample_refs);
+        let teaching_refs = normalized_sorted_strings(&self.teaching_refs);
+        let verification_refs = normalized_sorted_strings(&self.verification_refs);
         let mut components = vec![
             format!("memory_kind={}", memory_kind_slug(&self.memory_kind)),
             format!("domain={}", domain_slug(&self.domain)),
@@ -138,22 +142,25 @@ impl ValidatedIngestMetadata {
                 "scope_constraints={}",
                 self.scope_constraints.as_deref().unwrap_or("")
             ),
-            format!("supporting_refs={}", self.supporting_refs.join(",")),
-            format!("counterexample_refs={}", self.counterexample_refs.join(",")),
-            format!("teaching_refs={}", self.teaching_refs.join(",")),
-            format!("verification_refs={}", self.verification_refs.join(",")),
+            format!("supporting_refs={}", supporting_refs.join(",")),
+            format!("counterexample_refs={}", counterexample_refs.join(",")),
+            format!("teaching_refs={}", teaching_refs.join(",")),
+            format!("verification_refs={}", verification_refs.join(",")),
         ];
 
         if let Some(trigger_hints) = &self.trigger_hints {
             components.push(format!(
                 "intent_tags={}",
-                trigger_hints.intent_tags.join(",")
+                normalized_sorted_strings(&trigger_hints.intent_tags).join(",")
             ));
             components.push(format!(
                 "workflow_bias={}",
-                trigger_hints.workflow_bias.join(",")
+                normalized_sorted_strings(&trigger_hints.workflow_bias).join(",")
             ));
-            components.push(format!("tool_needs={}", trigger_hints.tool_needs.join(",")));
+            components.push(format!(
+                "tool_needs={}",
+                normalized_sorted_strings(&trigger_hints.tool_needs).join(",")
+            ));
         }
 
         components
@@ -255,7 +262,10 @@ fn validate_ingest_request(
                     None,
                 ));
             }
-            validate_supporting_refs(&supporting_refs)?;
+            validate_drawer_refs("supporting_refs", &supporting_refs)?;
+            validate_drawer_refs("counterexample_refs", &counterexample_refs)?;
+            validate_drawer_refs("teaching_refs", &teaching_refs)?;
+            validate_drawer_refs("verification_refs", &verification_refs)?;
 
             validate_tier_status(&tier, &status)?;
 
@@ -290,11 +300,15 @@ fn validate_anchor_metadata(
     let explicit_id = trim_to_option(request.anchor_id.as_deref());
 
     let anchor = match (explicit_kind, explicit_id) {
-        (Some(kind), Some(anchor_id)) => DerivedAnchor {
-            anchor_kind: parse_anchor_kind(Some(kind))?.expect("explicit kind"),
-            anchor_id: anchor_id.to_string(),
-            parent_anchor_id: trim_to_owned(request.parent_anchor_id.as_deref()),
-        },
+        (Some(kind), Some(anchor_id)) => {
+            let anchor_kind = parse_anchor_kind(Some(kind))?.expect("explicit kind");
+            anchor::validate_explicit_anchor(&anchor_kind, anchor_id).map_err(anchor_error)?;
+            DerivedAnchor {
+                anchor_kind,
+                anchor_id: anchor_id.to_string(),
+                parent_anchor_id: trim_to_owned(request.parent_anchor_id.as_deref()),
+            }
+        }
         (Some(_), None) | (None, Some(_)) => {
             return Err(ErrorData::invalid_params(
                 "anchor_kind and anchor_id must be provided together",
@@ -440,12 +454,12 @@ fn normalize_refs(values: Option<&[String]>) -> Vec<String> {
         .collect()
 }
 
-fn validate_supporting_refs(values: &[String]) -> std::result::Result<(), ErrorData> {
+fn validate_drawer_refs(field: &str, values: &[String]) -> std::result::Result<(), ErrorData> {
     if values.iter().all(|value| looks_like_drawer_id(value)) {
         Ok(())
     } else {
         Err(ErrorData::invalid_params(
-            "supporting_refs must contain drawer ids",
+            format!("{field} must contain drawer ids"),
             None,
         ))
     }
@@ -457,6 +471,17 @@ fn looks_like_drawer_id(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn normalized_sorted_strings(values: &[String]) -> Vec<String> {
+    let mut normalized = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized
 }
 
 fn trigger_hints_from_dto(dto: &TriggerHintsDto) -> TriggerHints {
