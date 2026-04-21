@@ -1,12 +1,14 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier};
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::Database;
-use mempal::core::queue::{PendingMessageStore, QueueConfig};
+use mempal::core::queue::{LAST_ERROR_MAX_BYTES, PendingMessageStore, QueueConfig};
 use rusqlite::Connection;
 use tempfile::TempDir;
+use tokio::sync::Barrier;
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -24,41 +26,8 @@ fn new_store() -> (TempDir, PathBuf, PendingMessageStore) {
 }
 
 #[test]
-fn test_fork_ext_migration_v0_to_v6_preserves_pending_messages_table() {
-    let (_tmp, db_path, _store) = new_store();
-    let conn = Connection::open(db_path).expect("open sqlite");
-
-    let version = conn
-        .query_row(
-            "SELECT value FROM fork_ext_meta WHERE key = 'fork_ext_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .expect("read fork_ext_version");
-    assert_eq!(version, "6");
-
-    let exists = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pending_messages'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .expect("query sqlite_master");
-    assert_eq!(exists, 1);
-
-    let index_exists = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_pending_next_attempt'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .expect("query sqlite_master");
-    assert_eq!(index_exists, 1);
-}
-
-#[test]
-fn test_enqueue_claim_confirm_basic() {
-    let (_tmp, db_path, store) = new_store();
+fn test_enqueue_then_claim_returns_same_payload() {
+    let (_tmp, _db_path, store) = new_store();
 
     let id = store
         .enqueue("hook_event", r#"{"tool":"Bash"}"#)
@@ -72,9 +41,23 @@ fn test_enqueue_claim_confirm_basic() {
     assert_eq!(claimed.kind, "hook_event");
     assert_eq!(claimed.payload, r#"{"tool":"Bash"}"#);
     assert_eq!(claimed.retry_count, 0);
+}
+
+#[test]
+fn test_confirm_deletes_row() {
+    let (_tmp, db_path, store) = new_store();
+    let id = store
+        .enqueue("hook_event", r#"{"tool":"Bash"}"#)
+        .expect("enqueue");
+    let claimed = store
+        .claim_next("worker-1", 60)
+        .expect("claim")
+        .expect("message");
+    assert_eq!(claimed.id, id);
 
     store.confirm(&claimed.id).expect("confirm");
     let stats = store.stats().expect("stats");
+
     assert_eq!(stats.pending, 0);
     assert_eq!(stats.claimed, 0);
     assert_eq!(stats.failed, 0);
@@ -180,23 +163,116 @@ fn test_max_retries_marks_failed_permanently() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_enqueue_does_not_block() {
+    let (_tmp, _db_path, store) = new_store();
+    let store = Arc::new(store);
+    let task_count = 8usize;
+    let items_per_task = 25usize;
+    let barrier = Arc::new(Barrier::new(task_count + 1));
+    let mut join_set = JoinSet::new();
+
+    for task_index in 0..task_count {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        join_set.spawn(async move {
+            barrier.wait().await;
+            let started = Instant::now();
+            tokio::task::spawn_blocking(move || {
+                for item_index in 0..items_per_task {
+                    store
+                        .enqueue(
+                            "hook_event",
+                            &format!(r#"{{"task":{task_index},"item":{item_index}}}"#),
+                        )
+                        .expect("enqueue from concurrent task");
+                }
+            })
+            .await
+            .expect("join blocking enqueue worker");
+            started.elapsed()
+        });
+    }
+
+    barrier.wait().await;
+    let latencies = timeout(Duration::from_secs(5), async move {
+        let mut elapsed = Vec::with_capacity(task_count);
+        while let Some(result) = join_set.join_next().await {
+            elapsed.push(result.expect("task result"));
+        }
+        elapsed
+    })
+    .await
+    .expect("concurrent enqueue timed out");
+
+    for latency in &latencies {
+        assert!(
+            latency.as_millis() < 1_500,
+            "enqueue task should stay millisecond-level, got {latency:?}"
+        );
+    }
+
+    let stats = store.stats().expect("stats");
+    assert_eq!(stats.pending, (task_count * items_per_task) as u64);
+}
+
+#[test]
+fn test_store_startup_auto_reclaims_stale() {
+    let (_tmp, db_path, store) = new_store();
+    let id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
+    let _claimed = store
+        .claim_next("worker-a", 60)
+        .expect("claim")
+        .expect("message");
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE pending_messages SET heartbeat_at = ?2, claimed_at = ?2 WHERE id = ?1",
+        rusqlite::params![id, now_secs() - 120],
+    )
+    .expect("age heartbeat");
+    drop(conn);
+    drop(store);
+
+    let restarted = PendingMessageStore::new(&db_path).expect("restart store");
+    let reclaimed = Connection::open(db_path)
+        .expect("reopen sqlite")
+        .query_row(
+            "SELECT status, claimed_at, heartbeat_at FROM pending_messages WHERE id = ?1",
+            [&id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .expect("query row");
+
+    assert_eq!(reclaimed.0, "pending");
+    assert!(reclaimed.1.is_none());
+    assert!(reclaimed.2.is_none());
+    assert_eq!(restarted.stats().expect("stats").pending, 1);
+}
+
 #[test]
 fn test_concurrent_claim_winner_takes_all() {
     let (_tmp, _db_path, store) = new_store();
     store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
 
     let shared = Arc::new(store);
-    let barrier = Arc::new(Barrier::new(3));
+    let barrier = Arc::new(std::sync::Barrier::new(3));
     let store_a = Arc::clone(&shared);
     let store_b = Arc::clone(&shared);
     let barrier_a = Arc::clone(&barrier);
     let barrier_b = Arc::clone(&barrier);
 
-    let handle_a = thread::spawn(move || {
+    let handle_a = std::thread::spawn(move || {
         barrier_a.wait();
         store_a.claim_next("worker-a", 60).expect("claim a")
     });
-    let handle_b = thread::spawn(move || {
+    let handle_b = std::thread::spawn(move || {
         barrier_b.wait();
         store_b.claim_next("worker-b", 60).expect("claim b")
     });
@@ -236,4 +312,64 @@ fn test_crash_recovery_reclaims_and_reissues_claim() {
         .expect("claim again")
         .expect("message");
     assert_eq!(reclaimed_msg.id, id);
+}
+
+#[test]
+fn test_readonly_open_keeps_non_wal_journal_mode() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("readonly.db");
+    let conn = Connection::open(&db_path).expect("create sqlite db");
+    let initial_mode = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+        .expect("read initial journal mode");
+    assert_ne!(initial_mode.to_lowercase(), "wal");
+    drop(conn);
+
+    let db = Database::open_read_only(&db_path).expect("open readonly db");
+    let readonly_mode = db
+        .conn()
+        .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+        .expect("read readonly journal mode");
+
+    assert_eq!(readonly_mode.to_lowercase(), initial_mode.to_lowercase());
+    assert_ne!(readonly_mode.to_lowercase(), "wal");
+}
+
+#[test]
+fn test_last_error_is_redacted_and_truncated() {
+    let (_tmp, db_path, store) = new_store();
+    let id = store
+        .enqueue("hook_event", r#"{"tool":"Bash"}"#)
+        .expect("enqueue");
+    store
+        .claim_next("worker-a", 60)
+        .expect("claim")
+        .expect("message");
+
+    let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789SECRETKEY";
+    let oversized_error = format!("before {secret} {}", "x".repeat(LAST_ERROR_MAX_BYTES * 2));
+    store
+        .mark_failed(&id, &oversized_error)
+        .expect("mark failed with secret");
+
+    let stored_error = Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT last_error FROM pending_messages WHERE id = ?1",
+            [&id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("read last_error")
+        .expect("stored error");
+
+    assert!(
+        stored_error.contains("[REDACTED:openai_key]"),
+        "{stored_error}"
+    );
+    assert!(!stored_error.contains(secret), "{stored_error}");
+    assert!(
+        stored_error.len() <= LAST_ERROR_MAX_BYTES,
+        "stored error length={} exceeds {LAST_ERROR_MAX_BYTES}",
+        stored_error.len()
+    );
 }

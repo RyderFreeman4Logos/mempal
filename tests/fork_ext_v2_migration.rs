@@ -1,8 +1,5 @@
-use mempal::core::db::Database;
+use mempal::core::db::{Database, apply_fork_ext_migrations, read_fork_ext_version};
 use tempfile::TempDir;
-
-#[path = "../src/core/db_fork_ext.rs"]
-mod db_fork_ext;
 
 fn new_test_db() -> (TempDir, Database) {
     let tmp = TempDir::new().expect("tempdir");
@@ -15,7 +12,7 @@ fn new_test_db() -> (TempDir, Database) {
 fn test_fork_ext_v4_migration() {
     let (_tmp, db) = new_test_db();
 
-    let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read version");
+    let version = read_fork_ext_version(db.conn()).expect("read version");
     assert_eq!(version, 6);
 
     let table_exists = db
@@ -53,9 +50,9 @@ fn test_fork_ext_v4_migration() {
 fn test_fork_ext_v4_migration_is_idempotent() {
     let (_tmp, db) = new_test_db();
 
-    db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("first apply");
-    db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("second apply");
+    apply_fork_ext_migrations(db.conn()).expect("first apply");
+    apply_fork_ext_migrations(db.conn()).expect("second apply");
 
-    let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read version");
+    let version = read_fork_ext_version(db.conn()).expect("read version");
     assert_eq!(version, 6);
 }

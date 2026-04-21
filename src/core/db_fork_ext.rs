@@ -327,7 +327,14 @@ fn vector_dimension(conn: &Connection, table_sql: &str) -> rusqlite::Result<usiz
 }
 
 pub fn apply_fork_ext_migrations(conn: &Connection) -> rusqlite::Result<()> {
-    apply_fork_ext_migrations_with_hook(conn, None)
+    apply_fork_ext_migrations_with_hook_and_target(conn, None, None)
+}
+
+pub fn apply_fork_ext_migrations_to(
+    conn: &Connection,
+    target_version: u32,
+) -> rusqlite::Result<()> {
+    apply_fork_ext_migrations_with_hook_and_target(conn, None, Some(target_version))
 }
 
 /// Run fork-ext migrations with an optional test hook injected between `up()`
@@ -337,13 +344,21 @@ pub fn apply_fork_ext_migrations_with_hook(
     conn: &Connection,
     hook: Option<&dyn MigrationHook>,
 ) -> rusqlite::Result<()> {
+    apply_fork_ext_migrations_with_hook_and_target(conn, hook, None)
+}
+
+fn apply_fork_ext_migrations_with_hook_and_target(
+    conn: &Connection,
+    hook: Option<&dyn MigrationHook>,
+    target_version: Option<u32>,
+) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_META_DDL)?;
 
     let current_version = read_fork_ext_version(conn)?;
-    for migration in fork_ext_migrations()
-        .iter()
-        .filter(|migration| migration.version > current_version)
-    {
+    for migration in fork_ext_migrations().iter().filter(|migration| {
+        migration.version > current_version
+            && target_version.is_none_or(|target| migration.version <= target)
+    }) {
         conn.execute_batch("BEGIN IMMEDIATE")?;
 
         let result = (|| {

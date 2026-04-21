@@ -16,7 +16,7 @@ use axum::{
 #[cfg(feature = "rest")]
 use mempal::api::{ApiState, router as api_router};
 use mempal::core::config::ConfigHandle;
-use mempal::core::db::Database;
+use mempal::core::db::{Database, apply_fork_ext_migrations, read_fork_ext_version};
 use mempal::core::types::{Drawer, SourceType};
 use mempal::core::utils::build_drawer_id;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
@@ -27,9 +27,6 @@ use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 #[cfg(feature = "rest")]
 use tower::ServiceExt;
-
-#[path = "../src/core/db_fork_ext.rs"]
-mod db_fork_ext;
 
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
@@ -318,7 +315,7 @@ fn test_ext_v5_migration_adds_project_id_column() {
     let db_path = tmp.path().join("palace.db");
     let db = Database::open(&db_path).expect("open db");
 
-    let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read version");
+    let version = read_fork_ext_version(db.conn()).expect("read version");
     assert_eq!(version, 6);
 
     let drawer_columns = column_names(db.conn(), "drawers");
@@ -349,10 +346,10 @@ fn test_ext_v5_migration_idempotent() {
     let before_drawers = column_names(db.conn(), "drawers");
     let before_vectors = sqlite_master_sql(db.conn(), "drawer_vectors");
 
-    db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("reapply once");
-    db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("reapply twice");
+    apply_fork_ext_migrations(db.conn()).expect("reapply once");
+    apply_fork_ext_migrations(db.conn()).expect("reapply twice");
 
-    let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read version");
+    let version = read_fork_ext_version(db.conn()).expect("read version");
     assert_eq!(version, 6);
     assert_eq!(before_drawers, column_names(db.conn(), "drawers"));
     assert_eq!(

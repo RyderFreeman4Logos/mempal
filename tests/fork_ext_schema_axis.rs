@@ -1,9 +1,6 @@
-use mempal::core::db::Database;
+use mempal::core::db::{Database, apply_fork_ext_migrations, read_fork_ext_version};
 use rusqlite::Connection;
 use tempfile::TempDir;
-
-#[path = "../src/core/db_fork_ext.rs"]
-mod db_fork_ext;
 
 fn new_test_db() -> (TempDir, std::path::PathBuf, Database) {
     let tmp = TempDir::new().expect("tempdir");
@@ -32,7 +29,7 @@ fn current_schema_version() -> u32 {
 fn test_fork_ext_version_is_six_after_audit_project_scope_phase() {
     let (_tmp, _db_path, db) = new_test_db();
 
-    let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read fork-ext version");
+    let version = read_fork_ext_version(db.conn()).expect("read fork-ext version");
 
     assert_eq!(version, 6);
 }
@@ -41,10 +38,10 @@ fn test_fork_ext_version_is_six_after_audit_project_scope_phase() {
 fn test_fork_ext_migrations_idempotent() {
     let (_tmp, _db_path, db) = new_test_db();
 
-    db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("first apply");
-    db_fork_ext::apply_fork_ext_migrations(db.conn()).expect("second apply");
+    apply_fork_ext_migrations(db.conn()).expect("first apply");
+    apply_fork_ext_migrations(db.conn()).expect("second apply");
 
-    let version = db_fork_ext::read_fork_ext_version(db.conn()).expect("read fork-ext version");
+    let version = read_fork_ext_version(db.conn()).expect("read fork-ext version");
     assert_eq!(version, 6);
 }
 
