@@ -261,9 +261,14 @@ fn build_drawer_records(
     mempal_home: &Path,
 ) -> Result<Vec<DrawerRecord>> {
     let mut records = vec![build_audit_drawer_record(envelope, config, mempal_home)?];
-    if envelope.event == crate::hook::HookEvent::SessionEnd.display_name() && !envelope.truncated {
+    if envelope.event == crate::hook::HookEvent::SessionEnd.display_name() {
+        let session_review_payload = if config.hooks.session_end.extract_self_review {
+            load_session_review_payload(envelope)?
+        } else {
+            None
+        };
         match extract_session_review(
-            envelope.payload.as_deref(),
+            session_review_payload.as_deref(),
             &envelope.agent,
             &config.hooks.session_end,
         )? {
@@ -282,6 +287,23 @@ fn build_drawer_records(
     }
 
     Ok(records)
+}
+
+fn load_session_review_payload(envelope: &CapturedHookEnvelope) -> Result<Option<String>> {
+    if !envelope.truncated {
+        return Ok(envelope.payload.clone());
+    }
+
+    let payload_path = envelope
+        .payload_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("truncated session_end missing payload_path"))?;
+    fs::read_to_string(payload_path).map(Some).with_context(|| {
+        format!(
+            "failed to read truncated session_end payload {}",
+            payload_path
+        )
+    })
 }
 
 fn build_audit_drawer_record(

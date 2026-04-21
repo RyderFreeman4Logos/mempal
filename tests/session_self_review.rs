@@ -130,6 +130,32 @@ enabled = false
             .enqueue(HookEvent::SessionEnd.queue_kind(), &payload)?)
     }
 
+    fn enqueue_truncated_session_end(
+        &self,
+        payload: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let oversize_dir = self.mempal_home.join("hook-oversize");
+        fs::create_dir_all(&oversize_dir)?;
+        let payload_path = oversize_dir.join("session-end-oversize.json");
+        fs::write(&payload_path, payload)?;
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::SessionEnd.display_name().to_string(),
+            kind: HookEvent::SessionEnd.queue_kind().to_string(),
+            agent: "claude".to_string(),
+            captured_at: "1713000000".to_string(),
+            claude_cwd: "/tmp/project".to_string(),
+            payload: None,
+            payload_path: Some(payload_path.to_string_lossy().to_string()),
+            payload_preview: Some(payload.chars().take(64).collect()),
+            original_size_bytes: payload.len(),
+            truncated: true,
+        };
+        let payload = serde_json::to_string(&envelope)?;
+        Ok(self
+            .store
+            .enqueue(HookEvent::SessionEnd.queue_kind(), &payload)?)
+    }
+
     async fn process_once(
         &self,
         embedder: &DeterministicEmbedder,
@@ -347,6 +373,51 @@ min_length = 1
     let (body, metadata) = split_session_metadata(&stored);
     assert_eq!(body, "A\n---\nB");
     assert_eq!(metadata.session_id.as_deref(), Some("trail-1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_truncated_session_end_still_creates_session_review() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(
+        r#"
+extract_self_review = true
+min_length = 10
+"#,
+        "enabled = false",
+        "enabled = false",
+    )
+    .expect("env");
+    let assistant = long_assistant_message("oversize payload should still produce a review.");
+    let payload = serde_json::json!({
+        "session_id": "oversize-1",
+        "agent": "claude",
+        "messages": [
+            {"role": "assistant", "content": assistant}
+        ],
+        "tool_calls": [
+            {"drawer_id": "D-oversize"}
+        ]
+    });
+    env.enqueue_truncated_session_end(&payload.to_string())
+        .expect("enqueue");
+    let embedder = DeterministicEmbedder {
+        vectors: Arc::new(HashMap::new()),
+        default_vector: vec![0.1, 0.2, 0.3],
+    };
+
+    env.process_once(&embedder).await.expect("process");
+
+    assert_eq!(count_drawers_by_wing(&env.db_path, "hooks-raw"), 1);
+    assert_eq!(count_drawers_by_wing(&env.db_path, "session-reviews"), 1);
+    let (content, room, source_file, importance) =
+        latest_drawer_in_wing(&env.db_path, "session-reviews");
+    let (body, metadata) = split_session_metadata(&content);
+    assert_eq!(body, assistant);
+    assert_eq!(room, "claude");
+    assert_eq!(source_file, "oversize-1");
+    assert_eq!(importance, 3);
+    assert_eq!(metadata.session_id.as_deref(), Some("oversize-1"));
+    assert_eq!(metadata.linked_drawer_ids, vec!["D-oversize"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
