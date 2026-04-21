@@ -25,6 +25,8 @@ const DEFAULT_DAEMON_LOG_PATH: &str = "~/.mempal/daemon.log";
 const DEFAULT_SESSION_REVIEW_WING: &str = "session-reviews";
 const DEFAULT_SESSION_REVIEW_MIN_LENGTH: usize = 100;
 const DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES: usize = 1;
+const DEFAULT_HOTPATCH_MIN_IMPORTANCE_STARS: i32 = 4;
+const DEFAULT_HOTPATCH_MAX_SUGGESTION_LENGTH: usize = 80;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
@@ -36,6 +38,7 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     pub config_hot_reload: ConfigHotReloadConfig,
     pub search: SearchConfig,
+    pub hotpatch: HotpatchConfig,
     pub ingest_gating: IngestGatingConfig,
     pub hooks: HooksConfig,
     pub daemon: DaemonConfig,
@@ -50,6 +53,7 @@ impl Default for Config {
             privacy: PrivacyConfig::default(),
             config_hot_reload: ConfigHotReloadConfig::default(),
             search: SearchConfig::default(),
+            hotpatch: HotpatchConfig::default(),
             ingest_gating: IngestGatingConfig::default(),
             hooks: HooksConfig::default(),
             daemon: DaemonConfig::default(),
@@ -101,6 +105,21 @@ impl Config {
         if self.search.preview_chars == 0 {
             return Err(ConfigError::InvalidConfig(
                 "search.preview_chars must be greater than 0".to_string(),
+            ));
+        }
+        if !(0..=5).contains(&self.hotpatch.min_importance_stars) {
+            return Err(ConfigError::InvalidConfig(
+                "hotpatch.min_importance_stars must be between 0 and 5".to_string(),
+            ));
+        }
+        if self.hotpatch.max_suggestion_length == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "hotpatch.max_suggestion_length must be greater than 0".to_string(),
+            ));
+        }
+        if self.hotpatch.watch_files.is_empty() {
+            return Err(ConfigError::InvalidConfig(
+                "hotpatch.watch_files must not be empty".to_string(),
             ));
         }
         if self.embed.alert.alert_every_n_failures == 0 {
@@ -596,6 +615,32 @@ impl Default for SearchConfig {
             strict_project_isolation: false,
             progressive_disclosure: false,
             preview_chars: DEFAULT_SEARCH_PREVIEW_CHARS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HotpatchConfig {
+    pub enabled: bool,
+    pub min_importance_stars: i32,
+    pub watch_files: Vec<String>,
+    pub max_suggestion_length: usize,
+    pub allowed_target_prefixes: Vec<String>,
+}
+
+impl Default for HotpatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_importance_stars: DEFAULT_HOTPATCH_MIN_IMPORTANCE_STARS,
+            watch_files: vec![
+                "CLAUDE.md".to_string(),
+                "AGENTS.md".to_string(),
+                "GEMINI.md".to_string(),
+            ],
+            max_suggestion_length: DEFAULT_HOTPATCH_MAX_SUGGESTION_LENGTH,
+            allowed_target_prefixes: Vec::new(),
         }
     }
 }

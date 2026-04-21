@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 
 use crate::daemon_bootstrap::DaemonContext;
 use crate::hook::CapturedHookEnvelope;
+use crate::hotpatch::generator::{GenerationOptions, suggest_for_drawer};
 use crate::session_review::{SessionReviewOutcome, extract_session_review};
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
@@ -195,7 +196,17 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
     };
     let mut last_drawer_id = None;
     for record in records {
-        last_drawer_id = Some(ingest_drawer_record(&drawer_context, record).await?);
+        let drawer_id = ingest_drawer_record(&drawer_context, record).await?;
+        if let Err(error) = suggest_for_drawer(
+            db,
+            context.config,
+            context.mempal_home,
+            &drawer_id,
+            GenerationOptions::default(),
+        ) {
+            tracing::warn!(?error, drawer_id, "hotpatch suggestion generation failed");
+        }
+        last_drawer_id = Some(drawer_id);
     }
 
     Ok(last_drawer_id.unwrap_or_else(|| message.id.clone()))
