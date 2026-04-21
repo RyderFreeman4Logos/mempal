@@ -16,7 +16,8 @@ use mempal::core::{
     config::{Config, ConfigHandle, default_config_path},
     db::Database,
     project::{
-        ProjectMigrationEvent, ProjectSearchScope, migrate_null_project_ids, resolve_project_id,
+        ProjectMigrationEvent, ProjectSearchScope, escape_project_id_for_display,
+        migrate_null_project_ids, resolve_project_id,
     },
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
     reindex::ReindexProgressStore,
@@ -1307,6 +1308,12 @@ fn status_command(db: &Database) -> Result<()> {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
     let drawer_count = db.drawer_count().context("failed to count drawers")?;
+    let project_breakdown = db
+        .project_breakdown()
+        .context("failed to count drawers per project")?;
+    let null_project_backfill_pending = db
+        .null_project_backfill_pending_count()
+        .context("failed to count pending project backfill drawers")?;
     let taxonomy_count = db.taxonomy_count().context("failed to count taxonomy")?;
     let db_size_bytes = db
         .database_size_bytes()
@@ -1333,6 +1340,27 @@ fn status_command(db: &Database) -> Result<()> {
     println!("schema_version: {schema_version}");
     println!("fork_ext_version: {fork_ext_version}");
     println!("drawer_count: {drawer_count}");
+    println!("drawers per project:");
+    if project_breakdown.is_empty() {
+        println!("(none)");
+    } else {
+        for (project_id, count) in project_breakdown {
+            match project_id {
+                Some(project_id) => {
+                    let project_id = escape_project_id_for_display(&project_id);
+                    println!("{project_id}={count}");
+                }
+                None => println!("NULL={count}"),
+            }
+        }
+    }
+    println!(
+        "null_project_backfill_pending: {}",
+        null_project_backfill_pending > 0
+    );
+    if null_project_backfill_pending > 0 {
+        println!("null_project_backfill_count: {null_project_backfill_pending}");
+    }
     if deleted_count > 0 {
         println!("deleted_drawers: {deleted_count} (use `mempal purge` to remove)");
     }

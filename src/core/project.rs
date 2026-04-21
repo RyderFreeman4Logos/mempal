@@ -1,9 +1,12 @@
 use std::env;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use percent_encoding::percent_decode_str;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -12,6 +15,7 @@ use super::config::Config;
 
 pub const PROJECT_MIGRATION_BATCH_SIZE: usize = 1_000;
 pub const PROJECT_MIGRATION_RETRY_DELAYS_MS: [u64; 3] = [500, 1_000, 2_000];
+pub const MAX_PROJECT_ID_BYTES: usize = 255;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectFilterMode {
@@ -129,14 +133,16 @@ pub enum ProjectMigrationEvent {
 
 #[derive(Debug, Error)]
 pub enum ProjectError {
-    #[error("project id cannot be empty")]
+    #[error("project_id is empty")]
     Empty,
-    #[error("project id cannot start or end with whitespace")]
+    #[error("project_id contains surrounding whitespace")]
     SurroundingWhitespace,
-    #[error("project id cannot contain '/'")]
+    #[error("project_id contains '/'")]
     Slash,
-    #[error("project id cannot contain NUL")]
-    Nul,
+    #[error("project_id contains control character")]
+    ControlCharacter,
+    #[error("project_id exceeds {max_bytes} bytes")]
+    TooLong { max_bytes: usize },
     #[error("failed to read current directory")]
     CurrentDir(#[source] std::io::Error),
     #[error("failed to run git to infer project root")]
@@ -172,12 +178,28 @@ pub fn resolve_project_id(
 }
 
 pub fn infer_project_id_from_path(path: &Path) -> Result<Option<String>, ProjectError> {
-    let candidate_root = git_repo_root(path)?.unwrap_or_else(|| path.to_path_buf());
-    match candidate_root.file_name().and_then(|name| name.to_str()) {
-        Some(name) => Ok(Some(validate_project_id(name)?)),
-        None if candidate_root.as_os_str().is_empty() => Ok(None),
-        None => Err(ProjectError::MissingBasename(candidate_root)),
+    if path_contains_nul(path) {
+        return Ok(None);
     }
+    let candidate_root = git_repo_root(path)?.unwrap_or_else(|| path.to_path_buf());
+    let canonical = candidate_root
+        .canonicalize()
+        .unwrap_or_else(|_| candidate_root.clone());
+    if canonical.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    match path_basename(&canonical) {
+        Ok(Some(candidate)) => Ok(validate_project_id(candidate).ok()),
+        Ok(None) | Err(ProjectError::InvalidUtf8Path) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn infer_project_id_from_root_uri(uri: &str) -> Result<Option<String>, ProjectError> {
+    let Some(path) = file_uri_to_path(uri)? else {
+        return Ok(None);
+    };
+    infer_project_id_from_path(&path)
 }
 
 fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, ProjectError> {
@@ -199,6 +221,54 @@ fn git_repo_root(path: &Path) -> Result<Option<PathBuf>, ProjectError> {
     Ok(Some(PathBuf::from(trimmed)))
 }
 
+fn file_uri_to_path(uri: &str) -> Result<Option<PathBuf>, ProjectError> {
+    let Some(rest) = uri.strip_prefix("file://") else {
+        return Ok(None);
+    };
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let decoded = percent_decode_str(rest)
+        .decode_utf8()
+        .map_err(|_| ProjectError::InvalidUtf8Path)?;
+    #[cfg(unix)]
+    let path = {
+        let decoded = decoded.as_ref();
+        let without_localhost = decoded
+            .strip_prefix("localhost/")
+            .map(|path| format!("/{path}"));
+        let normalized = if decoded.starts_with('/') {
+            decoded.to_string()
+        } else if let Some(path) = without_localhost {
+            path
+        } else {
+            format!("/{decoded}")
+        };
+        PathBuf::from(normalized)
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(decoded.into_owned());
+    Ok(Some(path))
+}
+
+fn path_basename(path: &Path) -> Result<Option<&str>, ProjectError> {
+    match path.file_name() {
+        Some(name) => name.to_str().map(Some).ok_or(ProjectError::InvalidUtf8Path),
+        None => Ok(None),
+    }
+}
+
+fn path_contains_nul(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        path.as_os_str().as_bytes().contains(&b'\0')
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 pub fn validate_project_id(raw: &str) -> Result<String, ProjectError> {
     if raw.is_empty() {
         return Err(ProjectError::Empty);
@@ -209,10 +279,22 @@ pub fn validate_project_id(raw: &str) -> Result<String, ProjectError> {
     if raw.contains('/') {
         return Err(ProjectError::Slash);
     }
-    if raw.contains('\0') {
-        return Err(ProjectError::Nul);
+    if raw.chars().any(char::is_control) {
+        return Err(ProjectError::ControlCharacter);
+    }
+    if raw.len() > MAX_PROJECT_ID_BYTES {
+        return Err(ProjectError::TooLong {
+            max_bytes: MAX_PROJECT_ID_BYTES,
+        });
     }
     Ok(raw.to_string())
+}
+
+pub fn escape_project_id_for_display(project_id: &str) -> String {
+    project_id
+        .chars()
+        .flat_map(|ch| ch.escape_debug())
+        .collect()
 }
 
 pub fn migrate_null_project_ids<F>(

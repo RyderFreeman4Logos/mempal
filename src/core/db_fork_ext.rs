@@ -189,7 +189,7 @@ fn apply_v4(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn apply_v5(conn: &Connection) -> rusqlite::Result<()> {
-    ensure_project_column(conn, "drawers", "TEXT")?;
+    ensure_drawers_project_column(conn)?;
     ensure_project_column(conn, "triples", "TEXT")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_drawers_project_id ON drawers(project_id);",
@@ -229,6 +229,13 @@ fn ensure_project_column(conn: &Connection, table: &str, ty: &str) -> rusqlite::
         return Ok(());
     }
     conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN project_id {ty};"))
+}
+
+fn ensure_drawers_project_column(conn: &Connection) -> rusqlite::Result<()> {
+    if table_has_column(conn, "drawers", "project_id")? {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE drawers ADD COLUMN project_id TEXT;")
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {

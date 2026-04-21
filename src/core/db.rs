@@ -15,7 +15,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::{
-    types::{Drawer, DrawerDetails, SourceType, TaxonomyEntry, Triple, TripleStats},
+    types::{Drawer, DrawerDetails, SourceType, TaxonomyEntry, Triple, TripleStats, TunnelDrawer},
     utils::{build_drawer_id, build_scoped_drawer_id},
 };
 use crate::ingest::gating::GatingDecision;
@@ -861,7 +861,7 @@ impl Database {
             FROM drawers
             WHERE deleted_at IS NULL
             GROUP BY project_id
-            ORDER BY project_id
+            ORDER BY project_id NULLS LAST
             "#,
         )?;
         let rows = stmt
@@ -872,12 +872,20 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn null_project_backfill_pending_count(&self) -> Result<i64, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL AND project_id IS NULL",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn tunnel_drawers_for_room(
         &self,
         room: &str,
         exclude_drawer_id: &str,
         current_project_id: Option<&str>,
-    ) -> Result<Vec<(Drawer, Option<String>)>, DbError> {
+    ) -> Result<Vec<TunnelDrawer>, DbError> {
         let Some(current_project_id) = current_project_id else {
             return Ok(Vec::new());
         };
@@ -925,8 +933,8 @@ impl Database {
                     importance,
                     project_id,
                 )| {
-                    Ok((
-                        Drawer {
+                    Ok(TunnelDrawer {
+                        drawer: Drawer {
                             id,
                             content,
                             wing,
@@ -937,8 +945,8 @@ impl Database {
                             chunk_index,
                             importance,
                         },
-                        project_id,
-                    ))
+                        target_project_id: project_id,
+                    })
                 },
             )
             .collect()

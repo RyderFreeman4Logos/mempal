@@ -32,6 +32,12 @@ pub struct DrawerDetails {
     pub project_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelDrawer {
+    pub drawer: Drawer,
+    pub target_project_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Triple {
     pub id: String,

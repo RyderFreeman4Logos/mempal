@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::core::{
     config::ConfigHandle,
     db::Database,
-    project::{ProjectSearchScope, resolve_project_id},
+    project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
     types::{Drawer, SourceType, Triple},
     utils::{build_triple_id, current_timestamp, source_file_or_synthetic},
 };
@@ -21,6 +21,7 @@ use rmcp::{
     ErrorData, Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
+    service::Peer,
     tool, tool_handler, tool_router,
 };
 
@@ -42,6 +43,8 @@ pub struct MempalMcpServer {
     /// Captured via `initialize` override so `auto` peek mode can infer the
     /// partner from the calling MCP client's self-reported name.
     client_name: Arc<Mutex<Option<String>>>,
+    client_project_id: Arc<Mutex<Option<String>>>,
+    client_peer: Arc<Mutex<Option<Peer<rmcp::RoleServer>>>>,
 }
 
 impl MempalMcpServer {
@@ -72,6 +75,8 @@ impl MempalMcpServer {
             embedder_factory,
             tool_router: Self::tool_router(),
             client_name: Arc::new(Mutex::new(None)),
+            client_project_id: Arc::new(Mutex::new(None)),
+            client_peer: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -91,6 +96,46 @@ impl MempalMcpServer {
         Database::open(&self.db_path).map_err(|error| {
             ErrorData::internal_error(format!("failed to open database: {error}"), None)
         })
+    }
+
+    async fn resolve_mcp_project_id(
+        &self,
+        explicit: Option<&str>,
+        config: &crate::core::config::Config,
+    ) -> std::result::Result<Option<String>, ErrorData> {
+        if let Some(explicit) = explicit {
+            return validate_project_id(explicit).map(Some).map_err(|error| {
+                ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
+            });
+        }
+
+        if let Some(configured) = config.project.id.as_deref() {
+            return validate_project_id(configured).map(Some).map_err(|error| {
+                ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
+            });
+        }
+
+        if let Ok(guard) = self.client_project_id.lock()
+            && let Some(project_id) = guard.clone()
+        {
+            return Ok(Some(project_id));
+        }
+
+        let peer = self.client_peer.lock().ok().and_then(|guard| guard.clone());
+        if let Some(peer) = peer
+            && let Ok(result) = peer.list_roots().await
+            && let Some(project_id) = result
+                .roots
+                .into_iter()
+                .find_map(|root| infer_project_id_from_root_uri(&root.uri).ok().flatten())
+        {
+            if let Ok(mut guard) = self.client_project_id.lock() {
+                *guard = Some(project_id.clone());
+            }
+            return Ok(Some(project_id));
+        }
+
+        Ok(None)
     }
 }
 
@@ -115,6 +160,8 @@ impl MempalMcpServer {
         let embed_snapshot = global_embed_status().snapshot();
         let schema_version = db.schema_version().map_err(db_error)?;
         let drawer_count = db.drawer_count().map_err(db_error)?;
+        let null_project_backfill_pending =
+            db.null_project_backfill_pending_count().map_err(db_error)?;
         let taxonomy_count = db.taxonomy_count().map_err(db_error)?;
         let db_size_bytes = db.database_size_bytes().map_err(db_error)?;
         let scopes = db
@@ -127,6 +174,16 @@ impl MempalMcpServer {
                 drawer_count,
             })
             .collect();
+        let mut system_warnings = current_system_warnings();
+        if null_project_backfill_pending > 0 {
+            system_warnings.push(SystemWarning {
+                level: "warn".to_string(),
+                message: format!(
+                    "{null_project_backfill_pending} drawers still have NULL project_id; run `mempal project migrate --project <id>` to backfill historical records"
+                ),
+                source: "project_isolation".to_string(),
+            });
+        }
 
         Ok(Json(StatusResponse {
             schema_version,
@@ -160,7 +217,7 @@ impl MempalMcpServer {
                 oldest_pending_age_secs: queue_stats.oldest_pending_age_secs,
             },
             scrub_stats: ScrubStatsDto::from(ConfigHandle::scrub_stats()),
-            system_warnings: current_system_warnings(),
+            system_warnings,
         }))
     }
 
@@ -173,10 +230,10 @@ impl MempalMcpServer {
         Parameters(request): Parameters<SearchRequest>,
     ) -> std::result::Result<Json<SearchResponse>, ErrorData> {
         let config = ConfigHandle::current();
-        let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
-            .map_err(|error| {
-            ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
-        })?;
+        let project_id = self
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await?;
+        let unresolved_scope = project_id.is_none() && !request.all_projects.unwrap_or(false);
         let scope = ProjectSearchScope::from_request(
             project_id,
             request.include_global.unwrap_or(false),
@@ -250,6 +307,13 @@ impl MempalMcpServer {
 
         let mut system_warnings = current_system_warnings();
         system_warnings.extend(extra_warnings);
+        if unresolved_scope && config.search.strict_project_isolation {
+            system_warnings.push(SystemWarning {
+                level: "warn".to_string(),
+                message: "no project scope resolved, isolation strict".to_string(),
+                source: "project_isolation".to_string(),
+            });
+        }
 
         Ok(Json(SearchResponse {
             results: results
@@ -276,10 +340,9 @@ impl MempalMcpServer {
         Parameters(request): Parameters<ReadDrawerRequest>,
     ) -> std::result::Result<Json<ReadDrawerResponse>, ErrorData> {
         let config = ConfigHandle::current();
-        let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
-            .map_err(|error| {
-            ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
-        })?;
+        let project_id = self
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await?;
         let scope = ProjectSearchScope::from_request(
             project_id,
             request.include_global.unwrap_or(false),
@@ -330,10 +393,9 @@ impl MempalMcpServer {
         Parameters(request): Parameters<IngestRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
-        let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
-            .map_err(|error| {
-            ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
-        })?;
+        let project_id = self
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await?;
         let scrubbed_content =
             config.scrub_content_with_compiled(&request.content, compiled_privacy.as_ref());
         let room = request.room.as_deref();
@@ -1067,14 +1129,11 @@ impl ServerHandler for MempalMcpServer {
             .with_instructions(instructions)
     }
 
-    fn initialize(
+    async fn initialize(
         &self,
         request: rmcp::model::InitializeRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> impl std::future::Future<
-        Output = std::result::Result<rmcp::model::InitializeResult, ErrorData>,
-    > + Send
-    + '_ {
+    ) -> std::result::Result<rmcp::model::InitializeResult, ErrorData> {
         // Capture the calling client's tool name so `mempal_peek_partner`
         // with `tool: "auto"` can infer which partner to read (e.g.,
         // caller=claude-code ⇒ peek codex; caller=codex-cli ⇒ peek claude).
@@ -1084,9 +1143,26 @@ impl ServerHandler for MempalMcpServer {
         // Preserve rmcp's default behavior: store peer_info so downstream
         // rmcp internals can read client capabilities.
         if context.peer.peer_info().is_none() {
-            context.peer.set_peer_info(request);
+            context.peer.set_peer_info(request.clone());
         }
-        std::future::ready(Ok(self.get_info()))
+
+        if let Ok(mut guard) = self.client_project_id.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.client_peer.lock() {
+            *guard = Some(context.peer.clone());
+        }
+
+        Ok(self.get_info())
+    }
+
+    async fn on_roots_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::RoleServer>,
+    ) {
+        if let Ok(mut guard) = self.client_project_id.lock() {
+            *guard = None;
+        }
     }
 }
 
@@ -1335,19 +1411,22 @@ mod tests {
         importance: i32,
     ) {
         let db = Database::open(db_path).expect("open db");
-        db.insert_drawer(&Drawer {
-            id: id.to_string(),
-            content: content.to_string(),
-            wing: wing.to_string(),
-            room: room.map(str::to_string),
-            source_file: Some(source_file.to_string()),
-            source_type: SourceType::Manual,
-            added_at: "1713000000".to_string(),
-            chunk_index: Some(0),
-            importance,
-        })
+        db.insert_drawer_with_project(
+            &Drawer {
+                id: id.to_string(),
+                content: content.to_string(),
+                wing: wing.to_string(),
+                room: room.map(str::to_string),
+                source_file: Some(source_file.to_string()),
+                source_type: SourceType::Manual,
+                added_at: "1713000000".to_string(),
+                chunk_index: Some(0),
+                importance,
+            },
+            Some("default"),
+        )
         .expect("insert drawer");
-        db.insert_vector(id, &[0.1, 0.2, 0.3])
+        db.insert_vector_with_project(id, &[0.1, 0.2, 0.3], Some("default"))
             .expect("insert vector");
     }
 
