@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{future::Future, pin::Pin};
 
+use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
     db::Database,
     project::resolve_project_id,
@@ -24,6 +25,7 @@ use crate::ingest::gating::{
 use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
 use crate::daemon_bootstrap::DaemonContext;
 use crate::hook::CapturedHookEnvelope;
@@ -31,7 +33,16 @@ use crate::hotpatch::generator::{GenerationOptions, suggest_for_drawer};
 use crate::session_review::{SessionReviewOutcome, extract_session_review};
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
-    let context = DaemonContext::bootstrap(config_path, foreground)?;
+    run_command_with_bootstrap_events(config_path, foreground, None)
+}
+
+pub fn run_command_with_bootstrap_events(
+    config_path: PathBuf,
+    foreground: bool,
+    bootstrap_events: Option<mpsc::Sender<BootstrapEvent>>,
+) -> Result<()> {
+    // harness-point: PR0
+    let context = DaemonContext::bootstrap_with_events(config_path, foreground, bootstrap_events)?;
     context.runtime.block_on(run_loop(&context))
 }
 

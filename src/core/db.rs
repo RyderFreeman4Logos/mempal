@@ -1,4 +1,6 @@
 #[rustfmt::skip] #[path = "db_fork_ext.rs"] mod db_fork_ext;
+// harness-point: PR0 — re-export MigrationHook trait + hooked migration runner for tests
+pub use db_fork_ext::{MigrationHook, apply_fork_ext_migrations_with_hook};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

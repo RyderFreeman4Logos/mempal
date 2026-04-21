@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use regex::Regex;
@@ -810,6 +811,11 @@ impl ConfigHandle {
 
     pub fn simulate_notify_failure() {
         super::hot_reload::global_hot_reload_state().simulate_notify_failure();
+    }
+
+    #[doc(hidden)]
+    pub fn harness_reload_counter() -> Arc<AtomicUsize> {
+        super::hot_reload::global_hot_reload_state().reload_counter_arc()
     }
 }
 

@@ -1,5 +1,12 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// Hook injected into the migration runner between `up()` and `COMMIT`.
+/// Returning Err triggers a ROLLBACK, leaving `fork_ext_version` unchanged.
+/// // harness-point: PR0
+pub trait MigrationHook: Send + Sync {
+    fn pre_commit(&self) -> anyhow::Result<()>;
+}
+
 pub const FORK_EXT_META_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS fork_ext_meta (
     key TEXT PRIMARY KEY,
@@ -320,6 +327,16 @@ fn vector_dimension(conn: &Connection, table_sql: &str) -> rusqlite::Result<usiz
 }
 
 pub fn apply_fork_ext_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    apply_fork_ext_migrations_with_hook(conn, None)
+}
+
+/// Run fork-ext migrations with an optional test hook injected between `up()`
+/// and `COMMIT`. If the hook returns Err the transaction is rolled back.
+// harness-point: PR0
+pub fn apply_fork_ext_migrations_with_hook(
+    conn: &Connection,
+    hook: Option<&dyn MigrationHook>,
+) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_META_DDL)?;
 
     let current_version = read_fork_ext_version(conn)?;
@@ -331,6 +348,16 @@ pub fn apply_fork_ext_migrations(conn: &Connection) -> rusqlite::Result<()> {
 
         let result = (|| {
             (migration.up)(conn)?;
+            // harness-point: PR0 — test hook injection between up() and COMMIT
+            if let Some(hook) = hook {
+                hook.pre_commit().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::other(error.to_string())),
+                    )
+                })?;
+            }
             set_fork_ext_version(conn, migration.version)?;
             conn.execute_batch("COMMIT")?;
             Ok(())

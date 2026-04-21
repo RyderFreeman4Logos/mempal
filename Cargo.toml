@@ -75,6 +75,7 @@ panic = "abort"        # no unwinding — smaller binary, faster panic
 
 [dev-dependencies]
 axum = "0.8"
+hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 mockito = "1"
 serde_json = "1"
 tempfile = "3"
