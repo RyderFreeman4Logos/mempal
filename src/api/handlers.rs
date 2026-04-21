@@ -1,9 +1,9 @@
 use crate::core::{
-    config::Config,
+    config::ConfigHandle,
     db::Database,
     project::{ProjectSearchScope, resolve_project_id},
     types::{Drawer, RouteDecision, SearchResult, SourceType, TaxonomyEntry},
-    utils::{build_drawer_id, current_timestamp, source_file_or_synthetic},
+    utils::{current_timestamp, source_file_or_synthetic},
 };
 use crate::search::{resolve_route, search_with_vector};
 use axum::{
@@ -148,12 +148,13 @@ async fn search_handler(
     let db = Database::open(&state.db_path).map_err(internal_error)?;
     let route = resolve_route(&db, &query.q, query.wing.as_deref(), query.room.as_deref())
         .map_err(internal_error)?;
-    let config = Config::default();
+    let config = ConfigHandle::current();
     let scope = ProjectSearchScope::from_request(
-        resolve_project_id(query.project_id.as_deref(), &config, None).map_err(internal_error)?,
+        resolve_project_id(query.project_id.as_deref(), config.as_ref(), None)
+            .map_err(internal_error)?,
         query.include_global.unwrap_or(false),
         query.all_projects.unwrap_or(false),
-        false,
+        config.search.strict_project_isolation,
     );
     let results = search_with_vector(
         &db,
@@ -192,12 +193,19 @@ async fn ingest_handler(
             )
         })?;
     let db = Database::open(&state.db_path).map_err(internal_error)?;
-    let drawer_id = build_drawer_id(&request.wing, request.room.as_deref(), &request.content);
-    let config = Config::default();
-    let project_id =
-        resolve_project_id(request.project_id.as_deref(), &config, None).map_err(internal_error)?;
+    let config = ConfigHandle::current();
+    let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
+        .map_err(internal_error)?;
+    let (drawer_id, drawer_exists) = db
+        .resolve_ingest_drawer_id(
+            &request.wing,
+            request.room.as_deref(),
+            &request.content,
+            project_id.as_deref(),
+        )
+        .map_err(internal_error)?;
 
-    if !db.drawer_exists(&drawer_id).map_err(internal_error)? {
+    if !drawer_exists {
         let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());
         db.insert_drawer_with_project(
             &Drawer {

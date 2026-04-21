@@ -8,7 +8,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use thiserror::Error;
 
-use super::types::{Drawer, SourceType, TaxonomyEntry, Triple, TripleStats};
+use super::{
+    types::{Drawer, SourceType, TaxonomyEntry, Triple, TripleStats},
+    utils::{build_drawer_id, build_scoped_drawer_id},
+};
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
@@ -396,6 +399,40 @@ impl Database {
         Ok(exists == 1)
     }
 
+    pub fn resolve_ingest_drawer_id(
+        &self,
+        wing: &str,
+        room: Option<&str>,
+        content: &str,
+        project_id: Option<&str>,
+    ) -> Result<(String, bool), DbError> {
+        if let Some(existing_id) =
+            self.find_active_drawer_id_by_identity(wing, room, content, project_id)?
+        {
+            return Ok((existing_id, true));
+        }
+
+        let base_id = build_drawer_id(wing, room, content);
+        if !self.drawer_id_in_use(&base_id)? {
+            return Ok((base_id, false));
+        }
+
+        let scoped_seed = project_id.unwrap_or("__global_collision__");
+        let scoped_id = build_scoped_drawer_id(wing, room, content, Some(scoped_seed));
+        if scoped_id != base_id && !self.drawer_id_in_use(&scoped_id)? {
+            return Ok((scoped_id, false));
+        }
+
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{scoped_id}_{suffix}");
+            if !self.drawer_id_in_use(&candidate)? {
+                return Ok((candidate, false));
+            }
+            suffix += 1;
+        }
+    }
+
     pub fn insert_vector(&self, drawer_id: &str, vector: &[f32]) -> Result<(), DbError> {
         self.insert_vector_with_project(drawer_id, vector, None)
     }
@@ -575,6 +612,43 @@ impl Database {
             )
             .optional()?;
         Ok(value.flatten())
+    }
+
+    fn drawer_id_in_use(&self, drawer_id: &str) -> Result<bool, DbError> {
+        let exists = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM drawers WHERE id = ?1)",
+            [drawer_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists == 1)
+    }
+
+    fn find_active_drawer_id_by_identity(
+        &self,
+        wing: &str,
+        room: Option<&str>,
+        content: &str,
+        project_id: Option<&str>,
+    ) -> Result<Option<String>, DbError> {
+        let value = self
+            .conn
+            .query_row(
+                r#"
+                SELECT id
+                FROM drawers
+                WHERE deleted_at IS NULL
+                  AND wing = ?1
+                  AND content = ?2
+                  AND ((room IS NULL AND ?3 IS NULL) OR room = ?3)
+                  AND ((project_id IS NULL AND ?4 IS NULL) OR project_id = ?4)
+                ORDER BY id
+                LIMIT 1
+                "#,
+                params![wing, content, room, project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value)
     }
 
     pub fn soft_delete_drawer(&self, drawer_id: &str) -> Result<bool, DbError> {

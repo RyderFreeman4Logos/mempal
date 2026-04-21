@@ -8,9 +8,22 @@ use super::types::TaxonomyEntry;
 pub const DEFAULT_ROOM: &str = "default";
 
 pub fn build_drawer_id(wing: &str, room: Option<&str>, content: &str) -> String {
+    build_scoped_drawer_id(wing, room, content, None)
+}
+
+pub fn build_scoped_drawer_id(
+    wing: &str,
+    room: Option<&str>,
+    content: &str,
+    scope_seed: Option<&str>,
+) -> String {
     let room = room.unwrap_or(DEFAULT_ROOM);
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
+    if let Some(scope_seed) = scope_seed {
+        hasher.update([0]);
+        hasher.update(scope_seed.as_bytes());
+    }
     let digest = format!("{:x}", hasher.finalize());
 
     format!(

@@ -8,15 +8,25 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+#[cfg(feature = "rest")]
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+#[cfg(feature = "rest")]
+use mempal::api::{ApiState, router as api_router};
 use mempal::core::config::ConfigHandle;
 use mempal::core::db::Database;
 use mempal::core::types::{Drawer, SourceType};
+use mempal::core::utils::build_drawer_id;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
-use mempal::mcp::{MempalMcpServer, SearchRequest};
+use mempal::mcp::{IngestRequest, MempalMcpServer, SearchRequest};
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::{Connection, OptionalExtension, params};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+#[cfg(feature = "rest")]
+use tower::ServiceExt;
 
 #[path = "../src/core/db_fork_ext.rs"]
 mod db_fork_ext;
@@ -101,6 +111,16 @@ impl SearchEnv {
 
     fn server(&self) -> MempalMcpServer {
         MempalMcpServer::new_with_factory(
+            self.db_path.clone(),
+            Arc::new(StaticEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+    }
+
+    #[cfg(feature = "rest")]
+    fn api_state(&self) -> ApiState {
+        ApiState::new(
             self.db_path.clone(),
             Arc::new(StaticEmbedderFactory {
                 vector: vec![0.1, 0.2, 0.3],
@@ -232,8 +252,9 @@ fn insert_projected_drawer(
 }
 
 async fn search_response_json(server: &MempalMcpServer, query: &str) -> serde_json::Value {
-    let response = server
-        .mempal_search(Parameters(SearchRequest {
+    search_response_json_with_request(
+        server,
+        SearchRequest {
             query: query.to_string(),
             wing: None,
             room: None,
@@ -241,11 +262,38 @@ async fn search_response_json(server: &MempalMcpServer, query: &str) -> serde_js
             project_id: None,
             include_global: None,
             all_projects: None,
-        }))
+        },
+    )
+    .await
+}
+
+async fn search_response_json_with_request(
+    server: &MempalMcpServer,
+    request: SearchRequest,
+) -> serde_json::Value {
+    let response = server
+        .mempal_search(Parameters(request))
         .await
         .expect("search should succeed")
         .0;
     serde_json::to_value(response).expect("serialize search response")
+}
+
+#[cfg(feature = "rest")]
+async fn rest_json_response(
+    env: &SearchEnv,
+    request: Request<Body>,
+) -> (StatusCode, serde_json::Value) {
+    let response = api_router(env.api_state())
+        .oneshot(request)
+        .await
+        .expect("router request");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json = serde_json::from_slice(&body).expect("parse json response");
+    (status, json)
 }
 
 fn install_cli_home(tmp: &TempDir) -> PathBuf {
@@ -456,6 +504,160 @@ async fn test_strict_project_isolation_config_hot_reload() {
         .map(|value| value["drawer_id"].as_str().expect("drawer_id").to_string())
         .collect::<Vec<_>>();
     assert_eq!(after_ids, vec!["drawer-global".to_string()]);
+}
+
+#[cfg(feature = "rest")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rest_search_uses_configured_project_scope() {
+    let _guard = config_guard().await;
+    let env = SearchEnv::new(Some("proj-A"), false);
+    insert_projected_drawer(
+        &env.db_path,
+        "drawer-a",
+        "state lives in proj A",
+        "code",
+        Some("room-a"),
+        Some("proj-A"),
+    );
+    insert_projected_drawer(
+        &env.db_path,
+        "drawer-b",
+        "state lives in proj B",
+        "docs",
+        Some("room-b"),
+        Some("proj-B"),
+    );
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/search?q=state")
+        .body(Body::empty())
+        .expect("build search request");
+    let (status, json) = rest_json_response(&env, request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let results = json.as_array().expect("results array");
+    let ids = results
+        .iter()
+        .map(|value| value["drawer_id"].as_str().expect("drawer id").to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        ids.iter().any(|id| id == "drawer-a"),
+        "missing proj-A hit: {ids:?}"
+    );
+    assert!(
+        ids.iter().all(|id| id != "drawer-b"),
+        "proj-B hit leaked through REST scope: {ids:?}"
+    );
+}
+
+#[cfg(feature = "rest")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rest_ingest_uses_configured_project_scope() {
+    let _guard = config_guard().await;
+    let env = SearchEnv::new(Some("proj-A"), false);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/ingest")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "content": "rest scoped insert",
+                "wing": "code",
+                "room": "api",
+            })
+            .to_string(),
+        ))
+        .expect("build ingest request");
+    let (status, json) = rest_json_response(&env, request).await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let drawer_id = json["drawer_id"]
+        .as_str()
+        .expect("drawer id in REST ingest response");
+    let db = Database::open(&env.db_path).expect("open db");
+    let stored_project = db
+        .drawer_project_id(drawer_id)
+        .expect("read drawer project id");
+    assert_eq!(stored_project.as_deref(), Some("proj-A"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_allows_same_content_in_different_projects() {
+    let _guard = config_guard().await;
+    let env = SearchEnv::new(Some("proj-A"), false);
+    let shared_content = "shared memory across repos";
+    let original_id = build_drawer_id("code", Some("shared"), shared_content);
+    insert_projected_drawer(
+        &env.db_path,
+        &original_id,
+        shared_content,
+        "code",
+        Some("shared"),
+        Some("proj-A"),
+    );
+
+    let response = env
+        .server()
+        .mempal_ingest(Parameters(IngestRequest {
+            content: shared_content.to_string(),
+            wing: "code".to_string(),
+            room: Some("shared".to_string()),
+            source: None,
+            project_id: Some("proj-B".to_string()),
+            dry_run: None,
+            importance: None,
+        }))
+        .await
+        .expect("cross-project ingest should succeed")
+        .0;
+
+    assert_ne!(
+        response.drawer_id, original_id,
+        "cross-project ingest must allocate a distinct drawer id"
+    );
+
+    let conn = Connection::open(&env.db_path).expect("open sqlite");
+    let rows = conn
+        .prepare(
+            r#"
+            SELECT project_id
+            FROM drawers
+            WHERE content = ?1 AND wing = 'code' AND room = 'shared' AND deleted_at IS NULL
+            ORDER BY project_id
+            "#,
+        )
+        .expect("prepare drawer query")
+        .query_map([shared_content], |row| row.get::<_, Option<String>>(0))
+        .expect("query drawers")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect drawers");
+    assert_eq!(
+        rows,
+        vec![Some("proj-A".to_string()), Some("proj-B".to_string())]
+    );
+
+    let proj_b_results = search_response_json_with_request(
+        &env.server(),
+        SearchRequest {
+            query: "shared memory".to_string(),
+            wing: None,
+            room: None,
+            top_k: Some(10),
+            project_id: Some("proj-B".to_string()),
+            include_global: None,
+            all_projects: None,
+        },
+    )
+    .await;
+    let ids = proj_b_results["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|value| value["drawer_id"].as_str().expect("drawer id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![response.drawer_id]);
 }
 
 #[test]
