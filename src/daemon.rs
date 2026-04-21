@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 
 use crate::daemon_bootstrap::DaemonContext;
 use crate::hook::CapturedHookEnvelope;
+use crate::session_review::{SessionReviewOutcome, extract_session_review};
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
     let context = DaemonContext::bootstrap(config_path, foreground)?;
@@ -142,6 +143,16 @@ pub struct DaemonIngestContext<'a> {
     pub mempal_home: &'a Path,
 }
 
+struct DrawerIngestContext<'a, E: Embedder + ?Sized> {
+    db: &'a Database,
+    store: &'a PendingMessageStore,
+    worker_id: &'a str,
+    message: &'a ClaimedMessage,
+    embedder: &'a E,
+    daemon: &'a DaemonIngestContext<'a>,
+    envelope: &'a CapturedHookEnvelope,
+}
+
 async fn poll_claim_next<'a, S>(
     store: &impl ClaimNextSource,
     worker_id: &str,
@@ -172,199 +183,22 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
 ) -> Result<String> {
     let envelope: CapturedHookEnvelope =
         serde_json::from_str(&message.payload).context("failed to decode queued hook envelope")?;
-
-    let record = build_drawer_record(&envelope, context.config, context.mempal_home)?;
-    let drawer_id = build_drawer_id(&record.wing, Some(record.room.as_str()), &record.content);
-    let candidate = build_gating_candidate(&envelope, &record);
-    let mut gating_decision = evaluate_tier1(&candidate, &context.config.ingest_gating);
-    if gating_decision.is_none() && !tier2_enabled(&context.config.ingest_gating) {
-        gating_decision = Some(GatingDecision::accepted(
-            0,
-            Some("tier2_disabled".to_string()),
-            None,
-        ));
-    }
-    if let Some(decision) = gating_decision.as_ref()
-        && decision.is_rejected()
-    {
-        db.record_gating_audit(&drawer_id, decision)
-            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
-        return Ok(drawer_id);
-    }
-
-    let heartbeat_store = store.clone();
-    let heartbeat_message_id = message.id.clone();
-    let heartbeat_worker_id = worker_id.to_string();
-    let heartbeat = move || -> crate::embed::Result<()> {
-        heartbeat_store
-            .refresh_heartbeat(&heartbeat_message_id, &heartbeat_worker_id)
-            .map_err(|error| EmbedError::Runtime(format!("refresh heartbeat failed: {error}")))?;
-        Ok(())
-    };
-
-    let mut vector = None;
-    let mut gating_audit_recorded = false;
-    if gating_decision.is_none()
-        && let Some(classifier) = context.prototype_classifier
-    {
-        let candidate_vector =
-            embed_text_with_heartbeat(embedder, &record.content, Some(&heartbeat)).await?;
-        let decision = classifier.decide(
-            &candidate_vector,
-            context.config.ingest_gating.embedding_classifier.threshold,
-        );
-        db.record_gating_audit(&drawer_id, &decision)
-            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
-        gating_audit_recorded = true;
-        if decision.is_rejected() {
-            return Ok(drawer_id);
-        }
-        gating_decision = Some(decision);
-        vector = Some(candidate_vector);
-    }
-    if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
-        db.record_gating_audit(&drawer_id, decision)
-            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
-    }
-
-    let vector = match vector {
-        Some(vector) => vector,
-        None => embed_text_with_heartbeat(embedder, &record.content, Some(&heartbeat)).await?,
-    };
-    let novelty = evaluate_novelty(
+    let records = build_drawer_records(&envelope, context.config, context.mempal_home)?;
+    let drawer_context = DrawerIngestContext {
         db,
-        &NoveltyCandidate {
-            wing: record.wing.clone(),
-            room: Some(record.room.clone()),
-        },
-        &vector,
-        &context.config.ingest_gating.novelty,
-    );
-    match novelty.action {
-        NoveltyAction::Insert => {
-            if novelty.should_audit {
-                db.record_novelty_audit(
-                    &drawer_id,
-                    NoveltyAction::Insert,
-                    novelty.near_drawer_id.as_deref(),
-                    novelty.cosine,
-                    novelty.audit_decision,
-                )
-                .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
-            }
-            let drawer = Drawer {
-                id: drawer_id.clone(),
-                content: record.content,
-                wing: record.wing,
-                room: Some(record.room),
-                source_file: Some(record.source_file),
-                source_type: SourceType::Manual,
-                added_at: current_timestamp(),
-                chunk_index: Some(0),
-                importance: 0,
-            };
-            db.insert_drawer(&drawer)
-                .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
-            db.insert_vector(&drawer.id, &vector)
-                .with_context(|| format!("failed to insert hook vector {}", drawer.id))?;
-            Ok(drawer_id)
-        }
-        NoveltyAction::Drop => {
-            if novelty.should_audit {
-                db.record_novelty_audit(
-                    &drawer_id,
-                    NoveltyAction::Drop,
-                    novelty.near_drawer_id.as_deref(),
-                    novelty.cosine,
-                    novelty.audit_decision,
-                )
-                .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
-            }
-            Ok(novelty.near_drawer_id.unwrap_or(drawer_id))
-        }
-        NoveltyAction::Merge => {
-            let target_id = novelty
-                .near_drawer_id
-                .clone()
-                .unwrap_or_else(|| drawer_id.clone());
-            let _target_lock = if target_id == drawer_id {
-                None
-            } else {
-                Some(
-                    crate::ingest::lock::acquire_source_lock(
-                        context.mempal_home,
-                        &target_id,
-                        Duration::from_secs(5),
-                    )
-                    .with_context(|| format!("failed to lock merge target {}", target_id))?,
-                )
-            };
-            let (existing_content, merge_count) = db
-                .drawer_merge_state(&target_id)
-                .with_context(|| format!("failed to load merge target {}", target_id))?
-                .ok_or_else(|| anyhow::anyhow!("novelty merge target missing: {}", target_id))?;
-            let merged_at = current_timestamp();
-            let merged_content = format!(
-                "{existing_content}\n---\nSUPPLEMENTARY ({merged_at}):\n{}",
-                record.content
-            );
-            let capped = merge_count >= context.config.ingest_gating.novelty.max_merges_per_drawer
-                || merged_content.len()
-                    > context
-                        .config
-                        .ingest_gating
-                        .novelty
-                        .max_content_bytes_per_drawer;
-            if capped {
-                db.record_novelty_audit(
-                    &drawer_id,
-                    NoveltyAction::Insert,
-                    Some(target_id.as_str()),
-                    novelty.cosine,
-                    Some("insert_due_to_merge_cap"),
-                )
-                .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
-                let drawer = Drawer {
-                    id: drawer_id.clone(),
-                    content: record.content,
-                    wing: record.wing,
-                    room: Some(record.room),
-                    source_file: Some(record.source_file),
-                    source_type: SourceType::Manual,
-                    added_at: current_timestamp(),
-                    chunk_index: Some(0),
-                    importance: 0,
-                };
-                db.insert_drawer(&drawer)
-                    .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
-                db.insert_vector(&drawer.id, &vector)
-                    .with_context(|| format!("failed to insert hook vector {}", drawer.id))?;
-                Ok(drawer_id)
-            } else {
-                let merged_vector =
-                    embed_text_with_heartbeat(embedder, &merged_content, Some(&heartbeat)).await?;
-                db.record_novelty_audit(
-                    &drawer_id,
-                    NoveltyAction::Merge,
-                    Some(target_id.as_str()),
-                    novelty.cosine,
-                    novelty.audit_decision,
-                )
-                .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
-                let mut db_for_merge = Database::open(db.path())
-                    .with_context(|| format!("failed to reopen db for merge {}", target_id))?;
-                db_for_merge
-                    .update_drawer_after_merge(
-                        &target_id,
-                        &merged_content,
-                        &merged_at,
-                        &merged_vector,
-                    )
-                    .with_context(|| format!("failed to merge hook drawer {}", target_id))?;
-                Ok(target_id)
-            }
-        }
+        store,
+        worker_id,
+        message,
+        embedder,
+        daemon: &context,
+        envelope: &envelope,
+    };
+    let mut last_drawer_id = None;
+    for record in records {
+        last_drawer_id = Some(ingest_drawer_record(&drawer_context, record).await?);
     }
+
+    Ok(last_drawer_id.unwrap_or_else(|| message.id.clone()))
 }
 
 fn build_gating_candidate(
@@ -417,9 +251,40 @@ struct DrawerRecord {
     room: String,
     source_file: String,
     content: String,
+    importance: i32,
+    bypass_novelty: bool,
 }
 
-fn build_drawer_record(
+fn build_drawer_records(
+    envelope: &CapturedHookEnvelope,
+    config: &crate::core::config::Config,
+    mempal_home: &Path,
+) -> Result<Vec<DrawerRecord>> {
+    let mut records = vec![build_audit_drawer_record(envelope, config, mempal_home)?];
+    if envelope.event == crate::hook::HookEvent::SessionEnd.display_name() && !envelope.truncated {
+        match extract_session_review(
+            envelope.payload.as_deref(),
+            &envelope.agent,
+            &config.hooks.session_end,
+        )? {
+            SessionReviewOutcome::Review(review) => records.push(DrawerRecord {
+                wing: review.wing,
+                room: review.room,
+                source_file: review.source_file,
+                content: config.scrub_content(&review.content),
+                importance: review.importance,
+                bypass_novelty: true,
+            }),
+            SessionReviewOutcome::Skipped(reason) => {
+                tracing::info!(?reason, "session self-review skipped");
+            }
+        }
+    }
+
+    Ok(records)
+}
+
+fn build_audit_drawer_record(
     envelope: &CapturedHookEnvelope,
     config: &crate::core::config::Config,
     mempal_home: &Path,
@@ -446,6 +311,8 @@ fn build_drawer_record(
             room: "truncated".to_string(),
             source_file,
             content,
+            importance: 0,
+            bypass_novelty: false,
         });
     }
 
@@ -464,13 +331,298 @@ fn build_drawer_record(
         }
     }))
     .context("failed to serialize hook diary drawer")?;
+    let (wing, room) = audit_target_for_event(&envelope.event, raw_payload, config);
 
     Ok(DrawerRecord {
-        wing: config.hooks.wing.clone(),
-        room: envelope.agent.clone(),
+        wing,
+        room,
         source_file: payload_path,
         content,
+        importance: 0,
+        bypass_novelty: false,
     })
+}
+
+fn audit_target_for_event(
+    event: &str,
+    raw_payload: &str,
+    config: &crate::core::config::Config,
+) -> (String, String) {
+    match event {
+        "PostToolUse" => (
+            "hooks-raw".to_string(),
+            serde_json::from_str::<Value>(raw_payload)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("tool_name")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .unwrap_or_else(|| "unknown-tool".to_string()),
+        ),
+        "UserPromptSubmit" => ("hooks-raw".to_string(), "user-prompt".to_string()),
+        "SessionStart" | "SessionEnd" => ("hooks-raw".to_string(), "session-lifecycle".to_string()),
+        _ => (
+            config.hooks.wing.clone(),
+            envelope_agent_fallback(raw_payload),
+        ),
+    }
+}
+
+fn envelope_agent_fallback(raw_payload: &str) -> String {
+    serde_json::from_str::<Value>(raw_payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("agent")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "unknown-agent".to_string())
+}
+
+async fn ingest_drawer_record<E: Embedder + ?Sized>(
+    context: &DrawerIngestContext<'_, E>,
+    record: DrawerRecord,
+) -> Result<String> {
+    let drawer_id = build_drawer_id(&record.wing, Some(record.room.as_str()), &record.content);
+    if context
+        .db
+        .drawer_exists(&drawer_id)
+        .with_context(|| format!("failed to check existing drawer {}", drawer_id))?
+    {
+        return Ok(drawer_id);
+    }
+
+    let candidate = build_gating_candidate(context.envelope, &record);
+    let mut gating_decision = evaluate_tier1(&candidate, &context.daemon.config.ingest_gating);
+    if gating_decision.is_none() && !tier2_enabled(&context.daemon.config.ingest_gating) {
+        gating_decision = Some(GatingDecision::accepted(
+            0,
+            Some("tier2_disabled".to_string()),
+            None,
+        ));
+    }
+    if let Some(decision) = gating_decision.as_ref()
+        && decision.is_rejected()
+    {
+        context
+            .db
+            .record_gating_audit(&drawer_id, decision)
+            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        return Ok(drawer_id);
+    }
+
+    let heartbeat_store = context.store.clone();
+    let heartbeat_message_id = context.message.id.clone();
+    let heartbeat_worker_id = context.worker_id.to_string();
+    let heartbeat = move || -> crate::embed::Result<()> {
+        heartbeat_store
+            .refresh_heartbeat(&heartbeat_message_id, &heartbeat_worker_id)
+            .map_err(|error| EmbedError::Runtime(format!("refresh heartbeat failed: {error}")))?;
+        Ok(())
+    };
+
+    let mut vector = None;
+    let mut gating_audit_recorded = false;
+    if gating_decision.is_none()
+        && let Some(classifier) = context.daemon.prototype_classifier
+    {
+        let candidate_vector =
+            embed_text_with_heartbeat(context.embedder, &record.content, Some(&heartbeat)).await?;
+        let decision = classifier.decide(
+            &candidate_vector,
+            context
+                .daemon
+                .config
+                .ingest_gating
+                .embedding_classifier
+                .threshold,
+        );
+        context
+            .db
+            .record_gating_audit(&drawer_id, &decision)
+            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        gating_audit_recorded = true;
+        if decision.is_rejected() {
+            return Ok(drawer_id);
+        }
+        gating_decision = Some(decision);
+        vector = Some(candidate_vector);
+    }
+    if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
+        context
+            .db
+            .record_gating_audit(&drawer_id, decision)
+            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+    }
+
+    let vector = match vector {
+        Some(vector) => vector,
+        None => {
+            embed_text_with_heartbeat(context.embedder, &record.content, Some(&heartbeat)).await?
+        }
+    };
+    if record.bypass_novelty {
+        insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+        return Ok(drawer_id);
+    }
+
+    let novelty = evaluate_novelty(
+        context.db,
+        &NoveltyCandidate {
+            wing: record.wing.clone(),
+            room: Some(record.room.clone()),
+        },
+        &vector,
+        &context.daemon.config.ingest_gating.novelty,
+    );
+    match novelty.action {
+        NoveltyAction::Insert => {
+            if novelty.should_audit {
+                context
+                    .db
+                    .record_novelty_audit(
+                        &drawer_id,
+                        NoveltyAction::Insert,
+                        novelty.near_drawer_id.as_deref(),
+                        novelty.cosine,
+                        novelty.audit_decision,
+                    )
+                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+            }
+            insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+            Ok(drawer_id)
+        }
+        NoveltyAction::Drop => {
+            if novelty.should_audit {
+                context
+                    .db
+                    .record_novelty_audit(
+                        &drawer_id,
+                        NoveltyAction::Drop,
+                        novelty.near_drawer_id.as_deref(),
+                        novelty.cosine,
+                        novelty.audit_decision,
+                    )
+                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+            }
+            Ok(novelty.near_drawer_id.unwrap_or(drawer_id))
+        }
+        NoveltyAction::Merge => {
+            let target_id = novelty
+                .near_drawer_id
+                .clone()
+                .unwrap_or_else(|| drawer_id.clone());
+            let _target_lock = if target_id == drawer_id {
+                None
+            } else {
+                Some(
+                    crate::ingest::lock::acquire_source_lock(
+                        context.daemon.mempal_home,
+                        &target_id,
+                        Duration::from_secs(5),
+                    )
+                    .with_context(|| format!("failed to lock merge target {}", target_id))?,
+                )
+            };
+            let (existing_content, merge_count) = context
+                .db
+                .drawer_merge_state(&target_id)
+                .with_context(|| format!("failed to load merge target {}", target_id))?
+                .ok_or_else(|| anyhow::anyhow!("novelty merge target missing: {}", target_id))?;
+            let merged_at = current_timestamp();
+            let merged_content = format!(
+                "{existing_content}\n---\nSUPPLEMENTARY ({merged_at}):\n{}",
+                record.content
+            );
+            let capped = merge_count
+                >= context
+                    .daemon
+                    .config
+                    .ingest_gating
+                    .novelty
+                    .max_merges_per_drawer
+                || merged_content.len()
+                    > context
+                        .daemon
+                        .config
+                        .ingest_gating
+                        .novelty
+                        .max_content_bytes_per_drawer;
+            if capped {
+                context
+                    .db
+                    .record_novelty_audit(
+                        &drawer_id,
+                        NoveltyAction::Insert,
+                        Some(target_id.as_str()),
+                        novelty.cosine,
+                        Some("insert_due_to_merge_cap"),
+                    )
+                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+                insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+                Ok(drawer_id)
+            } else {
+                let merged_vector =
+                    embed_text_with_heartbeat(context.embedder, &merged_content, Some(&heartbeat))
+                        .await?;
+                context
+                    .db
+                    .record_novelty_audit(
+                        &drawer_id,
+                        NoveltyAction::Merge,
+                        Some(target_id.as_str()),
+                        novelty.cosine,
+                        novelty.audit_decision,
+                    )
+                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+                let mut db_for_merge = Database::open(context.db.path())
+                    .with_context(|| format!("failed to reopen db for merge {}", target_id))?;
+                db_for_merge
+                    .update_drawer_after_merge(
+                        &target_id,
+                        &merged_content,
+                        &merged_at,
+                        &merged_vector,
+                    )
+                    .with_context(|| format!("failed to merge hook drawer {}", target_id))?;
+                Ok(target_id)
+            }
+        }
+    }
+}
+
+fn insert_drawer_with_vector(
+    db: &Database,
+    drawer_id: &str,
+    record: &DrawerRecord,
+    vector: &[f32],
+) -> Result<()> {
+    if db
+        .drawer_exists(drawer_id)
+        .with_context(|| format!("failed to re-check existing drawer {}", drawer_id))?
+    {
+        return Ok(());
+    }
+
+    let drawer = Drawer {
+        id: drawer_id.to_string(),
+        content: record.content.clone(),
+        wing: record.wing.clone(),
+        room: Some(record.room.clone()),
+        source_file: Some(record.source_file.clone()),
+        source_type: SourceType::Manual,
+        added_at: current_timestamp(),
+        chunk_index: Some(0),
+        importance: record.importance,
+    };
+    db.insert_drawer(&drawer)
+        .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
+    db.insert_vector(&drawer.id, vector)
+        .with_context(|| format!("failed to insert hook vector {}", drawer.id))?;
+    Ok(())
 }
 
 fn preview_for_event(event: &str, raw_payload: &str) -> String {

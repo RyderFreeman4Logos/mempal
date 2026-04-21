@@ -21,6 +21,9 @@ const DEFAULT_HOOK_WING: &str = "agent-diary";
 const DEFAULT_HOOK_POLL_INTERVAL_MS: u64 = 500;
 const DEFAULT_HOOK_CLAIM_TTL_SECS: u64 = 120;
 const DEFAULT_DAEMON_LOG_PATH: &str = "~/.mempal/daemon.log";
+const DEFAULT_SESSION_REVIEW_WING: &str = "session-reviews";
+const DEFAULT_SESSION_REVIEW_MIN_LENGTH: usize = 100;
+const DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
@@ -106,6 +109,11 @@ impl Config {
         if self.hooks.daemon_claim_ttl_secs == 0 {
             return Err(ConfigError::InvalidConfig(
                 "hooks.daemon_claim_ttl_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.hooks.session_end.trailing_messages == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "hooks.session_end.trailing_messages must be greater than 0".to_string(),
             ));
         }
         if let Some(path) = self
@@ -292,12 +300,21 @@ impl Default for HooksConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HooksSessionEndConfig {
-    pub enabled: bool,
+    #[serde(alias = "enabled")]
+    pub extract_self_review: bool,
+    pub trailing_messages: usize,
+    pub min_length: usize,
+    pub wing: String,
 }
 
 impl Default for HooksSessionEndConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            extract_self_review: false,
+            trailing_messages: DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES,
+            min_length: DEFAULT_SESSION_REVIEW_MIN_LENGTH,
+            wing: DEFAULT_SESSION_REVIEW_WING.to_string(),
+        }
     }
 }
 
