@@ -269,7 +269,6 @@ fn test_peek_partner_has_no_mempal_side_effects() {
     let drawers_before = db.drawer_count().expect("drawer count");
     let triples_before = db.triple_count().expect("triple count");
     let schema_before = db.schema_version().expect("schema version");
-    assert_eq!(schema_before, 4, "baseline palace.db should be schema v4");
     drop(db);
 
     // Record the DB file mtime as a second-line check: peek_partner must

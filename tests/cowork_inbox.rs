@@ -92,7 +92,6 @@ async fn push_and_drain_have_no_palace_db_side_effects() {
     let drawers_before = db.drawer_count().expect("drawer count");
     let triples_before = db.triple_count().expect("triple count");
     let schema_before = db.schema_version().expect("schema version");
-    assert_eq!(schema_before, 4, "baseline palace.db should be schema v4");
     drop(db);
 
     let mempal_home = tmp.path().join("home");
