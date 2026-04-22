@@ -411,6 +411,8 @@ async fn test_drawer_content_stores_scrubbed_text() {
             source_root: Some(&env.mempal_home),
             dry_run: false,
             project_id: None,
+            gating: None,
+            prototype_classifier: None,
         },
     )
     .await
@@ -442,6 +444,8 @@ async fn test_embedding_receives_scrubbed_text() {
             source_root: Some(&env.mempal_home),
             dry_run: false,
             project_id: None,
+            gating: None,
+            prototype_classifier: None,
         },
     )
     .await
@@ -547,6 +551,8 @@ async fn test_privacy_disabled_preserves_content_byte_identical() {
             source_root: Some(&env.mempal_home),
             dry_run: false,
             project_id: None,
+            gating: None,
+            prototype_classifier: None,
         },
     )
     .await
@@ -604,6 +610,8 @@ async fn test_scrub_does_not_affect_storage_invariants() {
             source_root: Some(&env.mempal_home),
             dry_run: false,
             project_id: None,
+            gating: None,
+            prototype_classifier: None,
         },
     )
     .await
@@ -681,6 +689,8 @@ async fn test_status_command_shows_scrub_stats() {
             source_root: Some(&env.mempal_home),
             dry_run: false,
             project_id: None,
+            gating: None,
+            prototype_classifier: None,
         },
     )
     .await
@@ -695,6 +705,8 @@ async fn test_status_command_shows_scrub_stats() {
             source_root: Some(&env.mempal_home),
             dry_run: false,
             project_id: None,
+            gating: None,
+            prototype_classifier: None,
         },
     )
     .await

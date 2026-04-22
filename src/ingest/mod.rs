@@ -13,11 +13,13 @@ use rusqlite::OptionalExtension;
 
 use crate::core::{
     config::ConfigHandle,
+    config::IngestGatingConfig,
     db::Database,
     types::{Drawer, SourceType},
     utils::{build_drawer_id, current_timestamp, route_room_from_taxonomy},
 };
 use crate::embed::{EmbedError, Embedder};
+use crate::ingest::gating::{PrototypeClassifier, evaluate_tier1, evaluate_tier2};
 use thiserror::Error;
 
 use crate::ingest::{
@@ -46,6 +48,7 @@ pub struct IngestStats {
     pub files: usize,
     pub chunks: usize,
     pub skipped: usize,
+    pub dropped_by_gate: usize,
     /// Time waited acquiring the per-source ingest lock (P9-B). `None`
     /// when the lock was bypassed (e.g. dry-run) or when no wait was
     /// needed and the path took the fast exit before lock acquisition.
@@ -58,6 +61,8 @@ pub struct IngestOptions<'a> {
     pub source_root: Option<&'a Path>,
     pub dry_run: bool,
     pub project_id: Option<&'a str>,
+    pub gating: Option<&'a IngestGatingConfig>,
+    pub prototype_classifier: Option<&'a PrototypeClassifier>,
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -143,6 +148,8 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             source_root: path.parent(),
             dry_run: false,
             project_id: None,
+            gating: None,
+            prototype_classifier: None,
         },
     )
     .await
@@ -245,6 +252,38 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             continue;
         }
 
+        if let Some(gating) = options.gating {
+            let candidate = gating::IngestCandidate {
+                content: chunk.to_string(),
+                tool_name: None,
+                exit_code: None,
+            };
+            let mut gating_decision = evaluate_tier1(&candidate, gating);
+            if gating_decision.is_none()
+                && let Some(classifier) = options.prototype_classifier
+            {
+                let tier2 = evaluate_tier2(
+                    &candidate,
+                    classifier,
+                    embedder,
+                    gating.embedding_classifier.threshold,
+                )
+                .await;
+                gating_decision = Some(tier2.decision);
+            }
+            if let Some(decision) = gating_decision.as_ref() {
+                db.record_gating_audit(&drawer_id, decision, options.project_id)
+                    .map_err(|source| IngestError::InsertDrawer {
+                        drawer_id: drawer_id.clone(),
+                        source,
+                    })?;
+                if decision.is_rejected() {
+                    stats.dropped_by_gate += 1;
+                    continue;
+                }
+            }
+        }
+
         pending.push((chunk_index, chunk, drawer_id));
     }
 
@@ -338,6 +377,8 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             source_root: Some(dir),
             dry_run: false,
             project_id: None,
+            gating: None,
+            prototype_classifier: None,
         },
     )
     .await
@@ -378,6 +419,7 @@ pub async fn ingest_dir_with_options<E: Embedder + ?Sized>(
                 stats.files += file_stats.files;
                 stats.chunks += file_stats.chunks;
                 stats.skipped += file_stats.skipped;
+                stats.dropped_by_gate += file_stats.dropped_by_gate;
             }
         }
     }

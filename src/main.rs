@@ -26,6 +26,7 @@ use mempal::core::{
 };
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
+use mempal::ingest::gating::compile_classifier_from_config;
 use mempal::ingest::{IngestOptions, IngestStats, ingest_dir_with_options};
 use mempal::mcp::MempalMcpServer;
 use mempal::search::search;
@@ -53,6 +54,15 @@ struct SearchCommandOptions<'a> {
     json: bool,
 }
 
+struct IngestCommandOptions<'a> {
+    dir: &'a Path,
+    wing: &'a str,
+    format: Option<String>,
+    project: Option<&'a str>,
+    no_gate: bool,
+    dry_run: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     Init {
@@ -68,6 +78,8 @@ enum Commands {
         format: Option<String>,
         #[arg(long)]
         project: Option<String>,
+        #[arg(long, default_value_t = false)]
+        no_gate: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -91,6 +103,10 @@ enum Commands {
     Project {
         #[command(subcommand)]
         command: ProjectCommands,
+    },
+    Gating {
+        #[command(subcommand)]
+        command: GatingCommands,
     },
     WakeUp {
         #[arg(long)]
@@ -244,6 +260,14 @@ enum TaxonomyCommands {
 }
 
 #[derive(Subcommand)]
+enum GatingCommands {
+    Stats {
+        #[arg(long)]
+        since: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum KgCommands {
     Add {
         subject: String,
@@ -353,7 +377,32 @@ fn run() -> Result<()> {
 
     ConfigHandle::bootstrap(&config_path).context("failed to bootstrap config hot reload")?;
     let config = ConfigHandle::current();
-    let db = Database::open(&expand_home(&config.db_path)).context("failed to open database")?;
+    let db_path = expand_home(&config.db_path);
+    let db = match Database::open(&db_path) {
+        Ok(db) => db,
+        Err(_error)
+            if matches!(
+                &cli.command,
+                Commands::Gating {
+                    command: GatingCommands::Stats { .. }
+                }
+            ) && !config_path.exists() =>
+        {
+            eprintln!(
+                "warning: failed to open database {}; reporting empty gating stats",
+                db_path.display()
+            );
+            let since = match &cli.command {
+                Commands::Gating {
+                    command: GatingCommands::Stats { since },
+                } => since.as_deref(),
+                _ => None,
+            };
+            observability::print_empty_gating_stats(since);
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("failed to open database"),
+    };
 
     match cli.command {
         Commands::Init { dir, dry_run } => init_command(&db, &dir, dry_run),
@@ -362,15 +411,19 @@ fn run() -> Result<()> {
             wing,
             format,
             project,
+            no_gate,
             dry_run,
         } => block_on_result(ingest_command(
             &db,
             config.as_ref(),
-            &dir,
-            &wing,
-            format,
-            project.as_deref(),
-            dry_run,
+            IngestCommandOptions {
+                dir: &dir,
+                wing: &wing,
+                format,
+                project: project.as_deref(),
+                no_gate,
+                dry_run,
+            },
         )),
         Commands::Search {
             query,
@@ -425,7 +478,8 @@ fn run() -> Result<()> {
         Commands::Tunnels => tunnels_command(&db),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
         Commands::Serve { mcp } => block_on_result(serve_command(config.as_ref(), mcp)),
-        Commands::Status => status_command(&db),
+        Commands::Status => status_command(&db, config.as_ref()),
+        Commands::Gating { command } => gating_command(&db, config.as_ref(), command),
         Commands::Tail {
             limit,
             follow,
@@ -559,57 +613,72 @@ fn init_command(db: &Database, dir: &Path, dry_run: bool) -> Result<()> {
 async fn ingest_command(
     db: &Database,
     config: &Config,
-    dir: &Path,
-    wing: &str,
-    format: Option<String>,
-    project: Option<&str>,
-    dry_run: bool,
+    options: IngestCommandOptions<'_>,
 ) -> Result<()> {
-    if let Some(format) = format.as_deref()
+    if let Some(format) = options.format.as_deref()
         && format != "convos"
     {
         bail!("unsupported --format value: {format}");
     }
 
-    let project_id = resolve_project_id(project, config, Some(dir))
+    let project_id = resolve_project_id(options.project, config, Some(options.dir))
         .context("failed to resolve ingest project id")?;
-    let stats = if dry_run {
+    let stats = if options.dry_run {
         ingest_dir_with_options(
             db,
             &NoopEmbedder,
-            dir,
-            wing,
+            options.dir,
+            options.wing,
             IngestOptions {
                 room: None,
-                source_root: Some(dir),
+                source_root: Some(options.dir),
                 dry_run: true,
                 project_id: project_id.as_deref(),
+                gating: None,
+                prototype_classifier: None,
             },
         )
         .await?
     } else {
+        let prototype_classifier = if config.ingest_gating.enabled && !options.no_gate {
+            compile_classifier_from_config(config)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                .context("gating prototypes unavailable")?
+        } else {
+            None
+        };
         let embedder = build_embedder(config).await?;
         ingest_dir_with_options(
             db,
             &*embedder,
-            dir,
-            wing,
+            options.dir,
+            options.wing,
             IngestOptions {
                 room: None,
-                source_root: Some(dir),
+                source_root: Some(options.dir),
                 dry_run: false,
                 project_id: project_id.as_deref(),
+                gating: (!options.no_gate).then_some(&config.ingest_gating),
+                prototype_classifier: prototype_classifier.as_ref(),
             },
         )
         .await?
     };
 
-    append_ingest_audit_log(db, dir, wing, format.as_deref(), dry_run, stats)
-        .context("failed to append ingest audit log")?;
+    append_ingest_audit_log(
+        db,
+        options.dir,
+        options.wing,
+        options.format.as_deref(),
+        options.dry_run,
+        stats,
+    )
+    .context("failed to append ingest audit log")?;
 
     println!(
-        "dry_run={} files={} chunks={} skipped={}",
-        dry_run, stats.files, stats.chunks, stats.skipped
+        "dry_run={} files={} chunks={} skipped={} dropped_by_gate={}",
+        options.dry_run, stats.files, stats.chunks, stats.skipped, stats.dropped_by_gate
     );
 
     Ok(())
@@ -664,6 +733,7 @@ fn append_ingest_audit_log(
         "files": stats.files,
         "chunks": stats.chunks,
         "skipped": stats.skipped,
+        "dropped_by_gate": stats.dropped_by_gate,
     });
     writeln!(file, "{entry}")
         .with_context(|| format!("failed to write audit log {}", audit_path.display()))?;
@@ -1285,7 +1355,7 @@ fn fact_check_command(
     Ok(())
 }
 
-fn status_command(db: &Database) -> Result<()> {
+fn status_command(db: &Database, config: &Config) -> Result<()> {
     let cfg_meta = ConfigHandle::snapshot_meta();
     let scrub_stats = ConfigHandle::scrub_stats();
     let runtime_warnings = ConfigHandle::collect_runtime_warnings();
@@ -1315,6 +1385,11 @@ fn status_command(db: &Database) -> Result<()> {
         .null_project_backfill_pending_count()
         .context("failed to count pending project backfill drawers")?;
     let taxonomy_count = db.taxonomy_count().context("failed to count taxonomy")?;
+    let gating_drop_counts = db
+        .gating_drop_counts()
+        .context("failed to read gating counters")?;
+    let gating_stats =
+        observability::gating_stats(db, config, None).context("failed to read gating stats")?;
     let db_size_bytes = db
         .database_size_bytes()
         .context("failed to compute database size")?;
@@ -1418,6 +1493,28 @@ fn status_command(db: &Database) -> Result<()> {
             .join(", ");
         println!("  redactions_per_pattern: {per_pattern}");
     }
+    println!("Gating:");
+    println!("  kept: {}", gating_stats.kept);
+    println!("  skipped: {}", gating_stats.skipped);
+    println!("  tier1_kept: {}", gating_stats.tier1_kept);
+    println!("  tier1_skipped: {}", gating_stats.tier1_skipped);
+    println!("  tier2_kept: {}", gating_stats.tier2_kept);
+    println!("  tier2_skipped: {}", gating_stats.tier2_skipped);
+    println!("  unclassified: {}", gating_stats.unclassified);
+    let nonzero_gating_counts = gating_drop_counts
+        .by_reason
+        .iter()
+        .filter_map(|(reason, count)| (*count > 0).then_some(format!("{reason}={count}")))
+        .collect::<Vec<_>>();
+    let dropped_total = gating_drop_counts
+        .total
+        .unwrap_or_else(|| gating_drop_counts.by_reason.values().copied().sum::<u64>());
+    println!("  dropped_total: {dropped_total}");
+    if nonzero_gating_counts.is_empty() {
+        println!("  dropped_by_reason: none");
+    } else {
+        println!("  dropped_by_reason: {}", nonzero_gating_counts.join(", "));
+    }
     if !runtime_warnings.is_empty() {
         println!("Warnings:");
         for warning in runtime_warnings {
@@ -1442,6 +1539,18 @@ fn status_command(db: &Database) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn gating_command(db: &Database, config: &Config, command: GatingCommands) -> Result<()> {
+    match command {
+        GatingCommands::Stats { since } => observability::gating_stats_command(
+            db,
+            config,
+            observability::GatingStatsOptions {
+                since: since.as_deref(),
+            },
+        ),
+    }
 }
 
 fn read_daemon_pid(db_path: &Path) -> Result<Option<i32>> {

@@ -1,8 +1,8 @@
 #[rustfmt::skip] #[path = "db_fork_ext.rs"] mod db_fork_ext;
 // harness-point: PR0 — re-export MigrationHook trait + hooked migration runner for tests
 pub use db_fork_ext::{
-    FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL, FORK_EXT_V3_SCHEMA_SQL,
-    MigrationHook, apply_fork_ext_migrations, apply_fork_ext_migrations_to,
+    CURRENT_FORK_EXT_VERSION, FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL,
+    FORK_EXT_V3_SCHEMA_SQL, MigrationHook, apply_fork_ext_migrations, apply_fork_ext_migrations_to,
     apply_fork_ext_migrations_with_hook, read_fork_ext_version, set_fork_ext_version,
 };
 use std::fs;
@@ -22,6 +22,7 @@ use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
 const CURRENT_SCHEMA_VERSION: u32 = 4;
+const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 
 const V1_SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -97,6 +98,12 @@ pub enum DbError {
 pub struct Database {
     conn: Connection,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatingDropCounts {
+    pub total: Option<u64>,
+    pub by_reason: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -214,6 +221,7 @@ impl Database {
         let created_at = super::utils::current_timestamp()
             .parse::<i64>()
             .unwrap_or_default();
+        let retained_until = created_at + 7 * 24 * 60 * 60;
         let unique_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
@@ -223,19 +231,121 @@ impl Database {
             explain_json
         );
         let id = format!("gating_{}", blake3::hash(id_seed.as_bytes()).to_hex());
+        let audit_decision = if decision.is_rejected() {
+            "skip"
+        } else {
+            "keep"
+        };
+        let drawer_id = (!decision.is_rejected()).then_some(candidate_hash);
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), DbError> {
+            self.conn.execute(
+                r#"
+                INSERT INTO gating_audit (
+                    id,
+                    candidate_hash,
+                    drawer_id,
+                    decision,
+                    tier,
+                    label,
+                    reason,
+                    score,
+                    explain_json,
+                    retained_until,
+                    created_at,
+                    project_id
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                "#,
+                params![
+                    id,
+                    candidate_hash,
+                    drawer_id,
+                    audit_decision,
+                    i64::from(decision.tier),
+                    decision.label.as_deref(),
+                    decision.gating_reason.as_deref(),
+                    decision.score,
+                    explain_json,
+                    retained_until,
+                    created_at,
+                    project_id,
+                ],
+            )?;
+            if let Some(reason) = decision.drop_reason() {
+                self.increment_meta_counter(GATING_DROP_TOTAL_KEY)?;
+                self.increment_meta_counter(&format!("gating.dropped.{reason}"))?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn gating_drop_counts(&self) -> Result<GatingDropCounts, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT key, value
+            FROM fork_ext_meta
+            WHERE key LIKE 'gating.dropped.%'
+            ORDER BY key
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let key = row.get::<_, String>(0)?;
+                let value = row.get::<_, String>(1)?;
+                Ok((key, value))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut total = None;
+        let mut counts = std::collections::BTreeMap::new();
+        for (key, value) in rows {
+            let count = value.parse::<u64>().unwrap_or_default();
+            if key == GATING_DROP_TOTAL_KEY {
+                total = Some(count);
+                continue;
+            }
+            if count == 0 {
+                continue;
+            }
+            if let Some(reason) = key.strip_prefix("gating.dropped.by_reason.") {
+                *counts.entry(reason.to_string()).or_default() += count;
+                continue;
+            }
+
+            let Some(reason) = key.strip_prefix("gating.dropped.") else {
+                continue;
+            };
+            if reason == "total" || reason.starts_with("by_reason.") {
+                continue;
+            }
+            *counts.entry(reason.to_string()).or_default() += count;
+        }
+        Ok(GatingDropCounts {
+            total,
+            by_reason: counts,
+        })
+    }
+
+    fn increment_meta_counter(&self, key: &str) -> Result<(), DbError> {
         self.conn.execute(
             r#"
-            INSERT INTO gating_audit (id, candidate_hash, decision, explain_json, created_at, project_id)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO fork_ext_meta (key, value)
+            VALUES (?1, '1')
+            ON CONFLICT(key) DO UPDATE
+            SET value = CAST(CAST(COALESCE(fork_ext_meta.value, '0') AS INTEGER) + 1 AS TEXT)
             "#,
-            params![
-                id,
-                candidate_hash,
-                decision.decision,
-                explain_json,
-                created_at,
-                project_id,
-            ],
+            [key],
         )?;
         Ok(())
     }

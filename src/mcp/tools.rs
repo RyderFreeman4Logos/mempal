@@ -157,6 +157,8 @@ pub struct DeleteResponse {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct IngestResponse {
     pub drawer_id: String,
+    #[serde(default)]
+    pub dropped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gating_decision: Option<GatingDecision>,
     #[serde(skip_serializing_if = "Option::is_none")]

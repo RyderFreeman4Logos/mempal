@@ -570,6 +570,8 @@ async fn test_mixed_dim_batch_aborts_before_begin_immediate() {
             source_root: source.parent(),
             dry_run: false,
             project_id: None,
+            gating: None,
+            prototype_classifier: None,
         },
     )
     .await

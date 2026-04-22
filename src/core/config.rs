@@ -41,6 +41,7 @@ pub struct Config {
     pub config_hot_reload: ConfigHotReloadConfig,
     pub search: SearchConfig,
     pub hotpatch: HotpatchConfig,
+    #[serde(alias = "gating")]
     pub ingest_gating: IngestGatingConfig,
     pub hooks: HooksConfig,
     pub daemon: DaemonConfig,
@@ -88,6 +89,9 @@ impl Config {
         let mut config: Self = toml::from_str(contents)?;
         if root.get("embed").is_none() && root.get("embedder").is_none() {
             config.embed.backend = "model2vec".to_string();
+        }
+        if has_llm_judge_section(&root) {
+            eprintln!("warning: llm_judge tier ignored: external LLM API disabled by design");
         }
         config.validate()?;
         Ok(config)
@@ -316,6 +320,20 @@ impl Config {
                 level: "warn",
                 source: "privacy",
                 message: "hooks capture is enabled while privacy scrubbing is disabled; captured content may persist secrets. Set [privacy].enabled = true or disable [hooks].enabled.".to_string(),
+            });
+        }
+        if self.hooks.enabled && !self.ingest_gating.enabled {
+            warnings.push(RuntimeWarning {
+                level: "warn",
+                source: "gating",
+                message: "hooks capture is enabled while local gating is disabled; passive captures will bypass memory filtering.".to_string(),
+            });
+        }
+        if self.hooks.enabled && self.ingest_gating.fail_open_active() {
+            warnings.push(RuntimeWarning {
+                level: "warn",
+                source: "gating",
+                message: "hooks capture is enabled while tier-2 gating is fail-open on embedder errors; review warnings before trusting passive captures.".to_string(),
             });
         }
         warnings
@@ -710,6 +728,14 @@ pub struct IngestGatingConfig {
     pub novelty: NoveltyConfig,
 }
 
+impl IngestGatingConfig {
+    pub fn fail_open_active(&self) -> bool {
+        self.enabled
+            && self.embedding_classifier.enabled
+            && !self.embedding_classifier.prototypes.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct GatingRuleConfig {
@@ -886,4 +912,11 @@ impl ConfigHandle {
 fn global_scrub_stats() -> &'static Mutex<ScrubStats> {
     static SCRUB_STATS: OnceLock<Mutex<ScrubStats>> = OnceLock::new();
     SCRUB_STATS.get_or_init(|| Mutex::new(ScrubStats::default()))
+}
+
+fn has_llm_judge_section(root: &toml::Value) -> bool {
+    ["ingest_gating", "gating"]
+        .into_iter()
+        .filter_map(|key| root.get(key))
+        .any(|section| section.get("llm_judge").is_some())
 }

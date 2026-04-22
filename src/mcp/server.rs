@@ -84,7 +84,7 @@ impl MempalMcpServer {
         self,
     ) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleServer, Self>> {
         self.gating_runtime
-            .initialize()
+            .initialize_from_config()
             .await
             .context("failed to initialize ingest gating")?;
         self.serve(rmcp::transport::stdio())
@@ -412,6 +412,7 @@ impl MempalMcpServer {
         if request.dry_run.unwrap_or(false) {
             return Ok(Json(IngestResponse {
                 drawer_id,
+                dropped: false,
                 gating_decision: None,
                 novelty_action: None,
                 near_drawer_id: None,
@@ -440,6 +441,7 @@ impl MempalMcpServer {
                 // TODO(spec ambiguity): rejected ingests have no persisted drawer.
                 // Return the candidate-derived drawer_id for audit correlation.
                 drawer_id,
+                dropped: true,
                 gating_decision,
                 novelty_action: None,
                 near_drawer_id: None,
@@ -500,7 +502,7 @@ impl MempalMcpServer {
                 gating_audit_recorded = true;
                 vector = tier2.vector;
                 gating_decision = Some(tier2.decision);
-            } else {
+            } else if config.ingest_gating.enabled {
                 gating_decision = Some(GatingDecision::accepted(
                     0,
                     Some("tier2_disabled".to_string()),
@@ -514,6 +516,7 @@ impl MempalMcpServer {
             drop(lock_guard);
             return Ok(Json(IngestResponse {
                 drawer_id,
+                dropped: true,
                 gating_decision,
                 novelty_action: None,
                 near_drawer_id: None,
@@ -713,6 +716,7 @@ impl MempalMcpServer {
 
         Ok(Json(IngestResponse {
             drawer_id: response_drawer_id,
+            dropped: false,
             gating_decision,
             novelty_action,
             near_drawer_id,

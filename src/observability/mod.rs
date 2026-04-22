@@ -41,6 +41,10 @@ pub struct AuditOptions<'a> {
     pub since: Option<&'a str>,
 }
 
+pub struct GatingStatsOptions<'a> {
+    pub since: Option<&'a str>,
+}
+
 #[derive(Clone)]
 struct DrawerRecord {
     rowid: i64,
@@ -59,6 +63,37 @@ struct AuditRecord {
     decision: String,
     created_at: i64,
     project_id: Option<String>,
+}
+
+struct GatingAuditDetail {
+    audit_id: String,
+    candidate_hash: String,
+    decision: String,
+    tier: u8,
+    label: Option<String>,
+    reason: Option<String>,
+    created_at: i64,
+    project_id: Option<String>,
+}
+
+struct GatingExplainFields {
+    tier: Option<u8>,
+    label: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Default)]
+pub struct GatingStatsSummary {
+    pub total: usize,
+    pub kept: usize,
+    pub skipped: usize,
+    pub tier1_kept: usize,
+    pub tier1_skipped: usize,
+    pub tier2_kept: usize,
+    pub tier2_skipped: usize,
+    pub unclassified: usize,
+    pub kept_by_label: std::collections::BTreeMap<String, usize>,
+    pub skipped_by_reason: std::collections::BTreeMap<String, usize>,
 }
 
 pub fn tail_command(db: &Database, config: &Config, options: TailOptions<'_>) -> Result<()> {
@@ -293,6 +328,31 @@ pub fn audit_command(db: &Database, config: &Config, options: AuditOptions<'_>) 
     Ok(())
 }
 
+pub fn gating_stats(
+    db: &Database,
+    config: &Config,
+    since: Option<&str>,
+) -> Result<GatingStatsSummary> {
+    let scope = dashboard_scope(config)?;
+    let since_cutoff = parse_since_cutoff(since)?;
+    let rows = load_gating_audit_details(db, &scope, since_cutoff)?;
+    Ok(summarize_gating_rows(&rows))
+}
+
+pub fn gating_stats_command(
+    db: &Database,
+    config: &Config,
+    options: GatingStatsOptions<'_>,
+) -> Result<()> {
+    let summary = gating_stats(db, config, options.since)?;
+    print_gating_stats(&summary, options.since);
+    Ok(())
+}
+
+pub fn print_empty_gating_stats(since: Option<&str>) {
+    print_gating_stats(&GatingStatsSummary::default(), since);
+}
+
 fn follow_tail(
     db: &Database,
     scope: &ProjectSearchScope,
@@ -503,16 +563,20 @@ fn load_audit_records(
     scope: &ProjectSearchScope,
     since_cutoff: Option<i64>,
 ) -> Result<Vec<AuditRecord>> {
+    if kind == "gating" {
+        return Ok(load_gating_audit_details(db, scope, since_cutoff)?
+            .into_iter()
+            .map(|row| AuditRecord {
+                audit_id: row.audit_id,
+                candidate_hash: row.candidate_hash,
+                decision: row.decision,
+                created_at: row.created_at,
+                project_id: row.project_id,
+            })
+            .collect());
+    }
+
     let sql = match kind {
-        "gating" => {
-            r#"
-            SELECT a.id, a.candidate_hash, a.decision, a.created_at,
-                   COALESCE(a.project_id, d.project_id)
-            FROM gating_audit a
-            LEFT JOIN drawers d ON d.id = a.candidate_hash
-            ORDER BY a.created_at DESC, a.id DESC
-            "#
-        }
         "novelty" => {
             r#"
             SELECT a.id, a.candidate_hash, a.decision, a.created_at,
@@ -543,6 +607,224 @@ fn load_audit_records(
                 && since_cutoff.is_none_or(|cutoff| row.created_at >= cutoff)
         })
         .collect())
+}
+
+fn load_gating_audit_details(
+    db: &Database,
+    scope: &ProjectSearchScope,
+    since_cutoff: Option<i64>,
+) -> Result<Vec<GatingAuditDetail>> {
+    if db.conn().query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gating_audit'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? == 0
+    {
+        return Ok(Vec::new());
+    }
+
+    let columns = table_columns(db, "gating_audit")?;
+    let project_expr = if columns.iter().any(|name| name == "project_id") {
+        "COALESCE(a.project_id, d.project_id)"
+    } else {
+        "d.project_id"
+    };
+    let modern = ["tier", "label", "reason", "drawer_id"]
+        .into_iter()
+        .all(|column| columns.iter().any(|name| name == column));
+
+    let rows = if modern {
+        let sql = format!(
+            r#"
+            SELECT a.id, a.candidate_hash, a.decision, a.tier, a.label, a.reason,
+                   a.explain_json, a.created_at, {project_expr}
+            FROM gating_audit a
+            LEFT JOIN drawers d ON d.id = COALESCE(a.drawer_id, a.candidate_hash)
+            ORDER BY a.created_at DESC, a.id DESC
+            "#
+        );
+        let mut stmt = db.conn().prepare(&sql)?;
+        stmt.query_map([], |row| {
+            let mut tier = row.get::<_, i64>(3)?.clamp(0, i64::from(u8::MAX)) as u8;
+            let mut label = row.get::<_, Option<String>>(4)?;
+            let mut reason = row.get::<_, Option<String>>(5)?;
+            let explain_json = row.get::<_, Option<String>>(6)?;
+            if tier == 0 && label.is_none() && reason.is_none() {
+                if let Some(parsed) = explain_json
+                    .as_deref()
+                    .and_then(parse_gating_explain_fields)
+                {
+                    tier = parsed.tier.unwrap_or(tier);
+                    label = parsed.label.or(label);
+                    reason = parsed.reason.or(reason);
+                }
+            }
+            Ok(GatingAuditDetail {
+                audit_id: row.get::<_, String>(0)?,
+                candidate_hash: row.get::<_, String>(1)?,
+                decision: canonical_gating_decision(row.get::<_, String>(2)?),
+                tier,
+                label,
+                reason,
+                created_at: row.get::<_, i64>(7)?,
+                project_id: row.get::<_, Option<String>>(8)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        let sql = format!(
+            r#"
+            SELECT a.id, a.candidate_hash, a.decision, a.explain_json, a.created_at, {project_expr}
+            FROM gating_audit a
+            LEFT JOIN drawers d ON d.id = a.candidate_hash
+            ORDER BY a.created_at DESC, a.id DESC
+            "#
+        );
+        let mut stmt = db.conn().prepare(&sql)?;
+        stmt.query_map([], |row| {
+            let explain_json = row.get::<_, String>(3)?;
+            let parsed = parse_gating_explain_fields(&explain_json);
+            Ok(GatingAuditDetail {
+                audit_id: row.get::<_, String>(0)?,
+                candidate_hash: row.get::<_, String>(1)?,
+                decision: canonical_gating_decision(row.get::<_, String>(2)?),
+                tier: parsed
+                    .as_ref()
+                    .and_then(|value| value.tier)
+                    .unwrap_or_default(),
+                label: parsed.as_ref().and_then(|value| value.label.clone()),
+                reason: parsed.and_then(|value| value.reason),
+                created_at: row.get::<_, i64>(4)?,
+                project_id: row.get::<_, Option<String>>(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            scope.allows_row(row.project_id.as_deref())
+                && since_cutoff.is_none_or(|cutoff| row.created_at >= cutoff)
+        })
+        .collect())
+}
+
+fn parse_gating_explain_fields(raw: &str) -> Option<GatingExplainFields> {
+    let parsed = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    Some(GatingExplainFields {
+        tier: parsed
+            .get("tier")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value.min(u64::from(u8::MAX)) as u8),
+        label: parsed
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        reason: parsed
+            .get("reason")
+            .or_else(|| parsed.get("gating_reason"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn summarize_gating_rows(rows: &[GatingAuditDetail]) -> GatingStatsSummary {
+    let mut summary = GatingStatsSummary {
+        total: rows.len(),
+        ..GatingStatsSummary::default()
+    };
+    for row in rows {
+        match (row.decision.as_str(), row.tier) {
+            ("keep", 1) => {
+                summary.kept += 1;
+                summary.tier1_kept += 1;
+            }
+            ("skip", 1) => {
+                summary.skipped += 1;
+                summary.tier1_skipped += 1;
+            }
+            ("keep", 2) => {
+                summary.kept += 1;
+                summary.tier2_kept += 1;
+            }
+            ("skip", 2) => {
+                summary.skipped += 1;
+                summary.tier2_skipped += 1;
+            }
+            ("keep", _) => {
+                summary.kept += 1;
+                summary.unclassified += 1;
+            }
+            ("skip", _) => {
+                summary.skipped += 1;
+                summary.unclassified += 1;
+            }
+            _ => {
+                summary.unclassified += 1;
+            }
+        }
+        if row.decision == "keep" {
+            let key = row.label.clone().unwrap_or_else(|| "unlabeled".to_string());
+            *summary.kept_by_label.entry(key).or_default() += 1;
+        } else if row.decision == "skip" {
+            let key = row.reason.clone().unwrap_or_else(|| "unknown".to_string());
+            *summary.skipped_by_reason.entry(key).or_default() += 1;
+        }
+    }
+    summary
+}
+
+fn render_breakdown(values: &std::collections::BTreeMap<String, usize>) -> String {
+    if values.is_empty() {
+        return "none".to_string();
+    }
+    values
+        .iter()
+        .map(|(key, count)| format!("{key}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn print_gating_stats(summary: &GatingStatsSummary, since: Option<&str>) {
+    println!("Gating stats:");
+    if let Some(since) = since {
+        println!("  window: last {since}");
+    } else {
+        println!("  window: all-time");
+        println!("  all_time_total: {}", summary.total);
+    }
+    println!("  kept: {}", summary.kept);
+    println!("  skipped: {}", summary.skipped);
+    println!("  tier1_kept: {}", summary.tier1_kept);
+    println!("  tier1_skipped: {}", summary.tier1_skipped);
+    println!("  tier2_kept: {}", summary.tier2_kept);
+    println!("  tier2_skipped: {}", summary.tier2_skipped);
+    println!("  unclassified: {}", summary.unclassified);
+    println!(
+        "  kept_by_label: {}",
+        render_breakdown(&summary.kept_by_label)
+    );
+    println!(
+        "  skipped_by_reason: {}",
+        render_breakdown(&summary.skipped_by_reason)
+    );
+}
+
+fn canonical_gating_decision(raw: String) -> String {
+    match raw.as_str() {
+        "accepted" => "keep".to_string(),
+        "rejected" => "skip".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn table_columns(db: &Database, table: &str) -> Result<Vec<String>> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = db.conn().prepare(&pragma)?;
+    Ok(stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn print_audit_section(kind: &str, rows: &[AuditRecord]) {

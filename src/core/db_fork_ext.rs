@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
+pub const CURRENT_FORK_EXT_VERSION: u32 = 7;
+
 pub const FORK_EXT_V1_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS pending_messages (
     id TEXT PRIMARY KEY,
@@ -54,8 +56,14 @@ pub const FORK_EXT_V3_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS gating_audit (
     id TEXT PRIMARY KEY,
     candidate_hash TEXT NOT NULL,
-    decision TEXT NOT NULL,
+    drawer_id TEXT,
+    decision TEXT NOT NULL CHECK(decision IN ('keep', 'skip')),
+    tier INTEGER NOT NULL,
+    label TEXT,
+    reason TEXT,
+    score REAL,
     explain_json TEXT NOT NULL,
+    retained_until INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 );
 
@@ -95,6 +103,14 @@ AFTER UPDATE OF content ON drawers BEGIN
     INSERT INTO drawers_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
 "#;
+
+const GATING_DROP_COUNTER_KEYS: &[&str] = &[
+    "gating.dropped.too_short",
+    "gating.dropped.boilerplate",
+    "gating.dropped.low_signal",
+    "gating.dropped.prototype_below_threshold",
+];
+const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 
 struct Migration {
     version: u32,
@@ -169,6 +185,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 6,
             up: apply_v6,
         },
+        Migration {
+            version: 7,
+            up: apply_v7,
+        },
     ]
 }
 
@@ -224,11 +244,195 @@ fn apply_v6(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn apply_v7(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_gating_audit_columns(conn)?;
+    backfill_gating_audit_from_explain_json(conn)?;
+    for key in GATING_DROP_COUNTER_KEYS {
+        conn.execute(
+            r#"
+            INSERT INTO fork_ext_meta (key, value)
+            VALUES (?1, '0')
+            ON CONFLICT(key) DO NOTHING
+            "#,
+            params![key],
+        )?;
+    }
+    conn.execute(
+        r#"
+        INSERT INTO fork_ext_meta (key, value)
+        VALUES (?1, '0')
+        ON CONFLICT(key) DO NOTHING
+        "#,
+        params![GATING_DROP_TOTAL_KEY],
+    )?;
+    backfill_gating_counter_metadata(conn)?;
+    Ok(())
+}
+
+fn ensure_gating_audit_columns(conn: &Connection) -> rusqlite::Result<()> {
+    if conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gating_audit'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+        == 0
+    {
+        return Ok(());
+    }
+
+    ensure_nullable_column(conn, "gating_audit", "drawer_id", "TEXT")?;
+    ensure_default_column(conn, "gating_audit", "tier", "INTEGER", "0")?;
+    ensure_nullable_column(conn, "gating_audit", "label", "TEXT")?;
+    ensure_nullable_column(conn, "gating_audit", "reason", "TEXT")?;
+    ensure_nullable_column(conn, "gating_audit", "score", "REAL")?;
+    ensure_default_column(conn, "gating_audit", "retained_until", "INTEGER", "0")?;
+
+    conn.execute_batch(
+        r#"
+        UPDATE gating_audit
+        SET retained_until = created_at + 604800
+        WHERE retained_until IS NULL OR retained_until = 0;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn backfill_gating_audit_from_explain_json(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        UPDATE gating_audit
+        SET
+            drawer_id = CASE
+                WHEN drawer_id IS NULL AND decision IN ('keep', 'accepted') THEN candidate_hash
+                ELSE drawer_id
+            END,
+            tier = CASE
+                WHEN (tier IS NULL OR tier = 0)
+                    AND json_type(explain_json, '$.tier') IN ('integer', 'real', 'text')
+                THEN CAST(json_extract(explain_json, '$.tier') AS INTEGER)
+                ELSE tier
+            END,
+            label = CASE
+                WHEN label IS NULL AND json_type(explain_json, '$.label') = 'text'
+                THEN json_extract(explain_json, '$.label')
+                ELSE label
+            END,
+            reason = CASE
+                WHEN reason IS NULL THEN COALESCE(
+                    CASE
+                        WHEN json_type(explain_json, '$.reason') = 'text'
+                        THEN json_extract(explain_json, '$.reason')
+                    END,
+                    CASE
+                        WHEN json_type(explain_json, '$.gating_reason') = 'text'
+                        THEN json_extract(explain_json, '$.gating_reason')
+                    END,
+                    reason
+                )
+                ELSE reason
+            END,
+            score = CASE
+                WHEN score IS NULL
+                    AND json_type(explain_json, '$.score') IN ('integer', 'real', 'text')
+                THEN CAST(json_extract(explain_json, '$.score') AS REAL)
+                ELSE score
+            END
+        WHERE explain_json IS NOT NULL
+            AND json_valid(explain_json) = 1
+            AND (
+                tier IS NULL
+                OR tier = 0
+                OR label IS NULL
+                OR reason IS NULL
+                OR score IS NULL
+                OR (drawer_id IS NULL AND decision IN ('keep', 'accepted'))
+            );
+
+        UPDATE gating_audit
+        SET decision = CASE
+            WHEN decision = 'accepted' THEN 'keep'
+            WHEN decision = 'rejected' THEN 'skip'
+            ELSE decision
+        END
+        WHERE decision IN ('accepted', 'rejected');
+        "#,
+    )
+}
+
+fn backfill_gating_counter_metadata(conn: &Connection) -> rusqlite::Result<()> {
+    let gating_audit_exists = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gating_audit'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if gating_audit_exists == 0 {
+        return Ok(());
+    }
+
+    conn.execute(
+        r#"
+        INSERT INTO fork_ext_meta (key, value)
+        SELECT ?1, CAST(COUNT(*) AS TEXT)
+        FROM gating_audit
+        WHERE decision IN ('skip', 'skipped', 'rejected')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        "#,
+        params![GATING_DROP_TOTAL_KEY],
+    )?;
+    conn.execute(
+        "DELETE FROM fork_ext_meta WHERE key LIKE 'gating.dropped.by_reason.%'",
+        [],
+    )?;
+    conn.execute_batch(
+        r#"
+        INSERT INTO fork_ext_meta (key, value)
+        SELECT
+            'gating.dropped.by_reason.' || label,
+            CAST(COUNT(*) AS TEXT)
+        FROM gating_audit
+        WHERE decision IN ('skip', 'skipped', 'rejected')
+            AND label IS NOT NULL
+            AND label != ''
+        GROUP BY label
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_project_column(conn: &Connection, table: &str, ty: &str) -> rusqlite::Result<()> {
     if table_has_column(conn, table, "project_id")? {
         return Ok(());
     }
     conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN project_id {ty};"))
+}
+
+fn ensure_nullable_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ty: &str,
+) -> rusqlite::Result<()> {
+    if table_has_column(conn, table, column)? {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty};"))
+}
+
+fn ensure_default_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ty: &str,
+    default: &str,
+) -> rusqlite::Result<()> {
+    if table_has_column(conn, table, column)? {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {ty} NOT NULL DEFAULT {default};"
+    ))
 }
 
 fn ensure_drawers_project_column(conn: &Connection) -> rusqlite::Result<()> {

@@ -1,4 +1,6 @@
-use mempal::core::db::{Database, apply_fork_ext_migrations, read_fork_ext_version};
+use mempal::core::db::{
+    CURRENT_FORK_EXT_VERSION, Database, apply_fork_ext_migrations, read_fork_ext_version,
+};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -26,12 +28,12 @@ fn current_schema_version() -> u32 {
 }
 
 #[test]
-fn test_fork_ext_version_is_six_after_audit_project_scope_phase() {
+fn test_fork_ext_version_is_current_after_audit_project_scope_phase() {
     let (_tmp, _db_path, db) = new_test_db();
 
     let version = read_fork_ext_version(db.conn()).expect("read fork-ext version");
 
-    assert_eq!(version, 6);
+    assert_eq!(version, CURRENT_FORK_EXT_VERSION);
 }
 
 #[test]
@@ -42,7 +44,7 @@ fn test_fork_ext_migrations_idempotent() {
     apply_fork_ext_migrations(db.conn()).expect("second apply");
 
     let version = read_fork_ext_version(db.conn()).expect("read fork-ext version");
-    assert_eq!(version, 6);
+    assert_eq!(version, CURRENT_FORK_EXT_VERSION);
 }
 
 #[test]
