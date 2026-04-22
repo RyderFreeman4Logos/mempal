@@ -91,13 +91,9 @@ CREATE INDEX IF NOT EXISTS idx_novelty_audit_created_at
 CREATE INDEX IF NOT EXISTS idx_novelty_audit_candidate_hash
     ON novelty_audit(candidate_hash);
 
--- TODO(spec ambiguity): earlier spec drafts referred to this trigger as
--- `drawers_au_fts`, while the task prompt provided the concrete
--- `drawers_fts_after_update` name. Standardize on the prompt name here and
--- drop the older draft name if it exists.
 DROP TRIGGER IF EXISTS drawers_au_fts;
 DROP TRIGGER IF EXISTS drawers_fts_after_update;
-CREATE TRIGGER drawers_fts_after_update
+CREATE TRIGGER drawers_au_fts
 AFTER UPDATE OF content ON drawers BEGIN
     INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
     INSERT INTO drawers_fts(rowid, content) VALUES (new.rowid, new.content);

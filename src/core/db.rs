@@ -613,6 +613,7 @@ impl Database {
         query_vector: &[f32],
         wing: Option<&str>,
         room: Option<&str>,
+        project_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, f32)>, DbError> {
         let vectors_exist: bool = self.conn.query_row(
@@ -627,31 +628,63 @@ impl Database {
         let query_json = serde_json::to_string(query_vector)?;
         let limit =
             i64::try_from(limit).map_err(|_| DbError::InvalidSourceType("limit".to_string()))?;
-        let mut statement = self.conn.prepare(
-            r#"
-            WITH matches AS (
-                SELECT id
-                FROM drawer_vectors
-                WHERE embedding MATCH vec_f32(?1)
-                  AND k = ?2
-            )
-            SELECT d.id,
-                   CAST(1.0 - vec_distance_cosine(v.embedding, vec_f32(?1)) AS REAL) AS similarity
-            FROM matches
-            JOIN drawer_vectors v ON v.id = matches.id
-            JOIN drawers d ON d.id = matches.id
-            WHERE d.deleted_at IS NULL
-              AND (?3 IS NULL OR d.wing = ?3)
-              AND (?4 IS NULL OR d.room = ?4)
-            ORDER BY similarity DESC
-            LIMIT ?2
-            "#,
-        )?;
-        let rows = statement
-            .query_map((query_json.as_str(), limit, wing, room), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let fork_ext_version = db_fork_ext::read_fork_ext_version(&self.conn)?;
+        let rows = if fork_ext_version >= 5 {
+            let mut statement = self.conn.prepare(
+                r#"
+                WITH matches AS (
+                    SELECT id
+                    FROM drawer_vectors
+                    WHERE embedding MATCH vec_f32(?1)
+                      AND k = ?2
+                      AND (?5 IS NULL OR project_id = ?5)
+                )
+                SELECT d.id,
+                       CAST(1.0 - vec_distance_cosine(v.embedding, vec_f32(?1)) AS REAL) AS similarity
+                FROM matches
+                JOIN drawer_vectors v ON v.id = matches.id
+                JOIN drawers d ON d.id = matches.id
+                WHERE d.deleted_at IS NULL
+                  AND (?3 IS NULL OR d.wing = ?3)
+                  AND (?4 IS NULL OR d.room = ?4)
+                  AND (?5 IS NULL OR d.project_id = ?5)
+                ORDER BY similarity DESC
+                LIMIT ?2
+                "#,
+            )?;
+            statement
+                .query_map(
+                    (query_json.as_str(), limit, wing, room, project_id),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?)),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let mut statement = self.conn.prepare(
+                r#"
+                WITH matches AS (
+                    SELECT id
+                    FROM drawer_vectors
+                    WHERE embedding MATCH vec_f32(?1)
+                      AND k = ?2
+                )
+                SELECT d.id,
+                       CAST(1.0 - vec_distance_cosine(v.embedding, vec_f32(?1)) AS REAL) AS similarity
+                FROM matches
+                JOIN drawer_vectors v ON v.id = matches.id
+                JOIN drawers d ON d.id = matches.id
+                WHERE d.deleted_at IS NULL
+                  AND (?3 IS NULL OR d.wing = ?3)
+                  AND (?4 IS NULL OR d.room = ?4)
+                ORDER BY similarity DESC
+                LIMIT ?2
+                "#,
+            )?;
+            statement
+                .query_map((query_json.as_str(), limit, wing, room), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
         Ok(rows)
     }
 
