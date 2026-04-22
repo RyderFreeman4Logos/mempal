@@ -497,13 +497,14 @@ impl SearchResultDto {
             route,
             tunnel_hints,
         } = value;
-        let signals = crate::aaak::analyze(&content);
+        let analyzed_content = crate::session_review::analysis_content(&content);
+        let signals = crate::aaak::analyze(analyzed_content);
         let original_content_bytes = content.len() as u64;
         let preview = if progressive_disclosure {
-            crate::search::preview::truncate(&content, preview_chars)
+            crate::search::preview::truncate(analyzed_content, preview_chars)
         } else {
             crate::search::preview::PreviewText {
-                content,
+                content: content.clone(),
                 truncated: false,
             }
         };

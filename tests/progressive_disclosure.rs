@@ -280,6 +280,37 @@ async fn test_per_call_disable_progressive() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_search_non_progressive_returns_raw_bytes_for_session_review_drawer() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(true, 24);
+    let content = concat!(
+        "Decision: keep the full session review drawer verbatim when callers disable preview mode.",
+        "\n\n<!-- mempal:session-review -->\n",
+        "linked_drawer_ids: [\"drawer-a\",\"drawer-b\"]\n",
+        "session_id: \"sess-raw\""
+    );
+    insert_drawer(
+        &env.db_path,
+        "drawer-session-review-raw",
+        content,
+        "sess-raw",
+        true,
+    );
+
+    let response = search(&env.server(), "verbatim", Some(true)).await;
+    let result = response
+        .results
+        .iter()
+        .find(|result| result.drawer_id == "drawer-session-review-raw")
+        .expect("session review result");
+
+    assert_eq!(result.content, content);
+    assert!(result.content.contains("<!-- mempal:session-review -->"));
+    assert_eq!(result.original_content_bytes, content.len() as u64);
+    assert!(!result.content_truncated);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_read_drawer_not_found() {
     let _guard = config_guard().await;
     let env = TestEnv::new(true, 24);

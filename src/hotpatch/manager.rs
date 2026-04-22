@@ -108,9 +108,9 @@ pub fn review(config: &Config, mempal_home: &Path, options: ReviewOptions) -> Re
         for entry in &entries {
             stdout.push_str(&format!(
                 "{}\n  suggestion_file: {}\n  {}\n",
-                entry.dir.display(),
-                entry.suggestion_file.display(),
-                entry.line
+                escape_for_terminal(&entry.dir.display().to_string()),
+                escape_for_terminal(&entry.suggestion_file.display().to_string()),
+                escape_for_terminal(&entry.line)
             ));
         }
         stdout.push_str(&format!("pending={pending_count}\n"));
@@ -133,7 +133,10 @@ pub fn apply(config: &Config, mempal_home: &Path, options: ApplyOptions) -> Resu
     if !suggestion_path.exists() {
         return Ok(ApplyReport {
             applied_count: 0,
-            stdout: format!("no suggestion file for {}\n", canonical_dir.display()),
+            stdout: format!(
+                "no suggestion file for {}\n",
+                escape_for_terminal(&canonical_dir.display().to_string())
+            ),
         });
     }
 
@@ -185,10 +188,13 @@ pub fn apply(config: &Config, mempal_home: &Path, options: ApplyOptions) -> Resu
         .collect::<Vec<_>>();
 
     if !options.confirm {
-        let mut stdout = format!("dry-run for {}\n", target_path.display());
+        let mut stdout = format!(
+            "dry-run for {}\n",
+            escape_for_terminal(&target_path.display().to_string())
+        );
         for line in &to_append {
             stdout.push_str("+ ");
-            stdout.push_str(line);
+            stdout.push_str(&escape_for_terminal(line));
             stdout.push('\n');
         }
         return Ok(ApplyReport {
@@ -238,7 +244,7 @@ pub fn apply(config: &Config, mempal_home: &Path, options: ApplyOptions) -> Resu
         stdout: format!(
             "applied {} suggestion(s) to {}\n",
             pending.len(),
-            target_path.display()
+            escape_for_terminal(&target_path.display().to_string())
         ),
     })
 }
@@ -417,11 +423,15 @@ fn resolve_target_file(config: &Config, canonical_dir: &Path) -> Result<PathBuf>
         })?;
     let resolved_target = fs::canonicalize(&candidate)
         .with_context(|| format!("failed to canonicalize {}", candidate.display()))?;
-    ensure_allowed_target(config, &resolved_target)?;
+    ensure_allowed_target(config, &resolved_target, "write target")?;
     Ok(resolved_target)
 }
 
-fn ensure_allowed_target(config: &Config, resolved_target: &Path) -> Result<()> {
+pub(crate) fn ensure_allowed_target(
+    config: &Config,
+    resolved_target: &Path,
+    purpose: &str,
+) -> Result<()> {
     let prefixes = allowed_prefixes(config)?;
     if prefixes
         .iter()
@@ -430,12 +440,12 @@ fn ensure_allowed_target(config: &Config, resolved_target: &Path) -> Result<()> 
         return Ok(());
     }
     bail!(
-        "refusing to write {} because it escapes hotpatch.allowed_target_prefixes",
+        "refusing hotpatch {purpose} {} because canonical path escapes hotpatch.allowed_target_prefixes (symlink escape / outside project root)",
         resolved_target.display()
     );
 }
 
-fn allowed_prefixes(config: &Config) -> Result<Vec<PathBuf>> {
+pub(crate) fn allowed_prefixes(config: &Config) -> Result<Vec<PathBuf>> {
     if !config.hotpatch.allowed_target_prefixes.is_empty() {
         return config
             .hotpatch
@@ -466,6 +476,10 @@ fn canonicalize_prefix(value: &str) -> Result<PathBuf> {
         PathBuf::from(value)
     };
     Ok(expanded.canonicalize().unwrap_or(expanded))
+}
+
+fn escape_for_terminal(value: &str) -> String {
+    crate::observability::escape_terminal_text(value)
 }
 
 fn mark_entries(content: &str, entries: &[SuggestionEntry], marker: &str) -> Result<String> {
