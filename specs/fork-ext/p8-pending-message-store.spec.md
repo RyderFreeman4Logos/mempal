@@ -19,7 +19,7 @@ estimate: 2d
 - 表结构：
   ```sql
   CREATE TABLE pending_messages (
-      id TEXT PRIMARY KEY,              -- ULID
+      id TEXT PRIMARY KEY,              -- monotonic id: <prefix>-<millis_hex>-<counter_hex>, lex-sortable (enqueue 顺序 = id 顺序)
       kind TEXT NOT NULL,               -- 'hook_event' | 'bulk_import' | etc.
       payload TEXT NOT NULL,            -- JSON 原文
       status TEXT NOT NULL,             -- 'pending' | 'claimed' | 'failed'
@@ -36,7 +36,7 @@ estimate: 2d
   CREATE INDEX idx_pending_heartbeat ON pending_messages(status, heartbeat_at) WHERE status='claimed';
   ```
 - 公共 API：
-  - `enqueue(kind: &str, payload: &str) -> Result<String>` 返回新消息 ULID，写入时 `status='pending'`, `next_attempt_at=now`
+  - `enqueue(kind: &str, payload: &str) -> Result<String>` 返回新消息 id（格式 `<prefix>-<millis_hex>-<counter_hex>`，单调且字典序可排）；写入时 `status='pending'`, `next_attempt_at=now`
   - `claim_next(worker_id: &str, claim_ttl_secs: i64) -> Result<Option<ClaimedMessage>>` 原子更新（SELECT + UPDATE in txn）一条 `status='pending' AND next_attempt_at <= now` 的消息，标为 `claimed`
   - `confirm(id: &str) -> Result<()>` 处理成功，DELETE 该行
   - `mark_failed(id: &str, error: &str) -> Result<()>` 处理失败，`retry_count += 1`，`next_attempt_at = now + backoff(retry_count)`，`status='pending'`（重新可领取）；超过 `max_retries` 时 `status='failed'` 永久保留供审计
@@ -60,7 +60,7 @@ estimate: 2d
 - `crates/mempal-core/src/lib.rs`（`pub mod queue` + re-export）
 - `crates/mempal-core/src/db/schema.rs` 或等价（fork_ext_version `0 → 1` migration + `pending_messages` DDL）
 - `crates/mempal-core/src/db.rs` 或 `db/mod.rs`（`Database::open` 追加 `PRAGMA journal_mode=WAL` + `PRAGMA synchronous=NORMAL`；启动时调 `reclaim_stale`）
-- `crates/mempal-core/Cargo.toml`（添加 `thiserror`、`ulid` workspace dep，若尚未有）
+- `crates/mempal-core/Cargo.toml`（添加 `thiserror` workspace dep，若尚未有；message id 使用内置 millis+counter 格式，不依赖 `ulid` crate）
 - `crates/mempal-cli/src/main.rs`（`mempal status` 加队列 stats 行）
 - `tests/queue_crash_safety.rs`（新建集成测试文件）
 - `tests/queue_concurrency.rs`（新建）
