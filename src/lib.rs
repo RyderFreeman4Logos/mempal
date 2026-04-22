@@ -14,6 +14,7 @@ pub mod hook;
 pub mod hook_install;
 pub mod hotpatch;
 pub mod ingest;
+pub mod integrations;
 pub mod mcp;
 pub mod observability;
 pub mod search;

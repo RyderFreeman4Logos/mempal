@@ -250,6 +250,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         global_codex: bool,
     },
+    Integrations {
+        #[command(subcommand)]
+        command: mempal::integrations::IntegrationCommands,
+    },
     Hook {
         #[command(subcommand)]
         command: mempal::hook::HookCommands,
@@ -375,6 +379,9 @@ fn run() -> Result<()> {
         }
         Commands::CoworkInstallHooks { global_codex } => {
             return cowork_install_hooks_command(*global_codex);
+        }
+        Commands::Integrations { command } => {
+            return mempal::integrations::run_command(command.clone());
         }
         Commands::Hook { command } => {
             return mempal::hook::run_command(command.clone());
@@ -581,6 +588,7 @@ fn run() -> Result<()> {
         Commands::CoworkDrain { .. }
         | Commands::CoworkStatus { .. }
         | Commands::CoworkInstallHooks { .. }
+        | Commands::Integrations { .. }
         | Commands::Hook { .. }
         | Commands::Hotpatch { .. }
         | Commands::Daemon { .. } => unreachable!(),
