@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "mempal_source": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__MEMPAL_SESSION_START_COMMAND__"
+          }
+        ]
+      }
+    ]
+  }
+}
