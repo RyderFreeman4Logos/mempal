@@ -12,8 +12,10 @@ use crate::core::{
     db::Database,
     project::{ProjectSearchScope, resolve_project_id},
 };
+use crate::hotpatch::manager::ensure_allowed_target;
 use crate::hotpatch::{FileLock, short_drawer_id};
 use crate::search::preview;
+use crate::session_review::hooks_raw_content;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GenerationOptions {
@@ -118,6 +120,10 @@ pub fn suggest_for_drawer(
     );
 
     for path in payload_paths {
+        let canonical_source = path.canonicalize().with_context(|| {
+            format!("failed to canonicalize hotpatch source {}", path.display())
+        })?;
+        ensure_allowed_target(config, &canonical_source, "source path scan")?;
         let watched_dir = match find_watched_dir(&path, &config.hotpatch.watch_files) {
             Ok(Some(dir)) => dir,
             Ok(None) => {
@@ -130,6 +136,13 @@ pub fn suggest_for_drawer(
                 continue;
             }
         };
+        let canonical_watched_dir = watched_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize hotpatch watched dir {}",
+                watched_dir.display()
+            )
+        })?;
+        ensure_allowed_target(config, &canonical_watched_dir, "watched dir scan")?;
         let suggestion_path = suggestion_file_path(mempal_home, &watched_dir)?;
         fs::create_dir_all(
             suggestion_path
@@ -137,8 +150,12 @@ pub fn suggest_for_drawer(
                 .context("hotpatch suggestion file missing parent")?,
         )
         .with_context(|| format!("failed to create {}", suggestion_path.display()))?;
-        let changed =
-            append_suggestion_line(&suggestion_path, &watched_dir, &details.drawer.id, &line)?;
+        let changed = append_suggestion_line(
+            &suggestion_path,
+            &canonical_watched_dir,
+            &details.drawer.id,
+            &line,
+        )?;
         if changed {
             appended += 1;
         } else {
@@ -150,7 +167,7 @@ pub fn suggest_for_drawer(
 }
 
 fn resolve_generation_project(config: &Config, drawer_content: &str) -> Result<Option<String>> {
-    let cwd = serde_json::from_str::<Value>(drawer_content)
+    let cwd = serde_json::from_str::<Value>(hooks_raw_content(drawer_content))
         .ok()
         .and_then(|value| {
             value
@@ -162,7 +179,7 @@ fn resolve_generation_project(config: &Config, drawer_content: &str) -> Result<O
 }
 
 fn summary_inputs(drawer_content: &str) -> Result<(Option<String>, Vec<String>, Option<PathBuf>)> {
-    let parsed = match serde_json::from_str::<Value>(drawer_content) {
+    let parsed = match serde_json::from_str::<Value>(hooks_raw_content(drawer_content)) {
         Ok(value) => value,
         Err(_) => return Ok((Some(drawer_content.to_string()), Vec::new(), None)),
     };

@@ -13,6 +13,7 @@ use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
 use mempal::daemon_bootstrap::DaemonContext;
 use mempal::hook::{CapturedHookEnvelope, HookEvent};
+use mempal::session_review::split_hooks_raw_metadata;
 use rusqlite::Connection;
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -345,6 +346,7 @@ async fn test_daemon_processes_hook_post_tool_to_drawer() {
             claude_cwd: tmp.path().display().to_string(),
             payload: Some(
                 serde_json::json!({
+                    "session_id": "sess-hook-post-tool",
                     "tool_name": "Bash",
                     "input": "printf secret",
                     "output": raw_secret,
@@ -378,15 +380,14 @@ async fn test_daemon_processes_hook_post_tool_to_drawer() {
         Path::new(&source_file).exists(),
         "payload path should exist"
     );
-    assert!(content.contains("\"preview\""), "{content}");
+    let (body, metadata) = split_hooks_raw_metadata(&content);
+    assert_eq!(metadata.session_id.as_deref(), Some("sess-hook-post-tool"));
+    assert!(body.contains("\"preview\""), "{body}");
     assert!(
-        content.contains("[REDACTED:openai_key]"),
-        "privacy scrub must affect stored preview: {content}"
+        body.contains("[REDACTED:openai_key]"),
+        "privacy scrub must affect stored preview: {body}"
     );
-    assert!(
-        !content.contains(raw_secret),
-        "raw secret leaked into drawer"
-    );
+    assert!(!body.contains(raw_secret), "raw secret leaked into drawer");
 
     daemon.sigterm();
     let status = daemon.wait().await.expect("wait daemon");

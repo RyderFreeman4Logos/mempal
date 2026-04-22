@@ -179,7 +179,8 @@ pub fn timeline_command(
     match options.format {
         "json" | "ndjson" => {
             for record in records {
-                let signals = crate::aaak::analyze(&record.content);
+                let signals =
+                    crate::aaak::analyze(crate::session_review::analysis_content(&record.content));
                 let line = TimelineJsonLine {
                     timestamp: format_timestamp(&record.added_at),
                     drawer_id: record.id,
@@ -348,7 +349,8 @@ pub fn view_command(db: &Database, config: &Config, options: ViewOptions<'_>) ->
     if options.raw {
         println!("{}", drawer.content);
     } else {
-        let signals = crate::aaak::analyze(&drawer.content);
+        let signals =
+            crate::aaak::analyze(crate::session_review::analysis_content(&drawer.content));
         println!(
             "flags: {}",
             signals
@@ -1064,7 +1066,11 @@ fn format_tail_line(record: &DrawerRecord, raw: bool) -> String {
 }
 
 fn preview(content: &str) -> String {
-    crate::search::preview::truncate(content, PREVIEW_CHARS).content
+    crate::search::preview::truncate(
+        crate::session_review::analysis_content(content),
+        PREVIEW_CHARS,
+    )
+    .content
 }
 
 fn render_room(room: Option<&str>) -> &str {
@@ -1206,7 +1212,7 @@ fn maybe_escape(value: &str, raw: bool) -> String {
     }
 }
 
-fn escape_terminal_text(value: &str) -> String {
+pub fn escape_terminal_text(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
         if ch.is_control() {

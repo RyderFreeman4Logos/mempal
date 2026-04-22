@@ -30,7 +30,12 @@ use tokio::sync::mpsc;
 use crate::daemon_bootstrap::DaemonContext;
 use crate::hook::CapturedHookEnvelope;
 use crate::hotpatch::generator::{GenerationOptions, suggest_for_drawer};
-use crate::session_review::{SessionReviewOutcome, extract_session_review};
+use crate::session_review::{
+    SessionReviewOutcome, analysis_content, append_hooks_raw_metadata, extract_session_review,
+    split_session_metadata, validate_linked_drawer_ids,
+};
+
+const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
     run_command_with_bootstrap_events(config_path, foreground, None)
@@ -197,7 +202,7 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
 ) -> Result<String> {
     let envelope: CapturedHookEnvelope =
         serde_json::from_str(&message.payload).context("failed to decode queued hook envelope")?;
-    let records = build_drawer_records(&envelope, context.config, context.mempal_home)?;
+    let records = build_drawer_records(db, &envelope, context.config, context.mempal_home)?;
     let drawer_context = DrawerIngestContext {
         db,
         store,
@@ -247,7 +252,7 @@ fn build_gating_candidate(
     }
 
     IngestCandidate {
-        content: record.content.clone(),
+        content: analysis_content(&record.content).to_string(),
         tool_name,
         exit_code,
     }
@@ -281,6 +286,7 @@ struct DrawerRecord {
 }
 
 fn build_drawer_records(
+    db: &Database,
     envelope: &CapturedHookEnvelope,
     config: &crate::core::config::Config,
     mempal_home: &Path,
@@ -292,27 +298,81 @@ fn build_drawer_records(
         } else {
             None
         };
-        match extract_session_review(
-            session_review_payload.as_deref(),
-            &envelope.agent,
-            &config.hooks.session_end,
-        )? {
-            SessionReviewOutcome::Review(review) => records.push(DrawerRecord {
-                wing: review.wing,
-                room: review.room,
-                source_file: review.source_file,
-                content: config.scrub_content(&review.content),
-                importance: review.importance,
-                bypass_novelty: true,
-                project_id: resolve_hook_project_id(envelope, config)?,
-            }),
-            SessionReviewOutcome::Skipped(reason) => {
-                tracing::info!(?reason, "session self-review skipped");
+        let review_record = (|| -> Result<Option<DrawerRecord>> {
+            match extract_session_review(
+                session_review_payload.as_deref(),
+                &envelope.agent,
+                &config.hooks.session_end,
+            )? {
+                SessionReviewOutcome::Review(review) => {
+                    let project_id = resolve_hook_project_id(envelope, config)?;
+                    let (_, metadata) = split_session_metadata(&review.content);
+                    if let Some(session_id) = metadata.session_id.as_deref() {
+                        validate_linked_drawer_ids(
+                            db.conn(),
+                            session_id,
+                            project_id.as_deref(),
+                            &metadata.linked_drawer_ids,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "session-review linked_drawer_ids rejected for source_file={}",
+                                review.source_file
+                            )
+                        })?;
+                    }
+                    Ok(Some(DrawerRecord {
+                        wing: review.wing,
+                        room: review.room,
+                        source_file: review.source_file,
+                        content: config.scrub_content(&review.content),
+                        importance: review.importance,
+                        bypass_novelty: true,
+                        project_id,
+                    }))
+                }
+                SessionReviewOutcome::Skipped(reason) => {
+                    tracing::info!(?reason, "session self-review skipped");
+                    Ok(None)
+                }
+            }
+        })();
+
+        match review_record {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => {}
+            Err(error) => {
+                record_session_review_rejection(db);
+                tracing::warn!(
+                    ?error,
+                    event = %envelope.event,
+                    agent = %envelope.agent,
+                    claude_cwd = %envelope.claude_cwd,
+                    "session self-review rejected; hooks-raw audit will still persist"
+                );
             }
         }
     }
 
     Ok(records)
+}
+
+fn record_session_review_rejection(db: &Database) {
+    if let Err(error) = db.conn().execute(
+        r#"
+        INSERT INTO fork_ext_meta (key, value)
+        VALUES (?1, '1')
+        ON CONFLICT(key) DO UPDATE
+        SET value = CAST(CAST(COALESCE(fork_ext_meta.value, '0') AS INTEGER) + 1 AS TEXT)
+        "#,
+        [SESSION_REVIEW_REJECTED_TOTAL_KEY],
+    ) {
+        tracing::warn!(
+            ?error,
+            key = SESSION_REVIEW_REJECTED_TOTAL_KEY,
+            "failed to record session-review rejection counter"
+        );
+    }
 }
 
 fn load_session_review_payload(envelope: &CapturedHookEnvelope) -> Result<Option<String>> {
@@ -387,6 +447,11 @@ fn build_audit_drawer_record(
         }
     }))
     .context("failed to serialize hook diary drawer")?;
+    let content = append_hooks_raw_metadata(
+        &content,
+        hook_payload_session_id(raw_payload).as_deref(),
+        Some(envelope.captured_at.as_str()),
+    );
     let (wing, room) = audit_target_for_event(&envelope.event, raw_payload, config);
 
     Ok(DrawerRecord {
@@ -506,8 +571,12 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     if gating_decision.is_none()
         && let Some(classifier) = context.daemon.prototype_classifier
     {
-        let candidate_vector =
-            embed_text_with_heartbeat(context.embedder, &record.content, Some(&heartbeat)).await?;
+        let candidate_vector = embed_text_with_heartbeat(
+            context.embedder,
+            analysis_content(&record.content),
+            Some(&heartbeat),
+        )
+        .await?;
         let decision = classifier.decide(
             &candidate_vector,
             context
@@ -538,7 +607,12 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     let vector = match vector {
         Some(vector) => vector,
         None => {
-            embed_text_with_heartbeat(context.embedder, &record.content, Some(&heartbeat)).await?
+            embed_text_with_heartbeat(
+                context.embedder,
+                analysis_content(&record.content),
+                Some(&heartbeat),
+            )
+            .await?
         }
     };
     if record.bypass_novelty {
@@ -724,7 +798,7 @@ fn insert_drawer_with_vector(
         wing: record.wing.clone(),
         room: Some(record.room.clone()),
         source_file: Some(record.source_file.clone()),
-        source_type: SourceType::Manual,
+        source_type: SourceType::Conversation,
         added_at: current_timestamp(),
         chunk_index: Some(0),
         importance: record.importance,
@@ -775,6 +849,19 @@ fn preview_for_event(event: &str, raw_payload: &str) -> String {
             .unwrap_or_else(|| raw_payload.to_string()),
         _ => raw_payload.to_string(),
     }
+}
+
+fn hook_payload_session_id(raw_payload: &str) -> Option<String> {
+    serde_json::from_str::<Value>(raw_payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn persist_raw_payload(raw_payload: &str, mempal_home: &Path) -> Result<String> {
