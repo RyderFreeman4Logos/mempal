@@ -47,6 +47,13 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    — capture the meaning. Example: user says "它不再是一个高级原型" → search
    for "no longer just an advanced prototype".
 
+3b. USE TIMELINE FOR PROJECT OVERVIEW
+   When you want project state overview without a specific question in mind,
+   call mempal_timeline instead of issuing a broad-match mempal_search.
+   Timeline gives you a project-scoped digest ordered by importance and
+   recency, with previews plus original_content_bytes so you can decide which
+   drawers deserve a deeper read.
+
 4. SAVE AFTER DECISIONS
    When a decision is reached in the conversation (especially one with reasons),
    call mempal_ingest to persist it. Include the rationale, not just the
@@ -131,6 +138,7 @@ You have persistent project memory via mempal. Follow these rules in every sessi
 
 TOOLS:
   mempal_status        — current state + this protocol + AAAK format spec
+  mempal_timeline      — project-scoped overview without a query, ordered by importance+recency
   mempal_search        — semantic search with wing/room filters, citation-bearing
   mempal_ingest        — save a new drawer (wing required, room optional, importance 0-5)
   mempal_delete        — soft-delete a drawer by ID
@@ -188,6 +196,18 @@ mod tests {
         assert!(
             MEMORY_PROTOCOL.contains("mempal_cowork_push"),
             "MEMORY_PROTOCOL must mention mempal_cowork_push in TOOLS list"
+        );
+    }
+
+    #[test]
+    fn contains_timeline_guidance() {
+        assert!(
+            MEMORY_PROTOCOL.contains("mempal_timeline"),
+            "MEMORY_PROTOCOL must mention mempal_timeline"
+        );
+        assert!(
+            MEMORY_PROTOCOL.contains("project state overview without a specific question"),
+            "MEMORY_PROTOCOL must explain when to use mempal_timeline"
         );
     }
 }
