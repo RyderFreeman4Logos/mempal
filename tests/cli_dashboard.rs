@@ -7,9 +7,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
 use mempal::core::db::Database;
+use mempal::core::project::ProjectSearchScope;
+use mempal::core::queue::PendingMessageStore;
 use mempal::core::types::{Drawer, SourceType};
 use mempal::ingest::gating::GatingDecision;
 use mempal::ingest::novelty::NoveltyAction;
+use mempal::observability::{self, TailFollowEvent, TailFollowFilters, TailFollowWake};
+use rusqlite::params;
 use tempfile::TempDir;
 
 fn mempal_bin() -> String {
@@ -23,7 +27,7 @@ struct DashboardEnv {
 }
 
 impl DashboardEnv {
-    fn new(project_id: Option<&str>, strict_project_isolation: bool) -> Self {
+    fn new() -> Self {
         let tmp = TempDir::new().expect("tempdir");
         let home = tmp.path().join("home");
         let mempal_home = home.join(".mempal");
@@ -32,7 +36,18 @@ impl DashboardEnv {
         Database::open(&db_path).expect("open db");
         write_config_atomic(
             &mempal_home.join("config.toml"),
-            &config_text(&db_path, project_id, strict_project_isolation),
+            &format!(
+                r#"
+db_path = "{}"
+
+[embed]
+backend = "model2vec"
+
+[search]
+strict_project_isolation = false
+"#,
+                db_path.display()
+            ),
         );
         Self {
             _tmp: tmp,
@@ -46,26 +61,89 @@ impl DashboardEnv {
     }
 }
 
-fn config_text(db_path: &Path, project_id: Option<&str>, strict_project_isolation: bool) -> String {
-    let project_section = project_id
-        .map(|project_id| format!("\n[project]\nid = \"{project_id}\"\n"))
-        .unwrap_or_default();
-    format!(
-        r#"
-db_path = "{}"
-{}
-[embedder]
-backend = "api"
-base_url = "http://127.0.0.1:9/v1/"
-api_model = "test-model"
+#[derive(Clone)]
+struct DrawerSeed {
+    id: String,
+    content: String,
+    wing: String,
+    room: Option<String>,
+    added_at: String,
+    importance: i32,
+}
 
-[search]
-strict_project_isolation = {}
-"#,
-        db_path.display(),
-        project_section,
-        strict_project_isolation
-    )
+fn drawer_seed(
+    id: impl Into<String>,
+    content: impl Into<String>,
+    wing: impl Into<String>,
+    room: Option<&str>,
+    added_at: impl Into<String>,
+    importance: i32,
+) -> DrawerSeed {
+    DrawerSeed {
+        id: id.into(),
+        content: content.into(),
+        wing: wing.into(),
+        room: room.map(str::to_string),
+        added_at: added_at.into(),
+        importance,
+    }
+}
+
+fn insert_drawer(db_path: &Path, seed: &DrawerSeed) {
+    let db = Database::open(db_path).expect("open db");
+    db.insert_drawer(&Drawer {
+        id: seed.id.clone(),
+        content: seed.content.clone(),
+        wing: seed.wing.clone(),
+        room: seed.room.clone(),
+        source_file: Some(format!("{}.md", seed.id)),
+        source_type: SourceType::Manual,
+        added_at: seed.added_at.clone(),
+        chunk_index: Some(0),
+        importance: seed.importance,
+    })
+    .expect("insert drawer");
+}
+
+fn record_gating_audit(db_path: &Path, drawer_id: &str, accepted: bool) {
+    let db = Database::open(db_path).expect("open db");
+    let decision = if accepted {
+        GatingDecision::accepted(1, Some("keep".to_string()), Some(0.9))
+    } else {
+        GatingDecision::rejected(1, Some("drop".to_string()), None, None)
+    };
+    db.record_gating_audit(drawer_id, &decision, None)
+        .expect("record gating audit");
+}
+
+fn record_novelty_audit(db_path: &Path, drawer_id: &str, action: NoveltyAction, created_at: i64) {
+    let db = Database::open(db_path).expect("open db");
+    db.record_novelty_audit(drawer_id, action, Some(drawer_id), Some(0.91), None, None)
+        .expect("record novelty audit");
+    db.conn()
+        .execute(
+            "UPDATE novelty_audit SET created_at = ?2 WHERE candidate_hash = ?1",
+            params![drawer_id, created_at],
+        )
+        .expect("set novelty created_at");
+}
+
+fn seed_queue_rows(db_path: &Path) {
+    let store = PendingMessageStore::new(db_path).expect("queue store");
+    let _pending = store
+        .enqueue("hook", "pending payload")
+        .expect("enqueue pending");
+    let _claimed = store
+        .enqueue("hook", "claimed payload")
+        .expect("enqueue claimed");
+    let failed = store
+        .enqueue("hook", "failed payload")
+        .expect("enqueue failed");
+    let _claim = store
+        .claim_next("dashboard-test", 120)
+        .expect("claim next")
+        .expect("claimed message");
+    store.mark_failed(&failed, "boom").expect("mark failed");
 }
 
 fn write_config_atomic(path: &Path, contents: &str) {
@@ -92,67 +170,6 @@ fn spawn_mempal(home: &Path, cwd: &Path, args: &[&str]) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mempal")
-}
-
-struct DrawerSeed<'a> {
-    id: &'a str,
-    content: &'a str,
-    wing: &'a str,
-    room: Option<&'a str>,
-    added_at: String,
-    importance: i32,
-    project_id: Option<&'a str>,
-}
-
-fn insert_drawer(db_path: &Path, seed: DrawerSeed<'_>) {
-    let db = Database::open(db_path).expect("open db");
-    db.insert_drawer(&Drawer {
-        id: seed.id.to_string(),
-        content: seed.content.to_string(),
-        wing: seed.wing.to_string(),
-        room: seed.room.map(str::to_string),
-        source_file: Some(format!("{}.md", seed.id)),
-        source_type: SourceType::Manual,
-        added_at: seed.added_at,
-        chunk_index: Some(0),
-        importance: seed.importance,
-    })
-    .expect("insert drawer");
-    db.conn()
-        .execute(
-            "UPDATE drawers SET project_id = ?2 WHERE id = ?1",
-            rusqlite::params![seed.id, seed.project_id],
-        )
-        .expect("update drawer project");
-}
-
-fn record_gating_audit(db_path: &Path, drawer_id: &str, accepted: bool, project_id: Option<&str>) {
-    let db = Database::open(db_path).expect("open db");
-    let decision = if accepted {
-        GatingDecision::accepted(1, Some("keep".to_string()), Some(0.9))
-    } else {
-        GatingDecision::rejected(1, Some("drop".to_string()), None, None)
-    };
-    db.record_gating_audit(drawer_id, &decision, project_id)
-        .expect("record gating audit");
-}
-
-fn record_novelty_audit(
-    db_path: &Path,
-    drawer_id: &str,
-    action: NoveltyAction,
-    project_id: Option<&str>,
-) {
-    let db = Database::open(db_path).expect("open db");
-    db.record_novelty_audit(
-        drawer_id,
-        action,
-        Some(drawer_id),
-        Some(0.91),
-        None,
-        project_id,
-    )
-    .expect("record novelty audit");
 }
 
 fn read_lines_until(
@@ -209,9 +226,7 @@ fn snapshot_db(db_path: &Path) -> DbSnapshot {
     let mut hasher = Hasher::new();
     let mut stmt = db
         .conn()
-        .prepare(
-            "SELECT id, content, wing, COALESCE(room, ''), COALESCE(project_id, '') FROM drawers ORDER BY id",
-        )
+        .prepare("SELECT id, content, wing, COALESCE(room, '') FROM drawers ORDER BY id")
         .expect("prepare drawers");
     let drawers = stmt
         .query_map([], |row| {
@@ -220,7 +235,6 @@ fn snapshot_db(db_path: &Path) -> DbSnapshot {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
             ))
         })
         .expect("query drawers")
@@ -231,7 +245,6 @@ fn snapshot_db(db_path: &Path) -> DbSnapshot {
         hasher.update(drawer.1.as_bytes());
         hasher.update(drawer.2.as_bytes());
         hasher.update(drawer.3.as_bytes());
-        hasher.update(drawer.4.as_bytes());
     }
     let mut stmt = db
         .conn()
@@ -285,276 +298,47 @@ fn day_label_days_ago(days: u64) -> String {
     mempal::cowork::peek::format_rfc3339(UNIX_EPOCH + Duration::from_secs(secs))[..10].to_string()
 }
 
-#[test]
-fn test_mempal_tail_emits_most_recent_drawer_first() {
-    let env = DashboardEnv::new(None, false);
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "oldest",
-            content: "old",
-            wing: "code",
-            room: Some("a"),
-            added_at: "1713000000".to_string(),
-            importance: 1,
-            project_id: None,
-        },
-    );
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "newer",
-            content: "new",
-            wing: "code",
-            room: Some("a"),
-            added_at: "1713000100".to_string(),
-            importance: 1,
-            project_id: None,
-        },
-    );
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "newest",
-            content: "latest",
-            wing: "docs",
-            room: Some("b"),
-            added_at: "1713000200".to_string(),
-            importance: 1,
-            project_id: None,
-        },
-    );
-
-    let output = run_mempal(&env.home, env.cwd(), &["tail", "--limit", "2"]);
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines = stdout.lines().collect::<Vec<_>>();
-
-    assert!(lines.first().is_some_and(|line| line.contains("newest")));
-    assert!(lines.get(1).is_some_and(|line| line.contains("newer")));
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after unix epoch")
+        .as_secs() as i64
 }
 
 #[test]
-fn test_mempal_tail_follow_coalesces_event_storm() {
-    let env = DashboardEnv::new(None, false);
-    let mut child = spawn_mempal(&env.home, env.cwd(), &["tail", "--follow", "--limit", "0"]);
-    std::thread::sleep(Duration::from_millis(300));
-
-    let burst_started = Instant::now();
-    for index in 0..20 {
-        let drawer_id = format!("follow-{index:02}");
-        let content = format!("burst drawer {index}");
+fn test_audit_novelty_lists_decisions() {
+    let env = DashboardEnv::new();
+    let decisions = [
+        ("novelty-09", NoveltyAction::Insert),
+        ("novelty-08", NoveltyAction::Insert),
+        ("novelty-07", NoveltyAction::Merge),
+        ("novelty-06", NoveltyAction::Drop),
+        ("novelty-05", NoveltyAction::Insert),
+        ("novelty-04", NoveltyAction::Drop),
+        ("novelty-03", NoveltyAction::Merge),
+        ("novelty-02", NoveltyAction::Insert),
+        ("novelty-01", NoveltyAction::Drop),
+        ("novelty-00", NoveltyAction::Insert),
+    ];
+    for (index, (drawer_id, action)) in decisions.iter().enumerate() {
         insert_drawer(
             &env.db_path,
-            DrawerSeed {
-                id: Box::leak(drawer_id.into_boxed_str()),
-                content: Box::leak(content.into_boxed_str()),
-                wing: "code",
-                room: Some("follow"),
-                added_at: format!("{}", 1713001000 + index),
-                importance: 1,
-                project_id: None,
-            },
+            &drawer_seed(
+                *drawer_id,
+                format!("novelty drawer {index}"),
+                "default",
+                Some("audit"),
+                format!("{}", 1_713_000_000 + index),
+                2,
+            ),
+        );
+        record_novelty_audit(
+            &env.db_path,
+            drawer_id,
+            *action,
+            now_unix_secs() - 60 + (decisions.len() - index) as i64,
         );
     }
-
-    let (lines, first_at) = read_lines_until(&mut child, 20, Duration::from_secs(5));
-    let _ = child.kill();
-    let _ = child.wait();
-
-    assert_eq!(lines.len(), 20, "stdout lines: {lines:?}");
-    let first_elapsed = first_at
-        .map(|instant| instant.duration_since(burst_started))
-        .expect("expected follow output");
-    assert!(
-        first_elapsed >= Duration::from_millis(200),
-        "follow output arrived too early for debounce: {first_elapsed:?}"
-    );
-    for index in 0..20 {
-        let needle = format!("follow-{index:02}");
-        assert!(
-            lines.iter().any(|line| line.contains(&needle)),
-            "missing follow line for {needle}: {lines:?}"
-        );
-    }
-}
-
-#[test]
-fn test_mempal_timeline_groups_by_day() {
-    let env = DashboardEnv::new(None, false);
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "d1",
-            content: "day one",
-            wing: "code",
-            room: Some("a"),
-            added_at: unix_secs_days_ago(2),
-            importance: 1,
-            project_id: None,
-        },
-    );
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "d2",
-            content: "day two",
-            wing: "code",
-            room: Some("a"),
-            added_at: unix_secs_days_ago(1),
-            importance: 1,
-            project_id: None,
-        },
-    );
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "d3",
-            content: "day three",
-            wing: "code",
-            room: Some("a"),
-            added_at: unix_secs_days_ago(0),
-            importance: 1,
-            project_id: None,
-        },
-    );
-
-    let output = run_mempal(&env.home, env.cwd(), &["timeline", "--since", "7d"]);
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(stdout.contains(&format!("=== {} ===", day_label_days_ago(2))));
-    assert!(stdout.contains(&format!("=== {} ===", day_label_days_ago(1))));
-    assert!(stdout.contains(&format!("=== {} ===", day_label_days_ago(0))));
-}
-
-#[test]
-fn test_mempal_stats_counts_drawers_by_wing_room() {
-    let env = DashboardEnv::new(None, false);
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "s1",
-            content: "one",
-            wing: "code",
-            room: Some("core"),
-            added_at: "1713000000".to_string(),
-            importance: 3,
-            project_id: None,
-        },
-    );
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "s2",
-            content: "two",
-            wing: "code",
-            room: Some("core"),
-            added_at: "1713000010".to_string(),
-            importance: 2,
-            project_id: None,
-        },
-    );
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "s3",
-            content: "three",
-            wing: "docs",
-            room: Some("notes"),
-            added_at: "1713000020".to_string(),
-            importance: 1,
-            project_id: None,
-        },
-    );
-    record_gating_audit(&env.db_path, "s1", true, None);
-    record_novelty_audit(&env.db_path, "s2", NoveltyAction::Merge, None);
-
-    let output = run_mempal(&env.home, env.cwd(), &["stats"]);
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(stdout.contains("drawers total: 3"));
-    assert!(stdout.contains("code/core: 2"));
-    assert!(stdout.contains("docs/notes: 1"));
-}
-
-#[test]
-fn test_mempal_view_drawer_id_prints_raw_verbatim() {
-    let env = DashboardEnv::new(None, false);
-    let content = "Decision: use raw output here.\nSecond line stays verbatim.";
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "view-1",
-            content,
-            wing: "code",
-            room: Some("view"),
-            added_at: "1713000000".to_string(),
-            importance: 4,
-            project_id: None,
-        },
-    );
-
-    let output = run_mempal(&env.home, env.cwd(), &["view", "view-1", "--raw"]);
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(stdout.contains("view-1"));
-    assert!(stdout.contains(content));
-    assert!(!stdout.contains("\u{1b}["));
-}
-
-#[test]
-fn test_mempal_audit_respects_project_isolation() {
-    let env = DashboardEnv::new(Some("proj-A"), true);
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "audit-a",
-            content: "project A drawer",
-            wing: "code",
-            room: Some("audit"),
-            added_at: "1713000000".to_string(),
-            importance: 1,
-            project_id: Some("proj-A"),
-        },
-    );
-    insert_drawer(
-        &env.db_path,
-        DrawerSeed {
-            id: "audit-b",
-            content: "project B drawer",
-            wing: "code",
-            room: Some("audit"),
-            added_at: "1713000001".to_string(),
-            importance: 1,
-            project_id: Some("proj-B"),
-        },
-    );
-    record_novelty_audit(
-        &env.db_path,
-        "audit-a",
-        NoveltyAction::Insert,
-        Some("proj-A"),
-    );
-    record_novelty_audit(&env.db_path, "audit-b", NoveltyAction::Drop, Some("proj-B"));
 
     let output = run_mempal(
         &env.home,
@@ -566,50 +350,121 @@ fn test_mempal_audit_respects_project_isolation() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("audit-a"));
-    assert!(!stdout.contains("audit-b"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail_lines = stdout
+        .lines()
+        .filter(|line| line.starts_with("  "))
+        .collect::<Vec<_>>();
+    assert_eq!(detail_lines.len(), 10, "{stdout}");
+    assert!(
+        detail_lines
+            .iter()
+            .any(|line| line.contains("decision=drop"))
+    );
+    assert!(
+        detail_lines
+            .iter()
+            .any(|line| line.contains("decision=merge"))
+    );
+    assert!(
+        detail_lines
+            .iter()
+            .any(|line| line.contains("decision=insert"))
+    );
+    assert!(detail_lines[0].contains("novelty-09"), "{stdout}");
+    assert!(
+        detail_lines[0].contains("similarity_score=0.910"),
+        "{stdout}"
+    );
 }
 
 #[test]
-fn test_dashboard_commands_do_not_mutate_db() {
-    let env = DashboardEnv::new(None, false);
+fn test_missing_palace_db_friendly_error() {
+    let tmp = TempDir::new().expect("tempdir");
+    let output = run_mempal(tmp.path(), tmp.path(), &["tail"]);
+    assert!(!output.status.success(), "command unexpectedly succeeded");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no palace.db found at ~/.mempal/palace.db; run `mempal init` first"),
+        "{stderr}"
+    );
+    assert!(!stderr.to_lowercase().contains("panic"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_no_http_port_bound() {
+    let env = DashboardEnv::new();
+    let mut child = spawn_mempal(&env.home, env.cwd(), &["tail", "--follow", "--limit", "0"]);
+    std::thread::sleep(Duration::from_millis(400));
+
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            "if command -v ss >/dev/null 2>&1; then ss -ltnp; elif command -v netstat >/dev/null 2>&1; then netstat -tlnp; else exit 1; fi",
+        ])
+        .output()
+        .expect("inspect listening sockets");
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        output.status.success(),
+        "socket inspection failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let listing = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !listing.contains(&format!("pid={},", child.id()))
+            && !listing.contains(&format!("pid={}", child.id())),
+        "dashboard process bound a listening socket:\n{listing}"
+    );
+}
+
+#[test]
+fn test_observability_subcommands_readonly() {
+    let env = DashboardEnv::new();
     insert_drawer(
         &env.db_path,
-        DrawerSeed {
-            id: "d1",
-            content: "drawer one",
-            wing: "code",
-            room: Some("same"),
-            added_at: "1713000000".to_string(),
-            importance: 1,
-            project_id: None,
-        },
+        &drawer_seed(
+            "readonly-1",
+            "drawer one",
+            "default",
+            Some("scope"),
+            "1713000000",
+            1,
+        ),
     );
     insert_drawer(
         &env.db_path,
-        DrawerSeed {
-            id: "d2",
-            content: "drawer two",
-            wing: "docs",
-            room: Some("same"),
-            added_at: "1713000001".to_string(),
-            importance: 1,
-            project_id: None,
-        },
+        &drawer_seed(
+            "readonly-2",
+            "drawer two",
+            "agent-diary",
+            Some("scope"),
+            "1713000010",
+            2,
+        ),
     );
-    record_gating_audit(&env.db_path, "d1", true, None);
-    record_novelty_audit(&env.db_path, "d2", NoveltyAction::Merge, None);
+    record_novelty_audit(
+        &env.db_path,
+        "readonly-1",
+        NoveltyAction::Insert,
+        1_713_000_100,
+    );
+    seed_queue_rows(&env.db_path);
 
     let before = snapshot_db(&env.db_path);
-
     for args in [
-        vec!["tail", "--limit", "2"],
+        vec!["tail"],
         vec!["timeline", "--since", "7d"],
+        vec!["timeline", "--format", "json"],
         vec!["stats"],
-        vec!["view", "d1", "--raw"],
-        vec!["audit", "--since", "7d"],
+        vec!["view", "readonly-1"],
+        vec!["audit", "--kind", "novelty", "--since", "7d"],
     ] {
         let output = run_mempal(&env.home, env.cwd(), &args);
         assert!(
@@ -618,38 +473,42 @@ fn test_dashboard_commands_do_not_mutate_db() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-
     let after = snapshot_db(&env.db_path);
     assert_eq!(before, after);
-}
-
-#[test]
-fn test_mempal_audit_keeps_project_scoped_rejects_without_drawer_rows() {
-    let env = DashboardEnv::new(Some("proj-A"), true);
-    record_gating_audit(&env.db_path, "candidate-a", false, Some("proj-A"));
-    record_gating_audit(&env.db_path, "candidate-b", false, Some("proj-B"));
-
-    let output = run_mempal(
-        &env.home,
-        env.cwd(),
-        &["audit", "--kind", "gating", "--since", "7d"],
-    );
     assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
+        !env.home.join(".mempal/audit.jsonl").exists(),
+        "dashboard subcommands must not emit audit log side effects"
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(stdout.contains("candidate-a"));
-    assert!(!stdout.contains("candidate-b"));
 }
 
 #[test]
-fn test_mempal_stats_counts_project_scoped_audit_rows_without_drawer_rows() {
-    let env = DashboardEnv::new(Some("proj-A"), true);
-    record_gating_audit(&env.db_path, "candidate-a", false, Some("proj-A"));
-    record_gating_audit(&env.db_path, "candidate-b", false, Some("proj-B"));
+fn test_stats_shows_all_sections() {
+    let env = DashboardEnv::new();
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "stats-1",
+            "drawer one",
+            "default",
+            Some("core"),
+            "1713000000",
+            3,
+        ),
+    );
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "stats-2",
+            "drawer two",
+            "agent-diary",
+            Some("codex"),
+            "1713000010",
+            4,
+        ),
+    );
+    seed_queue_rows(&env.db_path);
+    record_gating_audit(&env.db_path, "stats-1", true);
+    record_novelty_audit(&env.db_path, "stats-2", NoveltyAction::Merge, 1_713_000_200);
 
     let output = run_mempal(&env.home, env.cwd(), &["stats"]);
     assert!(
@@ -657,8 +516,395 @@ fn test_mempal_stats_counts_project_scoped_audit_rows_without_drawer_rows() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("gating:"));
-    assert!(stdout.contains("  skip: 1"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("schema_version:"), "{stdout}");
+    assert!(stdout.contains("fork_ext_version:"), "{stdout}");
+    assert!(stdout.contains("queue:"), "{stdout}");
+    assert!(stdout.contains("  heartbeat:"), "{stdout}");
+    assert!(stdout.contains("gating:"), "{stdout}");
+    assert!(stdout.contains("novelty:"), "{stdout}");
+    assert!(stdout.contains("privacy scrub:"), "{stdout}");
+    assert!(stdout.contains("drawers total: 2"), "{stdout}");
+}
+
+#[test]
+fn test_tail_default_prints_recent_20() {
+    let env = DashboardEnv::new();
+    for index in 0..25 {
+        let content = if index == 24 {
+            "latest \u{1b}[31mred\u{1b}[0m decision".to_string()
+        } else {
+            format!("tail drawer {index}")
+        };
+        insert_drawer(
+            &env.db_path,
+            &drawer_seed(
+                format!("tail-{index:02}"),
+                content,
+                "default",
+                Some("tail"),
+                format!("{}", 1_713_000_000 + index),
+                1,
+            ),
+        );
+    }
+
+    let output = run_mempal(&env.home, env.cwd(), &["tail"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 20, "{stdout}");
+    assert!(lines[0].contains("tail-24"), "{stdout}");
+    assert!(lines[19].contains("tail-05"), "{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "tail rendered raw ANSI:\n{stdout}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_tail_follow_coalesces_event_storm() {
+    let env = DashboardEnv::new();
+    for index in 0..20 {
+        insert_drawer(
+            &env.db_path,
+            &drawer_seed(
+                format!("storm-{index:02}"),
+                format!("storm drawer {index}"),
+                "default",
+                Some("follow"),
+                format!("{}", 1_713_001_000 + index),
+                1,
+            ),
+        );
+    }
+
+    let db = Database::open_read_only(&env.db_path).expect("open readonly db");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    for _ in 0..120 {
+        tx.send(TailFollowEvent::Notify).expect("send notify");
+    }
+
+    let started = Instant::now();
+    let batch = observability::collect_tail_follow_batch(
+        &db,
+        &ProjectSearchScope::all_projects(),
+        TailFollowFilters {
+            wing: None,
+            room: None,
+            since_cutoff: None,
+            raw: false,
+        },
+        0,
+        &mut rx,
+    )
+    .await
+    .expect("collect follow batch");
+
+    assert_eq!(batch.wake, TailFollowWake::Notify);
+    assert_eq!(batch.lines.len(), 20, "{batch:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "event storm was not debounced: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        batch
+            .lines
+            .first()
+            .is_some_and(|line| line.contains("storm-00"))
+    );
+    assert!(
+        batch
+            .lines
+            .last()
+            .is_some_and(|line| line.contains("storm-19"))
+    );
+}
+
+#[test]
+fn test_tail_follow_sees_new_drawers() {
+    let env = DashboardEnv::new();
+    let mut child = spawn_mempal(&env.home, env.cwd(), &["tail", "--follow", "--limit", "0"]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "follow-new",
+            "fresh follow drawer",
+            "default",
+            Some("follow"),
+            "1713002000",
+            2,
+        ),
+    );
+
+    let (lines, _) = read_lines_until(&mut child, 1, Duration::from_secs(5));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("follow-new"), "{lines:?}");
+}
+
+#[test]
+fn test_tail_wing_filter() {
+    let env = DashboardEnv::new();
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "wing-agent-1",
+            "agent diary entry",
+            "agent-diary",
+            Some("claude"),
+            "1713000000",
+            2,
+        ),
+    );
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "wing-default-1",
+            "default wing entry",
+            "default",
+            Some("room"),
+            "1713000010",
+            2,
+        ),
+    );
+
+    let output = run_mempal(&env.home, env.cwd(), &["tail", "--wing", "agent-diary"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("wing-agent-1"), "{stdout}");
+    assert!(!stdout.contains("wing-default-1"), "{stdout}");
+}
+
+#[test]
+fn test_timeline_groups_by_day() {
+    let env = DashboardEnv::new();
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "timeline-1",
+            "day one",
+            "default",
+            Some("room"),
+            unix_secs_days_ago(2),
+            1,
+        ),
+    );
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "timeline-2",
+            "day two",
+            "default",
+            Some("room"),
+            unix_secs_days_ago(1),
+            3,
+        ),
+    );
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "timeline-3",
+            "day three",
+            "default",
+            Some("room"),
+            unix_secs_days_ago(0),
+            2,
+        ),
+    );
+
+    let output = run_mempal(&env.home, env.cwd(), &["timeline", "--since", "7d"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("=== {} ===", day_label_days_ago(2))),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("=== {} ===", day_label_days_ago(1))),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("=== {} ===", day_label_days_ago(0))),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn test_timeline_json_format_is_valid_ndjson() {
+    let env = DashboardEnv::new();
+    for index in 0..5 {
+        insert_drawer(
+            &env.db_path,
+            &drawer_seed(
+                format!("json-{index}"),
+                format!("Decision {index} with control \u{1b}[31mred\u{1b}[0m"),
+                "default",
+                Some("timeline"),
+                format!("{}", 1_713_000_000 + index),
+                index + 1,
+            ),
+        );
+    }
+
+    let output = run_mempal(&env.home, env.cwd(), &["timeline", "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 5, "{stdout}");
+    for line in lines {
+        let value = serde_json::from_str::<serde_json::Value>(line).expect("valid ndjson row");
+        assert!(value.get("timestamp").is_some(), "{value}");
+        assert!(value.get("drawer_id").is_some(), "{value}");
+        assert!(value.get("wing").is_some(), "{value}");
+        assert!(value.get("room").is_some(), "{value}");
+        assert!(value.get("importance_stars").is_some(), "{value}");
+    }
+}
+
+#[test]
+fn test_view_prints_full_drawer() {
+    let env = DashboardEnv::new();
+    let content = "Decision: use CLI dashboard \u{1b}[31mRED\u{1b}[0m";
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "view-full",
+            content,
+            "default",
+            Some("view"),
+            "1713000000",
+            4,
+        ),
+    );
+
+    let output = run_mempal(&env.home, env.cwd(), &["view", "view-full"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("drawer_id: view-full"), "{stdout}");
+    assert!(stdout.contains("scope: default/view"), "{stdout}");
+    assert!(stdout.contains("created_at:"), "{stdout}");
+    assert!(stdout.contains("content_truncated: false"), "{stdout}");
+    assert!(stdout.contains("original_content_bytes:"), "{stdout}");
+    assert!(stdout.contains("Decision: use CLI dashboard"), "{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "view rendered raw ANSI:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_view_raw_is_verbatim() {
+    let env = DashboardEnv::new();
+    let content = "Decision: keep raw \u{1b}[31mRED\u{1b}[0m bytes";
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "view-raw",
+            content,
+            "default",
+            Some("view"),
+            "1713000000",
+            4,
+        ),
+    );
+
+    let output = run_mempal(&env.home, env.cwd(), &["view", "view-raw", "--raw"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(content), "{stdout}");
+    assert!(
+        stdout.contains('\u{1b}'),
+        "raw mode lost ANSI bytes:\n{stdout}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_tail_follow_fallback_on_inotify_silence() {
+    let env = DashboardEnv::new();
+    let db = Database::open_read_only(&env.db_path).expect("open readonly db");
+    let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let db_path = env.db_path.clone();
+
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        insert_drawer(
+            &db_path,
+            &drawer_seed(
+                "fallback-new",
+                "drawer visible after timeout tick",
+                "default",
+                Some("follow"),
+                "1713004000",
+                3,
+            ),
+        );
+    });
+
+    let started = Instant::now();
+    let batch = observability::collect_tail_follow_batch(
+        &db,
+        &ProjectSearchScope::all_projects(),
+        TailFollowFilters {
+            wing: None,
+            room: None,
+            since_cutoff: None,
+            raw: false,
+        },
+        0,
+        &mut rx,
+    )
+    .await
+    .expect("collect fallback batch");
+
+    assert_eq!(batch.wake, TailFollowWake::Tick, "{batch:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(3000),
+        "timeout fallback fired too early: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(batch.lines.len(), 1, "{batch:?}");
+    assert!(batch.lines[0].contains("fallback-new"), "{batch:?}");
 }

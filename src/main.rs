@@ -29,10 +29,10 @@ use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
 use mempal::ingest::gating::compile_classifier_from_config;
 use mempal::ingest::{IngestOptions, IngestStats, ingest_dir_with_options};
 use mempal::mcp::MempalMcpServer;
+use mempal::observability;
 use mempal::search::search;
 
 mod longmemeval;
-mod observability;
 
 use crate::longmemeval::{BenchMode, LongMemEvalArgs, LongMemEvalGranularity, default_top_k};
 
@@ -162,14 +162,23 @@ enum Commands {
         room: Option<String>,
         #[arg(long)]
         since: Option<String>,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
     },
     Timeline {
         #[arg(long)]
         wing: Option<String>,
         #[arg(long)]
         since: Option<String>,
+        #[arg(long, default_value = "text")]
+        format: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
     },
-    Stats,
+    Stats {
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
     View {
         drawer_id: String,
         #[arg(long, default_value_t = false)]
@@ -180,6 +189,8 @@ enum Commands {
         kind: Option<String>,
         #[arg(long)]
         since: Option<String>,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
     },
     /// Run offline contradiction check on text against KG triples +
     /// known-entity registry. Pure read, no LLM, no network.
@@ -340,23 +351,28 @@ fn run() -> Result<()> {
     // Cowork commands must graceful-degrade without requiring palace.db
     // or config to exist. Dispatch them BEFORE Config::load / Database::open
     // so a missing mempal_home never breaks the hook path.
-    match cli.command {
+    match &cli.command {
         Commands::CoworkDrain {
             target,
             cwd,
             cwd_source,
             format,
         } => {
-            return cowork_drain_command(target, cwd, cwd_source, format);
+            return cowork_drain_command(
+                target.clone(),
+                cwd.clone(),
+                cwd_source.clone(),
+                format.clone(),
+            );
         }
         Commands::CoworkStatus { cwd } => {
-            return cowork_status_command(cwd);
+            return cowork_status_command(cwd.clone());
         }
         Commands::CoworkInstallHooks { global_codex } => {
-            return cowork_install_hooks_command(global_codex);
+            return cowork_install_hooks_command(*global_codex);
         }
         Commands::Hook { command } => {
-            return mempal::hook::run_command(command);
+            return mempal::hook::run_command(command.clone());
         }
         Commands::Hotpatch { command } => {
             let config = Config::load_from(&config_path)
@@ -366,10 +382,10 @@ fn run() -> Result<()> {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
-            return mempal::hotpatch::run_command(&config, &mempal_home, command);
+            return mempal::hotpatch::run_command(&config, &mempal_home, command.clone());
         }
         Commands::Daemon { foreground } => {
-            return mempal::daemon::run_command(default_config_path(), foreground);
+            return mempal::daemon::run_command(default_config_path(), *foreground);
         }
         // All other commands fall through to the db-backed dispatch below.
         _ => {}
@@ -378,7 +394,19 @@ fn run() -> Result<()> {
     ConfigHandle::bootstrap(&config_path).context("failed to bootstrap config hot reload")?;
     let config = ConfigHandle::current();
     let db_path = expand_home(&config.db_path);
-    let db = match Database::open(&db_path) {
+    let dashboard_mode = is_dashboard_command(&cli.command);
+    if dashboard_mode && !db_path.exists() {
+        bail!(
+            "no palace.db found at {}; run `mempal init` first",
+            display_path_for_user(&db_path)
+        );
+    }
+
+    let db = match if dashboard_mode {
+        open_dashboard_database(&db_path).context("failed to open dashboard database")
+    } else {
+        Database::open(&db_path).context("failed to open database")
+    } {
         Ok(db) => db,
         Err(_error)
             if matches!(
@@ -401,7 +429,7 @@ fn run() -> Result<()> {
             observability::print_empty_gating_stats(since);
             return Ok(());
         }
-        Err(error) => return Err(error).context("failed to open database"),
+        Err(error) => return Err(error),
     };
 
     match cli.command {
@@ -486,6 +514,7 @@ fn run() -> Result<()> {
             wing,
             room,
             since,
+            raw,
         } => observability::tail_command(
             &db,
             config.as_ref(),
@@ -495,17 +524,27 @@ fn run() -> Result<()> {
                 wing: wing.as_deref(),
                 room: room.as_deref(),
                 since: since.as_deref(),
+                raw,
             },
         ),
-        Commands::Timeline { wing, since } => observability::timeline_command(
+        Commands::Timeline {
+            wing,
+            since,
+            format,
+            raw,
+        } => observability::timeline_command(
             &db,
             config.as_ref(),
             observability::TimelineOptions {
                 wing: wing.as_deref(),
                 since: since.as_deref(),
+                format: &format,
+                raw,
             },
         ),
-        Commands::Stats => observability::stats_command(&db, config.as_ref()),
+        Commands::Stats { raw } => {
+            observability::stats_command(&db, config.as_ref(), observability::StatsOptions { raw })
+        }
         Commands::View { drawer_id, raw } => observability::view_command(
             &db,
             config.as_ref(),
@@ -514,12 +553,13 @@ fn run() -> Result<()> {
                 raw,
             },
         ),
-        Commands::Audit { kind, since } => observability::audit_command(
+        Commands::Audit { kind, since, raw } => observability::audit_command(
             &db,
             config.as_ref(),
             observability::AuditOptions {
                 kind: kind.as_deref(),
                 since: since.as_deref(),
+                raw,
             },
         ),
         Commands::FactCheck {
@@ -536,6 +576,37 @@ fn run() -> Result<()> {
         | Commands::Hotpatch { .. }
         | Commands::Daemon { .. } => unreachable!(),
     }
+}
+
+fn is_dashboard_command(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Tail { .. }
+            | Commands::Timeline { .. }
+            | Commands::Stats { .. }
+            | Commands::View { .. }
+            | Commands::Audit { .. }
+    )
+}
+
+fn open_dashboard_database(path: &Path) -> Result<Database> {
+    let db = Database::open_read_only(path)?;
+    db.conn()
+        .execute_batch("PRAGMA query_only = ON;")
+        .context("failed to enable query_only for dashboard connection")?;
+    Ok(db)
+}
+
+fn display_path_for_user(path: &Path) -> String {
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from)
+        && let Ok(stripped) = path.strip_prefix(&home)
+    {
+        if stripped.as_os_str().is_empty() {
+            return "~".to_string();
+        }
+        return format!("~/{}", stripped.display());
+    }
+    path.display().to_string()
 }
 
 fn block_on_result<F, T>(future: F) -> Result<T>
