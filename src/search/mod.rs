@@ -2,7 +2,7 @@
 
 use crate::core::{
     db::Database,
-    project::{ProjectSearchScope, SearchResultSource},
+    project::{ProjectFilterMode, ProjectSearchScope, SearchResultSource},
     types::{RouteDecision, SearchResult},
     utils::source_file_or_synthetic,
 };
@@ -39,6 +39,8 @@ pub enum SearchError {
     ExecuteSearch(#[source] rusqlite::Error),
     #[error("failed to collect search rows")]
     CollectSearchRows(#[source] rusqlite::Error),
+    #[error("invalid embedding blob for drawer {drawer_id}")]
+    InvalidEmbeddingBlob { drawer_id: String },
     #[error("failed to load taxonomy entries")]
     LoadTaxonomy(#[source] crate::core::db::DbError),
     #[error("failed to run keyword search")]
@@ -349,11 +351,23 @@ pub fn search_by_vector(
         )
         .map_err(SearchError::CountTotalDrawers)?;
 
+    if scope.mode == ProjectFilterMode::ProjectScoped && candidate_count <= 4_096 {
+        return search_by_vector_scoped_exact(
+            db,
+            query_vector,
+            route.clone(),
+            applied_wing,
+            applied_room,
+            top_k,
+            scope.project_id.as_deref(),
+        );
+    }
+
     let query_json =
         serde_json::to_string(query_vector).map_err(SearchError::SerializeQueryVector)?;
     let top_k = i64::try_from(top_k).map_err(|_| SearchError::InvalidTopK)?;
 
-    let search_sql = build_vector_search_sql();
+    let search_sql = build_vector_search_sql(scope.mode);
 
     let mut statement = db
         .conn()
@@ -393,6 +407,124 @@ pub fn search_by_vector(
         .map_err(SearchError::CollectSearchRows)?;
 
     Ok(results)
+}
+
+fn search_by_vector_scoped_exact(
+    db: &Database,
+    query_vector: &[f32],
+    route: RouteDecision,
+    applied_wing: Option<&str>,
+    applied_room: Option<&str>,
+    top_k: usize,
+    project_id: Option<&str>,
+) -> Result<Vec<SearchResult>> {
+    let top_k = i64::try_from(top_k).map_err(|_| SearchError::InvalidTopK)?;
+    let search_sql = r#"
+        SELECT d.id, d.content, d.wing, d.room, d.source_file, d.project_id, v.embedding
+        FROM drawer_vectors v
+        JOIN drawers d ON d.id = v.id
+        WHERE d.deleted_at IS NULL
+          AND (?1 IS NULL OR d.wing = ?1)
+          AND (?2 IS NULL OR d.room = ?2)
+          AND (?3 IS NULL OR d.project_id = ?3)
+        "#;
+    let mut statement = db
+        .conn()
+        .prepare(search_sql)
+        .map_err(SearchError::PrepareSearch)?;
+    let mut rows = statement
+        .query_map((applied_wing, applied_room, project_id), |row| {
+            let drawer_id: String = row.get(0)?;
+            let source_file = row.get::<_, Option<String>>(4)?;
+            let embedding = row.get::<_, Vec<u8>>(6)?;
+            Ok((
+                drawer_id.clone(),
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                source_file_or_synthetic(&drawer_id, source_file.as_deref()),
+                embedding,
+            ))
+        })
+        .map_err(SearchError::ExecuteSearch)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(SearchError::CollectSearchRows)?;
+
+    rows.sort_by(|a, b| {
+        let a_distance = cosine_distance_from_blob(&a.0, &a.5, query_vector);
+        let b_distance = cosine_distance_from_blob(&b.0, &b.5, query_vector);
+        match (a_distance, b_distance) {
+            (Ok(left), Ok(right)) => left
+                .partial_cmp(&right)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => a.0.cmp(&b.0),
+        }
+    });
+
+    let results = rows
+        .into_iter()
+        .take(top_k as usize)
+        .map(|(drawer_id, content, wing, room, source_file, embedding)| {
+            let distance = cosine_distance_from_blob(&drawer_id, &embedding, query_vector)?;
+            Ok(SearchResult {
+                drawer_id: drawer_id.clone(),
+                content,
+                wing,
+                room,
+                source_file,
+                source: SearchResultSource::Project,
+                similarity: (1.0_f64 - distance) as f32,
+                route: route.clone(),
+                tunnel_hints: vec![],
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(results)
+}
+
+fn cosine_distance_from_blob(
+    drawer_id: &str,
+    embedding_blob: &[u8],
+    query_vector: &[f32],
+) -> Result<f64> {
+    if embedding_blob.len() % std::mem::size_of::<f32>() != 0 {
+        return Err(SearchError::InvalidEmbeddingBlob {
+            drawer_id: drawer_id.to_string(),
+        });
+    }
+    let embedding = embedding_blob
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect::<Vec<_>>();
+    if embedding.len() != query_vector.len() {
+        return Err(SearchError::InvalidEmbeddingBlob {
+            drawer_id: drawer_id.to_string(),
+        });
+    }
+
+    let dot = embedding
+        .iter()
+        .zip(query_vector.iter())
+        .map(|(left, right)| f64::from(*left) * f64::from(*right))
+        .sum::<f64>();
+    let left_norm = embedding
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    let right_norm = query_vector
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    let cosine_similarity = if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm * right_norm)
+    };
+    Ok((1.0 - cosine_similarity).clamp(0.0, 2.0))
 }
 
 pub fn resolve_route(
