@@ -5,12 +5,13 @@ pub use db_fork_ext::{
     FORK_EXT_V3_SCHEMA_SQL, MigrationHook, apply_fork_ext_migrations, apply_fork_ext_migrations_to,
     apply_fork_ext_migrations_with_hook, read_fork_ext_version, set_fork_ext_version,
 };
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -855,6 +856,102 @@ impl Database {
             }
             None => Ok(None),
         }
+    }
+
+    pub fn get_drawer_details_batch(
+        &self,
+        drawer_ids: &[String],
+    ) -> Result<Vec<DrawerDetails>, DbError> {
+        const SQLITE_VARIABLE_LIMIT: usize = 900;
+
+        let mut seen = HashSet::new();
+        let mut ordered_ids = Vec::new();
+        for drawer_id in drawer_ids {
+            if seen.insert(drawer_id.clone()) {
+                ordered_ids.push(drawer_id.clone());
+            }
+        }
+
+        if ordered_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut found_by_id = HashMap::new();
+        for chunk in ordered_ids.chunks(SQLITE_VARIABLE_LIMIT) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"
+                SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
+                       COALESCE(importance, 0) as importance,
+                       updated_at,
+                       COALESCE(merge_count, 0) as merge_count,
+                       project_id
+                FROM drawers
+                WHERE deleted_at IS NULL
+                  AND id IN ({placeholders})
+                "#
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, i32>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, u32>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (
+                    id,
+                    content,
+                    wing,
+                    room,
+                    source_file,
+                    source_type,
+                    added_at,
+                    chunk_index,
+                    importance,
+                    updated_at,
+                    merge_count,
+                    project_id,
+                ) = row?;
+                found_by_id.insert(
+                    id.clone(),
+                    DrawerDetails {
+                        drawer: Drawer {
+                            id,
+                            content,
+                            wing,
+                            room,
+                            source_file,
+                            source_type: source_type_from_str(&source_type)?,
+                            added_at,
+                            chunk_index,
+                            importance,
+                        },
+                        updated_at,
+                        merge_count,
+                        project_id,
+                    },
+                );
+            }
+        }
+
+        Ok(ordered_ids
+            .into_iter()
+            .filter_map(|drawer_id| found_by_id.remove(&drawer_id))
+            .collect())
     }
 
     pub fn drawer_project_id(&self, drawer_id: &str) -> Result<Option<String>, DbError> {

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,10 +29,11 @@ use rmcp::{
 use super::tools::{
     CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DuplicateWarning,
     EmbedStatusDto, FactCheckRequest, FactCheckResponse, IngestRequest, IngestResponse, KgRequest,
-    KgResponse, KgStatsDto, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto,
-    ReadDrawerRequest, ReadDrawerResponse, ScopeCount, ScrubStatsDto, SearchRequest,
-    SearchResponse, SearchResultDto, StatusResponse, SystemWarning, TaxonomyEntryDto,
-    TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
+    KgResponse, KgStatsDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS,
+    PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto, ReadDrawerRequest,
+    ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse, ScopeCount, ScrubStatsDto,
+    SearchRequest, SearchResponse, SearchResultDto, StatusResponse, SystemWarning,
+    TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -59,7 +61,7 @@ impl MempalMcpServer {
     pub fn new_with_factory(db_path: PathBuf, embedder_factory: Arc<dyn EmbedderFactory>) -> Self {
         Self::new_with_factory_and_config(
             db_path,
-            crate::core::config::Config::default(),
+            ConfigHandle::current().as_ref().clone(),
             embedder_factory,
         )
     }
@@ -354,7 +356,13 @@ impl MempalMcpServer {
             .get_drawer_details(&request.drawer_id)
             .map_err(db_error)?
             .ok_or_else(|| {
-                ErrorData::invalid_params(format!("drawer {} not found", request.drawer_id), None)
+                ErrorData::resource_not_found(
+                    "drawer not found",
+                    Some(serde_json::json!({
+                        "error": "not_found",
+                        "drawer_id": request.drawer_id,
+                    })),
+                )
             })?;
         if !scope.allows_row(details.project_id.as_deref()) {
             return Err(ErrorData::invalid_params(
@@ -366,21 +374,100 @@ impl MempalMcpServer {
             ));
         }
 
-        let signals = crate::aaak::analyze(&details.drawer.content);
-        let drawer = details.drawer;
-        Ok(Json(ReadDrawerResponse {
-            drawer_id: drawer.id,
-            content: drawer.content,
-            wing: drawer.wing,
-            room: drawer.room,
-            source_file: source_file_or_synthetic(
-                &request.drawer_id,
-                drawer.source_file.as_deref(),
-            ),
-            created_at: drawer.added_at,
-            updated_at: details.updated_at,
-            merge_count: details.merge_count,
-            importance_stars: signals.importance_stars,
+        Ok(Json(read_drawer_response(details)))
+    }
+
+    #[tool(
+        name = "mempal_read_drawers",
+        description = "Fetch multiple drawers' full raw verbatim content by drawer_id. Returns drawers, not_found ids, and warnings when max_count truncates the batch; use this after mempal_search previews identify a focused subset worth reading in full."
+    )]
+    pub async fn mempal_read_drawers(
+        &self,
+        Parameters(request): Parameters<ReadDrawersRequest>,
+    ) -> std::result::Result<Json<ReadDrawersResponse>, ErrorData> {
+        if request.drawer_ids.len() > MAX_READ_DRAWERS_REQUEST_IDS {
+            return Err(ErrorData::invalid_request(
+                format!(
+                    "drawer_ids exceeds limit: got {}, max {}",
+                    request.drawer_ids.len(),
+                    MAX_READ_DRAWERS_REQUEST_IDS
+                ),
+                Some(serde_json::json!({
+                    "error": "invalid_request",
+                    "field": "drawer_ids",
+                    "requested": request.drawer_ids.len(),
+                    "max_allowed": MAX_READ_DRAWERS_REQUEST_IDS,
+                })),
+            ));
+        }
+
+        let max_count = request.max_count.unwrap_or(20) as usize;
+        if max_count > MAX_READ_DRAWERS_MAX_COUNT {
+            return Err(ErrorData::invalid_request(
+                format!(
+                    "max_count exceeds limit: got {max_count}, max {}",
+                    MAX_READ_DRAWERS_MAX_COUNT
+                ),
+                Some(serde_json::json!({
+                    "error": "invalid_request",
+                    "field": "max_count",
+                    "requested": max_count,
+                    "max_allowed": MAX_READ_DRAWERS_MAX_COUNT,
+                })),
+            ));
+        }
+
+        let config = ConfigHandle::current();
+        let project_id = self
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await?;
+        let scope = ProjectSearchScope::from_request(
+            project_id,
+            request.include_global.unwrap_or(false),
+            request.all_projects.unwrap_or(false),
+            config.search.strict_project_isolation,
+        );
+        let mut seen = std::collections::HashSet::new();
+        let deduped_ids = request
+            .drawer_ids
+            .into_iter()
+            .filter(|drawer_id| seen.insert(drawer_id.clone()))
+            .collect::<Vec<_>>();
+        let requested_unique_count = deduped_ids.len();
+        let requested_ids = if requested_unique_count > max_count {
+            deduped_ids[..max_count].to_vec()
+        } else {
+            deduped_ids
+        };
+        let db = self.open_db()?;
+        let details = db
+            .get_drawer_details_batch(&requested_ids)
+            .map_err(db_error)?;
+        let mut drawers = Vec::with_capacity(details.len());
+        let mut found_ids = std::collections::HashSet::new();
+        for detail in details {
+            let drawer_id = detail.drawer.id.clone();
+            if scope.allows_row(detail.project_id.as_deref()) {
+                found_ids.insert(drawer_id);
+                drawers.push(read_drawer_response(detail));
+            }
+        }
+        let not_found = requested_ids
+            .into_iter()
+            .filter(|drawer_id| !found_ids.contains(drawer_id))
+            .collect();
+        let warnings = if requested_unique_count > max_count {
+            vec![format!(
+                "truncated_to_max_count: requested {requested_unique_count} unique drawer_ids, processed first {max_count} due to max_count={max_count}"
+            )]
+        } else {
+            Vec::new()
+        };
+
+        Ok(Json(ReadDrawersResponse {
+            drawers,
+            not_found,
+            warnings,
         }))
     }
 
@@ -1230,14 +1317,34 @@ impl ServerHandler for MempalMcpServer {
         // means every client (Claude Code, Codex, Cursor, Continue, ...) sees
         // it without needing to call any tool first. This is the primary
         // mechanism; `mempal_status` keeps the same text as a fallback/reference.
+        let config = ConfigHandle::current();
+        let progressive_disclosure_active = config.search.progressive_disclosure;
         let mut instructions = crate::core::protocol::MEMORY_PROTOCOL.to_string();
+        if progressive_disclosure_active {
+            instructions.push_str(
+                "\n\nRULE 10 (progressive disclosure): When progressive disclosure is active, mempal_search returns truncated previews and still includes content_truncated plus original_content_bytes on every result. Use mempal_read_drawer or mempal_read_drawers to fetch full verbatim content after you decide which drawer merits a deeper read. For narrow queries, pass disable_progressive=true on mempal_search to request verbatim content directly.",
+            );
+        }
         if global_embed_status().is_degraded() {
             instructions.push_str(
                 "\n\n11a. DEGRADED EMBED BACKEND\nWhen system_warnings mention an embed degradation, stop write operations and use read-only tools until recovery.",
             );
         }
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(instructions)
+        let mut experimental = BTreeMap::new();
+        experimental.insert(
+            "mempal".to_string(),
+            serde_json::Map::from_iter([(
+                "progressive_disclosure_active".to_string(),
+                serde_json::Value::Bool(progressive_disclosure_active),
+            )]),
+        );
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        capabilities.experimental = Some(experimental);
+
+        let mut info = ServerInfo::default();
+        info.capabilities = capabilities;
+        info.instructions = Some(instructions);
+        info
     }
 
     async fn initialize(
@@ -1364,6 +1471,25 @@ fn current_system_warnings() -> Vec<SystemWarning> {
             }),
     );
     warnings
+}
+
+fn read_drawer_response(details: crate::core::types::DrawerDetails) -> ReadDrawerResponse {
+    let signals = crate::aaak::analyze(&details.drawer.content);
+    let original_content_bytes = details.drawer.content.len() as u64;
+    let drawer = details.drawer;
+    ReadDrawerResponse {
+        drawer_id: drawer.id.clone(),
+        content: drawer.content,
+        content_truncated: false,
+        original_content_bytes,
+        wing: drawer.wing,
+        room: drawer.room,
+        source_file: source_file_or_synthetic(&drawer.id, drawer.source_file.as_deref()),
+        created_at: drawer.added_at,
+        updated_at: details.updated_at,
+        merge_count: details.merge_count,
+        importance_stars: signals.importance_stars,
+    }
 }
 
 const DEDUP_THRESHOLD: f32 = 0.85;

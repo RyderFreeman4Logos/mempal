@@ -106,10 +106,40 @@ pub struct ReadDrawerRequest {
     pub all_projects: Option<bool>,
 }
 
+/// Hard cap for `mempal_read_drawers.drawer_ids` to prevent unbounded request allocation.
+pub const MAX_READ_DRAWERS_REQUEST_IDS: usize = 10_000;
+
+/// Hard cap for `mempal_read_drawers.max_count`; must stay <= `MAX_READ_DRAWERS_REQUEST_IDS`.
+pub const MAX_READ_DRAWERS_MAX_COUNT: usize = 2_000;
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReadDrawersRequest {
+    pub drawer_ids: Vec<String>,
+
+    /// Optional max number of distinct drawer ids to read after de-duplication.
+    /// Defaults to 20 when omitted.
+    pub max_count: Option<u32>,
+
+    /// Optional explicit project scope. When omitted, mempal resolves the
+    /// current project from `[project]` config or MCP roots and scopes the
+    /// read there by default. Set `all_projects=true` to bypass project
+    /// scoping.
+    pub project_id: Option<String>,
+
+    /// Include legacy/global drawers (`project_id IS NULL`) alongside the
+    /// current project. Ignored when `all_projects=true`.
+    pub include_global: Option<bool>,
+
+    /// Opt-in override to read across all projects for this request.
+    pub all_projects: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReadDrawerResponse {
     pub drawer_id: String,
     pub content: String,
+    pub content_truncated: bool,
+    pub original_content_bytes: u64,
     pub wing: String,
     pub room: Option<String>,
     pub source_file: String,
@@ -118,6 +148,13 @@ pub struct ReadDrawerResponse {
     pub updated_at: Option<String>,
     pub merge_count: u32,
     pub importance_stars: u8,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReadDrawersResponse {
+    pub drawers: Vec<ReadDrawerResponse>,
+    pub not_found: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
