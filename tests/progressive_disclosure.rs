@@ -1,15 +1,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use mempal::core::config::ConfigHandle;
 use mempal::core::db::Database;
 use mempal::core::types::{Drawer, SourceType};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
-use mempal::mcp::{MempalMcpServer, SearchRequest};
+use mempal::mcp::{
+    MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, MempalMcpServer, ReadDrawerRequest,
+    ReadDrawersRequest, SearchRequest, SearchResponse,
+};
+use rmcp::ServerHandler;
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::ErrorCode;
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -62,26 +66,15 @@ struct TestEnv {
 }
 
 impl TestEnv {
-    fn new(
-        project_id: Option<&str>,
-        strict_project_isolation: bool,
-        progressive_disclosure: bool,
-        preview_chars: usize,
-    ) -> Self {
+    fn new(progressive_disclosure: bool, preview_chars: usize) -> Self {
         let tmp = TempDir::new().expect("tempdir");
         let mempal_home = tmp.path().join(".mempal");
         fs::create_dir_all(&mempal_home).expect("create mempal home");
         let config_path = mempal_home.join("config.toml");
         let db_path = mempal_home.join("palace.db");
-        write_config_atomic(
+        write_config(
             &config_path,
-            &config_text(
-                &db_path,
-                project_id,
-                strict_project_isolation,
-                progressive_disclosure,
-                preview_chars,
-            ),
+            &config_text(&db_path, progressive_disclosure, preview_chars),
         );
         Database::open(&db_path).expect("open db");
         ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
@@ -102,20 +95,11 @@ impl TestEnv {
     }
 }
 
-fn config_text(
-    db_path: &Path,
-    project_id: Option<&str>,
-    strict_project_isolation: bool,
-    progressive_disclosure: bool,
-    preview_chars: usize,
-) -> String {
-    let project_section = project_id
-        .map(|project_id| format!("\n[project]\nid = \"{project_id}\"\n"))
-        .unwrap_or_default();
+fn config_text(db_path: &Path, progressive_disclosure: bool, preview_chars: usize) -> String {
     format!(
         r#"
 db_path = "{}"
-{}
+
 [embedder]
 backend = "api"
 base_url = "http://127.0.0.1:9/v1/"
@@ -127,51 +111,62 @@ debounce_ms = 250
 poll_fallback_secs = 1
 
 [search]
-strict_project_isolation = {}
+strict_project_isolation = false
 progressive_disclosure = {}
 preview_chars = {}
 "#,
         db_path.display(),
-        project_section,
-        strict_project_isolation,
         progressive_disclosure,
         preview_chars
     )
 }
 
+fn write_config(path: &Path, contents: &str) {
+    fs::write(path, contents).expect("write config");
+}
+
 fn write_config_atomic(path: &Path, contents: &str) {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, contents).expect("write temp config");
-    fs::rename(&tmp, path).expect("rename config");
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, contents).expect("write temp config");
+    fs::rename(&tmp_path, path).expect("rename config atomically");
 }
 
-fn wait_for_config_version_change(previous: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let current = ConfigHandle::version();
-        if current != previous {
-            return current;
+fn wait_until(
+    timeout: std::time::Duration,
+    step: std::time::Duration,
+    mut predicate: impl FnMut() -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if predicate() {
+            return true;
         }
-        assert!(Instant::now() < deadline, "config version did not change");
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(step);
     }
+    predicate()
 }
 
-fn insert_drawer(
-    db_path: &Path,
-    id: &str,
-    content: &str,
-    wing: &str,
-    room: Option<&str>,
-    source_file: &str,
-    project_id: Option<&str>,
-) {
+fn wait_for_version_change(previous: &str) -> String {
+    let mut current = ConfigHandle::version();
+    let changed = wait_until(
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(50),
+        || {
+            current = ConfigHandle::version();
+            current != previous
+        },
+    );
+    assert!(changed, "config version did not change from {previous}");
+    current
+}
+
+fn insert_drawer(db_path: &Path, id: &str, content: &str, source_file: &str, insert_vector: bool) {
     let db = Database::open(db_path).expect("open db");
     db.insert_drawer(&Drawer {
         id: id.to_string(),
         content: content.to_string(),
-        wing: wing.to_string(),
-        room: room.map(str::to_string),
+        wing: "code".to_string(),
+        room: Some("preview".to_string()),
         source_file: Some(source_file.to_string()),
         source_type: SourceType::Manual,
         added_at: "1713000000".to_string(),
@@ -179,24 +174,18 @@ fn insert_drawer(
         importance: 4,
     })
     .expect("insert drawer");
-    db.insert_vector(id, &[0.1, 0.2, 0.3])
-        .expect("insert vector");
-    db.conn()
-        .execute(
-            "UPDATE drawers SET project_id = ?2 WHERE id = ?1",
-            rusqlite::params![id, project_id],
-        )
-        .expect("update drawer project");
-    db.conn()
-        .execute(
-            "UPDATE drawer_vectors SET project_id = ?2 WHERE id = ?1",
-            rusqlite::params![id, project_id],
-        )
-        .expect("update vector project");
+    if insert_vector {
+        db.insert_vector(id, &[0.1, 0.2, 0.3])
+            .expect("insert vector");
+    }
 }
 
-async fn search_response_json(server: &MempalMcpServer, query: &str) -> serde_json::Value {
-    let response = server
+async fn search(
+    server: &MempalMcpServer,
+    query: &str,
+    disable_progressive: Option<bool>,
+) -> SearchResponse {
+    server
         .mempal_search(Parameters(SearchRequest {
             query: query.to_string(),
             wing: None,
@@ -205,112 +194,130 @@ async fn search_response_json(server: &MempalMcpServer, query: &str) -> serde_js
             project_id: None,
             include_global: None,
             all_projects: None,
-            disable_progressive: None,
+            disable_progressive,
         }))
         .await
         .expect("search should succeed")
-        .0;
-    serde_json::to_value(response).expect("serialize response")
+        .0
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_search_result_has_content_truncated_field() {
-    let _guard = config_guard().await;
-    let env = TestEnv::new(None, false, true, 32);
-    insert_drawer(
-        &env.db_path,
-        "drawer-short",
-        "short content stays verbatim",
-        "code",
-        Some("preview"),
-        "/tmp/short.md",
-        Some("default"),
+async fn test_cjk_truncation_utf8_safe() {
+    let preview = mempal::search::preview::truncate(
+        "系统决策：采用共享内存同步机制解决状态漂移问题的根本原因是并发安全",
+        10,
     );
 
-    let json = search_response_json(&env.server(), "short").await;
-    let result = &json["results"][0];
-
-    assert!(
-        result.get("content_truncated").is_some(),
-        "missing content_truncated field: {json}"
-    );
-    assert!(
-        result.get("original_content_bytes").is_some(),
-        "missing original_content_bytes field: {json}"
-    );
+    assert!(preview.truncated);
+    assert!(preview.content.ends_with('…'));
+    assert!(preview.content.chars().count() <= 11);
+    assert!(std::str::from_utf8(preview.content.as_bytes()).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_search_preview_length_cap_applied() {
+async fn test_disabled_returns_verbatim_content() {
     let _guard = config_guard().await;
-    let env = TestEnv::new(None, false, true, 24);
-    let content = "Decision: adopt deterministic replay for queue recovery because replay order is part of the audit contract and must stay stable across restarts.";
+    let env = TestEnv::new(false, 32);
+    let content = "Decision: keep full verbatim content when progressive disclosure is disabled.";
     insert_drawer(
         &env.db_path,
-        "drawer-long",
+        "drawer-disabled",
         content,
-        "code",
-        Some("preview"),
-        "/tmp/long.md",
-        Some("default"),
+        "/tmp/disabled.md",
+        true,
     );
 
-    let json = search_response_json(&env.server(), "deterministic").await;
-    let result = &json["results"][0];
-    let preview = result["content"].as_str().expect("content string");
+    let response = search(&env.server(), "verbatim", None).await;
+    let result = &response.results[0];
 
-    assert!(preview.chars().count() <= 25, "preview too long: {preview}");
-    assert_eq!(result["content_truncated"], true);
+    assert_eq!(result.content, content);
+    assert!(!result.content_truncated);
+    assert_eq!(result.original_content_bytes, content.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_enabled_truncates_content() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(true, 32);
+    let content = "Decision: the disclosure preview should stop at a clean word boundary while still reporting the original byte count for the full drawer body.";
+    insert_drawer(
+        &env.db_path,
+        "drawer-enabled",
+        content,
+        "/tmp/enabled.md",
+        true,
+    );
+
+    let response = search(&env.server(), "disclosure", None).await;
+    let result = &response.results[0];
+
+    assert!(result.content_truncated);
+    assert!(result.content.ends_with('…'));
+    assert!(result.content.chars().count() <= 33);
+    assert_eq!(result.original_content_bytes, content.len() as u64);
+    assert_ne!(result.content, content);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_per_call_disable_progressive() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(true, 24);
+    let content = "Decision: callers may opt out per request when they expect a tiny result set.";
+    insert_drawer(
+        &env.db_path,
+        "drawer-override",
+        content,
+        "/tmp/override.md",
+        true,
+    );
+
+    let response = search(&env.server(), "result", Some(true)).await;
+    let result = &response.results[0];
+
+    assert_eq!(result.content, content);
+    assert!(!result.content_truncated);
+    assert_eq!(result.original_content_bytes, content.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_read_drawer_not_found() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(true, 24);
+    let error = env
+        .server()
+        .mempal_read_drawer(Parameters(ReadDrawerRequest {
+            drawer_id: "missing-drawer".to_string(),
+            project_id: None,
+            include_global: None,
+            all_projects: None,
+        }))
+        .await;
+    let error = match error {
+        Ok(_) => panic!("missing drawer should return error"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
+    assert_eq!(error.message, "drawer not found");
     assert_eq!(
-        result["original_content_bytes"].as_u64(),
-        Some(content.len() as u64)
+        error.data,
+        Some(serde_json::json!({
+            "error": "not_found",
+            "drawer_id": "missing-drawer",
+        }))
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_search_short_content_untruncated() {
+async fn test_read_drawer_returns_full_verbatim() {
     let _guard = config_guard().await;
-    let env = TestEnv::new(None, false, true, 120);
-    let content = "short drawer stays whole";
-    insert_drawer(
-        &env.db_path,
-        "drawer-short",
-        content,
-        "code",
-        Some("preview"),
-        "/tmp/short.md",
-        Some("default"),
-    );
-
-    let json = search_response_json(&env.server(), "whole").await;
-    let result = &json["results"][0];
-
-    assert_eq!(result["content"], content);
-    assert_eq!(result["content_truncated"], false);
-    assert_eq!(
-        result["original_content_bytes"].as_u64(),
-        Some(content.len() as u64)
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_mempal_read_drawer_returns_raw_full_content() {
-    let _guard = config_guard().await;
-    let env = TestEnv::new(None, false, true, 16);
-    let content = "Decision: keep the original raw drawer content intact even when previews are truncated in search.";
-    insert_drawer(
-        &env.db_path,
-        "drawer-read",
-        content,
-        "code",
-        Some("preview"),
-        "/tmp/read.md",
-        Some("default"),
-    );
+    let env = TestEnv::new(true, 16);
+    let content = "Decision: mempal_read_drawer is the escape hatch and therefore always returns raw content.";
+    insert_drawer(&env.db_path, "drawer-read", content, "/tmp/read.md", true);
 
     let response = env
         .server()
-        .mempal_read_drawer(Parameters(mempal::mcp::ReadDrawerRequest {
+        .mempal_read_drawer(Parameters(ReadDrawerRequest {
             drawer_id: "drawer-read".to_string(),
             project_id: None,
             include_global: None,
@@ -322,178 +329,334 @@ async fn test_mempal_read_drawer_returns_raw_full_content() {
 
     assert_eq!(response.drawer_id, "drawer-read");
     assert_eq!(response.content, content);
+    assert!(!response.content_truncated);
+    assert_eq!(response.original_content_bytes, content.len() as u64);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_mempal_read_drawer_respects_project_isolation() {
+async fn test_read_drawers_batch_with_not_found() {
     let _guard = config_guard().await;
-    let env = TestEnv::new(Some("proj-A"), true, true, 32);
-    insert_drawer(
-        &env.db_path,
-        "drawer-b",
-        "project B content should not leak",
-        "code",
-        Some("preview"),
-        "/tmp/b.md",
-        Some("proj-B"),
+    let env = TestEnv::new(true, 16);
+    insert_drawer(&env.db_path, "drawer-a", "alpha", "/tmp/a.md", false);
+    insert_drawer(&env.db_path, "drawer-b", "beta", "/tmp/b.md", false);
+
+    let small = env
+        .server()
+        .mempal_read_drawers(Parameters(ReadDrawersRequest {
+            drawer_ids: vec![
+                "drawer-a".to_string(),
+                "missing-small".to_string(),
+                "drawer-b".to_string(),
+            ],
+            max_count: Some(10),
+            project_id: None,
+            include_global: None,
+            all_projects: None,
+        }))
+        .await
+        .expect("small batch read should succeed")
+        .0;
+
+    assert_eq!(small.drawers.len(), 2);
+    assert_eq!(
+        small
+            .drawers
+            .iter()
+            .map(|drawer| drawer.drawer_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["drawer-a", "drawer-b"]
+    );
+    assert_eq!(small.not_found, vec!["missing-small".to_string()]);
+    assert!(small.warnings.is_empty());
+
+    let truncated = env
+        .server()
+        .mempal_read_drawers(Parameters(ReadDrawersRequest {
+            drawer_ids: vec![
+                "drawer-a".to_string(),
+                "missing-truncated".to_string(),
+                "drawer-b".to_string(),
+            ],
+            max_count: Some(2),
+            project_id: None,
+            include_global: None,
+            all_projects: None,
+        }))
+        .await
+        .expect("truncated batch read should succeed")
+        .0;
+
+    assert_eq!(truncated.drawers.len(), 1);
+    assert_eq!(truncated.drawers[0].drawer_id, "drawer-a");
+    assert_eq!(truncated.not_found, vec!["missing-truncated".to_string()]);
+    assert_eq!(
+        truncated.warnings,
+        vec![
+            "truncated_to_max_count: requested 3 unique drawer_ids, processed first 2 due to max_count=2"
+                .to_string()
+        ]
     );
 
-    let result = env
+    let mut large_ids = Vec::with_capacity(1500);
+    for index in 0..1500usize {
+        let drawer_id = format!("drawer-large-{index:04}");
+        insert_drawer(
+            &env.db_path,
+            &drawer_id,
+            &format!("large batch content {index}"),
+            &format!("/tmp/{drawer_id}.md"),
+            false,
+        );
+        large_ids.push(drawer_id);
+    }
+
+    let large = env
         .server()
-        .mempal_read_drawer(Parameters(mempal::mcp::ReadDrawerRequest {
-            drawer_id: "drawer-b".to_string(),
+        .mempal_read_drawers(Parameters(ReadDrawersRequest {
+            drawer_ids: large_ids.clone(),
+            max_count: Some(2000),
+            project_id: None,
+            include_global: None,
+            all_projects: None,
+        }))
+        .await
+        .expect("large batch read should succeed")
+        .0;
+
+    assert_eq!(large.drawers.len(), 1500);
+    assert!(large.not_found.is_empty());
+    assert!(large.warnings.is_empty());
+    assert_eq!(large.drawers[0].drawer_id, large_ids[0]);
+    assert_eq!(large.drawers[1499].drawer_id, large_ids[1499]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_read_drawers_rejects_oversized_input() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(true, 16);
+    let drawer_ids = (0..=MAX_READ_DRAWERS_REQUEST_IDS)
+        .map(|index| format!("drawer-{index:05}"))
+        .collect::<Vec<_>>();
+
+    let error = env
+        .server()
+        .mempal_read_drawers(Parameters(ReadDrawersRequest {
+            drawer_ids,
+            max_count: Some(20),
             project_id: None,
             include_global: None,
             all_projects: None,
         }))
         .await;
-    let error = match result {
-        Ok(_) => panic!("cross-project read should fail"),
+    let error = match error {
+        Ok(_) => panic!("oversized drawer_ids request must be rejected"),
         Err(error) => error,
     };
 
+    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
     assert!(
-        error.to_string().contains("project"),
-        "expected project isolation error, got: {error}"
+        error
+            .message
+            .contains(&MAX_READ_DRAWERS_REQUEST_IDS.to_string()),
+        "expected limit in error message, got: {}",
+        error.message
+    );
+    assert_eq!(
+        error.data,
+        Some(serde_json::json!({
+            "error": "invalid_request",
+            "field": "drawer_ids",
+            "requested": MAX_READ_DRAWERS_REQUEST_IDS + 1,
+            "max_allowed": MAX_READ_DRAWERS_REQUEST_IDS,
+        }))
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_mempal_read_drawer_supports_all_projects_scope() {
+async fn test_read_drawers_rejects_oversized_max_count() {
     let _guard = config_guard().await;
-    let env = TestEnv::new(Some("proj-A"), true, true, 16);
-    let content =
-        "cross-project drawer should stay readable when the caller explicitly widens scope.";
-    insert_drawer(
-        &env.db_path,
-        "drawer-cross",
-        content,
-        "code",
-        Some("preview"),
-        "/tmp/cross.md",
-        Some("proj-B"),
-    );
+    let env = TestEnv::new(true, 16);
 
-    let search = env
+    let error = env
         .server()
-        .mempal_search(Parameters(SearchRequest {
-            query: "cross-project".to_string(),
-            wing: None,
-            room: None,
-            top_k: Some(10),
+        .mempal_read_drawers(Parameters(ReadDrawersRequest {
+            drawer_ids: vec!["drawer-a".to_string()],
+            max_count: Some((MAX_READ_DRAWERS_MAX_COUNT + 1) as u32),
             project_id: None,
             include_global: None,
-            all_projects: Some(true),
-            disable_progressive: None,
+            all_projects: None,
         }))
-        .await
-        .expect("search should succeed")
-        .0;
-    assert_eq!(search.results[0].drawer_id, "drawer-cross");
-    assert!(search.results[0].content_truncated);
+        .await;
+    let error = match error {
+        Ok(_) => panic!("oversized max_count must be rejected"),
+        Err(error) => error,
+    };
 
-    let response = env
-        .server()
-        .mempal_read_drawer(Parameters(mempal::mcp::ReadDrawerRequest {
-            drawer_id: "drawer-cross".to_string(),
-            project_id: None,
-            include_global: None,
-            all_projects: Some(true),
+    assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+    assert!(
+        error
+            .message
+            .contains(&MAX_READ_DRAWERS_MAX_COUNT.to_string()),
+        "expected limit in error message, got: {}",
+        error.message
+    );
+    assert_eq!(
+        error.data,
+        Some(serde_json::json!({
+            "error": "invalid_request",
+            "field": "max_count",
+            "requested": MAX_READ_DRAWERS_MAX_COUNT + 1,
+            "max_allowed": MAX_READ_DRAWERS_MAX_COUNT,
         }))
-        .await
-        .expect("cross-project read should succeed when scope is widened")
-        .0;
-
-    assert_eq!(response.drawer_id, "drawer-cross");
-    assert_eq!(response.content, content);
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_mempal_read_drawer_supports_include_global_scope() {
+async fn test_server_info_injects_rule_10_when_active() {
     let _guard = config_guard().await;
-    let env = TestEnv::new(Some("proj-A"), true, true, 16);
-    let content = "global drawer should stay readable when include_global is requested.";
-    insert_drawer(
-        &env.db_path,
-        "drawer-global",
-        content,
-        "code",
-        Some("preview"),
-        "/tmp/global.md",
-        None,
-    );
-
-    let search = env
-        .server()
-        .mempal_search(Parameters(SearchRequest {
-            query: "global drawer".to_string(),
-            wing: None,
-            room: None,
-            top_k: Some(10),
-            project_id: None,
-            include_global: Some(true),
-            all_projects: None,
-            disable_progressive: None,
-        }))
-        .await
-        .expect("search should succeed")
-        .0;
-    assert_eq!(search.results[0].drawer_id, "drawer-global");
-    assert!(search.results[0].content_truncated);
-
-    let response = env
-        .server()
-        .mempal_read_drawer(Parameters(mempal::mcp::ReadDrawerRequest {
-            drawer_id: "drawer-global".to_string(),
-            project_id: None,
-            include_global: Some(true),
-            all_projects: None,
-        }))
-        .await
-        .expect("global read should succeed when include_global is set")
-        .0;
-
-    assert_eq!(response.drawer_id, "drawer-global");
-    assert_eq!(response.content, content);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_progressive_disclosure_hot_reload_applies_without_restart() {
-    let _guard = config_guard().await;
-    let env = TestEnv::new(None, false, true, 16);
-    let content = "Decision: the preview cap can change at runtime and the next search must observe the updated value.";
-    insert_drawer(
-        &env.db_path,
-        "drawer-hot",
-        content,
-        "code",
-        Some("preview"),
-        "/tmp/hot.md",
-        Some("default"),
-    );
-
-    let before = search_response_json(&env.server(), "preview").await;
-    let before_preview = before["results"][0]["content"]
-        .as_str()
-        .expect("before preview")
-        .to_string();
-    assert!(before_preview.chars().count() <= 17);
-
-    let previous = ConfigHandle::version();
-    write_config_atomic(
-        &env.config_path,
-        &config_text(&env.db_path, None, false, true, 48),
-    );
-    wait_for_config_version_change(&previous);
-
-    let after = search_response_json(&env.server(), "preview").await;
-    let after_preview = after["results"][0]["content"]
-        .as_str()
-        .expect("after preview")
-        .to_string();
+    let env = TestEnv::new(true, 16);
+    let info = <MempalMcpServer as ServerHandler>::get_info(&env.server());
+    let encoded = serde_json::to_value(&info).expect("serialize server info");
 
     assert!(
-        after_preview.chars().count() > before_preview.chars().count(),
-        "preview cap did not grow after hot reload: before={before_preview:?} after={after_preview:?}"
+        encoded["instructions"]
+            .as_str()
+            .expect("instructions string")
+            .contains("RULE 10 (progressive disclosure)")
     );
+    assert!(
+        encoded["instructions"]
+            .as_str()
+            .expect("instructions string")
+            .contains("mempal_read_drawer")
+    );
+    assert!(
+        encoded["instructions"]
+            .as_str()
+            .expect("instructions string")
+            .contains("content_truncated")
+    );
+    assert_eq!(
+        encoded["capabilities"]["experimental"]["mempal"]["progressive_disclosure_active"],
+        serde_json::Value::Bool(true)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_server_info_omits_rule_10_when_inactive() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(false, 16);
+    let info = <MempalMcpServer as ServerHandler>::get_info(&env.server());
+    let encoded = serde_json::to_value(&info).expect("serialize server info");
+
+    assert!(
+        !encoded["instructions"]
+            .as_str()
+            .expect("instructions string")
+            .contains("RULE 10 (progressive disclosure)")
+    );
+    assert_eq!(
+        encoded["capabilities"]["experimental"]["mempal"]["progressive_disclosure_active"],
+        serde_json::Value::Bool(false)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_server_info_reflects_hot_reloaded_progressive_disclosure_state() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(false, 16);
+    let server = env.server();
+
+    let initial = serde_json::to_value(<MempalMcpServer as ServerHandler>::get_info(&server))
+        .expect("serialize initial server info");
+    assert_eq!(
+        initial["capabilities"]["experimental"]["mempal"]["progressive_disclosure_active"],
+        serde_json::Value::Bool(false)
+    );
+    assert!(
+        !initial["instructions"]
+            .as_str()
+            .expect("initial instructions string")
+            .contains("RULE 10 (progressive disclosure)")
+    );
+
+    let initial_version = ConfigHandle::version();
+    write_config_atomic(&env.config_path, &config_text(&env.db_path, true, 16));
+    let enabled_version = wait_for_version_change(&initial_version);
+
+    let enabled = serde_json::to_value(<MempalMcpServer as ServerHandler>::get_info(&server))
+        .expect("serialize enabled server info");
+    assert_eq!(
+        enabled["capabilities"]["experimental"]["mempal"]["progressive_disclosure_active"],
+        serde_json::Value::Bool(true)
+    );
+    assert!(
+        enabled["instructions"]
+            .as_str()
+            .expect("enabled instructions string")
+            .contains("RULE 10 (progressive disclosure)")
+    );
+
+    write_config_atomic(&env.config_path, &config_text(&env.db_path, false, 16));
+    wait_for_version_change(&enabled_version);
+
+    let disabled_again =
+        serde_json::to_value(<MempalMcpServer as ServerHandler>::get_info(&server))
+            .expect("serialize disabled-again server info");
+    assert_eq!(
+        disabled_again["capabilities"]["experimental"]["mempal"]["progressive_disclosure_active"],
+        serde_json::Value::Bool(false)
+    );
+    assert!(
+        !disabled_again["instructions"]
+            .as_str()
+            .expect("disabled-again instructions string")
+            .contains("RULE 10 (progressive disclosure)")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_short_content_not_truncated() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(true, 120);
+    let content = "short drawer stays whole";
+    insert_drawer(&env.db_path, "drawer-short", content, "/tmp/short.md", true);
+
+    let response = search(&env.server(), "whole", None).await;
+    let result = &response.results[0];
+
+    assert_eq!(result.content, content);
+    assert!(!result.content_truncated);
+    assert_eq!(result.original_content_bytes, content.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_signals_computed_from_full_content() {
+    let _guard = config_guard().await;
+    let env = TestEnv::new(true, 32);
+    let content = "prefix ".repeat(40)
+        + "We decided to keep signals computed from the full drawer content because the preview is only a projection.";
+    insert_drawer(
+        &env.db_path,
+        "drawer-signals",
+        &content,
+        "/tmp/signals.md",
+        true,
+    );
+
+    let response = search(&env.server(), "projection", None).await;
+    let result = &response.results[0];
+
+    assert!(result.content_truncated);
+    assert!(!result.content.contains("decided"));
+    assert!(result.flags.iter().any(|flag| flag == "DECISION"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_truncation_aligns_to_word_boundary() {
+    let preview =
+        mempal::search::preview::truncate("The quick brown fox jumps over the lazy dog", 20);
+
+    assert!(preview.truncated);
+    assert_eq!(preview.content, "The quick brown fox…");
 }
