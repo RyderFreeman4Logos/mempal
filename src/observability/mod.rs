@@ -3,19 +3,20 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
-use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::core::config::{Config, ConfigHandle};
+use crate::core::db::{Database, read_fork_ext_version};
+use crate::core::project::{ProjectSearchScope, resolve_project_id};
+use crate::cowork::peek::format_rfc3339;
 use anyhow::{Context, Result, bail};
-use mempal::core::config::{Config, ConfigHandle};
-use mempal::core::db::Database;
-use mempal::core::project::{ProjectSearchScope, resolve_project_id};
-use mempal::core::queue::PendingMessageStore;
-use mempal::cowork::peek::format_rfc3339;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Serialize;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 const FOLLOW_POLL_SECS: u64 = 2;
 const FOLLOW_DEBOUNCE_MS: u64 = 250;
+const FOLLOW_SILENCE_TIMEOUT_MS: u64 = 3_000;
 const PREVIEW_CHARS: usize = 120;
 
 pub struct TailOptions<'a> {
@@ -24,11 +25,18 @@ pub struct TailOptions<'a> {
     pub wing: Option<&'a str>,
     pub room: Option<&'a str>,
     pub since: Option<&'a str>,
+    pub raw: bool,
 }
 
 pub struct TimelineOptions<'a> {
     pub wing: Option<&'a str>,
     pub since: Option<&'a str>,
+    pub format: &'a str,
+    pub raw: bool,
+}
+
+pub struct StatsOptions {
+    pub raw: bool,
 }
 
 pub struct ViewOptions<'a> {
@@ -39,10 +47,30 @@ pub struct ViewOptions<'a> {
 pub struct AuditOptions<'a> {
     pub kind: Option<&'a str>,
     pub since: Option<&'a str>,
+    pub raw: bool,
 }
 
 pub struct GatingStatsOptions<'a> {
     pub since: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailFollowEvent {
+    Notify,
+    Tick,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailFollowWake {
+    Notify,
+    Tick,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailFollowBatch {
+    pub wake: TailFollowWake,
+    pub lines: Vec<String>,
+    pub last_seen_rowid: i64,
 }
 
 #[derive(Clone)]
@@ -59,9 +87,11 @@ struct DrawerRecord {
 
 struct AuditRecord {
     audit_id: String,
-    candidate_hash: String,
+    candidate_drawer_id: String,
     decision: String,
     created_at: i64,
+    similarity_score: Option<f32>,
+    near_drawer_id: Option<String>,
     project_id: Option<String>,
 }
 
@@ -106,7 +136,7 @@ pub fn tail_command(db: &Database, config: &Config, options: TailOptions<'_>) ->
         let limit = options.limit;
         if limit > 0 {
             for record in records.iter().take(limit) {
-                println!("{}", format_tail_line(record));
+                println!("{}", format_tail_line(record, options.raw));
             }
             io::stdout()
                 .flush()
@@ -120,11 +150,12 @@ pub fn tail_command(db: &Database, config: &Config, options: TailOptions<'_>) ->
             options.room,
             since_cutoff,
             last_seen_rowid,
+            options.raw,
         );
     }
 
     for record in records.into_iter().take(options.limit) {
-        println!("{}", format_tail_line(&record));
+        println!("{}", format_tail_line(&record, options.raw));
     }
     Ok(())
 }
@@ -138,11 +169,40 @@ pub fn timeline_command(
     let since_cutoff = parse_since_cutoff(options.since)?;
     let mut records = load_visible_drawers(db, &scope, options.wing, None, since_cutoff)?;
     records.sort_by(|a, b| {
-        a.added_at
-            .cmp(&b.added_at)
+        format_day(&a.added_at)
+            .cmp(&format_day(&b.added_at))
             .then_with(|| b.importance.cmp(&a.importance))
+            .then_with(|| a.added_at.cmp(&b.added_at))
             .then_with(|| a.id.cmp(&b.id))
     });
+
+    match options.format {
+        "json" | "ndjson" => {
+            for record in records {
+                let signals = crate::aaak::analyze(&record.content);
+                let line = TimelineJsonLine {
+                    timestamp: format_timestamp(&record.added_at),
+                    drawer_id: record.id,
+                    wing: maybe_escape(&record.wing, options.raw),
+                    room: maybe_escape(render_room(record.room.as_deref()), options.raw),
+                    importance_stars: record.importance,
+                    flags: signals
+                        .flags
+                        .into_iter()
+                        .map(|value| maybe_escape(&value, options.raw))
+                        .collect(),
+                    preview: maybe_escape(&preview(&record.content), options.raw),
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&line).context("failed to serialize timeline row")?
+                );
+            }
+            return Ok(());
+        }
+        "text" => {}
+        other => bail!("unsupported timeline format: {other}"),
+    }
 
     let mut current_day = None::<String>;
     for record in records {
@@ -157,31 +217,23 @@ pub fn timeline_command(
         println!(
             "{} {}/{} {}",
             format_time(&record.added_at),
-            record.wing,
-            render_room(record.room.as_deref()),
-            record.id
+            maybe_escape(&record.wing, options.raw),
+            maybe_escape(render_room(record.room.as_deref()), options.raw),
+            maybe_escape(&record.id, options.raw)
         );
-        println!("  {}", preview(&record.content));
+        println!("  {}", maybe_escape(&preview(&record.content), options.raw));
     }
     Ok(())
 }
 
-pub fn stats_command(db: &Database, config: &Config) -> Result<()> {
+pub fn stats_command(db: &Database, config: &Config, options: StatsOptions) -> Result<()> {
     let scope = dashboard_scope(config)?;
     let records = load_visible_drawers(db, &scope, None, None, None)?;
     let schema_version = db
         .schema_version()
         .context("failed to read schema version")?;
-    let fork_ext_version = db
-        .conn()
-        .query_row(
-            "SELECT value FROM fork_ext_meta WHERE key = 'fork_ext_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
+    let fork_ext_version =
+        read_fork_ext_version(db.conn()).context("failed to read fork_ext_version")?;
     let mut by_scope = std::collections::BTreeMap::<String, usize>::new();
     let mut importance_total = 0i64;
     for record in &records {
@@ -195,10 +247,7 @@ pub fn stats_command(db: &Database, config: &Config) -> Result<()> {
         importance_total as f64 / records.len() as f64
     };
 
-    let queue_stats = PendingMessageStore::new(db.path())
-        .context("failed to open pending message store")?
-        .stats()
-        .context("failed to query queue stats")?;
+    let queue_stats = query_queue_stats(db).context("failed to query queue stats")?;
     let gating = load_audit_records(db, "gating", &scope, None)?;
     let novelty = load_audit_records(db, "novelty", &scope, None)?;
     let embed_count = db
@@ -230,12 +279,19 @@ pub fn stats_command(db: &Database, config: &Config) -> Result<()> {
     println!("avg importance: {:.2}", avg_importance);
     println!("drawers by scope:");
     for (scope_key, count) in by_scope {
-        println!("  {scope_key}: {count}");
+        println!("  {}: {count}", maybe_escape(&scope_key, options.raw));
     }
     println!("queue:");
     println!("  pending: {}", queue_stats.pending);
     println!("  claimed: {}", queue_stats.claimed);
     println!("  failed: {}", queue_stats.failed);
+    println!("  heartbeat: {}", queue_stats.heartbeat_state);
+    println!(
+        "  heartbeat_age_secs: {}",
+        queue_stats
+            .heartbeat_age_secs
+            .map_or_else(|| "none".to_string(), |value| value.to_string())
+    );
     println!("gating:");
     print_decision_counts(&gating);
     println!("novelty:");
@@ -267,11 +323,11 @@ pub fn view_command(db: &Database, config: &Config, options: ViewOptions<'_>) ->
     }
 
     let drawer = details.drawer;
-    println!("drawer_id: {}", drawer.id);
+    println!("drawer_id: {}", maybe_escape(&drawer.id, options.raw));
     println!(
         "scope: {}/{}",
-        drawer.wing,
-        render_room(drawer.room.as_deref())
+        maybe_escape(&drawer.wing, options.raw),
+        maybe_escape(render_room(drawer.room.as_deref()), options.raw)
     );
     println!("created_at: {}", format_timestamp(&drawer.added_at));
     println!(
@@ -281,18 +337,47 @@ pub fn view_command(db: &Database, config: &Config, options: ViewOptions<'_>) ->
     println!("merge_count: {}", details.merge_count);
     println!(
         "source_file: {}",
-        drawer.source_file.as_deref().unwrap_or("(synthetic)")
+        maybe_escape(
+            drawer.source_file.as_deref().unwrap_or("(synthetic)"),
+            options.raw
+        )
     );
+    println!("content_truncated: false");
+    println!("original_content_bytes: {}", drawer.content.len());
     println!();
     if options.raw {
         println!("{}", drawer.content);
     } else {
-        let signals = mempal::aaak::analyze(&drawer.content);
-        println!("flags: {}", signals.flags.join(", "));
-        println!("entities: {}", signals.entities.join(", "));
-        println!("topics: {}", signals.topics.join(", "));
+        let signals = crate::aaak::analyze(&drawer.content);
+        println!(
+            "flags: {}",
+            signals
+                .flags
+                .iter()
+                .map(|value| maybe_escape(value, false))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!(
+            "entities: {}",
+            signals
+                .entities
+                .iter()
+                .map(|value| maybe_escape(value, false))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!(
+            "topics: {}",
+            signals
+                .topics
+                .iter()
+                .map(|value| maybe_escape(value, false))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         println!();
-        println!("{}", drawer.content);
+        println!("{}", maybe_escape(&drawer.content, false));
     }
     Ok(())
 }
@@ -305,22 +390,26 @@ pub fn audit_command(db: &Database, config: &Config, options: AuditOptions<'_>) 
             print_audit_section(
                 "gating",
                 &load_audit_records(db, "gating", &scope, since_cutoff)?,
+                options.raw,
             );
             print_audit_section(
                 "novelty",
                 &load_audit_records(db, "novelty", &scope, since_cutoff)?,
+                options.raw,
             );
         }
         "gating" => {
             print_audit_section(
                 "gating",
                 &load_audit_records(db, "gating", &scope, since_cutoff)?,
+                options.raw,
             );
         }
         "novelty" => {
             print_audit_section(
                 "novelty",
                 &load_audit_records(db, "novelty", &scope, since_cutoff)?,
+                options.raw,
             );
         }
         other => bail!("unsupported audit kind: {other}"),
@@ -360,6 +449,7 @@ fn follow_tail(
     room: Option<&str>,
     since_cutoff: Option<i64>,
     mut last_seen_rowid: i64,
+    raw: bool,
 ) -> Result<()> {
     let db_path = db.path().to_path_buf();
     let db_file_name = db_path
@@ -370,7 +460,7 @@ fn follow_tail(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| ".".into());
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, mut rx) = unbounded_channel::<TailFollowEvent>();
     let mut watcher = create_db_watcher(tx.clone(), &db_file_name);
     let watcher_active = if let Some(active_watcher) = watcher.as_mut() {
         active_watcher
@@ -382,24 +472,49 @@ fn follow_tail(
     if !watcher_active {
         watcher = None;
     }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .context("failed to build tail follow runtime")?;
 
     loop {
         if watcher.is_some() {
-            rx.recv().context("tail watcher disconnected")?;
-            std::thread::sleep(Duration::from_millis(FOLLOW_DEBOUNCE_MS));
-            while rx.try_recv().is_ok() {}
+            let batch = runtime.block_on(collect_tail_follow_batch(
+                db,
+                scope,
+                TailFollowFilters {
+                    wing,
+                    room,
+                    since_cutoff,
+                    raw,
+                },
+                last_seen_rowid,
+                &mut rx,
+            ))?;
+            if batch.lines.is_empty() {
+                continue;
+            }
+            for line in &batch.lines {
+                println!("{line}");
+            }
+            last_seen_rowid = batch.last_seen_rowid;
         } else {
             std::thread::sleep(Duration::from_secs(FOLLOW_POLL_SECS));
-        }
-
-        let rows =
-            load_visible_drawers_after_rowid(db, scope, wing, room, since_cutoff, last_seen_rowid)?;
-        if rows.is_empty() {
-            continue;
-        }
-        for row in &rows {
-            println!("{}", format_tail_line(row));
-            last_seen_rowid = row.rowid;
+            let rows = load_visible_drawers_after_rowid(
+                db,
+                scope,
+                wing,
+                room,
+                since_cutoff,
+                last_seen_rowid,
+            )?;
+            if rows.is_empty() {
+                continue;
+            }
+            for row in &rows {
+                println!("{}", format_tail_line(row, raw));
+                last_seen_rowid = row.rowid;
+            }
         }
         io::stdout()
             .flush()
@@ -408,20 +523,73 @@ fn follow_tail(
 }
 
 fn create_db_watcher(
-    tx: mpsc::Sender<()>,
+    tx: UnboundedSender<TailFollowEvent>,
     db_file_name: &std::ffi::OsStr,
 ) -> Option<RecommendedWatcher> {
     let base = db_file_name.to_string_lossy().to_string();
     notify::recommended_watcher(move |result: notify::Result<Event>| match result {
         Ok(event) if is_db_event(&event, &base) => {
-            let _ = tx.send(());
+            let _ = tx.send(TailFollowEvent::Notify);
         }
         Ok(_) => {}
         Err(_) => {
-            let _ = tx.send(());
+            let _ = tx.send(TailFollowEvent::Notify);
         }
     })
     .ok()
+}
+
+#[derive(Clone, Copy)]
+pub struct TailFollowFilters<'a> {
+    pub wing: Option<&'a str>,
+    pub room: Option<&'a str>,
+    pub since_cutoff: Option<i64>,
+    pub raw: bool,
+}
+
+pub async fn next_tail_follow_event(
+    rx: &mut UnboundedReceiver<TailFollowEvent>,
+) -> TailFollowEvent {
+    match tokio::time::timeout(Duration::from_millis(FOLLOW_SILENCE_TIMEOUT_MS), rx.recv()).await {
+        Ok(Some(TailFollowEvent::Notify)) => {
+            tokio::time::sleep(Duration::from_millis(FOLLOW_DEBOUNCE_MS)).await;
+            while rx.try_recv().is_ok() {}
+            TailFollowEvent::Notify
+        }
+        Ok(Some(TailFollowEvent::Tick)) => TailFollowEvent::Tick,
+        Ok(None) | Err(_) => TailFollowEvent::Tick,
+    }
+}
+
+pub async fn collect_tail_follow_batch(
+    db: &Database,
+    scope: &ProjectSearchScope,
+    filters: TailFollowFilters<'_>,
+    last_seen_rowid: i64,
+    rx: &mut UnboundedReceiver<TailFollowEvent>,
+) -> Result<TailFollowBatch> {
+    let wake = match next_tail_follow_event(rx).await {
+        TailFollowEvent::Notify => TailFollowWake::Notify,
+        TailFollowEvent::Tick => TailFollowWake::Tick,
+    };
+    let rows = load_visible_drawers_after_rowid(
+        db,
+        scope,
+        filters.wing,
+        filters.room,
+        filters.since_cutoff,
+        last_seen_rowid,
+    )?;
+    let next_rowid = rows.last().map(|row| row.rowid).unwrap_or(last_seen_rowid);
+    let lines = rows
+        .iter()
+        .map(|row| format_tail_line(row, filters.raw))
+        .collect();
+    Ok(TailFollowBatch {
+        wake,
+        lines,
+        last_seen_rowid: next_rowid,
+    })
 }
 
 fn is_db_event(event: &Event, db_file_name: &str) -> bool {
@@ -568,9 +736,11 @@ fn load_audit_records(
             .into_iter()
             .map(|row| AuditRecord {
                 audit_id: row.audit_id,
-                candidate_hash: row.candidate_hash,
+                candidate_drawer_id: row.candidate_hash,
                 decision: row.decision,
                 created_at: row.created_at,
+                similarity_score: None,
+                near_drawer_id: None,
                 project_id: row.project_id,
             })
             .collect());
@@ -580,6 +750,7 @@ fn load_audit_records(
         "novelty" => {
             r#"
             SELECT a.id, a.candidate_hash, a.decision, a.created_at,
+                   a.cosine, a.near_drawer_id,
                    COALESCE(a.project_id, d.project_id)
             FROM novelty_audit a
             LEFT JOIN drawers d ON d.id = a.candidate_hash
@@ -593,10 +764,12 @@ fn load_audit_records(
         .query_map([], |row| {
             Ok(AuditRecord {
                 audit_id: row.get::<_, String>(0)?,
-                candidate_hash: row.get::<_, String>(1)?,
+                candidate_drawer_id: row.get::<_, String>(1)?,
                 decision: row.get::<_, String>(2)?,
                 created_at: row.get::<_, i64>(3)?,
-                project_id: row.get::<_, Option<String>>(4)?,
+                similarity_score: row.get::<_, Option<f32>>(4)?,
+                near_drawer_id: row.get::<_, Option<String>>(5)?,
+                project_id: row.get::<_, Option<String>>(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -827,20 +1000,41 @@ fn table_columns(db: &Database, table: &str) -> Result<Vec<String>> {
         .collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-fn print_audit_section(kind: &str, rows: &[AuditRecord]) {
+fn print_audit_section(kind: &str, rows: &[AuditRecord], raw: bool) {
     println!("{kind}:");
     if rows.is_empty() {
         println!("  none");
         return;
     }
     for row in rows {
-        println!(
-            "  {} {} {} {}",
-            format_created_at(row.created_at),
-            row.candidate_hash,
-            row.decision,
-            row.audit_id
-        );
+        if kind == "novelty" {
+            let similarity = row
+                .similarity_score
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "none".to_string());
+            let near_drawer_id = row
+                .near_drawer_id
+                .as_deref()
+                .map(|value| maybe_escape(value, raw))
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "  {} decision={} candidate_drawer_id={} similarity_score={} near_drawer_id={} audit_id={}",
+                format_created_at(row.created_at),
+                row.decision,
+                maybe_escape(&row.candidate_drawer_id, raw),
+                similarity,
+                near_drawer_id,
+                maybe_escape(&row.audit_id, raw)
+            );
+        } else {
+            println!(
+                "  {} decision={} candidate_drawer_id={} audit_id={}",
+                format_created_at(row.created_at),
+                row.decision,
+                maybe_escape(&row.candidate_drawer_id, raw),
+                maybe_escape(&row.audit_id, raw)
+            );
+        }
     }
 }
 
@@ -858,19 +1052,19 @@ fn print_decision_counts(rows: &[AuditRecord]) {
     }
 }
 
-fn format_tail_line(record: &DrawerRecord) -> String {
+fn format_tail_line(record: &DrawerRecord, raw: bool) -> String {
     format!(
         "{} {}/{} {} {}",
         format_time(&record.added_at),
-        record.wing,
-        render_room(record.room.as_deref()),
-        record.id,
-        preview(&record.content)
+        maybe_escape(&record.wing, raw),
+        maybe_escape(render_room(record.room.as_deref()), raw),
+        maybe_escape(&record.id, raw),
+        maybe_escape(&preview(&record.content), raw)
     )
 }
 
 fn preview(content: &str) -> String {
-    mempal::search::preview::truncate(content, PREVIEW_CHARS).content
+    crate::search::preview::truncate(content, PREVIEW_CHARS).content
 }
 
 fn render_room(room: Option<&str>) -> &str {
@@ -930,4 +1124,96 @@ fn format_timestamp(value: &str) -> String {
 fn format_created_at(value: i64) -> String {
     let secs = value.max(0) as u64;
     format_rfc3339(UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineJsonLine {
+    timestamp: String,
+    drawer_id: String,
+    wing: String,
+    room: String,
+    importance_stars: i32,
+    flags: Vec<String>,
+    preview: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DashboardQueueStats {
+    pending: i64,
+    claimed: i64,
+    failed: i64,
+    heartbeat_age_secs: Option<i64>,
+    heartbeat_state: &'static str,
+}
+
+fn query_queue_stats(db: &Database) -> Result<DashboardQueueStats> {
+    let has_pending_messages = db.conn().query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pending_messages'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if has_pending_messages == 0 {
+        return Ok(DashboardQueueStats {
+            pending: 0,
+            claimed: 0,
+            failed: 0,
+            heartbeat_age_secs: None,
+            heartbeat_state: "none",
+        });
+    }
+
+    let pending = db.conn().query_row(
+        "SELECT COUNT(*) FROM pending_messages WHERE status = 'pending'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let claimed = db.conn().query_row(
+        "SELECT COUNT(*) FROM pending_messages WHERE status = 'claimed'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let failed = db.conn().query_row(
+        "SELECT COUNT(*) FROM pending_messages WHERE status = 'failed'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let last_heartbeat = db.conn().query_row(
+        "SELECT MAX(heartbeat_at) FROM pending_messages WHERE heartbeat_at IS NOT NULL",
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    let heartbeat_age_secs =
+        last_heartbeat.map(|heartbeat| now_unix_secs().saturating_sub(heartbeat));
+    let heartbeat_state = match heartbeat_age_secs {
+        Some(age) if age <= 120 => "healthy",
+        Some(_) => "stale",
+        None => "none",
+    };
+    Ok(DashboardQueueStats {
+        pending,
+        claimed,
+        failed,
+        heartbeat_age_secs,
+        heartbeat_state,
+    })
+}
+
+fn maybe_escape(value: &str, raw: bool) -> String {
+    if raw {
+        value.to_string()
+    } else {
+        escape_terminal_text(value)
+    }
+}
+
+fn escape_terminal_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_control() {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
 }

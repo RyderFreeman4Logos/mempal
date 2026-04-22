@@ -15,5 +15,6 @@ pub mod hook_install;
 pub mod hotpatch;
 pub mod ingest;
 pub mod mcp;
+pub mod observability;
 pub mod search;
 pub mod session_review;
