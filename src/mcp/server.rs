@@ -548,6 +548,7 @@ impl MempalMcpServer {
         let novelty_candidate = NoveltyCandidate {
             wing: request.wing.clone(),
             room: request.room.clone(),
+            project_id: project_id.clone(),
         };
         let novelty = evaluate_novelty(
             &db,
@@ -676,17 +677,123 @@ impl MempalMcpServer {
                             .map_err(db_error)?;
                     }
                 } else {
-                    let merged_vector = embedder
-                        .embed(&[merged_content.as_str()])
-                        .await
-                        .map_err(|error| {
-                            ErrorData::internal_error(format!("embedding failed: {error}"), None)
-                        })?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| {
-                            ErrorData::internal_error("embedder returned no vector", None)
-                        })?;
+                    let merged_vector = match embedder.embed(&[merged_content.as_str()]).await {
+                        Ok(vectors) => match vectors.into_iter().next() {
+                            Some(vector) => vector,
+                            None => {
+                                tracing::warn!(
+                                    target_id = %target_id,
+                                    candidate_drawer_id = %drawer_id,
+                                    merged_content_bytes = merged_content.len(),
+                                    "novelty merge re-embed returned no vector; fail-open insert"
+                                );
+                                db.record_novelty_audit(
+                                    &drawer_id,
+                                    NoveltyAction::Insert,
+                                    Some(target_id.as_str()),
+                                    novelty.cosine,
+                                    Some("insert_due_to_embed_error"),
+                                    project_id.as_deref(),
+                                )
+                                .map_err(db_error)?;
+                                novelty_action = Some(NoveltyAction::Insert);
+                                near_drawer_id = Some(target_id);
+                                if !drawer_exists {
+                                    let source_file = source_file_or_synthetic(
+                                        &drawer_id,
+                                        request.source.as_deref(),
+                                    );
+                                    db.insert_drawer_with_project(
+                                        &Drawer {
+                                            id: drawer_id.clone(),
+                                            content: scrubbed_content.clone(),
+                                            wing: request.wing.clone(),
+                                            room: request.room.clone(),
+                                            source_file: Some(source_file),
+                                            source_type: SourceType::Manual,
+                                            added_at: current_timestamp(),
+                                            chunk_index: Some(0),
+                                            importance: request.importance.unwrap_or(0),
+                                        },
+                                        project_id.as_deref(),
+                                    )
+                                    .map_err(db_error)?;
+                                    db.insert_vector_with_project(
+                                        &drawer_id,
+                                        &vector,
+                                        project_id.as_deref(),
+                                    )
+                                    .map_err(db_error)?;
+                                }
+                                drop(lock_guard);
+                                return Ok(Json(IngestResponse {
+                                    drawer_id: response_drawer_id,
+                                    dropped: false,
+                                    gating_decision,
+                                    novelty_action,
+                                    near_drawer_id,
+                                    duplicate_warning,
+                                    lock_wait_ms,
+                                    system_warnings: current_system_warnings(),
+                                }));
+                            }
+                        },
+                        Err(_error) => {
+                            tracing::warn!(
+                                target_id = %target_id,
+                                candidate_drawer_id = %drawer_id,
+                                merged_content_bytes = merged_content.len(),
+                                "novelty merge re-embed failed; fail-open insert"
+                            );
+                            db.record_novelty_audit(
+                                &drawer_id,
+                                NoveltyAction::Insert,
+                                Some(target_id.as_str()),
+                                novelty.cosine,
+                                Some("insert_due_to_embed_error"),
+                                project_id.as_deref(),
+                            )
+                            .map_err(db_error)?;
+                            novelty_action = Some(NoveltyAction::Insert);
+                            near_drawer_id = Some(target_id);
+                            if !drawer_exists {
+                                let source_file =
+                                    source_file_or_synthetic(&drawer_id, request.source.as_deref());
+                                db.insert_drawer_with_project(
+                                    &Drawer {
+                                        id: drawer_id.clone(),
+                                        content: scrubbed_content.clone(),
+                                        wing: request.wing.clone(),
+                                        room: request.room.clone(),
+                                        source_file: Some(source_file),
+                                        source_type: SourceType::Manual,
+                                        added_at: current_timestamp(),
+                                        chunk_index: Some(0),
+                                        importance: request.importance.unwrap_or(0),
+                                    },
+                                    project_id.as_deref(),
+                                )
+                                .map_err(db_error)?;
+                                db.insert_vector_with_project(
+                                    &drawer_id,
+                                    &vector,
+                                    project_id.as_deref(),
+                                )
+                                .map_err(db_error)?;
+                            }
+                            drop(lock_guard);
+                            return Ok(Json(IngestResponse {
+                                drawer_id: response_drawer_id,
+                                dropped: false,
+                                gating_decision,
+                                novelty_action,
+                                near_drawer_id,
+                                duplicate_warning,
+                                lock_wait_ms,
+                                system_warnings: current_system_warnings(),
+                            }));
+                        }
+                    };
                     ensure_vector_dim_matches(&db, merged_vector.len())?;
                     db.update_drawer_after_merge(
                         &target_id,

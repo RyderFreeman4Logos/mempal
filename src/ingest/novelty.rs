@@ -1,5 +1,5 @@
 use crate::core::config::NoveltyConfig;
-use crate::core::db::Database;
+use crate::core::db::{Database, read_fork_ext_version};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,7 @@ impl NoveltyAction {
 pub struct NoveltyCandidate {
     pub wing: String,
     pub room: Option<String>,
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,11 +61,35 @@ pub fn evaluate(
         };
     }
 
+    let fork_ext_version = match read_fork_ext_version(db.conn()) {
+        Ok(version) => version,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "failed to read fork_ext_version for novelty; fail-open insert"
+            );
+            return NoveltyDecision::insert();
+        }
+    };
+    if candidate.project_id.is_some() && fork_ext_version < 5 {
+        tracing::warn!(
+            fork_ext_version,
+            wing = %candidate.wing,
+            room = ?candidate.room,
+            "shared palace detected, project isolation unavailable; novelty disabled"
+        );
+        return NoveltyDecision {
+            should_audit: false,
+            ..NoveltyDecision::insert()
+        };
+    }
+
     let (wing, room) = novelty_scope(candidate, config);
     let results = match db.novelty_candidates(
         vector,
         wing.as_deref(),
         room.as_deref(),
+        candidate.project_id.as_deref(),
         config.top_k_candidates,
     ) {
         Ok(results) => results,

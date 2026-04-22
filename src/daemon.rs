@@ -551,6 +551,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         &NoveltyCandidate {
             wing: record.wing.clone(),
             room: Some(record.room.clone()),
+            project_id: record.project_id.clone(),
         },
         &vector,
         &context.daemon.config.ingest_gating.novelty,
@@ -645,9 +646,38 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
                 Ok(drawer_id)
             } else {
-                let merged_vector =
-                    embed_text_with_heartbeat(context.embedder, &merged_content, Some(&heartbeat))
-                        .await?;
+                let merged_vector = match embed_text_with_heartbeat(
+                    context.embedder,
+                    &merged_content,
+                    Some(&heartbeat),
+                )
+                .await
+                {
+                    Ok(vector) => vector,
+                    Err(_error) => {
+                        tracing::warn!(
+                            target_id = %target_id,
+                            candidate_drawer_id = %drawer_id,
+                            merged_content_bytes = merged_content.len(),
+                            "novelty merge re-embed failed; fail-open insert"
+                        );
+                        context
+                            .db
+                            .record_novelty_audit(
+                                &drawer_id,
+                                NoveltyAction::Insert,
+                                Some(target_id.as_str()),
+                                novelty.cosine,
+                                Some("insert_due_to_embed_error"),
+                                record.project_id.as_deref(),
+                            )
+                            .with_context(|| {
+                                format!("failed to record novelty audit {}", drawer_id)
+                            })?;
+                        insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+                        return Ok(drawer_id);
+                    }
+                };
                 context
                     .db
                     .record_novelty_audit(
