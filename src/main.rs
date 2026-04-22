@@ -15,6 +15,7 @@ use mempal::api::{ApiState, DEFAULT_REST_ADDR, serve as serve_rest_api};
 use mempal::core::{
     config::{Config, ConfigHandle, default_config_path},
     db::Database,
+    priming::PrimingRequest,
     project::{
         ProjectMigrationEvent, ProjectSearchScope, escape_project_id_for_display,
         migrate_null_project_ids, resolve_project_id,
@@ -33,8 +34,11 @@ use mempal::observability;
 use mempal::search::search;
 
 mod longmemeval;
+#[path = "cli/prime.rs"]
+mod prime_cli;
 
 use crate::longmemeval::{BenchMode, LongMemEvalArgs, LongMemEvalGranularity, default_top_k};
+use crate::prime_cli::{PrimeArgs, PrimeFormat};
 
 #[derive(Parser)]
 #[command(name = "mempal", about = "Project memory for coding agents")]
@@ -112,6 +116,7 @@ enum Commands {
         #[arg(long)]
         format: Option<String>,
     },
+    Prime(PrimeArgs),
     Compress {
         text: String,
     },
@@ -387,6 +392,9 @@ fn run() -> Result<()> {
         Commands::Daemon { foreground } => {
             return mempal::daemon::run_command(default_config_path(), *foreground);
         }
+        Commands::Prime(args) => {
+            return prime_command(&config_path, args.clone());
+        }
         // All other commands fall through to the db-backed dispatch below.
         _ => {}
     }
@@ -480,6 +488,7 @@ fn run() -> Result<()> {
         Commands::Delete { drawer_id } => delete_command(&db, &drawer_id),
         Commands::Purge { before } => purge_command(&db, before.as_deref()),
         Commands::WakeUp { format } => wake_up_command(&db, format.as_deref()),
+        Commands::Prime(_) => unreachable!(),
         Commands::Compress { text } => compress_command(&text),
         Commands::Bench { command } => block_on_result(bench_command(config.as_ref(), command)),
         Commands::Reindex {
@@ -644,6 +653,54 @@ async fn bench_command(config: &Config, command: BenchCommands) -> Result<()> {
             .await
         }
     }
+}
+
+fn prime_command(config_path: &Path, args: PrimeArgs) -> Result<()> {
+    let config = Config::load_from(config_path)
+        .with_context(|| format!("failed to load config {}", config_path.display()))?;
+    let db_path = expand_home(&config.db_path);
+    if !db_path.exists() {
+        eprintln!("mempal: palace.db not found; skipping priming");
+        return Ok(());
+    }
+
+    let db = open_dashboard_database(&db_path).context("failed to open priming database")?;
+    let current_dir = env::current_dir().ok();
+    let project_id =
+        resolve_project_id(args.project_id.as_deref(), &config, current_dir.as_deref())
+            .context("failed to resolve prime project id")?;
+    let scope = ProjectSearchScope::from_request(
+        project_id.clone(),
+        false,
+        false,
+        config.search.strict_project_isolation,
+    );
+    let include_stats = args.want_stats();
+    let report = mempal::core::priming::build_priming_report(
+        &db,
+        PrimingRequest {
+            project_id,
+            scope,
+            since: args.since,
+            token_budget: args.token_budget,
+            include_stats,
+            embedder_degraded: prime_embedder_degraded(),
+        },
+    )
+    .context("failed to build priming output")?;
+
+    if report.drawers.is_empty() {
+        return Ok(());
+    }
+
+    match args.format {
+        PrimeFormat::Text => println!("{}", prime_cli::render_text(&report)),
+        PrimeFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("failed to serialize prime JSON")?
+        ),
+    }
+    Ok(())
 }
 
 fn init_command(db: &Database, dir: &Path, dry_run: bool) -> Result<()> {
@@ -1925,6 +1982,13 @@ fn expand_home(path: &str) -> PathBuf {
     }
 
     PathBuf::from(path)
+}
+
+fn prime_embedder_degraded() -> bool {
+    if std::env::var_os("MEMPAL_TEST_EMBED_DEGRADED").is_some() {
+        return true;
+    }
+    global_embed_status().is_degraded()
 }
 
 /// `mempal cowork-drain` — called by UserPromptSubmit hooks. Always exits
