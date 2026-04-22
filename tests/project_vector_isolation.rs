@@ -2143,7 +2143,22 @@ async fn test_mcp_roots_list_changed_invalidates_cached_project_id() {
         .await
         .expect("notify roots changed");
 
-    let second = call_mcp_search(&mut client, "root change").await;
+    // MCP `roots/list_changed` is fire-and-forget per protocol: no response is sent
+    // back after the server processes the notification. Under load the server's
+    // cache-invalidation handler may race with the next `tools/call`, so clients
+    // must poll until propagation is observed. See issue #50 for flake history.
+    let second = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = call_mcp_search(&mut client, "root change").await;
+            if parse_search_ids(&response) == vec!["drawer-project-b".to_string()] {
+                return response;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("roots change did not reflect in search within 5s");
+
     assert_eq!(
         parse_search_ids(&second),
         vec!["drawer-project-b".to_string()]
