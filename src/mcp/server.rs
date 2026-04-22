@@ -26,6 +26,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 
+use super::timeline::{TimelineRequest, TimelineResponse};
 use super::tools::{
     CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DuplicateWarning,
     EmbedStatusDto, FactCheckRequest, FactCheckResponse, IngestRequest, IngestResponse, KgRequest,
@@ -94,13 +95,13 @@ impl MempalMcpServer {
             .context("failed to initialize MCP stdio transport")
     }
 
-    fn open_db(&self) -> std::result::Result<Database, ErrorData> {
+    pub(super) fn open_db(&self) -> std::result::Result<Database, ErrorData> {
         Database::open(&self.db_path).map_err(|error| {
             ErrorData::internal_error(format!("failed to open database: {error}"), None)
         })
     }
 
-    async fn resolve_mcp_project_id(
+    pub(super) async fn resolve_mcp_project_id(
         &self,
         explicit: Option<&str>,
         config: &crate::core::config::Config,
@@ -331,6 +332,17 @@ impl MempalMcpServer {
                 .collect(),
             system_warnings,
         }))
+    }
+
+    #[tool(
+        name = "mempal_timeline",
+        description = "Return a project-scoped narrative overview ordered by importance and recency, without requiring a search query. Prefer this over broad mempal_search when you want project state overview without a specific question in mind."
+    )]
+    pub async fn mempal_timeline(
+        &self,
+        Parameters(request): Parameters<TimelineRequest>,
+    ) -> std::result::Result<Json<TimelineResponse>, ErrorData> {
+        super::timeline::handle(self, request).await
     }
 
     #[tool(
@@ -1384,7 +1396,7 @@ impl ServerHandler for MempalMcpServer {
     }
 }
 
-fn db_error(error: impl std::fmt::Display) -> ErrorData {
+pub(super) fn db_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(format!("{error}"), None)
 }
 
@@ -1451,7 +1463,7 @@ fn degraded_write_error() -> ErrorData {
     ErrorData::internal_error(message, data)
 }
 
-fn current_system_warnings() -> Vec<SystemWarning> {
+pub(super) fn current_system_warnings() -> Vec<SystemWarning> {
     let mut warnings = global_embed_status()
         .collect_warnings()
         .into_iter()
