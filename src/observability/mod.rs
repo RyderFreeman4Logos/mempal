@@ -179,8 +179,7 @@ pub fn timeline_command(
     match options.format {
         "json" | "ndjson" => {
             for record in records {
-                let signals =
-                    crate::aaak::analyze(crate::session_review::analysis_content(&record.content));
+                let signals = crate::aaak::analyze(visible_content(&record.wing, &record.content));
                 let line = TimelineJsonLine {
                     timestamp: format_timestamp(&record.added_at),
                     drawer_id: record.id,
@@ -192,7 +191,10 @@ pub fn timeline_command(
                         .into_iter()
                         .map(|value| maybe_escape(&value, options.raw))
                         .collect(),
-                    preview: maybe_escape(&preview(&record.content), options.raw),
+                    preview: maybe_escape(
+                        &preview(&record.wing, &record.content, options.raw),
+                        options.raw,
+                    ),
                 };
                 println!(
                     "{}",
@@ -222,7 +224,13 @@ pub fn timeline_command(
             maybe_escape(render_room(record.room.as_deref()), options.raw),
             maybe_escape(&record.id, options.raw)
         );
-        println!("  {}", maybe_escape(&preview(&record.content), options.raw));
+        println!(
+            "  {}",
+            maybe_escape(
+                &preview(&record.wing, &record.content, options.raw),
+                options.raw,
+            )
+        );
     }
     Ok(())
 }
@@ -236,10 +244,12 @@ pub fn stats_command(db: &Database, config: &Config, options: StatsOptions) -> R
     let fork_ext_version =
         read_fork_ext_version(db.conn()).context("failed to read fork_ext_version")?;
     let mut by_scope = std::collections::BTreeMap::<String, usize>::new();
+    let mut by_project = std::collections::BTreeMap::<Option<String>, usize>::new();
     let mut importance_total = 0i64;
     for record in &records {
         let key = format!("{}/{}", record.wing, render_room(record.room.as_deref()));
         *by_scope.entry(key).or_default() += 1;
+        *by_project.entry(record.project_id.clone()).or_default() += 1;
         importance_total += i64::from(record.importance);
     }
     let avg_importance = if records.is_empty() {
@@ -281,6 +291,13 @@ pub fn stats_command(db: &Database, config: &Config, options: StatsOptions) -> R
     println!("drawers by scope:");
     for (scope_key, count) in by_scope {
         println!("  {}: {count}", maybe_escape(&scope_key, options.raw));
+    }
+    println!("drawers by project:");
+    for (project_id, count) in by_project {
+        match project_id {
+            Some(project_id) => println!("  {}: {count}", maybe_escape(&project_id, options.raw)),
+            None => println!("  NULL: {count}"),
+        }
     }
     println!("queue:");
     println!("  pending: {}", queue_stats.pending);
@@ -349,8 +366,8 @@ pub fn view_command(db: &Database, config: &Config, options: ViewOptions<'_>) ->
     if options.raw {
         println!("{}", drawer.content);
     } else {
-        let signals =
-            crate::aaak::analyze(crate::session_review::analysis_content(&drawer.content));
+        let display_content = visible_content(&drawer.wing, &drawer.content);
+        let signals = crate::aaak::analyze(display_content);
         println!(
             "flags: {}",
             signals
@@ -379,7 +396,7 @@ pub fn view_command(db: &Database, config: &Config, options: ViewOptions<'_>) ->
                 .join(", ")
         );
         println!();
-        println!("{}", maybe_escape(&drawer.content, false));
+        println!("{}", maybe_escape(display_content, false));
     }
     Ok(())
 }
@@ -1061,16 +1078,26 @@ fn format_tail_line(record: &DrawerRecord, raw: bool) -> String {
         maybe_escape(&record.wing, raw),
         maybe_escape(render_room(record.room.as_deref()), raw),
         maybe_escape(&record.id, raw),
-        maybe_escape(&preview(&record.content), raw)
+        maybe_escape(&preview(&record.wing, &record.content, raw), raw)
     )
 }
 
-fn preview(content: &str) -> String {
-    crate::search::preview::truncate(
-        crate::session_review::analysis_content(content),
-        PREVIEW_CHARS,
-    )
-    .content
+fn preview(wing: &str, content: &str, raw: bool) -> String {
+    let content = if raw {
+        content
+    } else {
+        visible_content(wing, content)
+    };
+    crate::search::preview::truncate(content, PREVIEW_CHARS).content
+}
+
+fn visible_content<'a>(wing: &str, content: &'a str) -> &'a str {
+    let content = crate::session_review::analysis_content(content);
+    if wing == "hooks-raw" {
+        crate::session_review::split_hooks_raw_metadata(content).0
+    } else {
+        content
+    }
 }
 
 fn render_room(room: Option<&str>) -> &str {

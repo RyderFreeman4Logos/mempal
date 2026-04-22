@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
@@ -18,10 +18,12 @@ use mempal::core::db::{
     Database, apply_fork_ext_migrations_to, read_fork_ext_version, set_fork_ext_version,
 };
 use mempal::core::project::{
-    MAX_PROJECT_ID_BYTES, ProjectError, escape_project_id_for_display, infer_project_id_from_path,
-    infer_project_id_from_root_uri, migrate_null_project_ids, validate_project_id,
+    MAX_PROJECT_ID_BYTES, ProjectError, ProjectFilterMode, escape_project_id_for_display,
+    infer_project_id_from_path, infer_project_id_from_root_uri, migrate_null_project_ids,
+    validate_project_id,
 };
 use mempal::core::types::{Drawer, SourceType};
+use mempal::cowork::{PeekRequest, Tool, peek_partner};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::mcp::{MempalMcpServer, SearchRequest};
 use mempal::search::filter::{build_fts_runtime_sql, build_vector_search_sql};
@@ -147,10 +149,14 @@ strict_project_isolation = {}
     )
 }
 
-fn cli_embed_config(db_path: &Path, base_url: &str) -> String {
+fn cli_embed_config(db_path: &Path, base_url: &str, project_id: Option<&str>) -> String {
+    let project_section = project_id
+        .map(|project_id| format!("\n[project]\nid = \"{project_id}\"\n"))
+        .unwrap_or_default();
     format!(
         r#"
 db_path = "{}"
+{}
 
 [embed]
 backend = "openai_compat"
@@ -168,6 +174,7 @@ request_timeout_secs = 2
 strict_project_isolation = false
 "#,
         db_path.display(),
+        project_section,
         base_url,
         base_url
     )
@@ -177,6 +184,67 @@ fn write_config_atomic(path: &Path, contents: &str) {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, contents).expect("write temp config");
     fs::rename(&tmp, path).expect("rename config");
+}
+
+fn init_git_repo(path: &Path) {
+    let output = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(path)
+        .output()
+        .expect("run git init");
+    assert!(
+        output.status.success(),
+        "git init failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn today_ymd() -> (i64, u32, u32) {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let d = days + 719_468;
+    let era = if d >= 0 { d } else { d - 146_096 } / 146_097;
+    let doe = (d - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month as u32, day as u32)
+}
+
+fn codex_day_dir(home: &Path, year: i64, month: u32, day: u32) -> PathBuf {
+    home.join(format!(".codex/sessions/{year:04}/{month:02}/{day:02}"))
+}
+
+fn build_fake_partner_home(cwd: &Path) -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().to_path_buf();
+    let (year, month, day) = today_ymd();
+    let codex_dir = codex_day_dir(&home, year, month, day);
+    fs::create_dir_all(&codex_dir).expect("create codex day dir");
+    let cwd_str = cwd.to_string_lossy();
+    let stamp = format!("{year:04}-{month:02}-{day:02}T12:00:00Z");
+    let codex_jsonl = format!(
+        r#"{{"timestamp":"{stamp}","type":"session_meta","payload":{{"id":"peek","timestamp":"{stamp}","cwd":"{cwd_str}","originator":"codex-tui"}}}}
+{{"timestamp":"{stamp}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"partner user msg"}}]}}}}
+{{"timestamp":"{stamp}","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"partner assistant msg"}}]}}}}
+"#
+    );
+    fs::write(
+        codex_dir.join(format!(
+            "rollout-{year:04}-{month:02}-{day:02}T12-00-00-peek.jsonl"
+        )),
+        codex_jsonl,
+    )
+    .expect("write codex session");
+    (tmp, home)
 }
 
 fn column_names(conn: &Connection, table: &str) -> Vec<String> {
@@ -391,7 +459,7 @@ async fn call_mcp_search(client: &mut McpStdio, query: &str) -> Value {
 }
 
 #[test]
-fn test_schema_fork_ext_v5_applies_project_id_column() {
+fn test_fork_ext_migration_v4_to_v5_adds_project_id() {
     let tmp = TempDir::new().expect("tempdir");
     let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
     insert_projected_drawer(
@@ -441,7 +509,7 @@ fn test_schema_fork_ext_v5_applies_project_id_column() {
 }
 
 #[test]
-fn test_migration_v4_to_v5_preserves_null_project_ids() {
+fn test_v4_to_v5_migration_preserves_vectors_during_recreation() {
     let tmp = TempDir::new().expect("tempdir");
     let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
     insert_projected_drawer(
@@ -466,11 +534,113 @@ fn test_migration_v4_to_v5_preserves_null_project_ids() {
 
     apply_fork_ext_migrations_to(db.conn(), 5).expect("apply ext v5");
 
+    let vector_ids = db
+        .conn()
+        .prepare("SELECT id FROM drawer_vectors ORDER BY id")
+        .expect("prepare vector ids")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query vector ids")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect vector ids");
+    let drawer_payloads = db
+        .conn()
+        .prepare("SELECT id, content FROM drawers ORDER BY id")
+        .expect("prepare drawer payloads")
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query drawer payloads")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect drawer payloads");
+
+    assert_eq!(
+        vector_ids,
+        vec!["legacy-a".to_string(), "legacy-b".to_string()]
+    );
+    assert_eq!(
+        drawer_payloads,
+        vec![
+            ("legacy-a".to_string(), "legacy content a".to_string()),
+            ("legacy-b".to_string(), "legacy content b".to_string())
+        ]
+    );
     assert_eq!(drawer_project_ids(db.conn(), "drawers"), vec![None, None]);
     assert_eq!(
         drawer_project_ids(db.conn(), "drawer_vectors"),
         vec![None, None]
     );
+}
+
+#[test]
+fn test_v4_to_v5_migration_skips_backup_when_table_absent() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    insert_projected_drawer(
+        db.path(),
+        "legacy-drawer",
+        "legacy content",
+        "code",
+        Some("room"),
+        None,
+        &[0.1, 0.2, 0.3],
+    );
+    downgrade_to_v4(db.conn(), true);
+
+    assert!(
+        sqlite_master_sql(db.conn(), "drawer_vectors").is_none(),
+        "legacy v4 fixture should omit drawer_vectors"
+    );
+
+    apply_fork_ext_migrations_to(db.conn(), 5).expect("apply ext v5");
+
+    assert_eq!(read_fork_ext_version(db.conn()).expect("read version"), 5);
+    assert!(
+        sqlite_master_sql(db.conn(), "drawer_vectors").is_none(),
+        "migration should not recreate missing drawer_vectors eagerly"
+    );
+    assert_eq!(drawer_project_ids(db.conn(), "drawers"), vec![None]);
+}
+
+#[test]
+fn test_lazy_create_after_v5_has_project_id_column() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    db.insert_drawer_with_project(
+        &Drawer {
+            id: "lazy-drawer".to_string(),
+            content: "lazy vector creation".to_string(),
+            wing: "code".to_string(),
+            room: Some("room".to_string()),
+            source_file: Some("lazy.md".to_string()),
+            source_type: SourceType::Manual,
+            added_at: "1713000000".to_string(),
+            chunk_index: Some(0),
+            importance: 0,
+        },
+        Some("proj-lazy"),
+    )
+    .expect("insert drawer");
+    downgrade_to_v4(db.conn(), true);
+    apply_fork_ext_migrations_to(db.conn(), 5).expect("apply ext v5");
+
+    db.insert_vector_with_project("lazy-drawer", &[0.1, 0.2, 0.3], Some("proj-lazy"))
+        .expect("insert vector");
+
+    let vector_sql = sqlite_master_sql(db.conn(), "drawer_vectors").expect("drawer_vectors sql");
+    let stored = db
+        .conn()
+        .query_row(
+            "SELECT project_id FROM drawer_vectors WHERE id = 'lazy-drawer'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("read stored vector project");
+
+    assert!(
+        vector_sql.contains("project_id"),
+        "lazy-created drawer_vectors missing project_id: {vector_sql}"
+    );
+    assert_eq!(stored.as_deref(), Some("proj-lazy"));
 }
 
 #[test]
@@ -1047,7 +1217,7 @@ fn test_validate_project_id_rejects_length_over_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_search_excludes_other_project_vectors() {
+async fn test_search_hard_filters_by_project_id() {
     let _guard = config_guard().await;
     let env = SearchEnv::new(None, false);
     insert_projected_drawer(
@@ -1084,6 +1254,227 @@ async fn test_search_excludes_other_project_vectors() {
     )
     .await;
     assert_eq!(parse_search_ids(&json), vec!["drawer-a".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_search_include_global_returns_project_and_null() {
+    let _guard = config_guard().await;
+    let env = SearchEnv::new(None, false);
+    insert_projected_drawer(
+        &env.db_path,
+        "drawer-project",
+        "shared query text",
+        "code",
+        Some("room"),
+        Some("proj-A"),
+        &[0.1, 0.2, 0.3],
+    );
+    insert_projected_drawer(
+        &env.db_path,
+        "drawer-global",
+        "shared query text",
+        "code",
+        Some("room"),
+        None,
+        &[0.1, 0.2, 0.3],
+    );
+    insert_projected_drawer(
+        &env.db_path,
+        "drawer-other",
+        "shared query text",
+        "code",
+        Some("room"),
+        Some("proj-B"),
+        &[0.1, 0.2, 0.3],
+    );
+
+    let mut ids = parse_search_ids(
+        &search_response_json_with_request(
+            &env.server(),
+            SearchRequest {
+                query: "shared".to_string(),
+                wing: None,
+                room: None,
+                top_k: Some(10),
+                project_id: Some("proj-A".to_string()),
+                include_global: Some(true),
+                all_projects: None,
+                disable_progressive: None,
+            },
+        )
+        .await,
+    );
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["drawer-global".to_string(), "drawer-project".to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_search_without_project_id_returns_all() {
+    let _guard = config_guard().await;
+    let env = SearchEnv::new(None, false);
+    for (id, project_id) in [
+        ("drawer-null", None),
+        ("drawer-a", Some("proj-A")),
+        ("drawer-b", Some("proj-B")),
+    ] {
+        insert_projected_drawer(
+            &env.db_path,
+            id,
+            "rootless shared query",
+            "code",
+            Some("room"),
+            project_id,
+            &[0.1, 0.2, 0.3],
+        );
+    }
+
+    let mut ids = parse_search_ids(
+        &search_response_json_with_request(
+            &env.server(),
+            SearchRequest {
+                query: "rootless".to_string(),
+                wing: None,
+                room: None,
+                top_k: Some(10),
+                project_id: None,
+                include_global: None,
+                all_projects: None,
+                disable_progressive: None,
+            },
+        )
+        .await,
+    );
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "drawer-a".to_string(),
+            "drawer-b".to_string(),
+            "drawer-null".to_string()
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_strict_isolation_without_project_id_returns_null_only() {
+    let _guard = config_guard().await;
+    let env = SearchEnv::new(None, true);
+    insert_projected_drawer(
+        &env.db_path,
+        "drawer-null",
+        "strict rootless shared query",
+        "code",
+        Some("room"),
+        None,
+        &[0.1, 0.2, 0.3],
+    );
+    insert_projected_drawer(
+        &env.db_path,
+        "drawer-a",
+        "strict rootless shared query",
+        "code",
+        Some("room"),
+        Some("proj-A"),
+        &[0.1, 0.2, 0.3],
+    );
+    insert_projected_drawer(
+        &env.db_path,
+        "drawer-b",
+        "strict rootless shared query",
+        "code",
+        Some("room"),
+        Some("proj-B"),
+        &[0.1, 0.2, 0.3],
+    );
+
+    let json = search_response_json_with_request(
+        &env.server(),
+        SearchRequest {
+            query: "strict".to_string(),
+            wing: None,
+            room: None,
+            top_k: Some(10),
+            project_id: None,
+            include_global: None,
+            all_projects: None,
+            disable_progressive: None,
+        },
+    )
+    .await;
+    assert_eq!(parse_search_ids(&json), vec!["drawer-null".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_large_project_does_not_crowd_out_small() {
+    let _guard = config_guard().await;
+    let env = SearchEnv::new(None, false);
+    let db = Database::open(&env.db_path).expect("open db");
+    for index in 0..100_000 {
+        let id = format!("proj-a-{index:06}");
+        let a_vector = vec![0.1, 0.2, 0.3 + ((index % 17) as f32 / 10_000.0)];
+        db.insert_drawer_with_project(
+            &Drawer {
+                id: id.clone(),
+                content: "vector-only crowd control A".to_string(),
+                wing: "code".to_string(),
+                room: Some("room".to_string()),
+                source_file: Some(format!("{id}.md")),
+                source_type: SourceType::Manual,
+                added_at: "1713000000".to_string(),
+                chunk_index: Some(0),
+                importance: 0,
+            },
+            Some("proj-A"),
+        )
+        .expect("insert proj-A drawer");
+        db.insert_vector_with_project(&id, &a_vector, Some("proj-A"))
+            .expect("insert proj-A vector");
+    }
+    for index in 0..10 {
+        let id = format!("proj-b-{index:02}");
+        db.insert_drawer_with_project(
+            &Drawer {
+                id: id.clone(),
+                content: "vector-only crowd control B".to_string(),
+                wing: "code".to_string(),
+                room: Some("room".to_string()),
+                source_file: Some(format!("{id}.md")),
+                source_type: SourceType::Manual,
+                added_at: format!("{}", 1_713_100_000 + index),
+                chunk_index: Some(0),
+                importance: 0,
+            },
+            Some("proj-B"),
+        )
+        .expect("insert proj-B drawer");
+        db.insert_vector_with_project(&id, &[0.9, 0.8, 0.7], Some("proj-B"))
+            .expect("insert proj-B vector");
+    }
+
+    let ids = parse_search_ids(
+        &search_response_json_with_request(
+            &env.server(),
+            SearchRequest {
+                query: "nonexistent-vector-token".to_string(),
+                wing: None,
+                room: None,
+                top_k: Some(10),
+                project_id: Some("proj-B".to_string()),
+                include_global: None,
+                all_projects: None,
+                disable_progressive: None,
+            },
+        )
+        .await,
+    );
+    assert_eq!(ids.len(), 10, "{ids:?}");
+    assert!(
+        ids.iter().all(|id| id.starts_with("proj-b-")),
+        "small project rows were crowded out: {ids:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1160,7 +1551,7 @@ async fn test_vec_search_excludes_other_project() {
     let db = Database::open(&env.db_path).expect("open db");
     let mut stmt = db
         .conn()
-        .prepare(&build_vector_search_sql())
+        .prepare(&build_vector_search_sql(ProjectFilterMode::ProjectScoped))
         .expect("prepare vector sql");
     let ids = stmt
         .query_map(
@@ -1194,7 +1585,7 @@ async fn test_default_project_matches_current_dir() {
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     write_config_atomic(
         &home.join(".mempal").join("config.toml"),
-        &cli_embed_config(&db_path, &format!("http://{addr}/v1")),
+        &cli_embed_config(&db_path, &format!("http://{addr}/v1"), None),
     );
     Database::open(&db_path).expect("open db");
     insert_projected_drawer(
@@ -1236,7 +1627,7 @@ async fn test_explicit_project_override_wins_over_default() {
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     write_config_atomic(
         &home.join(".mempal").join("config.toml"),
-        &cli_embed_config(&db_path, &format!("http://{addr}/v1")),
+        &cli_embed_config(&db_path, &format!("http://{addr}/v1"), None),
     );
     Database::open(&db_path).expect("open db");
     insert_projected_drawer(
@@ -1266,6 +1657,148 @@ async fn test_explicit_project_override_wins_over_default() {
     assert_eq!(
         parse_cli_search_ids(&output),
         vec!["drawer-foo".to_string()]
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_project_id_auto_inferred_from_git() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = install_cli_home(&tmp);
+    let db_path = home.join(".mempal").join("palace.db");
+    let repo_root = tmp.path().join("workspace").join("repo-root");
+    let subdir = repo_root.join("nested").join("child");
+    fs::create_dir_all(&subdir).expect("create nested repo subdir");
+    init_git_repo(&repo_root);
+    let expected = expected_project_id(&repo_root);
+    let subdir_project_id = expected_project_id(&subdir);
+
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_config_atomic(
+        &home.join(".mempal").join("config.toml"),
+        &cli_embed_config(&db_path, &format!("http://{addr}/v1"), None),
+    );
+    Database::open(&db_path).expect("open db");
+    insert_projected_drawer(
+        &db_path,
+        "drawer-git-root",
+        "git inferred query",
+        "code",
+        Some("room"),
+        Some(&expected),
+        &[0.1, 0.2, 0.3, 0.4],
+    );
+    insert_projected_drawer(
+        &db_path,
+        "drawer-subdir",
+        "git inferred query",
+        "code",
+        Some("room"),
+        Some(subdir_project_id.as_str()),
+        &[0.1, 0.2, 0.3, 0.4],
+    );
+
+    let output = run_mempal_in_dir(&home, &subdir, &["search", "git", "--json"]);
+    assert_eq!(
+        parse_cli_search_ids(&output),
+        vec!["drawer-git-root".to_string()]
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_config_project_id_overrides_git() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = install_cli_home(&tmp);
+    let db_path = home.join(".mempal").join("palace.db");
+    let repo_root = tmp.path().join("workspace").join("repo-root");
+    let subdir = repo_root.join("nested").join("child");
+    fs::create_dir_all(&subdir).expect("create nested repo subdir");
+    init_git_repo(&repo_root);
+    let git_project_id = expected_project_id(&repo_root);
+
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_config_atomic(
+        &home.join(".mempal").join("config.toml"),
+        &cli_embed_config(
+            &db_path,
+            &format!("http://{addr}/v1"),
+            Some("config-project"),
+        ),
+    );
+    Database::open(&db_path).expect("open db");
+    insert_projected_drawer(
+        &db_path,
+        "drawer-config",
+        "config override query",
+        "code",
+        Some("room"),
+        Some("config-project"),
+        &[0.1, 0.2, 0.3, 0.4],
+    );
+    insert_projected_drawer(
+        &db_path,
+        "drawer-git-root",
+        "config override query",
+        "code",
+        Some("room"),
+        Some(&git_project_id),
+        &[0.1, 0.2, 0.3, 0.4],
+    );
+
+    let output = run_mempal_in_dir(&home, &subdir, &["search", "config", "--json"]);
+    assert_eq!(
+        parse_cli_search_ids(&output),
+        vec!["drawer-config".to_string()]
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cli_project_overrides_config() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = install_cli_home(&tmp);
+    let db_path = home.join(".mempal").join("palace.db");
+    let repo_root = tmp.path().join("workspace").join("repo-root");
+    let subdir = repo_root.join("nested").join("child");
+    fs::create_dir_all(&subdir).expect("create nested repo subdir");
+    init_git_repo(&repo_root);
+    let git_project_id = expected_project_id(&repo_root);
+
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_config_atomic(
+        &home.join(".mempal").join("config.toml"),
+        &cli_embed_config(
+            &db_path,
+            &format!("http://{addr}/v1"),
+            Some("config-project"),
+        ),
+    );
+    Database::open(&db_path).expect("open db");
+    for (id, project_id) in [
+        ("drawer-cli", "cli-project"),
+        ("drawer-config", "config-project"),
+        ("drawer-git-root", git_project_id.as_str()),
+    ] {
+        insert_projected_drawer(
+            &db_path,
+            id,
+            "cli override query",
+            "code",
+            Some("room"),
+            Some(project_id),
+            &[0.1, 0.2, 0.3, 0.4],
+        );
+    }
+
+    let output = run_mempal_in_dir(
+        &home,
+        &subdir,
+        &["search", "cli", "--project", "cli-project", "--json"],
+    );
+    assert_eq!(
+        parse_cli_search_ids(&output),
+        vec!["drawer-cli".to_string()]
     );
     handle.shutdown().await;
 }
@@ -1403,7 +1936,7 @@ async fn test_ingest_stores_project_id_from_cwd() {
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     write_config_atomic(
         &home.join(".mempal").join("config.toml"),
-        &cli_embed_config(&db_path, &format!("http://{addr}/v1")),
+        &cli_embed_config(&db_path, &format!("http://{addr}/v1"), None),
     );
 
     let output = run_mempal_in_dir(
@@ -1437,7 +1970,7 @@ async fn test_ingest_stores_project_id_from_cwd() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_ingest_project_id_override_flag() {
+async fn test_ingest_with_project_id_persists() {
     let tmp = TempDir::new().expect("tempdir");
     let home = install_cli_home(&tmp);
     let db_path = home.join(".mempal").join("palace.db");
@@ -1452,7 +1985,7 @@ async fn test_ingest_project_id_override_flag() {
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     write_config_atomic(
         &home.join(".mempal").join("config.toml"),
-        &cli_embed_config(&db_path, &format!("http://{addr}/v1")),
+        &cli_embed_config(&db_path, &format!("http://{addr}/v1"), None),
     );
 
     let output = run_mempal_in_dir(
@@ -1685,6 +2218,26 @@ async fn test_mcp_search_without_project_runs_unscoped_when_not_strict() {
             .any(|warning| warning["message"] == "no project scope resolved, isolation strict"),
         "unexpected warnings: {structured}"
     );
+}
+
+#[test]
+fn test_peek_partner_unaffected_by_project_filter() {
+    let cwd = std::env::current_dir().expect("current dir");
+    let (_tmp, home) = build_fake_partner_home(&cwd);
+    let request = PeekRequest {
+        tool: Tool::Codex,
+        limit: 10,
+        since: None,
+        cwd,
+        caller_tool: Some(Tool::Claude),
+        home_override: Some(home),
+    };
+
+    let response = peek_partner(request).expect("peek partner");
+    assert_eq!(response.partner_tool, Tool::Codex);
+    assert_eq!(response.messages.len(), 2);
+    assert_eq!(response.messages[0].text, "partner user msg");
+    assert_eq!(response.messages[1].text, "partner assistant msg");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -13,6 +13,7 @@ use mempal::core::types::{Drawer, SourceType};
 use mempal::ingest::gating::GatingDecision;
 use mempal::ingest::novelty::NoveltyAction;
 use mempal::observability::{self, TailFollowEvent, TailFollowFilters, TailFollowWake};
+use mempal::session_review::append_hooks_raw_metadata;
 use rusqlite::params;
 use tempfile::TempDir;
 
@@ -34,21 +35,7 @@ impl DashboardEnv {
         fs::create_dir_all(&mempal_home).expect("create mempal home");
         let db_path = mempal_home.join("palace.db");
         Database::open(&db_path).expect("open db");
-        write_config_atomic(
-            &mempal_home.join("config.toml"),
-            &format!(
-                r#"
-db_path = "{}"
-
-[embed]
-backend = "model2vec"
-
-[search]
-strict_project_isolation = false
-"#,
-                db_path.display()
-            ),
-        );
+        write_dashboard_config(&mempal_home.join("config.toml"), &db_path, None, false);
         Self {
             _tmp: tmp,
             home,
@@ -58,6 +45,15 @@ strict_project_isolation = false
 
     fn cwd(&self) -> &Path {
         &self.home
+    }
+
+    fn set_project_scope(&self, project_id: Option<&str>, strict_project_isolation: bool) {
+        write_dashboard_config(
+            &self.home.join(".mempal").join("config.toml"),
+            &self.db_path,
+            project_id,
+            strict_project_isolation,
+        );
     }
 }
 
@@ -90,19 +86,54 @@ fn drawer_seed(
 }
 
 fn insert_drawer(db_path: &Path, seed: &DrawerSeed) {
+    insert_drawer_with_project(db_path, seed, None);
+}
+
+fn insert_drawer_with_project(db_path: &Path, seed: &DrawerSeed, project_id: Option<&str>) {
     let db = Database::open(db_path).expect("open db");
-    db.insert_drawer(&Drawer {
-        id: seed.id.clone(),
-        content: seed.content.clone(),
-        wing: seed.wing.clone(),
-        room: seed.room.clone(),
-        source_file: Some(format!("{}.md", seed.id)),
-        source_type: SourceType::Manual,
-        added_at: seed.added_at.clone(),
-        chunk_index: Some(0),
-        importance: seed.importance,
-    })
+    db.insert_drawer_with_project(
+        &Drawer {
+            id: seed.id.clone(),
+            content: seed.content.clone(),
+            wing: seed.wing.clone(),
+            room: seed.room.clone(),
+            source_file: Some(format!("{}.md", seed.id)),
+            source_type: SourceType::Manual,
+            added_at: seed.added_at.clone(),
+            chunk_index: Some(0),
+            importance: seed.importance,
+        },
+        project_id,
+    )
     .expect("insert drawer");
+}
+
+fn write_dashboard_config(
+    path: &Path,
+    db_path: &Path,
+    project_id: Option<&str>,
+    strict_project_isolation: bool,
+) {
+    let project_section = project_id
+        .map(|project_id| format!("\n[project]\nid = \"{project_id}\"\n"))
+        .unwrap_or_default();
+    write_config_atomic(
+        path,
+        &format!(
+            r#"
+db_path = "{}"
+{}
+[embed]
+backend = "model2vec"
+
+[search]
+strict_project_isolation = {}
+"#,
+            db_path.display(),
+            project_section,
+            strict_project_isolation
+        ),
+    );
 }
 
 fn record_gating_audit(db_path: &Path, drawer_id: &str, accepted: bool) {
@@ -907,4 +938,231 @@ async fn test_tail_follow_fallback_on_inotify_silence() {
     );
     assert_eq!(batch.lines.len(), 1, "{batch:?}");
     assert!(batch.lines[0].contains("fallback-new"), "{batch:?}");
+}
+
+#[test]
+fn test_tail_strips_hooks_raw_sentinel_from_preview() {
+    let env = DashboardEnv::new();
+    let content = append_hooks_raw_metadata(
+        "hook envelope body remains visible",
+        Some("sess-hook-tail"),
+        Some("1713000100"),
+    );
+    insert_drawer(
+        &env.db_path,
+        &drawer_seed(
+            "hooks-raw-preview",
+            content,
+            "hooks-raw",
+            Some("Bash"),
+            "1713005000",
+            2,
+        ),
+    );
+
+    let output = run_mempal(&env.home, env.cwd(), &["tail"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("<!-- mempal:hooks-raw -->"),
+        "non-raw tail leaked hooks metadata:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("session_id:"),
+        "non-raw tail leaked session metadata:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("hook envelope body remains visible"),
+        "{stdout}"
+    );
+
+    let raw_output = run_mempal(&env.home, env.cwd(), &["tail", "--raw"]);
+    assert!(
+        raw_output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&raw_output.stderr)
+    );
+    let raw_stdout = String::from_utf8_lossy(&raw_output.stdout);
+    assert!(
+        raw_stdout.contains("<!-- mempal:hooks-raw -->"),
+        "{raw_stdout}"
+    );
+}
+
+#[test]
+fn test_tail_respects_strict_project_isolation() {
+    let env = DashboardEnv::new();
+    env.set_project_scope(Some("proj-A"), true);
+    insert_drawer_with_project(
+        &env.db_path,
+        &drawer_seed(
+            "tail-proj-a",
+            "project A visible",
+            "default",
+            Some("tail"),
+            "1713006002",
+            2,
+        ),
+        Some("proj-A"),
+    );
+    insert_drawer_with_project(
+        &env.db_path,
+        &drawer_seed(
+            "tail-proj-b",
+            "project B hidden",
+            "default",
+            Some("tail"),
+            "1713006001",
+            2,
+        ),
+        Some("proj-B"),
+    );
+    insert_drawer_with_project(
+        &env.db_path,
+        &drawer_seed(
+            "tail-global",
+            "global hidden",
+            "default",
+            Some("tail"),
+            "1713006000",
+            2,
+        ),
+        None,
+    );
+
+    let output = run_mempal(&env.home, env.cwd(), &["tail"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("tail-proj-a"), "{stdout}");
+    assert!(!stdout.contains("tail-proj-b"), "{stdout}");
+    assert!(!stdout.contains("tail-global"), "{stdout}");
+}
+
+#[test]
+fn test_stats_per_project_breakdown() {
+    let env = DashboardEnv::new();
+    insert_drawer_with_project(
+        &env.db_path,
+        &drawer_seed(
+            "stats-proj-a-1",
+            "stats project a one",
+            "default",
+            Some("stats"),
+            "1713007000",
+            1,
+        ),
+        Some("proj-A"),
+    );
+    insert_drawer_with_project(
+        &env.db_path,
+        &drawer_seed(
+            "stats-proj-a-2",
+            "stats project a two",
+            "default",
+            Some("stats"),
+            "1713007001",
+            1,
+        ),
+        Some("proj-A"),
+    );
+    insert_drawer_with_project(
+        &env.db_path,
+        &drawer_seed(
+            "stats-proj-b-1",
+            "stats project b one",
+            "default",
+            Some("stats"),
+            "1713007002",
+            1,
+        ),
+        Some("proj-B"),
+    );
+    insert_drawer_with_project(
+        &env.db_path,
+        &drawer_seed(
+            "stats-global-1",
+            "stats global one",
+            "default",
+            Some("stats"),
+            "1713007003",
+            1,
+        ),
+        None,
+    );
+
+    let output = run_mempal(&env.home, env.cwd(), &["stats"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("drawers by project:"), "{stdout}");
+    assert!(stdout.contains("  proj-A: 2"), "{stdout}");
+    assert!(stdout.contains("  proj-B: 1"), "{stdout}");
+    assert!(stdout.contains("  NULL: 1"), "{stdout}");
+}
+
+#[test]
+fn test_audit_filters_by_project_when_isolation_strict() {
+    let env = DashboardEnv::new();
+    env.set_project_scope(Some("proj-A"), true);
+    insert_drawer_with_project(
+        &env.db_path,
+        &drawer_seed(
+            "audit-proj-a",
+            "audit project a",
+            "default",
+            Some("audit"),
+            "1713008000",
+            2,
+        ),
+        Some("proj-A"),
+    );
+    insert_drawer_with_project(
+        &env.db_path,
+        &drawer_seed(
+            "audit-proj-b",
+            "audit project b",
+            "default",
+            Some("audit"),
+            "1713008001",
+            2,
+        ),
+        Some("proj-B"),
+    );
+    record_novelty_audit(
+        &env.db_path,
+        "audit-proj-a",
+        NoveltyAction::Insert,
+        now_unix_secs(),
+    );
+    record_novelty_audit(
+        &env.db_path,
+        "audit-proj-b",
+        NoveltyAction::Drop,
+        now_unix_secs(),
+    );
+
+    let output = run_mempal(
+        &env.home,
+        env.cwd(),
+        &["audit", "--kind", "novelty", "--since", "7d"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("audit-proj-a"), "{stdout}");
+    assert!(!stdout.contains("audit-proj-b"), "{stdout}");
 }

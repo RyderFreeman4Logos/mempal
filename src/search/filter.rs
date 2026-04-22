@@ -26,7 +26,7 @@ pub fn build_filter_clause(
     )
 }
 
-pub fn build_vector_search_sql() -> String {
+pub fn build_vector_search_sql(_mode: ProjectFilterMode) -> String {
     format!(
         r#"
         WITH matches AS (
@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn test_vector_recall_project_filter_pushed_to_sql() {
-        let sql = build_vector_search_sql();
+        let sql = build_vector_search_sql(ProjectFilterMode::ProjectScoped);
         assert!(
             sql.contains("v.project_id = ?4"),
             "vector SQL must push project_id filter into the vector CTE: {sql}"
