@@ -1,14 +1,28 @@
 use mempal::core::db::Database;
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
-use mempal::embed::Embedder;
+use mempal::embed::{Embedder, EmbedderFactory};
+use mempal::ingest::lock::{acquire_source_lock, source_key};
 use mempal::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use mempal::ingest::reindex::{ReindexMode, ReindexOptions, reindex_sources};
 use mempal::ingest::{IngestOptions, ingest_file_with_options};
+use mempal::mcp::MempalMcpServer;
 use rusqlite::Connection;
 use std::process::Command;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 struct StubEmbedder;
+
+struct StubEmbedderFactory;
+
+#[async_trait::async_trait]
+impl EmbedderFactory for StubEmbedderFactory {
+    async fn build(&self) -> mempal::embed::Result<Box<dyn Embedder>> {
+        Ok(Box::new(StubEmbedder))
+    }
+}
 
 #[async_trait::async_trait]
 impl Embedder for StubEmbedder {
@@ -213,6 +227,14 @@ fn write_cli_config(home: &std::path::Path, db_path: &std::path::Path) {
         format!("db_path = \"{}\"\n", db_path.display()),
     )
     .expect("write config");
+}
+
+fn setup_mcp_server() -> (TempDir, Database, MempalMcpServer) {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("open db");
+    let server = MempalMcpServer::new_with_factory(db_path, Arc::new(StubEmbedderFactory));
+    (tmp, db, server)
 }
 
 #[test]
@@ -483,4 +505,83 @@ fn test_cli_reindex_stale_dry_run_reports_without_writes() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("would reprocess 5 drawers"));
     assert_eq!(stale_drawer_count_raw(&db), 5);
+}
+
+#[tokio::test]
+async fn test_status_exposes_stale_count() {
+    let (_tmp, db, server) = setup_mcp_server();
+    for index in 0..5 {
+        insert_versioned_drawer(
+            &db,
+            &format!("drawer_status_stale_{index:03}"),
+            &format!("status-stale-{index}.md"),
+            &format!("old status stale {index}"),
+            0,
+        );
+    }
+    for index in 0..15 {
+        insert_versioned_drawer(
+            &db,
+            &format!("drawer_status_current_{index:03}"),
+            &format!("status-current-{index}.md"),
+            &format!("current status {index}"),
+            CURRENT_NORMALIZE_VERSION,
+        );
+    }
+
+    let status = server
+        .status_json_for_test()
+        .await
+        .expect("status should succeed");
+
+    assert_eq!(status.normalize_version_current, CURRENT_NORMALIZE_VERSION);
+    assert_eq!(status.stale_drawer_count, 5);
+}
+
+#[test]
+fn test_reindex_respects_per_source_lock() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("open db");
+    let source = tmp.path().join("locked.md");
+    std::fs::write(&source, "fresh locked source").expect("write locked source");
+    let source_file = source.to_string_lossy().to_string();
+    insert_versioned_drawer(&db, "drawer_locked", &source_file, "old locked", 0);
+    drop(db);
+
+    let key = source_key(std::path::Path::new(&source_file));
+    let guard = acquire_source_lock(tmp.path(), &key, Duration::from_secs(1))
+        .expect("acquire manual source lock");
+    let thread_db_path = db_path.clone();
+    let handle = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let db = Database::open(&thread_db_path).expect("open db in thread");
+            reindex_sources(
+                &db,
+                &StubEmbedder,
+                ReindexOptions {
+                    mode: ReindexMode::Stale,
+                    dry_run: false,
+                },
+            )
+            .await
+            .expect("reindex under lock")
+        })
+    });
+
+    thread::sleep(Duration::from_millis(150));
+    assert!(
+        !handle.is_finished(),
+        "reindex must wait for the per-source lock"
+    );
+    drop(guard);
+    let report = handle.join().expect("join reindex thread");
+
+    assert_eq!(report.processed_sources, 1);
+    let db = Database::open(&db_path).expect("reopen db");
+    assert_eq!(stale_drawer_count_raw(&db), 0);
 }

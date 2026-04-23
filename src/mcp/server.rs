@@ -108,6 +108,10 @@ impl MempalMcpServer {
             .await
             .map(|response| response.0)
     }
+
+    pub async fn status_json_for_test(&self) -> std::result::Result<StatusResponse, ErrorData> {
+        self.mempal_status().await.map(|response| response.0)
+    }
 }
 
 #[derive(Debug)]
@@ -488,6 +492,9 @@ impl MempalMcpServer {
     async fn mempal_status(&self) -> std::result::Result<Json<StatusResponse>, ErrorData> {
         let db = self.open_db()?;
         let schema_version = db.schema_version().map_err(db_error)?;
+        let stale_drawer_count = db
+            .stale_drawer_count(CURRENT_NORMALIZE_VERSION)
+            .map_err(db_error)? as u64;
         let drawer_count = db.drawer_count().map_err(db_error)?;
         let taxonomy_count = db.taxonomy_count().map_err(db_error)?;
         let db_size_bytes = db.database_size_bytes().map_err(db_error)?;
@@ -504,6 +511,8 @@ impl MempalMcpServer {
 
         Ok(Json(StatusResponse {
             schema_version,
+            normalize_version_current: CURRENT_NORMALIZE_VERSION,
+            stale_drawer_count,
             drawer_count,
             taxonomy_count,
             db_size_bytes,

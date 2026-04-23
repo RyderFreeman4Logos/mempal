@@ -174,6 +174,8 @@ pub struct DuplicateWarning {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct StatusResponse {
     pub schema_version: u32,
+    pub normalize_version_current: u32,
+    pub stale_drawer_count: u64,
     pub drawer_count: i64,
     pub taxonomy_count: i64,
     pub db_size_bytes: u64,
