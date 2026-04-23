@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -8,11 +9,12 @@ use thiserror::Error;
 
 use super::anchor;
 use super::types::{
-    AnchorKind, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance,
-    SourceType, TaxonomyEntry, Triple, TripleStats,
+    AnchorKind, Drawer, ExplicitTunnel, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
+    Provenance, SourceType, TaxonomyEntry, Triple, TripleStats, TunnelEndpoint, TunnelFollowResult,
 };
+use super::utils::{build_tunnel_id, current_timestamp, format_tunnel_endpoint};
 
-const CURRENT_SCHEMA_VERSION: u32 = 5;
+const CURRENT_SCHEMA_VERSION: u32 = 6;
 const DRAWER_SELECT_COLUMNS: &str = r#"
     id,
     content,
@@ -110,6 +112,8 @@ pub enum DbError {
     InvalidEnumValue { kind: &'static str, value: String },
     #[error("invalid drawer metadata: {0}")]
     InvalidDrawerMetadata(String),
+    #[error("invalid tunnel: {0}")]
+    InvalidTunnel(String),
     #[error("failed to register sqlite-vec auto extension: {0}")]
     RegisterVec(String),
     #[error("database schema version {current} is newer than supported version {supported}")]
@@ -648,6 +652,181 @@ impl Database {
             .collect())
     }
 
+    pub fn create_tunnel(
+        &self,
+        left: &TunnelEndpoint,
+        right: &TunnelEndpoint,
+        label: &str,
+        created_by: Option<&str>,
+    ) -> Result<ExplicitTunnel, DbError> {
+        let left = normalize_tunnel_endpoint(left)?;
+        let right = normalize_tunnel_endpoint(right)?;
+        let label = label.trim();
+        if label.is_empty() {
+            return Err(DbError::InvalidTunnel("label is required".to_string()));
+        }
+        if left == right {
+            return Err(DbError::InvalidTunnel(
+                "self-link is not allowed".to_string(),
+            ));
+        }
+
+        let id = build_tunnel_id(&left, &right);
+        let created_at = current_timestamp();
+        let created_by = created_by
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        self.conn.execute(
+            r#"
+            INSERT INTO tunnels (
+                id, left_wing, left_room, right_wing, right_room,
+                label, created_at, created_by, deleted_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+            ON CONFLICT(id) DO UPDATE SET
+                label = CASE
+                    WHEN tunnels.deleted_at IS NOT NULL THEN excluded.label
+                    ELSE tunnels.label
+                END,
+                created_at = CASE
+                    WHEN tunnels.deleted_at IS NOT NULL THEN excluded.created_at
+                    ELSE tunnels.created_at
+                END,
+                created_by = CASE
+                    WHEN tunnels.deleted_at IS NOT NULL THEN excluded.created_by
+                    ELSE tunnels.created_by
+                END,
+                deleted_at = NULL
+            "#,
+            params![
+                id, left.wing, left.room, right.wing, right.room, label, created_at, created_by,
+            ],
+        )?;
+
+        self.get_explicit_tunnel(&id)?
+            .ok_or_else(|| DbError::InvalidTunnel(format!("failed to create tunnel {id}")))
+    }
+
+    pub fn list_explicit_tunnels(
+        &self,
+        wing: Option<&str>,
+    ) -> Result<Vec<ExplicitTunnel>, DbError> {
+        let wing = wing.map(str::trim).filter(|value| !value.is_empty());
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, left_wing, left_room, right_wing, right_room,
+                   label, created_at, created_by, deleted_at
+            FROM tunnels
+            WHERE deleted_at IS NULL
+              AND (?1 IS NULL OR left_wing = ?1 OR right_wing = ?1)
+            ORDER BY left_wing, left_room, right_wing, right_room, id
+            "#,
+        )?;
+        let rows = statement
+            .query_map([wing], explicit_tunnel_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_explicit_tunnel(&self, tunnel_id: &str) -> Result<bool, DbError> {
+        let timestamp = current_timestamp();
+        let affected = self.conn.execute(
+            "UPDATE tunnels SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            params![timestamp, tunnel_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn follow_explicit_tunnels(
+        &self,
+        from: &TunnelEndpoint,
+        max_hops: u8,
+    ) -> Result<Vec<TunnelFollowResult>, DbError> {
+        if !(1..=2).contains(&max_hops) {
+            return Err(DbError::InvalidTunnel(
+                "max_hops must be 1 or 2".to_string(),
+            ));
+        }
+
+        let from = normalize_tunnel_endpoint(from)?;
+        let tunnels = self.list_explicit_tunnels(None)?;
+        let mut visited = BTreeSet::from([from.clone()]);
+        let mut queue = VecDeque::from([(from, 0_u8)]);
+        let mut results = Vec::new();
+
+        while let Some((current, hop)) = queue.pop_front() {
+            if hop >= max_hops {
+                continue;
+            }
+            let next_hop = hop + 1;
+            for tunnel in &tunnels {
+                let neighbor = if tunnel.left == current {
+                    Some(tunnel.right.clone())
+                } else if tunnel.right == current {
+                    Some(tunnel.left.clone())
+                } else {
+                    None
+                };
+                let Some(neighbor) = neighbor else {
+                    continue;
+                };
+                if !visited.insert(neighbor.clone()) {
+                    continue;
+                }
+                results.push(TunnelFollowResult {
+                    endpoint: neighbor.clone(),
+                    via_tunnel_id: tunnel.id.clone(),
+                    hop: next_hop,
+                });
+                queue.push_back((neighbor, next_hop));
+            }
+        }
+
+        results.sort_by(|left, right| {
+            left.hop
+                .cmp(&right.hop)
+                .then_with(|| left.endpoint.cmp(&right.endpoint))
+                .then_with(|| left.via_tunnel_id.cmp(&right.via_tunnel_id))
+        });
+        Ok(results)
+    }
+
+    pub fn explicit_tunnel_hints(
+        &self,
+        wing: &str,
+        room: Option<&str>,
+    ) -> Result<Vec<String>, DbError> {
+        let endpoint = TunnelEndpoint {
+            wing: wing.to_string(),
+            room: room.map(ToOwned::to_owned),
+        };
+        let hints = self
+            .follow_explicit_tunnels(&endpoint, 1)?
+            .into_iter()
+            .map(|result| format_tunnel_endpoint(&result.endpoint))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(hints)
+    }
+
+    fn get_explicit_tunnel(&self, tunnel_id: &str) -> Result<Option<ExplicitTunnel>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, left_wing, left_room, right_wing, right_room,
+                   label, created_at, created_by, deleted_at
+            FROM tunnels
+            WHERE id = ?1 AND deleted_at IS NULL
+            "#,
+        )?;
+        let mut rows = statement.query_map([tunnel_id], explicit_tunnel_from_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     // --- Embedding dimension management ---
 
     /// Returns the current embedding dimension from the vec0 table, or None if the table is empty.
@@ -750,6 +929,43 @@ fn set_user_version(conn: &Connection, version: u32) -> Result<(), DbError> {
     Ok(())
 }
 
+fn normalize_tunnel_endpoint(endpoint: &TunnelEndpoint) -> Result<TunnelEndpoint, DbError> {
+    let wing = endpoint.wing.trim();
+    if wing.is_empty() {
+        return Err(DbError::InvalidTunnel(
+            "endpoint wing is required".to_string(),
+        ));
+    }
+    let room = endpoint
+        .room
+        .as_deref()
+        .map(str::trim)
+        .filter(|room| !room.is_empty())
+        .map(ToOwned::to_owned);
+    Ok(TunnelEndpoint {
+        wing: wing.to_string(),
+        room,
+    })
+}
+
+fn explicit_tunnel_from_row(row: &Row<'_>) -> rusqlite::Result<ExplicitTunnel> {
+    Ok(ExplicitTunnel {
+        id: row.get(0)?,
+        left: TunnelEndpoint {
+            wing: row.get(1)?,
+            room: row.get(2)?,
+        },
+        right: TunnelEndpoint {
+            wing: row.get(3)?,
+            room: row.get(4)?,
+        },
+        label: row.get(5)?,
+        created_at: row.get(6)?,
+        created_by: row.get(7)?,
+        deleted_at: row.get(8)?,
+    })
+}
+
 const V2_MIGRATION_SQL: &str = r#"
 ALTER TABLE drawers ADD COLUMN deleted_at TEXT;
 CREATE INDEX IF NOT EXISTS idx_drawers_deleted_at ON drawers(deleted_at);
@@ -826,6 +1042,28 @@ WHERE memory_kind = 'evidence'
   AND provenance IS NULL;
 "#;
 
+const V6_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS tunnels (
+    id TEXT PRIMARY KEY,
+    left_wing TEXT NOT NULL,
+    left_room TEXT,
+    right_wing TEXT NOT NULL,
+    right_room TEXT,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT,
+    deleted_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tunnels_left
+    ON tunnels(left_wing, left_room)
+    WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_tunnels_right
+    ON tunnels(right_wing, right_room)
+    WHERE deleted_at IS NULL;
+"#;
+
 fn migrations() -> &'static [Migration] {
     static MIGRATIONS: &[Migration] = &[
         Migration {
@@ -847,6 +1085,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 5,
             sql: V5_MIGRATION_SQL,
+        },
+        Migration {
+            version: 6,
+            sql: V6_MIGRATION_SQL,
         },
     ];
     MIGRATIONS

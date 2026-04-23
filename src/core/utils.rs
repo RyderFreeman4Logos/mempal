@@ -7,7 +7,7 @@ use super::{
     anchor,
     types::{
         AnchorKind, BootstrapIdentityParts, KnowledgeStatus, KnowledgeTier, MemoryDomain,
-        MemoryKind, Provenance, SourceType, TaxonomyEntry,
+        MemoryKind, Provenance, SourceType, TaxonomyEntry, TunnelEndpoint,
     },
 };
 
@@ -164,6 +164,31 @@ pub fn build_triple_id(subject: &str, predicate: &str, object: &str) -> String {
     )
 }
 
+pub fn build_tunnel_id(left: &TunnelEndpoint, right: &TunnelEndpoint) -> String {
+    let mut endpoints = [tunnel_endpoint_key(left), tunnel_endpoint_key(right)];
+    endpoints.sort();
+
+    let mut hasher = Sha256::new();
+    for component in [
+        endpoints[0].0.as_str(),
+        endpoints[0].1.as_str(),
+        endpoints[1].0.as_str(),
+        endpoints[1].1.as_str(),
+    ] {
+        hasher.update([0]);
+        hasher.update(component.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("tunnel_{}", &digest[..16])
+}
+
+pub fn format_tunnel_endpoint(endpoint: &TunnelEndpoint) -> String {
+    match endpoint.room.as_deref() {
+        Some(room) if !room.is_empty() => format!("{}:{room}", endpoint.wing),
+        _ => endpoint.wing.clone(),
+    }
+}
+
 pub fn current_timestamp() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs().to_string(),
@@ -230,6 +255,19 @@ pub fn route_room_from_taxonomy(content: &str, wing: &str, taxonomy: &[TaxonomyE
             }
         })
         .unwrap_or_else(|| DEFAULT_ROOM.to_string())
+}
+
+fn tunnel_endpoint_key(endpoint: &TunnelEndpoint) -> (String, String) {
+    (
+        endpoint.wing.trim().to_string(),
+        endpoint
+            .room
+            .as_deref()
+            .map(str::trim)
+            .filter(|room| !room.is_empty())
+            .unwrap_or("")
+            .to_string(),
+    )
 }
 
 fn sanitize_component(value: &str) -> String {

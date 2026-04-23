@@ -87,6 +87,30 @@ pub struct BootstrapIdentityParts<'a> {
     pub trigger_hints: Option<&'a TriggerHints>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TunnelEndpoint {
+    pub wing: String,
+    pub room: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplicitTunnel {
+    pub id: String,
+    pub left: TunnelEndpoint,
+    pub right: TunnelEndpoint,
+    pub label: String,
+    pub created_at: String,
+    pub created_by: Option<String>,
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelFollowResult {
+    pub endpoint: TunnelEndpoint,
+    pub via_tunnel_id: String,
+    pub hop: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drawer {
     pub id: String,
