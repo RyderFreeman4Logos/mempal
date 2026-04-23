@@ -1,7 +1,37 @@
 use mempal::core::db::Database;
-use mempal::core::types::TunnelEndpoint;
+use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType, TunnelEndpoint};
+use mempal::embed::{Embedder, EmbedderFactory};
+use mempal::mcp::MempalMcpServer;
 use rusqlite::Connection;
+use serde_json::json;
+use std::sync::Arc;
 use tempfile::TempDir;
+
+struct StubEmbedderFactory;
+
+struct StubEmbedder;
+
+#[async_trait::async_trait]
+impl EmbedderFactory for StubEmbedderFactory {
+    async fn build(&self) -> mempal::embed::Result<Box<dyn Embedder>> {
+        Ok(Box::new(StubEmbedder))
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedder for StubEmbedder {
+    async fn embed(&self, texts: &[&str]) -> mempal::embed::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        3
+    }
+
+    fn name(&self) -> &str {
+        "stub"
+    }
+}
 
 fn new_db() -> (TempDir, Database) {
     let tmp = TempDir::new().expect("tempdir");
@@ -10,11 +40,34 @@ fn new_db() -> (TempDir, Database) {
     (tmp, db)
 }
 
+fn setup_mcp_server() -> (TempDir, Database, MempalMcpServer) {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("open db");
+    let server = MempalMcpServer::new_with_factory(db_path, Arc::new(StubEmbedderFactory));
+    (tmp, db, server)
+}
+
 fn endpoint(wing: &str, room: Option<&str>) -> TunnelEndpoint {
     TunnelEndpoint {
         wing: wing.to_string(),
         room: room.map(ToOwned::to_owned),
     }
+}
+
+fn insert_passive_drawer(db: &Database, id: &str, wing: &str, room: &str) {
+    db.insert_drawer(&Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: format!("{wing} {room}"),
+        wing: wing.to_string(),
+        room: Some(room.to_string()),
+        source_file: Some(format!("{wing}.md")),
+        source_type: SourceType::Project,
+        added_at: "1710000000".to_string(),
+        chunk_index: Some(0),
+        importance: 0,
+    }))
+    .expect("insert passive drawer");
 }
 
 fn create_v5_db(path: &std::path::Path) {
@@ -196,4 +249,139 @@ fn test_delete_explicit_tunnel_soft_delete() {
             .expect("list explicit tunnels")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn test_add_and_list_explicit_tunnel() {
+    let (_tmp, _db, server) = setup_mcp_server();
+    let add = server
+        .tunnels_json_for_test(json!({
+            "action": "add",
+            "left": {"wing": "mempal", "room": "auth"},
+            "right": {"wing": "robrix2", "room": "matrix-routing"},
+            "label": "both handle user auth"
+        }))
+        .await
+        .expect("add explicit tunnel");
+    let tunnel_id = add.tunnels[0].tunnel_id.clone();
+
+    let list = server
+        .tunnels_json_for_test(json!({
+            "action": "list",
+            "wing": "mempal",
+            "kind": "explicit"
+        }))
+        .await
+        .expect("list explicit tunnels");
+
+    assert_eq!(list.tunnels.len(), 1);
+    assert_eq!(list.tunnels[0].tunnel_id, tunnel_id);
+    assert_eq!(list.tunnels[0].kind, "explicit");
+    assert_eq!(
+        list.tunnels[0].label.as_deref(),
+        Some("both handle user auth")
+    );
+}
+
+#[tokio::test]
+async fn test_follow_one_hop() {
+    let (_tmp, _db, server) = setup_mcp_server();
+    for (right_wing, right_room) in [("robrix2", "matrix"), ("octos", "login")] {
+        server
+            .tunnels_json_for_test(json!({
+                "action": "add",
+                "left": {"wing": "mempal", "room": "auth"},
+                "right": {"wing": right_wing, "room": right_room},
+                "label": "auth-related"
+            }))
+            .await
+            .expect("add tunnel");
+    }
+
+    let follow = server
+        .tunnels_json_for_test(json!({
+            "action": "follow",
+            "from": {"wing": "mempal", "room": "auth"},
+            "max_hops": 1
+        }))
+        .await
+        .expect("follow tunnels");
+
+    let endpoints = follow
+        .tunnels
+        .iter()
+        .map(|tunnel| {
+            (
+                tunnel.left.as_ref().expect("follow endpoint").wing.as_str(),
+                tunnel
+                    .left
+                    .as_ref()
+                    .expect("follow endpoint")
+                    .room
+                    .as_deref(),
+                tunnel.hop,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(endpoints.contains(&("robrix2", Some("matrix"), Some(1))));
+    assert!(endpoints.contains(&("octos", Some("login"), Some(1))));
+}
+
+#[tokio::test]
+async fn test_follow_two_hops() {
+    let (_tmp, _db, server) = setup_mcp_server();
+    for (left_wing, left_room, right_wing, right_room) in [
+        ("mempal", "auth", "robrix2", "matrix"),
+        ("robrix2", "matrix", "hermes-agent", "sso"),
+    ] {
+        server
+            .tunnels_json_for_test(json!({
+                "action": "add",
+                "left": {"wing": left_wing, "room": left_room},
+                "right": {"wing": right_wing, "room": right_room},
+                "label": "auth-related"
+            }))
+            .await
+            .expect("add tunnel");
+    }
+
+    let follow = server
+        .tunnels_json_for_test(json!({
+            "action": "follow",
+            "from": {"wing": "mempal", "room": "auth"},
+            "max_hops": 2
+        }))
+        .await
+        .expect("follow tunnels");
+
+    assert!(follow.tunnels.iter().any(|tunnel| {
+        tunnel.left.as_ref().is_some_and(|endpoint| {
+            endpoint.wing == "hermes-agent" && endpoint.room.as_deref() == Some("sso")
+        }) && tunnel.hop == Some(2)
+    }));
+}
+
+#[tokio::test]
+async fn test_delete_passive_tunnel_rejected() {
+    let (_tmp, db, server) = setup_mcp_server();
+    insert_passive_drawer(&db, "drawer_passive_001", "mempal", "matrix-routing");
+    insert_passive_drawer(&db, "drawer_passive_002", "robrix2", "matrix-routing");
+    let passive = server
+        .tunnels_json_for_test(json!({
+            "action": "list",
+            "kind": "passive"
+        }))
+        .await
+        .expect("list passive tunnels");
+    let passive_id = passive.tunnels[0].tunnel_id.clone();
+
+    let error = server
+        .tunnels_json_for_test(json!({
+            "action": "delete",
+            "tunnel_id": passive_id
+        }))
+        .await
+        .expect_err("passive tunnel delete should reject");
+
+    assert!(error.to_string().contains("passive"));
 }

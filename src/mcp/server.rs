@@ -5,8 +5,8 @@ use crate::core::{
     anchor::{self, DerivedAnchor},
     db::Database,
     types::{
-        AnchorKind, BootstrapIdentityParts, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain,
-        MemoryKind, Provenance, SourceType, TriggerHints, Triple,
+        AnchorKind, BootstrapIdentityParts, Drawer, ExplicitTunnel, KnowledgeStatus, KnowledgeTier,
+        MemoryDomain, MemoryKind, Provenance, SourceType, TriggerHints, Triple,
     },
     utils::{
         build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp,
@@ -30,7 +30,8 @@ use super::tools::{
     FactCheckRequest, FactCheckResponse, IngestRequest, IngestResponse, KgRequest, KgResponse,
     KgStatsDto, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, ScopeCount, SearchRequest,
     SearchResponse, SearchResultDto, StatusResponse, TaxonomyEntryDto, TaxonomyRequest,
-    TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelsResponse,
+    TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto, TunnelsRequest,
+    TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -92,6 +93,17 @@ impl MempalMcpServer {
         let request = serde_json::from_value(value)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         self.mempal_search(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn tunnels_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<TunnelsResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_tunnels(Parameters(request))
             .await
             .map(|response| response.0)
     }
@@ -844,17 +856,113 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_tunnels",
-        description = "Discover cross-wing tunnels: rooms that appear in multiple wings, enabling cross-domain knowledge discovery. Returns an empty list if only one wing exists."
+        description = "Discover or manage cross-wing tunnels. Actions: discover/list passive same-room links, add/list/delete/follow explicit semantic links."
     )]
-    async fn mempal_tunnels(&self) -> std::result::Result<Json<TunnelsResponse>, ErrorData> {
+    async fn mempal_tunnels(
+        &self,
+        Parameters(request): Parameters<TunnelsRequest>,
+    ) -> std::result::Result<Json<TunnelsResponse>, ErrorData> {
         let db = self.open_db()?;
-        let tunnels = db
-            .find_tunnels()
-            .map_err(db_error)?
-            .into_iter()
-            .map(|(room, wings)| TunnelDto { room, wings })
-            .collect();
-        Ok(Json(TunnelsResponse { tunnels }))
+        let action = request.action.as_deref().unwrap_or("discover");
+        match action {
+            "discover" => Ok(Json(TunnelsResponse {
+                tunnels: passive_tunnel_dtos(&db, request.wing.as_deref())?,
+            })),
+            "list" => {
+                let kind = request.kind.as_deref().unwrap_or("all");
+                let mut tunnels = Vec::new();
+                if matches!(kind, "all" | "passive") {
+                    tunnels.extend(passive_tunnel_dtos(&db, request.wing.as_deref())?);
+                }
+                if matches!(kind, "all" | "explicit") {
+                    tunnels.extend(
+                        db.list_explicit_tunnels(request.wing.as_deref())
+                            .map_err(db_error)?
+                            .iter()
+                            .map(explicit_tunnel_to_dto),
+                    );
+                }
+                if !matches!(kind, "all" | "passive" | "explicit") {
+                    return Err(ErrorData::invalid_params(
+                        format!("unsupported tunnel kind: {kind}"),
+                        None,
+                    ));
+                }
+                Ok(Json(TunnelsResponse { tunnels }))
+            }
+            "add" => {
+                let left = request
+                    .left
+                    .ok_or_else(|| ErrorData::invalid_params("missing left endpoint", None))?;
+                let right = request
+                    .right
+                    .ok_or_else(|| ErrorData::invalid_params("missing right endpoint", None))?;
+                let label = trim_to_option(request.label.as_deref())
+                    .ok_or_else(|| ErrorData::invalid_params("missing label", None))?;
+                let created_by = self
+                    .client_name
+                    .lock()
+                    .map_err(|_| ErrorData::internal_error("client name lock poisoned", None))?
+                    .clone();
+                let tunnel = db
+                    .create_tunnel(&left.into(), &right.into(), label, created_by.as_deref())
+                    .map_err(db_error)?;
+                Ok(Json(TunnelsResponse {
+                    tunnels: vec![explicit_tunnel_to_dto(&tunnel)],
+                }))
+            }
+            "delete" => {
+                let tunnel_id = trim_to_option(request.tunnel_id.as_deref())
+                    .ok_or_else(|| ErrorData::invalid_params("missing tunnel_id", None))?;
+                if tunnel_id.starts_with("passive_") {
+                    return Err(ErrorData::invalid_params(
+                        "cannot delete passive tunnel",
+                        None,
+                    ));
+                }
+                if !db.delete_explicit_tunnel(tunnel_id).map_err(db_error)? {
+                    return Err(ErrorData::invalid_params(
+                        format!("tunnel not found: {tunnel_id}"),
+                        None,
+                    ));
+                }
+                Ok(Json(TunnelsResponse {
+                    tunnels: Vec::new(),
+                }))
+            }
+            "follow" => {
+                let from = request
+                    .from
+                    .ok_or_else(|| ErrorData::invalid_params("missing from endpoint", None))?;
+                let max_hops = request.max_hops.unwrap_or(1);
+                if !(1..=2).contains(&max_hops) {
+                    return Err(ErrorData::invalid_params("max_hops must be 1 or 2", None));
+                }
+                let tunnels = db
+                    .follow_explicit_tunnels(&from.into(), max_hops)
+                    .map_err(db_error)?
+                    .into_iter()
+                    .map(|result| TunnelDto {
+                        tunnel_id: result.via_tunnel_id.clone(),
+                        kind: "explicit".to_string(),
+                        room: None,
+                        wings: Vec::new(),
+                        left: Some(TunnelEndpointDto::from(&result.endpoint)),
+                        right: None,
+                        label: None,
+                        created_at: None,
+                        created_by: None,
+                        via_tunnel_id: Some(result.via_tunnel_id),
+                        hop: Some(result.hop),
+                    })
+                    .collect();
+                Ok(Json(TunnelsResponse { tunnels }))
+            }
+            other => Err(ErrorData::invalid_params(
+                format!("unsupported tunnels action: {other}"),
+                None,
+            )),
+        }
     }
 
     #[tool(
@@ -1123,6 +1231,63 @@ fn triple_to_dto(triple: &Triple) -> TripleDto {
         confidence: triple.confidence,
         source_drawer: triple.source_drawer.clone(),
     }
+}
+
+fn passive_tunnel_dtos(
+    db: &Database,
+    wing: Option<&str>,
+) -> std::result::Result<Vec<TunnelDto>, ErrorData> {
+    let wing = wing.map(str::trim).filter(|value| !value.is_empty());
+    let tunnels = db
+        .find_tunnels()
+        .map_err(db_error)?
+        .into_iter()
+        .filter(|(_, wings)| wing.is_none_or(|filter| wings.iter().any(|item| item == filter)))
+        .map(|(room, wings)| TunnelDto {
+            tunnel_id: passive_tunnel_id(&room),
+            kind: "passive".to_string(),
+            room: Some(room),
+            wings,
+            left: None,
+            right: None,
+            label: None,
+            created_at: None,
+            created_by: None,
+            via_tunnel_id: None,
+            hop: None,
+        })
+        .collect();
+    Ok(tunnels)
+}
+
+fn explicit_tunnel_to_dto(tunnel: &ExplicitTunnel) -> TunnelDto {
+    TunnelDto {
+        tunnel_id: tunnel.id.clone(),
+        kind: "explicit".to_string(),
+        room: None,
+        wings: vec![tunnel.left.wing.clone(), tunnel.right.wing.clone()],
+        left: Some(TunnelEndpointDto::from(&tunnel.left)),
+        right: Some(TunnelEndpointDto::from(&tunnel.right)),
+        label: Some(tunnel.label.clone()),
+        created_at: Some(tunnel.created_at.clone()),
+        created_by: tunnel.created_by.clone(),
+        via_tunnel_id: None,
+        hop: None,
+    }
+}
+
+fn passive_tunnel_id(room: &str) -> String {
+    let sanitized = room
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("passive_{sanitized}")
 }
 
 #[cfg(test)]

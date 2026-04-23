@@ -1,6 +1,6 @@
 use crate::core::types::{
     AnchorKind, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, RouteDecision,
-    SearchResult, TaxonomyEntry,
+    SearchResult, TaxonomyEntry, TunnelEndpoint,
 };
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -259,6 +259,29 @@ pub struct TripleDto {
 
 // --- Tunnels ---
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct TunnelsRequest {
+    /// Action: "discover" (default), "list", "add", "delete", or "follow".
+    pub action: Option<String>,
+    pub left: Option<TunnelEndpointDto>,
+    pub right: Option<TunnelEndpointDto>,
+    pub from: Option<TunnelEndpointDto>,
+    pub label: Option<String>,
+    pub tunnel_id: Option<String>,
+    pub wing: Option<String>,
+    /// Filter for list: "passive", "explicit", or "all" (default).
+    pub kind: Option<String>,
+    /// Follow depth. Must be 1 or 2. Defaults to 1.
+    pub max_hops: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TunnelEndpointDto {
+    pub wing: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct TunnelsResponse {
     pub tunnels: Vec<TunnelDto>,
@@ -266,8 +289,44 @@ pub struct TunnelsResponse {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct TunnelDto {
-    pub room: String,
+    pub tunnel_id: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<TunnelEndpointDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<TunnelEndpointDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via_tunnel_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hop: Option<u8>,
+}
+
+impl From<TunnelEndpointDto> for TunnelEndpoint {
+    fn from(value: TunnelEndpointDto) -> Self {
+        Self {
+            wing: value.wing,
+            room: value.room,
+        }
+    }
+}
+
+impl From<&TunnelEndpoint> for TunnelEndpointDto {
+    fn from(value: &TunnelEndpoint) -> Self {
+        Self {
+            wing: value.wing.clone(),
+            room: value.room.clone(),
+        }
+    }
 }
 
 // --- Cowork peek ---
