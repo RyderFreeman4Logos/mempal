@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::core::{
     db::Database,
     types::{BootstrapEvidenceArgs, Drawer, SourceType},
-    utils::{build_drawer_id, current_timestamp, route_room_from_taxonomy},
+    utils::{build_bootstrap_evidence_drawer_id, current_timestamp, route_room_from_taxonomy},
 };
 use crate::embed::{EmbedError, Embedder};
 use thiserror::Error;
@@ -208,10 +208,16 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         Some(guard)
     };
 
+    let source_type = source_type_for(format);
     let mut pending = Vec::new();
 
     for (chunk_index, chunk) in chunks.iter().enumerate() {
-        let drawer_id = build_drawer_id(wing, Some(resolved_room.as_str()), chunk);
+        let drawer_id = build_bootstrap_evidence_drawer_id(
+            wing,
+            Some(resolved_room.as_str()),
+            chunk,
+            &source_type,
+        );
         if db
             .drawer_exists(&drawer_id)
             .map_err(|source| IngestError::CheckDrawer {
@@ -254,7 +260,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             wing: wing.to_string(),
             room: Some(resolved_room.clone()),
             source_file: Some(source_file.clone()),
-            source_type: source_type_for(format),
+            source_type: source_type.clone(),
             added_at: current_timestamp(),
             chunk_index: Some(chunk_index as i64),
             importance: 0,

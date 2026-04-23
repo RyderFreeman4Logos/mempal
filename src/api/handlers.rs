@@ -3,7 +3,7 @@ use crate::core::{
     types::{
         BootstrapEvidenceArgs, Drawer, RouteDecision, SearchResult, SourceType, TaxonomyEntry,
     },
-    utils::{build_drawer_id, current_timestamp, source_file_or_synthetic},
+    utils::{build_bootstrap_evidence_drawer_id, current_timestamp, source_file_or_synthetic},
 };
 use crate::search::{resolve_route, search_with_vector};
 use axum::{
@@ -179,7 +179,12 @@ async fn ingest_handler(
             )
         })?;
     let db = Database::open(&state.db_path).map_err(internal_error)?;
-    let drawer_id = build_drawer_id(&request.wing, request.room.as_deref(), &request.content);
+    let drawer_id = build_bootstrap_evidence_drawer_id(
+        &request.wing,
+        request.room.as_deref(),
+        &request.content,
+        &SourceType::Manual,
+    );
 
     if !db.drawer_exists(&drawer_id).map_err(internal_error)? {
         let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());

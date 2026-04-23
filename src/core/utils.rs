@@ -3,9 +3,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use super::types::{
-    AnchorKind, BootstrapIdentityParts, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
-    Provenance, TaxonomyEntry,
+use super::{
+    anchor,
+    types::{
+        AnchorKind, BootstrapIdentityParts, KnowledgeStatus, KnowledgeTier, MemoryDomain,
+        MemoryKind, Provenance, SourceType, TaxonomyEntry,
+    },
 };
 
 pub const DEFAULT_ROOM: &str = "default";
@@ -107,6 +110,41 @@ pub fn build_bootstrap_drawer_id_from_parts(
     parts: BootstrapIdentityParts<'_>,
 ) -> String {
     build_bootstrap_drawer_id(wing, room, content, &bootstrap_identity_components(parts))
+}
+
+pub fn build_bootstrap_evidence_drawer_id(
+    wing: &str,
+    room: Option<&str>,
+    content: &str,
+    source_type: &SourceType,
+) -> String {
+    let defaults = anchor::bootstrap_defaults(source_type);
+    let memory_kind = MemoryKind::Evidence;
+    let domain = MemoryDomain::Project;
+    let empty_refs: &[String] = &[];
+    build_bootstrap_drawer_id_from_parts(
+        wing,
+        room,
+        content,
+        BootstrapIdentityParts {
+            memory_kind: &memory_kind,
+            domain: &domain,
+            field: &defaults.field,
+            anchor_kind: &defaults.anchor_kind,
+            anchor_id: &defaults.anchor_id,
+            parent_anchor_id: defaults.parent_anchor_id.as_deref(),
+            provenance: Some(&defaults.provenance),
+            statement: None,
+            tier: None,
+            status: None,
+            supporting_refs: empty_refs,
+            counterexample_refs: empty_refs,
+            teaching_refs: empty_refs,
+            verification_refs: empty_refs,
+            scope_constraints: None,
+            trigger_hints: None,
+        },
+    )
 }
 
 pub fn build_triple_id(subject: &str, predicate: &str, object: &str) -> String {
