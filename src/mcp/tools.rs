@@ -559,6 +559,8 @@ mod tests {
                 confidence: 0.88,
                 reason: "unit test".to_string(),
             },
+            chunk_index: Some(0),
+            neighbors: None,
             tunnel_hints: vec!["docs".to_string()],
         }
     }

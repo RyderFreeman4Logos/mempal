@@ -156,8 +156,7 @@ async fn test_with_neighbors_omit_backward_compat() {
             "top_k": 3
         }))
         .await
-        .expect("search")
-        ;
+        .expect("search");
     let json = serde_json::to_value(response.results.first().expect("result")).expect("json");
 
     assert!(json.get("neighbors").is_none());
@@ -218,7 +217,15 @@ async fn test_neighbors_limited_to_same_wing() {
     let (_tmp, db) = new_db();
     insert_chunk(&db, "a_0", "A chunk 0", "A", Some("docs"), "doc.md", 0);
     insert_chunk(&db, "a_1", "A chunk 1", "A", Some("docs"), "doc.md", 1);
-    insert_chunk(&db, "a_2", "A chunk 2 needle", "A", Some("docs"), "doc.md", 2);
+    insert_chunk(
+        &db,
+        "a_2",
+        "A chunk 2 needle",
+        "A",
+        Some("docs"),
+        "doc.md",
+        2,
+    );
     insert_chunk(&db, "b_3", "B chunk 3", "B", Some("docs"), "doc.md", 3);
 
     let results = search_with_vector_options(
@@ -240,7 +247,10 @@ async fn test_neighbors_limited_to_same_wing() {
     let neighbors = hit.neighbors.as_ref().expect("neighbors");
 
     assert_eq!(
-        neighbors.prev.as_ref().map(|chunk| chunk.drawer_id.as_str()),
+        neighbors
+            .prev
+            .as_ref()
+            .map(|chunk| chunk.drawer_id.as_str()),
         Some("a_1")
     );
     assert!(neighbors.next.is_none());
@@ -296,7 +306,10 @@ async fn test_new_ingest_writes_chunk_index_sequentially() {
 
     let indexes = active_chunk_indexes(&db, "long.md");
     let expected = (0..indexes.len() as i64).collect::<Vec<_>>();
-    assert!(indexes.len() >= 4, "expected at least 4 chunks: {indexes:?}");
+    assert!(
+        indexes.len() >= 4,
+        "expected at least 4 chunks: {indexes:?}"
+    );
     assert_eq!(indexes, expected);
 }
 
@@ -398,9 +411,7 @@ fn start_openai_embedding_stub(
     vector: Vec<f32>,
 ) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding stub");
-    listener
-        .set_nonblocking(true)
-        .expect("set nonblocking");
+    listener.set_nonblocking(true).expect("set nonblocking");
     let address = listener.local_addr().expect("local addr");
     let expected_query = expected_query.to_string();
     let handle = thread::spawn(move || {

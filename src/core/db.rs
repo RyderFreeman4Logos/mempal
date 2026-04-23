@@ -9,9 +9,9 @@ use thiserror::Error;
 
 use super::anchor;
 use super::types::{
-    AnchorKind, Drawer, ExplicitTunnel, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
-    Provenance, ReindexSource, SourceType, TaxonomyEntry, Triple, TripleStats, TunnelEndpoint,
-    TunnelFollowResult,
+    AnchorKind, ChunkNeighbors, Drawer, ExplicitTunnel, KnowledgeStatus, KnowledgeTier,
+    MemoryDomain, MemoryKind, NeighborChunk, Provenance, ReindexSource, SourceType, TaxonomyEntry,
+    Triple, TripleStats, TunnelEndpoint, TunnelFollowResult,
 };
 use super::utils::{build_tunnel_id, current_timestamp, format_tunnel_endpoint};
 
@@ -530,6 +530,52 @@ impl Database {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    pub fn neighbor_chunks(
+        &self,
+        source_file: &str,
+        wing: &str,
+        room: Option<&str>,
+        chunk_index: i64,
+    ) -> Result<ChunkNeighbors, DbError> {
+        let prev_index = chunk_index - 1;
+        let next_index = chunk_index + 1;
+        let sql = r#"
+            SELECT id, content, chunk_index
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND source_file = ?1
+              AND wing = ?2
+              AND ((?3 IS NULL AND room IS NULL) OR (?3 IS NOT NULL AND room = ?3))
+              AND chunk_index IN (?4, ?5)
+            ORDER BY chunk_index, id
+            "#;
+        let mut statement = self.conn.prepare(&sql)?;
+        let mut rows = statement.query(params![source_file, wing, room, prev_index, next_index])?;
+        let mut neighbors = ChunkNeighbors {
+            prev: None,
+            next: None,
+        };
+
+        while let Some(row) = rows.next()? {
+            let row_index = row.get::<_, i64>(2)?;
+            let Ok(chunk_index) = u32::try_from(row_index) else {
+                continue;
+            };
+            let chunk = NeighborChunk {
+                drawer_id: row.get(0)?,
+                content: row.get(1)?,
+                chunk_index,
+            };
+            if row_index == prev_index && neighbors.prev.is_none() {
+                neighbors.prev = Some(chunk);
+            } else if row_index == next_index && neighbors.next.is_none() {
+                neighbors.next = Some(chunk);
+            }
+        }
+
+        Ok(neighbors)
     }
 
     pub fn soft_delete_drawer(&self, drawer_id: &str) -> Result<bool, DbError> {

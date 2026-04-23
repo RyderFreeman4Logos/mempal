@@ -29,6 +29,12 @@ pub struct SearchFilters {
     pub anchor_kind: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub filters: SearchFilters,
+    pub with_neighbors: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum SearchError {
     #[error("failed to embed search query")]
@@ -53,6 +59,8 @@ pub enum SearchError {
     LoadTaxonomy(#[source] crate::core::db::DbError),
     #[error("failed to run keyword search")]
     KeywordSearch(#[source] crate::core::db::DbError),
+    #[error("failed to load neighbor chunks")]
+    LoadNeighbors(#[source] crate::core::db::DbError),
 }
 
 pub async fn search<E: Embedder + ?Sized>(
@@ -63,13 +71,13 @@ pub async fn search<E: Embedder + ?Sized>(
     room: Option<&str>,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
-    search_with_filters(
+    search_with_options(
         db,
         embedder,
         query,
         wing,
         room,
-        &SearchFilters::default(),
+        SearchOptions::default(),
         top_k,
     )
     .await
@@ -82,6 +90,30 @@ pub async fn search_with_filters<E: Embedder + ?Sized>(
     wing: Option<&str>,
     room: Option<&str>,
     filters: &SearchFilters,
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
+    search_with_options(
+        db,
+        embedder,
+        query,
+        wing,
+        room,
+        SearchOptions {
+            filters: filters.clone(),
+            with_neighbors: false,
+        },
+        top_k,
+    )
+    .await
+}
+
+pub async fn search_with_options<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    query: &str,
+    wing: Option<&str>,
+    room: Option<&str>,
+    options: SearchOptions,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
     if top_k == 0 {
@@ -99,7 +131,7 @@ pub async fn search_with_filters<E: Embedder + ?Sized>(
         .next()
         .ok_or(SearchError::MissingQueryVector)?;
 
-    search_with_vector_and_filters(db, query, &query_vector, route, filters, top_k)
+    search_with_vector_options(db, query, &query_vector, route, options, top_k)
 }
 
 pub fn search_with_vector(
@@ -109,12 +141,12 @@ pub fn search_with_vector(
     route: RouteDecision,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
-    search_with_vector_and_filters(
+    search_with_vector_options(
         db,
         query,
         query_vector,
         route,
-        &SearchFilters::default(),
+        SearchOptions::default(),
         top_k,
     )
 }
@@ -127,15 +159,36 @@ pub fn search_with_vector_and_filters(
     filters: &SearchFilters,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
+    search_with_vector_options(
+        db,
+        query,
+        query_vector,
+        route,
+        SearchOptions {
+            filters: filters.clone(),
+            with_neighbors: false,
+        },
+        top_k,
+    )
+}
+
+pub fn search_with_vector_options(
+    db: &Database,
+    query: &str,
+    query_vector: &[f32],
+    route: RouteDecision,
+    options: SearchOptions,
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
     if top_k == 0 {
         return Ok(Vec::new());
     }
 
     // Hybrid search: vector + BM25, merged via RRF
     let vector_results =
-        search_by_vector_with_filters(db, query_vector, route.clone(), filters, top_k)?;
+        search_by_vector_with_filters(db, query_vector, route.clone(), &options.filters, top_k)?;
 
-    let fts_results = search_fts_with_filters(db, query, &route, filters, top_k)?;
+    let fts_results = search_fts_with_filters(db, query, &route, &options.filters, top_k)?;
 
     let mut results = if fts_results.is_empty() {
         vector_results
@@ -145,8 +198,32 @@ pub fn search_with_vector_and_filters(
 
     // Inject tunnel hints: for each result, check if its room exists in other wings
     inject_tunnel_hints(db, &mut results);
+    if options.with_neighbors && top_k <= 10 {
+        inject_chunk_neighbors(db, &mut results)?;
+    }
 
     Ok(results)
+}
+
+fn inject_chunk_neighbors(db: &Database, results: &mut [SearchResult]) -> Result<()> {
+    for result in results {
+        let Some(chunk_index) = result.chunk_index else {
+            continue;
+        };
+        let neighbors = db
+            .neighbor_chunks(
+                &result.source_file,
+                &result.wing,
+                result.room.as_deref(),
+                chunk_index,
+            )
+            .map_err(SearchError::LoadNeighbors)?;
+        if neighbors.prev.is_some() || neighbors.next.is_some() {
+            result.neighbors = Some(neighbors);
+        }
+    }
+
+    Ok(())
 }
 
 /// For each search result, check if its room appears in other wings (tunnel).
@@ -307,7 +384,7 @@ fn search_by_vector_with_filters(
         )
         SELECT d.id, d.content, d.wing, d.room, d.source_file,
                d.memory_kind, d.domain, d.field, d.statement, d.tier, d.status,
-               d.anchor_kind, d.anchor_id, d.parent_anchor_id, matches.distance
+               d.anchor_kind, d.anchor_id, d.parent_anchor_id, d.chunk_index, matches.distance
         FROM matches
         JOIN drawers d ON d.id = matches.id
         {}
@@ -337,7 +414,7 @@ fn search_by_vector_with_filters(
                 top_k,
             ),
             |row| {
-                let distance: f64 = row.get(14)?;
+                let distance: f64 = row.get(15)?;
                 map_search_result_row(row, &route, (1.0_f64 - distance) as f32)
             },
         )
@@ -363,7 +440,7 @@ fn search_fts_with_filters(
         r#"
         SELECT d.id, d.content, d.wing, d.room, d.source_file,
                d.memory_kind, d.domain, d.field, d.statement, d.tier, d.status,
-               d.anchor_kind, d.anchor_id, d.parent_anchor_id, fts.rank
+               d.anchor_kind, d.anchor_id, d.parent_anchor_id, d.chunk_index, fts.rank
         FROM drawers_fts fts
         JOIN drawers d ON d.rowid = fts.rowid
         {}
@@ -428,6 +505,8 @@ fn map_search_result_row(
         parent_anchor_id: row.get(13)?,
         similarity,
         route: route.clone(),
+        chunk_index: row.get(14)?,
+        neighbors: None,
         tunnel_hints: vec![],
     })
 }

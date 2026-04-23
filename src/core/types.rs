@@ -244,6 +244,21 @@ pub struct RouteDecision {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeighborChunk {
+    pub drawer_id: String,
+    pub content: String,
+    pub chunk_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkNeighbors {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev: Option<NeighborChunk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<NeighborChunk>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchResult {
     pub drawer_id: String,
@@ -262,6 +277,10 @@ pub struct SearchResult {
     pub parent_anchor_id: Option<String>,
     pub similarity: f32,
     pub route: RouteDecision,
+    #[serde(skip)]
+    pub chunk_index: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neighbors: Option<ChunkNeighbors>,
     /// Other wings that share this result's room (tunnel hints).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tunnel_hints: Vec<String>,
