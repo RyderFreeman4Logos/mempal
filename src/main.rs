@@ -23,7 +23,7 @@ use mempal::core::{
 };
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder};
 use mempal::ingest::{
-    IngestOptions, IngestStats, ingest_dir, ingest_dir_with_options,
+    IngestOptions, IngestStats, ingest_dir_with_options, ingest_file_with_options,
     reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
 };
 use mempal::mcp::MempalMcpServer;
@@ -56,6 +56,8 @@ enum Commands {
         format: Option<String>,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        no_strip_noise: bool,
     },
     Search {
         query: String,
@@ -309,7 +311,8 @@ async fn run() -> Result<()> {
             wing,
             format,
             dry_run,
-        } => ingest_command(&db, &config, &dir, &wing, format, dry_run).await,
+            no_strip_noise,
+        } => ingest_command(&db, &config, &dir, &wing, format, dry_run, no_strip_noise).await,
         Commands::Search {
             query,
             wing,
@@ -451,6 +454,7 @@ async fn ingest_command(
     wing: &str,
     format: Option<String>,
     dry_run: bool,
+    no_strip_noise: bool,
 ) -> Result<()> {
     if let Some(format) = format.as_deref()
         && format != "convos"
@@ -458,36 +462,53 @@ async fn ingest_command(
         bail!("unsupported --format value: {format}");
     }
 
+    let options = IngestOptions {
+        room: None,
+        source_root: if dir.is_file() {
+            dir.parent()
+        } else {
+            Some(dir)
+        },
+        dry_run,
+        source_file_override: None,
+        replace_existing_source: false,
+        no_strip_noise,
+    };
+
     let stats = if dry_run {
-        ingest_dir_with_options(
-            db,
-            &NoopEmbedder,
-            dir,
-            wing,
-            IngestOptions {
-                room: None,
-                source_root: Some(dir),
-                dry_run: true,
-                source_file_override: None,
-                replace_existing_source: false,
-                no_strip_noise: false,
-            },
-        )
-        .await?
+        ingest_path_with_options(db, &NoopEmbedder, dir, wing, options).await?
     } else {
         let embedder = build_embedder(config).await?;
-        ingest_dir(db, &*embedder, dir, wing, None).await?
+        ingest_path_with_options(db, &*embedder, dir, wing, options).await?
     };
 
     append_ingest_audit_log(db, dir, wing, format.as_deref(), dry_run, stats)
         .context("failed to append ingest audit log")?;
 
     println!(
-        "dry_run={} files={} chunks={} skipped={}",
-        dry_run, stats.files, stats.chunks, stats.skipped
+        "dry_run={} files={} chunks={} skipped={} noise_bytes_stripped={}",
+        dry_run,
+        stats.files,
+        stats.chunks,
+        stats.skipped,
+        stats.noise_bytes_stripped.unwrap_or(0)
     );
 
     Ok(())
+}
+
+async fn ingest_path_with_options<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    path: &Path,
+    wing: &str,
+    options: IngestOptions<'_>,
+) -> mempal::ingest::Result<IngestStats> {
+    if path.is_file() {
+        ingest_file_with_options(db, embedder, path, wing, options).await
+    } else {
+        ingest_dir_with_options(db, embedder, path, wing, options).await
+    }
 }
 
 #[derive(Default)]

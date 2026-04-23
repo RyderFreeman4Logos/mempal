@@ -5,6 +5,7 @@ use mempal::ingest::noise::{strip_claude_jsonl_noise, strip_codex_rollout_noise}
 use mempal::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use mempal::ingest::reindex::{ReindexMode, ReindexOptions, reindex_sources};
 use mempal::ingest::{IngestOptions, ingest_file_with_options};
+use std::process::Command;
 use tempfile::TempDir;
 
 struct StubEmbedder;
@@ -204,6 +205,67 @@ async fn test_normalize_version_bump_triggers_reindex_opportunity() {
     assert_eq!(CURRENT_NORMALIZE_VERSION, 2);
 }
 
+#[test]
+fn test_cli_no_strip_noise_flag() {
+    let tmp = TempDir::new().expect("tempdir");
+    write_cli_config(tmp.path(), &tmp.path().join("palace.db"));
+    let source = tmp.path().join("claude.jsonl");
+    std::fs::write(
+        &source,
+        serde_json::json!({
+            "type": "assistant",
+            "message": "before <system-reminder>noise</system-reminder> after"
+        })
+        .to_string(),
+    )
+    .expect("write claude jsonl");
+
+    let stripped_output = Command::new(mempal_bin())
+        .args([
+            "ingest",
+            source.to_str().expect("utf8 path"),
+            "--wing",
+            "mempal",
+            "--dry-run",
+        ])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run default ingest");
+    assert!(
+        stripped_output.status.success(),
+        "default ingest failed: {}",
+        String::from_utf8_lossy(&stripped_output.stderr)
+    );
+    let stripped_stdout = String::from_utf8_lossy(&stripped_output.stdout);
+    assert!(
+        metric_value(&stripped_stdout, "noise_bytes_stripped") > 0,
+        "expected default strip metric > 0, stdout: {stripped_stdout}"
+    );
+
+    let no_strip_output = Command::new(mempal_bin())
+        .args([
+            "ingest",
+            source.to_str().expect("utf8 path"),
+            "--wing",
+            "mempal",
+            "--dry-run",
+            "--no-strip-noise",
+        ])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run no-strip ingest");
+    assert!(
+        no_strip_output.status.success(),
+        "no-strip ingest failed: {}",
+        String::from_utf8_lossy(&no_strip_output.stderr)
+    );
+    let no_strip_stdout = String::from_utf8_lossy(&no_strip_output.stdout);
+    assert!(
+        no_strip_stdout.contains("noise_bytes_stripped=0"),
+        "expected no-strip metric to be zero, stdout: {no_strip_stdout}"
+    );
+}
+
 fn insert_stale_drawer(db: &Database, source_file: &str) {
     let mut drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: "drawer_stale_noise".to_string(),
@@ -228,4 +290,26 @@ fn only_active_content(db: &Database) -> String {
             |row| row.get(0),
         )
         .expect("read only active content")
+}
+
+fn mempal_bin() -> String {
+    env!("CARGO_BIN_EXE_mempal").to_string()
+}
+
+fn write_cli_config(home: &std::path::Path, db_path: &std::path::Path) {
+    let mempal_dir = home.join(".mempal");
+    std::fs::create_dir_all(&mempal_dir).expect("create .mempal");
+    std::fs::write(
+        mempal_dir.join("config.toml"),
+        format!("db_path = \"{}\"\n", db_path.display()),
+    )
+    .expect("write config");
+}
+
+fn metric_value(stdout: &str, metric: &str) -> u64 {
+    stdout
+        .split_ascii_whitespace()
+        .find_map(|part| part.strip_prefix(&format!("{metric}=")))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
