@@ -181,7 +181,7 @@ impl Database {
     ) -> Result<(), DbError> {
         self.conn.execute(
             r#"
-            INSERT INTO drawers (
+            INSERT OR IGNORE INTO drawers (
                 id,
                 content,
                 wing,
@@ -603,7 +603,7 @@ impl Database {
         self.ensure_vectors_table(vector.len())?;
         let vector_json = serde_json::to_string(vector)?;
         self.conn.execute(
-            "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
+            "INSERT OR IGNORE INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
             params![drawer_id, vector_json.as_str(), project_id],
         )?;
         Ok(())
