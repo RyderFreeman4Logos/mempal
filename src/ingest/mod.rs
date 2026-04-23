@@ -20,7 +20,9 @@ use thiserror::Error;
 use crate::ingest::{
     chunk::{chunk_conversation, chunk_text},
     detect::{Format, detect_format},
-    normalize::{CURRENT_NORMALIZE_VERSION, NormalizeError, normalize_content},
+    normalize::{
+        CURRENT_NORMALIZE_VERSION, NormalizeError, NormalizeOptions, normalize_content_with_options,
+    },
 };
 
 const CHUNK_WINDOW: usize = 800;
@@ -43,6 +45,7 @@ pub struct IngestStats {
     pub files: usize,
     pub chunks: usize,
     pub skipped: usize,
+    pub noise_bytes_stripped: Option<u64>,
     /// Time waited acquiring the per-source ingest lock (P9-B). `None`
     /// when the lock was bypassed (e.g. dry-run) or when no wait was
     /// needed and the path took the fast exit before lock acquisition.
@@ -56,6 +59,7 @@ pub struct IngestOptions<'a> {
     pub dry_run: bool,
     pub source_file_override: Option<&'a str>,
     pub replace_existing_source: bool,
+    pub no_strip_noise: bool,
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -144,6 +148,7 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             dry_run: false,
             source_file_override: None,
             replace_existing_source: false,
+            no_strip_noise: false,
         },
     )
     .await
@@ -171,11 +176,19 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
     }
 
     let format = detect_format(&content);
-    let normalized =
-        normalize_content(&content, format).map_err(|source| IngestError::Normalize {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let normalize_output = normalize_content_with_options(
+        &content,
+        format,
+        NormalizeOptions {
+            strip_noise: !options.no_strip_noise,
+        },
+    )
+    .map_err(|source| IngestError::Normalize {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let normalized = normalize_output.content;
+    let noise_bytes_stripped = normalize_output.noise_bytes_stripped;
     let resolved_room = match options.room {
         Some(room) => room.to_string(),
         None => {
@@ -203,6 +216,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
 
     let mut stats = IngestStats {
         files: 1,
+        noise_bytes_stripped,
         ..IngestStats::default()
     };
     let source_file = options
@@ -327,6 +341,7 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             dry_run: false,
             source_file_override: None,
             replace_existing_source: false,
+            no_strip_noise: false,
         },
     )
     .await
@@ -367,11 +382,21 @@ pub async fn ingest_dir_with_options<E: Embedder + ?Sized>(
                 stats.files += file_stats.files;
                 stats.chunks += file_stats.chunks;
                 stats.skipped += file_stats.skipped;
+                stats.noise_bytes_stripped =
+                    merge_optional_sum(stats.noise_bytes_stripped, file_stats.noise_bytes_stripped);
             }
         }
     }
 
     Ok(stats)
+}
+
+fn merge_optional_sum(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn source_type_for(format: Format) -> SourceType {

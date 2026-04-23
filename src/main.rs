@@ -470,6 +470,7 @@ async fn ingest_command(
                 dry_run: true,
                 source_file_override: None,
                 replace_existing_source: false,
+                no_strip_noise: false,
             },
         )
         .await?

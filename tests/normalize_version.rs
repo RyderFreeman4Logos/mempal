@@ -291,6 +291,7 @@ async fn test_new_ingest_writes_current_normalize_version() {
             dry_run: false,
             source_file_override: None,
             replace_existing_source: false,
+            no_strip_noise: false,
         },
     )
     .await
@@ -400,7 +401,7 @@ async fn test_reindex_stale_only_reprocesses_outdated() {
     );
     assert_eq!(
         distinct_versions_for_source(&db, &current_source.to_string_lossy()),
-        vec![1]
+        vec![CURRENT_NORMALIZE_VERSION]
     );
 }
 

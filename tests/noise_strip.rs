@@ -1,4 +1,28 @@
+use mempal::core::db::Database;
+use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
+use mempal::embed::Embedder;
 use mempal::ingest::noise::{strip_claude_jsonl_noise, strip_codex_rollout_noise};
+use mempal::ingest::normalize::CURRENT_NORMALIZE_VERSION;
+use mempal::ingest::reindex::{ReindexMode, ReindexOptions, reindex_sources};
+use mempal::ingest::{IngestOptions, ingest_file_with_options};
+use tempfile::TempDir;
+
+struct StubEmbedder;
+
+#[async_trait::async_trait]
+impl Embedder for StubEmbedder {
+    async fn embed(&self, texts: &[&str]) -> mempal::embed::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        3
+    }
+
+    fn name(&self) -> &str {
+        "stub"
+    }
+}
 
 #[test]
 fn test_claude_jsonl_strips_system_reminder() {
@@ -58,4 +82,150 @@ fn test_strip_preserves_unicode_bytes() {
     assert!(stripped.contains("决策 🎯"));
     assert!(stripped.contains(" 完成 ✅"));
     assert!(!stripped.contains("system-reminder"));
+}
+
+#[tokio::test]
+async fn test_plain_markdown_not_stripped() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let source = tmp.path().join("doc.md");
+    std::fs::write(
+        &source,
+        "# Title\n<system-reminder>fake</system-reminder>\nbody",
+    )
+    .expect("write markdown");
+
+    ingest_file_with_options(
+        &db,
+        &StubEmbedder,
+        &source,
+        "mempal",
+        IngestOptions {
+            room: Some("noise"),
+            source_root: source.parent(),
+            dry_run: false,
+            source_file_override: None,
+            replace_existing_source: false,
+            no_strip_noise: false,
+        },
+    )
+    .await
+    .expect("ingest markdown");
+
+    let content = only_active_content(&db);
+    assert!(content.contains("<system-reminder>fake</system-reminder>"));
+}
+
+#[tokio::test]
+async fn test_ingest_outcome_reports_stripped_bytes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let source = tmp.path().join("claude.jsonl");
+    let reminder = "x".repeat(2048);
+    let message = format!("before <system-reminder>{reminder}</system-reminder> after");
+    std::fs::write(
+        &source,
+        serde_json::json!({
+            "type": "assistant",
+            "message": message
+        })
+        .to_string(),
+    )
+    .expect("write claude jsonl");
+
+    let stats = ingest_file_with_options(
+        &db,
+        &StubEmbedder,
+        &source,
+        "mempal",
+        IngestOptions {
+            room: Some("noise"),
+            source_root: source.parent(),
+            dry_run: false,
+            source_file_override: None,
+            replace_existing_source: false,
+            no_strip_noise: false,
+        },
+    )
+    .await
+    .expect("ingest claude jsonl");
+
+    let stripped = stats
+        .noise_bytes_stripped
+        .expect("strip metric should be present");
+    assert!(
+        (2050..=2100).contains(&stripped),
+        "unexpected stripped bytes: {stripped}"
+    );
+    let content = only_active_content(&db);
+    assert!(!content.contains("system-reminder"));
+    assert!(content.contains("before  after"));
+}
+
+#[tokio::test]
+async fn test_normalize_version_bump_triggers_reindex_opportunity() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let source = tmp.path().join("claude.jsonl");
+    std::fs::write(
+        &source,
+        serde_json::json!({
+            "type": "assistant",
+            "message": "old <system-reminder>noise</system-reminder> clean"
+        })
+        .to_string(),
+    )
+    .expect("write claude jsonl");
+    insert_stale_drawer(&db, &source.to_string_lossy());
+
+    let report = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Stale,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("reindex stale source");
+
+    assert_eq!(report.processed_sources, 1);
+    let content = only_active_content(&db);
+    assert!(!content.contains("system-reminder"));
+    let version: u32 = db
+        .conn()
+        .query_row(
+            "SELECT normalize_version FROM drawers WHERE deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read normalize_version");
+    assert_eq!(version, CURRENT_NORMALIZE_VERSION);
+    assert_eq!(CURRENT_NORMALIZE_VERSION, 2);
+}
+
+fn insert_stale_drawer(db: &Database, source_file: &str) {
+    let mut drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: "drawer_stale_noise".to_string(),
+        content: "old <system-reminder>noise</system-reminder> clean".to_string(),
+        wing: "mempal".to_string(),
+        room: Some("noise".to_string()),
+        source_file: Some(source_file.to_string()),
+        source_type: SourceType::Conversation,
+        added_at: "1710000000".to_string(),
+        chunk_index: Some(0),
+        importance: 0,
+    });
+    drawer.normalize_version = 1;
+    db.insert_drawer(&drawer).expect("insert stale drawer");
+}
+
+fn only_active_content(db: &Database) -> String {
+    db.conn()
+        .query_row(
+            "SELECT content FROM drawers WHERE deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read only active content")
 }
