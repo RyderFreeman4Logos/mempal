@@ -62,7 +62,7 @@
 - Modify: `tests/mind_model_bootstrap.rs`
 - Modify: `tests/tunnels_explicit.rs`
 
-- [ ] **Step 1: Add failing migration and DB API tests**
+- [x] **Step 1: Add failing migration and DB API tests**
 
 Create `tests/normalize_version.rs` with:
 
@@ -92,7 +92,7 @@ cargo test --test normalize_version test_migration_v6_to_v7_stamps_normalize_ver
 
 Expected: FAIL because schema is still v6 and the column does not exist.
 
-- [ ] **Step 2: Correct spec boundary drift**
+- [x] **Step 2: Correct spec boundary drift**
 
 In `specs/p10-normalize-version.spec.md`, change allowed file:
 
@@ -103,7 +103,7 @@ In `specs/p10-normalize-version.spec.md`, change allowed file:
 
 Do not change scope or acceptance criteria.
 
-- [ ] **Step 3: Add `normalize_version` to core types**
+- [x] **Step 3: Add `normalize_version` to core types**
 
 In `src/core/types.rs`, add to `Drawer`:
 
@@ -134,7 +134,7 @@ pub struct ReindexSource {
 }
 ```
 
-- [ ] **Step 4: Add schema v7 migration**
+- [x] **Step 4: Add schema v7 migration**
 
 In `src/core/db.rs`:
 
@@ -159,7 +159,7 @@ Add `normalize_version` to `DRAWER_SELECT_COLUMNS`, `insert_drawer`, and `drawer
 
 Use `i64::from(drawer.normalize_version)` when binding to SQLite and convert DB values back with `u32::try_from`.
 
-- [ ] **Step 5: Add DB query helpers**
+- [x] **Step 5: Add DB query helpers**
 
 In `src/core/db.rs`, add:
 
@@ -190,7 +190,7 @@ Replacement semantics:
 - Delete matching rows from `drawer_vectors` only if the vector table exists.
 - Then delete from `drawers`.
 
-- [ ] **Step 6: Update existing schema expectation tests**
+- [x] **Step 6: Update existing schema expectation tests**
 
 Update existing tests that assert current schema `6` to expect `7`, especially:
 
@@ -199,7 +199,7 @@ Update existing tests that assert current schema `6` to expect `7`, especially:
 
 Keep P10 explicit tunnel migration coverage by asserting both `tunnels` and `normalize_version` exist after opening old fixtures.
 
-- [ ] **Step 7: Run Task 1 tests**
+- [x] **Step 7: Run Task 1 tests**
 
 ```bash
 cargo test --test normalize_version test_migration_v6_to_v7_stamps_normalize_version_1 -- --exact
@@ -210,7 +210,7 @@ cargo test --test tunnels_explicit test_schema_v5_to_v6_migration_preserves_data
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add specs/p10-normalize-version.spec.md src/core/types.rs src/core/db.rs tests/normalize_version.rs tests/mind_model_bootstrap.rs tests/tunnels_explicit.rs
@@ -228,7 +228,7 @@ git commit -m "feat: add drawer normalize version storage"
 - Modify: `tests/normalize_version.rs`
 - Modify: existing tests that construct `Drawer` directly
 
-- [ ] **Step 1: Add failing ingest stamp test**
+- [x] **Step 1: Add failing ingest stamp test**
 
 In `tests/normalize_version.rs`, add:
 
@@ -255,7 +255,7 @@ cargo test --test normalize_version test_new_ingest_writes_current_normalize_ver
 
 Expected: FAIL until ingest stamps the version.
 
-- [ ] **Step 2: Add normalize version constant**
+- [x] **Step 2: Add normalize version constant**
 
 In `src/ingest/normalize.rs`:
 
@@ -265,7 +265,7 @@ pub const CURRENT_NORMALIZE_VERSION: u32 = 1;
 
 Do not change `normalize_content`.
 
-- [ ] **Step 3: Extend ingest options for reindex**
+- [x] **Step 3: Extend ingest options for reindex**
 
 In `src/ingest/mod.rs`, extend `IngestOptions`:
 
@@ -295,7 +295,7 @@ let source_file = options
     .unwrap_or_else(|| normalize_source_file(path, options.source_root));
 ```
 
-- [ ] **Step 4: Replace source drawers inside the P9 lock**
+- [x] **Step 4: Replace source drawers inside the P9 lock**
 
 In `ingest_file_with_options`, after the per-source lock is acquired and before `drawer_exists` checks:
 
@@ -309,7 +309,7 @@ Map errors through a new `IngestError::ReplaceSource`.
 
 This must stay inside the existing lock block so concurrent ingest/reindex of the same source serializes.
 
-- [ ] **Step 5: Stamp inserted drawers**
+- [x] **Step 5: Stamp inserted drawers**
 
 When creating file-ingested drawers:
 
@@ -320,7 +320,7 @@ drawer.normalize_version = CURRENT_NORMALIZE_VERSION;
 
 For direct MCP/API/manual `Drawer` literals, set `normalize_version: CURRENT_NORMALIZE_VERSION` or `1` where importing ingest would create an undesirable dependency. Runtime MCP/API paths should use `CURRENT_NORMALIZE_VERSION`.
 
-- [ ] **Step 6: Run Task 2 tests**
+- [x] **Step 6: Run Task 2 tests**
 
 ```bash
 cargo test --test normalize_version test_new_ingest_writes_current_normalize_version -- --exact
@@ -329,7 +329,7 @@ cargo test --test mind_model_bootstrap test_mcp_ingest_default_drawer_id_matches
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/ingest/normalize.rs src/ingest/mod.rs src/mcp/server.rs src/api/handlers.rs src/longmemeval.rs tests/normalize_version.rs tests/mind_model_bootstrap.rs tests/tunnels_explicit.rs
@@ -344,7 +344,7 @@ git commit -m "feat: stamp drawers with normalize version"
 - Modify: `src/main.rs`
 - Modify: `tests/normalize_version.rs`
 
-- [ ] **Step 1: Add failing reindex tests**
+- [x] **Step 1: Add failing reindex tests**
 
 In `tests/normalize_version.rs`, add:
 
@@ -380,7 +380,7 @@ cargo test --test normalize_version test_reindex_dry_run_no_writes -- --exact
 
 Expected: FAIL because reindex engine does not exist.
 
-- [ ] **Step 2: Implement `src/ingest/reindex.rs`**
+- [x] **Step 2: Implement `src/ingest/reindex.rs`**
 
 Add:
 
@@ -441,7 +441,7 @@ IngestOptions {
 
 - Preserve old source path string through `source_file_override`.
 
-- [ ] **Step 3: Wire CLI `reindex` flags**
+- [x] **Step 3: Wire CLI `reindex` flags**
 
 Change command enum:
 
@@ -484,7 +484,7 @@ Actual:
 reindex complete: processed 2 sources, 5 drawers selected, 5 chunks written, skipped 0 missing-source drawers
 ```
 
-- [ ] **Step 4: Add CLI dry-run smoke test**
+- [x] **Step 4: Add CLI dry-run smoke test**
 
 In `tests/normalize_version.rs`, add:
 
@@ -507,7 +507,7 @@ would reprocess 5 drawers
 
 Assert versions remain stale.
 
-- [ ] **Step 5: Run Task 3 tests**
+- [x] **Step 5: Run Task 3 tests**
 
 ```bash
 cargo test --test normalize_version test_reindex_dry_run_no_writes -- --exact
@@ -519,7 +519,7 @@ cargo test --test normalize_version test_cli_reindex_stale_dry_run_reports_witho
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/ingest/reindex.rs src/ingest/mod.rs src/main.rs tests/normalize_version.rs
@@ -533,7 +533,7 @@ git commit -m "feat: reindex stale normalized drawers"
 - Modify: `src/mcp/server.rs`
 - Modify: `tests/normalize_version.rs`
 
-- [ ] **Step 1: Add failing status test**
+- [x] **Step 1: Add failing status test**
 
 In `tests/normalize_version.rs`, add:
 
@@ -551,7 +551,7 @@ assert_eq!(response.normalize_version_current, CURRENT_NORMALIZE_VERSION);
 assert_eq!(response.stale_drawer_count, 5);
 ```
 
-- [ ] **Step 2: Extend status response schema**
+- [x] **Step 2: Extend status response schema**
 
 In `src/mcp/tools.rs`:
 
@@ -568,7 +568,7 @@ let stale_drawer_count = db
     .map_err(db_error)? as u64;
 ```
 
-- [ ] **Step 3: Add reindex lock test**
+- [x] **Step 3: Add reindex lock test**
 
 In `tests/normalize_version.rs`, add:
 
@@ -588,7 +588,7 @@ Test shape:
 
 Use bounded `tokio::time::timeout` windows to avoid a hanging test.
 
-- [ ] **Step 4: Run Task 4 tests**
+- [x] **Step 4: Run Task 4 tests**
 
 ```bash
 cargo test --test normalize_version test_status_exposes_stale_count -- --exact
@@ -597,7 +597,7 @@ cargo test --test normalize_version test_reindex_respects_per_source_lock -- --e
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/mcp/tools.rs src/mcp/server.rs tests/normalize_version.rs
@@ -611,7 +611,7 @@ git commit -m "feat: report normalize version freshness"
 - Modify: `CLAUDE.md`
 - Modify: `docs/plans/2026-04-23-p10-normalize-version-implementation.md`
 
-- [ ] **Step 1: Update project inventory**
+- [x] **Step 1: Update project inventory**
 
 In both `AGENTS.md` and `CLAUDE.md`:
 
@@ -623,7 +623,7 @@ In both `AGENTS.md` and `CLAUDE.md`:
 - `docs/plans/2026-04-23-p10-normalize-version-implementation.md` — P10 normalize-version（已完成）
 ```
 
-- [ ] **Step 2: Run contract checks**
+- [x] **Step 2: Run contract checks**
 
 ```bash
 agent-spec parse specs/p10-normalize-version.spec.md
@@ -632,7 +632,7 @@ agent-spec lint specs/p10-normalize-version.spec.md --min-score 0.7
 
 Expected: PASS. Existing advisory warnings are acceptable if quality remains above threshold.
 
-- [ ] **Step 3: Run focused tests**
+- [x] **Step 3: Run focused tests**
 
 ```bash
 cargo test --test normalize_version
@@ -642,7 +642,7 @@ cargo test --test tunnels_explicit
 
 Expected: PASS.
 
-- [ ] **Step 4: Run full project verification**
+- [x] **Step 4: Run full project verification**
 
 ```bash
 cargo fmt --check
@@ -653,11 +653,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS.
 
-- [ ] **Step 5: Mark checkboxes complete**
+- [x] **Step 5: Mark checkboxes complete**
 
 Mark all completed steps and final checklist items in this plan.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add AGENTS.md CLAUDE.md docs/plans/2026-04-23-p10-normalize-version-implementation.md
@@ -666,14 +666,14 @@ git commit -m "docs: close normalize version plan"
 
 ## Final Checklist
 
-- [ ] Current schema version is v7.
-- [ ] v6 databases migrate to v7 with all active drawers stamped `normalize_version = 1`.
-- [ ] New file ingest stamps drawers with `CURRENT_NORMALIZE_VERSION`.
-- [ ] `mempal_status` exposes `normalize_version_current` and `stale_drawer_count`.
-- [ ] `mempal reindex --stale --dry-run` reports candidate drawers without writes.
-- [ ] `mempal reindex --stale` rebuilds stale source groups only.
-- [ ] `mempal reindex --force` rebuilds all active source groups.
-- [ ] Missing source files are skipped and reported without deleting stale drawers.
-- [ ] Reindex replacement runs under the existing P9 per-source lock.
-- [ ] Search behavior is unchanged; stale drawers are not filtered.
-- [ ] No normalize logic changes and no dependency additions.
+- [x] Current schema version is v7.
+- [x] v6 databases migrate to v7 with all active drawers stamped `normalize_version = 1`.
+- [x] New file ingest stamps drawers with `CURRENT_NORMALIZE_VERSION`.
+- [x] `mempal_status` exposes `normalize_version_current` and `stale_drawer_count`.
+- [x] `mempal reindex --stale --dry-run` reports candidate drawers without writes.
+- [x] `mempal reindex --stale` rebuilds stale source groups only.
+- [x] `mempal reindex --force` rebuilds all active source groups.
+- [x] Missing source files are skipped and reported without deleting stale drawers.
+- [x] Reindex replacement runs under the existing P9 per-source lock.
+- [x] Search behavior is unchanged; stale drawers are not filtered.
+- [x] No normalize logic changes and no dependency additions.
