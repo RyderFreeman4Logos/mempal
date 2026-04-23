@@ -176,6 +176,12 @@ fn inject_tunnel_hints(db: &Database, results: &mut [SearchResult]) {
                     .collect();
             }
         }
+
+        if let Ok(explicit_hints) = db.explicit_tunnel_hints(&result.wing, result.room.as_deref()) {
+            result.tunnel_hints.extend(explicit_hints);
+        }
+        result.tunnel_hints.sort();
+        result.tunnel_hints.dedup();
     }
 }
 

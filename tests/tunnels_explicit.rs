@@ -4,6 +4,7 @@ use mempal::embed::{Embedder, EmbedderFactory};
 use mempal::mcp::MempalMcpServer;
 use rusqlite::Connection;
 use serde_json::json;
+use std::process::Command;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -68,6 +69,37 @@ fn insert_passive_drawer(db: &Database, id: &str, wing: &str, room: &str) {
         importance: 0,
     }))
     .expect("insert passive drawer");
+}
+
+fn insert_search_drawer(db: &Database, id: &str, wing: &str, room: &str, content: &str) {
+    db.insert_drawer(&Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: content.to_string(),
+        wing: wing.to_string(),
+        room: Some(room.to_string()),
+        source_file: Some(format!("{wing}-{room}.md")),
+        source_type: SourceType::Project,
+        added_at: "1710000000".to_string(),
+        chunk_index: Some(0),
+        importance: 0,
+    }))
+    .expect("insert search drawer");
+    db.insert_vector(id, &[0.1, 0.2, 0.3])
+        .expect("insert search vector");
+}
+
+fn mempal_bin() -> String {
+    env!("CARGO_BIN_EXE_mempal").to_string()
+}
+
+fn write_cli_config(home: &std::path::Path, db_path: &std::path::Path) {
+    let mempal_dir = home.join(".mempal");
+    std::fs::create_dir_all(&mempal_dir).expect("create .mempal");
+    std::fs::write(
+        mempal_dir.join("config.toml"),
+        format!("db_path = \"{}\"\n", db_path.display()),
+    )
+    .expect("write config");
 }
 
 fn create_v5_db(path: &std::path::Path) {
@@ -384,4 +416,115 @@ async fn test_delete_passive_tunnel_rejected() {
         .expect_err("passive tunnel delete should reject");
 
     assert!(error.to_string().contains("passive"));
+}
+
+#[tokio::test]
+async fn test_search_tunnel_hints_merges_passive_and_explicit() {
+    let (_tmp, db, server) = setup_mcp_server();
+    insert_search_drawer(
+        &db,
+        "drawer_search_mempal_auth",
+        "mempal",
+        "auth",
+        "auth search target",
+    );
+    insert_search_drawer(
+        &db,
+        "drawer_search_octos_auth",
+        "octos",
+        "auth",
+        "other passive auth",
+    );
+    db.create_tunnel(
+        &endpoint("mempal", Some("auth")),
+        &endpoint("robrix2", Some("matrix-routing")),
+        "both handle auth routing",
+        Some("codex"),
+    )
+    .expect("create explicit tunnel");
+
+    let response = server
+        .search_json_for_test(json!({
+            "query": "auth search target",
+            "wing": "mempal",
+            "top_k": 1
+        }))
+        .await
+        .expect("search should succeed");
+    let result = response.results.first().expect("search result");
+
+    assert!(result.tunnel_hints.contains(&"octos".to_string()));
+    assert!(
+        result
+            .tunnel_hints
+            .contains(&"robrix2:matrix-routing".to_string())
+    );
+}
+
+#[test]
+fn test_cli_tunnels_add_list_follow_delete() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    write_cli_config(tmp.path(), &db_path);
+
+    let add = Command::new(mempal_bin())
+        .args([
+            "tunnels",
+            "add",
+            "--left",
+            "mempal:auth",
+            "--right",
+            "robrix2:matrix",
+            "--label",
+            "both handle user auth",
+        ])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run tunnels add");
+    assert!(
+        add.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let add_stdout = String::from_utf8_lossy(&add.stdout);
+    let tunnel_id = add_stdout
+        .split_whitespace()
+        .find(|part| part.starts_with("tunnel_"))
+        .expect("add output should include tunnel id")
+        .to_string();
+
+    let list = Command::new(mempal_bin())
+        .args(["tunnels", "list", "--kind", "explicit"])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run tunnels list");
+    assert!(list.status.success());
+    assert!(String::from_utf8_lossy(&list.stdout).contains("both handle user auth"));
+
+    let follow = Command::new(mempal_bin())
+        .args(["tunnels", "follow", "--from", "mempal:auth", "--hops", "1"])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run tunnels follow");
+    assert!(follow.status.success());
+    assert!(String::from_utf8_lossy(&follow.stdout).contains("robrix2:matrix"));
+
+    let delete = Command::new(mempal_bin())
+        .args(["tunnels", "delete", &tunnel_id])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run tunnels delete");
+    assert!(
+        delete.status.success(),
+        "delete failed: {}",
+        String::from_utf8_lossy(&delete.stderr)
+    );
+
+    let list_after_delete = Command::new(mempal_bin())
+        .args(["tunnels", "list", "--kind", "explicit"])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run tunnels list after delete");
+    assert!(list_after_delete.status.success());
+    assert!(!String::from_utf8_lossy(&list_after_delete.stdout).contains(&tunnel_id));
 }

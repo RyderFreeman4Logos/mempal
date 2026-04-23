@@ -15,8 +15,11 @@ use mempal::core::{
     config::Config,
     db::Database,
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
-    types::{AnchorKind, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, TaxonomyEntry},
-    utils::{build_triple_id, current_timestamp},
+    types::{
+        AnchorKind, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, TaxonomyEntry,
+        TunnelEndpoint,
+    },
+    utils::{build_triple_id, current_timestamp, format_tunnel_endpoint},
 };
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder};
 use mempal::ingest::{IngestOptions, IngestStats, ingest_dir, ingest_dir_with_options};
@@ -98,7 +101,10 @@ enum Commands {
         #[command(subcommand)]
         command: KgCommands,
     },
-    Tunnels,
+    Tunnels {
+        #[command(subcommand)]
+        command: Option<TunnelCommands>,
+    },
     Taxonomy {
         #[command(subcommand)]
         command: TaxonomyCommands,
@@ -198,6 +204,33 @@ enum KgCommands {
     },
     Stats,
     List,
+}
+
+#[derive(Subcommand)]
+enum TunnelCommands {
+    Add {
+        #[arg(long)]
+        left: String,
+        #[arg(long)]
+        right: String,
+        #[arg(long)]
+        label: String,
+    },
+    List {
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long, default_value = "all")]
+        kind: String,
+    },
+    Delete {
+        tunnel_id: String,
+    },
+    Follow {
+        #[arg(long)]
+        from: String,
+        #[arg(long, default_value_t = 1)]
+        hops: u8,
+    },
 }
 
 #[derive(Subcommand)]
@@ -308,7 +341,7 @@ async fn run() -> Result<()> {
         Commands::Bench { command } => bench_command(&config, command).await,
         Commands::Reindex => reindex_command(&db, &config).await,
         Commands::Kg { command } => kg_command(&db, command),
-        Commands::Tunnels => tunnels_command(&db),
+        Commands::Tunnels { command } => tunnels_command(&db, command),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
         Commands::Serve { mcp } => serve_command(&config, mcp).await,
         Commands::Status => status_command(&db),
@@ -1011,7 +1044,68 @@ fn kg_command(db: &Database, command: KgCommands) -> Result<()> {
     Ok(())
 }
 
-fn tunnels_command(db: &Database) -> Result<()> {
+fn tunnels_command(db: &Database, command: Option<TunnelCommands>) -> Result<()> {
+    match command {
+        None => tunnels_discover_command(db),
+        Some(TunnelCommands::Add { left, right, label }) => {
+            let tunnel = db
+                .create_tunnel(
+                    &parse_tunnel_endpoint(&left)?,
+                    &parse_tunnel_endpoint(&right)?,
+                    &label,
+                    Some("mempal-cli"),
+                )
+                .context("failed to add tunnel")?;
+            println!(
+                "created tunnel {}\n{} <-> {} | {}",
+                tunnel.id,
+                format_tunnel_endpoint(&tunnel.left),
+                format_tunnel_endpoint(&tunnel.right),
+                tunnel.label
+            );
+            Ok(())
+        }
+        Some(TunnelCommands::List { wing, kind }) => {
+            tunnels_list_command(db, wing.as_deref(), &kind)
+        }
+        Some(TunnelCommands::Delete { tunnel_id }) => {
+            if tunnel_id.starts_with("passive_") {
+                bail!("cannot delete passive tunnel");
+            }
+            if db
+                .delete_explicit_tunnel(&tunnel_id)
+                .context("failed to delete tunnel")?
+            {
+                println!("deleted tunnel {tunnel_id}");
+                Ok(())
+            } else {
+                bail!("tunnel not found: {tunnel_id}");
+            }
+        }
+        Some(TunnelCommands::Follow { from, hops }) => {
+            let endpoint = parse_tunnel_endpoint(&from)?;
+            let results = db
+                .follow_explicit_tunnels(&endpoint, hops)
+                .context("failed to follow tunnels")?;
+            if results.is_empty() {
+                println!("no explicit tunnel neighbors");
+            } else {
+                for result in &results {
+                    println!(
+                        "hop {} via {} -> {}",
+                        result.hop,
+                        result.via_tunnel_id,
+                        format_tunnel_endpoint(&result.endpoint)
+                    );
+                }
+                println!("\n{} tunnel neighbor(s)", results.len());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn tunnels_discover_command(db: &Database) -> Result<()> {
     let tunnels = db.find_tunnels().context("failed to find tunnels")?;
     if tunnels.is_empty() {
         println!("no tunnels (need rooms shared across multiple wings)");
@@ -1022,6 +1116,63 @@ fn tunnels_command(db: &Database) -> Result<()> {
         println!("\n{} tunnel(s)", tunnels.len());
     }
     Ok(())
+}
+
+fn tunnels_list_command(db: &Database, wing: Option<&str>, kind: &str) -> Result<()> {
+    let mut count = 0_usize;
+    if matches!(kind, "all" | "passive") {
+        for (room, wings) in db
+            .find_tunnels()
+            .context("failed to find passive tunnels")?
+        {
+            if wing.is_none_or(|filter| wings.iter().any(|item| item == filter)) {
+                println!(
+                    "passive passive_{room}: room '{room}' ↔ wings: {}",
+                    wings.join(", ")
+                );
+                count += 1;
+            }
+        }
+    }
+    if matches!(kind, "all" | "explicit") {
+        for tunnel in db
+            .list_explicit_tunnels(wing)
+            .context("failed to list explicit tunnels")?
+        {
+            println!(
+                "explicit {}: {} <-> {} | {}",
+                tunnel.id,
+                format_tunnel_endpoint(&tunnel.left),
+                format_tunnel_endpoint(&tunnel.right),
+                tunnel.label
+            );
+            count += 1;
+        }
+    }
+    if !matches!(kind, "all" | "passive" | "explicit") {
+        bail!("unsupported tunnel kind: {kind}");
+    }
+    if count == 0 {
+        println!("no tunnels");
+    } else {
+        println!("\n{count} tunnel(s)");
+    }
+    Ok(())
+}
+
+fn parse_tunnel_endpoint(value: &str) -> Result<TunnelEndpoint> {
+    let trimmed = value.trim();
+    let (wing, room) = match trimmed.split_once(':') {
+        Some((wing, room)) => (wing.trim(), Some(room.trim())),
+        None => (trimmed, None),
+    };
+    if wing.is_empty() {
+        bail!("tunnel endpoint wing is required");
+    }
+    Ok(TunnelEndpoint {
+        wing: wing.to_string(),
+        room: room.filter(|room| !room.is_empty()).map(ToOwned::to_owned),
+    })
 }
 
 fn taxonomy_command(db: &Database, command: TaxonomyCommands) -> Result<()> {

@@ -36,7 +36,9 @@ You have persistent project memory via mempal. Follow these rules in every sessi
 3. QUERY WHEN UNCERTAIN
    When the user asks about past decisions, historical context, "why did we...",
    "last time we...", or "what was the decision about...", call mempal_search
-   with their question. Do not rely on conversation memory alone.
+   with their question. Do not rely on conversation memory alone. You can also
+   call mempal_tunnels with action="list" to discover related rooms across
+   wings when context may live in another project.
 
 3a. TRANSLATE QUERIES TO ENGLISH
    The default embedding model is a multilingual distillation (model2vec) but
