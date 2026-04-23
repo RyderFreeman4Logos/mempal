@@ -15,8 +15,8 @@ use axum::{
 };
 use mempal::aaak::{AaakCodec, AaakDocument};
 use mempal::core::types::{
-    AnchorKind, BootstrapIdentityParts, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain,
-    MemoryKind, Provenance, SourceType, TriggerHints,
+    AnchorKind, BootstrapEvidenceArgs, BootstrapIdentityParts, Drawer, KnowledgeStatus,
+    KnowledgeTier, MemoryDomain, MemoryKind, Provenance, SourceType, TriggerHints,
 };
 use mempal::core::utils::{build_bootstrap_drawer_id_from_parts, build_drawer_id};
 use mempal::core::{anchor, db::Database, protocol::MEMORY_PROTOCOL};
@@ -882,6 +882,88 @@ async fn test_file_ingest_uses_bootstrap_identity_for_evidence_drawer() {
         db.get_drawer(&expected)
             .expect("load file drawer")
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn test_bootstrap_identity_separates_same_content_with_different_anchors() {
+    let (_tmp, db, server) = setup_mcp_server();
+    let content = "Same content must remain anchor-local.";
+    let first = server
+        .ingest_json_for_test(json!({
+            "content": content,
+            "wing": "mempal",
+            "room": "identity",
+            "memory_kind": "evidence",
+            "anchor_kind": "repo",
+            "anchor_id": "repo://anchor-one"
+        }))
+        .await
+        .expect("first anchored evidence should succeed");
+    let second = server
+        .ingest_json_for_test(json!({
+            "content": content,
+            "wing": "mempal",
+            "room": "identity",
+            "memory_kind": "evidence",
+            "anchor_kind": "repo",
+            "anchor_id": "repo://anchor-two"
+        }))
+        .await
+        .expect("second anchored evidence should succeed");
+
+    assert_ne!(first.drawer_id, second.drawer_id);
+    assert_eq!(db.drawer_count().expect("drawer count"), 2);
+    let first_drawer = db
+        .get_drawer(&first.drawer_id)
+        .expect("load first anchored drawer")
+        .expect("first anchored drawer exists");
+    let second_drawer = db
+        .get_drawer(&second.drawer_id)
+        .expect("load second anchored drawer")
+        .expect("second anchored drawer exists");
+    assert_eq!(first_drawer.content, content);
+    assert_eq!(second_drawer.content, content);
+    assert_eq!(first_drawer.anchor_id, "repo://anchor-one");
+    assert_eq!(second_drawer.anchor_id, "repo://anchor-two");
+}
+
+#[test]
+fn test_p13b_does_not_rewrite_existing_drawer_ids() {
+    let (_tmp, db) = new_db();
+    let db_path = db.path().to_path_buf();
+    let content = "Legacy drawer id must survive P13B unchanged.";
+    let old_id = build_drawer_id("mempal", Some("identity"), content);
+    let new_id =
+        expected_bootstrap_evidence_id("mempal", Some("identity"), content, &SourceType::Manual);
+    assert_ne!(old_id, new_id);
+
+    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: old_id.clone(),
+        content: content.to_string(),
+        wing: "mempal".to_string(),
+        room: Some("identity".to_string()),
+        source_file: Some("legacy://p13b".to_string()),
+        source_type: SourceType::Manual,
+        added_at: "1710004000".to_string(),
+        chunk_index: Some(0),
+        importance: 0,
+    });
+    db.insert_drawer(&drawer).expect("insert legacy-id drawer");
+    drop(db);
+
+    let reopened = Database::open(&db_path).expect("reopen db");
+    assert!(
+        reopened
+            .get_drawer(&old_id)
+            .expect("load old id drawer")
+            .is_some()
+    );
+    assert!(
+        reopened
+            .get_drawer(&new_id)
+            .expect("probe new id drawer")
+            .is_none()
     );
 }
 

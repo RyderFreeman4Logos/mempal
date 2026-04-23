@@ -28,7 +28,7 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 ### 项目级 Spec
 - `specs/project.spec.md` — 项目约束（edition、依赖、编码规范、架构不变量）
 
-### 已完成的 Spec（P0-P8）
+### 已完成的 Spec（P0-P13B）
 
 | Spec | 状态 | 范围 |
 |------|------|------|
@@ -50,6 +50,9 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 | `specs/p8-cowork-inbox-push.spec.md` | 完成 | 双向 cowork push — `mempal_cowork_push` MCP 工具 + `cowork-drain` / `cowork-status` / `cowork-install-hooks` CLI + 对称 UserPromptSubmit hook 注入（at-next-submit 交付） |
 | `specs/p9-fact-checker.spec.md` | 完成 | 离线事实核查 — `mempal_fact_check` MCP 工具 + `fact-check` CLI，基于 KG triples + 已知 entity 检测 SimilarNameConflict / RelationContradiction / StaleFact（协议 Rule 11） |
 | `specs/p9-ingest-lock.spec.md` | 完成 | Per-source `flock` 锁 — 消除 Claude↔Codex 并发 ingest 同一 source 的 TOCTOU race；`IngestStats` / `IngestResponse.lock_wait_ms` 提供并发等待可观测性 |
+| `specs/p12-mind-model-bootstrap.spec.md` | 完成 | Stage-1 mind-model bootstrap：typed drawers + `dao/shu/qi` 最小治理字段 + `global/repo/worktree` anchor metadata |
+| `specs/p13-wake-up-statement.spec.md` | 完成 | wake-up 最小闭环：knowledge drawer 优先按 `statement` 唤醒，evidence 继续按 `content` 唤醒 |
+| `specs/p13-ingest-identity.spec.md` | 完成 | typed/bootstrap ingest `drawer_id` identity parity：MCP / REST / 文件入口统一使用 bootstrap identity components |
 
 ### 当前 Spec（草稿，未实现）
 
@@ -60,8 +63,6 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 | `specs/p11-diary-daily-rollup.spec.md` | `agent-diary` 天粒度 upsert drawer，防 chatty agent 爆炸 |
 | `specs/p11-chunk-neighbors.spec.md` | search 可选返回命中 chunk 前后邻居 |
 | `specs/p11-transcript-noise-strip.spec.md` | Claude JSONL / Codex rollout verbatim-safe 噪声剥离（依赖 P10 normalize-version） |
-| `specs/p12-mind-model-bootstrap.spec.md` | Stage-1 mind-model bootstrap：在现有 `drawers` 上引入 `evidence` / `knowledge` typed drawers、`dao/shu/qi` 最小治理字段和 `global/repo/worktree` anchor metadata |
-| `specs/p13-wake-up-statement.spec.md` | wake-up 最小闭环：knowledge drawer 优先按 `statement` 唤醒，evidence 继续按 `content` 唤醒 |
 
 ### 实现计划
 
@@ -72,7 +73,9 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 - `docs/plans/2026-04-13-p7-implementation.md` — P7（已完成）
 - `docs/plans/2026-04-15-p8-implementation.md` — P8（已完成）
 - `docs/plans/2026-04-17-p9-implementation.md` — P9 fact-checker + ingest-lock（已完成）
-- `docs/plans/2026-04-23-p13a-implementation.md` — P13A wake-up statement（草稿）
+- `docs/plans/2026-04-21-p12-implementation.md` — P12 mind-model bootstrap（已完成）
+- `docs/plans/2026-04-23-p13a-implementation.md` — P13A wake-up statement（已完成）
+- `docs/plans/2026-04-23-p13b-implementation.md` — P13B bootstrap ingest identity parity（已完成）
 
 ### Spec 使用方式
 
