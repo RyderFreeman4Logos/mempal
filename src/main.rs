@@ -22,7 +22,10 @@ use mempal::core::{
     utils::{build_triple_id, current_timestamp, format_tunnel_endpoint},
 };
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder};
-use mempal::ingest::{IngestOptions, IngestStats, ingest_dir, ingest_dir_with_options};
+use mempal::ingest::{
+    IngestOptions, IngestStats, ingest_dir, ingest_dir_with_options,
+    reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
+};
 use mempal::mcp::MempalMcpServer;
 use mempal::search::{SearchFilters, search_with_filters};
 use serde::Serialize;
@@ -96,7 +99,14 @@ enum Commands {
         #[arg(long)]
         before: Option<String>,
     },
-    Reindex,
+    Reindex {
+        #[arg(long)]
+        stale: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
     Kg {
         #[command(subcommand)]
         command: KgCommands,
@@ -339,7 +349,11 @@ async fn run() -> Result<()> {
         Commands::WakeUp { format } => wake_up_command(&db, format.as_deref()),
         Commands::Compress { text } => compress_command(&text),
         Commands::Bench { command } => bench_command(&config, command).await,
-        Commands::Reindex => reindex_command(&db, &config).await,
+        Commands::Reindex {
+            stale,
+            force,
+            dry_run,
+        } => reindex_command(&db, &config, stale, force, dry_run).await,
         Commands::Kg { command } => kg_command(&db, command),
         Commands::Tunnels { command } => tunnels_command(&db, command),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
@@ -829,49 +843,62 @@ fn compress_command(text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn reindex_command(db: &Database, config: &Config) -> Result<()> {
-    let embedder = build_embedder(config).await?;
-    let new_dim = embedder.dimensions();
-    let current_dim = db.embedding_dim().context("failed to read embedding dim")?;
-
-    println!("embedder: {} ({}d)", embedder.name(), new_dim);
-    if let Some(dim) = current_dim {
-        println!("current vector dim: {dim}");
+async fn reindex_command(
+    db: &Database,
+    config: &Config,
+    stale: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if stale && force {
+        bail!("--stale and --force are mutually exclusive");
+    }
+    let mode = if force {
+        ReindexMode::Force
     } else {
-        println!("current vector dim: (empty table)");
-    }
+        ReindexMode::Stale
+    };
+    let options = ReindexOptions { mode, dry_run };
 
-    // Recreate vectors table with new dimension
-    println!("recreating drawer_vectors with {new_dim} dimensions...");
-    db.recreate_vectors_table(new_dim)
-        .context("failed to recreate vectors table")?;
+    let report = if dry_run {
+        reindex_sources(db, &NoopEmbedder, options)
+            .await
+            .context("failed to plan reindex")?
+    } else {
+        let embedder = build_embedder(config).await?;
+        println!("embedder: {} ({}d)", embedder.name(), embedder.dimensions());
+        reindex_sources(db, &*embedder, options)
+            .await
+            .context("failed to reindex sources")?
+    };
 
-    // Re-embed all active drawers
-    let drawers = db
-        .all_active_drawers()
-        .context("failed to load active drawers")?;
-    let total = drawers.len();
-    println!("re-embedding {total} drawers...");
-
-    let batch_size = 64;
-    let mut done = 0;
-    for chunk in drawers.chunks(batch_size) {
-        let texts: Vec<&str> = chunk.iter().map(|(_, content)| content.as_str()).collect();
-        let vectors = embedder.embed(&texts).await.context("embedding failed")?;
-
-        for ((id, _), vector) in chunk.iter().zip(vectors.iter()) {
-            db.insert_vector(id, vector)
-                .with_context(|| format!("failed to insert vector for {id}"))?;
-        }
-
-        done += chunk.len();
-        if total > batch_size {
-            println!("  {done}/{total}");
-        }
-    }
-
-    println!("reindex complete: {total} drawers, {new_dim}d vectors");
+    print_reindex_report(report, dry_run);
     Ok(())
+}
+
+fn print_reindex_report(report: ReindexReport, dry_run: bool) {
+    if dry_run {
+        println!(
+            "would reprocess {} drawers from {} sources",
+            report.candidate_drawers, report.candidate_sources
+        );
+        if report.skipped_missing_drawers > 0 {
+            println!(
+                "would skip {} drawers from {} missing sources",
+                report.skipped_missing_drawers, report.skipped_missing_sources
+            );
+        }
+        return;
+    }
+
+    println!(
+        "reindex complete: processed {} sources, {} drawers selected, {} chunks written, skipped {} existing chunks, skipped {} missing-source drawers",
+        report.processed_sources,
+        report.candidate_drawers,
+        report.reingested_chunks,
+        report.skipped_existing_chunks,
+        report.skipped_missing_drawers
+    );
 }
 
 fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {

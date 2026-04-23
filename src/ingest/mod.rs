@@ -4,6 +4,7 @@ pub mod chunk;
 pub mod detect;
 pub mod lock;
 pub mod normalize;
+pub mod reindex;
 
 use std::path::{Path, PathBuf};
 

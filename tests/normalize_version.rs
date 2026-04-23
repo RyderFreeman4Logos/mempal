@@ -1,8 +1,11 @@
 use mempal::core::db::Database;
+use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use mempal::embed::Embedder;
 use mempal::ingest::normalize::CURRENT_NORMALIZE_VERSION;
+use mempal::ingest::reindex::{ReindexMode, ReindexOptions, reindex_sources};
 use mempal::ingest::{IngestOptions, ingest_file_with_options};
 use rusqlite::Connection;
+use std::process::Command;
 use tempfile::TempDir;
 
 struct StubEmbedder;
@@ -147,6 +150,71 @@ fn count_normalize_version(db: &Database, version: u32) -> i64 {
         .expect("count normalize_version")
 }
 
+fn insert_versioned_drawer(
+    db: &Database,
+    id: &str,
+    source_file: &str,
+    content: &str,
+    normalize_version: u32,
+) {
+    let mut drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: content.to_string(),
+        wing: "mempal".to_string(),
+        room: Some("normalize".to_string()),
+        source_file: Some(source_file.to_string()),
+        source_type: SourceType::Project,
+        added_at: "1710000000".to_string(),
+        chunk_index: Some(0),
+        importance: 0,
+    });
+    drawer.normalize_version = normalize_version;
+    db.insert_drawer(&drawer).expect("insert versioned drawer");
+}
+
+fn active_drawer_versions(db: &Database) -> Vec<u32> {
+    let mut statement = db
+        .conn()
+        .prepare(
+            r#"
+            SELECT normalize_version
+            FROM drawers
+            WHERE deleted_at IS NULL
+            ORDER BY id
+            "#,
+        )
+        .expect("prepare active versions");
+    statement
+        .query_map([], |row| row.get::<_, u32>(0))
+        .expect("query active versions")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect active versions")
+}
+
+fn stale_drawer_count_raw(db: &Database) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL AND normalize_version < ?1",
+            [CURRENT_NORMALIZE_VERSION],
+            |row| row.get(0),
+        )
+        .expect("count stale drawers")
+}
+
+fn mempal_bin() -> String {
+    env!("CARGO_BIN_EXE_mempal").to_string()
+}
+
+fn write_cli_config(home: &std::path::Path, db_path: &std::path::Path) {
+    let mempal_dir = home.join(".mempal");
+    std::fs::create_dir_all(&mempal_dir).expect("create .mempal");
+    std::fs::write(
+        mempal_dir.join("config.toml"),
+        format!("db_path = \"{}\"\n", db_path.display()),
+    )
+    .expect("write config");
+}
+
 #[test]
 fn test_migration_v6_to_v7_stamps_normalize_version_1() {
     let tmp = TempDir::new().expect("tempdir");
@@ -227,4 +295,192 @@ fn distinct_versions_for_source(db: &Database, source_file: &str) -> Vec<u32> {
         .expect("query versions")
         .collect::<std::result::Result<Vec<_>, _>>()
         .expect("collect versions")
+}
+
+#[tokio::test]
+async fn test_reindex_dry_run_no_writes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let source = tmp.path().join("doc.md");
+    std::fs::write(&source, "fresh source content").expect("write source");
+    insert_versioned_drawer(
+        &db,
+        "drawer_stale_001",
+        &source.to_string_lossy(),
+        "old source content",
+        0,
+    );
+
+    let report = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Stale,
+            dry_run: true,
+        },
+    )
+    .await
+    .expect("dry-run reindex");
+
+    assert_eq!(report.candidate_drawers, 1);
+    assert_eq!(report.candidate_sources, 1);
+    assert_eq!(report.processed_sources, 0);
+    assert_eq!(stale_drawer_count_raw(&db), 1);
+}
+
+#[tokio::test]
+async fn test_reindex_stale_only_reprocesses_outdated() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let stale_source = tmp.path().join("stale.md");
+    let current_source = tmp.path().join("current.md");
+    std::fs::write(&stale_source, "fresh stale replacement").expect("write stale source");
+    std::fs::write(&current_source, "current source").expect("write current source");
+
+    for index in 0..5 {
+        insert_versioned_drawer(
+            &db,
+            &format!("drawer_stale_{index:03}"),
+            &stale_source.to_string_lossy(),
+            &format!("old stale {index}"),
+            0,
+        );
+    }
+    for index in 0..15 {
+        insert_versioned_drawer(
+            &db,
+            &format!("drawer_current_{index:03}"),
+            &current_source.to_string_lossy(),
+            &format!("current {index}"),
+            CURRENT_NORMALIZE_VERSION,
+        );
+    }
+
+    let report = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Stale,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("stale reindex");
+
+    assert_eq!(report.candidate_drawers, 5);
+    assert_eq!(report.candidate_sources, 1);
+    assert_eq!(report.processed_sources, 1);
+    assert_eq!(stale_drawer_count_raw(&db), 0);
+    assert!(
+        active_drawer_versions(&db)
+            .into_iter()
+            .all(|version| version == CURRENT_NORMALIZE_VERSION)
+    );
+    assert_eq!(
+        distinct_versions_for_source(&db, &current_source.to_string_lossy()),
+        vec![1]
+    );
+}
+
+#[tokio::test]
+async fn test_reindex_force_reprocesses_all() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let source_a = tmp.path().join("a.md");
+    let source_b = tmp.path().join("b.md");
+    std::fs::write(&source_a, "source a replacement").expect("write source a");
+    std::fs::write(&source_b, "source b replacement").expect("write source b");
+    insert_versioned_drawer(
+        &db,
+        "drawer_force_a",
+        &source_a.to_string_lossy(),
+        "old a",
+        0,
+    );
+    insert_versioned_drawer(
+        &db,
+        "drawer_force_b",
+        &source_b.to_string_lossy(),
+        "old b",
+        CURRENT_NORMALIZE_VERSION,
+    );
+
+    let report = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Force,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("force reindex");
+
+    assert_eq!(report.candidate_drawers, 2);
+    assert_eq!(report.candidate_sources, 2);
+    assert_eq!(report.processed_sources, 2);
+    assert_eq!(stale_drawer_count_raw(&db), 0);
+}
+
+#[tokio::test]
+async fn test_reindex_skips_missing_source_file() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let missing = tmp.path().join("missing.md");
+    insert_versioned_drawer(
+        &db,
+        "drawer_missing_source",
+        &missing.to_string_lossy(),
+        "old missing",
+        0,
+    );
+
+    let report = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Stale,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("missing-source reindex");
+
+    assert_eq!(report.candidate_drawers, 1);
+    assert_eq!(report.processed_sources, 0);
+    assert_eq!(report.skipped_missing_sources, 1);
+    assert_eq!(report.skipped_missing_drawers, 1);
+    assert_eq!(stale_drawer_count_raw(&db), 1);
+}
+
+#[test]
+fn test_cli_reindex_stale_dry_run_reports_without_writes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    write_cli_config(tmp.path(), &db_path);
+    let db = Database::open(&db_path).expect("open db");
+    let missing = tmp.path().join("missing.md");
+    for index in 0..5 {
+        insert_versioned_drawer(
+            &db,
+            &format!("drawer_cli_stale_{index:03}"),
+            &missing.to_string_lossy(),
+            &format!("old cli stale {index}"),
+            0,
+        );
+    }
+
+    let output = Command::new(mempal_bin())
+        .args(["reindex", "--stale", "--dry-run"])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run reindex dry-run");
+
+    assert!(
+        output.status.success(),
+        "reindex dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("would reprocess 5 drawers"));
+    assert_eq!(stale_drawer_count_raw(&db), 5);
 }
