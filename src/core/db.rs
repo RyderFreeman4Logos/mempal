@@ -602,11 +602,24 @@ impl Database {
     ) -> Result<(), DbError> {
         self.ensure_vectors_table(vector.len())?;
         let vector_json = serde_json::to_string(vector)?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
+        match self.conn.execute(
+            "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
             params![drawer_id, vector_json.as_str(), project_id],
-        )?;
-        Ok(())
+        ) {
+            Ok(_) => Ok(()),
+            // sqlite-vec's vec0 virtual table does not honor INSERT OR IGNORE
+            // or INSERT OR REPLACE — it always raises a UNIQUE primary key
+            // violation on duplicate id, regardless of conflict clause. Match
+            // on the message text (extended_code is SQLITE_ERROR=1, not 1555)
+            // and swallow to preserve first-writer-wins semantics consistent
+            // with drawers table's INSERT OR IGNORE behavior.
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("UNIQUE constraint failed on drawer_vectors") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(DbError::Sqlite(e)),
+        }
     }
 
     pub fn novelty_candidates(
