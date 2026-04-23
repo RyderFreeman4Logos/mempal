@@ -15,6 +15,7 @@ use crate::core::{
 };
 use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
 use crate::embed::EmbedderFactory;
+use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use crate::search::{SearchFilters, resolve_route, search_with_vector_and_filters};
 use anyhow::Context;
 use rmcp::{
@@ -645,7 +646,7 @@ impl MempalMcpServer {
                 source_type: SourceType::Manual,
                 added_at: current_timestamp(),
                 chunk_index: Some(0),
-                normalize_version: 1,
+                normalize_version: CURRENT_NORMALIZE_VERSION,
                 importance: request.importance.unwrap_or(0),
                 memory_kind: metadata.memory_kind,
                 domain: metadata.domain,

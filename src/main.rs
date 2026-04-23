@@ -454,6 +454,8 @@ async fn ingest_command(
                 room: None,
                 source_root: Some(dir),
                 dry_run: true,
+                source_file_override: None,
+                replace_existing_source: false,
             },
         )
         .await?

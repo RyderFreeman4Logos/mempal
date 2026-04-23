@@ -1,6 +1,26 @@
 use mempal::core::db::Database;
+use mempal::embed::Embedder;
+use mempal::ingest::normalize::CURRENT_NORMALIZE_VERSION;
+use mempal::ingest::{IngestOptions, ingest_file_with_options};
 use rusqlite::Connection;
 use tempfile::TempDir;
+
+struct StubEmbedder;
+
+#[async_trait::async_trait]
+impl Embedder for StubEmbedder {
+    async fn embed(&self, texts: &[&str]) -> mempal::embed::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        3
+    }
+
+    fn name(&self) -> &str {
+        "stub"
+    }
+}
 
 fn create_v6_db(path: &std::path::Path, drawer_count: usize) {
     let conn = Connection::open(path).expect("open v6 db");
@@ -160,4 +180,51 @@ fn test_drawer_count_by_normalize_version_and_stale_count() {
             .expect("version histogram"),
         vec![(0, 5), (1, 15)]
     );
+}
+
+#[tokio::test]
+async fn test_new_ingest_writes_current_normalize_version() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("open db");
+    let source = tmp.path().join("doc.md");
+    std::fs::write(&source, "normalize version source content").expect("write source");
+
+    ingest_file_with_options(
+        &db,
+        &StubEmbedder,
+        &source,
+        "mempal",
+        IngestOptions {
+            room: Some("normalize"),
+            source_root: source.parent(),
+            dry_run: false,
+            source_file_override: None,
+            replace_existing_source: false,
+        },
+    )
+    .await
+    .expect("ingest source");
+
+    let versions = distinct_versions_for_source(&db, "doc.md");
+    assert_eq!(versions, vec![CURRENT_NORMALIZE_VERSION]);
+}
+
+fn distinct_versions_for_source(db: &Database, source_file: &str) -> Vec<u32> {
+    let mut statement = db
+        .conn()
+        .prepare(
+            r#"
+            SELECT DISTINCT normalize_version
+            FROM drawers
+            WHERE source_file = ?1
+            ORDER BY normalize_version
+            "#,
+        )
+        .expect("prepare versions");
+    statement
+        .query_map([source_file], |row| row.get::<_, u32>(0))
+        .expect("query versions")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect versions")
 }

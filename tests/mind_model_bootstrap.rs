@@ -868,6 +868,8 @@ async fn test_file_ingest_uses_bootstrap_identity_for_evidence_drawer() {
             room: Some("identity"),
             source_root: file.parent(),
             dry_run: false,
+            source_file_override: None,
+            replace_existing_source: false,
         },
     )
     .await

@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::ingest::{
     chunk::{chunk_conversation, chunk_text},
     detect::{Format, detect_format},
-    normalize::{NormalizeError, normalize_content},
+    normalize::{CURRENT_NORMALIZE_VERSION, NormalizeError, normalize_content},
 };
 
 const CHUNK_WINDOW: usize = 800;
@@ -52,6 +52,8 @@ pub struct IngestOptions<'a> {
     pub room: Option<&'a str>,
     pub source_root: Option<&'a Path>,
     pub dry_run: bool,
+    pub source_file_override: Option<&'a str>,
+    pub replace_existing_source: bool,
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -94,6 +96,12 @@ pub enum IngestError {
         #[source]
         source: crate::core::db::DbError,
     },
+    #[error("failed to replace source drawers for {source_file}")]
+    ReplaceSource {
+        source_file: String,
+        #[source]
+        source: crate::core::db::DbError,
+    },
     #[error("failed to insert vector for {drawer_id}")]
     InsertVector {
         drawer_id: String,
@@ -132,6 +140,8 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             room,
             source_root: path.parent(),
             dry_run: false,
+            source_file_override: None,
+            replace_existing_source: false,
         },
     )
     .await
@@ -193,7 +203,10 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         files: 1,
         ..IngestStats::default()
     };
-    let source_file = normalize_source_file(path, options.source_root);
+    let source_file = options
+        .source_file_override
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| normalize_source_file(path, options.source_root));
 
     // Per-source ingest lock (P9-B). Guards dedup-check + insert critical
     // section against concurrent Claude↔Codex ingests of the same source.
@@ -209,6 +222,14 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
     };
 
     let source_type = source_type_for(format);
+    if options.replace_existing_source && !options.dry_run {
+        db.replace_active_source_drawers(&source_file, wing, Some(resolved_room.as_str()))
+            .map_err(|source| IngestError::ReplaceSource {
+                source_file: source_file.clone(),
+                source,
+            })?;
+    }
+
     let mut pending = Vec::new();
 
     for (chunk_index, chunk) in chunks.iter().enumerate() {
@@ -265,6 +286,10 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             chunk_index: Some(chunk_index as i64),
             importance: 0,
         });
+        let drawer = Drawer {
+            normalize_version: CURRENT_NORMALIZE_VERSION,
+            ..drawer
+        };
 
         db.insert_drawer(&drawer)
             .map_err(|source| IngestError::InsertDrawer {
@@ -298,6 +323,8 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             room,
             source_root: Some(dir),
             dry_run: false,
+            source_file_override: None,
+            replace_existing_source: false,
         },
     )
     .await

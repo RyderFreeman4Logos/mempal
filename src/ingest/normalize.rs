@@ -3,6 +3,8 @@ use thiserror::Error;
 
 use super::detect::{Format, extract_content_text, extract_message_text};
 
+pub const CURRENT_NORMALIZE_VERSION: u32 = 1;
+
 pub type Result<T> = std::result::Result<T, NormalizeError>;
 
 #[derive(Debug, Error)]
