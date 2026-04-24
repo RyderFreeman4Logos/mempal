@@ -61,7 +61,9 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 
 ### 当前 Spec（草稿，未实现）
 
-暂无。
+| Spec | 范围 |
+|------|------|
+| `specs/p14-context-assembler.spec.md` | mind-model runtime assembler：`mempal context` 按 `dao_tian -> dao_ren -> shu -> qi -> evidence` 和 `worktree -> repo -> global` 组装 context pack |
 
 ### 实现计划
 
@@ -80,6 +82,7 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 - `docs/plans/2026-04-21-p12-implementation.md` — P12 mind-model bootstrap（已完成）
 - `docs/plans/2026-04-23-p13a-implementation.md` — P13A wake-up statement（已完成）
 - `docs/plans/2026-04-23-p13b-implementation.md` — P13B bootstrap ingest identity parity（已完成）
+- `docs/plans/2026-04-24-p14-context-assembler-implementation.md` — P14 mind-model runtime context assembler（草稿）
 
 ### Spec 使用方式
 
