@@ -2,6 +2,7 @@
 
 pub mod chunk;
 pub mod detect;
+pub mod diary;
 pub mod lock;
 pub mod noise;
 pub mod normalize;
@@ -60,6 +61,8 @@ pub struct IngestOptions<'a> {
     pub source_file_override: Option<&'a str>,
     pub replace_existing_source: bool,
     pub no_strip_noise: bool,
+    pub diary_rollup: bool,
+    pub diary_rollup_day: Option<&'a str>,
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -114,6 +117,20 @@ pub enum IngestError {
         #[source]
         source: crate::core::db::DbError,
     },
+    #[error("diary_rollup requires wing=\"agent-diary\", got wing=\"{wing}\"")]
+    DiaryRollupWrongWing { wing: String },
+    #[error("diary_rollup requires an explicit non-empty room")]
+    DiaryRollupMissingRoom,
+    #[error(
+        "daily rollup drawer {drawer_id} would exceed {limit_bytes} bytes ({attempted_bytes} bytes)"
+    )]
+    DailyRollupFull {
+        drawer_id: String,
+        limit_bytes: usize,
+        attempted_bytes: usize,
+    },
+    #[error("embedder returned no vector for {drawer_id}")]
+    EmbedderReturnedNoVector { drawer_id: String },
     #[error("failed to acquire ingest lock: {0}")]
     Lock(#[from] lock::LockError),
     #[error("failed to read directory {path}")]
@@ -149,6 +166,8 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             source_file_override: None,
             replace_existing_source: false,
             no_strip_noise: false,
+            diary_rollup: false,
+            diary_rollup_day: None,
         },
     )
     .await
@@ -189,6 +208,25 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
     })?;
     let normalized = normalize_output.content;
     let noise_bytes_stripped = normalize_output.noise_bytes_stripped;
+
+    if options.diary_rollup {
+        let mut outcome = diary::ingest_diary_rollup(
+            db,
+            embedder,
+            &normalized,
+            wing,
+            diary::DiaryRollupOptions {
+                room: options.room,
+                day: options.diary_rollup_day,
+                dry_run: options.dry_run,
+                importance: 0,
+            },
+        )
+        .await?;
+        outcome.stats.noise_bytes_stripped = noise_bytes_stripped;
+        return Ok(outcome.stats);
+    }
+
     let resolved_room = match options.room {
         Some(room) => room.to_string(),
         None => {
@@ -342,6 +380,8 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             source_file_override: None,
             replace_existing_source: false,
             no_strip_noise: false,
+            diary_rollup: false,
+            diary_rollup_day: None,
         },
     )
     .await

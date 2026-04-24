@@ -292,6 +292,7 @@ async fn test_new_ingest_writes_current_normalize_version() {
             source_file_override: None,
             replace_existing_source: false,
             no_strip_noise: false,
+            ..IngestOptions::default()
         },
     )
     .await

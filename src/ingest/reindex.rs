@@ -107,6 +107,7 @@ async fn reindex_one_source<E: Embedder + ?Sized>(
             source_file_override: Some(source_file),
             replace_existing_source: true,
             no_strip_noise: false,
+            ..IngestOptions::default()
         },
     )
     .await

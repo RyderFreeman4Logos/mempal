@@ -108,6 +108,7 @@ async fn test_plain_markdown_not_stripped() {
             source_file_override: None,
             replace_existing_source: false,
             no_strip_noise: false,
+            ..IngestOptions::default()
         },
     )
     .await
@@ -146,6 +147,7 @@ async fn test_ingest_outcome_reports_stripped_bytes() {
             source_file_override: None,
             replace_existing_source: false,
             no_strip_noise: false,
+            ..IngestOptions::default()
         },
     )
     .await

@@ -871,6 +871,7 @@ async fn test_file_ingest_uses_bootstrap_identity_for_evidence_drawer() {
             source_file_override: None,
             replace_existing_source: false,
             no_strip_noise: false,
+            ..IngestOptions::default()
         },
     )
     .await

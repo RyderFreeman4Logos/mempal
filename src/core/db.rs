@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -320,6 +320,132 @@ impl Database {
         Ok(())
     }
 
+    pub fn upsert_drawer_and_replace_vector(
+        &self,
+        drawer: &Drawer,
+        vector: &[f32],
+    ) -> Result<(), DbError> {
+        anchor::validate_anchor_domain(&drawer.domain, &drawer.anchor_kind)
+            .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
+        self.ensure_vectors_table(vector.len())?;
+
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT rowid, content FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+                [drawer.id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+
+        if existing.is_none() {
+            self.insert_drawer(drawer)?;
+            return self.insert_vector(&drawer.id, vector);
+        }
+
+        let (rowid, old_content) = existing.expect("checked Some");
+        let vector_json = serde_json::to_string(vector)?;
+
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<(), DbError> {
+            if self.table_exists("drawers_fts")? {
+                self.conn.execute(
+                    "INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', ?1, ?2)",
+                    params![rowid, old_content],
+                )?;
+            }
+
+            self.conn.execute(
+                r#"
+                UPDATE drawers
+                SET content = ?2,
+                    wing = ?3,
+                    room = ?4,
+                    source_file = ?5,
+                    source_type = ?6,
+                    added_at = ?7,
+                    chunk_index = ?8,
+                    normalize_version = ?9,
+                    importance = ?10,
+                    memory_kind = ?11,
+                    domain = ?12,
+                    field = ?13,
+                    anchor_kind = ?14,
+                    anchor_id = ?15,
+                    parent_anchor_id = ?16,
+                    provenance = ?17,
+                    statement = ?18,
+                    tier = ?19,
+                    status = ?20,
+                    supporting_refs = ?21,
+                    counterexample_refs = ?22,
+                    teaching_refs = ?23,
+                    verification_refs = ?24,
+                    scope_constraints = ?25,
+                    trigger_hints = ?26
+                WHERE id = ?1 AND deleted_at IS NULL
+                "#,
+                params![
+                    drawer.id.as_str(),
+                    drawer.content.as_str(),
+                    drawer.wing.as_str(),
+                    drawer.room.as_deref(),
+                    drawer.source_file.as_deref(),
+                    source_type_as_str(&drawer.source_type),
+                    drawer.added_at.as_str(),
+                    drawer.chunk_index,
+                    i64::from(drawer.normalize_version),
+                    drawer.importance,
+                    memory_kind_as_str(&drawer.memory_kind),
+                    memory_domain_as_str(&drawer.domain),
+                    drawer.field.as_str(),
+                    anchor_kind_as_str(&drawer.anchor_kind),
+                    drawer.anchor_id.as_str(),
+                    drawer.parent_anchor_id.as_deref(),
+                    drawer.provenance.as_ref().map(provenance_as_str),
+                    drawer.statement.as_deref(),
+                    drawer.tier.as_ref().map(knowledge_tier_as_str),
+                    drawer.status.as_ref().map(knowledge_status_as_str),
+                    encode_json(&drawer.supporting_refs)?,
+                    encode_json(&drawer.counterexample_refs)?,
+                    encode_json(&drawer.teaching_refs)?,
+                    encode_json(&drawer.verification_refs)?,
+                    drawer.scope_constraints.as_deref(),
+                    encode_optional_json(drawer.trigger_hints.as_ref())?,
+                ],
+            )?;
+
+            if self.table_exists("drawers_fts")? {
+                self.conn.execute(
+                    "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
+                    params![rowid, drawer.content.as_str()],
+                )?;
+            }
+
+            self.conn.execute(
+                "DELETE FROM drawer_vectors WHERE id = ?1",
+                [drawer.id.as_str()],
+            )?;
+            self.conn.execute(
+                "INSERT INTO drawer_vectors (id, embedding) VALUES (?1, vec_f32(?2))",
+                params![drawer.id.as_str(), vector_json.as_str()],
+            )?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
     /// Ensure drawer_vectors table exists with the right dimension.
     /// Creates it on first call; errors on dimension mismatch.
     fn ensure_vectors_table(&self, dim: usize) -> Result<(), DbError> {
@@ -370,6 +496,21 @@ impl Database {
             .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn diary_rollup_days(&self) -> Result<u32, DbError> {
+        let count = self.conn.query_row(
+            r#"
+            SELECT COUNT(DISTINCT substr(source_file, length(source_file) - 9, 10))
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND wing = 'agent-diary'
+              AND source_file LIKE 'agent-diary://rollup/%'
+            "#,
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u32)
     }
 
     pub fn reindex_sources_stale(

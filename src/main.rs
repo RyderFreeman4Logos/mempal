@@ -53,11 +53,15 @@ enum Commands {
         #[arg(long)]
         wing: String,
         #[arg(long)]
+        room: Option<String>,
+        #[arg(long)]
         format: Option<String>,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
         no_strip_noise: bool,
+        #[arg(long)]
+        diary_rollup: bool,
     },
     Search {
         query: String,
@@ -311,10 +315,27 @@ async fn run() -> Result<()> {
         Commands::Ingest {
             dir,
             wing,
+            room,
             format,
             dry_run,
             no_strip_noise,
-        } => ingest_command(&db, &config, &dir, &wing, format, dry_run, no_strip_noise).await,
+            diary_rollup,
+        } => {
+            ingest_command(
+                &db,
+                &config,
+                IngestCommandArgs {
+                    dir: &dir,
+                    wing: &wing,
+                    room: room.as_deref(),
+                    format,
+                    dry_run,
+                    no_strip_noise,
+                    diary_rollup,
+                },
+            )
+            .await
+        }
         Commands::Search {
             query,
             wing,
@@ -452,54 +473,66 @@ fn init_command(db: &Database, dir: &Path, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-async fn ingest_command(
-    db: &Database,
-    config: &Config,
-    dir: &Path,
-    wing: &str,
-    format: Option<String>,
-    dry_run: bool,
-    no_strip_noise: bool,
-) -> Result<()> {
-    if let Some(format) = format.as_deref()
+async fn ingest_command(db: &Database, config: &Config, args: IngestCommandArgs<'_>) -> Result<()> {
+    if let Some(format) = args.format.as_deref()
         && format != "convos"
     {
         bail!("unsupported --format value: {format}");
     }
 
     let options = IngestOptions {
-        room: None,
-        source_root: if dir.is_file() {
-            dir.parent()
+        room: args.room,
+        source_root: if args.dir.is_file() {
+            args.dir.parent()
         } else {
-            Some(dir)
+            Some(args.dir)
         },
-        dry_run,
+        dry_run: args.dry_run,
         source_file_override: None,
         replace_existing_source: false,
-        no_strip_noise,
+        no_strip_noise: args.no_strip_noise,
+        diary_rollup: args.diary_rollup,
+        diary_rollup_day: None,
     };
 
-    let stats = if dry_run {
-        ingest_path_with_options(db, &NoopEmbedder, dir, wing, options).await?
+    let stats = if args.dry_run {
+        ingest_path_with_options(db, &NoopEmbedder, args.dir, args.wing, options).await?
     } else {
         let embedder = build_embedder(config).await?;
-        ingest_path_with_options(db, &*embedder, dir, wing, options).await?
+        ingest_path_with_options(db, &*embedder, args.dir, args.wing, options).await?
     };
 
-    append_ingest_audit_log(db, dir, wing, format.as_deref(), dry_run, stats)
-        .context("failed to append ingest audit log")?;
+    append_ingest_audit_log(
+        db,
+        args.dir,
+        args.wing,
+        args.format.as_deref(),
+        args.dry_run,
+        stats,
+    )
+    .context("failed to append ingest audit log")?;
 
     println!(
-        "dry_run={} files={} chunks={} skipped={} noise_bytes_stripped={}",
-        dry_run,
+        "dry_run={} files={} chunks={} skipped={} noise_bytes_stripped={} lock_wait_ms={}",
+        args.dry_run,
         stats.files,
         stats.chunks,
         stats.skipped,
-        stats.noise_bytes_stripped.unwrap_or(0)
+        stats.noise_bytes_stripped.unwrap_or(0),
+        stats.lock_wait_ms.unwrap_or(0)
     );
 
     Ok(())
+}
+
+struct IngestCommandArgs<'a> {
+    dir: &'a Path,
+    wing: &'a str,
+    room: Option<&'a str>,
+    format: Option<String>,
+    dry_run: bool,
+    no_strip_noise: bool,
+    diary_rollup: bool,
 }
 
 async fn ingest_path_with_options<E: Embedder + ?Sized>(
@@ -1357,9 +1390,13 @@ fn status_command(db: &Database) -> Result<()> {
     let deleted_count = db
         .deleted_drawer_count()
         .context("failed to count deleted drawers")?;
+    let diary_rollup_days = db
+        .diary_rollup_days()
+        .context("failed to count diary rollup days")?;
 
     println!("schema_version: {schema_version}");
     println!("drawer_count: {drawer_count}");
+    println!("diary_rollup_days: {diary_rollup_days}");
     if deleted_count > 0 {
         println!("deleted_drawers: {deleted_count} (use `mempal purge` to remove)");
     }

@@ -15,7 +15,14 @@ use crate::core::{
 };
 use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
 use crate::embed::EmbedderFactory;
-use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
+use crate::ingest::{
+    IngestError,
+    diary::{
+        DIARY_ROLLUP_WING, DiaryRollupOptions, commit_prepared_diary_rollup,
+        diary_rollup_drawer_id, prepare_diary_rollup,
+    },
+    normalize::CURRENT_NORMALIZE_VERSION,
+};
 use crate::search::{SearchFilters, SearchOptions, resolve_route, search_with_vector_options};
 use anyhow::Context;
 use rmcp::{
@@ -498,6 +505,7 @@ impl MempalMcpServer {
         let drawer_count = db.drawer_count().map_err(db_error)?;
         let taxonomy_count = db.taxonomy_count().map_err(db_error)?;
         let db_size_bytes = db.database_size_bytes().map_err(db_error)?;
+        let diary_rollup_days = db.diary_rollup_days().map_err(db_error)?;
         let scopes = db
             .scope_counts()
             .map_err(db_error)?
@@ -516,6 +524,7 @@ impl MempalMcpServer {
             drawer_count,
             taxonomy_count,
             db_size_bytes,
+            diary_rollup_days,
             scopes,
             aaak_spec: crate::aaak::generate_spec(),
             memory_protocol: crate::core::protocol::MEMORY_PROTOCOL.to_string(),
@@ -586,6 +595,66 @@ impl MempalMcpServer {
         Parameters(request): Parameters<IngestRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let room = request.room.as_deref();
+        if request.diary_rollup.unwrap_or(false) {
+            validate_ingest_request(&request, &SourceType::Manual)?;
+            if request.wing != DIARY_ROLLUP_WING {
+                return Err(ingest_error(IngestError::DiaryRollupWrongWing {
+                    wing: request.wing,
+                }));
+            }
+
+            let room = room
+                .filter(|room| !room.trim().is_empty())
+                .ok_or_else(|| ingest_error(IngestError::DiaryRollupMissingRoom))?;
+            let day = crate::ingest::diary::current_rollup_day_utc();
+            let drawer_id = diary_rollup_drawer_id(room, &day);
+
+            if request.dry_run.unwrap_or(false) {
+                return Ok(Json(IngestResponse {
+                    drawer_id,
+                    duplicate_warning: None,
+                    lock_wait_ms: None,
+                }));
+            }
+
+            let prepared = {
+                let db = self.open_db()?;
+                prepare_diary_rollup(
+                    &db,
+                    &request.content,
+                    DIARY_ROLLUP_WING,
+                    DiaryRollupOptions {
+                        room: Some(room),
+                        day: Some(&day),
+                        dry_run: false,
+                        importance: request.importance.unwrap_or(0),
+                    },
+                )
+                .map_err(ingest_error)?
+            };
+            let embedder = self.embedder_factory.build().await.map_err(|error| {
+                ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
+            })?;
+            let vector = embedder
+                .embed(&[prepared.content.as_str()])
+                .await
+                .map_err(|error| {
+                    ErrorData::internal_error(format!("embedding failed: {error}"), None)
+                })?
+                .into_iter()
+                .next()
+                .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?;
+            let db = self.open_db()?;
+            let outcome =
+                commit_prepared_diary_rollup(&db, prepared, &vector).map_err(ingest_error)?;
+
+            return Ok(Json(IngestResponse {
+                drawer_id: outcome.drawer_id,
+                duplicate_warning: None,
+                lock_wait_ms: outcome.stats.lock_wait_ms,
+            }));
+        }
+
         let metadata = validate_ingest_request(&request, &SourceType::Manual)?;
         let drawer_id = build_bootstrap_drawer_id_from_parts(
             &request.wing,
@@ -1194,6 +1263,15 @@ fn db_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(format!("{error}"), None)
 }
 
+fn ingest_error(error: IngestError) -> ErrorData {
+    match error {
+        IngestError::DiaryRollupWrongWing { .. }
+        | IngestError::DiaryRollupMissingRoom
+        | IngestError::DailyRollupFull { .. } => ErrorData::invalid_params(error.to_string(), None),
+        _ => ErrorData::internal_error(error.to_string(), None),
+    }
+}
+
 fn fact_check_error(error: crate::factcheck::FactCheckError) -> ErrorData {
     match error {
         crate::factcheck::FactCheckError::InvalidScope(_)
@@ -1690,6 +1768,7 @@ mod tests {
             source: None,
             importance: None,
             dry_run: None,
+            diary_rollup: None,
             memory_kind: None,
             domain: None,
             field: None,

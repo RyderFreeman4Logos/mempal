@@ -127,6 +127,10 @@ pub struct IngestRequest {
     /// writing to the database. Use this to preview before committing.
     pub dry_run: Option<bool>,
 
+    /// If true, append this entry to one agent-diary drawer for the current
+    /// UTC day. Requires wing="agent-diary" and an explicit room.
+    pub diary_rollup: Option<bool>,
+
     /// Importance ranking (0-5). Higher values appear first in wake-up context.
     /// Default 0. Use 3-5 for key decisions, architecture choices, and lessons learned.
     pub importance: Option<i32>,
@@ -199,6 +203,7 @@ pub struct StatusResponse {
     pub drawer_count: i64,
     pub taxonomy_count: i64,
     pub db_size_bytes: u64,
+    pub diary_rollup_days: u32,
     pub scopes: Vec<ScopeCount>,
     pub aaak_spec: String,
     pub memory_protocol: String,

@@ -330,6 +330,7 @@ async fn test_new_ingest_writes_chunk_index_sequentially() {
             source_file_override: None,
             replace_existing_source: false,
             no_strip_noise: false,
+            ..IngestOptions::default()
         },
     )
     .await
