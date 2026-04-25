@@ -141,6 +141,85 @@ impl MempalMcpServer {
 
         Ok(None)
     }
+
+    /// Fallback helper for novelty merge paths that fall back to insert
+    /// (e.g. merge cap reached, re-embed failed). Inserts all chunks as
+    /// separate drawers, mirroring the Insert branch.
+    #[allow(clippy::too_many_arguments)]
+    fn mcp_ingest_insert_fallback(
+        &self,
+        db: &mut Database,
+        primary_drawer_id: &str,
+        _scrubbed_content: &str,
+        request: &IngestRequest,
+        chunks: &[String],
+        vectors: &[Vec<f32>],
+        chunk_drawer_ids: &[(usize, String, bool)],
+        mempal_home: &std::path::Path,
+        project_id: Option<&str>,
+        near_target_id: &str,
+        novelty: &crate::ingest::novelty::NoveltyDecision,
+        audit_decision: Option<&str>,
+        inserted_drawer_ids: &mut Vec<String>,
+    ) -> std::result::Result<(), ErrorData> {
+        db.record_novelty_audit(
+            primary_drawer_id,
+            NoveltyAction::Insert,
+            Some(near_target_id),
+            novelty.cosine,
+            audit_decision,
+            project_id,
+        )
+        .map_err(db_error)?;
+
+        for ((chunk_idx, chunk_did, _), (chunk, vector)) in chunk_drawer_ids
+            .iter()
+            .zip(chunks.iter().zip(vectors.iter()))
+        {
+            let _extra_lock = if *chunk_idx > 0 {
+                Some(
+                    crate::ingest::lock::acquire_source_lock(
+                        mempal_home,
+                        chunk_did,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .map_err(|e| {
+                        ErrorData::internal_error(
+                            format!("ingest lock chunk {chunk_idx}: {e}"),
+                            None,
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
+            let exists = db.drawer_exists(chunk_did).map_err(db_error)?;
+            if exists {
+                inserted_drawer_ids.push(chunk_did.clone());
+                continue;
+            }
+            let source_file = source_file_or_synthetic(chunk_did, request.source.as_deref());
+            db.insert_drawer_with_project(
+                &Drawer {
+                    id: chunk_did.clone(),
+                    content: chunk.clone(),
+                    wing: request.wing.clone(),
+                    room: request.room.clone(),
+                    source_file: Some(source_file),
+                    source_type: SourceType::Manual,
+                    added_at: current_timestamp(),
+                    chunk_index: Some(*chunk_idx as i64),
+                    importance: request.importance.unwrap_or(0),
+                },
+                project_id,
+            )
+            .map_err(db_error)?;
+            db.insert_vector_with_project(chunk_did, vector, project_id)
+                .map_err(db_error)?;
+            inserted_drawer_ids.push(chunk_did.clone());
+        }
+        Ok(())
+    }
 }
 
 #[tool_router(router = tool_router)]
@@ -503,18 +582,46 @@ impl MempalMcpServer {
             config.scrub_content_with_compiled(&request.content, compiled_privacy.as_ref());
         let room = request.room.as_deref();
         let db = self.open_db()?;
-        let (drawer_id, _drawer_exists) = db
-            .resolve_ingest_drawer_id(
-                &request.wing,
-                room,
-                &scrubbed_content,
-                project_id.as_deref(),
-            )
-            .map_err(db_error)?;
+        let dry_run = request.dry_run.unwrap_or(false);
 
-        if request.dry_run.unwrap_or(false) {
+        // Check degraded embed status BEFORE building the embedder so that
+        // non-dry-run writes fail fast with "writes are paused" (issue #57
+        // regression guard).
+        if !dry_run && global_embed_status().should_block_writes() {
+            return Err(degraded_write_error());
+        }
+
+        // --- Chunk the scrubbed content (issue #57) ---
+        // Build embedder early so the chunker can respect max_input_tokens.
+        let embedder = self.embedder_factory.build().await.map_err(|error| {
+            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
+        })?;
+        let chunks =
+            crate::ingest::prepare_chunks(&scrubbed_content, &config.chunker, embedder.as_ref());
+
+        // Resolve drawer_id per chunk. The first chunk's drawer_id is the
+        // primary identifier for backward compatibility.
+        let mut chunk_drawer_ids: Vec<(usize, String, bool)> = Vec::with_capacity(chunks.len());
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let (did, exists) = db
+                .resolve_ingest_drawer_id(&request.wing, room, chunk, project_id.as_deref())
+                .map_err(db_error)?;
+            chunk_drawer_ids.push((idx, did, exists));
+        }
+        let drawer_id = chunk_drawer_ids
+            .first()
+            .map(|(_, id, _)| id.clone())
+            .unwrap_or_default();
+
+        if dry_run {
+            let all_ids: Vec<String> = chunk_drawer_ids
+                .iter()
+                .map(|(_, id, _)| id.clone())
+                .collect();
             return Ok(Json(IngestResponse {
                 drawer_id,
+                drawer_ids: all_ids,
+                chunk_count: chunks.len(),
                 dropped: false,
                 gating_decision: None,
                 novelty_action: None,
@@ -525,10 +632,7 @@ impl MempalMcpServer {
             }));
         }
 
-        if global_embed_status().should_block_writes() {
-            return Err(degraded_write_error());
-        }
-
+        // Tier-1 gating runs on the full content (not per-chunk).
         let candidate = IngestCandidate {
             content: scrubbed_content.clone(),
             tool_name: None,
@@ -541,9 +645,9 @@ impl MempalMcpServer {
             db.record_gating_audit(&drawer_id, decision, project_id.as_deref())
                 .map_err(db_error)?;
             return Ok(Json(IngestResponse {
-                // TODO(spec ambiguity): rejected ingests have no persisted drawer.
-                // Return the candidate-derived drawer_id for audit correlation.
                 drawer_id,
+                drawer_ids: Vec::new(),
+                chunk_count: 0,
                 dropped: true,
                 gating_decision,
                 novelty_action: None,
@@ -556,10 +660,7 @@ impl MempalMcpServer {
 
         let mut db = db;
 
-        // P9-B reordered this path so the same-content lock is acquired
-        // before the expensive embedder call. That keeps concurrent manual
-        // ingests from racing past the dedup gate and writing duplicate
-        // drawers/vectors for identical content.
+        // P9-B: acquire lock on the first chunk's drawer_id before embedding.
         let mempal_home = db
             .path()
             .parent()
@@ -572,14 +673,10 @@ impl MempalMcpServer {
         )
         .map_err(|e| ErrorData::internal_error(format!("ingest lock: {e}"), None))?;
         let lock_wait_ms = Some(lock_guard.wait_duration().as_millis() as u64);
-        // Re-check after waiting: another request may have inserted this drawer
-        // while we were blocked on the same drawer_id lock.
-        let drawer_exists = db.drawer_exists(&drawer_id).map_err(db_error)?;
 
-        let embedder = self.embedder_factory.build().await.map_err(|error| {
-            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
-        })?;
-        let mut vector = None;
+        // Tier-2 gating: uses the first chunk's embedding as representative.
+        let first_chunk = chunks.first().map(|c| c.as_str()).unwrap_or("");
+        let mut first_vector = None;
         let mut gating_audit_recorded = false;
         if gating_decision.is_none() {
             let tier2_classifier = if config.ingest_gating.enabled
@@ -603,7 +700,7 @@ impl MempalMcpServer {
                 db.record_gating_audit(&drawer_id, &tier2.decision, project_id.as_deref())
                     .map_err(db_error)?;
                 gating_audit_recorded = true;
-                vector = tier2.vector;
+                first_vector = tier2.vector;
                 gating_decision = Some(tier2.decision);
             } else if config.ingest_gating.enabled {
                 gating_decision = Some(GatingDecision::accepted(
@@ -619,6 +716,8 @@ impl MempalMcpServer {
             drop(lock_guard);
             return Ok(Json(IngestResponse {
                 drawer_id,
+                drawer_ids: Vec::new(),
+                chunk_count: 0,
                 dropped: true,
                 gating_decision,
                 novelty_action: None,
@@ -632,22 +731,48 @@ impl MempalMcpServer {
             db.record_gating_audit(&drawer_id, decision, project_id.as_deref())
                 .map_err(db_error)?;
         }
-        let vector = match vector {
-            Some(vector) => vector,
-            None => embedder
-                .embed(&[scrubbed_content.as_str()])
-                .await
-                .map_err(|error| {
-                    ErrorData::internal_error(format!("embedding failed: {error}"), None)
-                })?
-                .into_iter()
-                .next()
-                .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?,
-        };
-        ensure_vector_dim_matches(&db, vector.len())?;
 
-        // Semantic dedup check: find most similar existing drawer
-        let duplicate_warning = check_semantic_duplicate(&db, &vector, &scrubbed_content);
+        // Embed ALL chunks in one batch call. If tier2 already produced a
+        // vector for the first chunk, splice it in.
+        let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();
+        let vectors = if first_vector.is_some() && chunks.len() == 1 {
+            // Single-chunk optimization: reuse tier2 vector.
+            vec![first_vector.take().expect("checked Some")]
+        } else if let Some(fv) = first_vector.take() {
+            // Multi-chunk with tier2 vector for first chunk: embed the rest.
+            if chunks.len() > 1 {
+                let rest_refs: Vec<&str> = chunk_refs[1..].to_vec();
+                let mut rest_vecs = embedder.embed(&rest_refs).await.map_err(|error| {
+                    ErrorData::internal_error(format!("embedding failed: {error}"), None)
+                })?;
+                let mut all = vec![fv];
+                all.append(&mut rest_vecs);
+                all
+            } else {
+                vec![fv]
+            }
+        } else {
+            embedder.embed(&chunk_refs).await.map_err(|error| {
+                ErrorData::internal_error(format!("embedding failed: {error}"), None)
+            })?
+        };
+        if vectors.len() != chunks.len() {
+            return Err(ErrorData::internal_error(
+                format!(
+                    "embedder returned {} vectors for {} chunks",
+                    vectors.len(),
+                    chunks.len()
+                ),
+                None,
+            ));
+        }
+        if let Some(v) = vectors.first() {
+            ensure_vector_dim_matches(&db, v.len())?;
+        }
+
+        // Novelty evaluation uses the first chunk's vector as representative.
+        let first_vector_ref = &vectors[0];
+        let duplicate_warning = check_semantic_duplicate(&db, first_vector_ref, first_chunk);
         let novelty_candidate = NoveltyCandidate {
             wing: request.wing.clone(),
             room: request.room.clone(),
@@ -656,11 +781,14 @@ impl MempalMcpServer {
         let novelty = evaluate_novelty(
             &db,
             &novelty_candidate,
-            &vector,
+            first_vector_ref,
             &config.ingest_gating.novelty,
         );
         let mut response_drawer_id = drawer_id.clone();
         let (novelty_action, near_drawer_id);
+
+        // Collect all successfully inserted drawer IDs.
+        let mut inserted_drawer_ids: Vec<String> = Vec::new();
 
         match novelty.action {
             NoveltyAction::Insert => {
@@ -677,26 +805,66 @@ impl MempalMcpServer {
                 }
                 novelty_action = Some(NoveltyAction::Insert);
                 near_drawer_id = novelty.near_drawer_id.clone();
-                if !drawer_exists {
+
+                // Insert ALL chunks as separate drawers.
+                for ((chunk_idx, chunk_did, chunk_exists), (chunk, vector)) in chunk_drawer_ids
+                    .iter()
+                    .zip(chunks.iter().zip(vectors.iter()))
+                {
+                    if *chunk_exists {
+                        inserted_drawer_ids.push(chunk_did.clone());
+                        continue;
+                    }
+                    // Acquire per-chunk lock for chunks beyond the first
+                    // (first chunk already holds lock_guard).
+                    let _extra_lock = if *chunk_idx > 0 {
+                        Some(
+                            crate::ingest::lock::acquire_source_lock(
+                                &mempal_home,
+                                chunk_did,
+                                std::time::Duration::from_secs(5),
+                            )
+                            .map_err(|e| {
+                                ErrorData::internal_error(
+                                    format!("ingest lock chunk {chunk_idx}: {e}"),
+                                    None,
+                                )
+                            })?,
+                        )
+                    } else {
+                        None
+                    };
+                    // Re-check existence after acquiring per-chunk lock.
+                    let exists_after_lock = if *chunk_idx > 0 {
+                        db.drawer_exists(chunk_did).map_err(db_error)?
+                    } else {
+                        // First chunk: re-check after the initial lock.
+                        db.drawer_exists(chunk_did).map_err(db_error)?
+                    };
+                    if exists_after_lock {
+                        inserted_drawer_ids.push(chunk_did.clone());
+                        continue;
+                    }
                     let source_file =
-                        source_file_or_synthetic(&drawer_id, request.source.as_deref());
+                        source_file_or_synthetic(chunk_did, request.source.as_deref());
                     db.insert_drawer_with_project(
                         &Drawer {
-                            id: drawer_id.clone(),
-                            content: scrubbed_content.clone(),
+                            id: chunk_did.clone(),
+                            content: chunk.clone(),
                             wing: request.wing.clone(),
                             room: request.room.clone(),
                             source_file: Some(source_file),
                             source_type: SourceType::Manual,
                             added_at: current_timestamp(),
-                            chunk_index: Some(0),
+                            chunk_index: Some(*chunk_idx as i64),
                             importance: request.importance.unwrap_or(0),
                         },
                         project_id.as_deref(),
                     )
                     .map_err(db_error)?;
-                    db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
+                    db.insert_vector_with_project(chunk_did, vector, project_id.as_deref())
                         .map_err(db_error)?;
+                    inserted_drawer_ids.push(chunk_did.clone());
                 }
             }
             NoveltyAction::Drop => {
@@ -716,6 +884,9 @@ impl MempalMcpServer {
                 response_drawer_id = novelty.near_drawer_id.unwrap_or(drawer_id.clone());
             }
             NoveltyAction::Merge => {
+                // Novelty merge operates on the FULL scrubbed content (not
+                // individual chunks). This preserves the existing merge
+                // semantics: the whole content is appended as supplementary.
                 let target_id = novelty.near_drawer_id.clone().ok_or_else(|| {
                     ErrorData::internal_error("novelty merge missing target", None)
                 })?;
@@ -747,42 +918,51 @@ impl MempalMcpServer {
                     || merged_content.len()
                         > config.ingest_gating.novelty.max_content_bytes_per_drawer;
                 if capped {
-                    db.record_novelty_audit(
+                    self.mcp_ingest_insert_fallback(
+                        &mut db,
                         &drawer_id,
-                        NoveltyAction::Insert,
-                        Some(target_id.as_str()),
-                        novelty.cosine,
-                        Some("insert_due_to_merge_cap"),
+                        &scrubbed_content,
+                        &request,
+                        &chunks,
+                        &vectors,
+                        &chunk_drawer_ids,
+                        &mempal_home,
                         project_id.as_deref(),
-                    )
-                    .map_err(db_error)?;
+                        &target_id,
+                        &novelty,
+                        Some("insert_due_to_merge_cap"),
+                        &mut inserted_drawer_ids,
+                    )?;
                     novelty_action = Some(NoveltyAction::Insert);
                     near_drawer_id = Some(target_id);
-                    if !drawer_exists {
-                        let source_file =
-                            source_file_or_synthetic(&drawer_id, request.source.as_deref());
-                        db.insert_drawer_with_project(
-                            &Drawer {
-                                id: drawer_id.clone(),
-                                content: scrubbed_content.clone(),
-                                wing: request.wing.clone(),
-                                room: request.room.clone(),
-                                source_file: Some(source_file),
-                                source_type: SourceType::Manual,
-                                added_at: current_timestamp(),
-                                chunk_index: Some(0),
-                                importance: request.importance.unwrap_or(0),
-                            },
-                            project_id.as_deref(),
-                        )
-                        .map_err(db_error)?;
-                        db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
-                            .map_err(db_error)?;
-                    }
                 } else {
-                    let merged_vector = match embedder.embed(&[merged_content.as_str()]).await {
-                        Ok(vectors) => match vectors.into_iter().next() {
-                            Some(vector) => vector,
+                    // Re-embed the merged content. Note: merged content may
+                    // exceed max_input_tokens — this is intentional (existing
+                    // merge semantics; the merged drawer is a single unit).
+                    match embedder.embed(&[merged_content.as_str()]).await {
+                        Ok(merged_vectors) => match merged_vectors.into_iter().next() {
+                            Some(merged_vector) => {
+                                ensure_vector_dim_matches(&db, merged_vector.len())?;
+                                db.update_drawer_after_merge(
+                                    &target_id,
+                                    &merged_content,
+                                    &merged_at,
+                                    &merged_vector,
+                                )
+                                .map_err(db_error)?;
+                                db.record_novelty_audit(
+                                    &drawer_id,
+                                    NoveltyAction::Merge,
+                                    Some(target_id.as_str()),
+                                    novelty.cosine,
+                                    novelty.audit_decision,
+                                    project_id.as_deref(),
+                                )
+                                .map_err(db_error)?;
+                                novelty_action = Some(NoveltyAction::Merge);
+                                near_drawer_id = Some(target_id.clone());
+                                response_drawer_id = target_id;
+                            }
                             None => {
                                 tracing::warn!(
                                     target_id = %target_id,
@@ -790,142 +970,63 @@ impl MempalMcpServer {
                                     merged_content_bytes = merged_content.len(),
                                     "novelty merge re-embed returned no vector; fail-open insert"
                                 );
-                                db.record_novelty_audit(
+                                self.mcp_ingest_insert_fallback(
+                                    &mut db,
                                     &drawer_id,
-                                    NoveltyAction::Insert,
-                                    Some(target_id.as_str()),
-                                    novelty.cosine,
-                                    Some("insert_due_to_embed_error"),
+                                    &scrubbed_content,
+                                    &request,
+                                    &chunks,
+                                    &vectors,
+                                    &chunk_drawer_ids,
+                                    &mempal_home,
                                     project_id.as_deref(),
-                                )
-                                .map_err(db_error)?;
+                                    &target_id,
+                                    &novelty,
+                                    Some("insert_due_to_embed_error"),
+                                    &mut inserted_drawer_ids,
+                                )?;
                                 novelty_action = Some(NoveltyAction::Insert);
                                 near_drawer_id = Some(target_id);
-                                if !drawer_exists {
-                                    let source_file = source_file_or_synthetic(
-                                        &drawer_id,
-                                        request.source.as_deref(),
-                                    );
-                                    db.insert_drawer_with_project(
-                                        &Drawer {
-                                            id: drawer_id.clone(),
-                                            content: scrubbed_content.clone(),
-                                            wing: request.wing.clone(),
-                                            room: request.room.clone(),
-                                            source_file: Some(source_file),
-                                            source_type: SourceType::Manual,
-                                            added_at: current_timestamp(),
-                                            chunk_index: Some(0),
-                                            importance: request.importance.unwrap_or(0),
-                                        },
-                                        project_id.as_deref(),
-                                    )
-                                    .map_err(db_error)?;
-                                    db.insert_vector_with_project(
-                                        &drawer_id,
-                                        &vector,
-                                        project_id.as_deref(),
-                                    )
-                                    .map_err(db_error)?;
-                                }
-                                drop(lock_guard);
-                                return Ok(Json(IngestResponse {
-                                    drawer_id: response_drawer_id,
-                                    dropped: false,
-                                    gating_decision,
-                                    novelty_action,
-                                    near_drawer_id,
-                                    duplicate_warning,
-                                    lock_wait_ms,
-                                    system_warnings: current_system_warnings(),
-                                }));
                             }
                         },
                         Err(_error) => {
                             tracing::warn!(
-                                target_id = %target_id,
                                 candidate_drawer_id = %drawer_id,
-                                merged_content_bytes = merged_content.len(),
                                 "novelty merge re-embed failed; fail-open insert"
                             );
-                            db.record_novelty_audit(
+                            self.mcp_ingest_insert_fallback(
+                                &mut db,
                                 &drawer_id,
-                                NoveltyAction::Insert,
-                                Some(target_id.as_str()),
-                                novelty.cosine,
-                                Some("insert_due_to_embed_error"),
+                                &scrubbed_content,
+                                &request,
+                                &chunks,
+                                &vectors,
+                                &chunk_drawer_ids,
+                                &mempal_home,
                                 project_id.as_deref(),
-                            )
-                            .map_err(db_error)?;
+                                &target_id,
+                                &novelty,
+                                Some("insert_due_to_embed_error"),
+                                &mut inserted_drawer_ids,
+                            )?;
                             novelty_action = Some(NoveltyAction::Insert);
                             near_drawer_id = Some(target_id);
-                            if !drawer_exists {
-                                let source_file =
-                                    source_file_or_synthetic(&drawer_id, request.source.as_deref());
-                                db.insert_drawer_with_project(
-                                    &Drawer {
-                                        id: drawer_id.clone(),
-                                        content: scrubbed_content.clone(),
-                                        wing: request.wing.clone(),
-                                        room: request.room.clone(),
-                                        source_file: Some(source_file),
-                                        source_type: SourceType::Manual,
-                                        added_at: current_timestamp(),
-                                        chunk_index: Some(0),
-                                        importance: request.importance.unwrap_or(0),
-                                    },
-                                    project_id.as_deref(),
-                                )
-                                .map_err(db_error)?;
-                                db.insert_vector_with_project(
-                                    &drawer_id,
-                                    &vector,
-                                    project_id.as_deref(),
-                                )
-                                .map_err(db_error)?;
-                            }
-                            drop(lock_guard);
-                            return Ok(Json(IngestResponse {
-                                drawer_id: response_drawer_id,
-                                dropped: false,
-                                gating_decision,
-                                novelty_action,
-                                near_drawer_id,
-                                duplicate_warning,
-                                lock_wait_ms,
-                                system_warnings: current_system_warnings(),
-                            }));
                         }
-                    };
-                    ensure_vector_dim_matches(&db, merged_vector.len())?;
-                    db.update_drawer_after_merge(
-                        &target_id,
-                        &merged_content,
-                        &merged_at,
-                        &merged_vector,
-                    )
-                    .map_err(db_error)?;
-                    db.record_novelty_audit(
-                        &drawer_id,
-                        NoveltyAction::Merge,
-                        Some(target_id.as_str()),
-                        novelty.cosine,
-                        novelty.audit_decision,
-                        project_id.as_deref(),
-                    )
-                    .map_err(db_error)?;
-                    novelty_action = Some(NoveltyAction::Merge);
-                    near_drawer_id = Some(target_id.clone());
-                    response_drawer_id = target_id;
+                    }
                 }
             }
         }
 
-        // lock_guard drops here, releasing the advisory lock.
         drop(lock_guard);
+
+        if !inserted_drawer_ids.is_empty() {
+            response_drawer_id = inserted_drawer_ids[0].clone();
+        }
 
         Ok(Json(IngestResponse {
             drawer_id: response_drawer_id,
+            drawer_ids: inserted_drawer_ids,
+            chunk_count: chunks.len(),
             dropped: false,
             gating_decision,
             novelty_action,

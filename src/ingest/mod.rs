@@ -128,6 +128,23 @@ pub enum IngestError {
     },
 }
 
+/// Chunk content for embedding using the token-aware chunker.
+///
+/// This is the shared entry point for MCP, REST, and any non-file ingest
+/// path that receives pre-processed text. Uses `chunk_text_token_aware`
+/// (plaintext mode) since the caller has already normalized the content.
+///
+/// Returns a `Vec<String>` where each element fits within the embedder's
+/// `max_input_tokens` limit. For short content that fits in a single chunk,
+/// the returned vec has exactly one element.
+pub fn prepare_chunks<E: Embedder + ?Sized>(
+    content: &str,
+    config: &crate::core::config::ChunkerConfig,
+    embedder: &E,
+) -> Vec<String> {
+    chunk_text_token_aware(content, config, embedder, None)
+}
+
 pub async fn ingest_file<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,

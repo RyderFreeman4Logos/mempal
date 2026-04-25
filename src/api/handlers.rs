@@ -79,6 +79,14 @@ struct IngestRequest {
 #[derive(Debug, Serialize)]
 struct IngestResponse {
     drawer_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    drawer_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    chunk_count: usize,
+}
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Serialize)]
@@ -180,53 +188,76 @@ async fn ingest_handler(
         .build()
         .await
         .map_err(internal_error)?;
-    let vector: Vec<f32> = embedder
-        .embed(&[request.content.as_str()])
-        .await
-        .map_err(internal_error)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "embedder returned no vector",
-            )
-        })?;
     let db = Database::open(&state.db_path).map_err(internal_error)?;
     let config = ConfigHandle::current();
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
         .map_err(internal_error)?;
-    let (drawer_id, drawer_exists) = db
-        .resolve_ingest_drawer_id(
-            &request.wing,
-            request.room.as_deref(),
-            &request.content,
-            project_id.as_deref(),
-        )
-        .map_err(internal_error)?;
 
-    if !drawer_exists {
-        let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());
-        db.insert_drawer_with_project(
-            &Drawer {
-                id: drawer_id.clone(),
-                content: request.content,
-                wing: request.wing,
-                room: request.room,
-                source_file: Some(source_file),
-                source_type: SourceType::Manual,
-                added_at: current_timestamp(),
-                chunk_index: Some(0),
-                importance: 0,
-            },
-            project_id.as_deref(),
-        )
-        .map_err(internal_error)?;
-        db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
-            .map_err(internal_error)?;
+    // Chunk the content using the token-aware chunker (issue #57).
+    let chunks =
+        crate::ingest::prepare_chunks(&request.content, &config.chunker, embedder.as_ref());
+    if chunks.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "content produced no chunks",
+        ));
     }
 
-    Ok((StatusCode::CREATED, Json(IngestResponse { drawer_id })))
+    // Embed all chunks in one batch call.
+    let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();
+    let vectors = embedder.embed(&chunk_refs).await.map_err(internal_error)?;
+    if vectors.len() != chunks.len() {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "embedder returned wrong number of vectors",
+        ));
+    }
+
+    // Insert each chunk as a separate drawer.
+    let mut drawer_ids: Vec<String> = Vec::with_capacity(chunks.len());
+    for (chunk_idx, (chunk, vector)) in chunks.iter().zip(vectors.iter()).enumerate() {
+        let (drawer_id, drawer_exists) = db
+            .resolve_ingest_drawer_id(
+                &request.wing,
+                request.room.as_deref(),
+                chunk,
+                project_id.as_deref(),
+            )
+            .map_err(internal_error)?;
+
+        if !drawer_exists {
+            let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());
+            db.insert_drawer_with_project(
+                &Drawer {
+                    id: drawer_id.clone(),
+                    content: chunk.clone(),
+                    wing: request.wing.clone(),
+                    room: request.room.clone(),
+                    source_file: Some(source_file),
+                    source_type: SourceType::Manual,
+                    added_at: current_timestamp(),
+                    chunk_index: Some(chunk_idx as i64),
+                    importance: 0,
+                },
+                project_id.as_deref(),
+            )
+            .map_err(internal_error)?;
+            db.insert_vector_with_project(&drawer_id, vector, project_id.as_deref())
+                .map_err(internal_error)?;
+        }
+        drawer_ids.push(drawer_id);
+    }
+
+    let primary_drawer_id = drawer_ids.first().cloned().unwrap_or_default();
+    let chunk_count = chunks.len();
+    Ok((
+        StatusCode::CREATED,
+        Json(IngestResponse {
+            drawer_id: primary_drawer_id,
+            drawer_ids,
+            chunk_count,
+        }),
+    ))
 }
 
 async fn taxonomy_handler(

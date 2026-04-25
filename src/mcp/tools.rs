@@ -193,7 +193,18 @@ pub struct DeleteResponse {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct IngestResponse {
+    /// ID of the first (or only) drawer created. For backward compatibility,
+    /// callers that only read `drawer_id` continue to work unchanged.
     pub drawer_id: String,
+    /// All drawer IDs created by this ingest (one per chunk). When content
+    /// fits in a single chunk, this contains exactly one element matching
+    /// `drawer_id`. Empty when `dropped` is true.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drawer_ids: Vec<String>,
+    /// Number of chunks the content was split into. Always >= 1 for
+    /// successful ingests; 0 when `dropped` is true.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub chunk_count: usize,
     #[serde(default)]
     pub dropped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,6 +222,10 @@ pub struct IngestResponse {
     pub lock_wait_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+}
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
