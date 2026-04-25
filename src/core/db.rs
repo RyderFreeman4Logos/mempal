@@ -1158,7 +1158,8 @@ impl Database {
             return Ok(Vec::new());
         };
 
-        let sql_limit = limit as i64;
+        let sql_limit =
+            i64::try_from(limit).map_err(|_| DbError::InvalidSourceType("limit".to_string()))?;
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
