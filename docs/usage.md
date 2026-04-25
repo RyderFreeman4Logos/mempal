@@ -95,6 +95,10 @@ Use this when you already know the concepts and just need the right command quic
 | `mempal init <DIR> [--dry-run]` | infer a `wing` and seed initial taxonomy rooms from a project tree |
 | `mempal ingest --wing <WING> <DIR> [--dry-run]` | chunk, embed, and store a project tree |
 | `mempal search <QUERY> [--wing W] [--room R] [--json]` | hybrid search (BM25 + vector + RRF) with tunnel hints |
+| `mempal context <QUERY> [--format json] [--include-evidence]` | assemble mind-model runtime context (`dao_tian -> dao_ren -> shu -> qi`) |
+| `mempal knowledge distill --statement ... --content ... --tier dao_ren --supporting-ref <ID>` | create candidate knowledge from evidence refs |
+| `mempal knowledge promote <ID> --status promoted --verification-ref <ID> --reason ...` | promote bootstrap knowledge into active runtime use |
+| `mempal knowledge demote <ID> --status demoted --evidence-ref <ID> --reason ... --reason-type contradicted` | demote or retire contradicted / obsolete bootstrap knowledge |
 | `mempal wake-up [--format aaak]` | context refresh sorted by importance (not just recency) |
 | `mempal compress <TEXT>` | format arbitrary text as AAAK |
 | `mempal kg add <S> <P> <O> [--source-drawer ID]` | add a knowledge graph triple |
@@ -171,6 +175,46 @@ Every ingest appends a JSONL audit record to:
 ```text
 ~/.mempal/audit.jsonl
 ```
+
+### Bootstrap Knowledge Lifecycle
+
+P18 adds the explicit Stage-1 distillation entry point: create candidate knowledge
+from existing evidence drawers.
+
+```bash
+mempal knowledge distill \
+  --statement "Prefer evidence before asserting project facts" \
+  --content "When answering project-specific questions, cite source-backed memory before making claims." \
+  --tier dao_ren \
+  --supporting-ref drawer_evidence
+```
+
+Distill always creates `status=candidate` and currently only allows `tier=dao_ren`
+or `tier=qi`. `dao_tian` and `shu` are intentionally excluded from candidate
+distill because the current P12 status policy does not allow candidate states
+for those tiers. Use `promote` only after review.
+
+P17 adds manual lifecycle commands for Stage-1 knowledge drawers. P19 hardens
+those commands so lifecycle refs must be existing evidence drawers, not arbitrary
+ids or other knowledge drawers:
+
+```bash
+mempal knowledge promote drawer_knowledge \
+  --status promoted \
+  --verification-ref drawer_evidence \
+  --reason "validated across repeated runs" \
+  --reviewer "human"
+```
+
+```bash
+mempal knowledge demote drawer_knowledge \
+  --status demoted \
+  --evidence-ref drawer_counterexample \
+  --reason "new evidence contradicts this heuristic" \
+  --reason-type contradicted
+```
+
+Lifecycle commands only update existing `memory_kind=knowledge` drawers. They validate that `--verification-ref` / `--evidence-ref` values start with `drawer_`, exist, and point to `memory_kind=evidence`. They do not change content, re-embed vectors, bump schema, or add Phase-2 `knowledge_cards`. Successful distill and lifecycle changes append JSONL audit entries.
 
 ### 4. Search
 
@@ -434,10 +478,11 @@ mempal serve --mcp
 
 If `mempal` was built without the `rest` feature, plain `mempal serve` behaves the same way.
 
-The MCP server exposes nine tools:
+The MCP server exposes eleven tools:
 
 - `mempal_status` — state + protocol + AAAK spec
 - `mempal_search` — hybrid search (BM25 + vector + RRF) with tunnel hints and AAAK-derived structured signals (`entities` / `topics` / `flags` / `emotions` / `importance_stars`)
+- `mempal_context` — mind-model runtime context pack (`dao_tian -> dao_ren -> shu -> qi`, evidence opt-in); guides workflow / skill / tool choice but never executes skills
 - `mempal_ingest` — store memories with optional importance (0-5) and dry_run
 - `mempal_delete` — soft-delete with audit
 - `mempal_taxonomy` — list or edit routing keywords
@@ -445,8 +490,9 @@ The MCP server exposes nine tools:
 - `mempal_tunnels` — cross-wing room discovery
 - `mempal_peek_partner` — read the partner coding agent's live session (Claude ↔ Codex); pure read, never writes to mempal
 - `mempal_cowork_push` — send a short handoff message (≤ 8 KB) to the partner agent's inbox; delivered at the partner's next UserPromptSubmit via a drain hook
+- `mempal_fact_check` — offline contradiction detection against KG triples and known entities
 
-The server also embeds MEMORY_PROTOCOL (10 behavioral rules) in the MCP `initialize.instructions` field so any MCP client learns the workflow on connect — zero configuration.
+The server also embeds MEMORY_PROTOCOL (behavioral rules) in the MCP `initialize.instructions` field so any MCP client learns the workflow on connect — zero configuration. The protocol treats `mempal_context` as guidance for choosing an approach, workflow, skill, or tool; `trigger_hints` are bias metadata only and never override system, user, repo, or client-native skill rules.
 
 Example request shapes:
 

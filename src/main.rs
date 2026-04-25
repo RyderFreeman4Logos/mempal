@@ -13,18 +13,23 @@ use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::api::{ApiState, DEFAULT_REST_ADDR, serve as serve_rest_api};
 use mempal::context::{ContextPack, ContextRequest, assemble_context};
 use mempal::core::{
+    anchor,
     config::Config,
     db::Database,
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
     types::{
-        AnchorKind, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, TaxonomyEntry,
-        TunnelEndpoint,
+        AnchorKind, BootstrapIdentityParts, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain,
+        MemoryKind, SourceType, TaxonomyEntry, TriggerHints, TunnelEndpoint,
     },
-    utils::{build_triple_id, current_timestamp, format_tunnel_endpoint},
+    utils::{
+        build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp,
+        format_tunnel_endpoint, knowledge_source_file,
+    },
 };
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder};
 use mempal::ingest::{
     IngestOptions, IngestStats, ingest_dir_with_options, ingest_file_with_options,
+    normalize::CURRENT_NORMALIZE_VERSION,
     reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
 };
 use mempal::mcp::MempalMcpServer;
@@ -135,6 +140,10 @@ enum Commands {
         #[command(subcommand)]
         command: KgCommands,
     },
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommands,
+    },
     Tunnels {
         #[command(subcommand)]
         command: Option<TunnelCommands>,
@@ -238,6 +247,69 @@ enum KgCommands {
     },
     Stats,
     List,
+}
+
+#[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
+enum KnowledgeCommands {
+    Distill {
+        #[arg(long)]
+        statement: String,
+        #[arg(long)]
+        content: String,
+        #[arg(long)]
+        tier: String,
+        #[arg(long = "supporting-ref", required = true)]
+        supporting_refs: Vec<String>,
+        #[arg(long, default_value = "mempal")]
+        wing: String,
+        #[arg(long, default_value = "knowledge")]
+        room: String,
+        #[arg(long, default_value = "project")]
+        domain: String,
+        #[arg(long, default_value = "general")]
+        field: String,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long = "scope-constraints")]
+        scope_constraints: Option<String>,
+        #[arg(long = "counterexample-ref")]
+        counterexample_refs: Vec<String>,
+        #[arg(long = "teaching-ref")]
+        teaching_refs: Vec<String>,
+        #[arg(long = "intent-tag")]
+        intent_tags: Vec<String>,
+        #[arg(long = "workflow-bias")]
+        workflow_bias: Vec<String>,
+        #[arg(long = "tool-need")]
+        tool_needs: Vec<String>,
+        #[arg(long, default_value_t = 2)]
+        importance: i32,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Promote {
+        drawer_id: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long = "verification-ref", required = true)]
+        verification_refs: Vec<String>,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        reviewer: Option<String>,
+    },
+    Demote {
+        drawer_id: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long = "evidence-ref", required = true)]
+        evidence_refs: Vec<String>,
+        #[arg(long)]
+        reason: String,
+        #[arg(long = "reason-type")]
+        reason_type: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -423,6 +495,7 @@ async fn run() -> Result<()> {
             dry_run,
         } => reindex_command(&db, &config, stale, force, dry_run).await,
         Commands::Kg { command } => kg_command(&db, command),
+        Commands::Knowledge { command } => knowledge_command(&db, &config, command).await,
         Commands::Tunnels { command } => tunnels_command(&db, command),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
         Commands::Serve { mcp } => serve_command(&config, mcp).await,
@@ -1109,6 +1182,440 @@ fn print_reindex_report(report: ReindexReport, dry_run: bool) {
         report.skipped_existing_chunks,
         report.skipped_missing_drawers
     );
+}
+
+async fn knowledge_command(
+    db: &Database,
+    config: &Config,
+    command: KnowledgeCommands,
+) -> Result<()> {
+    match command {
+        KnowledgeCommands::Distill {
+            statement,
+            content,
+            tier,
+            supporting_refs,
+            wing,
+            room,
+            domain,
+            field,
+            cwd,
+            scope_constraints,
+            counterexample_refs,
+            teaching_refs,
+            intent_tags,
+            workflow_bias,
+            tool_needs,
+            importance,
+            dry_run,
+        } => {
+            if !(0..=5).contains(&importance) {
+                bail!("importance must be between 0 and 5");
+            }
+            let statement = trim_required(&statement, "statement")?;
+            let content = trim_required(&content, "content")?;
+            let wing = trim_required(&wing, "wing")?;
+            let room = trim_required(&room, "room")?;
+            let field = trim_required(&field, "field")?;
+            let domain = parse_domain(&domain)?;
+            let tier = parse_distill_tier(&tier)?;
+            let memory_kind = MemoryKind::Knowledge;
+            let status = KnowledgeStatus::Candidate;
+            let verification_refs: &[String] = &[];
+
+            let supporting_refs = normalized_nonempty_strings(&supporting_refs);
+            let counterexample_refs = normalized_nonempty_strings(&counterexample_refs);
+            let teaching_refs = normalized_nonempty_strings(&teaching_refs);
+            validate_distill_refs(db, "supporting_refs", &supporting_refs)?;
+            validate_distill_refs(db, "counterexample_refs", &counterexample_refs)?;
+            validate_distill_refs(db, "teaching_refs", &teaching_refs)?;
+
+            let scope_constraints = scope_constraints
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            let trigger_hints = build_trigger_hints(intent_tags, workflow_bias, tool_needs);
+            let anchor = distill_anchor(&domain, cwd.as_deref())?;
+            anchor::validate_anchor_domain(&domain, &anchor.anchor_kind)
+                .map_err(|message| anyhow::anyhow!(message.to_string()))?;
+
+            let drawer_id = build_bootstrap_drawer_id_from_parts(
+                &wing,
+                Some(&room),
+                &content,
+                BootstrapIdentityParts {
+                    memory_kind: &memory_kind,
+                    domain: &domain,
+                    field: &field,
+                    anchor_kind: &anchor.anchor_kind,
+                    anchor_id: &anchor.anchor_id,
+                    parent_anchor_id: anchor.parent_anchor_id.as_deref(),
+                    provenance: None,
+                    statement: Some(&statement),
+                    tier: Some(&tier),
+                    status: Some(&status),
+                    supporting_refs: &supporting_refs,
+                    counterexample_refs: &counterexample_refs,
+                    teaching_refs: &teaching_refs,
+                    verification_refs,
+                    scope_constraints: scope_constraints.as_deref(),
+                    trigger_hints: trigger_hints.as_ref(),
+                },
+            );
+
+            if dry_run {
+                println!("dry_run=true drawer_id={drawer_id}");
+                return Ok(());
+            }
+
+            if db
+                .drawer_exists(&drawer_id)
+                .context("failed to check existing distilled drawer")?
+            {
+                println!("drawer_id={drawer_id} created=false");
+                return Ok(());
+            }
+
+            let embedder = build_embedder(config).await?;
+            let vector = embedder
+                .embed(&[content.as_str()])
+                .await
+                .context("failed to embed distilled knowledge")?
+                .into_iter()
+                .next()
+                .context("embedder returned no vector")?;
+            let drawer = Drawer {
+                id: drawer_id.clone(),
+                content,
+                wing,
+                room: Some(room),
+                source_file: Some(knowledge_source_file(&domain, &field, &tier, &statement)),
+                source_type: SourceType::Manual,
+                added_at: current_timestamp(),
+                chunk_index: Some(0),
+                normalize_version: CURRENT_NORMALIZE_VERSION,
+                importance,
+                memory_kind: MemoryKind::Knowledge,
+                domain,
+                field,
+                anchor_kind: anchor.anchor_kind,
+                anchor_id: anchor.anchor_id,
+                parent_anchor_id: anchor.parent_anchor_id,
+                provenance: None,
+                statement: Some(statement),
+                tier: Some(tier),
+                status: Some(status),
+                supporting_refs: supporting_refs.clone(),
+                counterexample_refs: counterexample_refs.clone(),
+                teaching_refs: teaching_refs.clone(),
+                verification_refs: Vec::new(),
+                scope_constraints,
+                trigger_hints,
+            };
+            db.insert_drawer(&drawer)
+                .context("failed to insert distilled knowledge drawer")?;
+            db.insert_vector(&drawer_id, &vector)
+                .context("failed to insert distilled knowledge vector")?;
+            append_audit_entry(
+                db,
+                "knowledge_distill",
+                &serde_json::json!({
+                    "drawer_id": drawer_id,
+                    "statement": drawer.statement,
+                    "tier": drawer.tier.as_ref().map(knowledge_tier_slug),
+                    "status": drawer.status.as_ref().map(knowledge_status_slug),
+                    "supporting_refs": supporting_refs,
+                    "counterexample_refs": counterexample_refs,
+                    "teaching_refs": teaching_refs,
+                }),
+            )
+            .context("failed to append audit log")?;
+            println!("drawer_id={drawer_id} created=true");
+        }
+        KnowledgeCommands::Promote {
+            drawer_id,
+            status,
+            verification_refs,
+            reason,
+            reviewer,
+        } => {
+            let target_status = parse_lifecycle_status(&status)?;
+            if !matches!(
+                target_status,
+                KnowledgeStatus::Promoted | KnowledgeStatus::Canonical
+            ) {
+                bail!("promote status must be promoted or canonical");
+            }
+            let drawer = load_lifecycle_knowledge_drawer(db, &drawer_id)?;
+            validate_tier_status(
+                drawer.tier.as_ref().expect("knowledge drawer has tier"),
+                &target_status,
+            )?;
+            validate_lifecycle_refs(db, &verification_refs)?;
+
+            let old_status = drawer.status.clone().expect("knowledge drawer has status");
+            let mut updated_verification_refs = drawer.verification_refs.clone();
+            append_unique_refs(&mut updated_verification_refs, &verification_refs);
+            db.update_knowledge_lifecycle(
+                &drawer_id,
+                &target_status,
+                &updated_verification_refs,
+                &drawer.counterexample_refs,
+            )
+            .context("failed to update knowledge lifecycle")?;
+            append_audit_entry(
+                db,
+                "knowledge_promote",
+                &serde_json::json!({
+                    "drawer_id": drawer_id,
+                    "old_status": knowledge_status_slug(&old_status),
+                    "new_status": knowledge_status_slug(&target_status),
+                    "verification_refs": verification_refs,
+                    "reason": reason,
+                    "reviewer": reviewer,
+                }),
+            )
+            .context("failed to append audit log")?;
+            println!(
+                "promoted {}: {} -> {}",
+                drawer_id,
+                knowledge_status_slug(&old_status),
+                knowledge_status_slug(&target_status)
+            );
+        }
+        KnowledgeCommands::Demote {
+            drawer_id,
+            status,
+            evidence_refs,
+            reason,
+            reason_type,
+        } => {
+            let target_status = parse_lifecycle_status(&status)?;
+            if !matches!(
+                target_status,
+                KnowledgeStatus::Demoted | KnowledgeStatus::Retired
+            ) {
+                bail!("demote status must be demoted or retired");
+            }
+            validate_demote_reason_type(&reason_type)?;
+            let drawer = load_lifecycle_knowledge_drawer(db, &drawer_id)?;
+            validate_tier_status(
+                drawer.tier.as_ref().expect("knowledge drawer has tier"),
+                &target_status,
+            )?;
+            validate_lifecycle_refs(db, &evidence_refs)?;
+
+            let old_status = drawer.status.clone().expect("knowledge drawer has status");
+            let mut updated_counterexample_refs = drawer.counterexample_refs.clone();
+            append_unique_refs(&mut updated_counterexample_refs, &evidence_refs);
+            db.update_knowledge_lifecycle(
+                &drawer_id,
+                &target_status,
+                &drawer.verification_refs,
+                &updated_counterexample_refs,
+            )
+            .context("failed to update knowledge lifecycle")?;
+            append_audit_entry(
+                db,
+                "knowledge_demote",
+                &serde_json::json!({
+                    "drawer_id": drawer_id,
+                    "old_status": knowledge_status_slug(&old_status),
+                    "new_status": knowledge_status_slug(&target_status),
+                    "evidence_refs": evidence_refs,
+                    "reason": reason,
+                    "reason_type": reason_type,
+                }),
+            )
+            .context("failed to append audit log")?;
+            println!(
+                "demoted {}: {} -> {}",
+                drawer_id,
+                knowledge_status_slug(&old_status),
+                knowledge_status_slug(&target_status)
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn trim_required(value: &str, field: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalized_nonempty_strings(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect()
+}
+
+fn parse_distill_tier(value: &str) -> Result<KnowledgeTier> {
+    match value.trim() {
+        "dao_ren" => Ok(KnowledgeTier::DaoRen),
+        "qi" => Ok(KnowledgeTier::Qi),
+        "dao_tian" | "shu" => bail!("distill only allows candidate dao_ren or qi"),
+        other => bail!("unsupported knowledge tier: {other}"),
+    }
+}
+
+fn build_trigger_hints(
+    intent_tags: Vec<String>,
+    workflow_bias: Vec<String>,
+    tool_needs: Vec<String>,
+) -> Option<TriggerHints> {
+    let intent_tags = normalized_nonempty_strings(&intent_tags);
+    let workflow_bias = normalized_nonempty_strings(&workflow_bias);
+    let tool_needs = normalized_nonempty_strings(&tool_needs);
+    if intent_tags.is_empty() && workflow_bias.is_empty() && tool_needs.is_empty() {
+        return None;
+    }
+    Some(TriggerHints {
+        intent_tags,
+        workflow_bias,
+        tool_needs,
+    })
+}
+
+fn distill_anchor(domain: &MemoryDomain, cwd: Option<&Path>) -> Result<anchor::DerivedAnchor> {
+    if matches!(domain, MemoryDomain::Global) {
+        return Ok(anchor::DerivedAnchor {
+            anchor_kind: AnchorKind::Global,
+            anchor_id: "global://default".to_string(),
+            parent_anchor_id: None,
+        });
+    }
+    let cwd = match cwd {
+        Some(path) => path.to_path_buf(),
+        None => env::current_dir().context("failed to read current directory")?,
+    };
+    anchor::derive_anchor_from_cwd(Some(&cwd)).context("failed to derive distill anchor")
+}
+
+fn validate_distill_refs(db: &Database, field: &str, refs: &[String]) -> Result<()> {
+    if field == "supporting_refs" && refs.is_empty() {
+        bail!("supporting_refs must not be empty");
+    }
+    for drawer_id in refs {
+        if !drawer_id.starts_with("drawer_") {
+            bail!("{field} must contain drawer ids");
+        }
+        let drawer = db
+            .get_drawer(drawer_id)
+            .with_context(|| format!("failed to load ref drawer {drawer_id}"))?
+            .with_context(|| format!("ref drawer not found: {drawer_id}"))?;
+        if drawer.memory_kind != MemoryKind::Evidence {
+            bail!("{field} must point to evidence drawers");
+        }
+    }
+    Ok(())
+}
+
+fn load_lifecycle_knowledge_drawer(
+    db: &Database,
+    drawer_id: &str,
+) -> Result<mempal::core::types::Drawer> {
+    let drawer = db
+        .get_drawer(drawer_id)
+        .context("failed to look up drawer")?
+        .with_context(|| format!("drawer not found: {drawer_id}"))?;
+    if drawer.memory_kind != MemoryKind::Knowledge {
+        bail!("knowledge lifecycle requires a knowledge drawer");
+    }
+    if drawer.tier.is_none() || drawer.status.is_none() {
+        bail!("knowledge lifecycle requires tier and status metadata");
+    }
+    Ok(drawer)
+}
+
+fn parse_lifecycle_status(value: &str) -> Result<KnowledgeStatus> {
+    match value {
+        "candidate" => Ok(KnowledgeStatus::Candidate),
+        "promoted" => Ok(KnowledgeStatus::Promoted),
+        "canonical" => Ok(KnowledgeStatus::Canonical),
+        "demoted" => Ok(KnowledgeStatus::Demoted),
+        "retired" => Ok(KnowledgeStatus::Retired),
+        other => bail!("unsupported knowledge status: {other}"),
+    }
+}
+
+fn validate_tier_status(tier: &KnowledgeTier, status: &KnowledgeStatus) -> Result<()> {
+    let allowed = match tier {
+        KnowledgeTier::DaoTian => &[KnowledgeStatus::Canonical, KnowledgeStatus::Demoted][..],
+        KnowledgeTier::DaoRen => &[
+            KnowledgeStatus::Candidate,
+            KnowledgeStatus::Promoted,
+            KnowledgeStatus::Demoted,
+            KnowledgeStatus::Retired,
+        ][..],
+        KnowledgeTier::Shu => &[
+            KnowledgeStatus::Promoted,
+            KnowledgeStatus::Demoted,
+            KnowledgeStatus::Retired,
+        ][..],
+        KnowledgeTier::Qi => &[
+            KnowledgeStatus::Candidate,
+            KnowledgeStatus::Promoted,
+            KnowledgeStatus::Demoted,
+            KnowledgeStatus::Retired,
+        ][..],
+    };
+
+    if allowed.contains(status) {
+        return Ok(());
+    }
+
+    match tier {
+        KnowledgeTier::DaoTian => bail!("dao_tian only allows canonical or demoted"),
+        KnowledgeTier::DaoRen => {
+            bail!("dao_ren only allows candidate, promoted, demoted, or retired")
+        }
+        KnowledgeTier::Shu => bail!("shu only allows promoted, demoted, or retired"),
+        KnowledgeTier::Qi => bail!("qi only allows candidate, promoted, demoted, or retired"),
+    }
+}
+
+fn validate_demote_reason_type(value: &str) -> Result<()> {
+    match value {
+        "contradicted" | "obsolete" | "superseded" | "out_of_scope" | "unsafe" => Ok(()),
+        other => bail!("unsupported demote reason_type: {other}"),
+    }
+}
+
+fn validate_lifecycle_refs(db: &Database, refs: &[String]) -> Result<()> {
+    if refs.is_empty() {
+        bail!("at least one lifecycle evidence ref is required");
+    }
+    for drawer_id in refs {
+        if !drawer_id.starts_with("drawer_") {
+            bail!("lifecycle refs must contain drawer ids");
+        }
+        let drawer = db
+            .get_drawer(drawer_id)
+            .with_context(|| format!("failed to load ref drawer {drawer_id}"))?
+            .with_context(|| format!("ref drawer not found: {drawer_id}"))?;
+        if drawer.memory_kind != MemoryKind::Evidence {
+            bail!("lifecycle refs must point to evidence drawers");
+        }
+    }
+    Ok(())
+}
+
+fn append_unique_refs(target: &mut Vec<String>, refs: &[String]) {
+    for item in refs {
+        if !target.iter().any(|existing| existing == item) {
+            target.push(item.clone());
+        }
+    }
 }
 
 fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
