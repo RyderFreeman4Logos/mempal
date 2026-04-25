@@ -221,7 +221,10 @@ async fn test_alert_script_args() {
     assert!(args.contains("backend down"));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Uses tokio mock clock (`start_paused = true`) so retry intervals are
+/// deterministic regardless of real CPU load. The `current_thread` runtime
+/// auto-advances time when all tasks are blocked on timers.
+#[tokio::test(start_paused = true)]
 async fn test_retry_interval_hot_reload() {
     let _guard = test_guard().await;
     let env = TestEnv::new(&config_text(
@@ -233,7 +236,8 @@ async fn test_retry_interval_hot_reload() {
     status.reset_for_tests();
     let times = Arc::new(Mutex::new(Vec::<i64>::new()));
     let attempts = Arc::new(Mutex::new(0usize));
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
+    let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
 
     let task: tokio::task::JoinHandle<mempal::embed::Result<Vec<Vec<f32>>>> = tokio::spawn({
         let times = Arc::clone(&times);
@@ -242,6 +246,7 @@ async fn test_retry_interval_hot_reload() {
             retry_embed_operation(status, None, || {
                 let times = Arc::clone(&times);
                 let attempts = Arc::clone(&attempts);
+                let attempt_tx = attempt_tx.clone();
                 async move {
                     times
                         .lock()
@@ -249,8 +254,11 @@ async fn test_retry_interval_hot_reload() {
                         .push(start.elapsed().as_millis() as i64);
                     let mut guard = attempts.lock().expect("attempts mutex");
                     *guard += 1;
-                    if *guard < 4 {
-                        Err(EmbedError::Runtime(format!("synthetic failure {}", *guard)))
+                    let n = *guard;
+                    drop(guard);
+                    let _ = attempt_tx.send(n);
+                    if n < 4 {
+                        Err(EmbedError::Runtime(format!("synthetic failure {n}")))
                     } else {
                         Ok(vec![vec![0.1, 0.2, 0.3]])
                     }
@@ -260,9 +268,9 @@ async fn test_retry_interval_hot_reload() {
         }
     });
 
-    wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
-        times.lock().expect("times mutex").len() >= 2
-    });
+    // Wait for attempt 1 and 2 before hot-reloading
+    let _ = attempt_rx.recv().await.expect("attempt 1");
+    let _ = attempt_rx.recv().await.expect("attempt 2");
 
     let changed = fs::read_to_string(&env.config_path)
         .expect("read config")
@@ -273,26 +281,82 @@ async fn test_retry_interval_hot_reload() {
     let _ = task.await.expect("join retry task").expect("retry success");
     let millis = times.lock().expect("times mutex").clone();
     assert_eq!(millis.len(), 4);
-    // Tolerance widened to 1200ms — retry scheduler observes ~1s systematic
-    // drift under parallel-build CPU load (first attempt's config snapshot
-    // may have been read before the test's interval_secs=1 hot-reload
-    // applied, making the first retry interval use the 2s default). The
-    // ±1200 bound still catches hot-reload not firing (>3s drift at each
-    // later step) while tolerating the race. Tracked separately.
-    assert!(
-        (millis[1] - 1_000).abs() <= 1_200,
-        "second attempt: {:?}",
-        millis
+    assert_eq!(millis[0], 0, "first attempt immediate: {millis:?}");
+    assert_eq!(millis[1], 1_000, "second attempt after 1s: {millis:?}");
+    assert_eq!(millis[2], 4_000, "third attempt after 3s: {millis:?}");
+    assert_eq!(millis[3], 7_000, "fourth attempt after 3s: {millis:?}");
+}
+
+/// Verifies that a config hot-reload mid-retry-loop takes effect on the next
+/// iteration rather than waiting for a process restart. Starts with 5s
+/// interval, hot-reloads to 1s after the first attempt, and asserts the second
+/// attempt fires at ~1s (not 5s).
+#[tokio::test(start_paused = true)]
+async fn test_retry_config_snapshot_per_iteration() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(
+        &config_text(
+            Path::new("/tmp/mempal-per-iter.db"),
+            "http://127.0.0.1:18002/v1",
+            "",
+        )
+        .replace("interval_secs = 1", "interval_secs = 5"),
     );
-    assert!(
-        (millis[2] - 4_000).abs() <= 1_200,
-        "third attempt: {:?}",
-        millis
+    let status = global_embed_status();
+    status.reset_for_tests();
+    let times = Arc::new(Mutex::new(Vec::<i64>::new()));
+    let attempts = Arc::new(Mutex::new(0usize));
+    let start = tokio::time::Instant::now();
+    let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+
+    let task: tokio::task::JoinHandle<mempal::embed::Result<Vec<Vec<f32>>>> = tokio::spawn({
+        let times = Arc::clone(&times);
+        let attempts = Arc::clone(&attempts);
+        async move {
+            retry_embed_operation(status, None, || {
+                let times = Arc::clone(&times);
+                let attempts = Arc::clone(&attempts);
+                let tx = attempt_tx.clone();
+                async move {
+                    times
+                        .lock()
+                        .expect("times mutex")
+                        .push(start.elapsed().as_millis() as i64);
+                    let mut guard = attempts.lock().expect("attempts mutex");
+                    *guard += 1;
+                    let n = *guard;
+                    drop(guard);
+                    let _ = tx.send(n);
+                    if n < 3 {
+                        Err(EmbedError::Runtime(format!("synthetic failure {n}")))
+                    } else {
+                        Ok(vec![vec![0.1, 0.2, 0.3]])
+                    }
+                }
+            })
+            .await
+        }
+    });
+
+    // After first attempt, hot-reload interval from 5s to 1s
+    let _ = attempt_rx.recv().await.expect("attempt 1");
+    let changed = fs::read_to_string(&env.config_path)
+        .expect("read config")
+        .replace("interval_secs = 5", "interval_secs = 1");
+    write_config(&env.config_path, &changed);
+    ConfigHandle::bootstrap(&env.config_path).expect("manual hot reload");
+
+    let _ = task.await.expect("join retry task").expect("retry success");
+    let millis = times.lock().expect("times mutex").clone();
+    assert_eq!(millis.len(), 3);
+    assert_eq!(millis[0], 0, "first attempt immediate: {millis:?}");
+    assert_eq!(
+        millis[1], 1_000,
+        "second attempt should use reloaded 1s: {millis:?}"
     );
-    assert!(
-        (millis[3] - 7_000).abs() <= 1_200,
-        "fourth attempt: {:?}",
-        millis
+    assert_eq!(
+        millis[2], 2_000,
+        "third attempt after another 1s: {millis:?}"
     );
 }
 

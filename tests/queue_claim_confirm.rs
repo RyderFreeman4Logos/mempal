@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::Database;
 use mempal::core::queue::{LAST_ERROR_MAX_BYTES, PendingMessageStore, QueueConfig};
@@ -163,6 +163,12 @@ fn test_max_retries_marks_failed_permanently() {
     );
 }
 
+/// Verifies concurrent enqueue doesn't deadlock or starve.
+///
+/// The outer `timeout(5s)` acts as a hang guard -- if any task is starved by
+/// SQLite lock contention the timeout trips. We intentionally avoid per-task
+/// wall-clock assertions because those are inherently flaky under heavy CPU
+/// load (parallel cargo builds, CI, etc.).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_enqueue_does_not_block() {
     let (_tmp, _db_path, store) = new_store();
@@ -177,7 +183,6 @@ async fn test_concurrent_enqueue_does_not_block() {
         let barrier = Arc::clone(&barrier);
         join_set.spawn(async move {
             barrier.wait().await;
-            let started = Instant::now();
             tokio::task::spawn_blocking(move || {
                 for item_index in 0..items_per_task {
                     store
@@ -190,31 +195,20 @@ async fn test_concurrent_enqueue_does_not_block() {
             })
             .await
             .expect("join blocking enqueue worker");
-            started.elapsed()
         });
     }
 
     barrier.wait().await;
-    let latencies = timeout(Duration::from_secs(5), async move {
-        let mut elapsed = Vec::with_capacity(task_count);
+    timeout(Duration::from_secs(5), async move {
+        let mut completed = 0usize;
         while let Some(result) = join_set.join_next().await {
-            elapsed.push(result.expect("task result"));
+            result.expect("task result");
+            completed += 1;
         }
-        elapsed
+        assert_eq!(completed, task_count);
     })
     .await
     .expect("concurrent enqueue timed out");
-
-    for latency in &latencies {
-        // Wall-clock tolerance widened to 4500ms (just under the outer 5s
-        // timeout) to absorb CPU contention from concurrent rustc/cargo runs;
-        // the assertion still fails fast on real per-task starvation because
-        // the timeout(5s) wrapper above would trip first if any task hung.
-        assert!(
-            latency.as_millis() < 4_500,
-            "enqueue task should stay millisecond-level, got {latency:?}"
-        );
-    }
 
     let stats = store.stats().expect("stats");
     assert_eq!(stats.pending, (task_count * items_per_task) as u64);
