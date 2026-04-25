@@ -229,9 +229,12 @@ pub(crate) fn inject_tunnel_hints_with_cap(
             if fanout_cap == 0 {
                 continue;
             }
-            if let Ok(drawers) =
-                db.tunnel_drawers_for_room(room, &result.drawer_id, scope.project_id.as_deref())
-            {
+            if let Ok(drawers) = db.tunnel_drawers_for_room(
+                room,
+                &result.drawer_id,
+                scope.project_id.as_deref(),
+                fanout_cap.saturating_add(1),
+            ) {
                 let mut added_from_this_result = 0usize;
                 for tunnel in drawers {
                     if added_from_this_result >= fanout_cap {
@@ -744,16 +747,37 @@ mod tests {
         let mut results = vec![make_result(&alpha), make_result(&gamma)];
         inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 2);
 
-        // Each of the 2 source results contributes up to 2 tunnel drawers, but
-        // `seen_ids` dedup means the second source result sees the same
-        // beta-{0,1} already inserted → its cap budget still holds 2 fresh rows.
-        // With 10 beta drawers available, we should see 2 (alpha) + 2 (gamma) = 4 tunnel rows
-        // total, plus 2 source rows = 6.
+        // SQL LIMIT = fanout_cap + 1 = 3.  Alpha's query returns 3 beta rows
+        // (beta-9, beta-8, beta-7 DESC order); alpha's Rust cap adds 2 (beta-9,
+        // beta-8).  Gamma's query also returns the same 3 rows; beta-9 and
+        // beta-8 are already in `seen_ids`, so only beta-7 is fresh → 1 tunnel
+        // row from gamma.  Total = 2 source + 2 (alpha) + 1 (gamma) = 5.
         assert_eq!(
             results.len(),
-            6,
-            "expected 2 source + 2 tunnel per source = 6, got {}",
+            5,
+            "expected 2 source + 2 (alpha) + 1 (gamma) = 5, got {}",
             results.len()
+        );
+    }
+
+    #[test]
+    fn tunnel_drawers_for_room_sql_limit_bounds_returned_rows() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        let source = make_drawer("alpha-1", "alpha", "decision");
+        // Insert 20 beta drawers — well above any reasonable fanout cap.
+        seed_cross_project(&db, &source, 20);
+
+        let limit: usize = 5;
+        let drawers = db
+            .tunnel_drawers_for_room("decision", "alpha-1", Some("proj-a"), limit)
+            .expect("query");
+
+        assert_eq!(
+            drawers.len(),
+            limit,
+            "SQL LIMIT should bound returned rows to {limit}, got {}",
+            drawers.len()
         );
     }
 

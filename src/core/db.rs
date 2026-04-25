@@ -1152,11 +1152,13 @@ impl Database {
         room: &str,
         exclude_drawer_id: &str,
         current_project_id: Option<&str>,
+        limit: usize,
     ) -> Result<Vec<TunnelDrawer>, DbError> {
         let Some(current_project_id) = current_project_id else {
             return Ok(Vec::new());
         };
 
+        let sql_limit = limit as i64;
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
@@ -1168,23 +1170,27 @@ impl Database {
               AND project_id IS NOT NULL
               AND project_id != ?3
             ORDER BY CAST(added_at AS INTEGER) DESC, id DESC
+            LIMIT ?4
             "#,
         )?;
         let rows = stmt
-            .query_map([room, exclude_drawer_id, current_project_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, i32>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            })?
+            .query_map(
+                rusqlite::params![room, exclude_drawer_id, current_project_id, sql_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, i32>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(
