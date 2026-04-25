@@ -14,6 +14,7 @@ pub struct OpenAiCompatibleEmbedder {
     endpoint: String,
     model: String,
     dimensions: usize,
+    max_input_tokens: Option<usize>,
 }
 
 impl OpenAiCompatibleEmbedder {
@@ -64,6 +65,7 @@ impl OpenAiCompatibleEmbedder {
             endpoint,
             model,
             dimensions: config.embed.resolved_openai_dim(),
+            max_input_tokens: config.embed.openai_compat.max_input_tokens,
         })
     }
 
@@ -141,6 +143,10 @@ impl Embedder for OpenAiCompatibleEmbedder {
 
     fn name(&self) -> &str {
         "openai_compat"
+    }
+
+    fn max_input_tokens(&self) -> Option<usize> {
+        self.max_input_tokens
     }
 }
 

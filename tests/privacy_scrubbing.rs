@@ -9,7 +9,7 @@ use mempal::core::config::{Config, ConfigHandle, ScrubStats};
 use mempal::core::db::Database;
 use mempal::core::utils::build_drawer_id;
 use mempal::embed::{EmbedError, Embedder};
-use mempal::ingest::{IngestOptions, chunk::chunk_text, ingest_file_with_options};
+use mempal::ingest::{IngestOptions, chunk::chunk_text_token_aware, ingest_file_with_options};
 use mempal::mcp::{MempalMcpServer, StatusResponse};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -342,7 +342,13 @@ async fn test_scrub_catches_cross_chunk_secret() {
 
     let embedder = RecordingEmbedder::default();
     let secret = "sk-abcdef1234567890abcdef1234567890abcd";
-    let content = format!("{}{} trailing text after boundary", "g".repeat(798), secret);
+    // Padding must exceed token-aware chunker target (~512 tokens ≈ 1280 chars)
+    // so the secret falls near a chunk boundary and content splits into ≥2 chunks.
+    let content = format!(
+        "{}{} trailing text after boundary",
+        "g".repeat(2560),
+        secret
+    );
     let file = env.fixture("cross-chunk.txt", &content);
 
     let stats = ingest_file_with_options(&env.db(), &embedder, &file, "test", Default::default())
@@ -594,9 +600,14 @@ async fn test_scrub_does_not_affect_storage_invariants() {
     let env = TestEnv::new(true, false);
     let embedder = RecordingEmbedder::default();
     let secret = fake_openai_key();
-    let original = format!("{} {} tail", "x".repeat(820), secret);
+    // Padding must exceed token-aware chunker target (~512 tokens ≈ 1280 chars)
+    // so the scrubbed content still splits into ≥2 chunks.
+    let original = format!("{} {} tail", "x".repeat(2600), secret);
     let expected_scrubbed = ConfigHandle::scrub_content(&original);
-    let expected_chunks = chunk_text(&expected_scrubbed, 800, 100);
+    let config = Config::load_from(&env.mempal_home.join("config.toml"))
+        .expect("reload config for chunker settings");
+    let expected_chunks =
+        chunk_text_token_aware(&expected_scrubbed, &config.chunker, &embedder, None);
     assert!(expected_chunks.len() >= 2, "{expected_chunks:?}");
     let file = env.fixture("storage-invariants.txt", &original);
 

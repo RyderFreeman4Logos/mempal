@@ -23,13 +23,10 @@ use crate::ingest::gating::{PrototypeClassifier, evaluate_tier1, evaluate_tier2}
 use thiserror::Error;
 
 use crate::ingest::{
-    chunk::{chunk_conversation, chunk_text},
+    chunk::{chunk_conversation_token_aware, chunk_text_token_aware},
     detect::{Format, detect_format},
     normalize::{NormalizeError, normalize_content},
 };
-
-const CHUNK_WINDOW: usize = 800;
-const CHUNK_OVERLAP: usize = 100;
 
 /// Max wait for per-source ingest lock before returning LockError::Timeout.
 const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -196,11 +193,20 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             route_room_from_taxonomy(&scrubbed, wing, &taxonomy)
         }
     };
+    let source_display = path.to_string_lossy();
+    let chunker_config = &config.chunker;
     let chunks = match format {
         Format::ClaudeJsonl | Format::ChatGptJson | Format::CodexJsonl | Format::SlackJson => {
-            chunk_conversation(&scrubbed)
+            chunk_conversation_token_aware(
+                &scrubbed,
+                chunker_config,
+                embedder,
+                Some(&source_display),
+            )
         }
-        Format::PlainText => chunk_text(&scrubbed, CHUNK_WINDOW, CHUNK_OVERLAP),
+        Format::PlainText => {
+            chunk_text_token_aware(&scrubbed, chunker_config, embedder, Some(&source_display))
+        }
     };
     if chunks.is_empty() {
         return Ok(IngestStats {

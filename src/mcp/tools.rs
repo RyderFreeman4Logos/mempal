@@ -234,6 +234,7 @@ pub struct StatusResponse {
     pub embed_status: EmbedStatusDto,
     pub queue_stats: QueueStatsDto,
     pub scrub_stats: ScrubStatsDto,
+    pub chunker_stats: ChunkerStatsDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
 }
@@ -251,6 +252,22 @@ impl From<crate::core::config::ScrubStats> for ScrubStatsDto {
             total_patterns_matched: value.total_patterns_matched,
             bytes_redacted: value.bytes_redacted,
             redactions_per_pattern: value.redactions_per_pattern,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ChunkerStatsDto {
+    pub hard_split_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_hard_split_source: Option<String>,
+}
+
+impl From<crate::ingest::chunk::ChunkerStatsSnapshot> for ChunkerStatsDto {
+    fn from(value: crate::ingest::chunk::ChunkerStatsSnapshot) -> Self {
+        Self {
+            hard_split_count: value.hard_split_count,
+            last_hard_split_source: value.last_hard_split_source,
         }
     }
 }

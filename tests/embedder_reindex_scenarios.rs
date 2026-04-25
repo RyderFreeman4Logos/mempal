@@ -552,7 +552,13 @@ async fn test_mixed_dim_batch_aborts_before_begin_immediate() {
     let db = Database::open(&db_path).expect("open db");
     let source = tmp.path().join("mixed.txt");
     let text = "word ".repeat(2_000);
-    let chunk_count = mempal::ingest::chunk::chunk_text(&text, 800, 100).len();
+    let chunk_count = mempal::ingest::chunk::chunk_text_token_aware(
+        &text,
+        &config.chunker,
+        embedder.as_ref(),
+        None,
+    )
+    .len();
     let mut dims = vec![4_u32; chunk_count];
     if chunk_count > 1 {
         dims[chunk_count - 1] = 2;

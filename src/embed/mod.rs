@@ -136,6 +136,21 @@ pub trait Embedder: Send + Sync {
     async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
     fn dimensions(&self) -> usize;
     fn name(&self) -> &str;
+
+    /// Backend-advertised maximum input tokens. `None` means unknown/unlimited.
+    /// Used by the chunker to clamp effective max below this limit.
+    fn max_input_tokens(&self) -> Option<usize> {
+        None
+    }
+
+    /// Estimate token count for `text`. Backends with a local tokenizer
+    /// should override for accuracy. The default uses a conservative
+    /// heuristic: `ceil(chars / 2.5)` — safe upper bound for most
+    /// tokenizers including CJK-heavy and base64-dense content.
+    fn estimate_tokens(&self, text: &str) -> usize {
+        let chars = text.chars().count();
+        (chars * 2).div_ceil(5)
+    }
 }
 
 pub async fn from_config(config: &Config) -> Result<Box<dyn Embedder>> {
@@ -221,5 +236,13 @@ impl Embedder for ManagedEmbedder {
 
     fn name(&self) -> &str {
         self.primary.name()
+    }
+
+    fn max_input_tokens(&self) -> Option<usize> {
+        self.primary.max_input_tokens()
+    }
+
+    fn estimate_tokens(&self, text: &str) -> usize {
+        self.primary.estimate_tokens(text)
     }
 }
