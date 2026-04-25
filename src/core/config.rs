@@ -10,6 +10,9 @@ use thiserror::Error;
 
 const DEFAULT_DB_PATH: &str = "~/.mempal/palace.db";
 const DEFAULT_EMBED_BACKEND: &str = "openai_compat";
+const DEFAULT_CHUNKER_MAX_TOKENS: usize = 1024;
+const DEFAULT_CHUNKER_TARGET_TOKENS: usize = 512;
+const DEFAULT_CHUNKER_OVERLAP_TOKENS: usize = 64;
 const DEFAULT_HOT_RELOAD_DEBOUNCE_MS: u64 = 250;
 const DEFAULT_HOT_RELOAD_POLL_FALLBACK_SECS: u64 = 5;
 const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 30;
@@ -37,6 +40,7 @@ pub struct Config {
     pub db_path: String,
     #[serde(alias = "embedder")]
     pub embed: EmbedConfig,
+    pub chunker: ChunkerConfig,
     pub project: ProjectConfig,
     pub privacy: PrivacyConfig,
     pub config_hot_reload: ConfigHotReloadConfig,
@@ -53,6 +57,7 @@ impl Default for Config {
         Self {
             db_path: DEFAULT_DB_PATH.to_string(),
             embed: EmbedConfig::default(),
+            chunker: ChunkerConfig::default(),
             project: ProjectConfig::default(),
             privacy: PrivacyConfig::default(),
             config_hot_reload: ConfigHotReloadConfig::default(),
@@ -102,6 +107,23 @@ impl Config {
         if let Some(project_id) = self.project.id.as_deref() {
             super::project::validate_project_id(project_id)
                 .map_err(|error| ConfigError::InvalidConfig(error.to_string()))?;
+        }
+        if self.chunker.max_tokens == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "chunker.max_tokens must be greater than 0".to_string(),
+            ));
+        }
+        if self.chunker.target_tokens == 0 || self.chunker.target_tokens > self.chunker.max_tokens {
+            return Err(ConfigError::InvalidConfig(format!(
+                "chunker.target_tokens must be in 1..={}",
+                self.chunker.max_tokens
+            )));
+        }
+        if self.chunker.overlap_tokens >= self.chunker.target_tokens {
+            return Err(ConfigError::InvalidConfig(format!(
+                "chunker.overlap_tokens ({}) must be less than target_tokens ({})",
+                self.chunker.overlap_tokens, self.chunker.target_tokens
+            )));
         }
         if self.embed.retry.interval_secs == 0 {
             return Err(ConfigError::InvalidConfig(
@@ -427,6 +449,29 @@ impl Default for DaemonConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
+pub struct ChunkerConfig {
+    /// Hard upper bound on tokens per chunk. The chunker guarantees every
+    /// emitted chunk is ≤ this value.
+    pub max_tokens: usize,
+    /// Soft target for split points — chunks aim for this size when natural
+    /// break points (sentence, word) allow.
+    pub target_tokens: usize,
+    /// Overlap between adjacent chunks in tokens. Must be < target_tokens.
+    pub overlap_tokens: usize,
+}
+
+impl Default for ChunkerConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: DEFAULT_CHUNKER_MAX_TOKENS,
+            target_tokens: DEFAULT_CHUNKER_TARGET_TOKENS,
+            overlap_tokens: DEFAULT_CHUNKER_OVERLAP_TOKENS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct EmbedConfig {
     pub backend: String,
     pub fallback: Option<String>,
@@ -492,6 +537,10 @@ pub struct OpenAiCompatConfig {
     pub api_key_env: Option<String>,
     pub request_timeout_secs: u64,
     pub dim: Option<usize>,
+    /// Maximum input tokens the model accepts. When set, the chunker uses
+    /// this as a hard ceiling. When `None`, the chunker relies on
+    /// `[chunker].max_tokens` alone.
+    pub max_input_tokens: Option<usize>,
 }
 
 impl Default for OpenAiCompatConfig {
@@ -502,6 +551,7 @@ impl Default for OpenAiCompatConfig {
             api_key_env: None,
             request_timeout_secs: DEFAULT_OPENAI_TIMEOUT_SECS,
             dim: Some(DEFAULT_OPENAI_DIM),
+            max_input_tokens: None,
         }
     }
 }

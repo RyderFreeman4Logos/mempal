@@ -177,6 +177,10 @@ impl Embedder for OnnxEmbedder {
     fn name(&self) -> &str {
         "onnx"
     }
+
+    fn max_input_tokens(&self) -> Option<usize> {
+        Some(MAX_SEQUENCE_LENGTH)
+    }
 }
 
 async fn download_if_missing(path: &Path, url: &str) -> Result<()> {

@@ -28,13 +28,14 @@ use rmcp::{
 
 use super::timeline::{TimelineRequest, TimelineResponse};
 use super::tools::{
-    CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DuplicateWarning,
-    EmbedStatusDto, FactCheckRequest, FactCheckResponse, IngestRequest, IngestResponse, KgRequest,
-    KgResponse, KgStatsDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS,
-    PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto, ReadDrawerRequest,
-    ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse, ScopeCount, ScrubStatsDto,
-    SearchRequest, SearchResponse, SearchResultDto, StatusResponse, SystemWarning,
-    TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
+    ChunkerStatsDto, CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse,
+    DuplicateWarning, EmbedStatusDto, FactCheckRequest, FactCheckResponse, IngestRequest,
+    IngestResponse, KgRequest, KgResponse, KgStatsDto, MAX_READ_DRAWERS_MAX_COUNT,
+    MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse,
+    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
+    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, StatusResponse,
+    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto,
+    TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -220,6 +221,9 @@ impl MempalMcpServer {
                 oldest_pending_age_secs: queue_stats.oldest_pending_age_secs,
             },
             scrub_stats: ScrubStatsDto::from(ConfigHandle::scrub_stats()),
+            chunker_stats: ChunkerStatsDto::from(
+                crate::ingest::chunk::global_chunker_stats().snapshot(),
+            ),
             system_warnings,
         }))
     }
