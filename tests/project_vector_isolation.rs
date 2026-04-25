@@ -1869,7 +1869,7 @@ fn test_tunnel_hint_records_target_project_id() {
     );
 
     let tunnels = db
-        .tunnel_drawers_for_room("shared-room", "drawer-a", Some("proj-A"))
+        .tunnel_drawers_for_room("shared-room", "drawer-a", Some("proj-A"), 100)
         .expect("load tunnel drawers");
     assert_eq!(tunnels.len(), 1);
     assert_eq!(tunnels[0].target_project_id.as_deref(), Some("proj-B"));
