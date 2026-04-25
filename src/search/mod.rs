@@ -2,7 +2,7 @@
 
 use crate::core::{
     db::Database,
-    project::{ProjectFilterMode, ProjectSearchScope, SearchResultSource},
+    project::{ProjectSearchScope, SearchResultSource},
     types::{RouteDecision, SearchResult},
     utils::source_file_or_synthetic,
 };
@@ -27,8 +27,6 @@ pub enum SearchError {
     MissingQueryVector,
     #[error("failed to count candidate drawers")]
     CountCandidateDrawers(#[source] rusqlite::Error),
-    #[error("failed to count total drawers")]
-    CountTotalDrawers(#[source] rusqlite::Error),
     #[error("failed to serialize query vector")]
     SerializeQueryVector(#[source] serde_json::Error),
     #[error("top_k does not fit into i64")]
@@ -333,6 +331,20 @@ fn rrf_merge(
     merged
 }
 
+/// Compute the KNN `k` parameter for sqlite-vec, clamped to its hardcoded
+/// limit of 4096. Uses `top_k * 50` as the recall multiplier (allowing
+/// post-filter shrinkage from wing/room/project predicates), floored at
+/// 100 to avoid degenerate single-digit recall on tiny `top_k` values.
+///
+/// When the database grows beyond 4096 drawers the KNN result is an
+/// *approximate* subset — callers that need exact recall on a small
+/// candidate set should use `search_by_vector_scoped_exact` instead.
+pub fn compute_knn_k(top_k: usize) -> i64 {
+    let raw = top_k.saturating_mul(50);
+    let raw_i64 = i64::try_from(raw).unwrap_or(i64::MAX);
+    raw_i64.clamp(100, 4_096)
+}
+
 pub fn search_by_vector(
     db: &Database,
     query_vector: &[f32],
@@ -367,16 +379,11 @@ pub fn search_by_vector(
     if candidate_count == 0 {
         return Ok(Vec::new());
     }
-    let total_count: i64 = db
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(SearchError::CountTotalDrawers)?;
 
-    if scope.mode == ProjectFilterMode::ProjectScoped && candidate_count <= 4_096 {
+    // When the candidate set fits within the sqlite-vec KNN limit, use
+    // the exact in-memory path regardless of scope mode — this avoids
+    // approximate recall loss and sidesteps the 4096 KNN cap entirely.
+    if candidate_count <= 4_096 {
         return search_by_vector_scoped_exact(
             db,
             query_vector,
@@ -384,13 +391,14 @@ pub fn search_by_vector(
             applied_wing,
             applied_room,
             top_k,
-            scope.project_id.as_deref(),
+            scope,
         );
     }
 
     let query_json =
         serde_json::to_string(query_vector).map_err(SearchError::SerializeQueryVector)?;
-    let top_k = i64::try_from(top_k).map_err(|_| SearchError::InvalidTopK)?;
+    let top_k_i64 = i64::try_from(top_k).map_err(|_| SearchError::InvalidTopK)?;
+    let knn_k = compute_knn_k(top_k);
 
     let search_sql = build_vector_search_sql(scope.mode);
 
@@ -402,12 +410,12 @@ pub fn search_by_vector(
         .query_map(
             (
                 query_json.as_str(),
-                total_count,
+                knn_k,
                 scope.mode_param(),
                 scope.project_id.as_deref(),
                 applied_wing,
                 applied_room,
-                top_k,
+                top_k_i64,
             ),
             |row| {
                 let distance: f64 = row.get(6)?;
@@ -441,43 +449,55 @@ fn search_by_vector_scoped_exact(
     applied_wing: Option<&str>,
     applied_room: Option<&str>,
     top_k: usize,
-    project_id: Option<&str>,
+    scope: &ProjectSearchScope,
 ) -> Result<Vec<SearchResult>> {
     let top_k = i64::try_from(top_k).map_err(|_| SearchError::InvalidTopK)?;
-    let search_sql = r#"
+    // Use the full filter clause so all scope modes (all / project /
+    // project_plus_global / null_only) work correctly through the exact path.
+    let filter = build_filter_clause("d", 1, 2, 3, 4);
+    let search_sql = format!(
+        r#"
         SELECT d.id, d.content, d.wing, d.room, d.source_file, d.project_id, v.embedding
         FROM drawer_vectors v
         JOIN drawers d ON d.id = v.id
-        WHERE d.deleted_at IS NULL
-          AND (?1 IS NULL OR d.wing = ?1)
-          AND (?2 IS NULL OR d.room = ?2)
-          AND (?3 IS NULL OR d.project_id = ?3)
-        "#;
+        {filter}
+        "#
+    );
     let mut statement = db
         .conn()
-        .prepare(search_sql)
+        .prepare(&search_sql)
         .map_err(SearchError::PrepareSearch)?;
     let mut rows = statement
-        .query_map((applied_wing, applied_room, project_id), |row| {
-            let drawer_id: String = row.get(0)?;
-            let source_file = row.get::<_, Option<String>>(4)?;
-            let embedding = row.get::<_, Vec<u8>>(6)?;
-            Ok((
-                drawer_id.clone(),
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                source_file_or_synthetic(&drawer_id, source_file.as_deref()),
-                embedding,
-            ))
-        })
+        .query_map(
+            (
+                applied_wing,
+                applied_room,
+                scope.mode_param(),
+                scope.project_id.as_deref(),
+            ),
+            |row| {
+                let drawer_id: String = row.get(0)?;
+                let source_file = row.get::<_, Option<String>>(4)?;
+                let row_project_id = row.get::<_, Option<String>>(5)?;
+                let embedding = row.get::<_, Vec<u8>>(6)?;
+                Ok((
+                    drawer_id.clone(),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    source_file_or_synthetic(&drawer_id, source_file.as_deref()),
+                    row_project_id,
+                    embedding,
+                ))
+            },
+        )
         .map_err(SearchError::ExecuteSearch)?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(SearchError::CollectSearchRows)?;
 
     rows.sort_by(|a, b| {
-        let a_distance = cosine_distance_from_blob(&a.0, &a.5, query_vector);
-        let b_distance = cosine_distance_from_blob(&b.0, &b.5, query_vector);
+        let a_distance = cosine_distance_from_blob(&a.0, &a.6, query_vector);
+        let b_distance = cosine_distance_from_blob(&b.0, &b.6, query_vector);
         match (a_distance, b_distance) {
             (Ok(left), Ok(right)) => left
                 .partial_cmp(&right)
@@ -491,20 +511,22 @@ fn search_by_vector_scoped_exact(
     let results = rows
         .into_iter()
         .take(top_k as usize)
-        .map(|(drawer_id, content, wing, room, source_file, embedding)| {
-            let distance = cosine_distance_from_blob(&drawer_id, &embedding, query_vector)?;
-            Ok(SearchResult {
-                drawer_id: drawer_id.clone(),
-                content,
-                wing,
-                room,
-                source_file,
-                source: SearchResultSource::Project,
-                similarity: (1.0_f64 - distance) as f32,
-                route: route.clone(),
-                tunnel_hints: vec![],
-            })
-        })
+        .map(
+            |(drawer_id, content, wing, room, source_file, row_project_id, embedding)| {
+                let distance = cosine_distance_from_blob(&drawer_id, &embedding, query_vector)?;
+                Ok(SearchResult {
+                    drawer_id: drawer_id.clone(),
+                    content,
+                    wing,
+                    room,
+                    source_file,
+                    source: scope.classify_row(row_project_id.as_deref()),
+                    similarity: (1.0_f64 - distance) as f32,
+                    route: route.clone(),
+                    tunnel_hints: vec![],
+                })
+            },
+        )
         .collect::<Result<Vec<_>>>()?;
     Ok(results)
 }
@@ -733,5 +755,48 @@ mod tests {
             "expected 2 source + 2 tunnel per source = 6, got {}",
             results.len()
         );
+    }
+
+    // --- compute_knn_k unit tests ---
+
+    #[test]
+    fn compute_knn_k_zero_top_k_returns_floor() {
+        assert_eq!(compute_knn_k(0), 100);
+    }
+
+    #[test]
+    fn compute_knn_k_one_returns_floor() {
+        // 1 * 50 = 50, clamped up to 100
+        assert_eq!(compute_knn_k(1), 100);
+    }
+
+    #[test]
+    fn compute_knn_k_small_top_k() {
+        // 10 * 50 = 500
+        assert_eq!(compute_knn_k(10), 500);
+    }
+
+    #[test]
+    fn compute_knn_k_at_ceiling_boundary() {
+        // 81 * 50 = 4050, still under 4096
+        assert_eq!(compute_knn_k(81), 4050);
+        // 82 * 50 = 4100, clamped to 4096
+        assert_eq!(compute_knn_k(82), 4096);
+    }
+
+    #[test]
+    fn compute_knn_k_large_top_k_clamped() {
+        assert_eq!(compute_knn_k(100), 4096);
+        assert_eq!(compute_knn_k(1_000), 4096);
+        assert_eq!(compute_knn_k(10_000), 4096);
+    }
+
+    #[test]
+    fn compute_knn_k_always_in_bounds() {
+        for top_k in [0, 1, 2, 10, 50, 81, 82, 100, 1_000, 10_000, usize::MAX] {
+            let k = compute_knn_k(top_k);
+            assert!(k >= 100, "k={k} below floor for top_k={top_k}");
+            assert!(k <= 4_096, "k={k} above ceiling for top_k={top_k}");
+        }
     }
 }
