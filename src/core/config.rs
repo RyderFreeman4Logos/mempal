@@ -733,7 +733,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             strict_project_isolation: false,
-            progressive_disclosure: false,
+            progressive_disclosure: true,
             preview_chars: DEFAULT_SEARCH_PREVIEW_CHARS,
             tunnel_fanout_cap: DEFAULT_SEARCH_TUNNEL_FANOUT_CAP,
         }

@@ -691,3 +691,56 @@ async fn test_truncation_aligns_to_word_boundary() {
     assert!(preview.truncated);
     assert_eq!(preview.content, "The quick brown fox…");
 }
+
+#[test]
+fn test_search_config_default_progressive_disclosure_is_true() {
+    let config = mempal::core::config::SearchConfig::default();
+    assert!(
+        config.progressive_disclosure,
+        "SearchConfig::default() must have progressive_disclosure = true \
+         so that MCP mempal_search returns truncated previews by default"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_default_mcp_search_truncates_large_drawers() {
+    let _guard = config_guard().await;
+    // Use default progressive_disclosure=true with a small preview_chars to
+    // verify that the default config truncates large drawers.
+    let env = TestEnv::new(true, 120);
+    let large_content = "Decision: ".to_string() + &"x".repeat(5000);
+    insert_drawer(
+        &env.db_path,
+        "drawer-default-large",
+        &large_content,
+        "/tmp/default-large.md",
+        true,
+    );
+
+    // Call search WITHOUT disable_progressive — should truncate
+    let response = search(&env.server(), "Decision", None).await;
+    let result = &response.results[0];
+
+    assert!(
+        result.content_truncated,
+        "content_truncated must be true for drawers larger than preview_chars"
+    );
+    assert!(
+        result.content.len() < large_content.len(),
+        "truncated content ({} bytes) must be smaller than original ({} bytes)",
+        result.content.len(),
+        large_content.len()
+    );
+    assert_eq!(
+        result.original_content_bytes,
+        large_content.len() as u64,
+        "original_content_bytes must reflect full drawer size"
+    );
+    // Verify total response payload stays reasonable
+    let payload = serde_json::to_string(&response).expect("serialize response");
+    assert!(
+        payload.len() < 256 * 1024,
+        "total response payload ({} bytes) must be under 256 KB",
+        payload.len()
+    );
+}
