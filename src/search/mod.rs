@@ -178,10 +178,27 @@ pub fn search_bm25_only(
 /// For each search result, check if its room appears in other wings (tunnel).
 /// If so, add the other wing names as tunnel_hints and append any explicit
 /// cross-project tunnel targets without applying the project filter.
+///
+/// Reads `[search].tunnel_fanout_cap` from the hot-reload config snapshot.
 fn inject_tunnel_hints_and_results(
     db: &Database,
     results: &mut Vec<SearchResult>,
     scope: &ProjectSearchScope,
+) {
+    let fanout_cap = crate::core::hot_reload::global_hot_reload_state()
+        .current()
+        .search
+        .tunnel_fanout_cap;
+    inject_tunnel_hints_with_cap(db, results, scope, fanout_cap);
+}
+
+/// Tunnel-hint injection with explicit per-source fanout cap — factored out for
+/// unit tests so a caller can pin the cap without touching the global hot-reload state.
+pub(crate) fn inject_tunnel_hints_with_cap(
+    db: &Database,
+    results: &mut Vec<SearchResult>,
+    scope: &ProjectSearchScope,
+    fanout_cap: usize,
 ) {
     let tunnels = match db.find_tunnels() {
         Ok(t) => t,
@@ -211,10 +228,17 @@ fn inject_tunnel_hints_and_results(
                     .cloned()
                     .collect();
             }
+            if fanout_cap == 0 {
+                continue;
+            }
             if let Ok(drawers) =
                 db.tunnel_drawers_for_room(room, &result.drawer_id, scope.project_id.as_deref())
             {
+                let mut added_from_this_result = 0usize;
                 for tunnel in drawers {
+                    if added_from_this_result >= fanout_cap {
+                        break;
+                    }
                     let drawer = tunnel.drawer;
                     if seen_ids.insert(drawer.id.clone()) {
                         tunnel_results.push(SearchResult {
@@ -231,6 +255,7 @@ fn inject_tunnel_hints_and_results(
                             route: result.route.clone(),
                             tunnel_hints: vec![],
                         });
+                        added_from_this_result += 1;
                     }
                 }
             }
@@ -560,4 +585,153 @@ pub fn resolve_route(
         confidence: route.confidence,
         reason: route.reason,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::project::{ProjectSearchScope, SearchResultSource};
+    use crate::core::types::{Drawer, RouteDecision, SearchResult, SourceType};
+    use tempfile::TempDir;
+
+    fn make_drawer(id: &str, wing: &str, room: &str) -> Drawer {
+        Drawer {
+            id: id.to_string(),
+            content: format!("content for {id}"),
+            wing: wing.to_string(),
+            room: Some(room.to_string()),
+            source_file: Some(format!("{id}.md")),
+            source_type: SourceType::Manual,
+            added_at: "1700000000".to_string(),
+            chunk_index: None,
+            importance: 0,
+        }
+    }
+
+    fn make_result(drawer: &Drawer) -> SearchResult {
+        SearchResult {
+            drawer_id: drawer.id.clone(),
+            content: drawer.content.clone(),
+            wing: drawer.wing.clone(),
+            room: drawer.room.clone(),
+            source_file: drawer.source_file.clone().unwrap_or_default(),
+            source: SearchResultSource::Project,
+            similarity: 0.9,
+            route: RouteDecision {
+                wing: None,
+                room: None,
+                confidence: 0.0,
+                reason: "test".to_string(),
+            },
+            tunnel_hints: vec![],
+        }
+    }
+
+    fn seed_cross_project(db: &Database, source: &Drawer, beta_count: usize) {
+        db.insert_drawer_with_project(source, Some("proj-a"))
+            .expect("insert source");
+        for i in 0..beta_count {
+            let id = format!("beta-{i}");
+            let drawer = make_drawer(&id, "beta", "decision");
+            db.insert_drawer_with_project(&drawer, Some("proj-b"))
+                .expect("insert beta");
+        }
+    }
+
+    fn scoped_to_proj_a() -> ProjectSearchScope {
+        ProjectSearchScope::from_request(Some("proj-a".to_string()), false, false, false)
+    }
+
+    #[test]
+    fn tunnel_fanout_cap_limits_cross_project_expansion() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        let source = make_drawer("alpha-1", "alpha", "decision");
+        seed_cross_project(&db, &source, 10);
+
+        let mut results = vec![make_result(&source)];
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 3);
+
+        assert_eq!(
+            results.len(),
+            4,
+            "expected 1 source + 3 tunnel = 4, got {}",
+            results.len()
+        );
+        assert_eq!(results[0].drawer_id, "alpha-1");
+        for result in &results[1..] {
+            assert_eq!(result.source, SearchResultSource::TunnelCrossProject);
+            assert_eq!(result.wing, "beta");
+        }
+    }
+
+    #[test]
+    fn tunnel_fanout_cap_zero_disables_cross_project_rows() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        let source = make_drawer("alpha-1", "alpha", "decision");
+        seed_cross_project(&db, &source, 5);
+
+        let mut results = vec![make_result(&source)];
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 0);
+
+        assert_eq!(results.len(), 1, "cap=0 must not add tunnel drawers");
+        assert_eq!(
+            results[0].tunnel_hints,
+            vec!["beta".to_string()],
+            "wing hints should still populate with cap=0"
+        );
+    }
+
+    #[test]
+    fn tunnel_fanout_cap_large_returns_all_available() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        let source = make_drawer("alpha-1", "alpha", "decision");
+        seed_cross_project(&db, &source, 2);
+
+        let mut results = vec![make_result(&source)];
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 100);
+
+        assert_eq!(
+            results.len(),
+            3,
+            "cap>available must return all {} available",
+            2
+        );
+    }
+
+    #[test]
+    fn tunnel_fanout_cap_applies_per_source_result() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        let alpha = make_drawer("alpha-1", "alpha", "decision");
+        let gamma = make_drawer("gamma-1", "gamma", "decision");
+        db.insert_drawer_with_project(&alpha, Some("proj-a"))
+            .expect("insert alpha");
+        db.insert_drawer_with_project(&gamma, Some("proj-a"))
+            .expect("insert gamma");
+        for i in 0..10 {
+            let id = format!("beta-{i}");
+            let drawer = make_drawer(&id, "beta", "decision");
+            db.insert_drawer_with_project(&drawer, Some("proj-b"))
+                .expect("insert beta");
+        }
+
+        let mut results = vec![make_result(&alpha), make_result(&gamma)];
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 2);
+
+        // Each of the 2 source results contributes up to 2 tunnel drawers, but
+        // `seen_ids` dedup means the second source result sees the same
+        // beta-{0,1} already inserted → its cap budget still holds 2 fresh rows.
+        // With 10 beta drawers available, we should see 2 (alpha) + 2 (gamma) = 4 tunnel rows
+        // total, plus 2 source rows = 6.
+        assert_eq!(
+            results.len(),
+            6,
+            "expected 2 source + 2 tunnel per source = 6, got {}",
+            results.len()
+        );
+    }
 }

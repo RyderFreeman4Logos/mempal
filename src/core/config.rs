@@ -17,6 +17,7 @@ const DEFAULT_OPENAI_DIM: usize = 4096;
 const DEFAULT_RETRY_INTERVAL_SECS: u64 = 2;
 const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 5;
 const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
+const DEFAULT_SEARCH_TUNNEL_FANOUT_CAP: usize = 5;
 const DEFAULT_ALERT_EVERY_N_FAILURES: u64 = 100;
 const DEFAULT_DEGRADE_AFTER_N_FAILURES: u64 = 10;
 const DEFAULT_HOOK_WING: &str = "agent-diary";
@@ -675,6 +676,7 @@ pub struct SearchConfig {
     pub strict_project_isolation: bool,
     pub progressive_disclosure: bool,
     pub preview_chars: usize,
+    pub tunnel_fanout_cap: usize,
 }
 
 impl Default for SearchConfig {
@@ -683,6 +685,7 @@ impl Default for SearchConfig {
             strict_project_isolation: false,
             progressive_disclosure: false,
             preview_chars: DEFAULT_SEARCH_PREVIEW_CHARS,
+            tunnel_fanout_cap: DEFAULT_SEARCH_TUNNEL_FANOUT_CAP,
         }
     }
 }
