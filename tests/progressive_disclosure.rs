@@ -85,6 +85,24 @@ impl TestEnv {
         }
     }
 
+    /// Create a test environment whose config omits the `[search]` section
+    /// entirely, so all search fields fall back to their compiled defaults.
+    fn with_default_search_config() -> Self {
+        let tmp = TempDir::new().expect("tempdir");
+        let mempal_home = tmp.path().join(".mempal");
+        fs::create_dir_all(&mempal_home).expect("create mempal home");
+        let config_path = mempal_home.join("config.toml");
+        let db_path = mempal_home.join("palace.db");
+        write_config(&config_path, &config_text_no_search_section(&db_path));
+        Database::open(&db_path).expect("open db");
+        ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
+        Self {
+            _tmp: tmp,
+            config_path,
+            db_path,
+        }
+    }
+
     fn server(&self) -> MempalMcpServer {
         MempalMcpServer::new_with_factory(
             self.db_path.clone(),
@@ -118,6 +136,27 @@ preview_chars = {}
         db_path.display(),
         progressive_disclosure,
         preview_chars
+    )
+}
+
+/// Config text that omits `[search]` entirely, forcing all search fields
+/// to their compiled defaults (including progressive_disclosure).
+fn config_text_no_search_section(db_path: &Path) -> String {
+    format!(
+        r#"
+db_path = "{}"
+
+[embedder]
+backend = "api"
+base_url = "http://127.0.0.1:9/v1/"
+api_model = "test-model"
+
+[config_hot_reload]
+enabled = true
+debounce_ms = 250
+poll_fallback_secs = 1
+"#,
+        db_path.display()
     )
 }
 
@@ -705,9 +744,10 @@ fn test_search_config_default_progressive_disclosure_is_true() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_default_mcp_search_truncates_large_drawers() {
     let _guard = config_guard().await;
-    // Use default progressive_disclosure=true with a small preview_chars to
-    // verify that the default config truncates large drawers.
-    let env = TestEnv::new(true, 120);
+    // Omit [search] section entirely so progressive_disclosure falls back to
+    // the compiled default (true). This validates the actual default behavior,
+    // not an explicit opt-in.
+    let env = TestEnv::with_default_search_config();
     let large_content = "Decision: ".to_string() + &"x".repeat(5000);
     insert_drawer(
         &env.db_path,
