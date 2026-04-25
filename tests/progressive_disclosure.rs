@@ -85,6 +85,24 @@ impl TestEnv {
         }
     }
 
+    /// Create a test environment whose config omits the `[search]` section
+    /// entirely, so all search fields fall back to their compiled defaults.
+    fn with_default_search_config() -> Self {
+        let tmp = TempDir::new().expect("tempdir");
+        let mempal_home = tmp.path().join(".mempal");
+        fs::create_dir_all(&mempal_home).expect("create mempal home");
+        let config_path = mempal_home.join("config.toml");
+        let db_path = mempal_home.join("palace.db");
+        write_config(&config_path, &config_text_no_search_section(&db_path));
+        Database::open(&db_path).expect("open db");
+        ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
+        Self {
+            _tmp: tmp,
+            config_path,
+            db_path,
+        }
+    }
+
     fn server(&self) -> MempalMcpServer {
         MempalMcpServer::new_with_factory(
             self.db_path.clone(),
@@ -118,6 +136,27 @@ preview_chars = {}
         db_path.display(),
         progressive_disclosure,
         preview_chars
+    )
+}
+
+/// Config text that omits `[search]` entirely, forcing all search fields
+/// to their compiled defaults (including progressive_disclosure).
+fn config_text_no_search_section(db_path: &Path) -> String {
+    format!(
+        r#"
+db_path = "{}"
+
+[embedder]
+backend = "api"
+base_url = "http://127.0.0.1:9/v1/"
+api_model = "test-model"
+
+[config_hot_reload]
+enabled = true
+debounce_ms = 250
+poll_fallback_secs = 1
+"#,
+        db_path.display()
     )
 }
 
@@ -690,4 +729,58 @@ async fn test_truncation_aligns_to_word_boundary() {
 
     assert!(preview.truncated);
     assert_eq!(preview.content, "The quick brown fox…");
+}
+
+#[test]
+fn test_search_config_default_progressive_disclosure_is_true() {
+    let config = mempal::core::config::SearchConfig::default();
+    assert!(
+        config.progressive_disclosure,
+        "SearchConfig::default() must have progressive_disclosure = true \
+         so that MCP mempal_search returns truncated previews by default"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_default_mcp_search_truncates_large_drawers() {
+    let _guard = config_guard().await;
+    // Omit [search] section entirely so progressive_disclosure falls back to
+    // the compiled default (true). This validates the actual default behavior,
+    // not an explicit opt-in.
+    let env = TestEnv::with_default_search_config();
+    let large_content = "Decision: ".to_string() + &"x".repeat(5000);
+    insert_drawer(
+        &env.db_path,
+        "drawer-default-large",
+        &large_content,
+        "/tmp/default-large.md",
+        true,
+    );
+
+    // Call search WITHOUT disable_progressive — should truncate
+    let response = search(&env.server(), "Decision", None).await;
+    let result = &response.results[0];
+
+    assert!(
+        result.content_truncated,
+        "content_truncated must be true for drawers larger than preview_chars"
+    );
+    assert!(
+        result.content.len() < large_content.len(),
+        "truncated content ({} bytes) must be smaller than original ({} bytes)",
+        result.content.len(),
+        large_content.len()
+    );
+    assert_eq!(
+        result.original_content_bytes,
+        large_content.len() as u64,
+        "original_content_bytes must reflect full drawer size"
+    );
+    // Verify total response payload stays reasonable
+    let payload = serde_json::to_string(&response).expect("serialize response");
+    assert!(
+        payload.len() < 256 * 1024,
+        "total response payload ({} bytes) must be under 256 KB",
+        payload.len()
+    );
 }
