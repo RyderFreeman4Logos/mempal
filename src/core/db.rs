@@ -22,8 +22,14 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 4;
+const CURRENT_SCHEMA_VERSION: u32 = 5;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
+
+const CONTENT_HASH_BACKFILL_BATCH: usize = 1_000;
+
+fn content_hash_hex(content: &str) -> String {
+    blake3::hash(content.as_bytes()).to_hex().to_string()
+}
 
 const V1_SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -179,6 +185,7 @@ impl Database {
         drawer: &Drawer,
         project_id: Option<&str>,
     ) -> Result<(), DbError> {
+        let content_hash = content_hash_hex(&drawer.content);
         self.conn.execute(
             r#"
             INSERT OR IGNORE INTO drawers (
@@ -191,9 +198,10 @@ impl Database {
                 added_at,
                 chunk_index,
                 importance,
-                project_id
+                project_id,
+                content_hash
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             "#,
             params![
                 drawer.id,
@@ -206,6 +214,7 @@ impl Database {
                 drawer.chunk_index,
                 drawer.importance,
                 project_id,
+                content_hash,
             ],
         )?;
 
@@ -995,6 +1004,11 @@ impl Database {
         content: &str,
         project_id: Option<&str>,
     ) -> Result<Option<String>, DbError> {
+        // Indexed lookup via idx_drawers_content_hash(wing, content_hash).
+        // blake3 collisions are cryptographically negligible, so the hash
+        // alone determines content-identity; room/project_id/deleted_at are
+        // post-filtered against the (typically single-row) hash bucket.
+        let hash = content_hash_hex(content);
         let value = self
             .conn
             .query_row(
@@ -1003,13 +1017,13 @@ impl Database {
                 FROM drawers
                 WHERE deleted_at IS NULL
                   AND wing = ?1
-                  AND content = ?2
+                  AND content_hash = ?2
                   AND ((room IS NULL AND ?3 IS NULL) OR room = ?3)
                   AND ((project_id IS NULL AND ?4 IS NULL) OR project_id = ?4)
                 ORDER BY id
                 LIMIT 1
                 "#,
-                params![wing, content, room, project_id],
+                params![wing, hash, room, project_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -1454,10 +1468,70 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
         .iter()
         .filter(|migration| migration.version > current_version)
     {
+        if migration.version == 5 {
+            // ALTER TABLE ADD COLUMN is not idempotent in SQLite, so guard
+            // it explicitly. The index in the migration SQL already uses
+            // CREATE INDEX IF NOT EXISTS.
+            ensure_drawers_content_hash_column(conn)?;
+        }
         conn.execute_batch(migration.sql)?;
+        if migration.version == 5 {
+            // V5 introduces content_hash for indexed dedup; backfill existing
+            // rows so the new query path can rely on the column being populated
+            // for all live drawers. Batched commits keep the WAL bounded on
+            // installs with hundreds of thousands of drawers.
+            backfill_content_hash(conn)?;
+        }
         set_user_version(conn, migration.version)?;
     }
 
+    Ok(())
+}
+
+fn ensure_drawers_content_hash_column(conn: &Connection) -> Result<(), DbError> {
+    let exists = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('drawers') WHERE name = 'content_hash'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if exists == 0 {
+        conn.execute_batch("ALTER TABLE drawers ADD COLUMN content_hash TEXT;")?;
+    }
+    Ok(())
+}
+
+fn backfill_content_hash(conn: &Connection) -> Result<(), DbError> {
+    loop {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let updated = (|| -> Result<usize, DbError> {
+            let mut select = conn
+                .prepare("SELECT id, content FROM drawers WHERE content_hash IS NULL LIMIT ?1")?;
+            let rows = select
+                .query_map([CONTENT_HASH_BACKFILL_BATCH as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(select);
+
+            let mut update = conn.prepare("UPDATE drawers SET content_hash = ?1 WHERE id = ?2")?;
+            for (id, content) in &rows {
+                update.execute(params![content_hash_hex(content), id])?;
+            }
+            Ok(rows.len())
+        })();
+        match updated {
+            Ok(count) => {
+                conn.execute_batch("COMMIT")?;
+                if count == 0 {
+                    break;
+                }
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(err);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1521,12 +1595,20 @@ fn migrations() -> &'static [Migration] {
             version: 4,
             sql: V4_MIGRATION_SQL,
         },
+        Migration {
+            version: 5,
+            sql: V5_MIGRATION_SQL,
+        },
     ];
     MIGRATIONS
 }
 
 const V4_MIGRATION_SQL: &str = r#"
 ALTER TABLE drawers ADD COLUMN importance INTEGER DEFAULT 0;
+"#;
+
+const V5_MIGRATION_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_drawers_content_hash ON drawers(wing, content_hash);
 "#;
 
 struct Migration {
