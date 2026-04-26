@@ -23,7 +23,7 @@ use mempal::core::{
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
     reindex::ReindexProgressStore,
     types::TaxonomyEntry,
-    utils::{build_triple_id, current_timestamp},
+    utils::{build_triple_id, current_timestamp, normalize_added_at as normalize_added_at_value},
 };
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
@@ -154,6 +154,11 @@ enum Commands {
         /// With --recompute-importance: only process drawers where importance is 0.
         #[arg(long, default_value_t = false)]
         only_zero: bool,
+        /// Normalise legacy Unix-epoch `added_at` values to ISO 8601 (RFC 3339 UTC).
+        /// Idempotent: already-ISO rows are skipped.  Mutually exclusive with
+        /// embedder-based reindex and --recompute-importance.
+        #[arg(long, default_value_t = false)]
+        normalize_added_at: bool,
     },
     Kg {
         #[command(subcommand)]
@@ -548,8 +553,17 @@ fn run() -> Result<()> {
             stale,
             recompute_importance,
             only_zero,
+            normalize_added_at,
         } => {
-            if recompute_importance {
+            if normalize_added_at {
+                if recompute_importance || embedder.is_some() || from_config {
+                    bail!(
+                        "--normalize-added-at is mutually exclusive with \
+                         --embedder, --from-config, and --recompute-importance"
+                    );
+                }
+                normalize_added_at_command(&db)
+            } else if recompute_importance {
                 recompute_importance_command(&db, only_zero)
             } else {
                 let backend = match (embedder.as_deref(), from_config) {
@@ -1172,6 +1186,55 @@ fn recompute_importance_command(db: &Database, only_zero: bool) -> Result<()> {
         .bulk_update_importance(&updates)
         .context("failed to apply importance scores")?;
     println!("updated {updated} drawers with recomputed importance scores");
+    Ok(())
+}
+
+/// Load all (id, added_at) pairs in ascending rowid order so progress is
+/// deterministic and resumable from the last committed batch.
+fn load_added_at_rows(db: &Database) -> Result<Vec<(String, String)>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT id, added_at FROM drawers \
+             WHERE deleted_at IS NULL \
+             ORDER BY rowid ASC",
+        )
+        .context("failed to prepare added_at query")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("failed to execute added_at query")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to collect added_at rows")?;
+    Ok(rows)
+}
+
+fn normalize_added_at_command(db: &Database) -> Result<()> {
+    let rows = load_added_at_rows(db).context("failed to load drawers for normalization")?;
+    let total = rows.len();
+    if total == 0 {
+        println!("no drawers found");
+        return Ok(());
+    }
+    println!("scanning {total} drawers for Unix-epoch added_at values...");
+
+    let updates: Vec<(String, String)> = rows
+        .into_iter()
+        .filter_map(|(id, added_at)| normalize_added_at_value(&added_at).map(|iso| (id, iso)))
+        .collect();
+
+    let to_update = updates.len();
+    if to_update == 0 {
+        println!("all {total} drawers already have ISO 8601 added_at — nothing to do");
+        return Ok(());
+    }
+    println!("normalising {to_update} rows (batches of 1000)...");
+
+    let updated = db
+        .bulk_update_added_at(&updates)
+        .context("failed to apply added_at normalisation")?;
+    println!("done: {updated} drawers normalised to ISO 8601 added_at");
     Ok(())
 }
 

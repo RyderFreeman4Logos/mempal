@@ -1570,6 +1570,43 @@ impl Database {
         }
         Ok(total)
     }
+
+    /// Normalise `added_at` values in batched `BEGIN IMMEDIATE` transactions.
+    ///
+    /// Each batch of up to 1000 rows is committed independently so concurrent
+    /// readers (WAL mode) are not blocked for the full duration.  Returns the
+    /// total number of rows updated.
+    ///
+    /// `updates`: slice of `(drawer_id, new_added_at)` pairs.
+    pub fn bulk_update_added_at(&self, updates: &[(String, String)]) -> Result<usize, DbError> {
+        const BATCH_SIZE: usize = 1000;
+        let mut total = 0usize;
+        for chunk in updates.chunks(BATCH_SIZE) {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> Result<usize, DbError> {
+                let mut count = 0usize;
+                for (id, new_added_at) in chunk {
+                    self.conn.execute(
+                        "UPDATE drawers SET added_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                        rusqlite::params![new_added_at, id],
+                    )?;
+                    count += 1;
+                }
+                Ok(count)
+            })();
+            match result {
+                Ok(n) => {
+                    self.conn.execute_batch("COMMIT")?;
+                    total += n;
+                }
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
+        }
+        Ok(total)
+    }
 }
 
 fn apply_migrations(conn: &Connection) -> Result<(), DbError> {

@@ -12,7 +12,7 @@ use crate::core::{
     project::resolve_project_id,
     queue::{ClaimedMessage, PendingMessageStore},
     types::{Drawer, SourceType},
-    utils::{current_timestamp, synthetic_source_file},
+    utils::{current_timestamp, iso_timestamp, synthetic_source_file},
 };
 use crate::embed::{
     EmbedError, Embedder, build_backend_from_name, global_embed_status,
@@ -799,7 +799,7 @@ fn insert_drawer_with_vector(
         room: Some(record.room.clone()),
         source_file: Some(record.source_file.clone()),
         source_type: SourceType::Conversation,
-        added_at: current_timestamp(),
+        added_at: iso_timestamp(),
         chunk_index: Some(0),
         importance: record.importance,
     };

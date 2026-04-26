@@ -16,7 +16,7 @@ use crate::core::{
     config::IngestGatingConfig,
     db::Database,
     types::{Drawer, SourceType},
-    utils::{build_drawer_id, current_timestamp, route_room_from_taxonomy},
+    utils::{build_drawer_id, iso_timestamp, route_room_from_taxonomy},
 };
 use crate::embed::{EmbedError, Embedder};
 use crate::ingest::gating::{PrototypeClassifier, evaluate_tier1, evaluate_tier2};
@@ -362,7 +362,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             room: Some(resolved_room.clone()),
             source_file: Some(source_file.clone()),
             source_type: source_type_for(format),
-            added_at: current_timestamp(),
+            added_at: iso_timestamp(),
             chunk_index: Some(chunk_index as i64),
             importance: 0,
         };
