@@ -8,7 +8,7 @@ use crate::core::{
     db::Database,
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
     types::{Drawer, SourceType, Triple},
-    utils::{build_triple_id, current_timestamp, source_file_or_synthetic},
+    utils::{build_triple_id, current_timestamp, iso_timestamp, source_file_or_synthetic},
 };
 use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
 use crate::embed::{EmbedderFactory, global_embed_status};
@@ -207,7 +207,7 @@ impl MempalMcpServer {
                     room: request.room.clone(),
                     source_file: Some(source_file),
                     source_type: SourceType::Manual,
-                    added_at: current_timestamp(),
+                    added_at: iso_timestamp(),
                     chunk_index: Some(*chunk_idx as i64),
                     importance: request.importance.unwrap_or(0),
                 },
@@ -855,7 +855,7 @@ impl MempalMcpServer {
                             room: request.room.clone(),
                             source_file: Some(source_file),
                             source_type: SourceType::Manual,
-                            added_at: current_timestamp(),
+                            added_at: iso_timestamp(),
                             chunk_index: Some(*chunk_idx as i64),
                             importance: request.importance.unwrap_or(0),
                         },

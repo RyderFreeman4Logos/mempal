@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use super::types::TaxonomyEntry;
+use crate::cowork::peek::{format_rfc3339, parse_rfc3339};
 
 pub const DEFAULT_ROOM: &str = "default";
 
@@ -56,6 +57,41 @@ pub fn current_timestamp() -> String {
         Ok(duration) => duration.as_secs().to_string(),
         Err(_) => "0".to_string(),
     }
+}
+
+/// Return the current UTC time as an RFC 3339 string with second precision
+/// (e.g. `"2026-04-26T05:39:49Z"`).  Use this for `added_at` fields in new
+/// drawers so the column is uniformly ISO 8601.
+pub fn iso_timestamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_rfc3339(UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+/// Attempt to normalise a stored `added_at` value to RFC 3339 UTC.
+///
+/// Returns:
+/// - `Some(iso)` — value was a bare Unix-epoch integer string and was
+///   converted successfully.
+/// - `None` — value is already an ISO 8601 string (idempotent skip) **or**
+///   is unrecognised garbage (skipped gracefully; caller should log a
+///   warning).
+pub fn normalize_added_at(value: &str) -> Option<String> {
+    let v = value.trim();
+    // Already ISO 8601 — skip (idempotent).
+    if parse_rfc3339(v).is_some() {
+        return None;
+    }
+    // Bare Unix-epoch integer — convert.
+    if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(secs) = v.parse::<u64>() {
+            return Some(format_rfc3339(UNIX_EPOCH + Duration::from_secs(secs)));
+        }
+    }
+    // Unrecognised — caller should log a warning, we return None.
+    None
 }
 
 pub fn synthetic_source_file(drawer_id: &str) -> String {
@@ -150,4 +186,35 @@ fn content_terms(content: &str) -> BTreeSet<String> {
         .filter(|term| !term.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_added_at_unix_epoch_to_iso() {
+        let ts: u64 = 1_777_169_989;
+        let result = normalize_added_at("1777169989");
+        assert!(result.is_some(), "expected Some for Unix epoch string");
+        let iso = result.unwrap();
+        // Verify round-trip: parsing back gives the same epoch seconds.
+        let parsed = parse_rfc3339(&iso).expect("converted value must be valid RFC3339");
+        assert_eq!(parsed as u64, ts);
+        assert!(iso.ends_with('Z'), "output must be UTC");
+        assert!(iso.contains('T'), "output must contain date/time separator");
+    }
+
+    #[test]
+    fn test_normalize_added_at_already_iso_returns_none() {
+        assert_eq!(normalize_added_at("2026-04-26T05:39:49Z"), None);
+        assert_eq!(normalize_added_at("2026-04-26T05:39:49+08:00"), None);
+    }
+
+    #[test]
+    fn test_normalize_added_at_garbage_returns_none() {
+        assert_eq!(normalize_added_at("not-a-date"), None);
+        assert_eq!(normalize_added_at(""), None);
+        assert_eq!(normalize_added_at("   "), None);
+    }
 }

@@ -1160,7 +1160,7 @@ fn now_unix_secs() -> i64 {
 }
 
 fn parse_added_at(value: &str) -> Option<i64> {
-    value.parse::<i64>().ok()
+    value.parse::<i64>().ok().or_else(|| parse_rfc3339(value))
 }
 
 fn format_day(value: &str) -> String {

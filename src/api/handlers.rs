@@ -3,7 +3,7 @@ use crate::core::{
     db::Database,
     project::{ProjectSearchScope, resolve_project_id},
     types::{Drawer, RouteDecision, SearchResult, SourceType, TaxonomyEntry},
-    utils::{current_timestamp, source_file_or_synthetic},
+    utils::{iso_timestamp, source_file_or_synthetic},
 };
 use crate::search::{resolve_route, search_with_vector};
 use axum::{
@@ -235,7 +235,7 @@ async fn ingest_handler(
                     room: request.room.clone(),
                     source_file: Some(source_file),
                     source_type: SourceType::Manual,
-                    added_at: current_timestamp(),
+                    added_at: iso_timestamp(),
                     chunk_index: Some(chunk_idx as i64),
                     importance: 0,
                 },
