@@ -407,9 +407,11 @@ fn run() -> Result<()> {
             );
         }
         Commands::CoworkStatus { cwd } => {
-            let resolved = cwd
-                .clone()
-                .unwrap_or_else(|| std::env::current_dir().expect("current_dir failed"));
+            let resolved = match cwd {
+                Some(p) => p.clone(),
+                None => std::env::current_dir()
+                    .context("cowork-status: failed to determine current directory")?,
+            };
             return cowork_status_command(resolved);
         }
         Commands::CoworkInstallHooks { global_codex } => {
