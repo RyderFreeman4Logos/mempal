@@ -172,7 +172,12 @@ enum Commands {
         wing: Option<String>,
         #[arg(long)]
         room: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Filter to drawers added after this point. \
+                    Duration: '10s', '15m', '2h', '3d'. \
+                    ISO 8601: '2026-04-25T20:00:00Z' or '2026-04-25T20:00:00+08:00'."
+        )]
         since: Option<String>,
         #[arg(long, default_value_t = false)]
         raw: bool,
@@ -180,7 +185,12 @@ enum Commands {
     Timeline {
         #[arg(long)]
         wing: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Filter to drawers added after this point. \
+                    Duration: '10s', '15m', '2h', '3d'. \
+                    ISO 8601: '2026-04-25T20:00:00Z' or '2026-04-25T20:00:00+08:00'."
+        )]
         since: Option<String>,
         #[arg(long, default_value = "text")]
         format: String,
@@ -199,7 +209,12 @@ enum Commands {
     Audit {
         #[arg(long)]
         kind: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Filter to audit records created after this point. \
+                    Duration: '10s', '15m', '2h', '3d'. \
+                    ISO 8601: '2026-04-25T20:00:00Z' or '2026-04-25T20:00:00+08:00'."
+        )]
         since: Option<String>,
         #[arg(long, default_value_t = false)]
         raw: bool,
@@ -289,7 +304,12 @@ enum TaxonomyCommands {
 #[derive(Subcommand)]
 enum GatingCommands {
     Stats {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Filter to gating decisions created after this point. \
+                    Duration: '10s', '15m', '2h', '3d'. \
+                    ISO 8601: '2026-04-25T20:00:00Z' or '2026-04-25T20:00:00+08:00'."
+        )]
         since: Option<String>,
     },
 }

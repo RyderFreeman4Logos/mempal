@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::core::config::{Config, ConfigHandle};
 use crate::core::db::{Database, read_fork_ext_version};
 use crate::core::project::{ProjectSearchScope, resolve_project_id};
-use crate::cowork::peek::format_rfc3339;
+use crate::cowork::peek::{format_rfc3339, parse_rfc3339};
 use anyhow::{Context, Result, bail};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -1105,27 +1105,51 @@ fn render_room(room: Option<&str>) -> &str {
 }
 
 fn parse_since_cutoff(raw: Option<&str>) -> Result<Option<i64>> {
-    raw.map(parse_duration_spec)
-        .transpose()
-        .map(|seconds| seconds.map(|seconds| now_unix_secs() - seconds))
+    raw.map(|s| parse_since_str(s, now_unix_secs())).transpose()
 }
 
-fn parse_duration_spec(raw: &str) -> Result<i64> {
+/// Parse a `--since` value into an absolute epoch-second cutoff.
+///
+/// Accepts:
+/// - Duration suffix: `10s`, `15m`, `2h`, `3d` → `now - duration`
+/// - ISO 8601 / RFC 3339 absolute timestamp: `2026-04-25T20:00:00Z`,
+///   `2026-04-25T20:00:00+08:00` → exact UTC epoch seconds
+pub(crate) fn parse_since_str(raw: &str, now: i64) -> Result<i64> {
     if raw.is_empty() {
-        bail!("empty duration");
+        bail!(
+            "empty --since value; accepted: duration like '10s', '15m', '2h', '3d' \
+             or ISO 8601 timestamp like '2026-04-25T20:00:00Z'"
+        );
+    }
+    if let Some(secs) = try_parse_duration_secs(raw) {
+        return Ok(now - secs);
+    }
+    if let Some(ts) = parse_rfc3339(raw) {
+        return Ok(ts);
+    }
+    bail!(
+        "invalid --since value {raw:?}; \
+         accepted: duration like '10s', '15m', '2h', '3d' \
+         or ISO 8601 timestamp like '2026-04-25T20:00:00Z'"
+    )
+}
+
+/// Returns the duration in seconds for strings like `10s`, `15m`, `2h`, `3d`.
+/// Returns `None` for unrecognised formats (including ISO timestamps).
+fn try_parse_duration_secs(raw: &str) -> Option<i64> {
+    if raw.is_empty() {
+        return None;
     }
     let (digits, unit) = raw.split_at(raw.len() - 1);
-    let value = digits
-        .parse::<i64>()
-        .with_context(|| format!("invalid duration: {raw}"))?;
+    let value = digits.parse::<i64>().ok()?;
     let multiplier = match unit {
-        "s" => 1,
+        "s" => 1_i64,
         "m" => 60,
-        "h" => 60 * 60,
-        "d" => 60 * 60 * 24,
-        other => bail!("unsupported duration unit: {other}"),
+        "h" => 3600,
+        "d" => 86400,
+        _ => return None,
     };
-    Ok(value * multiplier)
+    Some(value * multiplier)
 }
 
 fn now_unix_secs() -> i64 {
@@ -1249,4 +1273,71 @@ pub fn escape_terminal_text(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXED_NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn test_parse_since_10_minutes() {
+        let cutoff = parse_since_str("10m", FIXED_NOW).unwrap();
+        assert_eq!(cutoff, FIXED_NOW - 600);
+    }
+
+    #[test]
+    fn test_parse_since_1_hour() {
+        let cutoff = parse_since_str("1h", FIXED_NOW).unwrap();
+        assert_eq!(cutoff, FIXED_NOW - 3600);
+    }
+
+    #[test]
+    fn test_parse_since_1_day() {
+        let cutoff = parse_since_str("1d", FIXED_NOW).unwrap();
+        assert_eq!(cutoff, FIXED_NOW - 86400);
+    }
+
+    #[test]
+    fn test_parse_since_seconds_suffix() {
+        let cutoff = parse_since_str("30s", FIXED_NOW).unwrap();
+        assert_eq!(cutoff, FIXED_NOW - 30);
+    }
+
+    #[test]
+    fn test_parse_since_iso_8601_z() {
+        // 2026-04-25T20:00:00Z → absolute UTC epoch, independent of 'now'
+        let cutoff = parse_since_str("2026-04-25T20:00:00Z", FIXED_NOW).unwrap();
+        let expected = parse_rfc3339("2026-04-25T20:00:00Z").expect("valid ISO");
+        assert_eq!(cutoff, expected);
+        // Sanity: result is well before FIXED_NOW (year 2057)
+        assert!(cutoff < FIXED_NOW);
+    }
+
+    #[test]
+    fn test_parse_since_iso_8601_offset() {
+        // +08:00 means 8 hours ahead of UTC → UTC equivalent is 8h earlier
+        let cutoff_z = parse_since_str("2026-04-25T20:00:00Z", FIXED_NOW).unwrap();
+        let cutoff_plus8 = parse_since_str("2026-04-25T20:00:00+08:00", FIXED_NOW).unwrap();
+        assert_eq!(cutoff_z - cutoff_plus8, 8 * 3600);
+    }
+
+    #[test]
+    fn test_parse_since_rejects_garbage() {
+        assert!(parse_since_str("not-a-duration", FIXED_NOW).is_err());
+        assert!(parse_since_str("xyz", FIXED_NOW).is_err());
+        assert!(parse_since_str("", FIXED_NOW).is_err());
+    }
+
+    #[test]
+    fn test_try_parse_duration_secs() {
+        assert_eq!(try_parse_duration_secs("10m"), Some(600));
+        assert_eq!(try_parse_duration_secs("1h"), Some(3600));
+        assert_eq!(try_parse_duration_secs("1d"), Some(86400));
+        assert_eq!(try_parse_duration_secs("30s"), Some(30));
+        assert_eq!(try_parse_duration_secs("2026-04-25T20:00:00Z"), None);
+        assert_eq!(try_parse_duration_secs("not-a-duration"), None);
+        assert_eq!(try_parse_duration_secs(""), None);
+    }
 }
