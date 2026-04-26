@@ -243,8 +243,9 @@ enum Commands {
         #[arg(long)]
         target: String,
 
-        /// Project cwd. Exactly ONE of --cwd or --cwd-source must be set.
-        /// Use this for Claude Code hook (pass ${CLAUDE_PROJECT_CWD:-$PWD}).
+        /// Project cwd — defaults to current working directory when neither
+        /// --cwd nor --cwd-source is provided. Use this for Claude Code hook
+        /// (pass ${CLAUDE_PROJECT_CWD:-$PWD}).
         #[arg(long, conflicts_with = "cwd_source")]
         cwd: Option<PathBuf>,
 
@@ -263,8 +264,9 @@ enum Commands {
     /// Show current cowork inbox state for both targets at the given cwd
     /// (read-only — does NOT drain).
     CoworkStatus {
+        /// Project cwd — defaults to current working directory.
         #[arg(long)]
-        cwd: PathBuf,
+        cwd: Option<PathBuf>,
     },
     /// Install cowork hooks: Claude Code (project-level .claude/hooks)
     /// and optionally Codex (global ~/.codex/hooks.json merge).
@@ -405,7 +407,10 @@ fn run() -> Result<()> {
             );
         }
         Commands::CoworkStatus { cwd } => {
-            return cowork_status_command(cwd.clone());
+            let resolved = cwd
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().expect("current_dir failed"));
+            return cowork_status_command(resolved);
         }
         Commands::CoworkInstallHooks { global_codex } => {
             return cowork_install_hooks_command(*global_codex);
@@ -2140,7 +2145,7 @@ fn cowork_drain_command(
             (None, Some(other)) => {
                 return Err(format!("unsupported --cwd-source: {other}").into());
             }
-            (None, None) => return Err("must provide --cwd or --cwd-source".into()),
+            (None, None) => std::env::current_dir()?,
             (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
         };
 

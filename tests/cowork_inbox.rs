@@ -922,3 +922,140 @@ fn cowork_install_hooks_heals_stale_codex_drain_entry() {
         "unrelated UserPromptSubmit hook must be preserved"
     );
 }
+
+// --- Issue #83: --cwd defaults to current working directory ---
+
+#[test]
+fn test_cowork_status_no_cwd_uses_pwd() {
+    let tmp = TempDir::new().unwrap();
+    let mempal_home = tmp.path().join(".mempal");
+    let repo = setup_repo(&tmp, "proj-status-pwd");
+
+    push(
+        &mempal_home,
+        Tool::Codex,
+        Tool::Claude,
+        &repo,
+        "hello from codex".into(),
+        "2026-04-25T00:00:00Z".into(),
+    )
+    .unwrap();
+
+    // Run cowork-status without --cwd, but with current_dir set to repo.
+    let output = Command::new(mempal_bin())
+        .args(["cowork-status"])
+        .current_dir(&repo)
+        .env("HOME", tmp.path())
+        .output()
+        .expect("spawn cowork-status without --cwd");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "exit code must be 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("claude inbox"),
+        "should list claude inbox, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 message"),
+        "should show 1 message for claude, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cowork_status_explicit_cwd_overrides() {
+    let tmp = TempDir::new().unwrap();
+    let mempal_home = tmp.path().join(".mempal");
+    let repo_a = setup_repo(&tmp, "proj-a");
+    let repo_b = setup_repo(&tmp, "proj-b");
+
+    // Push a message to repo_a only.
+    push(
+        &mempal_home,
+        Tool::Codex,
+        Tool::Claude,
+        &repo_a,
+        "message for repo-a".into(),
+        "2026-04-25T00:00:00Z".into(),
+    )
+    .unwrap();
+
+    // Run cowork-status with --cwd pointing at repo_a, but current_dir = repo_b.
+    // The explicit --cwd must win: we should see messages from repo_a.
+    let output = Command::new(mempal_bin())
+        .args(["cowork-status", "--cwd", repo_a.to_str().unwrap()])
+        .current_dir(&repo_b)
+        .env("HOME", tmp.path())
+        .output()
+        .expect("spawn cowork-status with explicit --cwd");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 message"),
+        "explicit --cwd must point at repo_a which has 1 message, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(repo_a.to_str().unwrap()),
+        "Project line must show repo_a path, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cowork_drain_no_cwd_uses_pwd() {
+    let tmp = TempDir::new().unwrap();
+    let mempal_home = tmp.path().join(".mempal");
+    let repo = setup_repo(&tmp, "proj-drain-pwd");
+
+    push(
+        &mempal_home,
+        Tool::Codex,
+        Tool::Claude,
+        &repo,
+        "drain me via pwd".into(),
+        "2026-04-25T00:00:00Z".into(),
+    )
+    .unwrap();
+
+    // Run cowork-drain --target claude without --cwd, current_dir = repo.
+    let output = Command::new(mempal_bin())
+        .args(["cowork-drain", "--target", "claude"])
+        .current_dir(&repo)
+        .env("HOME", tmp.path())
+        .output()
+        .expect("spawn cowork-drain without --cwd");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "exit code must be 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("drain me via pwd"),
+        "should have drained the message, stdout: {stdout}"
+    );
+
+    // Verify inbox is now empty (message was actually drained).
+    let remaining = drain(&mempal_home, Tool::Claude, &repo).unwrap();
+    assert!(remaining.is_empty(), "inbox should be empty after drain");
+}
+
+#[test]
+fn test_cowork_status_help_documents_default() {
+    let output = Command::new(mempal_bin())
+        .args(["cowork-status", "--help"])
+        .output()
+        .expect("spawn cowork-status --help");
+
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("current") || help.contains("PWD") || help.contains("default"),
+        "help text should mention cwd defaults to current directory, got: {help}"
+    );
+}
