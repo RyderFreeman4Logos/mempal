@@ -333,6 +333,9 @@ enum KgCommands {
         #[arg(long)]
         all: bool,
     },
+    Invalidate {
+        triple_id: String,
+    },
     Timeline {
         entity: String,
     },
@@ -1398,6 +1401,28 @@ fn kg_command(db: &Database, command: KgCommands) -> Result<()> {
                     );
                 }
                 println!("\n{} triple(s)", triples.len());
+            }
+        }
+        KgCommands::Invalidate { triple_id } => {
+            if !db
+                .triple_exists(&triple_id)
+                .context("failed to check triple existence")?
+            {
+                bail!("triple not found: {triple_id}");
+            }
+            let invalidated = db
+                .invalidate_triple(&triple_id)
+                .context("failed to invalidate triple")?;
+            if invalidated {
+                append_audit_entry(
+                    db,
+                    "kg-invalidate",
+                    &serde_json::json!({ "triple_id": triple_id }),
+                )
+                .context("failed to append audit log")?;
+                println!("invalidated triple {triple_id}");
+            } else {
+                println!("triple {triple_id} already invalidated");
             }
         }
         KgCommands::Timeline { entity } => {
