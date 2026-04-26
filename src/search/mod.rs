@@ -177,26 +177,38 @@ pub fn search_bm25_only(
 /// If so, add the other wing names as tunnel_hints and append any explicit
 /// cross-project tunnel targets without applying the project filter.
 ///
-/// Reads `[search].tunnel_fanout_cap` from the hot-reload config snapshot.
+/// Reads `[search].tunnel_fanout_cap` and `[search].tunnel_hints_display_cap`
+/// from the hot-reload config snapshot.
 fn inject_tunnel_hints_and_results(
     db: &Database,
     results: &mut Vec<SearchResult>,
     scope: &ProjectSearchScope,
 ) {
-    let fanout_cap = crate::core::hot_reload::global_hot_reload_state()
+    let search_cfg = crate::core::hot_reload::global_hot_reload_state()
         .current()
         .search
-        .tunnel_fanout_cap;
-    inject_tunnel_hints_with_cap(db, results, scope, fanout_cap);
+        .clone();
+    inject_tunnel_hints_with_cap(
+        db,
+        results,
+        scope,
+        search_cfg.tunnel_fanout_cap,
+        search_cfg.tunnel_hints_display_cap,
+    );
 }
 
-/// Tunnel-hint injection with explicit per-source fanout cap — factored out for
-/// unit tests so a caller can pin the cap without touching the global hot-reload state.
+/// Tunnel-hint injection with explicit caps — factored out for unit tests so callers
+/// can pin caps without touching the global hot-reload state.
+///
+/// `fanout_cap` bounds the number of injected cross-project rows per source result.
+/// `hints_display_cap` bounds `tunnel_hints` string entries per result; excess wings
+/// are replaced by a single `"… +N more"` sentinel as the last element.
 pub(crate) fn inject_tunnel_hints_with_cap(
     db: &Database,
     results: &mut Vec<SearchResult>,
     scope: &ProjectSearchScope,
     fanout_cap: usize,
+    hints_display_cap: usize,
 ) {
     let tunnels = match db.find_tunnels() {
         Ok(t) => t,
@@ -220,11 +232,18 @@ pub(crate) fn inject_tunnel_hints_with_cap(
     for result in results.iter_mut() {
         if let Some(room) = result.room.as_deref() {
             if let Some(wings) = tunnel_map.get(room) {
-                result.tunnel_hints = wings
+                let other_wings: Vec<&String> =
+                    wings.iter().filter(|w| *w != &result.wing).collect();
+                let total_other = other_wings.len();
+                let mut hints: Vec<String> = other_wings
                     .iter()
-                    .filter(|w| *w != &result.wing)
-                    .cloned()
+                    .take(hints_display_cap)
+                    .map(|w| (*w).clone())
                     .collect();
+                if total_other > hints_display_cap {
+                    hints.push(format!("… +{} more", total_other - hints_display_cap));
+                }
+                result.tunnel_hints = hints;
             }
             if fanout_cap == 0 {
                 continue;
@@ -675,7 +694,7 @@ mod tests {
         seed_cross_project(&db, &source, 10);
 
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 3);
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 3, usize::MAX);
 
         assert_eq!(
             results.len(),
@@ -698,7 +717,7 @@ mod tests {
         seed_cross_project(&db, &source, 5);
 
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 0);
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 0, usize::MAX);
 
         assert_eq!(results.len(), 1, "cap=0 must not add tunnel drawers");
         assert_eq!(
@@ -716,7 +735,7 @@ mod tests {
         seed_cross_project(&db, &source, 2);
 
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 100);
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 100, usize::MAX);
 
         assert_eq!(
             results.len(),
@@ -745,7 +764,7 @@ mod tests {
         }
 
         let mut results = vec![make_result(&alpha), make_result(&gamma)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 2);
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 2, usize::MAX);
 
         // SQL LIMIT = fanout_cap + 1 = 3.  Alpha's query returns 3 beta rows
         // (beta-9, beta-8, beta-7 DESC order); alpha's Rust cap adds 2 (beta-9,
@@ -779,6 +798,109 @@ mod tests {
             "SQL LIMIT should bound returned rows to {limit}, got {}",
             drawers.len()
         );
+    }
+
+    // --- tunnel_hints display cap tests ---
+
+    fn seed_many_wings(db: &Database, source_wing: &str, sibling_count: usize, room: &str) {
+        let source = make_drawer(&format!("{source_wing}-1"), source_wing, room);
+        db.insert_drawer_with_project(&source, None)
+            .expect("insert source");
+        for i in 0..sibling_count {
+            let id = format!("sibling-{i}");
+            let wing = format!("wing-{i:02}");
+            let d = make_drawer(&id, &wing, room);
+            db.insert_drawer_with_project(&d, None)
+                .expect("insert sibling");
+        }
+    }
+
+    #[test]
+    fn test_tunnel_hints_capped_at_default_when_many_wings() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        seed_many_wings(&db, "alpha", 49, "room-shared");
+
+        let source = make_drawer("alpha-1", "alpha", "room-shared");
+        let mut results = vec![make_result(&source)];
+        inject_tunnel_hints_with_cap(&db, &mut results, &ProjectSearchScope::all_projects(), 0, 8);
+
+        // 8 real hints + 1 sentinel = 9 = display_cap + 1
+        assert!(
+            results[0].tunnel_hints.len() <= 9,
+            "expected <= 9 hints, got {}",
+            results[0].tunnel_hints.len()
+        );
+        let last = results[0].tunnel_hints.last().expect("has entries");
+        assert!(last.starts_with("… +"), "expected sentinel, got {:?}", last);
+    }
+
+    #[test]
+    fn test_tunnel_hints_no_sentinel_when_under_cap() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        seed_many_wings(&db, "alpha", 5, "room-shared");
+
+        let source = make_drawer("alpha-1", "alpha", "room-shared");
+        let mut results = vec![make_result(&source)];
+        inject_tunnel_hints_with_cap(&db, &mut results, &ProjectSearchScope::all_projects(), 0, 8);
+
+        assert_eq!(results[0].tunnel_hints.len(), 5, "exactly 5 sibling hints");
+        assert!(
+            !results[0].tunnel_hints.iter().any(|h| h.starts_with("… +")),
+            "no sentinel expected when under cap"
+        );
+    }
+
+    #[test]
+    fn test_tunnel_hints_sentinel_count_is_correct() {
+        // 49 siblings, cap=8 → show 8, sentinel = "… +41 more"
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        seed_many_wings(&db, "alpha", 49, "room-shared");
+
+        let source = make_drawer("alpha-1", "alpha", "room-shared");
+        let mut results = vec![make_result(&source)];
+        inject_tunnel_hints_with_cap(&db, &mut results, &ProjectSearchScope::all_projects(), 0, 8);
+
+        let sentinel = results[0].tunnel_hints.last().expect("has sentinel");
+        assert_eq!(sentinel, "… +41 more");
+    }
+
+    #[test]
+    fn test_tunnel_hints_excludes_self_wing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        seed_many_wings(&db, "alpha", 10, "room-shared");
+
+        let source = make_drawer("alpha-1", "alpha", "room-shared");
+        let mut results = vec![make_result(&source)];
+        inject_tunnel_hints_with_cap(&db, &mut results, &ProjectSearchScope::all_projects(), 0, 8);
+
+        assert!(
+            !results[0].tunnel_hints.iter().any(|h| h == "alpha"),
+            "own wing must not appear in tunnel_hints"
+        );
+    }
+
+    #[test]
+    fn test_tunnel_hints_cap_config_override() {
+        // display_cap=3 → 3 real hints + 1 sentinel
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        seed_many_wings(&db, "alpha", 10, "room-shared");
+
+        let source = make_drawer("alpha-1", "alpha", "room-shared");
+        let mut results = vec![make_result(&source)];
+        inject_tunnel_hints_with_cap(&db, &mut results, &ProjectSearchScope::all_projects(), 0, 3);
+
+        assert_eq!(
+            results[0].tunnel_hints.len(),
+            4,
+            "expected 3 real + 1 sentinel = 4"
+        );
+        let sentinel = results[0].tunnel_hints.last().expect("has sentinel");
+        assert!(sentinel.starts_with("… +"), "last entry should be sentinel");
     }
 
     // --- compute_knn_k unit tests ---

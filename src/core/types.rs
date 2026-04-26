@@ -86,6 +86,8 @@ pub struct SearchResult {
     pub similarity: f32,
     pub route: RouteDecision,
     /// Other wings that share this result's room (tunnel hints).
+    /// Capped to `[search].tunnel_hints_display_cap` (default 8); excess entries
+    /// are replaced by a single `"… +N more"` sentinel as the last element.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tunnel_hints: Vec<String>,
 }
