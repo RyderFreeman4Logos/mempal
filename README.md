@@ -18,6 +18,16 @@ Next session (any agent) → mempal search → finds the decision with source ci
 
 ## Quick Start
 
+> **Caution: `cargo install --git` from a fork is unreliable across schema migrations.**
+> `cargo install --git <fork-url> --branch main --force mempal` may report success while actually
+> skipping the rebuild (cargo's source cache returns a stale ref despite `--force`, which only
+> forces *installation* not *re-fetch*). After a `CURRENT_SCHEMA_VERSION` bump in `src/core/db.rs`,
+> the resulting binary will fail with `database schema version N is newer than supported version N-1`.
+> See [#76](https://github.com/RyderFreeman4Logos/mempal/issues/76).
+>
+> For fork builds, prefer the `--path` route below (clones a fresh checkout, builds locally).
+> A one-liner is provided at [`scripts/install-from-source.sh`](scripts/install-from-source.sh).
+
 ```bash
 cargo install --path crates/mempal-cli --locked
 
