@@ -799,8 +799,8 @@ async fn ingest_command(
         bail!(
             "`mempal ingest` expects a DIRECTORY of source files, but `{path_str}` is a single file.\n\
              To ingest a single file, place it in a directory first:\n\n\
-             mkdir -p /tmp/mempal-batch && cp {path_str} /tmp/mempal-batch/ && \\\n\
-             mempal ingest --wing {wing} /tmp/mempal-batch/"
+             mkdir -p /tmp/mempal-batch && cp \"{path_str}\" /tmp/mempal-batch/ && \\\n\
+             mempal ingest --wing \"{wing}\" /tmp/mempal-batch/"
         );
     }
     if !path.is_dir() {
