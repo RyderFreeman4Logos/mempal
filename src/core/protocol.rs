@@ -59,6 +59,21 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    call mempal_ingest to persist it. Include the rationale, not just the
    decision. Use the current project's wing; let mempal auto-route the room.
 
+4a. SET IMPORTANCE AT INGEST TIME
+   mempal_ingest accepts an optional `importance` field (integer 1-5). Set it
+   explicitly for any drawer that represents a decision, discovery, or feature
+   outcome — these are high-signal items that should surface early in wake-up
+   context. Good defaults:
+     5 — critical architectural choice or non-obvious constraint (hard to reverse)
+     4 — significant decision with clear rationale
+     3 — useful discovery or feature design outcome
+     2 — minor decision or exploratory finding
+     1 — routine status update worth keeping but low priority
+   Omit importance (it defaults to 0) ONLY for routine status snapshots, diary
+   chatter, or ephemeral observations. Drawers at importance 0 are hidden from
+   wake-up context unless explicitly queried. If you are unsure, use 2.
+   Operators can back-fill legacy drawers with `mempal reindex --recompute-importance`.
+
 5. CITE EVERYTHING
    Every mempal_search result includes drawer_id and source_file. Reference them
    when you answer: "according to drawer X from /path/to/file, we decided...".

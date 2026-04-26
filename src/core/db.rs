@@ -1460,6 +1460,107 @@ impl Database {
     pub fn schema_version(&self) -> Result<u32, DbError> {
         read_user_version(&self.conn)
     }
+
+    /// Load all active (non-deleted) drawers for importance rescoring.
+    ///
+    /// When `only_zero` is true, returns only drawers where importance is 0 or NULL.
+    pub fn drawers_for_rescore(&self, only_zero: bool) -> Result<Vec<Drawer>, DbError> {
+        let sql = if only_zero {
+            r#"
+            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
+                   COALESCE(importance, 0) as importance
+            FROM drawers
+            WHERE deleted_at IS NULL AND COALESCE(importance, 0) = 0
+            ORDER BY id ASC
+            "#
+        } else {
+            r#"
+            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
+                   COALESCE(importance, 0) as importance
+            FROM drawers
+            WHERE deleted_at IS NULL
+            ORDER BY id ASC
+            "#
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, i32>(8)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    content,
+                    wing,
+                    room,
+                    source_file,
+                    source_type,
+                    added_at,
+                    chunk_index,
+                    importance,
+                )| {
+                    Ok(Drawer {
+                        id,
+                        content,
+                        wing,
+                        room,
+                        source_file,
+                        source_type: source_type_from_str(&source_type)?,
+                        added_at,
+                        chunk_index,
+                        importance,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Apply importance scores in batched `BEGIN IMMEDIATE` transactions.
+    ///
+    /// Each batch of up to 1000 rows is committed independently so that concurrent
+    /// readers (WAL mode) are not blocked for the full duration of large rescores.
+    /// Returns the total number of rows updated.
+    pub fn bulk_update_importance(&self, updates: &[(String, i32)]) -> Result<usize, DbError> {
+        const BATCH_SIZE: usize = 1000;
+        let mut total = 0usize;
+        for chunk in updates.chunks(BATCH_SIZE) {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> Result<usize, DbError> {
+                let mut count = 0usize;
+                for (id, importance) in chunk {
+                    self.conn.execute(
+                        "UPDATE drawers SET importance = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                        rusqlite::params![importance, id],
+                    )?;
+                    count += 1;
+                }
+                Ok(count)
+            })();
+            match result {
+                Ok(n) => {
+                    self.conn.execute_batch("COMMIT")?;
+                    total += n;
+                }
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
+        }
+        Ok(total)
+    }
 }
 
 fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
