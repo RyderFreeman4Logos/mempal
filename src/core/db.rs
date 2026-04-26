@@ -1289,6 +1289,15 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn triple_exists(&self, triple_id: &str) -> Result<bool, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM triples WHERE id = ?1",
+            params![triple_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn invalidate_triple(&self, triple_id: &str) -> Result<bool, DbError> {
         let timestamp = super::utils::current_timestamp();
         let affected = self.conn.execute(
