@@ -13,6 +13,7 @@ pub mod factcheck;
 pub mod hook;
 pub mod hook_install;
 pub mod hotpatch;
+pub mod importance;
 pub mod ingest;
 pub mod integrations;
 pub mod mcp;

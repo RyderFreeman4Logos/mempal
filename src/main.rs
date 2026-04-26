@@ -141,6 +141,13 @@ enum Commands {
         resume: bool,
         #[arg(long, default_value_t = false)]
         stale: bool,
+        /// Recompute importance scores for existing drawers using rule-based heuristics.
+        /// Mutually exclusive with embedder-based reindex; does not re-embed.
+        #[arg(long, default_value_t = false)]
+        recompute_importance: bool,
+        /// With --recompute-importance: only process drawers where importance is 0.
+        #[arg(long, default_value_t = false)]
+        only_zero: bool,
     },
     Kg {
         #[command(subcommand)]
@@ -503,20 +510,28 @@ fn run() -> Result<()> {
             from_config,
             resume,
             stale,
+            recompute_importance,
+            only_zero,
         } => {
-            let backend = match (embedder.as_deref(), from_config) {
-                (Some(name), false) => name.to_string(),
-                (None, true) => config.embed.backend.clone(),
-                (Some(_), true) => bail!("use either --embedder <name> or --from-config, not both"),
-                (None, false) => bail!("reindex requires --embedder <name> or --from-config"),
-            };
-            block_on_result(reindex_command(
-                &db,
-                config.as_ref(),
-                &backend,
-                resume,
-                stale,
-            ))
+            if recompute_importance {
+                recompute_importance_command(&db, only_zero)
+            } else {
+                let backend = match (embedder.as_deref(), from_config) {
+                    (Some(name), false) => name.to_string(),
+                    (None, true) => config.embed.backend.clone(),
+                    (Some(_), true) => {
+                        bail!("use either --embedder <name> or --from-config, not both")
+                    }
+                    (None, false) => bail!("reindex requires --embedder <name> or --from-config"),
+                };
+                block_on_result(reindex_command(
+                    &db,
+                    config.as_ref(),
+                    &backend,
+                    resume,
+                    stale,
+                ))
+            }
         }
         Commands::Kg { command } => kg_command(&db, command),
         Commands::Tunnels => tunnels_command(&db),
@@ -1075,6 +1090,36 @@ fn compress_command(text: &str) -> Result<()> {
     );
 
     println!("{}", output.document);
+    Ok(())
+}
+
+fn recompute_importance_command(db: &Database, only_zero: bool) -> Result<()> {
+    use mempal::importance::score_importance;
+
+    let drawers = db
+        .drawers_for_rescore(only_zero)
+        .context("failed to load drawers for importance rescoring")?;
+    let total = drawers.len();
+    if total == 0 {
+        println!(
+            "no drawers to rescore (already have importance > 0 and --only-zero is set, or database is empty)"
+        );
+        return Ok(());
+    }
+    println!("scoring {total} drawers...");
+
+    let updates: Vec<(String, i32)> = drawers
+        .into_iter()
+        .map(|drawer| {
+            let new_score = score_importance(&drawer);
+            (drawer.id, new_score)
+        })
+        .collect();
+
+    let updated = db
+        .bulk_update_importance(&updates)
+        .context("failed to apply importance scores")?;
+    println!("updated {updated} drawers with recomputed importance scores");
     Ok(())
 }
 
