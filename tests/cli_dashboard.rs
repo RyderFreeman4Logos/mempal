@@ -351,6 +351,10 @@ fn test_audit_novelty_lists_decisions() {
         ("novelty-01", NoveltyAction::Drop),
         ("novelty-00", NoveltyAction::Insert),
     ];
+    // Capture base time once so that each record's created_at is distinct
+    // (avoids a second-boundary race where two loop iterations call
+    // now_unix_secs() in the same second and produce identical timestamps).
+    let base_ts = now_unix_secs();
     for (index, (drawer_id, action)) in decisions.iter().enumerate() {
         insert_drawer(
             &env.db_path,
@@ -367,7 +371,7 @@ fn test_audit_novelty_lists_decisions() {
             &env.db_path,
             drawer_id,
             *action,
-            now_unix_secs() - 60 + (decisions.len() - index) as i64,
+            base_ts - 60 + (decisions.len() - index) as i64,
         );
     }
 
@@ -1165,4 +1169,144 @@ fn test_audit_filters_by_project_when_isolation_strict() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("audit-proj-a"), "{stdout}");
     assert!(!stdout.contains("audit-proj-b"), "{stdout}");
+}
+
+/// Insert a drawer whose `added_at` is `offset_secs` seconds before now.
+fn insert_drawer_at_offset(db_path: &std::path::Path, id: &str, offset_secs: u64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after unix epoch")
+        .as_secs();
+    let ts = now.saturating_sub(offset_secs);
+    insert_drawer(
+        db_path,
+        &drawer_seed(
+            id,
+            format!("recent drawer {id}"),
+            "test-wing",
+            None,
+            ts.to_string(),
+            1,
+        ),
+    );
+}
+
+#[test]
+fn test_tail_since_10m_returns_recent_drawer() {
+    let env = DashboardEnv::new();
+    // drawer added 30 seconds ago — within the 10-minute window
+    insert_drawer_at_offset(&env.db_path, "recent-drawer", 30);
+    // old drawer outside the window (25 hours ago)
+    insert_drawer_at_offset(&env.db_path, "old-drawer", 25 * 3600);
+
+    let output = run_mempal(&env.home, env.cwd(), &["tail", "--since", "10m"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("recent-drawer"),
+        "10m window should include recent drawer\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("old-drawer"),
+        "10m window should exclude old drawer\n{stdout}"
+    );
+}
+
+#[test]
+fn test_tail_since_1h_returns_recent_drawer() {
+    let env = DashboardEnv::new();
+    // drawer added 5 minutes ago — within the 1-hour window
+    insert_drawer_at_offset(&env.db_path, "five-min-drawer", 300);
+    // old drawer outside the window (2 hours ago)
+    insert_drawer_at_offset(&env.db_path, "two-hour-drawer", 2 * 3600);
+
+    let output = run_mempal(&env.home, env.cwd(), &["tail", "--since", "1h"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("five-min-drawer"),
+        "1h window should include 5-min-old drawer\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("two-hour-drawer"),
+        "1h window should exclude 2-hour-old drawer\n{stdout}"
+    );
+}
+
+#[test]
+fn test_tail_and_timeline_share_parser() {
+    let env = DashboardEnv::new();
+    // drawer added 30 seconds ago
+    insert_drawer_at_offset(&env.db_path, "shared-parser-drawer", 30);
+    // old drawer (2 hours ago, outside 1h window)
+    insert_drawer_at_offset(&env.db_path, "shared-parser-old", 2 * 3600);
+
+    let tail_out = run_mempal(&env.home, env.cwd(), &["tail", "--since", "1h"]);
+    let timeline_out = run_mempal(&env.home, env.cwd(), &["timeline", "--since", "1h"]);
+    assert!(tail_out.status.success(), "tail failed");
+    assert!(timeline_out.status.success(), "timeline failed");
+
+    let tail_stdout = String::from_utf8_lossy(&tail_out.stdout);
+    let timeline_stdout = String::from_utf8_lossy(&timeline_out.stdout);
+
+    // Both commands must include the recent drawer
+    assert!(
+        tail_stdout.contains("shared-parser-drawer"),
+        "tail --since 1h should include recent drawer\n{tail_stdout}"
+    );
+    assert!(
+        timeline_stdout.contains("shared-parser-drawer"),
+        "timeline --since 1h should include recent drawer\n{timeline_stdout}"
+    );
+    // Both commands must exclude the old drawer
+    assert!(
+        !tail_stdout.contains("shared-parser-old"),
+        "tail --since 1h should exclude old drawer\n{tail_stdout}"
+    );
+    assert!(
+        !timeline_stdout.contains("shared-parser-old"),
+        "timeline --since 1h should exclude old drawer\n{timeline_stdout}"
+    );
+}
+
+#[test]
+fn test_tail_since_iso_8601_accepted() {
+    let env = DashboardEnv::new();
+    // Use an ISO timestamp 1 hour in the past — anything newer should appear
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs();
+    insert_drawer_at_offset(&env.db_path, "iso-recent", 30);
+    insert_drawer_at_offset(&env.db_path, "iso-old", 2 * 3600);
+
+    // Build an ISO timestamp for 1h ago
+    let cutoff_secs = now - 3600;
+    let cutoff_ts = mempal::cowork::peek::format_rfc3339(
+        UNIX_EPOCH + std::time::Duration::from_secs(cutoff_secs),
+    );
+
+    let output = run_mempal(&env.home, env.cwd(), &["tail", "--since", &cutoff_ts]);
+    assert!(
+        output.status.success(),
+        "ISO timestamp should be accepted; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("iso-recent"),
+        "ISO cutoff should include recent drawer\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("iso-old"),
+        "ISO cutoff should exclude old drawer\n{stdout}"
+    );
 }
