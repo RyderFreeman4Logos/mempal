@@ -21,6 +21,7 @@ const DEFAULT_RETRY_INTERVAL_SECS: u64 = 2;
 const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 5;
 const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
 const DEFAULT_SEARCH_TUNNEL_FANOUT_CAP: usize = 5;
+const DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP: usize = 8;
 const DEFAULT_ALERT_EVERY_N_FAILURES: u64 = 100;
 const DEFAULT_DEGRADE_AFTER_N_FAILURES: u64 = 10;
 const DEFAULT_HOOK_WING: &str = "agent-diary";
@@ -727,6 +728,9 @@ pub struct SearchConfig {
     pub progressive_disclosure: bool,
     pub preview_chars: usize,
     pub tunnel_fanout_cap: usize,
+    /// Maximum wing names shown per result in `tunnel_hints`. Excess entries are
+    /// replaced by a single `"… +N more"` sentinel. Default: 8.
+    pub tunnel_hints_display_cap: usize,
 }
 
 impl Default for SearchConfig {
@@ -736,6 +740,7 @@ impl Default for SearchConfig {
             progressive_disclosure: true,
             preview_chars: DEFAULT_SEARCH_PREVIEW_CHARS,
             tunnel_fanout_cap: DEFAULT_SEARCH_TUNNEL_FANOUT_CAP,
+            tunnel_hints_display_cap: DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP,
         }
     }
 }
