@@ -67,6 +67,12 @@ struct IngestCommandOptions<'a> {
     dry_run: bool,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum WakeUpFormat {
+    Aaak,
+    Protocol,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     Init {
@@ -113,8 +119,8 @@ enum Commands {
         command: GatingCommands,
     },
     WakeUp {
-        #[arg(long)]
-        format: Option<String>,
+        #[arg(long, value_enum)]
+        format: Option<WakeUpFormat>,
     },
     Prime(PrimeArgs),
     Compress {
@@ -531,7 +537,7 @@ fn run() -> Result<()> {
         Commands::Project { command } => project_command(&db, command),
         Commands::Delete { drawer_id } => delete_command(&db, &drawer_id),
         Commands::Purge { before } => purge_command(&db, before.as_deref()),
-        Commands::WakeUp { format } => wake_up_command(&db, format.as_deref()),
+        Commands::WakeUp { format } => wake_up_command(&db, format),
         Commands::Prime(_) => unreachable!(),
         Commands::Compress { text } => compress_command(&text),
         Commands::Bench { command } => block_on_result(bench_command(config.as_ref(), command)),
@@ -1018,16 +1024,14 @@ fn project_command(db: &Database, command: ProjectCommands) -> Result<()> {
     }
 }
 
-fn wake_up_command(db: &Database, format: Option<&str>) -> Result<()> {
-    if let Some("aaak") = format {
-        return wake_up_aaak_command(db);
-    }
-    if let Some("protocol") = format {
-        println!("{MEMORY_PROTOCOL}");
-        return Ok(());
-    }
-    if let Some(format) = format {
-        bail!("unsupported wake-up format: {format}");
+fn wake_up_command(db: &Database, format: Option<WakeUpFormat>) -> Result<()> {
+    match format {
+        Some(WakeUpFormat::Aaak) => return wake_up_aaak_command(db),
+        Some(WakeUpFormat::Protocol) => {
+            println!("{MEMORY_PROTOCOL}");
+            return Ok(());
+        }
+        None => {}
     }
 
     let drawer_count = db.drawer_count().context("failed to count drawers")?;
