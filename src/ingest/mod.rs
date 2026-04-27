@@ -40,12 +40,13 @@ fn mempal_home_from_db(db: &Database) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IngestStats {
     pub files: usize,
     pub chunks: usize,
     pub skipped: usize,
     pub dropped_by_gate: usize,
+    pub drawer_ids: Vec<String>,
     /// Time waited acquiring the per-source ingest lock (P9-B). `None`
     /// when the lock was bypassed (e.g. dry-run) or when no wait was
     /// needed and the path took the fast exit before lock acquisition.
@@ -377,6 +378,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
                 drawer_id: drawer.id.clone(),
                 source,
             })?;
+        stats.drawer_ids.push(drawer_id);
         stats.chunks += 1;
     }
 
@@ -443,6 +445,7 @@ pub async fn ingest_dir_with_options<E: Embedder + ?Sized>(
                 stats.chunks += file_stats.chunks;
                 stats.skipped += file_stats.skipped;
                 stats.dropped_by_gate += file_stats.dropped_by_gate;
+                stats.drawer_ids.extend(file_stats.drawer_ids);
             }
         }
     }

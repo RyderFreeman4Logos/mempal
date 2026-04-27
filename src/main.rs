@@ -32,6 +32,7 @@ use mempal::ingest::{IngestOptions, IngestStats, ingest_dir_with_options};
 use mempal::mcp::MempalMcpServer;
 use mempal::observability;
 use mempal::search::search;
+use serde::Serialize;
 
 mod longmemeval;
 #[path = "cli/prime.rs"]
@@ -65,6 +66,7 @@ struct IngestCommandOptions<'a> {
     project: Option<&'a str>,
     no_gate: bool,
     dry_run: bool,
+    json: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -92,6 +94,8 @@ enum Commands {
         no_gate: bool,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        json: bool,
     },
     Search {
         query: String,
@@ -504,6 +508,7 @@ fn run() -> Result<()> {
             project,
             no_gate,
             dry_run,
+            json,
         } => block_on_result(ingest_command(
             &db,
             config.as_ref(),
@@ -514,6 +519,7 @@ fn run() -> Result<()> {
                 project: project.as_deref(),
                 no_gate,
                 dry_run,
+                json,
             },
         )),
         Commands::Search {
@@ -891,9 +897,26 @@ async fn ingest_command(
         options.wing,
         options.format.as_deref(),
         options.dry_run,
-        stats,
+        &stats,
     )
     .context("failed to append ingest audit log")?;
+
+    if options.json {
+        let output = IngestJsonOutput {
+            dry_run: options.dry_run,
+            files: stats.files,
+            chunks: stats.chunks,
+            skipped: stats.skipped,
+            dropped_by_gate: stats.dropped_by_gate,
+            drawer_ids: &stats.drawer_ids,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output)
+                .context("failed to serialize ingest JSON output")?
+        );
+        return Ok(());
+    }
 
     println!(
         "dry_run={} files={} chunks={} skipped={} dropped_by_gate={}",
@@ -901,6 +924,16 @@ async fn ingest_command(
     );
 
     Ok(())
+}
+
+#[derive(Serialize)]
+struct IngestJsonOutput<'a> {
+    dry_run: bool,
+    files: usize,
+    chunks: usize,
+    skipped: usize,
+    dropped_by_gate: usize,
+    drawer_ids: &'a [String],
 }
 
 #[derive(Default)]
@@ -930,7 +963,7 @@ fn append_ingest_audit_log(
     wing: &str,
     format: Option<&str>,
     dry_run: bool,
-    stats: IngestStats,
+    stats: &IngestStats,
 ) -> Result<()> {
     let audit_path = db
         .path()
