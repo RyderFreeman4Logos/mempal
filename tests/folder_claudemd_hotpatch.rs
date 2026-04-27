@@ -117,6 +117,7 @@ allowed_target_prefixes = ["{}"]
                 added_at: "1713000000".to_string(),
                 chunk_index: Some(0),
                 importance: 5,
+                ..Drawer::default()
             },
             Some("project-alpha"),
         )

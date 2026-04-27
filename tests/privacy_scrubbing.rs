@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use async_trait::async_trait;
 use mempal::core::config::{Config, ConfigHandle, ScrubStats};
 use mempal::core::db::Database;
-use mempal::core::utils::build_drawer_id;
+use mempal::core::types::SourceType;
+use mempal::core::utils::build_bootstrap_evidence_drawer_id;
 use mempal::embed::{EmbedError, Embedder};
 use mempal::ingest::{IngestOptions, chunk::chunk_text_token_aware, ingest_file_with_options};
 use mempal::mcp::{MempalMcpServer, StatusResponse};
@@ -415,10 +416,7 @@ async fn test_drawer_content_stores_scrubbed_text() {
         IngestOptions {
             room: Some("privacy"),
             source_root: Some(&env.mempal_home),
-            dry_run: false,
-            project_id: None,
-            gating: None,
-            prototype_classifier: None,
+            ..IngestOptions::default()
         },
     )
     .await
@@ -448,10 +446,7 @@ async fn test_embedding_receives_scrubbed_text() {
         IngestOptions {
             room: Some("privacy"),
             source_root: Some(&env.mempal_home),
-            dry_run: false,
-            project_id: None,
-            gating: None,
-            prototype_classifier: None,
+            ..IngestOptions::default()
         },
     )
     .await
@@ -555,10 +550,7 @@ async fn test_privacy_disabled_preserves_content_byte_identical() {
         IngestOptions {
             room: Some("privacy"),
             source_root: Some(&env.mempal_home),
-            dry_run: false,
-            project_id: None,
-            gating: None,
-            prototype_classifier: None,
+            ..IngestOptions::default()
         },
     )
     .await
@@ -619,10 +611,7 @@ async fn test_scrub_does_not_affect_storage_invariants() {
         IngestOptions {
             room: Some("privacy"),
             source_root: Some(&env.mempal_home),
-            dry_run: false,
-            project_id: None,
-            gating: None,
-            prototype_classifier: None,
+            ..IngestOptions::default()
         },
     )
     .await
@@ -645,7 +634,12 @@ async fn test_scrub_does_not_affect_storage_invariants() {
     for (index, chunk) in expected_chunks.iter().enumerate() {
         assert_eq!(
             stored_ids[index],
-            build_drawer_id("test", Some("privacy"), chunk),
+            build_bootstrap_evidence_drawer_id(
+                "test",
+                Some("privacy"),
+                chunk,
+                &SourceType::Project,
+            ),
             "chunk {index} must keep deterministic drawer_id"
         );
         let (resolved_id, exists) = env
@@ -698,10 +692,7 @@ async fn test_status_command_shows_scrub_stats() {
         IngestOptions {
             room: Some("privacy"),
             source_root: Some(&env.mempal_home),
-            dry_run: false,
-            project_id: None,
-            gating: None,
-            prototype_classifier: None,
+            ..IngestOptions::default()
         },
     )
     .await
@@ -714,10 +705,7 @@ async fn test_status_command_shows_scrub_stats() {
         IngestOptions {
             room: Some("privacy"),
             source_root: Some(&env.mempal_home),
-            dry_run: false,
-            project_id: None,
-            gating: None,
-            prototype_classifier: None,
+            ..IngestOptions::default()
         },
     )
     .await

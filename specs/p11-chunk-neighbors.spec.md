@@ -35,10 +35,10 @@ mempalace 的方案：`search` 返回 top chunk 时同时带上**同一 source_f
   }
   ```
 - **邻居定位算法**：
-  1. 命中 drawer 有字段 `source_file` + `chunk_index`（`chunk_index` 在 `drawers` 表已有？如无则本 spec 加列）
+  1. 命中 drawer 有字段 `source_file` + `chunk_index`（当前 schema v7 已有 `drawers.chunk_index`，本 spec 不新增 schema）
   2. 查 `SELECT id, content, chunk_index FROM drawers WHERE source_file = ? AND chunk_index IN (hit_idx - 1, hit_idx + 1) AND deleted_at IS NULL AND wing = ? [AND room = ?]`
   3. 按 chunk_index 排序填入 prev/next（缺失的留 `None`）
-- **Schema 检查**：若 `drawers` 表没 `chunk_index` 列，bump schema v6 → v7 加 `chunk_index INTEGER NOT NULL DEFAULT 0`，migration 时按 `source_file + created_at` 顺序自动回填 chunk_index（`ROW_NUMBER() OVER (PARTITION BY source_file ORDER BY created_at)`）
+- **Schema 检查**：当前 schema v7 已包含 `chunk_index`，且 P10 normalize-version 已占用 schema v7；本 spec 不 bump schema，只补当前 schema / ingest 顺序验证
 - **MCP tool schema**：`mempal_search` 的 request schema 更新，`with_neighbors` 字段 Optional；response `SearchResult` 追加 `neighbors`
 - **Payload size 保护**：`with_neighbors=true` 只对 top_k ≤ 10 的请求生效；> 10 时 silently 不补（避免 response 爆炸）
 - **Tunnel hits 不带 neighbors**：tunnel_hints 仍保持轻量，只 hit drawer 本身带 neighbors
@@ -50,13 +50,12 @@ mempalace 的方案：`search` 返回 top chunk 时同时带上**同一 source_f
 ## Boundaries
 
 ### Allowed
-- `src/core/schema.sql`（若需 bump 则加 `chunk_index`）
-- `src/core/db.rs`（migration v6→v7 若 bump；`get_neighbor_chunks(source_file, chunk_idx, scope)` 方法）
+- `src/core/db.rs`（`get_neighbor_chunks(source_file, chunk_idx, scope)` 方法）
 - `src/search/mod.rs`（命中后 optional 补 neighbors）
 - `src/search/mod.rs` 的 `SearchResult` 追加 `neighbors` 字段
 - `src/mcp/tools.rs`（`SearchRequest.with_neighbors` + `SearchResultDto.neighbors`）
 - `src/mcp/server.rs`（透传）
-- `src/cli.rs`（`--with-neighbors` flag）
+- `src/main.rs`（`--with-neighbors` flag）
 - `src/ingest/mod.rs` / `src/ingest/chunk.rs`（写入 chunk_index）
 - `tests/search_neighbors.rs`（新增）
 
@@ -134,14 +133,14 @@ Scenario: 邻居不跨 wing（scope 隔离）
   When `search(wing="A", with_neighbors=true)` 命中 chunk_index=2
   Then hit.neighbors.next IS None（不把 B wing 的 chunk_index=3 当邻居）
 
-Scenario: schema migration 自动回填 chunk_index
+Scenario: current schema exposes chunk_index
   Test:
-    Filter: test_migration_backfills_chunk_index
+    Filter: test_current_schema_has_chunk_index
     Level: integration
-  Given v6 palace.db with 3 drawers same source_file（chunk_index 列不存在）
-  When 打开 db（触发 migration）
+  Given 一个新建 palace.db
+  When 打开 db
   Then schema_version == 7
-  And 3 个 drawer 的 chunk_index 依次为 0, 1, 2（按 created_at 排序）
+  And drawers 表包含 chunk_index 列
 
 Scenario: ingest 新 source 时 chunk_index 从 0 顺序写入
   Test:

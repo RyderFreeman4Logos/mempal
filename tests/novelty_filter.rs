@@ -213,6 +213,7 @@ fn insert_drawer(db_path: &Path, seed: DrawerSeed<'_>, vector: &[f32]) {
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance: 0,
+            ..Drawer::default()
         },
         seed.project_id,
     )
@@ -233,10 +234,9 @@ async fn ingest(
             content: content.to_string(),
             wing: wing.to_string(),
             room: Some(room.to_string()),
-            source: None,
             project_id: project_id.map(ToOwned::to_owned),
             dry_run: Some(false),
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
         .expect("ingest response")

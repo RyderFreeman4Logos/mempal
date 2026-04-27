@@ -48,6 +48,7 @@ fn insert_drawer_at(db_path: &Path, id: &str, wing: &str, content: &str, importa
         added_at: "1713000000".to_string(),
         chunk_index: Some(0),
         importance,
+        ..Drawer::default()
     })
     .expect("insert drawer");
 }
@@ -189,6 +190,7 @@ fn test_reindex_batched_does_not_block_concurrent_reads() {
                 added_at: "1713000000".to_string(),
                 chunk_index: Some(i as i64),
                 importance: 0,
+                ..Drawer::default()
             })
             .expect("insert drawer");
     }

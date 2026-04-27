@@ -25,6 +25,7 @@ fn make_drawer(i: usize) -> Drawer {
         added_at: "1700000000".to_string(),
         chunk_index: None,
         importance: 0,
+        ..Drawer::default()
     }
 }
 

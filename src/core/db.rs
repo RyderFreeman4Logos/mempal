@@ -5,26 +5,37 @@ pub use db_fork_ext::{
     FORK_EXT_V3_SCHEMA_SQL, MigrationHook, apply_fork_ext_migrations, apply_fork_ext_migrations_to,
     apply_fork_ext_migrations_with_hook, read_fork_ext_version, set_fork_ext_version,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, params, params_from_iter, types::Value as SqlValue,
+    Connection, OpenFlags, OptionalExtension, Row, params, params_from_iter,
+    types::Value as SqlValue,
 };
 use serde_json::Value;
 use thiserror::Error;
 
+use super::anchor;
 use super::{
-    types::{Drawer, DrawerDetails, SourceType, TaxonomyEntry, Triple, TripleStats, TunnelDrawer},
-    utils::{build_drawer_id, build_scoped_drawer_id},
+    types::{
+        AnchorKind, ChunkNeighbors, Drawer, DrawerDetails, ExplicitTunnel, KnowledgeCard,
+        KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink,
+        KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
+        NeighborChunk, Provenance, ReindexSource, SourceType, TaxonomyEntry, Triple, TripleStats,
+        TunnelDrawer, TunnelEndpoint, TunnelFollowResult,
+    },
+    utils::{
+        build_drawer_id, build_scoped_drawer_id, build_tunnel_id, current_timestamp,
+        format_tunnel_endpoint,
+    },
 };
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 5;
+const CURRENT_SCHEMA_VERSION: u32 = 8;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 
 const CONTENT_HASH_BACKFILL_BATCH: usize = 1_000;
@@ -32,6 +43,35 @@ const CONTENT_HASH_BACKFILL_BATCH: usize = 1_000;
 fn content_hash_hex(content: &str) -> String {
     blake3::hash(content.as_bytes()).to_hex().to_string()
 }
+
+const DRAWER_SELECT_COLUMNS: &str = r#"
+    id,
+    content,
+    wing,
+    room,
+    source_file,
+    source_type,
+    added_at,
+    chunk_index,
+    normalize_version,
+    COALESCE(importance, 0) as importance,
+    memory_kind,
+    domain,
+    field,
+    anchor_kind,
+    anchor_id,
+    parent_anchor_id,
+    provenance,
+    statement,
+    tier,
+    status,
+    supporting_refs,
+    counterexample_refs,
+    teaching_refs,
+    verification_refs,
+    scope_constraints,
+    trigger_hints
+"#;
 
 const V1_SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -98,6 +138,12 @@ pub enum DbError {
     Json(#[from] serde_json::Error),
     #[error("invalid source_type stored in database: {0}")]
     InvalidSourceType(String),
+    #[error("invalid {kind} stored in database: {value}")]
+    InvalidEnumValue { kind: &'static str, value: String },
+    #[error("invalid drawer metadata: {0}")]
+    InvalidDrawerMetadata(String),
+    #[error("invalid tunnel: {0}")]
+    InvalidTunnel(String),
     #[error("failed to register sqlite-vec auto extension: {0}")]
     RegisterVec(String),
     #[error("database schema version {current} is newer than supported version {supported}")]
@@ -160,6 +206,7 @@ impl Database {
         if mode.allows_write() {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             apply_migrations(&conn)?;
             db_fork_ext::apply_fork_ext_migrations(&conn)?;
         }
@@ -188,6 +235,9 @@ impl Database {
         project_id: Option<&str>,
     ) -> Result<(), DbError> {
         let content_hash = content_hash_hex(&drawer.content);
+        anchor::validate_anchor_domain(&drawer.domain, &drawer.anchor_kind)
+            .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
+
         self.conn.execute(
             r#"
             INSERT OR IGNORE INTO drawers (
@@ -199,24 +249,58 @@ impl Database {
                 source_type,
                 added_at,
                 chunk_index,
+                normalize_version,
                 importance,
                 project_id,
-                content_hash
+                content_hash,
+                memory_kind,
+                domain,
+                field,
+                anchor_kind,
+                anchor_id,
+                parent_anchor_id,
+                provenance,
+                statement,
+                tier,
+                status,
+                supporting_refs,
+                counterexample_refs,
+                teaching_refs,
+                verification_refs,
+                scope_constraints,
+                trigger_hints
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
             "#,
             params![
-                drawer.id,
-                drawer.content,
-                drawer.wing,
-                drawer.room,
-                drawer.source_file,
+                drawer.id.as_str(),
+                drawer.content.as_str(),
+                drawer.wing.as_str(),
+                drawer.room.as_deref(),
+                drawer.source_file.as_deref(),
                 source_type_as_str(&drawer.source_type),
-                drawer.added_at,
+                drawer.added_at.as_str(),
                 drawer.chunk_index,
+                i64::from(drawer.normalize_version),
                 drawer.importance,
                 project_id,
                 content_hash,
+                memory_kind_as_str(&drawer.memory_kind),
+                memory_domain_as_str(&drawer.domain),
+                drawer.field.as_str(),
+                anchor_kind_as_str(&drawer.anchor_kind),
+                drawer.anchor_id.as_str(),
+                drawer.parent_anchor_id.as_deref(),
+                drawer.provenance.as_ref().map(provenance_as_str),
+                drawer.statement.as_deref(),
+                drawer.tier.as_ref().map(knowledge_tier_as_str),
+                drawer.status.as_ref().map(knowledge_status_as_str),
+                encode_json(&drawer.supporting_refs)?,
+                encode_json(&drawer.counterexample_refs)?,
+                encode_json(&drawer.teaching_refs)?,
+                encode_json(&drawer.verification_refs)?,
+                drawer.scope_constraints.as_deref(),
+                encode_optional_json(drawer.trigger_hints.as_ref())?,
             ],
         )?;
 
@@ -505,54 +589,22 @@ impl Database {
     pub fn top_drawers(&self, limit: usize) -> Result<Vec<Drawer>, DbError> {
         let limit = i64::try_from(limit)
             .map_err(|_| rusqlite::Error::InvalidParameterName("limit".to_string()))?;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
-                   COALESCE(importance, 0) as importance
+            SELECT {DRAWER_SELECT_COLUMNS}
             FROM drawers
             WHERE deleted_at IS NULL
             ORDER BY importance DESC, CAST(added_at AS INTEGER) DESC, id DESC
             LIMIT ?1
             "#,
-        )?;
+        ))?;
         let rows = statement.query_map([limit], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, i32>(8)?,
-            ))
+            drawer_from_row(row).map_err(row_decode_error)
         })?;
 
         let mut drawers = Vec::new();
         for row in rows {
-            let (
-                id,
-                content,
-                wing,
-                room,
-                source_file,
-                source_type,
-                added_at,
-                chunk_index,
-                importance,
-            ) = row?;
-            drawers.push(Drawer {
-                id,
-                content,
-                wing,
-                room,
-                source_file,
-                source_type: source_type_from_str(&source_type)?,
-                added_at,
-                chunk_index,
-                importance,
-            });
+            drawers.push(row?);
         }
 
         Ok(drawers)
@@ -630,6 +682,120 @@ impl Database {
                 Ok(())
             }
             Err(e) => Err(DbError::Sqlite(e)),
+        }
+    }
+
+    pub fn upsert_drawer_and_replace_vector(
+        &self,
+        drawer: &Drawer,
+        vector: &[f32],
+    ) -> Result<(), DbError> {
+        anchor::validate_anchor_domain(&drawer.domain, &drawer.anchor_kind)
+            .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
+        self.ensure_vectors_table(vector.len())?;
+
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+                [drawer.id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+
+        if existing.is_none() {
+            self.insert_drawer(drawer)?;
+            return self.insert_vector(&drawer.id, vector);
+        }
+
+        let vector_json = serde_json::to_string(vector)?;
+        let content_hash = content_hash_hex(&drawer.content);
+
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<(), DbError> {
+            self.conn.execute(
+                r#"
+                UPDATE drawers
+                SET content = ?2,
+                    wing = ?3,
+                    room = ?4,
+                    source_file = ?5,
+                    source_type = ?6,
+                    added_at = ?7,
+                    chunk_index = ?8,
+                    normalize_version = ?9,
+                    importance = ?10,
+                    memory_kind = ?11,
+                    domain = ?12,
+                    field = ?13,
+                    anchor_kind = ?14,
+                    anchor_id = ?15,
+                    parent_anchor_id = ?16,
+                    provenance = ?17,
+                    statement = ?18,
+                    tier = ?19,
+                    status = ?20,
+                    supporting_refs = ?21,
+                    counterexample_refs = ?22,
+                    teaching_refs = ?23,
+                    verification_refs = ?24,
+                    scope_constraints = ?25,
+                    trigger_hints = ?26,
+                    content_hash = ?27
+                WHERE id = ?1 AND deleted_at IS NULL
+                "#,
+                params![
+                    drawer.id.as_str(),
+                    drawer.content.as_str(),
+                    drawer.wing.as_str(),
+                    drawer.room.as_deref(),
+                    drawer.source_file.as_deref(),
+                    source_type_as_str(&drawer.source_type),
+                    drawer.added_at.as_str(),
+                    drawer.chunk_index,
+                    i64::from(drawer.normalize_version),
+                    drawer.importance,
+                    memory_kind_as_str(&drawer.memory_kind),
+                    memory_domain_as_str(&drawer.domain),
+                    drawer.field.as_str(),
+                    anchor_kind_as_str(&drawer.anchor_kind),
+                    drawer.anchor_id.as_str(),
+                    drawer.parent_anchor_id.as_deref(),
+                    drawer.provenance.as_ref().map(provenance_as_str),
+                    drawer.statement.as_deref(),
+                    drawer.tier.as_ref().map(knowledge_tier_as_str),
+                    drawer.status.as_ref().map(knowledge_status_as_str),
+                    encode_json(&drawer.supporting_refs)?,
+                    encode_json(&drawer.counterexample_refs)?,
+                    encode_json(&drawer.teaching_refs)?,
+                    encode_json(&drawer.verification_refs)?,
+                    drawer.scope_constraints.as_deref(),
+                    encode_optional_json(drawer.trigger_hints.as_ref())?,
+                    content_hash,
+                ],
+            )?;
+
+            self.conn.execute(
+                "DELETE FROM drawer_vectors WHERE id = ?1",
+                [drawer.id.as_str()],
+            )?;
+            self.conn.execute(
+                "INSERT INTO drawer_vectors (id, embedding) VALUES (?1, vec_f32(?2))",
+                params![drawer.id.as_str(), vector_json.as_str()],
+            )?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
         }
     }
 
@@ -736,6 +902,159 @@ impl Database {
         )?)
     }
 
+    pub fn stale_drawer_count(&self, current_normalize_version: u32) -> Result<i64, DbError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL AND normalize_version < ?1",
+            [i64::from(current_normalize_version)],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn drawer_count_by_normalize_version(&self) -> Result<Vec<(u32, i64)>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT normalize_version, COUNT(*)
+            FROM drawers
+            WHERE deleted_at IS NULL
+            GROUP BY normalize_version
+            ORDER BY normalize_version
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn diary_rollup_days(&self) -> Result<u32, DbError> {
+        let count = self.conn.query_row(
+            r#"
+            SELECT COUNT(DISTINCT substr(source_file, length(source_file) - 9, 10))
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND wing = 'agent-diary'
+              AND source_file LIKE 'agent-diary://rollup/%'
+            "#,
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    pub fn reindex_sources_stale(
+        &self,
+        current_normalize_version: u32,
+    ) -> Result<Vec<ReindexSource>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT source_file, wing, room, COUNT(*)
+            FROM drawers
+            WHERE deleted_at IS NULL AND normalize_version < ?1
+            GROUP BY source_file, wing, room
+            ORDER BY source_file, wing, room
+            "#,
+        )?;
+        let rows = statement
+            .query_map(
+                [i64::from(current_normalize_version)],
+                reindex_source_from_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn reindex_sources_force(&self) -> Result<Vec<ReindexSource>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT source_file, wing, room, COUNT(*)
+            FROM drawers
+            WHERE deleted_at IS NULL
+            GROUP BY source_file, wing, room
+            ORDER BY source_file, wing, room
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], reindex_source_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn replace_active_source_drawers(
+        &self,
+        source_file: &str,
+        wing: &str,
+        room: Option<&str>,
+    ) -> Result<u64, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT rowid, id, content
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND source_file = ?1
+              AND wing = ?2
+              AND ((?3 IS NULL AND room IS NULL) OR room = ?3)
+            ORDER BY rowid
+            "#,
+        )?;
+        let rows = statement
+            .query_map((source_file, wing, room), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<u64, DbError> {
+            let fts_exists = self.table_exists("drawers_fts")?;
+            let vectors_exist = self.table_exists("drawer_vectors")?;
+
+            for (rowid, id, content) in &rows {
+                if fts_exists {
+                    self.conn.execute(
+                        "INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', ?1, ?2)",
+                        params![rowid, content],
+                    )?;
+                }
+                if vectors_exist {
+                    self.conn
+                        .execute("DELETE FROM drawer_vectors WHERE id = ?1", [id])?;
+                }
+                self.conn
+                    .execute("DELETE FROM drawers WHERE rowid = ?1", [rowid])?;
+            }
+
+            Ok(rows.len() as u64)
+        })();
+
+        match result {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(count)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
+    fn table_exists(&self, table_name: &str) -> Result<bool, DbError> {
+        let exists = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1)",
+            [table_name],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists == 1)
+    }
+
     pub fn taxonomy_count(&self) -> Result<i64, DbError> {
         Ok(self
             .conn
@@ -765,119 +1084,49 @@ impl Database {
     }
 
     pub fn get_drawer(&self, drawer_id: &str) -> Result<Option<Drawer>, DbError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
-                   COALESCE(importance, 0) as importance
+            SELECT {DRAWER_SELECT_COLUMNS}
             FROM drawers
             WHERE id = ?1 AND deleted_at IS NULL
             "#,
-        )?;
+        ))?;
         let mut rows = statement.query_map([drawer_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, i32>(8)?,
-            ))
+            drawer_from_row(row).map_err(row_decode_error)
         })?;
 
         match rows.next() {
-            Some(row) => {
-                let (
-                    id,
-                    content,
-                    wing,
-                    room,
-                    source_file,
-                    source_type,
-                    added_at,
-                    chunk_index,
-                    importance,
-                ) = row?;
-                Ok(Some(Drawer {
-                    id,
-                    content,
-                    wing,
-                    room,
-                    source_file,
-                    source_type: source_type_from_str(&source_type)?,
-                    added_at,
-                    chunk_index,
-                    importance,
-                }))
-            }
+            Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
     }
 
     pub fn get_drawer_details(&self, drawer_id: &str) -> Result<Option<DrawerDetails>, DbError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(&format!(
             r#"
-            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
-                   COALESCE(importance, 0) as importance,
+            SELECT {DRAWER_SELECT_COLUMNS},
                    updated_at,
                    COALESCE(merge_count, 0) as merge_count,
                    project_id
             FROM drawers
             WHERE id = ?1 AND deleted_at IS NULL
             "#,
-        )?;
+        ))?;
         let mut rows = statement.query_map([drawer_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, i32>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, u32>(10)?,
-                row.get::<_, Option<String>>(11)?,
-            ))
+            let drawer = drawer_from_row(row).map_err(row_decode_error)?;
+            let updated_at = row.get::<_, Option<String>>(26)?;
+            let merge_count = row.get::<_, u32>(27)?;
+            let project_id = row.get::<_, Option<String>>(28)?;
+            Ok(DrawerDetails {
+                drawer,
+                updated_at,
+                merge_count,
+                project_id,
+            })
         })?;
 
         match rows.next() {
-            Some(row) => {
-                let (
-                    id,
-                    content,
-                    wing,
-                    room,
-                    source_file,
-                    source_type,
-                    added_at,
-                    chunk_index,
-                    importance,
-                    updated_at,
-                    merge_count,
-                    project_id,
-                ) = row?;
-                Ok(Some(DrawerDetails {
-                    drawer: Drawer {
-                        id,
-                        content,
-                        wing,
-                        room,
-                        source_file,
-                        source_type: source_type_from_str(&source_type)?,
-                        added_at,
-                        chunk_index,
-                        importance,
-                    },
-                    updated_at,
-                    merge_count,
-                    project_id,
-                }))
-            }
+            Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
     }
@@ -907,8 +1156,7 @@ impl Database {
                 .join(", ");
             let sql = format!(
                 r#"
-                SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
-                       COALESCE(importance, 0) as importance,
+                SELECT {DRAWER_SELECT_COLUMNS},
                        updated_at,
                        COALESCE(merge_count, 0) as merge_count,
                        project_id
@@ -919,56 +1167,24 @@ impl Database {
             );
             let mut statement = self.conn.prepare(&sql)?;
             let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+                let drawer = drawer_from_row(row).map_err(row_decode_error)?;
+                let updated_at = row.get::<_, Option<String>>(26)?;
+                let merge_count = row.get::<_, u32>(27)?;
+                let project_id = row.get::<_, Option<String>>(28)?;
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, i32>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, u32>(10)?,
-                    row.get::<_, Option<String>>(11)?,
-                ))
-            })?;
-
-            for row in rows {
-                let (
-                    id,
-                    content,
-                    wing,
-                    room,
-                    source_file,
-                    source_type,
-                    added_at,
-                    chunk_index,
-                    importance,
-                    updated_at,
-                    merge_count,
-                    project_id,
-                ) = row?;
-                found_by_id.insert(
-                    id.clone(),
+                    drawer.id.clone(),
                     DrawerDetails {
-                        drawer: Drawer {
-                            id,
-                            content,
-                            wing,
-                            room,
-                            source_file,
-                            source_type: source_type_from_str(&source_type)?,
-                            added_at,
-                            chunk_index,
-                            importance,
-                        },
+                        drawer,
                         updated_at,
                         merge_count,
                         project_id,
                     },
-                );
+                ))
+            })?;
+
+            for row in rows {
+                let (id, details) = row?;
+                found_by_id.insert(id, details);
             }
         }
 
@@ -1030,6 +1246,392 @@ impl Database {
             )
             .optional()?;
         Ok(value)
+    }
+
+    pub fn update_knowledge_lifecycle(
+        &self,
+        drawer_id: &str,
+        status: &KnowledgeStatus,
+        verification_refs: &[String],
+        counterexample_refs: &[String],
+    ) -> Result<bool, DbError> {
+        let affected = self.conn.execute(
+            r#"
+            UPDATE drawers
+            SET status = ?2,
+                verification_refs = ?3,
+                counterexample_refs = ?4
+            WHERE id = ?1
+              AND deleted_at IS NULL
+              AND memory_kind = 'knowledge'
+            "#,
+            params![
+                drawer_id,
+                knowledge_status_as_str(status),
+                encode_json(verification_refs)?,
+                encode_json(counterexample_refs)?,
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn update_knowledge_anchor(
+        &self,
+        drawer_id: &str,
+        anchor_kind: &AnchorKind,
+        anchor_id: &str,
+        parent_anchor_id: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let affected = self.conn.execute(
+            r#"
+            UPDATE drawers
+            SET anchor_kind = ?2,
+                anchor_id = ?3,
+                parent_anchor_id = ?4
+            WHERE id = ?1
+              AND deleted_at IS NULL
+              AND memory_kind = 'knowledge'
+            "#,
+            params![
+                drawer_id,
+                anchor_kind_as_str(anchor_kind),
+                anchor_id,
+                parent_anchor_id,
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn insert_knowledge_card(&self, card: &KnowledgeCard) -> Result<(), DbError> {
+        anchor::validate_anchor_domain(&card.domain, &card.anchor_kind)
+            .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
+
+        self.conn.execute(
+            r#"
+            INSERT INTO knowledge_cards (
+                id,
+                statement,
+                content,
+                tier,
+                status,
+                domain,
+                field,
+                anchor_kind,
+                anchor_id,
+                parent_anchor_id,
+                scope_constraints,
+                trigger_hints,
+                created_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "#,
+            params![
+                card.id.as_str(),
+                card.statement.as_str(),
+                card.content.as_str(),
+                knowledge_tier_as_str(&card.tier),
+                knowledge_status_as_str(&card.status),
+                memory_domain_as_str(&card.domain),
+                card.field.as_str(),
+                anchor_kind_as_str(&card.anchor_kind),
+                card.anchor_id.as_str(),
+                card.parent_anchor_id.as_deref(),
+                card.scope_constraints.as_deref(),
+                encode_optional_json(card.trigger_hints.as_ref())?,
+                card.created_at.as_str(),
+                card.updated_at.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_knowledge_card(&self, card_id: &str) -> Result<Option<KnowledgeCard>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT
+                id,
+                statement,
+                content,
+                tier,
+                status,
+                domain,
+                field,
+                anchor_kind,
+                anchor_id,
+                parent_anchor_id,
+                scope_constraints,
+                trigger_hints,
+                created_at,
+                updated_at
+            FROM knowledge_cards
+            WHERE id = ?1
+            "#,
+        )?;
+        let mut rows = statement.query_map([card_id], |row| {
+            knowledge_card_from_row(row).map_err(row_decode_error)
+        })?;
+
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_knowledge_cards(
+        &self,
+        filter: &KnowledgeCardFilter,
+    ) -> Result<Vec<KnowledgeCard>, DbError> {
+        let tier = filter.tier.as_ref().map(knowledge_tier_as_str);
+        let status = filter.status.as_ref().map(knowledge_status_as_str);
+        let domain = filter.domain.as_ref().map(memory_domain_as_str);
+        let anchor_kind = filter.anchor_kind.as_ref().map(anchor_kind_as_str);
+
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT
+                id,
+                statement,
+                content,
+                tier,
+                status,
+                domain,
+                field,
+                anchor_kind,
+                anchor_id,
+                parent_anchor_id,
+                scope_constraints,
+                trigger_hints,
+                created_at,
+                updated_at
+            FROM knowledge_cards
+            WHERE (?1 IS NULL OR tier = ?1)
+              AND (?2 IS NULL OR status = ?2)
+              AND (?3 IS NULL OR domain = ?3)
+              AND (?4 IS NULL OR field = ?4)
+              AND (?5 IS NULL OR anchor_kind = ?5)
+              AND (?6 IS NULL OR anchor_id = ?6)
+            ORDER BY tier, status, id
+            "#,
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    tier,
+                    status,
+                    domain,
+                    filter.field.as_deref(),
+                    anchor_kind,
+                    filter.anchor_id.as_deref(),
+                ],
+                |row| knowledge_card_from_row(row).map_err(row_decode_error),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_knowledge_card(&self, card: &KnowledgeCard) -> Result<bool, DbError> {
+        anchor::validate_anchor_domain(&card.domain, &card.anchor_kind)
+            .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
+
+        let affected = self.conn.execute(
+            r#"
+            UPDATE knowledge_cards
+            SET statement = ?2,
+                content = ?3,
+                tier = ?4,
+                status = ?5,
+                domain = ?6,
+                field = ?7,
+                anchor_kind = ?8,
+                anchor_id = ?9,
+                parent_anchor_id = ?10,
+                scope_constraints = ?11,
+                trigger_hints = ?12,
+                updated_at = ?13
+            WHERE id = ?1
+            "#,
+            params![
+                card.id.as_str(),
+                card.statement.as_str(),
+                card.content.as_str(),
+                knowledge_tier_as_str(&card.tier),
+                knowledge_status_as_str(&card.status),
+                memory_domain_as_str(&card.domain),
+                card.field.as_str(),
+                anchor_kind_as_str(&card.anchor_kind),
+                card.anchor_id.as_str(),
+                card.parent_anchor_id.as_deref(),
+                card.scope_constraints.as_deref(),
+                encode_optional_json(card.trigger_hints.as_ref())?,
+                card.updated_at.as_str(),
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn insert_knowledge_evidence_link(
+        &self,
+        link: &KnowledgeEvidenceLink,
+    ) -> Result<(), DbError> {
+        let evidence = self.get_drawer(&link.evidence_drawer_id)?.ok_or_else(|| {
+            DbError::InvalidDrawerMetadata(format!(
+                "evidence drawer {} does not exist",
+                link.evidence_drawer_id
+            ))
+        })?;
+        if evidence.memory_kind != MemoryKind::Evidence {
+            return Err(DbError::InvalidDrawerMetadata(format!(
+                "evidence link target {} must be an evidence drawer",
+                link.evidence_drawer_id
+            )));
+        }
+
+        self.conn.execute(
+            r#"
+            INSERT INTO knowledge_evidence_links (
+                id,
+                card_id,
+                evidence_drawer_id,
+                role,
+                note,
+                created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                link.id.as_str(),
+                link.card_id.as_str(),
+                link.evidence_drawer_id.as_str(),
+                knowledge_evidence_role_as_str(&link.role),
+                link.note.as_deref(),
+                link.created_at.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn knowledge_evidence_links(
+        &self,
+        card_id: &str,
+    ) -> Result<Vec<KnowledgeEvidenceLink>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, card_id, evidence_drawer_id, role, note, created_at
+            FROM knowledge_evidence_links
+            WHERE card_id = ?1
+            ORDER BY created_at, id
+            "#,
+        )?;
+        let rows = statement
+            .query_map([card_id], |row| {
+                knowledge_evidence_link_from_row(row).map_err(row_decode_error)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn append_knowledge_event(&self, event: &KnowledgeCardEvent) -> Result<(), DbError> {
+        self.conn.execute(
+            r#"
+            INSERT INTO knowledge_events (
+                id,
+                card_id,
+                event_type,
+                from_status,
+                to_status,
+                reason,
+                actor,
+                metadata,
+                created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                event.id.as_str(),
+                event.card_id.as_str(),
+                knowledge_event_type_as_str(&event.event_type),
+                event.from_status.as_ref().map(knowledge_status_as_str),
+                event.to_status.as_ref().map(knowledge_status_as_str),
+                event.reason.as_str(),
+                event.actor.as_deref(),
+                encode_optional_json(event.metadata.as_ref())?,
+                event.created_at.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn knowledge_events(&self, card_id: &str) -> Result<Vec<KnowledgeCardEvent>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT
+                id,
+                card_id,
+                event_type,
+                from_status,
+                to_status,
+                reason,
+                actor,
+                metadata,
+                created_at
+            FROM knowledge_events
+            WHERE card_id = ?1
+            ORDER BY created_at, id
+            "#,
+        )?;
+        let rows = statement
+            .query_map([card_id], |row| {
+                knowledge_event_from_row(row).map_err(row_decode_error)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn neighbor_chunks(
+        &self,
+        source_file: &str,
+        wing: &str,
+        room: Option<&str>,
+        chunk_index: i64,
+    ) -> Result<ChunkNeighbors, DbError> {
+        let prev_index = chunk_index - 1;
+        let next_index = chunk_index + 1;
+        let sql = r#"
+            SELECT id, content, chunk_index
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND source_file = ?1
+              AND wing = ?2
+              AND ((?3 IS NULL AND room IS NULL) OR (?3 IS NOT NULL AND room = ?3))
+              AND chunk_index IN (?4, ?5)
+            ORDER BY chunk_index, id
+            "#;
+        let mut statement = self.conn.prepare(sql)?;
+        let mut rows = statement.query(params![source_file, wing, room, prev_index, next_index])?;
+        let mut neighbors = ChunkNeighbors {
+            prev: None,
+            next: None,
+        };
+
+        while let Some(row) = rows.next()? {
+            let row_index = row.get::<_, i64>(2)?;
+            let Ok(chunk_index) = u32::try_from(row_index) else {
+                continue;
+            };
+            let chunk = NeighborChunk {
+                drawer_id: row.get(0)?,
+                content: row.get(1)?,
+                chunk_index,
+            };
+            if row_index == prev_index && neighbors.prev.is_none() {
+                neighbors.prev = Some(chunk);
+            } else if row_index == next_index && neighbors.next.is_none() {
+                neighbors.next = Some(chunk);
+            }
+        }
+
+        Ok(neighbors)
     }
 
     pub fn soft_delete_drawer(&self, drawer_id: &str) -> Result<bool, DbError> {
@@ -1206,10 +1808,9 @@ impl Database {
 
         let sql_limit =
             i64::try_from(limit).map_err(|_| DbError::InvalidSourceType("limit".to_string()))?;
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             r#"
-            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
-                   COALESCE(importance, 0) as importance, project_id
+            SELECT {DRAWER_SELECT_COLUMNS}, project_id
             FROM drawers
             WHERE deleted_at IS NULL
               AND room = ?1
@@ -1219,57 +1820,21 @@ impl Database {
             ORDER BY CAST(added_at AS INTEGER) DESC, id DESC
             LIMIT ?4
             "#,
-        )?;
+        ))?;
         let rows = stmt
             .query_map(
                 rusqlite::params![room, exclude_drawer_id, current_project_id, sql_limit],
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, Option<i64>>(7)?,
-                        row.get::<_, i32>(8)?,
-                        row.get::<_, Option<String>>(9)?,
-                    ))
-                },
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(
-                |(
-                    id,
-                    content,
-                    wing,
-                    room,
-                    source_file,
-                    source_type,
-                    added_at,
-                    chunk_index,
-                    importance,
-                    project_id,
-                )| {
+                    let drawer = drawer_from_row(row).map_err(row_decode_error)?;
+                    let project_id = row.get::<_, Option<String>>(26)?;
                     Ok(TunnelDrawer {
-                        drawer: Drawer {
-                            id,
-                            content,
-                            wing,
-                            room,
-                            source_file,
-                            source_type: source_type_from_str(&source_type)?,
-                            added_at,
-                            chunk_index,
-                            importance,
-                        },
+                        drawer,
                         target_project_id: project_id,
                     })
                 },
-            )
-            .collect()
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // --- Triples (Knowledge Graph) ---
@@ -1452,6 +2017,181 @@ impl Database {
             .collect())
     }
 
+    pub fn create_tunnel(
+        &self,
+        left: &TunnelEndpoint,
+        right: &TunnelEndpoint,
+        label: &str,
+        created_by: Option<&str>,
+    ) -> Result<ExplicitTunnel, DbError> {
+        let left = normalize_tunnel_endpoint(left)?;
+        let right = normalize_tunnel_endpoint(right)?;
+        let label = label.trim();
+        if label.is_empty() {
+            return Err(DbError::InvalidTunnel("label is required".to_string()));
+        }
+        if left == right {
+            return Err(DbError::InvalidTunnel(
+                "self-link is not allowed".to_string(),
+            ));
+        }
+
+        let id = build_tunnel_id(&left, &right);
+        let created_at = current_timestamp();
+        let created_by = created_by
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        self.conn.execute(
+            r#"
+            INSERT INTO tunnels (
+                id, left_wing, left_room, right_wing, right_room,
+                label, created_at, created_by, deleted_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+            ON CONFLICT(id) DO UPDATE SET
+                label = CASE
+                    WHEN tunnels.deleted_at IS NOT NULL THEN excluded.label
+                    ELSE tunnels.label
+                END,
+                created_at = CASE
+                    WHEN tunnels.deleted_at IS NOT NULL THEN excluded.created_at
+                    ELSE tunnels.created_at
+                END,
+                created_by = CASE
+                    WHEN tunnels.deleted_at IS NOT NULL THEN excluded.created_by
+                    ELSE tunnels.created_by
+                END,
+                deleted_at = NULL
+            "#,
+            params![
+                id, left.wing, left.room, right.wing, right.room, label, created_at, created_by,
+            ],
+        )?;
+
+        self.get_explicit_tunnel(&id)?
+            .ok_or_else(|| DbError::InvalidTunnel(format!("failed to create tunnel {id}")))
+    }
+
+    pub fn list_explicit_tunnels(
+        &self,
+        wing: Option<&str>,
+    ) -> Result<Vec<ExplicitTunnel>, DbError> {
+        let wing = wing.map(str::trim).filter(|value| !value.is_empty());
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, left_wing, left_room, right_wing, right_room,
+                   label, created_at, created_by, deleted_at
+            FROM tunnels
+            WHERE deleted_at IS NULL
+              AND (?1 IS NULL OR left_wing = ?1 OR right_wing = ?1)
+            ORDER BY left_wing, left_room, right_wing, right_room, id
+            "#,
+        )?;
+        let rows = statement
+            .query_map([wing], explicit_tunnel_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_explicit_tunnel(&self, tunnel_id: &str) -> Result<bool, DbError> {
+        let timestamp = current_timestamp();
+        let affected = self.conn.execute(
+            "UPDATE tunnels SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            params![timestamp, tunnel_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn follow_explicit_tunnels(
+        &self,
+        from: &TunnelEndpoint,
+        max_hops: u8,
+    ) -> Result<Vec<TunnelFollowResult>, DbError> {
+        if !(1..=2).contains(&max_hops) {
+            return Err(DbError::InvalidTunnel(
+                "max_hops must be 1 or 2".to_string(),
+            ));
+        }
+
+        let from = normalize_tunnel_endpoint(from)?;
+        let tunnels = self.list_explicit_tunnels(None)?;
+        let mut visited = BTreeSet::from([from.clone()]);
+        let mut queue = VecDeque::from([(from, 0_u8)]);
+        let mut results = Vec::new();
+
+        while let Some((current, hop)) = queue.pop_front() {
+            if hop >= max_hops {
+                continue;
+            }
+            let next_hop = hop + 1;
+            for tunnel in &tunnels {
+                let neighbor = if tunnel.left == current {
+                    Some(tunnel.right.clone())
+                } else if tunnel.right == current {
+                    Some(tunnel.left.clone())
+                } else {
+                    None
+                };
+                let Some(neighbor) = neighbor else {
+                    continue;
+                };
+                if !visited.insert(neighbor.clone()) {
+                    continue;
+                }
+                results.push(TunnelFollowResult {
+                    endpoint: neighbor.clone(),
+                    via_tunnel_id: tunnel.id.clone(),
+                    hop: next_hop,
+                });
+                queue.push_back((neighbor, next_hop));
+            }
+        }
+
+        results.sort_by(|left, right| {
+            left.hop
+                .cmp(&right.hop)
+                .then_with(|| left.endpoint.cmp(&right.endpoint))
+                .then_with(|| left.via_tunnel_id.cmp(&right.via_tunnel_id))
+        });
+        Ok(results)
+    }
+
+    pub fn explicit_tunnel_hints(
+        &self,
+        wing: &str,
+        room: Option<&str>,
+    ) -> Result<Vec<String>, DbError> {
+        let endpoint = TunnelEndpoint {
+            wing: wing.to_string(),
+            room: room.map(ToOwned::to_owned),
+        };
+        let hints = self
+            .follow_explicit_tunnels(&endpoint, 1)?
+            .into_iter()
+            .map(|result| format_tunnel_endpoint(&result.endpoint))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(hints)
+    }
+
+    fn get_explicit_tunnel(&self, tunnel_id: &str) -> Result<Option<ExplicitTunnel>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, left_wing, left_room, right_wing, right_room,
+                   label, created_at, created_by, deleted_at
+            FROM tunnels
+            WHERE id = ?1 AND deleted_at IS NULL
+            "#,
+        )?;
+        let mut rows = statement.query_map([tunnel_id], explicit_tunnel_from_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     // --- Embedding dimension management ---
 
     /// Returns the current embedding dimension from the vec0 table, or None if the table is empty.
@@ -1521,65 +2261,29 @@ impl Database {
     /// When `only_zero` is true, returns only drawers where importance is 0 or NULL.
     pub fn drawers_for_rescore(&self, only_zero: bool) -> Result<Vec<Drawer>, DbError> {
         let sql = if only_zero {
-            r#"
-            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
-                   COALESCE(importance, 0) as importance
-            FROM drawers
-            WHERE deleted_at IS NULL AND COALESCE(importance, 0) = 0
-            ORDER BY id ASC
-            "#
-        } else {
-            r#"
-            SELECT id, content, wing, room, source_file, source_type, added_at, chunk_index,
-                   COALESCE(importance, 0) as importance
-            FROM drawers
-            WHERE deleted_at IS NULL
-            ORDER BY id ASC
-            "#
-        };
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, i32>(8)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(
-                |(
-                    id,
-                    content,
-                    wing,
-                    room,
-                    source_file,
-                    source_type,
-                    added_at,
-                    chunk_index,
-                    importance,
-                )| {
-                    Ok(Drawer {
-                        id,
-                        content,
-                        wing,
-                        room,
-                        source_file,
-                        source_type: source_type_from_str(&source_type)?,
-                        added_at,
-                        chunk_index,
-                        importance,
-                    })
-                },
+            format!(
+                r#"
+                SELECT {DRAWER_SELECT_COLUMNS}
+                FROM drawers
+                WHERE deleted_at IS NULL AND COALESCE(importance, 0) = 0
+                ORDER BY id ASC
+                "#
             )
-            .collect()
+        } else {
+            format!(
+                r#"
+                SELECT {DRAWER_SELECT_COLUMNS}
+                FROM drawers
+                WHERE deleted_at IS NULL
+                ORDER BY id ASC
+                "#
+            )
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], |row| drawer_from_row(row).map_err(row_decode_error))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Apply importance scores in batched `BEGIN IMMEDIATE` transactions.
@@ -1668,13 +2372,25 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
         .iter()
         .filter(|migration| migration.version > current_version)
     {
-        if migration.version == 5 {
+        if migration.version == 5 && current_version < 5 {
+            // Fork: content_hash column added alongside upstream V5 columns.
             // ALTER TABLE ADD COLUMN is not idempotent in SQLite, so guard
-            // it explicitly. The index in the migration SQL already uses
-            // CREATE INDEX IF NOT EXISTS.
+            // it explicitly before the atomic migration block.
             ensure_drawers_content_hash_column(conn)?;
+            if drawers_column_exists(conn, "memory_kind")? {
+                apply_migration_atomic(conn, &V5_ALREADY_APPLIED_MIGRATION)?;
+                backfill_content_hash(conn)?;
+                continue;
+            }
         }
-        conn.execute_batch(migration.sql)?;
+        if migration.version == 7
+            && current_version < 7
+            && drawers_column_exists(conn, "normalize_version")?
+        {
+            apply_migration_atomic(conn, &V7_ALREADY_APPLIED_MIGRATION)?;
+            continue;
+        }
+        apply_migration_atomic(conn, migration)?;
         if migration.version == 5 {
             // V5 introduces content_hash for indexed dedup; backfill existing
             // rows so the new query path can rely on the column being populated
@@ -1682,22 +2398,39 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             // installs with hundreds of thousands of drawers.
             backfill_content_hash(conn)?;
         }
-        set_user_version(conn, migration.version)?;
     }
 
     Ok(())
 }
 
+fn apply_migration_atomic(conn: &Connection, migration: &Migration) -> Result<(), DbError> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(error) = (|| -> Result<(), DbError> {
+        conn.execute_batch(migration.sql)?;
+        set_user_version(conn, migration.version)?;
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn ensure_drawers_content_hash_column(conn: &Connection) -> Result<(), DbError> {
-    let exists = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('drawers') WHERE name = 'content_hash'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if exists == 0 {
+    if !drawers_column_exists(conn, "content_hash")? {
         conn.execute_batch("ALTER TABLE drawers ADD COLUMN content_hash TEXT;")?;
     }
     Ok(())
+}
+
+fn drawers_column_exists(conn: &Connection, column: &str) -> Result<bool, DbError> {
+    let exists = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('drawers') WHERE name = ?1",
+        [column],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(exists > 0)
 }
 
 fn backfill_content_hash(conn: &Connection) -> Result<(), DbError> {
@@ -1760,6 +2493,53 @@ fn append_drawers_since_filters(
     }
 }
 
+fn normalize_tunnel_endpoint(endpoint: &TunnelEndpoint) -> Result<TunnelEndpoint, DbError> {
+    let wing = endpoint.wing.trim();
+    if wing.is_empty() {
+        return Err(DbError::InvalidTunnel(
+            "endpoint wing is required".to_string(),
+        ));
+    }
+    let room = endpoint
+        .room
+        .as_deref()
+        .map(str::trim)
+        .filter(|room| !room.is_empty())
+        .map(ToOwned::to_owned);
+    Ok(TunnelEndpoint {
+        wing: wing.to_string(),
+        room,
+    })
+}
+
+fn explicit_tunnel_from_row(row: &Row<'_>) -> rusqlite::Result<ExplicitTunnel> {
+    Ok(ExplicitTunnel {
+        id: row.get(0)?,
+        left: TunnelEndpoint {
+            wing: row.get(1)?,
+            room: row.get(2)?,
+        },
+        right: TunnelEndpoint {
+            wing: row.get(3)?,
+            room: row.get(4)?,
+        },
+        label: row.get(5)?,
+        created_at: row.get(6)?,
+        created_by: row.get(7)?,
+        deleted_at: row.get(8)?,
+    })
+}
+
+fn reindex_source_from_row(row: &Row<'_>) -> rusqlite::Result<ReindexSource> {
+    let drawer_count = row.get::<_, i64>(3)?;
+    Ok(ReindexSource {
+        source_file: row.get(0)?,
+        wing: row.get(1)?,
+        room: row.get(2)?,
+        drawer_count: drawer_count as u64,
+    })
+}
+
 const V2_MIGRATION_SQL: &str = r#"
 ALTER TABLE drawers ADD COLUMN deleted_at TEXT;
 CREATE INDEX IF NOT EXISTS idx_drawers_deleted_at ON drawers(deleted_at);
@@ -1792,6 +2572,166 @@ END;
 -- entry is already gone.
 "#;
 
+const V4_MIGRATION_SQL: &str = r#"
+ALTER TABLE drawers ADD COLUMN importance INTEGER DEFAULT 0;
+"#;
+
+const V5_MIGRATION_SQL: &str = r#"
+ALTER TABLE drawers ADD COLUMN memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge')) DEFAULT 'evidence';
+ALTER TABLE drawers ADD COLUMN domain TEXT NOT NULL CHECK(domain IN ('project', 'agent', 'skill', 'global')) DEFAULT 'project';
+ALTER TABLE drawers ADD COLUMN field TEXT NOT NULL DEFAULT 'general';
+ALTER TABLE drawers ADD COLUMN anchor_kind TEXT NOT NULL CHECK(anchor_kind IN ('global', 'repo', 'worktree')) DEFAULT 'repo';
+ALTER TABLE drawers ADD COLUMN anchor_id TEXT NOT NULL DEFAULT 'repo://legacy';
+ALTER TABLE drawers ADD COLUMN parent_anchor_id TEXT;
+ALTER TABLE drawers ADD COLUMN provenance TEXT CHECK(provenance IN ('runtime', 'research', 'human'));
+ALTER TABLE drawers ADD COLUMN statement TEXT;
+ALTER TABLE drawers ADD COLUMN tier TEXT CHECK(tier IN ('qi', 'shu', 'dao_ren', 'dao_tian'));
+ALTER TABLE drawers ADD COLUMN status TEXT CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'));
+ALTER TABLE drawers ADD COLUMN supporting_refs TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE drawers ADD COLUMN counterexample_refs TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE drawers ADD COLUMN teaching_refs TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE drawers ADD COLUMN verification_refs TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE drawers ADD COLUMN scope_constraints TEXT;
+ALTER TABLE drawers ADD COLUMN trigger_hints TEXT;
+
+UPDATE drawers
+SET memory_kind = 'evidence',
+    domain = 'project',
+    field = 'general',
+    anchor_kind = 'repo',
+    anchor_id = 'repo://legacy',
+    parent_anchor_id = NULL,
+    provenance = CASE source_type
+        WHEN 'project' THEN 'research'
+        WHEN 'conversation' THEN 'human'
+        WHEN 'manual' THEN 'human'
+        ELSE NULL
+    END
+WHERE memory_kind = 'evidence'
+  AND domain = 'project'
+  AND field = 'general'
+  AND anchor_kind = 'repo'
+  AND anchor_id = 'repo://legacy'
+  AND parent_anchor_id IS NULL
+  AND provenance IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_drawers_content_hash ON drawers(wing, content_hash);
+"#;
+
+const V5_ALREADY_APPLIED_MIGRATION_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_drawers_content_hash ON drawers(wing, content_hash);
+"#;
+
+const V6_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS tunnels (
+    id TEXT PRIMARY KEY,
+    left_wing TEXT NOT NULL,
+    left_room TEXT,
+    right_wing TEXT NOT NULL,
+    right_room TEXT,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT,
+    deleted_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tunnels_left
+    ON tunnels(left_wing, left_room)
+    WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_tunnels_right
+    ON tunnels(right_wing, right_room)
+    WHERE deleted_at IS NULL;
+"#;
+
+const V7_MIGRATION_SQL: &str = r#"
+ALTER TABLE drawers ADD COLUMN normalize_version INTEGER NOT NULL DEFAULT 1;
+
+CREATE INDEX IF NOT EXISTS idx_drawers_normalize_version
+    ON drawers(normalize_version)
+    WHERE deleted_at IS NULL;
+"#;
+
+const V7_ALREADY_APPLIED_MIGRATION_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_drawers_normalize_version
+    ON drawers(normalize_version)
+    WHERE deleted_at IS NULL;
+"#;
+
+const V8_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS knowledge_cards (
+    id TEXT PRIMARY KEY,
+    statement TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tier TEXT NOT NULL CHECK(tier IN ('qi', 'shu', 'dao_ren', 'dao_tian')),
+    status TEXT NOT NULL CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired')),
+    domain TEXT NOT NULL CHECK(domain IN ('project', 'agent', 'skill', 'global')),
+    field TEXT NOT NULL DEFAULT 'general',
+    anchor_kind TEXT NOT NULL CHECK(anchor_kind IN ('global', 'repo', 'worktree')),
+    anchor_id TEXT NOT NULL,
+    parent_anchor_id TEXT,
+    scope_constraints TEXT,
+    trigger_hints TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_evidence_links (
+    id TEXT PRIMARY KEY,
+    card_id TEXT NOT NULL,
+    evidence_drawer_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('supporting', 'verification', 'counterexample', 'teaching')),
+    note TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(card_id, evidence_drawer_id, role),
+    FOREIGN KEY(card_id) REFERENCES knowledge_cards(id) ON DELETE RESTRICT,
+    FOREIGN KEY(evidence_drawer_id) REFERENCES drawers(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_events (
+    id TEXT PRIMARY KEY,
+    card_id TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('created', 'promoted', 'demoted', 'retired', 'linked', 'unlinked', 'updated', 'published_anchor')),
+    from_status TEXT,
+    to_status TEXT,
+    reason TEXT NOT NULL,
+    actor TEXT,
+    metadata TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(card_id) REFERENCES knowledge_cards(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_cards_tier_status
+    ON knowledge_cards(tier, status);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_cards_domain_field
+    ON knowledge_cards(domain, field);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_cards_anchor
+    ON knowledge_cards(anchor_kind, anchor_id);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_evidence_links_card
+    ON knowledge_evidence_links(card_id);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_evidence_links_evidence
+    ON knowledge_evidence_links(evidence_drawer_id);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_events_card_created_at
+    ON knowledge_events(card_id, created_at);
+
+CREATE TRIGGER IF NOT EXISTS knowledge_events_no_update
+BEFORE UPDATE ON knowledge_events
+BEGIN
+    SELECT RAISE(ABORT, 'knowledge_events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS knowledge_events_no_delete
+BEFORE DELETE ON knowledge_events
+BEGIN
+    SELECT RAISE(ABORT, 'knowledge_events are append-only');
+END;
+"#;
+
 fn migrations() -> &'static [Migration] {
     static MIGRATIONS: &[Migration] = &[
         Migration {
@@ -1814,22 +2754,36 @@ fn migrations() -> &'static [Migration] {
             version: 5,
             sql: V5_MIGRATION_SQL,
         },
+        Migration {
+            version: 6,
+            sql: V6_MIGRATION_SQL,
+        },
+        Migration {
+            version: 7,
+            sql: V7_MIGRATION_SQL,
+        },
+        Migration {
+            version: 8,
+            sql: V8_MIGRATION_SQL,
+        },
     ];
     MIGRATIONS
 }
-
-const V4_MIGRATION_SQL: &str = r#"
-ALTER TABLE drawers ADD COLUMN importance INTEGER DEFAULT 0;
-"#;
-
-const V5_MIGRATION_SQL: &str = r#"
-CREATE INDEX IF NOT EXISTS idx_drawers_content_hash ON drawers(wing, content_hash);
-"#;
 
 struct Migration {
     version: u32,
     sql: &'static str,
 }
+
+const V5_ALREADY_APPLIED_MIGRATION: Migration = Migration {
+    version: 5,
+    sql: V5_ALREADY_APPLIED_MIGRATION_SQL,
+};
+
+const V7_ALREADY_APPLIED_MIGRATION: Migration = Migration {
+    version: 7,
+    sql: V7_ALREADY_APPLIED_MIGRATION_SQL,
+};
 
 fn register_sqlite_vec() -> Result<(), DbError> {
     SQLITE_VEC_AUTO_EXTENSION
@@ -1866,6 +2820,341 @@ fn source_type_from_str(source_type: &str) -> Result<SourceType, DbError> {
     }
 }
 
+fn memory_kind_as_str(memory_kind: &MemoryKind) -> &'static str {
+    match memory_kind {
+        MemoryKind::Evidence => "evidence",
+        MemoryKind::Knowledge => "knowledge",
+    }
+}
+
+fn memory_kind_from_str(memory_kind: &str) -> Result<MemoryKind, DbError> {
+    match memory_kind {
+        "evidence" => Ok(MemoryKind::Evidence),
+        "knowledge" => Ok(MemoryKind::Knowledge),
+        other => Err(DbError::InvalidEnumValue {
+            kind: "memory_kind",
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn memory_domain_as_str(domain: &MemoryDomain) -> &'static str {
+    match domain {
+        MemoryDomain::Project => "project",
+        MemoryDomain::Agent => "agent",
+        MemoryDomain::Skill => "skill",
+        MemoryDomain::Global => "global",
+    }
+}
+
+fn memory_domain_from_str(domain: &str) -> Result<MemoryDomain, DbError> {
+    match domain {
+        "project" => Ok(MemoryDomain::Project),
+        "agent" => Ok(MemoryDomain::Agent),
+        "skill" => Ok(MemoryDomain::Skill),
+        "global" => Ok(MemoryDomain::Global),
+        other => Err(DbError::InvalidEnumValue {
+            kind: "domain",
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn anchor_kind_as_str(anchor_kind: &AnchorKind) -> &'static str {
+    match anchor_kind {
+        AnchorKind::Global => "global",
+        AnchorKind::Repo => "repo",
+        AnchorKind::Worktree => "worktree",
+    }
+}
+
+fn anchor_kind_from_str(anchor_kind: &str) -> Result<AnchorKind, DbError> {
+    match anchor_kind {
+        "global" => Ok(AnchorKind::Global),
+        "repo" => Ok(AnchorKind::Repo),
+        "worktree" => Ok(AnchorKind::Worktree),
+        other => Err(DbError::InvalidEnumValue {
+            kind: "anchor_kind",
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn provenance_as_str(provenance: &Provenance) -> &'static str {
+    match provenance {
+        Provenance::Runtime => "runtime",
+        Provenance::Research => "research",
+        Provenance::Human => "human",
+    }
+}
+
+fn provenance_from_str(provenance: &str) -> Result<Provenance, DbError> {
+    match provenance {
+        "runtime" => Ok(Provenance::Runtime),
+        "research" => Ok(Provenance::Research),
+        "human" => Ok(Provenance::Human),
+        other => Err(DbError::InvalidEnumValue {
+            kind: "provenance",
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn knowledge_tier_as_str(tier: &KnowledgeTier) -> &'static str {
+    match tier {
+        KnowledgeTier::Qi => "qi",
+        KnowledgeTier::Shu => "shu",
+        KnowledgeTier::DaoRen => "dao_ren",
+        KnowledgeTier::DaoTian => "dao_tian",
+    }
+}
+
+fn knowledge_tier_from_str(tier: &str) -> Result<KnowledgeTier, DbError> {
+    match tier {
+        "qi" => Ok(KnowledgeTier::Qi),
+        "shu" => Ok(KnowledgeTier::Shu),
+        "dao_ren" => Ok(KnowledgeTier::DaoRen),
+        "dao_tian" => Ok(KnowledgeTier::DaoTian),
+        other => Err(DbError::InvalidEnumValue {
+            kind: "tier",
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn knowledge_status_as_str(status: &KnowledgeStatus) -> &'static str {
+    match status {
+        KnowledgeStatus::Candidate => "candidate",
+        KnowledgeStatus::Promoted => "promoted",
+        KnowledgeStatus::Canonical => "canonical",
+        KnowledgeStatus::Demoted => "demoted",
+        KnowledgeStatus::Retired => "retired",
+    }
+}
+
+fn knowledge_status_from_str(status: &str) -> Result<KnowledgeStatus, DbError> {
+    match status {
+        "candidate" => Ok(KnowledgeStatus::Candidate),
+        "promoted" => Ok(KnowledgeStatus::Promoted),
+        "canonical" => Ok(KnowledgeStatus::Canonical),
+        "demoted" => Ok(KnowledgeStatus::Demoted),
+        "retired" => Ok(KnowledgeStatus::Retired),
+        other => Err(DbError::InvalidEnumValue {
+            kind: "status",
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn knowledge_evidence_role_as_str(role: &KnowledgeEvidenceRole) -> &'static str {
+    match role {
+        KnowledgeEvidenceRole::Supporting => "supporting",
+        KnowledgeEvidenceRole::Verification => "verification",
+        KnowledgeEvidenceRole::Counterexample => "counterexample",
+        KnowledgeEvidenceRole::Teaching => "teaching",
+    }
+}
+
+fn knowledge_evidence_role_from_str(role: &str) -> Result<KnowledgeEvidenceRole, DbError> {
+    match role {
+        "supporting" => Ok(KnowledgeEvidenceRole::Supporting),
+        "verification" => Ok(KnowledgeEvidenceRole::Verification),
+        "counterexample" => Ok(KnowledgeEvidenceRole::Counterexample),
+        "teaching" => Ok(KnowledgeEvidenceRole::Teaching),
+        other => Err(DbError::InvalidEnumValue {
+            kind: "knowledge_evidence_role",
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn knowledge_event_type_as_str(event_type: &KnowledgeEventType) -> &'static str {
+    match event_type {
+        KnowledgeEventType::Created => "created",
+        KnowledgeEventType::Promoted => "promoted",
+        KnowledgeEventType::Demoted => "demoted",
+        KnowledgeEventType::Retired => "retired",
+        KnowledgeEventType::Linked => "linked",
+        KnowledgeEventType::Unlinked => "unlinked",
+        KnowledgeEventType::Updated => "updated",
+        KnowledgeEventType::PublishedAnchor => "published_anchor",
+    }
+}
+
+fn knowledge_event_type_from_str(event_type: &str) -> Result<KnowledgeEventType, DbError> {
+    match event_type {
+        "created" => Ok(KnowledgeEventType::Created),
+        "promoted" => Ok(KnowledgeEventType::Promoted),
+        "demoted" => Ok(KnowledgeEventType::Demoted),
+        "retired" => Ok(KnowledgeEventType::Retired),
+        "linked" => Ok(KnowledgeEventType::Linked),
+        "unlinked" => Ok(KnowledgeEventType::Unlinked),
+        "updated" => Ok(KnowledgeEventType::Updated),
+        "published_anchor" => Ok(KnowledgeEventType::PublishedAnchor),
+        other => Err(DbError::InvalidEnumValue {
+            kind: "knowledge_event_type",
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn encode_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, DbError> {
+    Ok(serde_json::to_string(value)?)
+}
+
+fn encode_optional_json<T: serde::Serialize>(value: Option<&T>) -> Result<Option<String>, DbError> {
+    value.map(encode_json).transpose()
+}
+
+fn parse_string_list(raw: Option<&str>) -> Result<Vec<String>, DbError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    Ok(serde_json::from_str::<Vec<String>>(raw)?)
+}
+
+fn parse_optional_json<T>(raw: Option<&str>) -> Result<Option<T>, DbError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    raw.map(serde_json::from_str)
+        .transpose()
+        .map_err(DbError::from)
+}
+
+fn row_decode_error(error: DbError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+}
+
+fn knowledge_card_from_row(row: &Row<'_>) -> Result<KnowledgeCard, DbError> {
+    let tier = knowledge_tier_from_str(&row.get::<_, String>(3)?)?;
+    let status = knowledge_status_from_str(&row.get::<_, String>(4)?)?;
+    let domain = memory_domain_from_str(&row.get::<_, String>(5)?)?;
+    let anchor_kind = anchor_kind_from_str(&row.get::<_, String>(7)?)?;
+    let trigger_hints = parse_optional_json(row.get::<_, Option<String>>(11)?.as_deref())?;
+
+    anchor::validate_anchor_domain(&domain, &anchor_kind)
+        .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
+
+    Ok(KnowledgeCard {
+        id: row.get(0)?,
+        statement: row.get(1)?,
+        content: row.get(2)?,
+        tier,
+        status,
+        domain,
+        field: row.get(6)?,
+        anchor_kind,
+        anchor_id: row.get(8)?,
+        parent_anchor_id: row.get(9)?,
+        scope_constraints: row.get(10)?,
+        trigger_hints,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+fn knowledge_evidence_link_from_row(row: &Row<'_>) -> Result<KnowledgeEvidenceLink, DbError> {
+    Ok(KnowledgeEvidenceLink {
+        id: row.get(0)?,
+        card_id: row.get(1)?,
+        evidence_drawer_id: row.get(2)?,
+        role: knowledge_evidence_role_from_str(&row.get::<_, String>(3)?)?,
+        note: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+fn knowledge_event_from_row(row: &Row<'_>) -> Result<KnowledgeCardEvent, DbError> {
+    let from_status = row
+        .get::<_, Option<String>>(3)?
+        .as_deref()
+        .map(knowledge_status_from_str)
+        .transpose()?;
+    let to_status = row
+        .get::<_, Option<String>>(4)?
+        .as_deref()
+        .map(knowledge_status_from_str)
+        .transpose()?;
+    let metadata = parse_optional_json(row.get::<_, Option<String>>(7)?.as_deref())?;
+
+    Ok(KnowledgeCardEvent {
+        id: row.get(0)?,
+        card_id: row.get(1)?,
+        event_type: knowledge_event_type_from_str(&row.get::<_, String>(2)?)?,
+        from_status,
+        to_status,
+        reason: row.get(5)?,
+        actor: row.get(6)?,
+        metadata,
+        created_at: row.get(8)?,
+    })
+}
+
+fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
+    let source_type = source_type_from_str(&row.get::<_, String>(5)?)?;
+    let memory_kind = memory_kind_from_str(&row.get::<_, String>(10)?)?;
+    let domain = memory_domain_from_str(&row.get::<_, String>(11)?)?;
+    let field = row.get::<_, String>(12)?;
+    let anchor_kind = anchor_kind_from_str(&row.get::<_, String>(13)?)?;
+    let anchor_id = row.get::<_, String>(14)?;
+    let parent_anchor_id = row.get::<_, Option<String>>(15)?;
+    let provenance = row
+        .get::<_, Option<String>>(16)?
+        .as_deref()
+        .map(provenance_from_str)
+        .transpose()?;
+    let statement = row.get::<_, Option<String>>(17)?;
+    let tier = row
+        .get::<_, Option<String>>(18)?
+        .as_deref()
+        .map(knowledge_tier_from_str)
+        .transpose()?;
+    let status = row
+        .get::<_, Option<String>>(19)?
+        .as_deref()
+        .map(knowledge_status_from_str)
+        .transpose()?;
+    let supporting_refs = parse_string_list(row.get::<_, Option<String>>(20)?.as_deref())?;
+    let counterexample_refs = parse_string_list(row.get::<_, Option<String>>(21)?.as_deref())?;
+    let teaching_refs = parse_string_list(row.get::<_, Option<String>>(22)?.as_deref())?;
+    let verification_refs = parse_string_list(row.get::<_, Option<String>>(23)?.as_deref())?;
+    let scope_constraints = row.get::<_, Option<String>>(24)?;
+    let trigger_hints = parse_optional_json(row.get::<_, Option<String>>(25)?.as_deref())?;
+
+    anchor::validate_anchor_domain(&domain, &anchor_kind)
+        .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
+
+    Ok(Drawer {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        wing: row.get(2)?,
+        room: row.get(3)?,
+        source_file: row.get(4)?,
+        source_type,
+        added_at: row.get(6)?,
+        chunk_index: row.get(7)?,
+        normalize_version: row.get(8)?,
+        importance: row.get(9)?,
+        memory_kind,
+        domain,
+        field,
+        anchor_kind,
+        anchor_id,
+        parent_anchor_id,
+        provenance,
+        statement,
+        tier,
+        status,
+        supporting_refs,
+        counterexample_refs,
+        teaching_refs,
+        verification_refs,
+        scope_constraints,
+        trigger_hints,
+    })
+}
+
 fn parse_keywords(raw: Option<&str>) -> Result<Vec<String>, DbError> {
     let Some(raw) = raw else {
         return Ok(Vec::new());
@@ -1895,5 +3184,54 @@ fn build_fts_match_query(query: &str) -> Option<String> {
         None
     } else {
         Some(terms.join(" AND "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_atomic_migration_rolls_back_partial_schema_changes() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE drawers (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL
+            );
+            PRAGMA user_version = 4;
+            "#,
+        )
+        .expect("create base schema");
+
+        let migration = Migration {
+            version: 5,
+            sql: r#"
+            ALTER TABLE drawers ADD COLUMN memory_kind TEXT;
+            ALTER TABLE missing_table ADD COLUMN nope TEXT;
+            "#,
+        };
+
+        let error = apply_migration_atomic(&conn, &migration).expect_err("migration should fail");
+        assert!(
+            matches!(error, DbError::Sqlite(_)),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(read_user_version(&conn).expect("user_version"), 4);
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(drawers)")
+            .expect("table_info");
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query columns")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect columns");
+
+        assert!(
+            !columns.iter().any(|column| column == "memory_kind"),
+            "failed migration must not leave partial columns behind"
+        );
     }
 }

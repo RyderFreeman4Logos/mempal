@@ -3,7 +3,10 @@
 use crate::core::{
     db::Database,
     project::{ProjectSearchScope, SearchResultSource},
-    types::{RouteDecision, SearchResult},
+    types::{
+        AnchorKind, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
+        RouteDecision, SearchResult,
+    },
     utils::source_file_or_synthetic,
 };
 use crate::embed::{EmbedError, Embedder};
@@ -18,6 +21,24 @@ pub mod rerank;
 pub mod route;
 
 pub type Result<T> = std::result::Result<T, SearchError>;
+
+// --- Upstream knowledge-filter types ---
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchFilters {
+    pub memory_kind: Option<String>,
+    pub domain: Option<String>,
+    pub field: Option<String>,
+    pub tier: Option<String>,
+    pub status: Option<String>,
+    pub anchor_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub filters: SearchFilters,
+    pub with_neighbors: bool,
+}
 
 #[derive(Debug, Error)]
 pub enum SearchError {
@@ -43,12 +64,21 @@ pub enum SearchError {
     LoadTaxonomy(#[source] crate::core::db::DbError),
     #[error("failed to run keyword search")]
     KeywordSearch(#[source] crate::core::db::DbError),
+    #[error("failed to load neighbor chunks")]
+    LoadNeighbors(#[source] crate::core::db::DbError),
+    #[error("failed to load search result drawer metadata")]
+    LoadDrawer(#[source] crate::core::db::DbError),
     #[error(
         "embedding dimension mismatch: drawer_vectors uses {current_dim}d but embedder returned {new_dim}d; run `mempal reindex --embedder <name>` before searching with this backend"
     )]
     VectorDimensionMismatch { current_dim: usize, new_dim: usize },
 }
 
+// ---------------------------------------------------------------------------
+// Async entry points
+// ---------------------------------------------------------------------------
+
+/// Simple async search with project scope (fork API).
 pub async fn search<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,
@@ -84,30 +114,75 @@ pub async fn search<E: Embedder + ?Sized>(
     search_with_vector(db, query, &query_vector, route, scope, top_k)
 }
 
-fn current_vector_dim(
+/// Async search with upstream knowledge filters + options (upstream API).
+///
+/// Uses `ProjectSearchScope::all_projects()` — callers that need project
+/// isolation should use [`search_with_all_options`] instead.
+pub async fn search_with_options<E: Embedder + ?Sized>(
     db: &Database,
-) -> std::result::Result<Option<usize>, crate::core::db::DbError> {
-    let exists: bool = db.conn().query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !exists {
-        return Ok(None);
-    }
-
-    let dimension = db
-        .conn()
-        .query_row(
-            "SELECT vec_length(embedding) FROM drawer_vectors LIMIT 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .map(|value| value as usize);
-    Ok(dimension)
+    embedder: &E,
+    query: &str,
+    wing: Option<&str>,
+    room: Option<&str>,
+    options: SearchOptions,
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
+    search_with_all_options(
+        db,
+        embedder,
+        query,
+        wing,
+        room,
+        &ProjectSearchScope::all_projects(),
+        options,
+        top_k,
+    )
+    .await
 }
 
+/// Async search with both project scope AND knowledge filter options (merged API).
+#[allow(clippy::too_many_arguments)]
+pub async fn search_with_all_options<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    query: &str,
+    wing: Option<&str>,
+    room: Option<&str>,
+    scope: &ProjectSearchScope,
+    options: SearchOptions,
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
+    if top_k == 0 {
+        return Ok(Vec::new());
+    }
+
+    let route = resolve_route(db, query, wing, room)?;
+
+    let embeddings = embedder
+        .embed(&[query])
+        .await
+        .map_err(SearchError::EmbedQuery)?;
+    let query_vector = embeddings
+        .into_iter()
+        .next()
+        .ok_or(SearchError::MissingQueryVector)?;
+    if let Some(current_dim) = current_vector_dim(db).map_err(SearchError::KeywordSearch)?
+        && current_dim != query_vector.len()
+    {
+        return Err(SearchError::VectorDimensionMismatch {
+            current_dim,
+            new_dim: query_vector.len(),
+        });
+    }
+
+    search_with_vector_and_scope_options(db, query, &query_vector, route, scope, options, top_k)
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous vector-entry points
+// ---------------------------------------------------------------------------
+
+/// Fork API: vector search with project scope, no knowledge filters.
 pub fn search_with_vector(
     db: &Database,
     query: &str,
@@ -116,12 +191,66 @@ pub fn search_with_vector(
     scope: &ProjectSearchScope,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
+    search_with_vector_and_scope_options(
+        db,
+        query,
+        query_vector,
+        route,
+        scope,
+        SearchOptions::default(),
+        top_k,
+    )
+}
+
+/// Upstream API: vector search with knowledge filter options, no project scope
+/// (`all_projects` default).
+///
+/// Used by `context.rs` which does not carry a `ProjectSearchScope`.
+pub fn search_with_vector_options(
+    db: &Database,
+    query: &str,
+    query_vector: &[f32],
+    route: RouteDecision,
+    options: SearchOptions,
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
+    search_with_vector_and_scope_options(
+        db,
+        query,
+        query_vector,
+        route,
+        &ProjectSearchScope::all_projects(),
+        options,
+        top_k,
+    )
+}
+
+/// Combined: vector search with BOTH project scope AND knowledge filters.
+///
+/// This is the single canonical implementation that all other entry points
+/// delegate to.
+pub fn search_with_vector_and_scope_options(
+    db: &Database,
+    query: &str,
+    query_vector: &[f32],
+    route: RouteDecision,
+    scope: &ProjectSearchScope,
+    options: SearchOptions,
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
     if top_k == 0 {
         return Ok(Vec::new());
     }
 
+    let has_filters = !options.filters.is_empty();
+    let candidate_top_k = if has_filters {
+        top_k.saturating_mul(20).max(100)
+    } else {
+        top_k
+    };
+
     // Hybrid search: vector + BM25, merged via RRF
-    let vector_results = search_by_vector(db, query_vector, route.clone(), scope, top_k)?;
+    let vector_results = search_by_vector(db, query_vector, route.clone(), scope, candidate_top_k)?;
 
     let fts_ids = db
         .search_fts(
@@ -130,22 +259,32 @@ pub fn search_with_vector(
             route.room.as_deref(),
             scope.mode_param(),
             scope.project_id.as_deref(),
-            top_k,
+            candidate_top_k,
         )
         .map_err(SearchError::KeywordSearch)?;
 
     let mut results = if fts_ids.is_empty() {
         vector_results
     } else {
-        rrf_merge(vector_results, &fts_ids, &route, scope, db, top_k)
+        rrf_merge(vector_results, &fts_ids, &route, scope, db, candidate_top_k)
     };
+    if has_filters {
+        results.retain(|result| matches_filters(result, &options.filters));
+        results.truncate(top_k);
+    }
 
     // Inject tunnel hints: for each result, check if its room exists in other wings
     inject_tunnel_hints_and_results(db, &mut results, scope);
 
+    // Chunk neighbors hydration (upstream feature)
+    if options.with_neighbors && top_k <= 10 {
+        inject_chunk_neighbors(db, &mut results)?;
+    }
+
     Ok(results)
 }
 
+/// BM25-only search path (fork API, used when embedder is unavailable).
 pub fn search_bm25_only(
     db: &Database,
     query: &str,
@@ -172,6 +311,77 @@ pub fn search_bm25_only(
     inject_tunnel_hints_and_results(db, &mut results, scope);
     Ok(results)
 }
+
+impl SearchFilters {
+    fn is_empty(&self) -> bool {
+        self.memory_kind.is_none()
+            && self.domain.is_none()
+            && self.field.is_none()
+            && self.tier.is_none()
+            && self.status.is_none()
+            && self.anchor_kind.is_none()
+    }
+}
+
+fn matches_filters(result: &SearchResult, filters: &SearchFilters) -> bool {
+    filters
+        .memory_kind
+        .as_deref()
+        .is_none_or(|value| value == memory_kind_slug(&result.memory_kind))
+        && filters
+            .domain
+            .as_deref()
+            .is_none_or(|value| value == domain_slug(&result.domain))
+        && filters
+            .field
+            .as_deref()
+            .is_none_or(|value| value == result.field)
+        && filters.tier.as_deref().is_none_or(|value| {
+            result
+                .tier
+                .as_ref()
+                .is_some_and(|tier| value == tier_slug(tier))
+        })
+        && filters.status.as_deref().is_none_or(|value| {
+            result
+                .status
+                .as_ref()
+                .is_some_and(|status| value == status_slug(status))
+        })
+        && filters
+            .anchor_kind
+            .as_deref()
+            .is_none_or(|value| value == anchor_kind_slug(&result.anchor_kind))
+}
+
+// ---------------------------------------------------------------------------
+// Chunk neighbors (upstream)
+// ---------------------------------------------------------------------------
+
+fn inject_chunk_neighbors(db: &Database, results: &mut [SearchResult]) -> Result<()> {
+    for result in results {
+        let Some(chunk_index) = result.chunk_index else {
+            continue;
+        };
+        let neighbors = db
+            .neighbor_chunks(
+                &result.source_file,
+                &result.wing,
+                result.room.as_deref(),
+                chunk_index,
+            )
+            .map_err(SearchError::LoadNeighbors)?;
+        if neighbors.prev.is_some() || neighbors.next.is_some() {
+            result.neighbors = Some(neighbors);
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tunnel hints (fork — project-aware fanout + display cap)
+// ---------------------------------------------------------------------------
 
 /// For each search result, check if its room appears in other wings (tunnel).
 /// If so, add the other wing names as tunnel_hints and append any explicit
@@ -218,7 +428,7 @@ pub(crate) fn inject_tunnel_hints_with_cap(
         return;
     }
 
-    // Build room → other-wings map
+    // Build room -> other-wings map
     let tunnel_map: std::collections::HashMap<&str, &[String]> = tunnels
         .iter()
         .map(|(room, wings)| (room.as_str(), wings.as_slice()))
@@ -234,14 +444,22 @@ pub(crate) fn inject_tunnel_hints_with_cap(
             if let Some(wings) = tunnel_map.get(room) {
                 let other_wings: Vec<&String> =
                     wings.iter().filter(|w| *w != &result.wing).collect();
-                let total_other = other_wings.len();
-                let mut hints: Vec<String> = other_wings
-                    .iter()
+                let mut combined_hints: Vec<String> =
+                    other_wings.iter().map(|w| (*w).clone()).collect();
+                if let Ok(explicit_hints) = db.explicit_tunnel_hints(&result.wing, Some(room)) {
+                    for hint in explicit_hints {
+                        if !combined_hints.contains(&hint) {
+                            combined_hints.push(hint);
+                        }
+                    }
+                }
+                let total_hints = combined_hints.len();
+                let mut hints = combined_hints
+                    .into_iter()
                     .take(hints_display_cap)
-                    .map(|w| (*w).clone())
-                    .collect();
-                if total_other > hints_display_cap {
-                    hints.push(format!("… +{} more", total_other - hints_display_cap));
+                    .collect::<Vec<_>>();
+                if total_hints > hints_display_cap {
+                    hints.push(format!("… +{} more", total_hints - hints_display_cap));
                 }
                 result.tunnel_hints = hints;
             }
@@ -261,20 +479,12 @@ pub(crate) fn inject_tunnel_hints_with_cap(
                     }
                     let drawer = tunnel.drawer;
                     if seen_ids.insert(drawer.id.clone()) {
-                        tunnel_results.push(SearchResult {
-                            drawer_id: drawer.id.clone(),
-                            content: drawer.content,
-                            wing: drawer.wing,
-                            room: drawer.room,
-                            source_file: source_file_or_synthetic(
-                                &drawer.id,
-                                drawer.source_file.as_deref(),
-                            ),
-                            source: SearchResultSource::TunnelCrossProject,
-                            similarity: result.similarity,
-                            route: result.route.clone(),
-                            tunnel_hints: vec![],
-                        });
+                        tunnel_results.push(result_from_drawer(
+                            drawer,
+                            SearchResultSource::TunnelCrossProject,
+                            result.similarity,
+                            result.route.clone(),
+                        ));
                         added_from_this_result += 1;
                     }
                 }
@@ -283,6 +493,49 @@ pub(crate) fn inject_tunnel_hints_with_cap(
     }
     results.extend(tunnel_results);
 }
+
+fn result_from_drawer(
+    drawer: Drawer,
+    source: SearchResultSource,
+    similarity: f32,
+    route: RouteDecision,
+) -> SearchResult {
+    SearchResult {
+        drawer_id: drawer.id.clone(),
+        content: drawer.content,
+        wing: drawer.wing,
+        room: drawer.room,
+        source_file: source_file_or_synthetic(&drawer.id, drawer.source_file.as_deref()),
+        source,
+        memory_kind: drawer.memory_kind,
+        domain: drawer.domain,
+        field: drawer.field,
+        statement: drawer.statement,
+        tier: drawer.tier,
+        status: drawer.status,
+        anchor_kind: drawer.anchor_kind,
+        anchor_id: drawer.anchor_id,
+        parent_anchor_id: drawer.parent_anchor_id,
+        similarity,
+        route,
+        chunk_index: drawer.chunk_index,
+        neighbors: None,
+        tunnel_hints: vec![],
+    }
+}
+
+fn hydrate_result_metadata(db: &Database, result: SearchResult) -> SearchResult {
+    match db.get_drawer(&result.drawer_id) {
+        Ok(Some(drawer)) => {
+            result_from_drawer(drawer, result.source, result.similarity, result.route)
+        }
+        _ => result,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RRF merge
+// ---------------------------------------------------------------------------
 
 /// Reciprocal Rank Fusion: merge vector and BM25 ranked lists.
 /// RRF score = sum(1 / (k + rank)) across both lists, with k=60.
@@ -316,20 +569,10 @@ fn rrf_merge(
         // If this ID wasn't in vector results, load the drawer
         if !result_map.contains_key(id) {
             if let Ok(Some(drawer)) = db.get_drawer(id) {
+                let source = scope.classify_row(db.drawer_project_id(id).ok().flatten().as_deref());
                 result_map.insert(
                     id.clone(),
-                    SearchResult {
-                        drawer_id: drawer.id,
-                        content: drawer.content,
-                        wing: drawer.wing,
-                        room: drawer.room,
-                        source_file: source_file_or_synthetic(id, drawer.source_file.as_deref()),
-                        source: scope
-                            .classify_row(db.drawer_project_id(id).ok().flatten().as_deref()),
-                        similarity: 0.0, // will be overwritten below
-                        route: route.clone(),
-                        tunnel_hints: vec![],
-                    },
+                    result_from_drawer(drawer, source, 0.0, route.clone()),
                 );
             }
         }
@@ -353,19 +596,51 @@ fn rrf_merge(
     merged
 }
 
+// ---------------------------------------------------------------------------
+// KNN helpers (fork)
+// ---------------------------------------------------------------------------
+
+fn current_vector_dim(
+    db: &Database,
+) -> std::result::Result<Option<usize>, crate::core::db::DbError> {
+    let exists: bool = db.conn().query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+
+    let dimension = db
+        .conn()
+        .query_row(
+            "SELECT vec_length(embedding) FROM drawer_vectors LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|value| value as usize);
+    Ok(dimension)
+}
+
 /// Compute the KNN `k` parameter for sqlite-vec, clamped to its hardcoded
 /// limit of 4096. Uses `top_k * 50` as the recall multiplier (allowing
 /// post-filter shrinkage from wing/room/project predicates), floored at
 /// 100 to avoid degenerate single-digit recall on tiny `top_k` values.
 ///
 /// When the database grows beyond 4096 drawers the KNN result is an
-/// *approximate* subset — callers that need exact recall on a small
+/// *approximate* subset -- callers that need exact recall on a small
 /// candidate set should use `search_by_vector_scoped_exact` instead.
 pub fn compute_knn_k(top_k: usize) -> i64 {
     let raw = top_k.saturating_mul(50);
     let raw_i64 = i64::try_from(raw).unwrap_or(i64::MAX);
     raw_i64.clamp(100, 4_096)
 }
+
+// ---------------------------------------------------------------------------
+// Vector search (fork path with project scope)
+// ---------------------------------------------------------------------------
 
 pub fn search_by_vector(
     db: &Database,
@@ -403,7 +678,7 @@ pub fn search_by_vector(
     }
 
     // When the candidate set fits within the sqlite-vec KNN limit, use
-    // the exact in-memory path regardless of scope mode — this avoids
+    // the exact in-memory path regardless of scope mode -- this avoids
     // approximate recall loss and sidesteps the 4096 KNN cap entirely.
     if candidate_count <= 4_096 {
         return search_by_vector_scoped_exact(
@@ -451,8 +726,22 @@ pub fn search_by_vector(
                     room: row.get(3)?,
                     source_file: source_file_or_synthetic(&drawer_id, source_file.as_deref()),
                     source: scope.classify_row(row_project_id.as_deref()),
+                    // Knowledge fields are not available from the vector-only
+                    // SQL path; use defaults.  Callers that need them should
+                    // hydrate via the drawer record.
+                    memory_kind: MemoryKind::Evidence,
+                    domain: MemoryDomain::Project,
+                    field: String::new(),
+                    statement: None,
+                    tier: None,
+                    status: None,
+                    anchor_kind: AnchorKind::Global,
+                    anchor_id: String::new(),
+                    parent_anchor_id: None,
                     similarity: (1.0_f64 - distance) as f32,
                     route: route.clone(),
+                    chunk_index: None,
+                    neighbors: None,
                     tunnel_hints: vec![],
                 })
             },
@@ -461,7 +750,10 @@ pub fn search_by_vector(
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(SearchError::CollectSearchRows)?;
 
-    Ok(results)
+    Ok(results
+        .into_iter()
+        .map(|result| hydrate_result_metadata(db, result))
+        .collect())
 }
 
 fn search_by_vector_scoped_exact(
@@ -543,14 +835,28 @@ fn search_by_vector_scoped_exact(
                     room,
                     source_file,
                     source: scope.classify_row(row_project_id.as_deref()),
+                    memory_kind: MemoryKind::Evidence,
+                    domain: MemoryDomain::Project,
+                    field: String::new(),
+                    statement: None,
+                    tier: None,
+                    status: None,
+                    anchor_kind: AnchorKind::Global,
+                    anchor_id: String::new(),
+                    parent_anchor_id: None,
                     similarity: (1.0_f64 - distance) as f32,
                     route: route.clone(),
+                    chunk_index: None,
+                    neighbors: None,
                     tunnel_hints: vec![],
                 })
             },
         )
         .collect::<Result<Vec<_>>>()?;
-    Ok(results)
+    Ok(results
+        .into_iter()
+        .map(|result| hydrate_result_metadata(db, result))
+        .collect())
 }
 
 fn cosine_distance_from_blob(
@@ -596,6 +902,10 @@ fn cosine_distance_from_blob(
     Ok((1.0 - cosine_similarity).clamp(0.0, 2.0))
 }
 
+// ---------------------------------------------------------------------------
+// Route resolution
+// ---------------------------------------------------------------------------
+
 pub fn resolve_route(
     db: &Database,
     query: &str,
@@ -631,6 +941,140 @@ pub fn resolve_route(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Upstream knowledge-enum helpers
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn invalid_enum_value(kind: &'static str, value: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid {kind}: {value}"),
+        )),
+    )
+}
+
+#[allow(dead_code)]
+fn memory_kind_from_str(value: &str) -> rusqlite::Result<MemoryKind> {
+    match value {
+        "evidence" => Ok(MemoryKind::Evidence),
+        "knowledge" => Ok(MemoryKind::Knowledge),
+        _ => Err(invalid_enum_value("memory_kind", value.to_string())),
+    }
+}
+
+fn memory_kind_slug(value: &MemoryKind) -> &'static str {
+    match value {
+        MemoryKind::Evidence => "evidence",
+        MemoryKind::Knowledge => "knowledge",
+    }
+}
+
+#[allow(dead_code)]
+fn memory_domain_from_str(value: &str) -> rusqlite::Result<MemoryDomain> {
+    match value {
+        "project" => Ok(MemoryDomain::Project),
+        "agent" => Ok(MemoryDomain::Agent),
+        "skill" => Ok(MemoryDomain::Skill),
+        "global" => Ok(MemoryDomain::Global),
+        _ => Err(invalid_enum_value("domain", value.to_string())),
+    }
+}
+
+fn domain_slug(value: &MemoryDomain) -> &'static str {
+    match value {
+        MemoryDomain::Project => "project",
+        MemoryDomain::Agent => "agent",
+        MemoryDomain::Skill => "skill",
+        MemoryDomain::Global => "global",
+    }
+}
+
+#[allow(dead_code)]
+fn knowledge_tier_from_str(value: &str) -> rusqlite::Result<KnowledgeTier> {
+    match value {
+        "qi" => Ok(KnowledgeTier::Qi),
+        "shu" => Ok(KnowledgeTier::Shu),
+        "dao_ren" => Ok(KnowledgeTier::DaoRen),
+        "dao_tian" => Ok(KnowledgeTier::DaoTian),
+        _ => Err(invalid_enum_value("tier", value.to_string())),
+    }
+}
+
+fn tier_slug(value: &KnowledgeTier) -> &'static str {
+    match value {
+        KnowledgeTier::Qi => "qi",
+        KnowledgeTier::Shu => "shu",
+        KnowledgeTier::DaoRen => "dao_ren",
+        KnowledgeTier::DaoTian => "dao_tian",
+    }
+}
+
+#[allow(dead_code)]
+fn knowledge_status_from_str(value: &str) -> rusqlite::Result<KnowledgeStatus> {
+    match value {
+        "candidate" => Ok(KnowledgeStatus::Candidate),
+        "promoted" => Ok(KnowledgeStatus::Promoted),
+        "canonical" => Ok(KnowledgeStatus::Canonical),
+        "demoted" => Ok(KnowledgeStatus::Demoted),
+        "retired" => Ok(KnowledgeStatus::Retired),
+        _ => Err(invalid_enum_value("status", value.to_string())),
+    }
+}
+
+fn status_slug(value: &KnowledgeStatus) -> &'static str {
+    match value {
+        KnowledgeStatus::Candidate => "candidate",
+        KnowledgeStatus::Promoted => "promoted",
+        KnowledgeStatus::Canonical => "canonical",
+        KnowledgeStatus::Demoted => "demoted",
+        KnowledgeStatus::Retired => "retired",
+    }
+}
+
+#[allow(dead_code)]
+fn anchor_kind_from_str(value: &str) -> rusqlite::Result<AnchorKind> {
+    match value {
+        "global" => Ok(AnchorKind::Global),
+        "repo" => Ok(AnchorKind::Repo),
+        "worktree" => Ok(AnchorKind::Worktree),
+        _ => Err(invalid_enum_value("anchor_kind", value.to_string())),
+    }
+}
+
+fn anchor_kind_slug(value: &AnchorKind) -> &'static str {
+    match value {
+        AnchorKind::Global => "global",
+        AnchorKind::Repo => "repo",
+        AnchorKind::Worktree => "worktree",
+    }
+}
+
+/// Build an FTS5 MATCH query from a user search string.
+/// Each whitespace-separated term is quoted and joined with AND.
+#[allow(dead_code)]
+fn build_fts_match_query(query: &str) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" AND "))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests (fork)
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +1093,7 @@ mod tests {
             added_at: "1700000000".to_string(),
             chunk_index: None,
             importance: 0,
+            ..Drawer::default()
         }
     }
 
@@ -660,6 +1105,15 @@ mod tests {
             room: drawer.room.clone(),
             source_file: drawer.source_file.clone().unwrap_or_default(),
             source: SearchResultSource::Project,
+            memory_kind: MemoryKind::Evidence,
+            domain: MemoryDomain::Project,
+            field: String::new(),
+            statement: None,
+            tier: None,
+            status: None,
+            anchor_kind: AnchorKind::Global,
+            anchor_id: String::new(),
+            parent_anchor_id: None,
             similarity: 0.9,
             route: RouteDecision {
                 wing: None,
@@ -667,6 +1121,8 @@ mod tests {
                 confidence: 0.0,
                 reason: "test".to_string(),
             },
+            chunk_index: None,
+            neighbors: None,
             tunnel_hints: vec![],
         }
     }
@@ -769,7 +1225,7 @@ mod tests {
         // SQL LIMIT = fanout_cap + 1 = 3.  Alpha's query returns 3 beta rows
         // (beta-9, beta-8, beta-7 DESC order); alpha's Rust cap adds 2 (beta-9,
         // beta-8).  Gamma's query also returns the same 3 rows; beta-9 and
-        // beta-8 are already in `seen_ids`, so only beta-7 is fresh → 1 tunnel
+        // beta-8 are already in `seen_ids`, so only beta-7 is fresh -> 1 tunnel
         // row from gamma.  Total = 2 source + 2 (alpha) + 1 (gamma) = 5.
         assert_eq!(
             results.len(),
@@ -784,7 +1240,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("test.db")).expect("db");
         let source = make_drawer("alpha-1", "alpha", "decision");
-        // Insert 20 beta drawers — well above any reasonable fanout cap.
+        // Insert 20 beta drawers -- well above any reasonable fanout cap.
         seed_cross_project(&db, &source, 20);
 
         let limit: usize = 5;
@@ -854,7 +1310,7 @@ mod tests {
 
     #[test]
     fn test_tunnel_hints_sentinel_count_is_correct() {
-        // 49 siblings, cap=8 → show 8, sentinel = "… +41 more"
+        // 49 siblings, cap=8 -> show 8, sentinel = "... +41 more"
         let tmp = TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("test.db")).expect("db");
         seed_many_wings(&db, "alpha", 49, "room-shared");
@@ -885,7 +1341,7 @@ mod tests {
 
     #[test]
     fn test_tunnel_hints_cap_config_override() {
-        // display_cap=3 → 3 real hints + 1 sentinel
+        // display_cap=3 -> 3 real hints + 1 sentinel
         let tmp = TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("test.db")).expect("db");
         seed_many_wings(&db, "alpha", 10, "room-shared");

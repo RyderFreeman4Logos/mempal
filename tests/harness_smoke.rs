@@ -33,6 +33,7 @@ fn vec0_snapshot_round_trips() {
         added_at: "2026-04-21T00:00:00Z".to_string(),
         chunk_index: Some(0),
         importance: 3,
+        ..Drawer::default()
     };
     source.insert_drawer(&drawer).expect("insert drawer");
     source

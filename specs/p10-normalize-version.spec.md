@@ -16,8 +16,8 @@ mempalace 的方案：每个 drawer row 存一个 `normalize_version`，当 `CUR
 
 ## Decisions
 
-- **Schema v6**：`drawers` 表加列 `normalize_version INTEGER NOT NULL DEFAULT 1`；`CURRENT_SCHEMA_VERSION: 5 → 6`（假设 P10 tunnels 先落盘到 v5）
-- **Migration 语义**：v5 → v6 的 ALTER TABLE 把所有历史 drawer 设为 `normalize_version = 1`（baseline）
+- **Schema v7**：`drawers` 表加列 `normalize_version INTEGER NOT NULL DEFAULT 1`；`CURRENT_SCHEMA_VERSION: 6 → 7`（P10 explicit tunnels 使用 schema v6）
+- **Migration 语义**：v6 → v7 的 ALTER TABLE 把所有历史 drawer 设为 `normalize_version = 1`（baseline）
 - **新常量 `CURRENT_NORMALIZE_VERSION`** 在 `src/ingest/normalize.rs`，**初值 = 1**（本 spec 不 bump，只建立机制）
 - **Ingest pipeline 改造**：`ingest_file_with_options` 写入 drawer 时记入 `CURRENT_NORMALIZE_VERSION`
 - **`mempal reindex` 子命令扩展**（假设现已存在；若无则新增）：
@@ -35,10 +35,10 @@ mempalace 的方案：每个 drawer row 存一个 `normalize_version`，当 `CUR
 
 ### Allowed
 - `src/core/schema.sql`（ALTER / CREATE 新列）
-- `src/core/db.rs`（migration v5→v6；`stale_drawer_count()` 查询；`drawer_count_by_normalize_version()`；insert 路径带入新列）
+- `src/core/db.rs`（migration v6→v7；`stale_drawer_count()` 查询；`drawer_count_by_normalize_version()`；insert 路径带入新列）
 - `src/ingest/normalize.rs`（pub const `CURRENT_NORMALIZE_VERSION: u32 = 1`）
 - `src/ingest/mod.rs`（insert 时带 CURRENT_NORMALIZE_VERSION）
-- `src/cli.rs`（reindex --stale / --force / --dry-run 子命令 flag）
+- `src/main.rs`（reindex --stale / --force / --dry-run 子命令 flag）
 - `src/mcp/tools.rs`（`StatusResponse` 加两个字段）
 - `src/mcp/server.rs`（`mempal_status` handler 填新字段）
 - `tests/normalize_version.rs`（新增）
@@ -62,13 +62,13 @@ mempalace 的方案：每个 drawer row 存一个 `normalize_version`，当 `CUR
 
 ## Completion Criteria
 
-Scenario: v5 → v6 migration 把历史 drawer 设为 normalize_version=1
+Scenario: v6 → v7 migration 把历史 drawer 设为 normalize_version=1
   Test:
-    Filter: test_migration_v5_to_v6_stamps_normalize_version_1
+    Filter: test_migration_v6_to_v7_stamps_normalize_version_1
     Level: integration
-  Given schema v5 palace.db with 20 drawers
+  Given schema v6 palace.db with 20 drawers
   When 打开 db（触发 migration）
-  Then schema_version == 6
+  Then schema_version == 7
   And `SELECT COUNT(*) FROM drawers WHERE normalize_version = 1` == 20
   And drawer_count 不变
 
@@ -76,7 +76,7 @@ Scenario: 新 ingest drawer 带 CURRENT_NORMALIZE_VERSION
   Test:
     Filter: test_new_ingest_writes_current_normalize_version
     Level: unit
-  Given schema v6，CURRENT_NORMALIZE_VERSION == 1
+  Given schema v7，CURRENT_NORMALIZE_VERSION == 1
   When ingest 一个新文件产生 3 chunks
   Then `SELECT DISTINCT normalize_version FROM drawers WHERE source_file = ?` == [1]
 

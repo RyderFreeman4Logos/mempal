@@ -2,8 +2,28 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::detect::{Format, extract_content_text, extract_message_text};
+use super::noise::{strip_claude_jsonl_noise, strip_codex_rollout_noise};
+
+pub const CURRENT_NORMALIZE_VERSION: u32 = 2;
 
 pub type Result<T> = std::result::Result<T, NormalizeError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NormalizeOptions {
+    pub strip_noise: bool,
+}
+
+impl Default for NormalizeOptions {
+    fn default() -> Self {
+        Self { strip_noise: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizeOutput {
+    pub content: String,
+    pub noise_bytes_stripped: Option<u64>,
+}
 
 #[derive(Debug, Error)]
 pub enum NormalizeError {
@@ -14,17 +34,35 @@ pub enum NormalizeError {
 }
 
 pub fn normalize_content(content: &str, format: Format) -> Result<String> {
+    Ok(normalize_content_with_options(content, format, NormalizeOptions::default())?.content)
+}
+
+pub fn normalize_content_with_options(
+    content: &str,
+    format: Format,
+    options: NormalizeOptions,
+) -> Result<NormalizeOutput> {
     match format {
-        Format::PlainText => Ok(content.trim().to_string()),
-        Format::ClaudeJsonl => normalize_claude_jsonl(content),
-        Format::ChatGptJson => normalize_chatgpt_json(content),
-        Format::CodexJsonl => normalize_codex_jsonl(content),
-        Format::SlackJson => normalize_slack_json(content),
+        Format::PlainText => Ok(NormalizeOutput {
+            content: content.trim().to_string(),
+            noise_bytes_stripped: None,
+        }),
+        Format::ClaudeJsonl => normalize_claude_jsonl(content, options.strip_noise),
+        Format::ChatGptJson => Ok(NormalizeOutput {
+            content: normalize_chatgpt_json(content)?,
+            noise_bytes_stripped: None,
+        }),
+        Format::CodexJsonl => normalize_codex_jsonl(content, options.strip_noise),
+        Format::SlackJson => Ok(NormalizeOutput {
+            content: normalize_slack_json(content)?,
+            noise_bytes_stripped: None,
+        }),
     }
 }
 
-fn normalize_claude_jsonl(content: &str) -> Result<String> {
+fn normalize_claude_jsonl(content: &str, strip_noise: bool) -> Result<NormalizeOutput> {
     let mut lines = Vec::new();
+    let mut noise_bytes_stripped = 0_u64;
 
     for raw_line in content
         .lines()
@@ -37,6 +75,14 @@ fn normalize_claude_jsonl(content: &str) -> Result<String> {
             .and_then(Value::as_str)
             .unwrap_or("assistant");
         let message = extract_message_text(&value).unwrap_or_default();
+        let message = message.trim();
+        let message = if strip_noise {
+            let stripped = strip_claude_jsonl_noise(message);
+            noise_bytes_stripped += message.len().saturating_sub(stripped.len()) as u64;
+            stripped
+        } else {
+            message.to_string()
+        };
 
         if message.trim().is_empty() {
             continue;
@@ -49,7 +95,10 @@ fn normalize_claude_jsonl(content: &str) -> Result<String> {
         }
     }
 
-    Ok(lines.join("\n"))
+    Ok(NormalizeOutput {
+        content: lines.join("\n"),
+        noise_bytes_stripped: strip_noise.then_some(noise_bytes_stripped),
+    })
 }
 
 fn normalize_chatgpt_json(content: &str) -> Result<String> {
@@ -124,8 +173,9 @@ fn collect_messages_dfs(
     }
 }
 
-fn normalize_codex_jsonl(content: &str) -> Result<String> {
+fn normalize_codex_jsonl(content: &str, strip_noise: bool) -> Result<NormalizeOutput> {
     let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut noise_bytes_stripped = 0_u64;
 
     for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let value: Value = serde_json::from_str(line)?;
@@ -141,17 +191,27 @@ fn normalize_codex_jsonl(content: &str) -> Result<String> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
+        let message = if strip_noise {
+            let stripped = strip_codex_rollout_noise(message);
+            noise_bytes_stripped += message.len().saturating_sub(stripped.len()) as u64;
+            stripped
+        } else {
+            message.to_string()
+        };
         if message.is_empty() {
             continue;
         }
         match msg_type {
-            "user_message" => pairs.push(("user".to_string(), message.to_string())),
-            "agent_message" => pairs.push(("assistant".to_string(), message.to_string())),
+            "user_message" => pairs.push(("user".to_string(), message)),
+            "agent_message" => pairs.push(("assistant".to_string(), message)),
             _ => {}
         }
     }
 
-    Ok(render_transcript(pairs))
+    Ok(NormalizeOutput {
+        content: render_transcript(pairs),
+        noise_bytes_stripped: strip_noise.then_some(noise_bytes_stripped),
+    })
 }
 
 fn normalize_slack_json(content: &str) -> Result<String> {

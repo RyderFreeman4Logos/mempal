@@ -111,6 +111,7 @@ fn insert_drawer(db_path: &Path, seed: DrawerSeed) {
             added_at: seed.added_at.to_string(),
             chunk_index: Some(0),
             importance: seed.importance,
+            ..Drawer::default()
         },
         seed.project_id.as_deref(),
     )

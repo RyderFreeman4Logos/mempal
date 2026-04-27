@@ -16,10 +16,10 @@ estimate: 1.0d
 
 ## Decisions
 
-- **Schema v5**：新增 `tunnels` 表（**不**删被动发现路径），同时 `CURRENT_SCHEMA_VERSION: 4 → 5`：
+- **Schema v6**：新增 `tunnels` 表（**不**删被动发现路径）。P12 已占用 schema v5（typed drawers），因此本 spec 使用 `CURRENT_SCHEMA_VERSION: 5 → 6`：
   ```sql
   CREATE TABLE IF NOT EXISTS tunnels (
-    id TEXT PRIMARY KEY,              -- blake3_hex(left_wing+left_room+right_wing+right_room)[..16]
+    id TEXT PRIMARY KEY,              -- sha256_hex(sorted endpoints)[..16]，复用现有 sha2 依赖
     left_wing TEXT NOT NULL,
     left_room TEXT,                   -- NULL = whole wing
     right_wing TEXT NOT NULL,
@@ -32,7 +32,7 @@ estimate: 1.0d
   CREATE INDEX idx_tunnels_left ON tunnels(left_wing, left_room) WHERE deleted_at IS NULL;
   CREATE INDEX idx_tunnels_right ON tunnels(right_wing, right_room) WHERE deleted_at IS NULL;
   ```
-- **去重**：同一对 endpoint（无序）只能存一条。`id` 用排序后的 4-tuple hash 保证 `(A, B)` 和 `(B, A)` 映射到同一 id，INSERT OR IGNORE 去重
+- **去重**：同一对 endpoint（无序）只能存一条。`id` 用排序后的 4-tuple SHA-256 hash 保证 `(A, B)` 和 `(B, A)` 映射到同一 id，INSERT OR IGNORE 去重
 - **`mempal_tunnels` MCP 工具扩展**（不新增工具，扩展现有）：
   - 当前 action: `"discover"`（已存在的被动发现）
   - 新增 action: `"add"` / `"list"` / `"delete"` / `"follow"`
@@ -49,7 +49,7 @@ estimate: 1.0d
   - `mempal tunnels follow --from w:r [--hops 1|2]`
 - **CLI graceful**：delete 不存在的 id 报 `TunnelError::NotFound` + exit 1
 - **Protocol Rule 更新**：Rule 3 "QUERY WHEN UNCERTAIN" 尾部补一句"也可以用 `mempal_tunnels` with `action:list` 发现跨项目相关 room"
-- **Migration**：schema v4 → v5 在 db open 时自动执行 `CREATE TABLE IF NOT EXISTS tunnels ...`；旧 palace 打开后显式 tunnels 表空，行为完全向后兼容
+- **Migration**：schema v5 → v6 在 db open 时自动执行 `CREATE TABLE IF NOT EXISTS tunnels ...`；旧 palace 打开后显式 tunnels 表空，行为完全向后兼容
 - **不破坏被动发现**：`db.find_tunnels()`（现有）保留，被动发现逻辑不动
 
 ## Boundaries
@@ -149,13 +149,13 @@ Scenario: search tunnel_hints 融合被动 + 显式
   Then search result 的 `tunnel_hints` 字段长度 == 2
   And 两条都出现（顺序不约束，内容字段检查）
 
-Scenario: schema v4 palace 自动迁移到 v5 且现有数据不丢
+Scenario: schema v5 palace 自动迁移到 v6 且现有数据不丢
   Test:
-    Filter: test_schema_v4_to_v5_migration_preserves_data
+    Filter: test_schema_v5_to_v6_migration_preserves_data
     Level: integration
-  Given 预置 schema v4 的 palace.db with 10 drawers + 5 triples
+  Given 预置 schema v5 的 palace.db with 10 drawers + 5 triples
   When 重新打开 db（触发 migration）
-  Then schema_version == 5
+  Then schema_version == 6
   And drawer_count == 10
   And triple_count == 5
   And tunnels 表存在且空

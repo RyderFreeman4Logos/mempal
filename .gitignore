@@ -28,3 +28,6 @@ skills/rust-skills/
 /data/longmemeval/
 /benchmarks/*.jsonl
 skills/rust-skills/
+
+# Local git worktrees
+.worktrees/

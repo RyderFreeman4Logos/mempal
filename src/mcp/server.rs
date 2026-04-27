@@ -1,25 +1,45 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::context::assemble_context_with_vector;
 use crate::core::{
+    anchor::{self, DerivedAnchor},
     config::ConfigHandle,
     db::Database,
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
-    types::{Drawer, SourceType, Triple},
+    types::{
+        AnchorKind, BootstrapIdentityParts, Drawer, ExplicitTunnel, KnowledgeStatus, KnowledgeTier,
+        MemoryDomain, MemoryKind, Provenance, SourceType, TriggerHints, Triple,
+    },
     utils::{
-        build_triple_id, current_timestamp, iso_timestamp, normalize_rfc3339_timestamp,
-        source_file_or_synthetic,
+        build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp, iso_timestamp,
+        knowledge_source_file, normalize_rfc3339_timestamp, source_file_or_synthetic,
     },
 };
 use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
 use crate::embed::{EmbedderFactory, global_embed_status};
-use crate::ingest::gating::{
-    GatingDecision, GatingRuntime, IngestCandidate, evaluate_tier1, evaluate_tier2,
+use crate::field_taxonomy::field_taxonomy;
+use crate::ingest::{
+    IngestError,
+    gating::{GatingDecision, GatingRuntime, IngestCandidate, evaluate_tier1, evaluate_tier2},
+    normalize::CURRENT_NORMALIZE_VERSION,
+    novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty},
 };
-use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
-use crate::search::{resolve_route, search_bm25_only, search_with_vector};
+use crate::knowledge_anchor::{PublishAnchorRequest as CorePublishAnchorRequest, publish_anchor};
+use crate::knowledge_distill::{
+    DistillPlan, DistillRequest as CoreDistillRequest, commit_distill, prepare_distill,
+};
+use crate::knowledge_gate::{evaluate_gate_by_id, promotion_policy};
+use crate::knowledge_lifecycle::{
+    DemoteRequest as CoreDemoteRequest, PromoteRequest as CorePromoteRequest, demote_knowledge,
+    promote_knowledge,
+};
+use crate::search::{
+    SearchFilters, SearchOptions, resolve_route, search_bm25_only,
+    search_with_vector_and_scope_options,
+};
 use anyhow::Context;
 use rmcp::{
     ErrorData, Json, ServerHandler, ServiceExt,
@@ -28,17 +48,23 @@ use rmcp::{
     service::Peer,
     tool, tool_handler, tool_router,
 };
+use serde_json::Value;
 
 use super::timeline::{TimelineRequest, TimelineResponse};
 use super::tools::{
-    ChunkerStatsDto, CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse,
-    DuplicateWarning, EmbedStatusDto, FactCheckRequest, FactCheckResponse, IngestRequest,
-    IngestResponse, KgRequest, KgResponse, KgStatsDto, MAX_READ_DRAWERS_MAX_COUNT,
+    ChunkerStatsDto, ContextRequest, ContextResponse, CoworkPushRequest, CoworkPushResponse,
+    DeleteRequest, DeleteResponse, DuplicateWarning, EmbedStatusDto, FactCheckRequest,
+    FactCheckResponse, FieldTaxonomyEntryDto, FieldTaxonomyResponse, IngestRequest, IngestResponse,
+    KgRequest, KgResponse, KgStatsDto, KnowledgeDemoteRequest, KnowledgeDemoteResponse,
+    KnowledgeDistillRequest, KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse,
+    KnowledgePolicyResponse, KnowledgePromoteRequest, KnowledgePromoteResponse,
+    KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse, MAX_READ_DRAWERS_MAX_COUNT,
     MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse,
     QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
     RollbackRequest, RollbackResponse, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
     SearchResultDto, StatusResponse, SystemWarning, TaxonomyEntryDto, TaxonomyRequest,
-    TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
+    TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto, TunnelsRequest,
+    TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -145,6 +171,125 @@ impl MempalMcpServer {
         Ok(None)
     }
 
+    pub async fn ingest_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<IngestResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_ingest(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn search_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<SearchResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_search(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn context_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<ContextResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_context(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn knowledge_gate_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<KnowledgeGateResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_knowledge_gate(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn knowledge_distill_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<KnowledgeDistillResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_knowledge_distill(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn knowledge_promote_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<KnowledgePromoteResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_knowledge_promote(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn knowledge_demote_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<KnowledgeDemoteResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_knowledge_demote(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn knowledge_publish_anchor_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<KnowledgePublishAnchorResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_knowledge_publish_anchor(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn tunnels_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<TunnelsResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_tunnels(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn status_json_for_test(&self) -> std::result::Result<StatusResponse, ErrorData> {
+        self.mempal_status().await.map(|response| response.0)
+    }
+
+    pub async fn knowledge_policy_json_for_test(
+        &self,
+    ) -> std::result::Result<KnowledgePolicyResponse, ErrorData> {
+        self.mempal_knowledge_policy()
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn field_taxonomy_json_for_test(
+        &self,
+    ) -> std::result::Result<FieldTaxonomyResponse, ErrorData> {
+        self.mempal_field_taxonomy()
+            .await
+            .map(|response| response.0)
+    }
+
     /// Fallback helper for novelty merge paths that fall back to insert
     /// (e.g. merge cap reached, re-embed failed). Inserts all chunks as
     /// separate drawers, mirroring the Insert branch.
@@ -165,6 +310,8 @@ impl MempalMcpServer {
         audit_decision: Option<&str>,
         inserted_drawer_ids: &mut Vec<String>,
     ) -> std::result::Result<(), ErrorData> {
+        let source_type = SourceType::Manual;
+        let metadata = validate_ingest_request(request, &source_type)?;
         db.record_novelty_audit(
             primary_drawer_id,
             NoveltyAction::Insert,
@@ -201,22 +348,16 @@ impl MempalMcpServer {
                 inserted_drawer_ids.push(chunk_did.clone());
                 continue;
             }
-            let source_file = source_file_or_synthetic(chunk_did, request.source.as_deref());
-            db.insert_drawer_with_project(
-                &Drawer {
-                    id: chunk_did.clone(),
-                    content: chunk.clone(),
-                    wing: request.wing.clone(),
-                    room: request.room.clone(),
-                    source_file: Some(source_file),
-                    source_type: SourceType::Manual,
-                    added_at: iso_timestamp(),
-                    chunk_index: Some(*chunk_idx as i64),
-                    importance: request.importance.unwrap_or(0),
-                },
-                project_id,
-            )
-            .map_err(db_error)?;
+            let drawer = drawer_from_ingest_metadata(
+                request,
+                &metadata,
+                chunk_did,
+                chunk,
+                *chunk_idx,
+                &source_type,
+            );
+            db.insert_drawer_with_project(&drawer, project_id)
+                .map_err(db_error)?;
             db.insert_vector_with_project(chunk_did, vector, project_id)
                 .map_err(db_error)?;
             inserted_drawer_ids.push(chunk_did.clone());
@@ -224,6 +365,458 @@ impl MempalMcpServer {
         Ok(())
     }
 }
+
+// =========================================================================
+// Knowledge-system ingest validation (upstream)
+// These helpers are part of the upstream knowledge lifecycle API surface.
+// The fork's ingest handler uses a different code path (gating + novelty),
+// but these are retained for the knowledge distill/gate/promote tools.
+// =========================================================================
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct ValidatedIngestMetadata {
+    memory_kind: MemoryKind,
+    domain: MemoryDomain,
+    field: String,
+    anchor_kind: AnchorKind,
+    anchor_id: String,
+    parent_anchor_id: Option<String>,
+    provenance: Option<Provenance>,
+    statement: Option<String>,
+    tier: Option<KnowledgeTier>,
+    status: Option<KnowledgeStatus>,
+    supporting_refs: Vec<String>,
+    counterexample_refs: Vec<String>,
+    teaching_refs: Vec<String>,
+    verification_refs: Vec<String>,
+    scope_constraints: Option<String>,
+    trigger_hints: Option<TriggerHints>,
+}
+
+#[allow(dead_code)]
+impl ValidatedIngestMetadata {
+    fn identity_parts(&self) -> BootstrapIdentityParts<'_> {
+        BootstrapIdentityParts {
+            memory_kind: &self.memory_kind,
+            domain: &self.domain,
+            field: &self.field,
+            anchor_kind: &self.anchor_kind,
+            anchor_id: &self.anchor_id,
+            parent_anchor_id: self.parent_anchor_id.as_deref(),
+            provenance: self.provenance.as_ref(),
+            statement: self.statement.as_deref(),
+            tier: self.tier.as_ref(),
+            status: self.status.as_ref(),
+            supporting_refs: &self.supporting_refs,
+            counterexample_refs: &self.counterexample_refs,
+            teaching_refs: &self.teaching_refs,
+            verification_refs: &self.verification_refs,
+            scope_constraints: self.scope_constraints.as_deref(),
+            trigger_hints: self.trigger_hints.as_ref(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn validate_ingest_request(
+    request: &IngestRequest,
+    source_type: &SourceType,
+) -> std::result::Result<ValidatedIngestMetadata, ErrorData> {
+    let memory_kind =
+        parse_memory_kind(request.memory_kind.as_deref())?.unwrap_or(MemoryKind::Evidence);
+    let domain = parse_domain(request.domain.as_deref())?.unwrap_or(MemoryDomain::Project);
+    let field = trim_to_option(request.field.as_deref())
+        .unwrap_or(anchor::DEFAULT_FIELD)
+        .to_string();
+    let statement = trim_to_owned(request.statement.as_deref());
+    let tier = parse_tier(request.tier.as_deref())?;
+    let status = parse_status(request.status.as_deref())?;
+    let provenance = parse_provenance(request.provenance.as_deref())?;
+    let supporting_refs = normalize_refs(request.supporting_refs.as_deref());
+    let counterexample_refs = normalize_refs(request.counterexample_refs.as_deref());
+    let teaching_refs = normalize_refs(request.teaching_refs.as_deref());
+    let verification_refs = normalize_refs(request.verification_refs.as_deref());
+    let scope_constraints = trim_to_owned(request.scope_constraints.as_deref());
+    let trigger_hints = request.trigger_hints.as_ref().map(trigger_hints_from_dto);
+
+    let derived_anchor = validate_anchor_metadata(request, &domain, source_type)?;
+
+    match memory_kind {
+        MemoryKind::Evidence => {
+            if statement.is_some()
+                || tier.is_some()
+                || status.is_some()
+                || !supporting_refs.is_empty()
+                || !counterexample_refs.is_empty()
+                || !teaching_refs.is_empty()
+                || !verification_refs.is_empty()
+                || scope_constraints.is_some()
+                || trigger_hints.is_some()
+            {
+                return Err(ErrorData::invalid_params(
+                    "evidence drawer does not allow knowledge-only fields",
+                    None,
+                ));
+            }
+
+            Ok(ValidatedIngestMetadata {
+                memory_kind,
+                domain,
+                field,
+                anchor_kind: derived_anchor.anchor_kind,
+                anchor_id: derived_anchor.anchor_id,
+                parent_anchor_id: derived_anchor.parent_anchor_id,
+                provenance: Some(
+                    provenance.unwrap_or_else(|| anchor::bootstrap_provenance(source_type)),
+                ),
+                statement: None,
+                tier: None,
+                status: None,
+                supporting_refs: Vec::new(),
+                counterexample_refs: Vec::new(),
+                teaching_refs: Vec::new(),
+                verification_refs: Vec::new(),
+                scope_constraints: None,
+                trigger_hints: None,
+            })
+        }
+        MemoryKind::Knowledge => {
+            if provenance.is_some() {
+                return Err(ErrorData::invalid_params(
+                    "knowledge drawer does not allow provenance",
+                    None,
+                ));
+            }
+
+            let statement = statement.ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "knowledge drawer requires statement and supporting_refs",
+                    None,
+                )
+            })?;
+            let tier = tier.ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "knowledge drawer requires tier, status, statement, and supporting_refs",
+                    None,
+                )
+            })?;
+            let status = status.ok_or_else(|| {
+                ErrorData::invalid_params(
+                    "knowledge drawer requires tier, status, statement, and supporting_refs",
+                    None,
+                )
+            })?;
+
+            if supporting_refs.is_empty() {
+                return Err(ErrorData::invalid_params(
+                    "knowledge drawer requires statement and supporting_refs",
+                    None,
+                ));
+            }
+            validate_drawer_refs("supporting_refs", &supporting_refs)?;
+            validate_drawer_refs("counterexample_refs", &counterexample_refs)?;
+            validate_drawer_refs("teaching_refs", &teaching_refs)?;
+            validate_drawer_refs("verification_refs", &verification_refs)?;
+
+            validate_tier_status(&tier, &status)?;
+
+            Ok(ValidatedIngestMetadata {
+                memory_kind,
+                domain,
+                field,
+                anchor_kind: derived_anchor.anchor_kind,
+                anchor_id: derived_anchor.anchor_id,
+                parent_anchor_id: derived_anchor.parent_anchor_id,
+                provenance: None,
+                statement: Some(statement),
+                tier: Some(tier),
+                status: Some(status),
+                supporting_refs,
+                counterexample_refs,
+                teaching_refs,
+                verification_refs,
+                scope_constraints,
+                trigger_hints,
+            })
+        }
+    }
+}
+
+fn drawer_from_ingest_metadata(
+    request: &IngestRequest,
+    metadata: &ValidatedIngestMetadata,
+    drawer_id: &str,
+    content: &str,
+    chunk_idx: usize,
+    source_type: &SourceType,
+) -> Drawer {
+    let source_file = match metadata.memory_kind {
+        MemoryKind::Knowledge => Some(knowledge_source_file(
+            &metadata.domain,
+            &metadata.field,
+            metadata.tier.as_ref().expect("validated knowledge tier"),
+            metadata
+                .statement
+                .as_deref()
+                .expect("validated knowledge statement"),
+        )),
+        MemoryKind::Evidence => Some(source_file_or_synthetic(
+            drawer_id,
+            request.source.as_deref(),
+        )),
+    };
+
+    Drawer {
+        id: drawer_id.to_string(),
+        content: content.to_string(),
+        wing: request.wing.clone(),
+        room: request.room.clone(),
+        source_file,
+        source_type: source_type.clone(),
+        added_at: iso_timestamp(),
+        chunk_index: Some(chunk_idx as i64),
+        normalize_version: CURRENT_NORMALIZE_VERSION,
+        importance: request.importance.unwrap_or(0),
+        memory_kind: metadata.memory_kind.clone(),
+        domain: metadata.domain.clone(),
+        field: metadata.field.clone(),
+        anchor_kind: metadata.anchor_kind.clone(),
+        anchor_id: metadata.anchor_id.clone(),
+        parent_anchor_id: metadata.parent_anchor_id.clone(),
+        provenance: metadata.provenance.clone(),
+        statement: metadata.statement.clone(),
+        tier: metadata.tier.clone(),
+        status: metadata.status.clone(),
+        supporting_refs: metadata.supporting_refs.clone(),
+        counterexample_refs: metadata.counterexample_refs.clone(),
+        teaching_refs: metadata.teaching_refs.clone(),
+        verification_refs: metadata.verification_refs.clone(),
+        scope_constraints: metadata.scope_constraints.clone(),
+        trigger_hints: metadata.trigger_hints.clone(),
+    }
+}
+
+#[allow(dead_code)]
+fn validate_anchor_metadata(
+    request: &IngestRequest,
+    domain: &MemoryDomain,
+    source_type: &SourceType,
+) -> std::result::Result<DerivedAnchor, ErrorData> {
+    let explicit_kind = trim_to_option(request.anchor_kind.as_deref());
+    let explicit_id = trim_to_option(request.anchor_id.as_deref());
+
+    let anchor = match (explicit_kind, explicit_id) {
+        (Some(kind), Some(anchor_id)) => {
+            let anchor_kind = parse_anchor_kind(Some(kind))?.expect("explicit kind");
+            anchor::validate_explicit_anchor(&anchor_kind, anchor_id).map_err(anchor_error)?;
+            DerivedAnchor {
+                anchor_kind,
+                anchor_id: anchor_id.to_string(),
+                parent_anchor_id: trim_to_owned(request.parent_anchor_id.as_deref()),
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(ErrorData::invalid_params(
+                "anchor_kind and anchor_id must be provided together",
+                None,
+            ));
+        }
+        (None, None) => {
+            if let Some(cwd) = trim_to_option(request.cwd.as_deref()) {
+                anchor::derive_anchor_from_cwd(Some(Path::new(cwd))).map_err(anchor_error)?
+            } else {
+                let defaults = anchor::bootstrap_defaults(source_type);
+                DerivedAnchor {
+                    anchor_kind: defaults.anchor_kind,
+                    anchor_id: defaults.anchor_id,
+                    parent_anchor_id: defaults.parent_anchor_id,
+                }
+            }
+        }
+    };
+
+    anchor::validate_anchor_domain(domain, &anchor.anchor_kind)
+        .map_err(|message| ErrorData::invalid_params(message.to_string(), None))?;
+    Ok(anchor)
+}
+
+#[allow(dead_code)]
+fn validate_tier_status(
+    tier: &KnowledgeTier,
+    status: &KnowledgeStatus,
+) -> std::result::Result<(), ErrorData> {
+    let allowed = match tier {
+        KnowledgeTier::DaoTian => &[KnowledgeStatus::Canonical, KnowledgeStatus::Demoted][..],
+        KnowledgeTier::DaoRen => &[
+            KnowledgeStatus::Candidate,
+            KnowledgeStatus::Promoted,
+            KnowledgeStatus::Demoted,
+            KnowledgeStatus::Retired,
+        ][..],
+        KnowledgeTier::Shu => &[
+            KnowledgeStatus::Promoted,
+            KnowledgeStatus::Demoted,
+            KnowledgeStatus::Retired,
+        ][..],
+        KnowledgeTier::Qi => &[
+            KnowledgeStatus::Candidate,
+            KnowledgeStatus::Promoted,
+            KnowledgeStatus::Demoted,
+            KnowledgeStatus::Retired,
+        ][..],
+    };
+
+    if allowed.contains(status) {
+        return Ok(());
+    }
+
+    let message = match tier {
+        KnowledgeTier::DaoTian => "dao_tian only allows canonical or demoted",
+        KnowledgeTier::DaoRen => "dao_ren only allows candidate, promoted, demoted, or retired",
+        KnowledgeTier::Shu => "shu only allows promoted, demoted, or retired",
+        KnowledgeTier::Qi => "qi only allows candidate, promoted, demoted, or retired",
+    };
+    Err(ErrorData::invalid_params(message, None))
+}
+
+#[allow(dead_code)]
+fn parse_memory_kind(value: Option<&str>) -> std::result::Result<Option<MemoryKind>, ErrorData> {
+    parse_enum(value, "memory_kind", |normalized| match normalized {
+        "evidence" => Some(MemoryKind::Evidence),
+        "knowledge" => Some(MemoryKind::Knowledge),
+        _ => None,
+    })
+}
+
+fn parse_domain(value: Option<&str>) -> std::result::Result<Option<MemoryDomain>, ErrorData> {
+    parse_enum(value, "domain", |normalized| match normalized {
+        "project" => Some(MemoryDomain::Project),
+        "agent" => Some(MemoryDomain::Agent),
+        "skill" => Some(MemoryDomain::Skill),
+        "global" => Some(MemoryDomain::Global),
+        _ => None,
+    })
+}
+
+#[allow(dead_code)]
+fn parse_anchor_kind(value: Option<&str>) -> std::result::Result<Option<AnchorKind>, ErrorData> {
+    parse_enum(value, "anchor_kind", |normalized| match normalized {
+        "global" => Some(AnchorKind::Global),
+        "repo" => Some(AnchorKind::Repo),
+        "worktree" => Some(AnchorKind::Worktree),
+        _ => None,
+    })
+}
+
+#[allow(dead_code)]
+fn parse_provenance(value: Option<&str>) -> std::result::Result<Option<Provenance>, ErrorData> {
+    parse_enum(value, "provenance", |normalized| match normalized {
+        "runtime" => Some(Provenance::Runtime),
+        "research" => Some(Provenance::Research),
+        "human" => Some(Provenance::Human),
+        _ => None,
+    })
+}
+
+#[allow(dead_code)]
+fn parse_tier(value: Option<&str>) -> std::result::Result<Option<KnowledgeTier>, ErrorData> {
+    parse_enum(value, "tier", |normalized| match normalized {
+        "qi" => Some(KnowledgeTier::Qi),
+        "shu" => Some(KnowledgeTier::Shu),
+        "dao_ren" => Some(KnowledgeTier::DaoRen),
+        "dao_tian" => Some(KnowledgeTier::DaoTian),
+        _ => None,
+    })
+}
+
+#[allow(dead_code)]
+fn parse_status(value: Option<&str>) -> std::result::Result<Option<KnowledgeStatus>, ErrorData> {
+    parse_enum(value, "status", |normalized| match normalized {
+        "candidate" => Some(KnowledgeStatus::Candidate),
+        "promoted" => Some(KnowledgeStatus::Promoted),
+        "canonical" => Some(KnowledgeStatus::Canonical),
+        "demoted" => Some(KnowledgeStatus::Demoted),
+        "retired" => Some(KnowledgeStatus::Retired),
+        _ => None,
+    })
+}
+
+fn parse_enum<T, F>(
+    value: Option<&str>,
+    field: &'static str,
+    parser: F,
+) -> std::result::Result<Option<T>, ErrorData>
+where
+    F: Fn(&str) -> Option<T>,
+{
+    let Some(value) = trim_to_option(value) else {
+        return Ok(None);
+    };
+
+    parser(value)
+        .map(Some)
+        .ok_or_else(|| ErrorData::invalid_params(format!("invalid {field}: {value}"), None))
+}
+
+#[allow(dead_code)]
+fn normalize_refs(values: Option<&[String]>) -> Vec<String> {
+    values
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|value| trim_to_owned(Some(value.as_str())))
+        .collect()
+}
+
+#[allow(dead_code)]
+fn validate_drawer_refs(field: &str, values: &[String]) -> std::result::Result<(), ErrorData> {
+    if values.iter().all(|value| looks_like_drawer_id(value)) {
+        Ok(())
+    } else {
+        Err(ErrorData::invalid_params(
+            format!("{field} must contain drawer ids"),
+            None,
+        ))
+    }
+}
+
+#[allow(dead_code)]
+fn looks_like_drawer_id(value: &str) -> bool {
+    value.starts_with("drawer_")
+        && value.len() > "drawer_".len()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn trigger_hints_from_dto(dto: &TriggerHintsDto) -> TriggerHints {
+    TriggerHints {
+        intent_tags: normalize_refs(Some(&dto.intent_tags)),
+        workflow_bias: normalize_refs(Some(&dto.workflow_bias)),
+        tool_needs: normalize_refs(Some(&dto.tool_needs)),
+    }
+}
+
+fn trim_to_option(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn trim_to_owned(value: Option<&str>) -> Option<String> {
+    trim_to_option(value).map(ToOwned::to_owned)
+}
+
+#[allow(dead_code)]
+fn anchor_error(error: anchor::AnchorError) -> ErrorData {
+    ErrorData::invalid_params(error.to_string(), None)
+}
+
+// The tool_router impl block and all tool handlers are defined below.
+// Tools from fork: status, search, timeline, read_drawer, read_drawers,
+//   ingest (with gating/novelty/chunking/privacy), delete, rollback,
+//   taxonomy, kg, tunnels (full CRUD), peek_partner, cowork_push, fact_check
+// Tools from upstream: context, knowledge_distill, knowledge_gate,
+//   knowledge_policy, knowledge_promote, knowledge_demote,
+//   knowledge_publish_anchor, field_taxonomy
 
 #[tool_router(router = tool_router)]
 impl MempalMcpServer {
@@ -245,11 +838,15 @@ impl MempalMcpServer {
             })?;
         let embed_snapshot = global_embed_status().snapshot();
         let schema_version = db.schema_version().map_err(db_error)?;
+        let stale_drawer_count = db
+            .stale_drawer_count(CURRENT_NORMALIZE_VERSION)
+            .map_err(db_error)? as u64;
         let drawer_count = db.drawer_count().map_err(db_error)?;
         let null_project_backfill_pending =
             db.null_project_backfill_pending_count().map_err(db_error)?;
         let taxonomy_count = db.taxonomy_count().map_err(db_error)?;
         let db_size_bytes = db.database_size_bytes().map_err(db_error)?;
+        let diary_rollup_days = db.diary_rollup_days().map_err(db_error)?;
         let scopes = db
             .scope_counts()
             .map_err(db_error)?
@@ -273,9 +870,12 @@ impl MempalMcpServer {
 
         Ok(Json(StatusResponse {
             schema_version,
+            normalize_version_current: CURRENT_NORMALIZE_VERSION,
+            stale_drawer_count,
             drawer_count,
             taxonomy_count,
             db_size_bytes,
+            diary_rollup_days,
             config_version: cfg_meta.version,
             config_loaded_at_unix_ms: cfg_meta.loaded_at_unix_ms,
             scopes,
@@ -338,6 +938,17 @@ impl MempalMcpServer {
         )
         .map_err(|error| ErrorData::internal_error(format!("routing failed: {error}"), None))?;
         let top_k = request.top_k.unwrap_or(10);
+        let search_options = SearchOptions {
+            filters: SearchFilters {
+                memory_kind: request.memory_kind.clone(),
+                domain: request.domain.clone(),
+                field: request.field.clone(),
+                tier: request.tier.clone(),
+                status: request.status.clone(),
+                anchor_kind: request.anchor_kind.clone(),
+            },
+            with_neighbors: request.with_neighbors.unwrap_or(false),
+        };
         let mut extra_warnings = Vec::new();
         let embedder = self.embedder_factory.build().await.map_err(|error| {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
@@ -352,12 +963,13 @@ impl MempalMcpServer {
                 let query_vector = vectors.into_iter().next().ok_or_else(|| {
                     ErrorData::internal_error("embedder returned no query vector", None)
                 })?;
-                search_with_vector(
+                search_with_vector_and_scope_options(
                     &db,
                     &request.query,
                     &query_vector,
                     route.clone(),
                     &scope,
+                    search_options.clone(),
                     top_k,
                 )
                 .map_err(|error| {
@@ -570,6 +1182,230 @@ impl MempalMcpServer {
     }
 
     #[tool(
+        name = "mempal_context",
+        description = "Assemble a mind-model runtime context pack from typed memory. Use this when you need ordered guidance rather than raw search results: dao_tian -> dao_ren -> shu -> qi, with evidence opt-in. Returns source-backed items with drawer_id/source_file citations and trigger_hints metadata, but never executes skills."
+    )]
+    async fn mempal_context(
+        &self,
+        Parameters(request): Parameters<ContextRequest>,
+    ) -> std::result::Result<Json<ContextResponse>, ErrorData> {
+        let max_items = request.max_items.unwrap_or(12);
+        if max_items == 0 {
+            return Err(ErrorData::invalid_params(
+                "max_items must be greater than 0",
+                None,
+            ));
+        }
+        let dao_tian_limit = request.dao_tian_limit.unwrap_or(1);
+
+        let domain = parse_domain(request.domain.as_deref())?.unwrap_or(MemoryDomain::Project);
+        let cwd = match request.cwd.as_deref() {
+            Some(value) if !value.trim().is_empty() => PathBuf::from(value),
+            Some(_) => {
+                return Err(ErrorData::invalid_params(
+                    "cwd must not be empty when provided",
+                    None,
+                ));
+            }
+            None => std::env::current_dir().map_err(|error| {
+                ErrorData::internal_error(
+                    format!("failed to read current directory: {error}"),
+                    None,
+                )
+            })?,
+        };
+
+        let embedder = self.embedder_factory.build().await.map_err(|error| {
+            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
+        })?;
+        let query_vector = embedder
+            .embed(&[request.query.as_str()])
+            .await
+            .map_err(|error| ErrorData::internal_error(format!("embedding failed: {error}"), None))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
+
+        let db = self.open_db()?;
+        let pack = assemble_context_with_vector(
+            &db,
+            crate::context::ContextRequest {
+                query: request.query,
+                domain,
+                field: request
+                    .field
+                    .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
+                cwd,
+                include_evidence: request.include_evidence.unwrap_or(false),
+                max_items,
+                dao_tian_limit,
+            },
+            &query_vector,
+        )
+        .map_err(context_error)?;
+
+        Ok(Json(ContextResponse::from(pack)))
+    }
+
+    #[tool(
+        name = "mempal_knowledge_distill",
+        description = "Create candidate knowledge from existing evidence drawer refs. Deterministic Stage-1 distill: writes memory_kind=knowledge/status=candidate for tier dao_ren or qi, validates refs are evidence drawers, and never calls an LLM, promotes, or creates Phase-2 knowledge cards."
+    )]
+    async fn mempal_knowledge_distill(
+        &self,
+        Parameters(request): Parameters<KnowledgeDistillRequest>,
+    ) -> std::result::Result<Json<KnowledgeDistillResponse>, ErrorData> {
+        let dry_run = request.dry_run.unwrap_or(false);
+        let core_request = CoreDistillRequest {
+            statement: request.statement,
+            content: request.content,
+            tier: request.tier,
+            supporting_refs: request.supporting_refs,
+            wing: request.wing.unwrap_or_else(|| "mempal".to_string()),
+            room: request.room.unwrap_or_else(|| "knowledge".to_string()),
+            domain: request.domain.unwrap_or_else(|| "project".to_string()),
+            field: request
+                .field
+                .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
+            cwd: request.cwd.map(PathBuf::from),
+            scope_constraints: request.scope_constraints,
+            counterexample_refs: request.counterexample_refs.unwrap_or_default(),
+            teaching_refs: request.teaching_refs.unwrap_or_default(),
+            trigger_hints: request.trigger_hints.as_ref().map(trigger_hints_from_dto),
+            importance: request.importance.unwrap_or(3),
+            dry_run,
+        };
+        let plan = {
+            let db = self.open_db()?;
+            prepare_distill(&db, core_request).map_err(knowledge_distill_error)?
+        };
+        let prepared = match plan {
+            DistillPlan::Done(outcome) => return Ok(Json(KnowledgeDistillResponse::from(outcome))),
+            DistillPlan::Create(prepared) => prepared,
+        };
+
+        let embedder = self.embedder_factory.build().await.map_err(|error| {
+            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
+        })?;
+        let vector = embedder
+            .embed(&[prepared.content.as_str()])
+            .await
+            .map_err(|error| ErrorData::internal_error(format!("embedding failed: {error}"), None))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?;
+        let db = self.open_db()?;
+        let outcome = commit_distill(&db, *prepared, &vector).map_err(knowledge_distill_error)?;
+        Ok(Json(KnowledgeDistillResponse::from(outcome)))
+    }
+
+    #[tool(
+        name = "mempal_knowledge_gate",
+        description = "Read-only promotion readiness check for a knowledge drawer. Evaluates whether dao_tian/dao_ren/shu/qi knowledge has enough supporting, verification, teaching, reviewer, and counterexample evidence for the target status. Does not mutate drawers, vectors, schema, audit logs, or lifecycle state."
+    )]
+    async fn mempal_knowledge_gate(
+        &self,
+        Parameters(request): Parameters<KnowledgeGateRequest>,
+    ) -> std::result::Result<Json<KnowledgeGateResponse>, ErrorData> {
+        let db = self.open_db()?;
+        let report = evaluate_gate_by_id(
+            &db,
+            &request.drawer_id,
+            request.target_status.as_deref(),
+            request.reviewer.as_deref(),
+            request.allow_counterexamples.unwrap_or(false),
+        )
+        .map_err(knowledge_gate_error)?;
+
+        Ok(Json(KnowledgeGateResponse::from(report)))
+    }
+
+    #[tool(
+        name = "mempal_knowledge_policy",
+        description = "Read-only Stage-1 knowledge promotion policy table. Lists deterministic gate thresholds for dao_tian -> canonical, dao_ren -> promoted, shu -> promoted, and qi -> promoted without requiring a drawer and without mutating storage."
+    )]
+    async fn mempal_knowledge_policy(
+        &self,
+    ) -> std::result::Result<Json<KnowledgePolicyResponse>, ErrorData> {
+        Ok(Json(KnowledgePolicyResponse::from(promotion_policy())))
+    }
+
+    #[tool(
+        name = "mempal_knowledge_promote",
+        description = "Promote a knowledge drawer after a deterministic gate pass. Appends verification evidence refs, evaluates promotion readiness, then updates lifecycle status and audit log only if the gate allows it."
+    )]
+    async fn mempal_knowledge_promote(
+        &self,
+        Parameters(request): Parameters<KnowledgePromoteRequest>,
+    ) -> std::result::Result<Json<KnowledgePromoteResponse>, ErrorData> {
+        let db = self.open_db()?;
+        let outcome = promote_knowledge(
+            &db,
+            CorePromoteRequest {
+                drawer_id: request.drawer_id,
+                status: request.status,
+                verification_refs: request.verification_refs,
+                reason: request.reason,
+                reviewer: request.reviewer,
+                allow_counterexamples: request.allow_counterexamples.unwrap_or(false),
+                enforce_gate: true,
+            },
+        )
+        .map_err(knowledge_lifecycle_error)?;
+
+        Ok(Json(KnowledgePromoteResponse::from(outcome)))
+    }
+
+    #[tool(
+        name = "mempal_knowledge_demote",
+        description = "Demote or retire a knowledge drawer with counterexample evidence. Appends evidence refs to counterexample_refs, updates lifecycle status, and writes an audit entry without touching vectors or schema."
+    )]
+    async fn mempal_knowledge_demote(
+        &self,
+        Parameters(request): Parameters<KnowledgeDemoteRequest>,
+    ) -> std::result::Result<Json<KnowledgeDemoteResponse>, ErrorData> {
+        let db = self.open_db()?;
+        let outcome = demote_knowledge(
+            &db,
+            CoreDemoteRequest {
+                drawer_id: request.drawer_id,
+                status: request.status,
+                evidence_refs: request.evidence_refs,
+                reason: request.reason,
+                reason_type: request.reason_type,
+            },
+        )
+        .map_err(knowledge_lifecycle_error)?;
+
+        Ok(Json(KnowledgeDemoteResponse::from(outcome)))
+    }
+
+    #[tool(
+        name = "mempal_knowledge_publish_anchor",
+        description = "Publish active knowledge outward across anchor scope. Metadata-only operation for worktree -> repo or repo -> global publication; updates anchor fields and audit log without touching content, vectors, schema, or tier/status lifecycle."
+    )]
+    async fn mempal_knowledge_publish_anchor(
+        &self,
+        Parameters(request): Parameters<KnowledgePublishAnchorRequest>,
+    ) -> std::result::Result<Json<KnowledgePublishAnchorResponse>, ErrorData> {
+        let db = self.open_db()?;
+        let outcome = publish_anchor(
+            &db,
+            CorePublishAnchorRequest {
+                drawer_id: request.drawer_id,
+                to: request.to,
+                target_anchor_id: request.target_anchor_id,
+                cwd: request.cwd.map(PathBuf::from),
+                reason: request.reason,
+                reviewer: request.reviewer,
+            },
+        )
+        .map_err(knowledge_anchor_error)?;
+
+        Ok(Json(KnowledgePublishAnchorResponse::from(outcome)))
+    }
+
+    #[tool(
         name = "mempal_ingest",
         description = "Persist a decision, bug fix, or design insight to project memory. Call this when a decision is reached in conversation — include the rationale, not just the outcome. Wing is required; let mempal auto-route the room. Set dry_run=true to preview the drawer_id without writing."
     )]
@@ -586,29 +1422,28 @@ impl MempalMcpServer {
         let room = request.room.as_deref();
         let db = self.open_db()?;
         let dry_run = request.dry_run.unwrap_or(false);
+        let source_type = SourceType::Manual;
+        let metadata = validate_ingest_request(&request, &source_type)?;
 
-        // Check degraded embed status BEFORE building the embedder so that
-        // non-dry-run writes fail fast with "writes are paused" (issue #57
-        // regression guard).
         if !dry_run && global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
         }
 
-        // --- Chunk the scrubbed content (issue #57) ---
-        // Build embedder early so the chunker can respect max_input_tokens.
         let embedder = self.embedder_factory.build().await.map_err(|error| {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
         })?;
         let chunks =
             crate::ingest::prepare_chunks(&scrubbed_content, &config.chunker, embedder.as_ref());
 
-        // Resolve drawer_id per chunk. The first chunk's drawer_id is the
-        // primary identifier for backward compatibility.
         let mut chunk_drawer_ids: Vec<(usize, String, bool)> = Vec::with_capacity(chunks.len());
         for (idx, chunk) in chunks.iter().enumerate() {
-            let (did, exists) = db
-                .resolve_ingest_drawer_id(&request.wing, room, chunk, project_id.as_deref())
-                .map_err(db_error)?;
+            let did = build_bootstrap_drawer_id_from_parts(
+                &request.wing,
+                room,
+                chunk,
+                metadata.identity_parts(),
+            );
+            let exists = db.drawer_exists(&did).map_err(db_error)?;
             chunk_drawer_ids.push((idx, did, exists));
         }
         let drawer_id = chunk_drawer_ids
@@ -635,7 +1470,6 @@ impl MempalMcpServer {
             }));
         }
 
-        // Tier-1 gating runs on the full content (not per-chunk).
         let candidate = IngestCandidate {
             content: scrubbed_content.clone(),
             tool_name: None,
@@ -663,7 +1497,6 @@ impl MempalMcpServer {
 
         let mut db = db;
 
-        // P9-B: acquire lock on the first chunk's drawer_id before embedding.
         let mempal_home = db
             .path()
             .parent()
@@ -677,7 +1510,6 @@ impl MempalMcpServer {
         .map_err(|e| ErrorData::internal_error(format!("ingest lock: {e}"), None))?;
         let lock_wait_ms = Some(lock_guard.wait_duration().as_millis() as u64);
 
-        // Tier-2 gating: uses the first chunk's embedding as representative.
         let first_chunk = chunks.first().map(|c| c.as_str()).unwrap_or("");
         let mut first_vector = None;
         let mut gating_audit_recorded = false;
@@ -735,14 +1567,10 @@ impl MempalMcpServer {
                 .map_err(db_error)?;
         }
 
-        // Embed ALL chunks in one batch call. If tier2 already produced a
-        // vector for the first chunk, splice it in.
         let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();
         let vectors = if first_vector.is_some() && chunks.len() == 1 {
-            // Single-chunk optimization: reuse tier2 vector.
             vec![first_vector.take().expect("checked Some")]
         } else if let Some(fv) = first_vector.take() {
-            // Multi-chunk with tier2 vector for first chunk: embed the rest.
             if chunks.len() > 1 {
                 let rest_refs: Vec<&str> = chunk_refs[1..].to_vec();
                 let mut rest_vecs = embedder.embed(&rest_refs).await.map_err(|error| {
@@ -773,7 +1601,6 @@ impl MempalMcpServer {
             ensure_vector_dim_matches(&db, v.len())?;
         }
 
-        // Novelty evaluation uses the first chunk's vector as representative.
         let first_vector_ref = &vectors[0];
         let duplicate_warning = check_semantic_duplicate(&db, first_vector_ref, first_chunk);
         let novelty_candidate = NoveltyCandidate {
@@ -790,7 +1617,6 @@ impl MempalMcpServer {
         let mut response_drawer_id = drawer_id.clone();
         let (novelty_action, near_drawer_id);
 
-        // Collect all successfully inserted drawer IDs.
         let mut inserted_drawer_ids: Vec<String> = Vec::new();
 
         match novelty.action {
@@ -809,7 +1635,6 @@ impl MempalMcpServer {
                 novelty_action = Some(NoveltyAction::Insert);
                 near_drawer_id = novelty.near_drawer_id.clone();
 
-                // Insert ALL chunks as separate drawers.
                 for ((chunk_idx, chunk_did, chunk_exists), (chunk, vector)) in chunk_drawer_ids
                     .iter()
                     .zip(chunks.iter().zip(vectors.iter()))
@@ -818,8 +1643,6 @@ impl MempalMcpServer {
                         inserted_drawer_ids.push(chunk_did.clone());
                         continue;
                     }
-                    // Acquire per-chunk lock for chunks beyond the first
-                    // (first chunk already holds lock_guard).
                     let _extra_lock = if *chunk_idx > 0 {
                         Some(
                             crate::ingest::lock::acquire_source_lock(
@@ -837,34 +1660,21 @@ impl MempalMcpServer {
                     } else {
                         None
                     };
-                    // Re-check existence after acquiring per-chunk lock.
-                    let exists_after_lock = if *chunk_idx > 0 {
-                        db.drawer_exists(chunk_did).map_err(db_error)?
-                    } else {
-                        // First chunk: re-check after the initial lock.
-                        db.drawer_exists(chunk_did).map_err(db_error)?
-                    };
+                    let exists_after_lock = db.drawer_exists(chunk_did).map_err(db_error)?;
                     if exists_after_lock {
                         inserted_drawer_ids.push(chunk_did.clone());
                         continue;
                     }
-                    let source_file =
-                        source_file_or_synthetic(chunk_did, request.source.as_deref());
-                    db.insert_drawer_with_project(
-                        &Drawer {
-                            id: chunk_did.clone(),
-                            content: chunk.clone(),
-                            wing: request.wing.clone(),
-                            room: request.room.clone(),
-                            source_file: Some(source_file),
-                            source_type: SourceType::Manual,
-                            added_at: iso_timestamp(),
-                            chunk_index: Some(*chunk_idx as i64),
-                            importance: request.importance.unwrap_or(0),
-                        },
-                        project_id.as_deref(),
-                    )
-                    .map_err(db_error)?;
+                    let drawer = drawer_from_ingest_metadata(
+                        &request,
+                        &metadata,
+                        chunk_did,
+                        chunk,
+                        *chunk_idx,
+                        &source_type,
+                    );
+                    db.insert_drawer_with_project(&drawer, project_id.as_deref())
+                        .map_err(db_error)?;
                     db.insert_vector_with_project(chunk_did, vector, project_id.as_deref())
                         .map_err(db_error)?;
                     inserted_drawer_ids.push(chunk_did.clone());
@@ -887,9 +1697,6 @@ impl MempalMcpServer {
                 response_drawer_id = novelty.near_drawer_id.unwrap_or(drawer_id.clone());
             }
             NoveltyAction::Merge => {
-                // Novelty merge operates on the FULL scrubbed content (not
-                // individual chunks). This preserves the existing merge
-                // semantics: the whole content is appended as supplementary.
                 let target_id = novelty.near_drawer_id.clone().ok_or_else(|| {
                     ErrorData::internal_error("novelty merge missing target", None)
                 })?;
@@ -939,9 +1746,6 @@ impl MempalMcpServer {
                     novelty_action = Some(NoveltyAction::Insert);
                     near_drawer_id = Some(target_id);
                 } else {
-                    // Re-embed the merged content. Note: merged content may
-                    // exceed max_input_tokens — this is intentional (existing
-                    // merge semantics; the merged drawer is a single unit).
                     match embedder.embed(&[merged_content.as_str()]).await {
                         Ok(merged_vectors) => match merged_vectors.into_iter().next() {
                             Some(merged_vector) => {
@@ -1175,6 +1979,21 @@ impl MempalMcpServer {
     }
 
     #[tool(
+        name = "mempal_field_taxonomy",
+        description = "Read-only mind-model field taxonomy guidance. Lists recommended Stage-1 field values such as general, epistemics, software-engineering, debugging, tooling, research, writing, and diary. Guidance only; custom fields remain accepted."
+    )]
+    async fn mempal_field_taxonomy(
+        &self,
+    ) -> std::result::Result<Json<FieldTaxonomyResponse>, ErrorData> {
+        Ok(Json(FieldTaxonomyResponse {
+            entries: field_taxonomy()
+                .into_iter()
+                .map(FieldTaxonomyEntryDto::from)
+                .collect(),
+        }))
+    }
+
+    #[tool(
         name = "mempal_kg",
         description = "Knowledge graph: add, query, or invalidate triples (subject-predicate-object). Use 'add' to record structured relationships between entities. Use 'query' to find relationships by subject, predicate, or object. Use 'invalidate' to mark a triple as no longer valid."
     )]
@@ -1290,25 +2109,127 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_tunnels",
-        description = "Discover cross-wing tunnels: rooms that appear in multiple wings, enabling cross-domain knowledge discovery. Returns an empty list if only one wing exists."
+        description = "Discover or manage cross-wing tunnels. Actions: discover/list passive same-room links, add/list/delete/follow explicit semantic links."
     )]
-    async fn mempal_tunnels(&self) -> std::result::Result<Json<TunnelsResponse>, ErrorData> {
+    async fn mempal_tunnels(
+        &self,
+        Parameters(request): Parameters<TunnelsRequest>,
+    ) -> std::result::Result<Json<TunnelsResponse>, ErrorData> {
         let db = self.open_db()?;
-        let tunnels = db
-            .find_tunnels()
-            .map_err(db_error)?
-            .into_iter()
-            .map(|(room, wings)| TunnelDto { room, wings })
-            .collect();
-        Ok(Json(TunnelsResponse {
-            tunnels,
-            system_warnings: current_system_warnings(),
-        }))
+        let action = request.action.as_deref().unwrap_or("discover");
+        match action {
+            "discover" => Ok(Json(TunnelsResponse {
+                tunnels: passive_tunnel_dtos(&db, request.wing.as_deref())?,
+                system_warnings: current_system_warnings(),
+            })),
+            "list" => {
+                let kind = request.kind.as_deref().unwrap_or("all");
+                let mut tunnels = Vec::new();
+                if matches!(kind, "all" | "passive") {
+                    tunnels.extend(passive_tunnel_dtos(&db, request.wing.as_deref())?);
+                }
+                if matches!(kind, "all" | "explicit") {
+                    tunnels.extend(
+                        db.list_explicit_tunnels(request.wing.as_deref())
+                            .map_err(db_error)?
+                            .iter()
+                            .map(explicit_tunnel_to_dto),
+                    );
+                }
+                if !matches!(kind, "all" | "passive" | "explicit") {
+                    return Err(ErrorData::invalid_params(
+                        format!("unsupported tunnel kind: {kind}"),
+                        None,
+                    ));
+                }
+                Ok(Json(TunnelsResponse {
+                    tunnels,
+                    system_warnings: current_system_warnings(),
+                }))
+            }
+            "add" => {
+                let left = request
+                    .left
+                    .ok_or_else(|| ErrorData::invalid_params("missing left endpoint", None))?;
+                let right = request
+                    .right
+                    .ok_or_else(|| ErrorData::invalid_params("missing right endpoint", None))?;
+                let label = trim_to_option(request.label.as_deref())
+                    .ok_or_else(|| ErrorData::invalid_params("missing label", None))?;
+                let created_by = self
+                    .client_name
+                    .lock()
+                    .map_err(|_| ErrorData::internal_error("client name lock poisoned", None))?
+                    .clone();
+                let tunnel = db
+                    .create_tunnel(&left.into(), &right.into(), label, created_by.as_deref())
+                    .map_err(db_error)?;
+                Ok(Json(TunnelsResponse {
+                    tunnels: vec![explicit_tunnel_to_dto(&tunnel)],
+                    system_warnings: current_system_warnings(),
+                }))
+            }
+            "delete" => {
+                let tunnel_id = trim_to_option(request.tunnel_id.as_deref())
+                    .ok_or_else(|| ErrorData::invalid_params("missing tunnel_id", None))?;
+                if tunnel_id.starts_with("passive_") {
+                    return Err(ErrorData::invalid_params(
+                        "cannot delete passive tunnel",
+                        None,
+                    ));
+                }
+                if !db.delete_explicit_tunnel(tunnel_id).map_err(db_error)? {
+                    return Err(ErrorData::invalid_params(
+                        format!("tunnel not found: {tunnel_id}"),
+                        None,
+                    ));
+                }
+                Ok(Json(TunnelsResponse {
+                    tunnels: Vec::new(),
+                    system_warnings: current_system_warnings(),
+                }))
+            }
+            "follow" => {
+                let from = request
+                    .from
+                    .ok_or_else(|| ErrorData::invalid_params("missing from endpoint", None))?;
+                let max_hops = request.max_hops.unwrap_or(1);
+                if !(1..=2).contains(&max_hops) {
+                    return Err(ErrorData::invalid_params("max_hops must be 1 or 2", None));
+                }
+                let tunnels = db
+                    .follow_explicit_tunnels(&from.into(), max_hops)
+                    .map_err(db_error)?
+                    .into_iter()
+                    .map(|result| TunnelDto {
+                        tunnel_id: result.via_tunnel_id.clone(),
+                        kind: "explicit".to_string(),
+                        room: None,
+                        wings: Vec::new(),
+                        left: Some(TunnelEndpointDto::from(&result.endpoint)),
+                        right: None,
+                        label: None,
+                        created_at: None,
+                        created_by: None,
+                        via_tunnel_id: Some(result.via_tunnel_id),
+                        hop: Some(result.hop),
+                    })
+                    .collect();
+                Ok(Json(TunnelsResponse {
+                    tunnels,
+                    system_warnings: current_system_warnings(),
+                }))
+            }
+            other => Err(ErrorData::invalid_params(
+                format!("unsupported tunnels action: {other}"),
+                None,
+            )),
+        }
     }
 
     #[tool(
         name = "mempal_peek_partner",
-        description = "Read the partner coding agent's LIVE session log (Claude Code ↔ Codex) without storing it in mempal. Returns the most recent user+assistant messages from their active session file. Use this for CURRENT partner state; use mempal_search for CRYSTALLIZED past decisions. Peek is a pure read — it never writes to mempal drawers. Pass tool=\"auto\" to infer the partner from MCP ClientInfo, or tool=\"claude\"/\"codex\" explicitly."
+        description = "Read the partner coding agent's LIVE session log (Claude Code <-> Codex) without storing it in mempal. Returns the most recent user+assistant messages from their active session file. Use this for CURRENT partner state; use mempal_search for CRYSTALLIZED past decisions. Peek is a pure read -- it never writes to mempal drawers. Pass tool=\"auto\" to infer the partner from MCP ClientInfo, or tool=\"claude\"/\"codex\" explicitly."
     )]
     async fn mempal_peek_partner(
         &self,
@@ -1369,13 +2290,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_cowork_push",
-        description = "Proactively deliver a short handoff message to the PARTNER agent's inbox. \
-                       Partner reads it at their next UserPromptSubmit hook, NOT real-time. \
-                       Use for transient handoffs too important for mempal_peek_partner \
-                       and too ephemeral for mempal_ingest. Max 8 KB per message; total inbox \
-                       capped at 32 KB / 16 messages (InboxFull error means partner must drain). \
-                       Pass target_tool=\"claude\"/\"codex\" explicitly, or omit to infer partner \
-                       from MCP client identity. Self-push is rejected."
+        description = "Proactively deliver a short handoff message to the PARTNER agent's inbox. Partner reads it at their next UserPromptSubmit hook, NOT real-time. Use for transient handoffs too important for mempal_peek_partner and too ephemeral for mempal_ingest. Max 8 KB per message; total inbox capped at 32 KB / 16 messages (InboxFull error means partner must drain). Pass target_tool=\"claude\"/\"codex\" explicitly, or omit to infer partner from MCP client identity. Self-push is rejected."
     )]
     async fn mempal_cowork_push(
         &self,
@@ -1437,12 +2352,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_fact_check",
-        description = "Detect contradictions in text against KG triples + known entities. \
-                       Returns SimilarNameConflict (similar-name typos), RelationContradiction \
-                       (incompatible predicate for same endpoints), and StaleFact (KG valid_to \
-                       expired) issues. Pure read, zero LLM, zero network, deterministic. \
-                       Call before ingesting decisions that assert relationships between named \
-                       entities to catch typos or outdated assumptions early."
+        description = "Detect contradictions in text against KG triples + known entities. Returns SimilarNameConflict (similar-name typos), RelationContradiction (incompatible predicate for same endpoints), and StaleFact (KG valid_to expired) issues. Pure read, zero LLM, zero network, deterministic. Call before ingesting decisions that assert relationships between named entities to catch typos or outdated assumptions early."
     )]
     async fn mempal_fact_check(
         &self,
@@ -1470,29 +2380,19 @@ impl MempalMcpServer {
 }
 
 /// Return the current UTC timestamp in RFC 3339 format (seconds precision).
-/// Matches the format used by P6 peek_partner messages.
 fn current_rfc3339() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    // Use the same days_to_ymd+format_rfc3339 helpers as cowork::peek,
-    // but we don't need to pull them in — format as a simple UTC timestamp.
-    // Use the existing format_rfc3339 via SystemTime conversion.
     let secs = now;
-    // Reuse cowork::peek::format_rfc3339 is pub; call it to stay consistent.
     crate::cowork::peek::format_rfc3339(UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MempalMcpServer {
     fn get_info(&self) -> ServerInfo {
-        // MCP spec: `instructions` is auto-injected into the LLM system prompt
-        // by most clients at connection time. Putting the memory protocol here
-        // means every client (Claude Code, Codex, Cursor, Continue, ...) sees
-        // it without needing to call any tool first. This is the primary
-        // mechanism; `mempal_status` keeps the same text as a fallback/reference.
         let config = ConfigHandle::current();
         let progressive_disclosure_active = config.search.progressive_disclosure;
         let mut instructions = crate::core::protocol::MEMORY_PROTOCOL.to_string();
@@ -1528,14 +2428,9 @@ impl ServerHandler for MempalMcpServer {
         request: rmcp::model::InitializeRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<rmcp::model::InitializeResult, ErrorData> {
-        // Capture the calling client's tool name so `mempal_peek_partner`
-        // with `tool: "auto"` can infer which partner to read (e.g.,
-        // caller=claude-code ⇒ peek codex; caller=codex-cli ⇒ peek claude).
         if let Ok(mut guard) = self.client_name.lock() {
             *guard = Some(request.client_info.name.clone());
         }
-        // Preserve rmcp's default behavior: store peer_info so downstream
-        // rmcp internals can read client capabilities.
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request.clone());
         }
@@ -1564,6 +2459,16 @@ pub(super) fn db_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(format!("{error}"), None)
 }
 
+#[allow(dead_code)]
+fn ingest_error(error: IngestError) -> ErrorData {
+    match error {
+        IngestError::DiaryRollupWrongWing { .. }
+        | IngestError::DiaryRollupMissingRoom
+        | IngestError::DailyRollupFull { .. } => ErrorData::invalid_params(error.to_string(), None),
+        _ => ErrorData::internal_error(error.to_string(), None),
+    }
+}
+
 fn fact_check_error(error: crate::factcheck::FactCheckError) -> ErrorData {
     match error {
         crate::factcheck::FactCheckError::InvalidScope(_)
@@ -1572,6 +2477,60 @@ fn fact_check_error(error: crate::factcheck::FactCheckError) -> ErrorData {
         }
         crate::factcheck::FactCheckError::Db(_) => {
             ErrorData::internal_error(format!("fact_check: {error}"), None)
+        }
+    }
+}
+
+fn knowledge_gate_error(error: anyhow::Error) -> ErrorData {
+    ErrorData::invalid_params(error.to_string(), None)
+}
+
+fn knowledge_distill_error(error: anyhow::Error) -> ErrorData {
+    let message = error.to_string();
+    if message.contains("failed to embed")
+        || message.contains("failed to insert")
+        || message.contains("failed to append audit")
+        || message.contains("embedder required")
+    {
+        return ErrorData::internal_error(message, None);
+    }
+    ErrorData::invalid_params(message, None)
+}
+
+fn knowledge_lifecycle_error(error: anyhow::Error) -> ErrorData {
+    let message = error.to_string();
+    if message.contains("failed to update")
+        || message.contains("failed to append audit")
+        || message.contains("failed to open audit")
+        || message.contains("failed to write audit")
+    {
+        return ErrorData::internal_error(message, None);
+    }
+    ErrorData::invalid_params(message, None)
+}
+
+fn knowledge_anchor_error(error: anyhow::Error) -> ErrorData {
+    let message = error.to_string();
+    if message.contains("failed to update")
+        || message.contains("failed to append audit")
+        || message.contains("failed to open audit")
+        || message.contains("failed to write audit")
+    {
+        return ErrorData::internal_error(message, None);
+    }
+    ErrorData::invalid_params(message, None)
+}
+
+fn context_error(error: crate::context::ContextError) -> ErrorData {
+    match error {
+        crate::context::ContextError::DeriveAnchor(_) => {
+            ErrorData::invalid_params(error.to_string(), None)
+        }
+        crate::context::ContextError::EmbedQuery(_)
+        | crate::context::ContextError::MissingQueryVector
+        | crate::context::ContextError::Search(_)
+        | crate::context::ContextError::LoadDrawer(_) => {
+            ErrorData::internal_error(format!("context assembly failed: {error}"), None)
         }
     }
 }
@@ -1710,614 +2669,59 @@ fn triple_to_dto(triple: &Triple) -> TripleDto {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    use async_trait::async_trait;
-    use tempfile::TempDir;
-
-    use super::*;
-    use crate::embed::Embedder;
-
-    #[derive(Clone)]
-    struct StubEmbedderFactory {
-        vector: Vec<f32>,
-    }
-
-    struct StubEmbedder {
-        vector: Vec<f32>,
-    }
-
-    #[derive(Clone)]
-    struct HoldEmbedderFactory {
-        vector: Vec<f32>,
-        delay: Duration,
-        entered: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    }
-
-    struct HoldEmbedder {
-        vector: Vec<f32>,
-        delay: Duration,
-        entered: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    }
-
-    #[async_trait]
-    impl crate::embed::EmbedderFactory for StubEmbedderFactory {
-        async fn build(&self) -> crate::embed::Result<Box<dyn Embedder>> {
-            Ok(Box::new(StubEmbedder {
-                vector: self.vector.clone(),
-            }))
-        }
-    }
-
-    #[async_trait]
-    impl crate::embed::EmbedderFactory for HoldEmbedderFactory {
-        async fn build(&self) -> crate::embed::Result<Box<dyn Embedder>> {
-            Ok(Box::new(HoldEmbedder {
-                vector: self.vector.clone(),
-                delay: self.delay,
-                entered: Arc::clone(&self.entered),
-            }))
-        }
-    }
-
-    #[async_trait]
-    impl Embedder for StubEmbedder {
-        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
-            Ok(texts.iter().map(|_| self.vector.clone()).collect())
-        }
-
-        fn dimensions(&self) -> usize {
-            self.vector.len()
-        }
-
-        fn name(&self) -> &str {
-            "stub"
-        }
-    }
-
-    #[async_trait]
-    impl Embedder for HoldEmbedder {
-        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
-            if let Some(tx) = self.entered.lock().unwrap().take() {
-                let _ = tx.send(());
-            }
-            if !self.delay.is_zero() {
-                tokio::time::sleep(self.delay).await;
-            }
-            Ok(texts.iter().map(|_| self.vector.clone()).collect())
-        }
-
-        fn dimensions(&self) -> usize {
-            self.vector.len()
-        }
-
-        fn name(&self) -> &str {
-            "hold"
-        }
-    }
-
-    fn setup_server() -> (TempDir, PathBuf, MempalMcpServer) {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let db_path = tempdir.path().join("palace.db");
-        let server = MempalMcpServer::new_with_factory(
-            db_path.clone(),
-            Arc::new(StubEmbedderFactory {
-                vector: vec![0.1, 0.2, 0.3],
-            }),
-        );
-        (tempdir, db_path, server)
-    }
-
-    fn insert_drawer(
-        db_path: &Path,
-        id: &str,
-        content: &str,
-        wing: &str,
-        room: Option<&str>,
-        source_file: &str,
-        importance: i32,
-    ) {
-        let db = Database::open(db_path).expect("open db");
-        db.insert_drawer_with_project(
-            &Drawer {
-                id: id.to_string(),
-                content: content.to_string(),
-                wing: wing.to_string(),
-                room: room.map(str::to_string),
-                source_file: Some(source_file.to_string()),
-                source_type: SourceType::Manual,
-                added_at: "1713000000".to_string(),
-                chunk_index: Some(0),
-                importance,
-            },
-            Some("default"),
-        )
-        .expect("insert drawer");
-        db.insert_vector_with_project(id, &[0.1, 0.2, 0.3], Some("default"))
-            .expect("insert vector");
-    }
-
-    fn insert_triple(
-        db_path: &Path,
-        subject: &str,
-        predicate: &str,
-        object: &str,
-        valid_from: Option<&str>,
-        valid_to: Option<&str>,
-    ) {
-        let db = Database::open(db_path).expect("open db");
-        db.insert_triple(&Triple {
-            id: crate::core::utils::build_triple_id(subject, predicate, object),
-            subject: subject.to_string(),
-            predicate: predicate.to_string(),
-            object: object.to_string(),
-            valid_from: valid_from.map(str::to_string),
-            valid_to: valid_to.map(str::to_string),
-            confidence: 1.0,
-            source_drawer: None,
+fn passive_tunnel_dtos(
+    db: &Database,
+    wing: Option<&str>,
+) -> std::result::Result<Vec<TunnelDto>, ErrorData> {
+    let wing = wing.map(str::trim).filter(|value| !value.is_empty());
+    let tunnels = db
+        .find_tunnels()
+        .map_err(db_error)?
+        .into_iter()
+        .filter(|(_, wings)| wing.is_none_or(|filter| wings.iter().any(|item| item == filter)))
+        .map(|(room, wings)| TunnelDto {
+            tunnel_id: passive_tunnel_id(&room),
+            kind: "passive".to_string(),
+            room: Some(room),
+            wings,
+            left: None,
+            right: None,
+            label: None,
+            created_at: None,
+            created_by: None,
+            via_tunnel_id: None,
+            hop: None,
         })
-        .expect("insert triple");
+        .collect();
+    Ok(tunnels)
+}
+
+fn explicit_tunnel_to_dto(tunnel: &ExplicitTunnel) -> TunnelDto {
+    TunnelDto {
+        tunnel_id: tunnel.id.clone(),
+        kind: "explicit".to_string(),
+        room: None,
+        wings: vec![tunnel.left.wing.clone(), tunnel.right.wing.clone()],
+        left: Some(TunnelEndpointDto::from(&tunnel.left)),
+        right: Some(TunnelEndpointDto::from(&tunnel.right)),
+        label: Some(tunnel.label.clone()),
+        created_at: Some(tunnel.created_at.clone()),
+        created_by: tunnel.created_by.clone(),
+        via_tunnel_id: None,
+        hop: None,
     }
+}
 
-    async fn run_search(
-        server: &MempalMcpServer,
-        query: &str,
-        wing: Option<&str>,
-        room: Option<&str>,
-        top_k: usize,
-    ) -> SearchResponse {
-        server
-            .mempal_search(Parameters(SearchRequest {
-                query: query.to_string(),
-                wing: wing.map(str::to_string),
-                room: room.map(str::to_string),
-                top_k: Some(top_k),
-                project_id: None,
-                include_global: None,
-                all_projects: None,
-                disable_progressive: None,
-            }))
-            .await
-            .expect("search should succeed")
-            .0
-    }
-
-    #[tokio::test]
-    async fn test_mempal_search_includes_structured_signals_and_preserves_raw_fields() {
-        let (_tempdir, db_path, server) = setup_server();
-        insert_drawer(
-            &db_path,
-            "drawer-1",
-            "We decided to use Arc<Mutex<>> for state because shared ownership mattered",
-            "mempal",
-            Some("signals"),
-            "/tmp/decision.md",
-            4,
-        );
-        insert_drawer(
-            &db_path,
-            "drawer-2",
-            "上海决定采用共享内存同步机制解决状态漂移问题",
-            "mempal",
-            Some("signals"),
-            "/tmp/cjk.md",
-            3,
-        );
-
-        let response = run_search(&server, "state", None, None, 2).await;
-
-        assert_eq!(response.results.len(), 2);
-
-        let decision = response
-            .results
-            .iter()
-            .find(|result| result.drawer_id == "drawer-1")
-            .expect("decision result");
-        assert_eq!(
-            decision.content,
-            "We decided to use Arc<Mutex<>> for state because shared ownership mattered"
-        );
-        assert_eq!(decision.source_file, "/tmp/decision.md");
-        assert!(decision.flags.contains(&"DECISION".to_string()));
-        assert!(!decision.entities.is_empty());
-        assert!(!decision.emotions.is_empty());
-        assert!(decision.importance_stars >= 2);
-
-        let cjk = response
-            .results
-            .iter()
-            .find(|result| result.drawer_id == "drawer-2")
-            .expect("cjk result");
-        assert_ne!(cjk.entities, vec!["UNK".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn test_mempal_search_returns_empty_results_when_filters_exclude_all_drawers() {
-        let (_tempdir, db_path, server) = setup_server();
-        insert_drawer(
-            &db_path,
-            "drawer-1",
-            "We decided to use Arc<Mutex<>> for state because shared ownership mattered",
-            "mempal",
-            Some("signals"),
-            "/tmp/decision.md",
-            4,
-        );
-
-        let response = run_search(&server, "state", Some("other-wing"), None, 5).await;
-
-        assert!(response.results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_mempal_search_has_no_db_side_effects() {
-        let (_tempdir, db_path, server) = setup_server();
-        insert_drawer(
-            &db_path,
-            "drawer-1",
-            "We decided to use Arc<Mutex<>> for state because shared ownership mattered",
-            "mempal",
-            Some("signals"),
-            "/tmp/decision.md",
-            4,
-        );
-
-        let db = Database::open(&db_path).expect("open db");
-        let baseline_drawers = db.drawer_count().expect("drawer count");
-        let baseline_triples = db.triple_count().expect("triple count");
-        let baseline_schema = db.schema_version().expect("schema version");
-
-        for _ in 0..3 {
-            let response = run_search(&server, "state", None, None, 5).await;
-            assert!(!response.results.is_empty());
-        }
-
-        let db = Database::open(&db_path).expect("reopen db");
-        assert_eq!(db.drawer_count().expect("drawer count"), baseline_drawers);
-        assert_eq!(db.triple_count().expect("triple count"), baseline_triples);
-        assert_eq!(
-            db.schema_version().expect("schema version"),
-            baseline_schema
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_mcp_fact_check_round_trip() {
-        let (_tempdir, db_path, server) = setup_server();
-        insert_triple(
-            &db_path,
-            "Bob",
-            "husband_of",
-            "Alice",
-            Some("1799900000"),
-            None,
-        );
-        insert_triple(
-            &db_path,
-            "Alice",
-            "works_at",
-            "Acme",
-            Some("1700000000"),
-            Some("1799999999"),
-        );
-
-        let response = server
-            .mempal_fact_check(Parameters(FactCheckRequest {
-                text: "Bob is Alice's brother. Alice works at Acme.".to_string(),
-                wing: None,
-                room: None,
-                now: Some("2027-01-15T08:00:00Z".to_string()),
-            }))
-            .await
-            .expect("fact check should succeed")
-            .0;
-
-        assert_eq!(response.issues.len(), 2, "issues={:?}", response.issues);
-
-        let json = serde_json::to_vec(&response).expect("serialize");
-        let back: FactCheckResponse = serde_json::from_slice(&json).expect("deserialize");
-        assert_eq!(back.issues, response.issues);
-        assert_eq!(back.checked_entities, response.checked_entities);
-        assert_eq!(back.kg_triples_scanned, response.kg_triples_scanned);
-    }
-
-    #[tokio::test]
-    async fn test_mcp_fact_check_invalid_scope_maps_to_invalid_params() {
-        let (_tempdir, _db_path, server) = setup_server();
-
-        let err = match server
-            .mempal_fact_check(Parameters(FactCheckRequest {
-                text: "Bob is Alice's brother".to_string(),
-                wing: None,
-                room: Some("design".to_string()),
-                now: None,
-            }))
-            .await
-        {
-            Ok(_) => panic!("room without wing must be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string().contains("room requires wing"),
-            "expected invalid scope error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mcp_fact_check_invalid_now_maps_to_invalid_params() {
-        let (_tempdir, _db_path, server) = setup_server();
-
-        let err = match server
-            .mempal_fact_check(Parameters(FactCheckRequest {
-                text: "Bob is Alice's brother".to_string(),
-                wing: None,
-                room: None,
-                now: Some("not-a-timestamp".to_string()),
-            }))
-            .await
-        {
-            Ok(_) => panic!("invalid now must be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string().contains("expected RFC3339"),
-            "expected invalid now error, got: {err}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_mcp_ingest_response_exposes_lock_wait() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let db_path = tempdir.path().join("palace.db");
-        Database::open(&db_path).expect("init db before concurrent open_db calls");
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let server = Arc::new(MempalMcpServer::new_with_factory(
-            db_path,
-            Arc::new(HoldEmbedderFactory {
-                vector: vec![0.1, 0.2, 0.3],
-                delay: Duration::from_millis(250),
-                entered: Arc::new(Mutex::new(Some(entered_tx))),
-            }),
-        ));
-
-        let request = IngestRequest {
-            content: "same content for lock contention".to_string(),
-            wing: "mempal".to_string(),
-            room: Some("review".to_string()),
-            source: None,
-            project_id: None,
-            importance: None,
-            dry_run: None,
-        };
-
-        let server_a = Arc::clone(&server);
-        let request_a = request.clone();
-        let task_a =
-            tokio::spawn(async move { server_a.mempal_ingest(Parameters(request_a)).await });
-        entered_rx
-            .recv()
-            .expect("first ingest entered embed under lock");
-
-        let server_b = Arc::clone(&server);
-        let task_b = tokio::spawn(async move { server_b.mempal_ingest(Parameters(request)).await });
-
-        let response_a = task_a
-            .await
-            .expect("join a")
-            .expect("ingest a should succeed")
-            .0;
-        let response_b = task_b
-            .await
-            .expect("join b")
-            .expect("ingest b should succeed")
-            .0;
-
-        let waits = [
-            response_a.lock_wait_ms.unwrap_or(0),
-            response_b.lock_wait_ms.unwrap_or(0),
-        ];
-        let waited = waits.into_iter().filter(|ms| *ms > 0).count();
-        assert_eq!(waited, 1, "expected exactly one waiter: {waits:?}");
-
-        let json = serde_json::to_value(&response_a).expect("serialize");
-        assert!(
-            json.get("lock_wait_ms").is_some(),
-            "JSON must expose lock_wait_ms"
-        );
-    }
-
-    // =========================================================================
-    // mempal_cowork_push MCP handler tests (P8 task 7, Codex review round-2 #2)
-    // =========================================================================
-    //
-    // These tests exercise the HANDLER itself — caller identity inference,
-    // target auto-inference, self-push rejection, and InboxError → ErrorData
-    // mapping. They complement the integration tests in tests/cowork_inbox.rs,
-    // which only cover the CLI and inbox layers.
-
-    use super::super::tools::CoworkPushRequest;
-    use tokio::sync::Mutex as TokioMutex;
-
-    // Tests below mutate $HOME env var to point mempal_home() at a tempdir.
-    // Rust's default test runner runs tests in parallel threads, so they
-    // would race on shared process state. Serialize them behind a process-
-    // wide async Mutex whose guard CAN be held across .await points
-    // (unlike std::sync::Mutex, which clippy rejects with await_holding_lock).
-    // Every cowork push handler test must acquire this guard before
-    // mutating $HOME and hold it for its entire lifetime.
-    static COWORK_HOME_LOCK: TokioMutex<()> = TokioMutex::const_new(());
-
-    async fn setup_cowork_home(
-        tempdir: &TempDir,
-    ) -> (PathBuf, PathBuf, tokio::sync::MutexGuard<'static, ()>) {
-        // Lock FIRST before touching $HOME so no other parallel cowork
-        // test can observe a half-written env var.
-        let guard = COWORK_HOME_LOCK.lock().await;
-        let home = tempdir.path().to_path_buf();
-        let mempal_home = home.join(".mempal");
-        let repo = home.join("proj");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        (mempal_home, repo, guard)
-    }
-
-    #[tokio::test]
-    async fn test_mcp_push_without_client_info_rejects_auto_target() {
-        let (tempdir, _db_path, server) = setup_server();
-        let (_mempal_home, repo, _guard) = setup_cowork_home(&tempdir).await;
-
-        // client_name is None because we never called initialize().
-        // Pushing without an explicit target must fail with "cannot infer".
-        let result = server
-            .mempal_cowork_push(Parameters(CoworkPushRequest {
-                content: "hello".into(),
-                target_tool: None,
-                cwd: repo.to_string_lossy().into_owned(),
-            }))
-            .await;
-
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("expected push to fail when client_name is None"),
-        };
-        // MCP error message must mention inference failure.
-        assert!(
-            err.to_string().contains("cannot infer"),
-            "expected inference error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mcp_push_succeeds_with_captured_client_name_and_auto_target() {
-        let (tempdir, _db_path, server) = setup_server();
-        let (mempal_home, repo, _guard) = setup_cowork_home(&tempdir).await;
-
-        // Simulate a completed `initialize` handshake: caller identified
-        // as "claude-code" (Claude Code's standard MCP client name).
-        *server.client_name.lock().unwrap() = Some("claude-code".to_string());
-
-        let response = match server
-            .mempal_cowork_push(Parameters(CoworkPushRequest {
-                content: "from claude to partner".into(),
-                target_tool: None,
-                cwd: repo.to_string_lossy().into_owned(),
-            }))
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => panic!("push should succeed with valid client_name: {e}"),
-        };
-
-        // Target auto-inferred as partner of Claude → Codex.
-        assert_eq!(response.0.target_tool, "codex");
-        assert!(response.0.inbox_size_after > 0);
-
-        // Verify the message actually landed in the codex inbox by draining.
-        let messages = crate::cowork::inbox::drain(&mempal_home, Tool::Codex, &repo).unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "from claude to partner");
-        assert_eq!(messages[0].from, "claude");
-    }
-
-    #[tokio::test]
-    async fn test_mcp_push_self_push_rejected_via_inbox_error_mapping() {
-        let (tempdir, _db_path, server) = setup_server();
-        let (_mempal_home, repo, _guard) = setup_cowork_home(&tempdir).await;
-
-        // Caller is Codex, target explicitly Codex → SelfPush error from
-        // inbox::push. Handler must map it to InvalidParams MCP error.
-        *server.client_name.lock().unwrap() = Some("codex".to_string());
-
-        let err = match server
-            .mempal_cowork_push(Parameters(CoworkPushRequest {
-                content: "would be self push".into(),
-                target_tool: Some("codex".to_string()),
-                cwd: repo.to_string_lossy().into_owned(),
-            }))
-            .await
-        {
-            Err(e) => e,
-            Ok(_) => panic!("expected self-push to be rejected"),
-        };
-
-        assert!(
-            err.to_string().contains("self"),
-            "expected self-push error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mcp_push_explicit_target_overrides_auto_inference() {
-        let (tempdir, _db_path, server) = setup_server();
-        let (mempal_home, repo, _guard) = setup_cowork_home(&tempdir).await;
-
-        *server.client_name.lock().unwrap() = Some("claude-code".to_string());
-
-        // Caller=Claude; auto would infer Codex. Override explicitly to Codex
-        // (same effective target, but proves the explicit branch runs).
-        let response = match server
-            .mempal_cowork_push(Parameters(CoworkPushRequest {
-                content: "explicit target".into(),
-                target_tool: Some("codex".to_string()),
-                cwd: repo.to_string_lossy().into_owned(),
-            }))
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => panic!("explicit target push should succeed: {e}"),
-        };
-        assert_eq!(response.0.target_tool, "codex");
-
-        let messages = crate::cowork::inbox::drain(&mempal_home, Tool::Codex, &repo).unwrap();
-        assert_eq!(messages.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_mcp_push_rejects_explicit_auto_target() {
-        // Guard for Codex review finding 1: `target_tool="auto"` must NOT
-        // be accepted as an explicit target. Per spec lines 37/39 target is
-        // limited to claude|codex. Previously `Tool::from_str_ci` let "auto"
-        // through, which would silently write to an orphan
-        // ~/.mempal/cowork-inbox/auto/*.jsonl that no partner drains.
-        let (tempdir, _db_path, server) = setup_server();
-        let (mempal_home, repo, _guard) = setup_cowork_home(&tempdir).await;
-
-        *server.client_name.lock().unwrap() = Some("claude-code".to_string());
-
-        for bad in ["auto", "AUTO", "Auto"] {
-            let err = match server
-                .mempal_cowork_push(Parameters(CoworkPushRequest {
-                    content: "should not land".into(),
-                    target_tool: Some(bad.to_string()),
-                    cwd: repo.to_string_lossy().into_owned(),
-                }))
-                .await
-            {
-                Err(e) => e,
-                Ok(_) => panic!("target_tool={bad:?} must be rejected"),
-            };
-            assert!(
-                err.to_string().contains("expected claude|codex"),
-                "error for target_tool={bad:?} should mention expected targets, got: {err}"
-            );
-        }
-
-        // And ensure nothing was written to the orphan `auto/` inbox dir.
-        let auto_inbox_dir = mempal_home.join("cowork-inbox").join("auto");
-        assert!(
-            !auto_inbox_dir.exists(),
-            "rejected push must not create orphan auto/ inbox dir at {}",
-            auto_inbox_dir.display()
-        );
-    }
+fn passive_tunnel_id(room: &str) -> String {
+    let sanitized = room
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("passive_{sanitized}")
 }

@@ -254,6 +254,7 @@ preview_chars = 48
                 added_at: "1713000100".to_string(),
                 chunk_index: Some(0),
                 importance: 0,
+                ..Drawer::default()
             },
             Some(project_id),
         )
@@ -452,12 +453,11 @@ async fn test_linked_drawer_ids_in_sentinel_section() {
         .mempal_search(Parameters(SearchRequest {
             query: "implementation".to_string(),
             wing: Some("session-reviews".to_string()),
-            room: None,
             top_k: Some(5),
             project_id: Some("project-alpha".to_string()),
             include_global: Some(false),
             all_projects: Some(false),
-            disable_progressive: None,
+            ..SearchRequest::default()
         }))
         .await
         .expect("search")
@@ -618,8 +618,7 @@ async fn test_linked_drawer_ids_rejects_manual_hooks_raw_with_external_source() 
             room: Some("Bash".to_string()),
             source: Some(forged_path.display().to_string()),
             project_id: Some("project-alpha".to_string()),
-            dry_run: None,
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
         .expect("manual hooks-raw ingest")
@@ -674,8 +673,7 @@ async fn test_linked_drawer_ids_does_not_read_external_filesystem() {
             room: Some("Bash".to_string()),
             source: Some(missing_path.display().to_string()),
             project_id: Some("project-alpha".to_string()),
-            dry_run: None,
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
         .expect("manual hooks-raw ingest")

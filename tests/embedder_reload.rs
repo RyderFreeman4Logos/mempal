@@ -434,6 +434,7 @@ async fn test_dim_mismatch_fail_fast() {
         added_at: "1713000000".to_string(),
         chunk_index: Some(0),
         importance: 0,
+        ..Drawer::default()
     })
     .expect("insert drawer");
     db.insert_vector("existing", &[0.1, 0.2])
@@ -448,10 +449,8 @@ async fn test_dim_mismatch_fail_fast() {
             content: "new drawer".to_string(),
             wing: "test".to_string(),
             room: Some("room".to_string()),
-            source: None,
-            project_id: None,
             dry_run: Some(false),
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
     {

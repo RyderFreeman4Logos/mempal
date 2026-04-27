@@ -167,10 +167,8 @@ async fn test_mcp_ingest_short_content_single_chunk() {
             content,
             wing: "test".to_string(),
             room: Some("chunker".to_string()),
-            source: None,
-            project_id: None,
             dry_run: Some(false),
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
         .expect("mcp ingest")
@@ -204,10 +202,8 @@ async fn test_mcp_ingest_large_content_multi_chunk() {
             content: content.clone(),
             wing: "test".to_string(),
             room: Some("chunker".to_string()),
-            source: None,
-            project_id: None,
             dry_run: Some(false),
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
         .expect("mcp ingest")
@@ -271,10 +267,8 @@ async fn test_mcp_ingest_dry_run_returns_chunk_info() {
             content,
             wing: "test".to_string(),
             room: Some("chunker".to_string()),
-            source: None,
-            project_id: None,
             dry_run: Some(true),
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
         .expect("mcp ingest dry_run")

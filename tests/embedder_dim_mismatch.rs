@@ -34,6 +34,7 @@ async fn test_dim_mismatch_detected_before_reindex() {
         added_at: "1713000000".to_string(),
         chunk_index: Some(0),
         importance: 0,
+        ..Drawer::default()
     })
     .expect("insert drawer");
     db.insert_vector("existing", &[0.9, 0.8])
@@ -72,10 +73,8 @@ request_timeout_secs = 5
             content: "new drawer".to_string(),
             wing: "test".to_string(),
             room: Some("room".to_string()),
-            source: None,
-            project_id: None,
             dry_run: Some(false),
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
     {

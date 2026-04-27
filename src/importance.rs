@@ -56,10 +56,10 @@ pub fn score_importance(drawer: &Drawer) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::score_importance;
-    use crate::core::types::{Drawer, SourceType};
+    use crate::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 
     fn drawer(wing: &str, content: &str) -> Drawer {
-        Drawer {
+        Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
             id: "test-id".to_string(),
             content: content.to_string(),
             wing: wing.to_string(),
@@ -69,7 +69,7 @@ mod tests {
             added_at: "1713000000".to_string(),
             chunk_index: None,
             importance: 0,
-        }
+        })
     }
 
     #[test]

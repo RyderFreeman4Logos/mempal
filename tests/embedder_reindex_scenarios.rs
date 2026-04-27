@@ -109,6 +109,7 @@ fn seed_drawers(db_path: &Path, count: usize, vector_dim: usize) {
                 added_at: format!("17130000{index:02}"),
                 chunk_index: Some(index as i64),
                 importance: 0,
+                ..Drawer::default()
             },
             Some("default"),
         )
@@ -266,6 +267,7 @@ async fn test_search_and_ingest_during_partial_reindex() {
             include_global: None,
             all_projects: None,
             disable_progressive: None,
+            ..SearchRequest::default()
         }))
         .await
         .expect("search during reindex")
@@ -277,10 +279,8 @@ async fn test_search_and_ingest_during_partial_reindex() {
             content: "ingest during partial reindex".to_string(),
             wing: "test".to_string(),
             room: Some("reindex".to_string()),
-            source: None,
-            project_id: None,
             dry_run: Some(false),
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
         .expect("ingest during reindex")
@@ -473,10 +473,8 @@ block_writes_when_degraded = true
             content: "blocked".to_string(),
             wing: "test".to_string(),
             room: Some("room".to_string()),
-            source: None,
-            project_id: None,
             dry_run: Some(false),
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
     {
@@ -515,10 +513,8 @@ async fn test_embed_degraded_allows_writes_when_not_configured() {
                 content: "allowed after recovery".to_string(),
                 wing: "test".to_string(),
                 room: Some("room".to_string()),
-                source: None,
-                project_id: None,
                 dry_run: Some(false),
-                importance: None,
+                ..IngestRequest::default()
             }))
             .await
     });
@@ -574,10 +570,7 @@ async fn test_mixed_dim_batch_aborts_before_begin_immediate() {
         IngestOptions {
             room: Some("mixed"),
             source_root: source.parent(),
-            dry_run: false,
-            project_id: None,
-            gating: None,
-            prototype_classifier: None,
+            ..IngestOptions::default()
         },
     )
     .await

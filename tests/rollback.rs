@@ -68,6 +68,7 @@ fn insert_drawer(
             added_at: added_at.to_string(),
             chunk_index: Some(0),
             importance: 0,
+            ..Drawer::default()
         },
         project_id,
     )
