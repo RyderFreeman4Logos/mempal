@@ -14,6 +14,7 @@ fn make_drawer(id: &str, content: &str, wing: &str, room: Option<&str>) -> Drawe
         added_at: "2026-04-25T00:00:00Z".to_string(),
         chunk_index: Some(0),
         importance: 0,
+        ..Drawer::default()
     }
 }
 

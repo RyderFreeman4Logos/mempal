@@ -10,10 +10,11 @@ use mempal::core::{
     config::Config,
     db::Database,
     project::ProjectSearchScope,
-    types::{Drawer, SourceType, TaxonomyEntry},
+    types::{BootstrapEvidenceArgs, Drawer, SourceType, TaxonomyEntry},
     utils::{build_drawer_id, route_room_from_taxonomy},
 };
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder};
+use mempal::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use mempal::search::search;
 use serde::{Deserialize, Deserializer, Serialize};
 use tempfile::tempdir;
@@ -454,7 +455,7 @@ async fn ingest_corpus<E: Embedder + ?Sized>(
             BenchMode::Raw | BenchMode::Aaak => None,
         };
 
-        db.insert_drawer(&Drawer {
+        let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
             id: item.drawer_id.clone(),
             content: item.retrieval_text.clone(),
             wing: BENCH_WING.to_string(),
@@ -464,8 +465,13 @@ async fn ingest_corpus<E: Embedder + ?Sized>(
             added_at: item.timestamp.clone(),
             chunk_index: Some(0),
             importance: 0,
-        })
-        .with_context(|| format!("failed to insert drawer {}", item.drawer_id))?;
+        });
+        let drawer = Drawer {
+            normalize_version: CURRENT_NORMALIZE_VERSION,
+            ..drawer
+        };
+        db.insert_drawer(&drawer)
+            .with_context(|| format!("failed to insert drawer {}", item.drawer_id))?;
         db.insert_vector(&item.drawer_id, vector)
             .with_context(|| format!("failed to insert vector for {}", item.drawer_id))?;
     }

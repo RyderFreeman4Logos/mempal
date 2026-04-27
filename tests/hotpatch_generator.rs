@@ -80,6 +80,7 @@ allowed_target_prefixes = ["{}"]
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance,
+            ..Drawer::default()
         })
         .expect("insert drawer");
         db.conn()

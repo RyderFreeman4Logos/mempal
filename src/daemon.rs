@@ -11,7 +11,7 @@ use crate::core::{
     db::Database,
     project::resolve_project_id,
     queue::{ClaimedMessage, PendingMessageStore},
-    types::{Drawer, SourceType},
+    types::{BootstrapEvidenceArgs, Drawer, SourceType},
     utils::{current_timestamp, iso_timestamp, synthetic_source_file},
 };
 use crate::embed::{
@@ -792,7 +792,7 @@ fn insert_drawer_with_vector(
         return Ok(());
     }
 
-    let drawer = Drawer {
+    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: drawer_id.to_string(),
         content: record.content.clone(),
         wing: record.wing.clone(),
@@ -802,7 +802,7 @@ fn insert_drawer_with_vector(
         added_at: iso_timestamp(),
         chunk_index: Some(0),
         importance: record.importance,
-    };
+    });
     db.insert_drawer_with_project(&drawer, record.project_id.as_deref())
         .with_context(|| format!("failed to insert hook drawer {}", drawer.id))?;
     db.insert_vector_with_project(&drawer.id, vector, record.project_id.as_deref())

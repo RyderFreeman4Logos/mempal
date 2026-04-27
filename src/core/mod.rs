@@ -1,5 +1,6 @@
 #![warn(clippy::all)]
 
+pub mod anchor;
 pub mod config;
 pub mod db;
 pub mod hot_reload;

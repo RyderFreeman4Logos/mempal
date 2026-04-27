@@ -2,9 +2,12 @@ use crate::core::{
     config::ConfigHandle,
     db::Database,
     project::{ProjectSearchScope, resolve_project_id},
-    types::{Drawer, RouteDecision, SearchResult, SourceType, TaxonomyEntry},
-    utils::{iso_timestamp, source_file_or_synthetic},
+    types::{
+        BootstrapEvidenceArgs, Drawer, RouteDecision, SearchResult, SourceType, TaxonomyEntry,
+    },
+    utils::{build_bootstrap_evidence_drawer_id, iso_timestamp, source_file_or_synthetic},
 };
+use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use crate::search::{resolve_route, search_with_vector};
 use axum::{
     Json, Router,
@@ -216,32 +219,33 @@ async fn ingest_handler(
     // Insert each chunk as a separate drawer.
     let mut drawer_ids: Vec<String> = Vec::with_capacity(chunks.len());
     for (chunk_idx, (chunk, vector)) in chunks.iter().zip(vectors.iter()).enumerate() {
-        let (drawer_id, drawer_exists) = db
-            .resolve_ingest_drawer_id(
-                &request.wing,
-                request.room.as_deref(),
-                chunk,
-                project_id.as_deref(),
-            )
-            .map_err(internal_error)?;
+        let drawer_id = build_bootstrap_evidence_drawer_id(
+            &request.wing,
+            request.room.as_deref(),
+            chunk,
+            &SourceType::Manual,
+        );
+        let drawer_exists = db.drawer_exists(&drawer_id).map_err(internal_error)?;
 
         if !drawer_exists {
             let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());
-            db.insert_drawer_with_project(
-                &Drawer {
-                    id: drawer_id.clone(),
-                    content: chunk.clone(),
-                    wing: request.wing.clone(),
-                    room: request.room.clone(),
-                    source_file: Some(source_file),
-                    source_type: SourceType::Manual,
-                    added_at: iso_timestamp(),
-                    chunk_index: Some(chunk_idx as i64),
-                    importance: 0,
-                },
-                project_id.as_deref(),
-            )
-            .map_err(internal_error)?;
+            let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+                id: drawer_id.clone(),
+                content: chunk.clone(),
+                wing: request.wing.clone(),
+                room: request.room.clone(),
+                source_file: Some(source_file),
+                source_type: SourceType::Manual,
+                added_at: iso_timestamp(),
+                chunk_index: Some(chunk_idx as i64),
+                importance: 0,
+            });
+            let drawer = Drawer {
+                normalize_version: CURRENT_NORMALIZE_VERSION,
+                ..drawer
+            };
+            db.insert_drawer_with_project(&drawer, project_id.as_deref())
+                .map_err(internal_error)?;
             db.insert_vector_with_project(&drawer_id, vector, project_id.as_deref())
                 .map_err(internal_error)?;
         }

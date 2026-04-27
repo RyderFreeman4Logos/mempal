@@ -2,10 +2,13 @@
 
 pub mod chunk;
 pub mod detect;
+pub mod diary;
 pub mod gating;
 pub mod lock;
+pub mod noise;
 pub mod normalize;
 pub mod novelty;
+pub mod reindex;
 
 use std::path::{Path, PathBuf};
 
@@ -15,8 +18,11 @@ use crate::core::{
     config::ConfigHandle,
     config::IngestGatingConfig,
     db::Database,
-    types::{Drawer, SourceType},
-    utils::{build_drawer_id, iso_timestamp, route_room_from_taxonomy},
+    types::{BootstrapEvidenceArgs, Drawer, SourceType},
+    utils::{
+        build_bootstrap_evidence_drawer_id, build_drawer_id, iso_timestamp,
+        route_room_from_taxonomy,
+    },
 };
 use crate::embed::{EmbedError, Embedder};
 use crate::ingest::gating::{PrototypeClassifier, evaluate_tier1, evaluate_tier2};
@@ -25,7 +31,9 @@ use thiserror::Error;
 use crate::ingest::{
     chunk::{chunk_conversation_token_aware, chunk_text_token_aware},
     detect::{Format, detect_format},
-    normalize::{NormalizeError, normalize_content},
+    normalize::{
+        CURRENT_NORMALIZE_VERSION, NormalizeError, NormalizeOptions, normalize_content_with_options,
+    },
 };
 
 /// Max wait for per-source ingest lock before returning LockError::Timeout.
@@ -47,6 +55,7 @@ pub struct IngestStats {
     pub skipped: usize,
     pub dropped_by_gate: usize,
     pub drawer_ids: Vec<String>,
+    pub noise_bytes_stripped: Option<u64>,
     /// Time waited acquiring the per-source ingest lock (P9-B). `None`
     /// when the lock was bypassed (e.g. dry-run) or when no wait was
     /// needed and the path took the fast exit before lock acquisition.
@@ -61,6 +70,11 @@ pub struct IngestOptions<'a> {
     pub project_id: Option<&'a str>,
     pub gating: Option<&'a IngestGatingConfig>,
     pub prototype_classifier: Option<&'a PrototypeClassifier>,
+    pub source_file_override: Option<&'a str>,
+    pub replace_existing_source: bool,
+    pub no_strip_noise: bool,
+    pub diary_rollup: bool,
+    pub diary_rollup_day: Option<&'a str>,
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -103,6 +117,12 @@ pub enum IngestError {
         #[source]
         source: crate::core::db::DbError,
     },
+    #[error("failed to replace source drawers for {source_file}")]
+    ReplaceSource {
+        source_file: String,
+        #[source]
+        source: crate::core::db::DbError,
+    },
     #[error("failed to insert vector for {drawer_id}")]
     InsertVector {
         drawer_id: String,
@@ -113,6 +133,20 @@ pub enum IngestError {
         "embedding dimension mismatch: drawer_vectors uses {current_dim}d but embedder returned {new_dim}d; run `mempal reindex --embedder <name>` before ingesting more content"
     )]
     VectorDimensionMismatch { current_dim: usize, new_dim: usize },
+    #[error("diary_rollup requires wing=\"agent-diary\", got wing=\"{wing}\"")]
+    DiaryRollupWrongWing { wing: String },
+    #[error("diary_rollup requires an explicit non-empty room")]
+    DiaryRollupMissingRoom,
+    #[error(
+        "daily rollup drawer {drawer_id} would exceed {limit_bytes} bytes ({attempted_bytes} bytes)"
+    )]
+    DailyRollupFull {
+        drawer_id: String,
+        limit_bytes: usize,
+        attempted_bytes: usize,
+    },
+    #[error("embedder returned no vector for {drawer_id}")]
+    EmbedderReturnedNoVector { drawer_id: String },
     #[error("failed to acquire ingest lock: {0}")]
     Lock(#[from] lock::LockError),
     #[error("failed to read directory {path}")]
@@ -165,6 +199,11 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             project_id: None,
             gating: None,
             prototype_classifier: None,
+            source_file_override: None,
+            replace_existing_source: false,
+            no_strip_noise: false,
+            diary_rollup: false,
+            diary_rollup_day: None,
         },
     )
     .await
@@ -192,13 +231,45 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
     }
 
     let format = detect_format(&content);
-    let normalized =
-        normalize_content(&content, format).map_err(|source| IngestError::Normalize {
-            path: path.to_path_buf(),
-            source,
-        })?;
+
+    // Stage 1: Normalize (upstream noise stripping integrated)
+    let normalize_output = normalize_content_with_options(
+        &content,
+        format,
+        NormalizeOptions {
+            strip_noise: !options.no_strip_noise,
+        },
+    )
+    .map_err(|source| IngestError::Normalize {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let normalized = normalize_output.content;
+    let noise_bytes_stripped = normalize_output.noise_bytes_stripped;
+
+    // Stage 2: Privacy scrubbing (fork) — BEFORE chunking
     let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
     let scrubbed = config.scrub_content_with_compiled(&normalized, compiled_privacy.as_ref());
+
+    // Stage 3: Diary rollup early-return (upstream)
+    if options.diary_rollup {
+        let mut outcome = diary::ingest_diary_rollup(
+            db,
+            embedder,
+            &scrubbed,
+            wing,
+            diary::DiaryRollupOptions {
+                room: options.room,
+                day: options.diary_rollup_day,
+                dry_run: options.dry_run,
+                importance: 0,
+            },
+        )
+        .await?;
+        outcome.stats.noise_bytes_stripped = noise_bytes_stripped;
+        return Ok(outcome.stats);
+    }
+
     let resolved_room = match options.room {
         Some(room) => room.to_string(),
         None => {
@@ -213,6 +284,8 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
     };
     let source_display = path.to_string_lossy();
     let chunker_config = &config.chunker;
+
+    // Stage 4: Chunking
     let chunks = match format {
         Format::ClaudeJsonl | Format::ChatGptJson | Format::CodexJsonl | Format::SlackJson => {
             chunk_conversation_token_aware(
@@ -235,9 +308,13 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
 
     let mut stats = IngestStats {
         files: 1,
+        noise_bytes_stripped,
         ..IngestStats::default()
     };
-    let source_file = normalize_source_file(path, options.source_root);
+    let source_file = options
+        .source_file_override
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| normalize_source_file(path, options.source_root));
 
     // Per-source ingest lock (P9-B). Guards dedup-check + insert critical
     // section against concurrent Claude↔Codex ingests of the same source.
@@ -252,16 +329,26 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         Some(guard)
     };
 
+    let source_type = source_type_for(format);
+    if options.replace_existing_source && !options.dry_run {
+        db.replace_active_source_drawers(&source_file, wing, Some(resolved_room.as_str()))
+            .map_err(|source| IngestError::ReplaceSource {
+                source_file: source_file.clone(),
+                source,
+            })?;
+    }
+
     let mut pending = Vec::new();
 
     for (chunk_index, chunk) in chunks.iter().enumerate() {
-        let (drawer_id, exists) = db
-            .resolve_ingest_drawer_id(
-                wing,
-                Some(resolved_room.as_str()),
-                chunk,
-                options.project_id,
-            )
+        let drawer_id = build_bootstrap_evidence_drawer_id(
+            wing,
+            Some(resolved_room.as_str()),
+            chunk,
+            &source_type,
+        );
+        let exists = db
+            .drawer_exists(&drawer_id)
             .map_err(|source| IngestError::CheckDrawer {
                 drawer_id: build_drawer_id(wing, Some(resolved_room.as_str()), chunk),
                 source,
@@ -276,6 +363,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             continue;
         }
 
+        // Stage 5: Judge gating (fork) — after chunking, before embedding
         if let Some(gating) = options.gating {
             let candidate = gating::IngestCandidate {
                 content: chunk.to_string(),
@@ -315,6 +403,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         return Ok(stats);
     }
 
+    // Stage 6: Embedding
     let chunk_refs = pending
         .iter()
         .map(|(_, chunk, _)| chunk.as_ref())
@@ -355,17 +444,22 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         }
     }
 
-    for ((chunk_index, chunk, drawer_id), vector) in pending.into_iter().zip(vectors.into_iter()) {
-        let drawer = Drawer {
+    // Stage 7: Storage with all fields from both sides
+    for ((chunk_index, chunk, drawer_id), vector) in pending.into_iter().zip(vectors) {
+        let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
             id: drawer_id.clone(),
             content: chunk.to_string(),
             wing: wing.to_string(),
             room: Some(resolved_room.clone()),
             source_file: Some(source_file.clone()),
-            source_type: source_type_for(format),
+            source_type: source_type.clone(),
             added_at: iso_timestamp(),
             chunk_index: Some(chunk_index as i64),
             importance: 0,
+        });
+        let drawer = Drawer {
+            normalize_version: CURRENT_NORMALIZE_VERSION,
+            ..drawer
         };
 
         db.insert_drawer_with_project(&drawer, options.project_id)
@@ -404,6 +498,11 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             project_id: None,
             gating: None,
             prototype_classifier: None,
+            source_file_override: None,
+            replace_existing_source: false,
+            no_strip_noise: false,
+            diary_rollup: false,
+            diary_rollup_day: None,
         },
     )
     .await
@@ -446,11 +545,21 @@ pub async fn ingest_dir_with_options<E: Embedder + ?Sized>(
                 stats.skipped += file_stats.skipped;
                 stats.dropped_by_gate += file_stats.dropped_by_gate;
                 stats.drawer_ids.extend(file_stats.drawer_ids);
+                stats.noise_bytes_stripped =
+                    merge_optional_sum(stats.noise_bytes_stripped, file_stats.noise_bytes_stripped);
             }
         }
     }
 
     Ok(stats)
+}
+
+fn merge_optional_sum(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn source_type_for(format: Format) -> SourceType {

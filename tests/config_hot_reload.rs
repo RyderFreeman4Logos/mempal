@@ -242,10 +242,7 @@ async fn ingest(server: &MempalMcpServer, content: &str) -> String {
             content: content.to_string(),
             wing: "mempal".to_string(),
             room: Some("config-hot-reload".to_string()),
-            source: None,
-            project_id: None,
-            dry_run: None,
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
         .expect("ingest should succeed")
@@ -339,10 +336,7 @@ async fn test_ingest_gating_hot_reload_applies_without_server_restart() {
             content: "tiny".to_string(),
             wing: "mempal".to_string(),
             room: Some("config-hot-reload".to_string()),
-            source: None,
-            project_id: None,
-            dry_run: None,
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
         .expect("ingest should return structured reject")

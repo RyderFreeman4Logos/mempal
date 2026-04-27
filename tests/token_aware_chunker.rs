@@ -96,10 +96,7 @@ async fn test_ingest_respects_max_input_tokens() {
         IngestOptions {
             room: Some("chunker-test"),
             source_root: source.parent(),
-            dry_run: false,
-            project_id: None,
-            gating: None,
-            prototype_classifier: None,
+            ..IngestOptions::default()
         },
     )
     .await
@@ -156,10 +153,7 @@ async fn test_ingest_cjk_and_base64_within_limits() {
         IngestOptions {
             room: Some("cjk-test"),
             source_root: cjk_source.parent(),
-            dry_run: false,
-            project_id: None,
-            gating: None,
-            prototype_classifier: None,
+            ..IngestOptions::default()
         },
     )
     .await
@@ -180,10 +174,7 @@ async fn test_ingest_cjk_and_base64_within_limits() {
         IngestOptions {
             room: Some("b64-test"),
             source_root: b64_source.parent(),
-            dry_run: false,
-            project_id: None,
-            gating: None,
-            prototype_classifier: None,
+            ..IngestOptions::default()
         },
     )
     .await

@@ -153,6 +153,7 @@ async fn test_search_deadline_bm25_fallback() {
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance: 2,
+            ..Drawer::default()
         },
         Some("default"),
     )
@@ -166,13 +167,8 @@ async fn test_search_deadline_bm25_fallback() {
             server
                 .mempal_search(Parameters(SearchRequest {
                     query: "fallback keyword".to_string(),
-                    wing: None,
-                    room: None,
                     top_k: Some(5),
-                    project_id: None,
-                    include_global: None,
-                    all_projects: None,
-                    disable_progressive: None,
+                    ..SearchRequest::default()
                 }))
                 .await
         }
@@ -243,10 +239,8 @@ async fn ingest_with_config(db_path: PathBuf, config: Config) -> Result<serde_js
             content: "blocked until recover".to_string(),
             wing: "test".to_string(),
             room: Some("recover".to_string()),
-            source: None,
-            project_id: None,
             dry_run: Some(false),
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await?;
     Ok(serde_json::to_value(response.0).expect("serialize response"))

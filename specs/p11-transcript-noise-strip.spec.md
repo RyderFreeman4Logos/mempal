@@ -21,7 +21,7 @@ mempalace 的方案：严格的 **scoped** noise-strip（只对 Claude Code JSON
 - **新增模块 `src/ingest/noise.rs`**：
   - `pub fn strip_claude_jsonl_noise(content: &str) -> String`
   - `pub fn strip_codex_rollout_noise(content: &str) -> String`
-  - 内部 **正则白名单** 式剥离，逐行扫描：
+  - 内部 **dependency-free 白名单扫描** 式剥离，逐行扫描（不引新 dep）：
     - 匹配 `<system-reminder>(.|\n)*?</system-reminder>` → 去
     - 匹配独立行 `<command-name>...</command-name>` → 去
     - 匹配 `[{"type":"tool_use_id","id":"..."}]` 裸块 → 去
@@ -29,7 +29,7 @@ mempalace 的方案：严格的 **scoped** noise-strip（只对 Claude Code JSON
     - 匹配 Codex rollout 里的 `[session ... started]` / `[session ... ended]` → 去
     - 其他内容原样保留（包括 code block、user message quote、tool result 文本）
 - **触发路径严格 scope**：
-  - 只在 `detect.rs` 识别出 `Format::ClaudeJsonl` 或 `Format::CodexRollout` 时，`normalize.rs` 调对应 strip 函数
+  - 只在 `detect.rs` 识别出 `Format::ClaudeJsonl` 或当前代码中的 `Format::CodexJsonl`（Codex rollout JSONL）时，`normalize.rs` 调对应 strip 函数
   - 其他 format（Markdown / Slack DM / Plain Text / YAML）**禁止**走这条路径
 - **Verbatim 保留保证**（测试覆盖）：
   - 代码块 `\`\`\`...\`\`\`` 跨行保留
@@ -37,9 +37,9 @@ mempalace 的方案：严格的 **scoped** noise-strip（只对 Claude Code JSON
   - 中文 / emoji / 引号字节级不变
 - **不 bump schema**：这是 normalize 层改动；但**触发 normalize_version bump**（若 P10 normalize_version spec 已 merge），`CURRENT_NORMALIZE_VERSION: 1 → 2`。历史 drawer 通过 `mempal reindex --stale` 重处理
 - **Normalize version 依赖**：**本 spec 依赖 P10 `p10-normalize-version` 先落地**；没有 normalize_version 机制时，历史 drawer 无法被选择性重刷
-- **Metrics**：ingest 完成后如果触发 noise strip，`IngestOutcome` 追加 `noise_bytes_stripped: Option<u64>`（debug 可见）
+- **Metrics**：ingest 完成后如果触发 noise strip，`IngestStats` 追加 `noise_bytes_stripped: Option<u64>`（debug 可见）
 - **CLI**：`mempal ingest` 自动走 strip（由 detect 决定），用户无感；如需强制禁用加 `--no-strip-noise` flag（默认 strip）
-- **Fallback**：regex 失败（format detection 误判）时走**整体保留**不 panic
+- **Fallback**：白名单扫描无匹配或 format detection 误判时走**整体保留**不 panic
 
 ## Boundaries
 
@@ -47,12 +47,12 @@ mempalace 的方案：严格的 **scoped** noise-strip（只对 Claude Code JSON
 - `src/ingest/noise.rs`（新增）
 - `src/ingest/normalize.rs`（调 noise strip；bump CURRENT_NORMALIZE_VERSION 到 2）
 - `src/ingest/detect.rs`（如需识别更多格式变种）
-- `src/ingest/mod.rs`（`IngestOutcome` 加 `noise_bytes_stripped` 字段）
-- `src/cli.rs`（`--no-strip-noise` flag）
+- `src/ingest/mod.rs`（`IngestStats` 加 `noise_bytes_stripped` 字段）
+- `src/main.rs`（`--no-strip-noise` flag）
 - `tests/noise_strip.rs`（新增，含 verbatim 保全断言）
 
 ### Forbidden
-- 不对非 ClaudeJsonl / CodexRollout 格式运行 noise strip
+- 不对非 ClaudeJsonl / CodexJsonl 格式运行 noise strip
 - 不改变代码块内容
 - 不改 user message 的字节（只去 system 生成的 UI chrome）
 - 不引新 dep（现有 `regex` 足够）

@@ -49,6 +49,7 @@ fn insert_drawer_with_raw_added_at(db_path: &Path, id: &str, added_at: &str) {
         added_at: "placeholder".to_string(), // will be overwritten below
         chunk_index: Some(0),
         importance: 0,
+        ..Drawer::default()
     };
     db.insert_drawer_with_project(&drawer, None)
         .expect("insert drawer");
@@ -296,6 +297,7 @@ fn test_ingest_path_writes_iso_not_epoch() {
         added_at: iso_timestamp(),
         chunk_index: Some(0),
         importance: 0,
+        ..Drawer::default()
     };
     db.insert_drawer_with_project(&drawer, None)
         .expect("insert drawer");

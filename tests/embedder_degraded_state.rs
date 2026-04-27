@@ -87,10 +87,8 @@ async fn test_degraded_state_blocks_mcp_writes() {
             content: "blocked".to_string(),
             wing: "test".to_string(),
             room: Some("room".to_string()),
-            source: None,
-            project_id: None,
             dry_run: Some(false),
-            importance: None,
+            ..IngestRequest::default()
         }))
         .await
     {
@@ -108,6 +106,7 @@ async fn test_degraded_state_blocks_mcp_writes() {
             include_global: None,
             all_projects: None,
             disable_progressive: None,
+            ..SearchRequest::default()
         }))
         .await
         .expect("search should still work")

@@ -286,6 +286,7 @@ fn insert_projected_drawer(
         added_at: "1713000000".to_string(),
         chunk_index: Some(0),
         importance: 0,
+        ..Drawer::default()
     })
     .expect("insert drawer");
     db.insert_vector(id, vector).expect("insert vector");
@@ -616,6 +617,7 @@ fn test_lazy_create_after_v5_has_project_id_column() {
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance: 0,
+            ..Drawer::default()
         },
         Some("proj-lazy"),
     )
@@ -898,6 +900,7 @@ fn test_project_migrate_batched_does_not_block_ingest() {
                     added_at: "1713000000".to_string(),
                     chunk_index: Some(0),
                     importance: 0,
+                    ..Drawer::default()
                 });
                 match result {
                     Ok(()) => {
@@ -1250,6 +1253,7 @@ async fn test_search_hard_filters_by_project_id() {
             include_global: None,
             all_projects: None,
             disable_progressive: None,
+            ..SearchRequest::default()
         },
     )
     .await;
@@ -1300,6 +1304,7 @@ async fn test_search_include_global_returns_project_and_null() {
                 include_global: Some(true),
                 all_projects: None,
                 disable_progressive: None,
+                ..SearchRequest::default()
             },
         )
         .await,
@@ -1343,6 +1348,7 @@ async fn test_search_without_project_id_returns_all() {
                 include_global: None,
                 all_projects: None,
                 disable_progressive: None,
+                ..SearchRequest::default()
             },
         )
         .await,
@@ -1401,6 +1407,7 @@ async fn test_strict_isolation_without_project_id_returns_null_only() {
             include_global: None,
             all_projects: None,
             disable_progressive: None,
+            ..SearchRequest::default()
         },
     )
     .await;
@@ -1426,6 +1433,7 @@ async fn test_large_project_does_not_crowd_out_small() {
                 added_at: "1713000000".to_string(),
                 chunk_index: Some(0),
                 importance: 0,
+                ..Drawer::default()
             },
             Some("proj-A"),
         )
@@ -1446,6 +1454,7 @@ async fn test_large_project_does_not_crowd_out_small() {
                 added_at: format!("{}", 1_713_100_000 + index),
                 chunk_index: Some(0),
                 importance: 0,
+                ..Drawer::default()
             },
             Some("proj-B"),
         )
@@ -1466,6 +1475,7 @@ async fn test_large_project_does_not_crowd_out_small() {
                 include_global: None,
                 all_projects: None,
                 disable_progressive: None,
+                ..SearchRequest::default()
             },
         )
         .await,
@@ -1837,6 +1847,7 @@ async fn test_tunnel_resolver_bypasses_project_filter() {
             include_global: None,
             all_projects: None,
             disable_progressive: None,
+            ..SearchRequest::default()
         },
     )
     .await;
@@ -1909,6 +1920,7 @@ async fn test_tunnel_resolved_drawer_marks_source_cross_project() {
             include_global: None,
             all_projects: None,
             disable_progressive: None,
+            ..SearchRequest::default()
         },
     )
     .await;
@@ -2211,6 +2223,7 @@ async fn test_mcp_search_without_project_runs_unscoped_when_not_strict() {
             include_global: None,
             all_projects: None,
             disable_progressive: None,
+            ..SearchRequest::default()
         },
     )
     .await;
@@ -2289,6 +2302,7 @@ async fn test_mcp_search_without_project_warns_and_returns_empty_when_strict() {
             include_global: None,
             all_projects: None,
             disable_progressive: None,
+            ..SearchRequest::default()
         },
     )
     .await;

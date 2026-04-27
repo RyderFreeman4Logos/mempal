@@ -129,6 +129,7 @@ fn seed_db(db_path: &Path) {
             added_at: format!("17130000{index:02}"),
             chunk_index: Some(index as i64),
             importance: 0,
+            ..Drawer::default()
         })
         .expect("insert drawer");
         db.insert_vector(&id, &[0.9, 0.8])

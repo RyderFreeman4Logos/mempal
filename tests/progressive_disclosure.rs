@@ -211,6 +211,7 @@ fn insert_drawer(db_path: &Path, id: &str, content: &str, source_file: &str, ins
         added_at: "1713000000".to_string(),
         chunk_index: Some(0),
         importance: 4,
+        ..Drawer::default()
     })
     .expect("insert drawer");
     if insert_vector {
@@ -234,6 +235,7 @@ async fn search(
             include_global: None,
             all_projects: None,
             disable_progressive,
+            ..SearchRequest::default()
         }))
         .await
         .expect("search should succeed")
