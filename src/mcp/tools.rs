@@ -191,6 +191,25 @@ pub struct DeleteResponse {
     pub system_warnings: Vec<SystemWarning>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RollbackRequest {
+    pub since: String,
+    pub wing: Option<String>,
+    pub room: Option<String>,
+    pub project_id: Option<String>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RollbackResponse {
+    pub since: String,
+    pub deleted_count: usize,
+    pub drawer_ids: Vec<String>,
+    pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct IngestResponse {
     /// ID of the first (or only) drawer created. For backward compatibility,

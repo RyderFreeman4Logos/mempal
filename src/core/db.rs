@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, params, params_from_iter, types::Value as SqlValue,
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -1039,6 +1041,50 @@ impl Database {
         Ok(affected > 0)
     }
 
+    pub fn soft_delete_drawers_since(
+        &self,
+        since: &str,
+        wing: Option<&str>,
+        room: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Vec<String>, DbError> {
+        let mut sql = String::from(
+            "UPDATE drawers SET deleted_at = ?1 \
+             WHERE added_at > ?2 AND deleted_at IS NULL",
+        );
+        let mut values = vec![
+            SqlValue::Text(super::utils::current_timestamp()),
+            SqlValue::Text(since.to_string()),
+        ];
+        append_drawers_since_filters(&mut sql, &mut values, wing, room, project_id);
+        sql.push_str(" RETURNING id");
+
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(values), |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn count_drawers_since(
+        &self,
+        since: &str,
+        wing: Option<&str>,
+        room: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM drawers \
+             WHERE added_at > ?1 AND deleted_at IS NULL",
+        );
+        let mut values = vec![SqlValue::Text(since.to_string())];
+        append_drawers_since_filters(&mut sql, &mut values, wing, room, project_id);
+
+        Ok(self
+            .conn
+            .query_row(&sql, params_from_iter(values), |row| row.get(0))?)
+    }
+
     pub fn purge_deleted(&self, before: Option<&str>) -> Result<u64, DbError> {
         // First collect IDs to purge, then delete from both tables
         let ids: Vec<String> = if let Some(before) = before {
@@ -1697,6 +1743,21 @@ fn read_user_version(conn: &Connection) -> Result<u32, DbError> {
 fn set_user_version(conn: &Connection, version: u32) -> Result<(), DbError> {
     conn.execute_batch(&format!("PRAGMA user_version = {version};"))?;
     Ok(())
+}
+
+fn append_drawers_since_filters(
+    sql: &mut String,
+    values: &mut Vec<SqlValue>,
+    wing: Option<&str>,
+    room: Option<&str>,
+    project_id: Option<&str>,
+) {
+    for (column, value) in [("wing", wing), ("room", room), ("project_id", project_id)] {
+        if let Some(value) = value {
+            values.push(SqlValue::Text(value.to_string()));
+            sql.push_str(&format!(" AND {column} = ?{}", values.len()));
+        }
+    }
 }
 
 const V2_MIGRATION_SQL: &str = r#"
