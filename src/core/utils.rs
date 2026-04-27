@@ -70,6 +70,13 @@ pub fn iso_timestamp() -> String {
     format_rfc3339(UNIX_EPOCH + Duration::from_secs(secs))
 }
 
+/// Validate an RFC 3339 timestamp and normalize it to UTC seconds precision.
+pub fn normalize_rfc3339_timestamp(value: &str) -> Option<String> {
+    let secs = parse_rfc3339(value)?;
+    let secs = u64::try_from(secs).ok()?;
+    Some(format_rfc3339(UNIX_EPOCH + Duration::from_secs(secs)))
+}
+
 /// Attempt to normalise a stored `added_at` value to RFC 3339 UTC.
 ///
 /// Returns:
@@ -216,5 +223,14 @@ mod tests {
         assert_eq!(normalize_added_at("not-a-date"), None);
         assert_eq!(normalize_added_at(""), None);
         assert_eq!(normalize_added_at("   "), None);
+    }
+
+    #[test]
+    fn test_normalize_rfc3339_timestamp_converts_offset_to_utc_z() {
+        assert_eq!(
+            normalize_rfc3339_timestamp("2026-04-25T20:00:00+08:00"),
+            Some("2026-04-25T12:00:00Z".to_string())
+        );
+        assert_eq!(normalize_rfc3339_timestamp("not-a-date"), None);
     }
 }

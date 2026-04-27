@@ -23,7 +23,10 @@ use mempal::core::{
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
     reindex::ReindexProgressStore,
     types::TaxonomyEntry,
-    utils::{build_triple_id, current_timestamp, normalize_added_at as normalize_added_at_value},
+    utils::{
+        build_triple_id, current_timestamp, normalize_added_at as normalize_added_at_value,
+        normalize_rfc3339_timestamp,
+    },
 };
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
@@ -67,6 +70,23 @@ struct IngestCommandOptions<'a> {
     no_gate: bool,
     dry_run: bool,
     json: bool,
+}
+
+struct RollbackCommandOptions<'a> {
+    since: &'a str,
+    wing: Option<&'a str>,
+    room: Option<&'a str>,
+    project: Option<&'a str>,
+    dry_run: bool,
+    json: bool,
+}
+
+#[derive(Serialize)]
+struct RollbackOutput {
+    since: String,
+    deleted_count: usize,
+    drawer_ids: Vec<String>,
+    dry_run: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -136,6 +156,20 @@ enum Commands {
     },
     Delete {
         drawer_id: String,
+    },
+    Rollback {
+        #[arg(long)]
+        since: String,
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long)]
+        room: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
     },
     Purge {
         /// Only purge drawers soft-deleted before this ISO timestamp
@@ -547,6 +581,25 @@ fn run() -> Result<()> {
         )),
         Commands::Project { command } => project_command(&db, command),
         Commands::Delete { drawer_id } => delete_command(&db, &drawer_id),
+        Commands::Rollback {
+            since,
+            wing,
+            room,
+            project,
+            dry_run,
+            json,
+        } => rollback_command(
+            &db,
+            config.as_ref(),
+            RollbackCommandOptions {
+                since: &since,
+                wing: wing.as_deref(),
+                room: room.as_deref(),
+                project: project.as_deref(),
+                dry_run,
+                json,
+            },
+        ),
         Commands::Purge { before } => purge_command(&db, before.as_deref()),
         Commands::WakeUp { format } => wake_up_command(&db, format),
         Commands::Prime(_) => unreachable!(),
@@ -1425,6 +1478,62 @@ fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
             bail!("drawer not found: {drawer_id}");
         }
     }
+    Ok(())
+}
+
+fn rollback_command(
+    db: &Database,
+    config: &Config,
+    options: RollbackCommandOptions<'_>,
+) -> Result<()> {
+    let since = normalize_rfc3339_timestamp(options.since)
+        .with_context(|| format!("invalid --since ISO 8601 timestamp: {}", options.since))?;
+    let current_dir = env::current_dir().ok();
+    let project_id = resolve_project_id(options.project, config, current_dir.as_deref())
+        .context("failed to resolve rollback project id")?;
+
+    let output = if options.dry_run {
+        let count = db
+            .count_drawers_since(&since, options.wing, options.room, project_id.as_deref())
+            .context("failed to count rollback drawers")?;
+        RollbackOutput {
+            since,
+            deleted_count: count.max(0) as usize,
+            drawer_ids: Vec::new(),
+            dry_run: true,
+        }
+    } else {
+        let drawer_ids = db
+            .soft_delete_drawers_since(&since, options.wing, options.room, project_id.as_deref())
+            .context("failed to rollback drawers")?;
+        RollbackOutput {
+            since,
+            deleted_count: drawer_ids.len(),
+            drawer_ids,
+            dry_run: false,
+        }
+    };
+
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string(&output).context("failed to serialize rollback output")?
+        );
+    } else if output.dry_run {
+        println!(
+            "would delete {} drawers since {}",
+            output.deleted_count, output.since
+        );
+    } else {
+        println!(
+            "deleted {} drawers since {}",
+            output.deleted_count, output.since
+        );
+        for drawer_id in &output.drawer_ids {
+            println!("  {drawer_id}");
+        }
+    }
+
     Ok(())
 }
 

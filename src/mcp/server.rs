@@ -8,7 +8,10 @@ use crate::core::{
     db::Database,
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
     types::{Drawer, SourceType, Triple},
-    utils::{build_triple_id, current_timestamp, iso_timestamp, source_file_or_synthetic},
+    utils::{
+        build_triple_id, current_timestamp, iso_timestamp, normalize_rfc3339_timestamp,
+        source_file_or_synthetic,
+    },
 };
 use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
 use crate::embed::{EmbedderFactory, global_embed_status};
@@ -33,9 +36,9 @@ use super::tools::{
     IngestResponse, KgRequest, KgResponse, KgStatsDto, MAX_READ_DRAWERS_MAX_COUNT,
     MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse,
     QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
-    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, StatusResponse,
-    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TripleDto, TunnelDto,
-    TunnelsResponse,
+    RollbackRequest, RollbackResponse, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
+    SearchResultDto, StatusResponse, SystemWarning, TaxonomyEntryDto, TaxonomyRequest,
+    TaxonomyResponse, TripleDto, TunnelDto, TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -1058,6 +1061,62 @@ impl MempalMcpServer {
             drawer_id: request.drawer_id,
             deleted,
             message,
+            system_warnings: current_system_warnings(),
+        }))
+    }
+
+    #[tool(
+        name = "mempal_rollback",
+        description = "Roll back (soft-delete) all drawers created after a given timestamp. Scope can be narrowed by wing/room/project. Use dry_run=true to preview without mutating."
+    )]
+    pub async fn mempal_rollback(
+        &self,
+        Parameters(request): Parameters<RollbackRequest>,
+    ) -> std::result::Result<Json<RollbackResponse>, ErrorData> {
+        let since = normalize_rfc3339_timestamp(&request.since).ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!(
+                    "invalid since timestamp; expected RFC3339: {}",
+                    request.since
+                ),
+                None,
+            )
+        })?;
+        let project_id = match request.project_id.as_deref() {
+            Some(project_id) => Some(validate_project_id(project_id).map_err(|error| {
+                ErrorData::invalid_params(format!("invalid project scope: {error}"), None)
+            })?),
+            None => None,
+        };
+        let db = self.open_db()?;
+        let dry_run = request.dry_run.unwrap_or(false);
+        let (deleted_count, drawer_ids) = if dry_run {
+            let count = db
+                .count_drawers_since(
+                    &since,
+                    request.wing.as_deref(),
+                    request.room.as_deref(),
+                    project_id.as_deref(),
+                )
+                .map_err(db_error)?;
+            (count.max(0) as usize, Vec::new())
+        } else {
+            let drawer_ids = db
+                .soft_delete_drawers_since(
+                    &since,
+                    request.wing.as_deref(),
+                    request.room.as_deref(),
+                    project_id.as_deref(),
+                )
+                .map_err(db_error)?;
+            (drawer_ids.len(), drawer_ids)
+        };
+
+        Ok(Json(RollbackResponse {
+            since,
+            deleted_count,
+            drawer_ids,
+            dry_run,
             system_warnings: current_system_warnings(),
         }))
     }
