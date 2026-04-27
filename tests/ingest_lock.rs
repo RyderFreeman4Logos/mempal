@@ -12,7 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mempal::core::db::Database;
 use mempal::embed::{Embedder, Result as EmbedResult};
-use mempal::ingest::{IngestOptions, ingest_file_with_options};
+use mempal::ingest::{IngestOptions, ingest_dir_with_options, ingest_file_with_options};
 use tempfile::TempDir;
 
 /// Stub embedder: returns a fixed vector regardless of input. 3 dims so
@@ -148,6 +148,65 @@ fn test_concurrent_ingest_same_source_single_drawer() {
     assert_eq!(
         waited, 1,
         "expected exactly one waiter; a={stats_a:?} b={stats_b:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_ingest_dir_stats_include_created_drawer_ids() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("init db");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    write_file(&source_dir, "alpha.md", "alpha drawer id fixture");
+    write_file(&source_dir, "beta.md", "beta drawer id fixture");
+
+    let stats = ingest_dir_with_options(
+        &db,
+        &StubEmbedder,
+        &source_dir,
+        "test",
+        IngestOptions::default(),
+    )
+    .await
+    .expect("ingest dir");
+
+    assert_eq!(stats.files, 2);
+    assert!(!stats.drawer_ids.is_empty(), "drawer_ids must be reported");
+    assert_eq!(
+        stats.drawer_ids.len(),
+        stats.chunks,
+        "each inserted chunk must report one drawer_id"
+    );
+}
+
+#[tokio::test]
+async fn test_dry_run_ingest_stats_do_not_include_drawer_ids() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("init db");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    write_file(&source_dir, "alpha.md", "dry run drawer id fixture");
+
+    let stats = ingest_dir_with_options(
+        &db,
+        &StubEmbedder,
+        &source_dir,
+        "test",
+        IngestOptions {
+            dry_run: true,
+            ..IngestOptions::default()
+        },
+    )
+    .await
+    .expect("dry-run ingest dir");
+
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.chunks, 1);
+    assert!(
+        stats.drawer_ids.is_empty(),
+        "dry-run should not report drawer_ids"
     );
 }
 
