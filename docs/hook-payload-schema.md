@@ -142,4 +142,3 @@ cat <<'JSON' | mempal hook hook_user_prompt
 }
 JSON
 ```
-

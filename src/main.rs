@@ -1666,7 +1666,7 @@ fn scrub_metadata_for_audit_log(
         .iter()
         .map(|(key, value)| {
             (
-                key.clone(),
+                config.scrub_content_with_compiled(key, compiled_privacy.as_ref()),
                 scrub_metadata_value_for_audit_log(value, &config, compiled_privacy.as_ref()),
             )
         })
@@ -1692,7 +1692,7 @@ fn scrub_metadata_value_for_audit_log(
             map.iter()
                 .map(|(key, value)| {
                     (
-                        key.clone(),
+                        config.scrub_content_with_compiled(key, compiled_privacy),
                         scrub_metadata_value_for_audit_log(value, config, compiled_privacy),
                     )
                 })

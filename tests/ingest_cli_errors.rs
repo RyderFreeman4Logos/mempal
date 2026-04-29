@@ -311,6 +311,7 @@ fn test_ingest_stdin_scrubs_metadata_in_audit_log() {
         "wing": "privacy-wing",
         "metadata": {
             "token": secret,
+            secret.clone(): "secret-in-key",
             "nested": {
                 "tokens": [format!("prefix {secret}")]
             }
