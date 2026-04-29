@@ -14,7 +14,7 @@ use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::api::{ApiState, DEFAULT_REST_ADDR, serve as serve_rest_api};
 use mempal::context::{ContextPack, ContextRequest, assemble_context};
 use mempal::core::{
-    config::{Config, ConfigHandle, default_config_path},
+    config::{CompiledPrivacyConfig, Config, ConfigHandle, default_config_path},
     db::Database,
     priming::PrimingRequest,
     project::{
@@ -41,9 +41,10 @@ use mempal::field_taxonomy::{FieldTaxonomyEntry, field_taxonomy};
 use mempal::ingest::gating::compile_classifier_from_config;
 use mempal::ingest::{
     IngestOptions, IngestStats,
+    detect::detect_format,
     gating::{IngestCandidate, evaluate_tier1, evaluate_tier2},
     ingest_dir_with_options, ingest_file_with_options,
-    normalize::CURRENT_NORMALIZE_VERSION,
+    normalize::{CURRENT_NORMALIZE_VERSION, NormalizeOptions, normalize_content_with_options},
     reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
 };
 use mempal::knowledge_anchor::{PublishAnchorRequest, publish_anchor};
@@ -58,6 +59,7 @@ use mempal::mcp::MempalMcpServer;
 use mempal::observability;
 use mempal::search::{SearchFilters, SearchOptions, search_with_all_options};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod longmemeval;
@@ -1344,6 +1346,8 @@ struct StdinIngestRecord {
     metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+const MAX_STDIN_INGEST_BYTES: usize = 10 * 1024 * 1024;
+
 #[derive(Serialize)]
 struct StdinIngestJsonOutput<'a> {
     drawer_ids: &'a [String],
@@ -1371,21 +1375,30 @@ async fn ingest_stdin_command(
         bail!("--diary-rollup is only supported for directory ingest");
     }
 
-    let mut input = String::new();
+    let mut input = Vec::new();
     std::io::stdin()
-        .read_to_string(&mut input)
+        .take(MAX_STDIN_INGEST_BYTES as u64 + 1)
+        .read_to_end(&mut input)
         .context("failed to read stdin")?;
+    if input.len() > MAX_STDIN_INGEST_BYTES {
+        bail!(
+            "stdin payload exceeds {} byte limit",
+            MAX_STDIN_INGEST_BYTES
+        );
+    }
+    let input = String::from_utf8(input).context("stdin payload is not valid UTF-8")?;
     let record: StdinIngestRecord =
         serde_json::from_str(&input).context("failed to parse stdin JSON object")?;
 
-    let content = record
+    let raw_content = record
         .content
         .as_deref()
         .context("stdin JSON object is missing required `content` field")?
         .to_string();
-    if content.trim().is_empty() {
+    if raw_content.trim().is_empty() {
         bail!("stdin JSON `content` field must not be empty");
     }
+    let content = normalize_stdin_content(&raw_content, options.no_strip_noise)?;
 
     let wing = options
         .wing
@@ -1464,8 +1477,14 @@ async fn ingest_stdin_command(
         .into_iter()
         .next()
         .context("embedder returned no vector for stdin content")?;
-    let source_hint = record.source_file.as_deref().or(record.source.as_deref());
-    let source_file = source_file_or_synthetic(&drawer_id, source_hint);
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let scrub = |s: &str| config.scrub_content_with_compiled(s, compiled_privacy.as_ref());
+    let source_hint = record
+        .source_file
+        .as_deref()
+        .or(record.source.as_deref())
+        .map(&scrub);
+    let source_file = source_file_or_synthetic(&drawer_id, source_hint.as_deref());
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: drawer_id.clone(),
         content,
@@ -1493,6 +1512,25 @@ async fn ingest_stdin_command(
         .context("failed to append ingest audit log")?;
     print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
     Ok(())
+}
+
+fn normalize_stdin_content(content: &str, no_strip_noise: bool) -> Result<String> {
+    let format = detect_format(content);
+    let normalize_output = normalize_content_with_options(
+        content,
+        format,
+        NormalizeOptions {
+            strip_noise: !no_strip_noise,
+        },
+    )
+    .context("failed to normalize stdin content")?;
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let scrubbed =
+        config.scrub_content_with_compiled(&normalize_output.content, compiled_privacy.as_ref());
+    if scrubbed.trim().is_empty() {
+        bail!("stdin JSON `content` field must not be empty after normalization");
+    }
+    Ok(scrubbed)
 }
 
 fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> Result<()> {
@@ -1606,14 +1644,19 @@ fn append_ingest_stdin_audit_log(
         .append(true)
         .open(&audit_path)
         .with_context(|| format!("failed to open audit log {}", audit_path.display()))?;
+    let metadata = record.metadata.as_ref().map(scrub_metadata_for_audit_log);
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let scrub = |s: &str| config.scrub_content_with_compiled(s, compiled_privacy.as_ref());
+    let source = record.source.as_deref().map(&scrub);
+    let source_file = record.source_file.as_deref().map(&scrub);
     let entry = serde_json::json!({
         "timestamp": current_timestamp(),
         "command": "ingest",
         "mode": "stdin",
         "wing": wing,
-        "source": record.source.as_deref(),
-        "source_file": record.source_file.as_deref(),
-        "metadata": record.metadata.as_ref(),
+        "source": source,
+        "source_file": source_file,
+        "metadata": metadata.as_ref(),
         "dry_run": dry_run,
         "files": stats.files,
         "chunks": stats.chunks,
@@ -1623,6 +1666,50 @@ fn append_ingest_stdin_audit_log(
     writeln!(file, "{entry}")
         .with_context(|| format!("failed to write audit log {}", audit_path.display()))?;
     Ok(())
+}
+
+fn scrub_metadata_for_audit_log(
+    metadata: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    metadata
+        .iter()
+        .map(|(key, value)| {
+            (
+                config.scrub_content_with_compiled(key, compiled_privacy.as_ref()),
+                scrub_metadata_value_for_audit_log(value, &config, compiled_privacy.as_ref()),
+            )
+        })
+        .collect()
+}
+
+fn scrub_metadata_value_for_audit_log(
+    value: &Value,
+    config: &Config,
+    compiled_privacy: &CompiledPrivacyConfig,
+) -> Value {
+    match value {
+        Value::String(text) => {
+            Value::String(config.scrub_content_with_compiled(text, compiled_privacy))
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| scrub_metadata_value_for_audit_log(item, config, compiled_privacy))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    (
+                        config.scrub_content_with_compiled(key, compiled_privacy),
+                        scrub_metadata_value_for_audit_log(value, config, compiled_privacy),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+    }
 }
 
 async fn context_command(db: &Database, config: &Config, args: ContextCommandArgs) -> Result<()> {
