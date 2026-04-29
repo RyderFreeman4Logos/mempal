@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs::OpenOptions;
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "rest")]
 use std::sync::Arc;
@@ -24,13 +24,15 @@ use mempal::core::{
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
     reindex::ReindexProgressStore,
     types::{
-        AnchorKind, KnowledgeCard, KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType,
-        KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain,
-        MemoryKind, TaxonomyEntry, TriggerHints, TunnelEndpoint,
+        AnchorKind, BootstrapEvidenceArgs, Drawer, KnowledgeCard, KnowledgeCardEvent,
+        KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole,
+        KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, SourceType, TaxonomyEntry,
+        TriggerHints, TunnelEndpoint,
     },
     utils::{
-        build_triple_id, current_timestamp, format_tunnel_endpoint,
-        normalize_added_at as normalize_added_at_value, normalize_rfc3339_timestamp,
+        build_bootstrap_evidence_drawer_id, build_triple_id, current_timestamp,
+        format_tunnel_endpoint, iso_timestamp, normalize_added_at as normalize_added_at_value,
+        normalize_rfc3339_timestamp, source_file_or_synthetic,
     },
 };
 use mempal::embed::build_backend_from_name;
@@ -38,7 +40,10 @@ use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
 use mempal::field_taxonomy::{FieldTaxonomyEntry, field_taxonomy};
 use mempal::ingest::gating::compile_classifier_from_config;
 use mempal::ingest::{
-    IngestOptions, IngestStats, ingest_dir_with_options, ingest_file_with_options,
+    IngestOptions, IngestStats,
+    gating::{IngestCandidate, evaluate_tier1, evaluate_tier2},
+    ingest_dir_with_options, ingest_file_with_options,
+    normalize::CURRENT_NORMALIZE_VERSION,
     reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
 };
 use mempal::knowledge_anchor::{PublishAnchorRequest, publish_anchor};
@@ -52,7 +57,7 @@ use mempal::knowledge_lifecycle::{
 use mempal::mcp::MempalMcpServer;
 use mempal::observability;
 use mempal::search::{SearchFilters, SearchOptions, search_with_all_options};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod longmemeval;
@@ -83,8 +88,9 @@ struct SearchCommandOptions<'a> {
 }
 
 struct IngestCommandOptions<'a> {
-    dir: &'a Path,
-    wing: &'a str,
+    dir: Option<&'a Path>,
+    stdin: bool,
+    wing: Option<&'a str>,
     room: Option<&'a str>,
     format: Option<String>,
     project: Option<&'a str>,
@@ -137,9 +143,11 @@ enum Commands {
         dry_run: bool,
     },
     Ingest {
-        dir: PathBuf,
+        dir: Option<PathBuf>,
         #[arg(long)]
-        wing: String,
+        stdin: bool,
+        #[arg(long)]
+        wing: Option<String>,
         #[arg(long)]
         room: Option<String>,
         #[arg(long)]
@@ -807,6 +815,7 @@ fn run() -> Result<()> {
         Commands::Init { dir, dry_run } => init_command(&db, &dir, dry_run),
         Commands::Ingest {
             dir,
+            stdin,
             wing,
             room,
             format,
@@ -820,8 +829,9 @@ fn run() -> Result<()> {
             &db,
             config.as_ref(),
             IngestCommandOptions {
-                dir: &dir,
-                wing: &wing,
+                dir: dir.as_deref(),
+                stdin,
+                wing: wing.as_deref(),
                 room: room.as_deref(),
                 format,
                 project: project.as_deref(),
@@ -1192,7 +1202,28 @@ async fn ingest_command(
     config: &Config,
     options: IngestCommandOptions<'_>,
 ) -> Result<()> {
-    let path = options.dir;
+    match (options.stdin, options.dir) {
+        (true, Some(path)) => {
+            bail!(
+                "`mempal ingest --stdin` cannot be combined with directory path `{}`",
+                path.display()
+            );
+        }
+        (true, None) => {
+            return ingest_stdin_command(db, config, options).await;
+        }
+        (false, None) => {
+            bail!("`mempal ingest` requires a directory path unless --stdin is used");
+        }
+        (false, Some(_)) => {}
+    }
+
+    let path = options
+        .dir
+        .expect("validated that non-stdin ingest has a directory path");
+    let wing = options
+        .wing
+        .context("`mempal ingest` requires --wing for directory ingest")?;
     if !path.exists() {
         bail!("path `{}` does not exist", path.display());
     }
@@ -1201,7 +1232,7 @@ async fn ingest_command(
             "`mempal ingest` expects a DIRECTORY, got file `{}`. To ingest a single file, create a temporary directory first, e.g. `mkdir -p /path/to/dir && cp {} /path/to/dir/ && mempal ingest /path/to/dir --wing {}`",
             path.display(),
             path.display(),
-            options.wing
+            wing
         );
     }
     if let Some(format) = options.format.as_deref()
@@ -1210,7 +1241,7 @@ async fn ingest_command(
         bail!("unsupported --format value: {format}");
     }
 
-    let project_id = resolve_project_id(options.project, config, Some(options.dir))
+    let project_id = resolve_project_id(options.project, config, Some(path))
         .context("failed to resolve ingest project id")?;
     let base_options = IngestOptions {
         room: options.room,
@@ -1231,7 +1262,7 @@ async fn ingest_command(
     };
 
     let stats = if options.dry_run {
-        ingest_path_with_options(db, &NoopEmbedder, path, options.wing, base_options).await?
+        ingest_path_with_options(db, &NoopEmbedder, path, wing, base_options).await?
     } else {
         let prototype_classifier = if config.ingest_gating.enabled && !options.no_gate {
             compile_classifier_from_config(config)
@@ -1259,13 +1290,13 @@ async fn ingest_command(
             diary_rollup: options.diary_rollup,
             diary_rollup_day: None,
         };
-        ingest_path_with_options(db, &*embedder, path, options.wing, live_options).await?
+        ingest_path_with_options(db, &*embedder, path, wing, live_options).await?
     };
 
     append_ingest_audit_log(
         db,
-        options.dir,
-        options.wing,
+        path,
+        wing,
         options.format.as_deref(),
         options.dry_run,
         &stats,
@@ -1298,6 +1329,195 @@ async fn ingest_command(
         stats.dropped_by_gate,
         stats.noise_bytes_stripped.unwrap_or(0),
         stats.lock_wait_ms.unwrap_or(0)
+    );
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct StdinIngestRecord {
+    content: Option<String>,
+    wing: Option<String>,
+    room: Option<String>,
+    project: Option<String>,
+    source: Option<String>,
+    source_file: Option<String>,
+    metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Serialize)]
+struct StdinIngestJsonOutput<'a> {
+    drawer_ids: &'a [String],
+    stats: StdinIngestStatsJson,
+}
+
+#[derive(Serialize)]
+struct StdinIngestStatsJson {
+    dry_run: bool,
+    files: usize,
+    chunks: usize,
+    skipped: usize,
+    dropped_by_gate: usize,
+}
+
+async fn ingest_stdin_command(
+    db: &Database,
+    config: &Config,
+    options: IngestCommandOptions<'_>,
+) -> Result<()> {
+    if options.format.is_some() {
+        bail!("--format is only supported for directory ingest");
+    }
+    if options.diary_rollup {
+        bail!("--diary-rollup is only supported for directory ingest");
+    }
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .context("failed to read stdin")?;
+    let record: StdinIngestRecord =
+        serde_json::from_str(&input).context("failed to parse stdin JSON object")?;
+
+    let content = record
+        .content
+        .as_deref()
+        .context("stdin JSON object is missing required `content` field")?
+        .to_string();
+    if content.trim().is_empty() {
+        bail!("stdin JSON `content` field must not be empty");
+    }
+
+    let wing = options
+        .wing
+        .or(record.wing.as_deref())
+        .context("stdin ingest requires --wing or JSON `wing`")?;
+    let room = options.room.or(record.room.as_deref());
+    let project = options.project.or(record.project.as_deref());
+    let cwd = env::current_dir().ok();
+    let project_id = resolve_project_id(project, config, cwd.as_deref())
+        .context("failed to resolve stdin ingest project id")?;
+
+    let source_type = SourceType::Manual;
+    let drawer_id = build_bootstrap_evidence_drawer_id(wing, room, &content, &source_type);
+    let mut stats = IngestStats {
+        files: 1,
+        ..IngestStats::default()
+    };
+
+    if options.dry_run {
+        stats.chunks = 1;
+        stats.drawer_ids.push(drawer_id.clone());
+        append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
+            .context("failed to append ingest audit log")?;
+        print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
+        return Ok(());
+    }
+
+    let prototype_classifier = if config.ingest_gating.enabled && !options.no_gate {
+        compile_classifier_from_config(config)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .context("gating prototypes unavailable")?
+    } else {
+        None
+    };
+    let embedder = build_embedder(config).await?;
+
+    if !options.no_gate {
+        let candidate = IngestCandidate {
+            content: content.clone(),
+            tool_name: None,
+            exit_code: None,
+        };
+        let mut gating_decision = evaluate_tier1(&candidate, &config.ingest_gating);
+        if gating_decision.is_none()
+            && let Some(classifier) = prototype_classifier.as_ref()
+        {
+            let tier2 = evaluate_tier2(
+                &candidate,
+                classifier,
+                embedder.as_ref(),
+                config.ingest_gating.embedding_classifier.threshold,
+            )
+            .await;
+            gating_decision = Some(tier2.decision);
+        }
+        if let Some(decision) = gating_decision.as_ref() {
+            db.record_gating_audit(&drawer_id, decision, project_id.as_deref())
+                .with_context(|| format!("failed to record gating audit for {drawer_id}"))?;
+            if decision.is_rejected() {
+                stats.dropped_by_gate = 1;
+                append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
+                    .context("failed to append ingest audit log")?;
+                print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
+                return Ok(());
+            }
+        }
+    }
+
+    let texts = [content.as_str()];
+    let vectors = embedder
+        .embed(&texts)
+        .await
+        .context("failed to embed stdin content")?;
+    let vector = vectors
+        .into_iter()
+        .next()
+        .context("embedder returned no vector for stdin content")?;
+    let source_hint = record.source_file.as_deref().or(record.source.as_deref());
+    let source_file = source_file_or_synthetic(&drawer_id, source_hint);
+    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: drawer_id.clone(),
+        content,
+        wing: wing.to_string(),
+        room: room.map(ToOwned::to_owned),
+        source_file: Some(source_file),
+        source_type,
+        added_at: iso_timestamp(),
+        chunk_index: Some(0),
+        importance: 0,
+    });
+    let drawer = Drawer {
+        normalize_version: CURRENT_NORMALIZE_VERSION,
+        ..drawer
+    };
+
+    db.insert_drawer_with_project(&drawer, project_id.as_deref())
+        .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
+    db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
+        .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
+
+    stats.chunks = 1;
+    stats.drawer_ids.push(drawer_id);
+    append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
+        .context("failed to append ingest audit log")?;
+    print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
+    Ok(())
+}
+
+fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> Result<()> {
+    if json {
+        let output = StdinIngestJsonOutput {
+            drawer_ids: &stats.drawer_ids,
+            stats: StdinIngestStatsJson {
+                dry_run,
+                files: stats.files,
+                chunks: stats.chunks,
+                skipped: stats.skipped,
+                dropped_by_gate: stats.dropped_by_gate,
+            },
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output)
+                .context("failed to serialize stdin ingest JSON output")?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "dry_run={} files={} chunks={} skipped={} dropped_by_gate={}",
+        dry_run, stats.files, stats.chunks, stats.skipped, stats.dropped_by_gate
     );
     Ok(())
 }
@@ -1364,6 +1584,42 @@ fn append_ingest_audit_log(
         .open(&audit_path)
         .with_context(|| format!("failed to open audit log {}", audit_path.display()))?;
     let entry = serde_json::json!({ "timestamp": current_timestamp(), "command": "ingest", "wing": wing, "dir": dir.to_string_lossy(), "format": format, "dry_run": dry_run, "files": stats.files, "chunks": stats.chunks, "skipped": stats.skipped, "dropped_by_gate": stats.dropped_by_gate });
+    writeln!(file, "{entry}")
+        .with_context(|| format!("failed to write audit log {}", audit_path.display()))?;
+    Ok(())
+}
+
+fn append_ingest_stdin_audit_log(
+    db: &Database,
+    wing: &str,
+    dry_run: bool,
+    record: &StdinIngestRecord,
+    stats: &IngestStats,
+) -> Result<()> {
+    let audit_path = db
+        .path()
+        .parent()
+        .map(|p| p.join("audit.jsonl"))
+        .unwrap_or_else(|| PathBuf::from("audit.jsonl"));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&audit_path)
+        .with_context(|| format!("failed to open audit log {}", audit_path.display()))?;
+    let entry = serde_json::json!({
+        "timestamp": current_timestamp(),
+        "command": "ingest",
+        "mode": "stdin",
+        "wing": wing,
+        "source": record.source.as_deref(),
+        "source_file": record.source_file.as_deref(),
+        "metadata": record.metadata.as_ref(),
+        "dry_run": dry_run,
+        "files": stats.files,
+        "chunks": stats.chunks,
+        "skipped": stats.skipped,
+        "dropped_by_gate": stats.dropped_by_gate,
+    });
     writeln!(file, "{entry}")
         .with_context(|| format!("failed to write audit log {}", audit_path.display()))?;
     Ok(())

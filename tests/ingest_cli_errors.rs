@@ -4,8 +4,9 @@
 mod common;
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use common::harness::start as start_embed_mock;
 use serde_json::Value;
@@ -45,6 +46,28 @@ fn run_ingest_json(home: &Path, target: &str, wing: &str) -> Output {
         .env("HOME", home)
         .output()
         .expect("run mempal ingest --json")
+}
+
+fn run_ingest_stdin_json(home: &Path, payload: &str, args: &[&str]) -> Output {
+    let mut command = Command::new(mempal_bin());
+    command
+        .arg("ingest")
+        .arg("--stdin")
+        .args(args)
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn mempal ingest --stdin");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(payload.as_bytes())
+        .expect("write stdin payload");
+    child
+        .wait_with_output()
+        .expect("wait mempal ingest --stdin")
 }
 
 fn write_embed_config(home: &Path, base_url: &str) {
@@ -162,4 +185,52 @@ async fn test_ingest_json_outputs_created_drawer_ids() {
         drawer_ids.iter().all(|value| value.as_str().is_some()),
         "drawer_ids must contain strings"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_stdin_json_creates_single_drawer() {
+    let tmp = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_embed_config(tmp.path(), &format!("http://{addr}/v1"));
+
+    let payload = r#"{
+        "content": "stdin memory content from issue 99",
+        "wing": "json-wing",
+        "room": "json-room",
+        "project": "json-project",
+        "source": "csa-session",
+        "source_file": "csa://session/99",
+        "metadata": { "issue": 99 }
+    }"#;
+    let output = run_ingest_stdin_json(
+        tmp.path(),
+        payload,
+        &["--wing", "cli-wing", "--no-gate", "--json"],
+    );
+    handle.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "ingest --stdin --json must succeed, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse stdin ingest JSON");
+    let drawer_ids = json["drawer_ids"].as_array().expect("drawer_ids array");
+    assert_eq!(drawer_ids.len(), 1);
+    assert_eq!(json["stats"]["files"], 1);
+    assert_eq!(json["stats"]["chunks"], 1);
+    assert_eq!(json["stats"]["dropped_by_gate"], 0);
+
+    let drawer_id = drawer_ids[0].as_str().expect("drawer id string");
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    let drawer = db
+        .get_drawer(drawer_id)
+        .expect("get drawer")
+        .expect("drawer exists");
+    assert_eq!(drawer.wing, "cli-wing");
+    assert_eq!(drawer.room.as_deref(), Some("json-room"));
+    assert_eq!(drawer.source_file.as_deref(), Some("csa://session/99"));
 }
