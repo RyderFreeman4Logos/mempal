@@ -302,6 +302,46 @@ async fn test_ingest_stdin_applies_privacy_scrubbing() {
 }
 
 #[test]
+fn test_ingest_stdin_scrubs_metadata_in_audit_log() {
+    let tmp = setup_home();
+    write_embed_config_with_privacy(tmp.path(), "http://127.0.0.1:9/v1", true);
+    let secret = format!("sk-{}", "1".repeat(40));
+    let payload = serde_json::json!({
+        "content": "metadata audit content",
+        "wing": "privacy-wing",
+        "metadata": {
+            "token": secret,
+            "nested": {
+                "tokens": [format!("prefix {secret}")]
+            }
+        }
+    })
+    .to_string();
+
+    let output = run_ingest_stdin_json(tmp.path(), &payload, &["--dry-run", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "ingest --stdin dry-run must succeed, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let audit_path = tmp.path().join(".mempal").join("audit.jsonl");
+    let audit = fs::read_to_string(&audit_path).expect("read audit log");
+    assert!(!audit.contains(&secret), "{audit}");
+    assert!(audit.contains("[REDACTED:openai_key]"), "{audit}");
+
+    let entry: Value = serde_json::from_str(audit.lines().last().expect("audit entry"))
+        .expect("parse audit entry");
+    assert_eq!(entry["metadata"]["token"], "[REDACTED:openai_key]");
+    assert_eq!(
+        entry["metadata"]["nested"]["tokens"][0],
+        "prefix [REDACTED:openai_key]"
+    );
+}
+
+#[test]
 fn test_ingest_stdin_rejects_invalid_json() {
     let tmp = setup_home();
     let output = run_ingest_stdin_json(tmp.path(), "not json", &["--wing", "test"]);

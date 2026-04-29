@@ -14,7 +14,7 @@ use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::api::{ApiState, DEFAULT_REST_ADDR, serve as serve_rest_api};
 use mempal::context::{ContextPack, ContextRequest, assemble_context};
 use mempal::core::{
-    config::{Config, ConfigHandle, default_config_path},
+    config::{CompiledPrivacyConfig, Config, ConfigHandle, default_config_path},
     db::Database,
     priming::PrimingRequest,
     project::{
@@ -59,6 +59,7 @@ use mempal::mcp::MempalMcpServer;
 use mempal::observability;
 use mempal::search::{SearchFilters, SearchOptions, search_with_all_options};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod longmemeval;
@@ -1637,6 +1638,7 @@ fn append_ingest_stdin_audit_log(
         .append(true)
         .open(&audit_path)
         .with_context(|| format!("failed to open audit log {}", audit_path.display()))?;
+    let metadata = record.metadata.as_ref().map(scrub_metadata_for_audit_log);
     let entry = serde_json::json!({
         "timestamp": current_timestamp(),
         "command": "ingest",
@@ -1644,7 +1646,7 @@ fn append_ingest_stdin_audit_log(
         "wing": wing,
         "source": record.source.as_deref(),
         "source_file": record.source_file.as_deref(),
-        "metadata": record.metadata.as_ref(),
+        "metadata": metadata.as_ref(),
         "dry_run": dry_run,
         "files": stats.files,
         "chunks": stats.chunks,
@@ -1654,6 +1656,50 @@ fn append_ingest_stdin_audit_log(
     writeln!(file, "{entry}")
         .with_context(|| format!("failed to write audit log {}", audit_path.display()))?;
     Ok(())
+}
+
+fn scrub_metadata_for_audit_log(
+    metadata: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    metadata
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                scrub_metadata_value_for_audit_log(value, &config, compiled_privacy.as_ref()),
+            )
+        })
+        .collect()
+}
+
+fn scrub_metadata_value_for_audit_log(
+    value: &Value,
+    config: &Config,
+    compiled_privacy: &CompiledPrivacyConfig,
+) -> Value {
+    match value {
+        Value::String(text) => {
+            Value::String(config.scrub_content_with_compiled(text, compiled_privacy))
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| scrub_metadata_value_for_audit_log(item, config, compiled_privacy))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        scrub_metadata_value_for_audit_log(value, config, compiled_privacy),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+    }
 }
 
 async fn context_command(db: &Database, config: &Config, args: ContextCommandArgs) -> Result<()> {
