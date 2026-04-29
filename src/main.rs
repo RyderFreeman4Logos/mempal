@@ -1477,8 +1477,14 @@ async fn ingest_stdin_command(
         .into_iter()
         .next()
         .context("embedder returned no vector for stdin content")?;
-    let source_hint = record.source_file.as_deref().or(record.source.as_deref());
-    let source_file = source_file_or_synthetic(&drawer_id, source_hint);
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let scrub = |s: &str| config.scrub_content_with_compiled(s, compiled_privacy.as_ref());
+    let source_hint = record
+        .source_file
+        .as_deref()
+        .or(record.source.as_deref())
+        .map(&scrub);
+    let source_file = source_file_or_synthetic(&drawer_id, source_hint.as_deref());
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: drawer_id.clone(),
         content,
