@@ -18,6 +18,10 @@ const DEFAULT_HOT_RELOAD_POLL_FALLBACK_SECS: u64 = 5;
 const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_OPENAI_DIM: usize = 4096;
 const DEFAULT_RETRY_INTERVAL_SECS: u64 = 2;
+const DEFAULT_LLM_BACKEND: &str = "openai_compat";
+const DEFAULT_LLM_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_LLM_RETRY_INTERVAL_SECS: u64 = 2;
+const DEFAULT_LLM_MAX_CONCURRENT: usize = 16;
 const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 5;
 const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
 const DEFAULT_SEARCH_TUNNEL_FANOUT_CAP: usize = 5;
@@ -41,6 +45,7 @@ pub struct Config {
     pub db_path: String,
     #[serde(alias = "embedder")]
     pub embed: EmbedConfig,
+    pub llm: LlmConfig,
     pub chunker: ChunkerConfig,
     pub project: ProjectConfig,
     pub privacy: PrivacyConfig,
@@ -58,6 +63,7 @@ impl Default for Config {
         Self {
             db_path: DEFAULT_DB_PATH.to_string(),
             embed: EmbedConfig::default(),
+            llm: LlmConfig::default(),
             chunker: ChunkerConfig::default(),
             project: ProjectConfig::default(),
             privacy: PrivacyConfig::default(),
@@ -97,9 +103,6 @@ impl Config {
         if root.get("embed").is_none() && root.get("embedder").is_none() {
             config.embed.backend = "model2vec".to_string();
         }
-        if has_llm_judge_section(&root) {
-            eprintln!("warning: llm_judge tier ignored: external LLM API disabled by design");
-        }
         config.validate()?;
         Ok(config)
     }
@@ -134,6 +137,17 @@ impl Config {
         if self.embed.retry.search_deadline_secs == 0 {
             return Err(ConfigError::InvalidConfig(
                 "embed.retry.search_deadline_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.llm.enabled
+            && self
+                .llm
+                .base_url
+                .as_deref()
+                .is_none_or(|base_url| base_url.trim().is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "llm.base_url must be set when llm.enabled is true".to_string(),
             ));
         }
         if self.search.preview_chars == 0 {
@@ -319,6 +333,15 @@ impl Config {
         if self.embed.openai_compat.dim != other.embed.openai_compat.dim {
             fields.push("embedder.openai_compat.dim");
         }
+        if self.llm.base_url != other.llm.base_url {
+            fields.push("llm.base_url");
+        }
+        if self.llm.model != other.llm.model {
+            fields.push("llm.model");
+        }
+        if self.llm.api_key_env != other.llm.api_key_env {
+            fields.push("llm.api_key_env");
+        }
         if self.daemon.log_path != other.daemon.log_path {
             fields.push("daemon.log_path");
         }
@@ -334,6 +357,9 @@ impl Config {
         effective.embed.base_url = self.embed.base_url.clone();
         effective.embed.api_model = self.embed.api_model.clone();
         effective.embed.openai_compat = self.embed.openai_compat.clone();
+        effective.llm.base_url = self.llm.base_url.clone();
+        effective.llm.model = self.llm.model.clone();
+        effective.llm.api_key_env = self.llm.api_key_env.clone();
         effective
     }
 
@@ -527,6 +553,36 @@ impl EmbedConfig {
 
     pub fn resolved_openai_dim(&self) -> usize {
         self.openai_compat.dim.unwrap_or(DEFAULT_OPENAI_DIM)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LlmConfig {
+    pub enabled: bool,
+    pub backend: String,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
+    pub request_timeout_secs: u64,
+    pub retry_interval_secs: u64,
+    pub max_concurrent: usize,
+    pub enabled_for: Vec<String>,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: DEFAULT_LLM_BACKEND.to_string(),
+            base_url: None,
+            model: None,
+            api_key_env: None,
+            request_timeout_secs: DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
+            retry_interval_secs: DEFAULT_LLM_RETRY_INTERVAL_SECS,
+            max_concurrent: DEFAULT_LLM_MAX_CONCURRENT,
+            enabled_for: vec!["gating".to_string()],
+        }
     }
 }
 
@@ -871,6 +927,8 @@ pub enum ConfigError {
         source: toml::ser::Error,
     },
     #[error("invalid config: {0}")]
+    Validation(String),
+    #[error("invalid config: {0}")]
     InvalidConfig(String),
 }
 
@@ -970,11 +1028,4 @@ impl ConfigHandle {
 fn global_scrub_stats() -> &'static Mutex<ScrubStats> {
     static SCRUB_STATS: OnceLock<Mutex<ScrubStats>> = OnceLock::new();
     SCRUB_STATS.get_or_init(|| Mutex::new(ScrubStats::default()))
-}
-
-fn has_llm_judge_section(root: &toml::Value) -> bool {
-    ["ingest_gating", "gating"]
-        .into_iter()
-        .filter_map(|key| root.get(key))
-        .any(|section| section.get("llm_judge").is_some())
 }
