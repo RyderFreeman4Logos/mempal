@@ -1639,13 +1639,17 @@ fn append_ingest_stdin_audit_log(
         .open(&audit_path)
         .with_context(|| format!("failed to open audit log {}", audit_path.display()))?;
     let metadata = record.metadata.as_ref().map(scrub_metadata_for_audit_log);
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let scrub = |s: &str| config.scrub_content_with_compiled(s, compiled_privacy.as_ref());
+    let source = record.source.as_deref().map(&scrub);
+    let source_file = record.source_file.as_deref().map(&scrub);
     let entry = serde_json::json!({
         "timestamp": current_timestamp(),
         "command": "ingest",
         "mode": "stdin",
         "wing": wing,
-        "source": record.source.as_deref(),
-        "source_file": record.source_file.as_deref(),
+        "source": source,
+        "source_file": source_file,
         "metadata": metadata.as_ref(),
         "dry_run": dry_run,
         "files": stats.files,

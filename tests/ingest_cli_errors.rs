@@ -340,6 +340,39 @@ fn test_ingest_stdin_scrubs_metadata_in_audit_log() {
         entry["metadata"]["nested"]["tokens"][0],
         "prefix [REDACTED:openai_key]"
     );
+
+    // Verify source/source_file are also scrubbed in audit log
+    assert!(!audit.contains("sk-"), "source/source_file secret leaked: {audit}");
+}
+
+#[test]
+fn test_ingest_stdin_scrubs_source_fields_in_audit_log() {
+    let tmp = setup_home();
+    write_embed_config_with_privacy(tmp.path(), "http://127.0.0.1:9/v1", true);
+    let secret = format!("sk-{}", "2".repeat(40));
+    let payload = serde_json::json!({
+        "content": "source field audit content",
+        "wing": "privacy-wing",
+        "source": format!("hook-{secret}"),
+        "source_file": secret
+    })
+    .to_string();
+
+    let output = run_ingest_stdin_json(tmp.path(), &payload, &["--dry-run", "--json"]);
+    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+
+    let audit_path = tmp.path().join(".mempal").join("audit.jsonl");
+    let audit = fs::read_to_string(&audit_path).expect("read audit log");
+    assert!(!audit.contains(&secret), "source secret in audit: {audit}");
+
+    let entry: Value = serde_json::from_str(audit.lines().last().expect("audit entry"))
+        .expect("parse audit entry");
+    assert!(
+        entry["source"].as_str().unwrap().contains("[REDACTED:openai_key]"),
+        "source not scrubbed: {}",
+        entry["source"]
+    );
+    assert_eq!(entry["source_file"], "[REDACTED:openai_key]");
 }
 
 #[test]
