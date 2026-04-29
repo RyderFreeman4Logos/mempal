@@ -348,20 +348,22 @@ fn test_ingest_stdin_scrubs_metadata_in_audit_log() {
     );
 }
 
-#[test]
-fn test_ingest_stdin_scrubs_source_fields_in_audit_log() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_stdin_scrubs_source_fields_in_audit_and_drawer() {
     let tmp = setup_home();
-    write_embed_config_with_privacy(tmp.path(), "http://127.0.0.1:9/v1", true);
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_embed_config_with_privacy(tmp.path(), &format!("http://{addr}/v1"), true);
     let secret = format!("sk-{}", "2".repeat(40));
     let payload = serde_json::json!({
-        "content": "source field audit content",
+        "content": "source field privacy content",
         "wing": "privacy-wing",
         "source": format!("hook-{secret}"),
         "source_file": secret
     })
     .to_string();
 
-    let output = run_ingest_stdin_json(tmp.path(), &payload, &["--dry-run", "--json"]);
+    let output = run_ingest_stdin_json(tmp.path(), &payload, &["--json"]);
+    handle.shutdown().await;
     assert!(
         output.status.success(),
         "stderr={}",
@@ -383,6 +385,17 @@ fn test_ingest_stdin_scrubs_source_fields_in_audit_log() {
         entry["source"]
     );
     assert_eq!(entry["source_file"], "[REDACTED:openai_key]");
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse stdout JSON");
+    let drawer_id = json["drawer_ids"][0].as_str().expect("drawer id");
+    let db_path = tmp.path().join(".mempal").join("palace.db");
+    let db = mempal::core::db::Database::open(&db_path).expect("open db");
+    let drawer = db.get_drawer(drawer_id).expect("get drawer").expect("drawer exists");
+    assert!(
+        !drawer.source_file.as_deref().unwrap_or("").contains(&secret),
+        "source_file secret in drawer: {:?}",
+        drawer.source_file
+    );
 }
 
 #[test]
