@@ -41,9 +41,10 @@ use mempal::field_taxonomy::{FieldTaxonomyEntry, field_taxonomy};
 use mempal::ingest::gating::compile_classifier_from_config;
 use mempal::ingest::{
     IngestOptions, IngestStats,
+    detect::detect_format,
     gating::{IngestCandidate, evaluate_tier1, evaluate_tier2},
     ingest_dir_with_options, ingest_file_with_options,
-    normalize::CURRENT_NORMALIZE_VERSION,
+    normalize::{CURRENT_NORMALIZE_VERSION, NormalizeOptions, normalize_content_with_options},
     reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
 };
 use mempal::knowledge_anchor::{PublishAnchorRequest, publish_anchor};
@@ -1344,6 +1345,8 @@ struct StdinIngestRecord {
     metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+const MAX_STDIN_INGEST_BYTES: usize = 10 * 1024 * 1024;
+
 #[derive(Serialize)]
 struct StdinIngestJsonOutput<'a> {
     drawer_ids: &'a [String],
@@ -1371,21 +1374,30 @@ async fn ingest_stdin_command(
         bail!("--diary-rollup is only supported for directory ingest");
     }
 
-    let mut input = String::new();
+    let mut input = Vec::new();
     std::io::stdin()
-        .read_to_string(&mut input)
+        .take(MAX_STDIN_INGEST_BYTES as u64 + 1)
+        .read_to_end(&mut input)
         .context("failed to read stdin")?;
+    if input.len() > MAX_STDIN_INGEST_BYTES {
+        bail!(
+            "stdin payload exceeds {} byte limit",
+            MAX_STDIN_INGEST_BYTES
+        );
+    }
+    let input = String::from_utf8(input).context("stdin payload is not valid UTF-8")?;
     let record: StdinIngestRecord =
         serde_json::from_str(&input).context("failed to parse stdin JSON object")?;
 
-    let content = record
+    let raw_content = record
         .content
         .as_deref()
         .context("stdin JSON object is missing required `content` field")?
         .to_string();
-    if content.trim().is_empty() {
+    if raw_content.trim().is_empty() {
         bail!("stdin JSON `content` field must not be empty");
     }
+    let content = normalize_stdin_content(&raw_content, options.no_strip_noise)?;
 
     let wing = options
         .wing
@@ -1493,6 +1505,25 @@ async fn ingest_stdin_command(
         .context("failed to append ingest audit log")?;
     print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
     Ok(())
+}
+
+fn normalize_stdin_content(content: &str, no_strip_noise: bool) -> Result<String> {
+    let format = detect_format(content);
+    let normalize_output = normalize_content_with_options(
+        content,
+        format,
+        NormalizeOptions {
+            strip_noise: !no_strip_noise,
+        },
+    )
+    .context("failed to normalize stdin content")?;
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let scrubbed =
+        config.scrub_content_with_compiled(&normalize_output.content, compiled_privacy.as_ref());
+    if scrubbed.trim().is_empty() {
+        bail!("stdin JSON `content` field must not be empty after normalization");
+    }
+    Ok(scrubbed)
 }
 
 fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> Result<()> {

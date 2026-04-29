@@ -4,7 +4,7 @@
 mod common;
 
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -49,6 +49,10 @@ fn run_ingest_json(home: &Path, target: &str, wing: &str) -> Output {
 }
 
 fn run_ingest_stdin_json(home: &Path, payload: &str, args: &[&str]) -> Output {
+    run_ingest_stdin_bytes(home, payload.as_bytes(), args)
+}
+
+fn run_ingest_stdin_bytes(home: &Path, payload: &[u8], args: &[&str]) -> Output {
     let mut command = Command::new(mempal_bin());
     command
         .arg("ingest")
@@ -59,18 +63,23 @@ fn run_ingest_stdin_json(home: &Path, payload: &str, args: &[&str]) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn mempal ingest --stdin");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin pipe")
-        .write_all(payload.as_bytes())
-        .expect("write stdin payload");
+    if let Some(stdin) = child.stdin.as_mut() {
+        match stdin.write_all(payload) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::BrokenPipe => {}
+            Err(error) => panic!("write stdin payload: {error}"),
+        }
+    }
     child
         .wait_with_output()
         .expect("wait mempal ingest --stdin")
 }
 
 fn write_embed_config(home: &Path, base_url: &str) {
+    write_embed_config_with_privacy(home, base_url, false);
+}
+
+fn write_embed_config_with_privacy(home: &Path, base_url: &str, privacy_enabled: bool) {
     let db_path = home.join(".mempal").join("palace.db");
     let config = format!(
         r#"
@@ -87,12 +96,28 @@ base_url = "{}"
 model = "test-embed"
 dim = 4
 request_timeout_secs = 2
+
+[privacy]
+enabled = {}
 "#,
         db_path.display(),
         base_url,
-        base_url
+        base_url,
+        privacy_enabled
     );
     fs::write(home.join(".mempal").join("config.toml"), config).expect("write config");
+}
+
+fn assert_stdin_error(output: Output, expected: &str) {
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for stdin error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(expected),
+        "stderr must contain {expected:?}, got: {stderr}"
+    );
 }
 
 #[test]
@@ -233,4 +258,134 @@ async fn test_ingest_stdin_json_creates_single_drawer() {
     assert_eq!(drawer.wing, "cli-wing");
     assert_eq!(drawer.room.as_deref(), Some("json-room"));
     assert_eq!(drawer.source_file.as_deref(), Some("csa://session/99"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_stdin_applies_privacy_scrubbing() {
+    let tmp = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_embed_config_with_privacy(tmp.path(), &format!("http://{addr}/v1"), true);
+    let secret = format!("sk-{}", "0".repeat(40));
+    let payload = serde_json::json!({
+        "content": format!("keep {secret} and <private>hidden</private>"),
+        "wing": "privacy-wing",
+        "room": "privacy-room",
+        "source_file": "stdin://privacy"
+    })
+    .to_string();
+
+    let output = run_ingest_stdin_json(tmp.path(), &payload, &["--no-gate", "--json"]);
+    handle.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "ingest --stdin must succeed, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse stdin ingest JSON");
+    let drawer_id = json["drawer_ids"][0].as_str().expect("drawer id string");
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    let drawer = db
+        .get_drawer(drawer_id)
+        .expect("get drawer")
+        .expect("drawer exists");
+    assert!(
+        drawer.content.contains("[REDACTED:openai_key]"),
+        "{}",
+        drawer.content
+    );
+    assert!(!drawer.content.contains(&secret), "{}", drawer.content);
+    assert!(!drawer.content.contains("hidden"), "{}", drawer.content);
+}
+
+#[test]
+fn test_ingest_stdin_rejects_invalid_json() {
+    let tmp = setup_home();
+    let output = run_ingest_stdin_json(tmp.path(), "not json", &["--wing", "test"]);
+
+    assert_stdin_error(output, "failed to parse stdin JSON object");
+}
+
+#[test]
+fn test_ingest_stdin_rejects_missing_content() {
+    let tmp = setup_home();
+    let output = run_ingest_stdin_json(tmp.path(), r#"{"wing":"test"}"#, &[]);
+
+    assert_stdin_error(
+        output,
+        "stdin JSON object is missing required `content` field",
+    );
+}
+
+#[test]
+fn test_ingest_stdin_rejects_empty_content() {
+    let tmp = setup_home();
+    let output = run_ingest_stdin_json(tmp.path(), r#"{"content":"   ","wing":"test"}"#, &[]);
+
+    assert_stdin_error(output, "stdin JSON `content` field must not be empty");
+}
+
+#[test]
+fn test_ingest_stdin_rejects_missing_wing() {
+    let tmp = setup_home();
+    let output = run_ingest_stdin_json(tmp.path(), r#"{"content":"hello"}"#, &[]);
+
+    assert_stdin_error(output, "stdin ingest requires --wing or JSON `wing`");
+}
+
+#[test]
+fn test_ingest_stdin_rejects_directory_path() {
+    let tmp = setup_home();
+    let source_dir = tmp.path().join("source");
+    fs::create_dir_all(&source_dir).expect("create source dir");
+    let source_dir = source_dir.to_str().expect("source dir path");
+    let output = run_ingest_stdin_json(
+        tmp.path(),
+        r#"{"content":"hello","wing":"test"}"#,
+        &[source_dir],
+    );
+
+    assert_stdin_error(
+        output,
+        "`mempal ingest --stdin` cannot be combined with directory path",
+    );
+}
+
+#[test]
+fn test_ingest_stdin_rejects_format() {
+    let tmp = setup_home();
+    let output = run_ingest_stdin_json(
+        tmp.path(),
+        r#"{"content":"hello","wing":"test"}"#,
+        &["--format", "convos"],
+    );
+
+    assert_stdin_error(output, "--format is only supported for directory ingest");
+}
+
+#[test]
+fn test_ingest_stdin_rejects_diary_rollup() {
+    let tmp = setup_home();
+    let output = run_ingest_stdin_json(
+        tmp.path(),
+        r#"{"content":"hello","wing":"agent-diary","room":"codex"}"#,
+        &["--diary-rollup"],
+    );
+
+    assert_stdin_error(
+        output,
+        "--diary-rollup is only supported for directory ingest",
+    );
+}
+
+#[test]
+fn test_ingest_stdin_rejects_payload_over_size_limit() {
+    let tmp = setup_home();
+    let payload = vec![b'a'; 10 * 1024 * 1024 + 1];
+    let output = run_ingest_stdin_bytes(tmp.path(), &payload, &["--wing", "test"]);
+
+    assert_stdin_error(output, "stdin payload exceeds 10485760 byte limit");
 }
