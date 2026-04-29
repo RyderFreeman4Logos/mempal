@@ -390,9 +390,16 @@ async fn test_ingest_stdin_scrubs_source_fields_in_audit_and_drawer() {
     let drawer_id = json["drawer_ids"][0].as_str().expect("drawer id");
     let db_path = tmp.path().join(".mempal").join("palace.db");
     let db = mempal::core::db::Database::open(&db_path).expect("open db");
-    let drawer = db.get_drawer(drawer_id).expect("get drawer").expect("drawer exists");
+    let drawer = db
+        .get_drawer(drawer_id)
+        .expect("get drawer")
+        .expect("drawer exists");
     assert!(
-        !drawer.source_file.as_deref().unwrap_or("").contains(&secret),
+        !drawer
+            .source_file
+            .as_deref()
+            .unwrap_or("")
+            .contains(&secret),
         "source_file secret in drawer: {:?}",
         drawer.source_file
     );

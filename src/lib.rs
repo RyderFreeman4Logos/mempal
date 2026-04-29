@@ -22,6 +22,7 @@ pub mod knowledge_anchor;
 pub mod knowledge_distill;
 pub mod knowledge_gate;
 pub mod knowledge_lifecycle;
+pub mod llm;
 pub mod mcp;
 pub mod observability;
 pub mod search;
