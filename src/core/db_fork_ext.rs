@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 8;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 9;
 
 pub const FORK_EXT_V1_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS pending_messages (
@@ -103,6 +103,23 @@ END;
 pub const FORK_EXT_V8_SCHEMA_SQL: &str = r#"
 ALTER TABLE gating_audit ADD COLUMN llm_verdict TEXT;
 ALTER TABLE gating_audit ADD COLUMN llm_score REAL;
+"#;
+
+pub const FORK_EXT_V9_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS pending_message_completions (
+    message_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    claimed_at INTEGER,
+    completed_at INTEGER NOT NULL,
+    processing_ms INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_completions_completed_at
+    ON pending_message_completions(completed_at);
+
+CREATE INDEX IF NOT EXISTS idx_pending_completions_kind_completed_at
+    ON pending_message_completions(kind, completed_at);
 "#;
 
 const GATING_DROP_COUNTER_KEYS: &[&str] = &[
@@ -194,6 +211,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 8,
             up: apply_v8,
         },
+        Migration {
+            version: 9,
+            up: apply_v9,
+        },
     ]
 }
 
@@ -276,6 +297,10 @@ fn apply_v7(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v8(conn: &Connection) -> rusqlite::Result<()> {
     ensure_gating_audit_llm_columns(conn)
+}
+
+fn apply_v9(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V9_SCHEMA_SQL)
 }
 
 fn ensure_gating_audit_columns(conn: &Connection) -> rusqlite::Result<()> {

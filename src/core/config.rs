@@ -32,6 +32,7 @@ const DEFAULT_HOOK_WING: &str = "agent-diary";
 const DEFAULT_HOOK_POLL_INTERVAL_MS: u64 = 500;
 const DEFAULT_HOOK_CLAIM_TTL_SECS: u64 = 120;
 const DEFAULT_DAEMON_LOG_PATH: &str = "~/.mempal/daemon.log";
+const DEFAULT_MCP_LOG_PATH: &str = "~/.mempal/mcp.log";
 const DEFAULT_SESSION_REVIEW_WING: &str = "session-reviews";
 const DEFAULT_SESSION_REVIEW_MIN_LENGTH: usize = 100;
 const DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES: usize = 1;
@@ -56,6 +57,7 @@ pub struct Config {
     pub ingest_gating: IngestGatingConfig,
     pub hooks: HooksConfig,
     pub daemon: DaemonConfig,
+    pub mcp: McpConfig,
 }
 
 impl Default for Config {
@@ -73,6 +75,7 @@ impl Default for Config {
             ingest_gating: IngestGatingConfig::default(),
             hooks: HooksConfig::default(),
             daemon: DaemonConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -351,6 +354,9 @@ impl Config {
         if self.daemon.log_path != other.daemon.log_path {
             fields.push("daemon.log_path");
         }
+        if self.mcp.log_path != other.mcp.log_path {
+            fields.push("mcp.log_path");
+        }
         fields
     }
 
@@ -367,6 +373,8 @@ impl Config {
         effective.llm.model = self.llm.model.clone();
         effective.llm.api_key = self.llm.api_key.clone();
         effective.llm.api_key_env = self.llm.api_key_env.clone();
+        effective.daemon.log_path = self.daemon.log_path.clone();
+        effective.mcp.log_path = self.mcp.log_path.clone();
         effective
     }
 
@@ -477,6 +485,20 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             log_path: DEFAULT_DAEMON_LOG_PATH.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpConfig {
+    pub log_path: String,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            log_path: DEFAULT_MCP_LOG_PATH.to_string(),
         }
     }
 }
