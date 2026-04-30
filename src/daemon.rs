@@ -85,9 +85,16 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                 let llm_client = std::sync::Arc::new(llm_client);
                 let db_path = context.db.path().to_path_buf();
                 tracing::info!("spawning LLM worker task");
-                Some(tokio::spawn(crate::llm::worker::run_llm_worker(
-                    llm_store, llm_client, llm_status, db_path,
-                )))
+                Some(tokio::spawn(async move {
+                    if let Err(e) = crate::llm::worker::run_llm_worker(
+                        llm_store, llm_client, llm_status, db_path,
+                    )
+                    .await
+                    {
+                        tracing::error!("LLM worker fatal error: {e:#}");
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }))
             }
             Err(error) => {
                 tracing::warn!("LLM client init failed, skipping LLM worker: {error}");

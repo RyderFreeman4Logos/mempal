@@ -333,6 +333,9 @@ impl Config {
         if self.embed.openai_compat.dim != other.embed.openai_compat.dim {
             fields.push("embedder.openai_compat.dim");
         }
+        if self.llm.enabled != other.llm.enabled {
+            fields.push("llm.enabled");
+        }
         if self.llm.base_url != other.llm.base_url {
             fields.push("llm.base_url");
         }
