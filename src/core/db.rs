@@ -1,9 +1,9 @@
 #[rustfmt::skip] #[path = "db_fork_ext.rs"] mod db_fork_ext;
 // harness-point: PR0 — re-export MigrationHook trait + hooked migration runner for tests
 pub use db_fork_ext::{
-    apply_fork_ext_migrations, apply_fork_ext_migrations_to, apply_fork_ext_migrations_with_hook,
-    read_fork_ext_version, set_fork_ext_version, MigrationHook, CURRENT_FORK_EXT_VERSION,
-    FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL, FORK_EXT_V3_SCHEMA_SQL,
+    CURRENT_FORK_EXT_VERSION, FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL,
+    FORK_EXT_V3_SCHEMA_SQL, MigrationHook, apply_fork_ext_migrations, apply_fork_ext_migrations_to,
+    apply_fork_ext_migrations_with_hook, read_fork_ext_version, set_fork_ext_version,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -12,8 +12,8 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
-    params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension,
-    Row,
+    Connection, OpenFlags, OptionalExtension, Row, params, params_from_iter,
+    types::Value as SqlValue,
 };
 use serde_json::Value;
 use thiserror::Error;

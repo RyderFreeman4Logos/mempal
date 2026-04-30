@@ -342,6 +342,9 @@ impl Config {
         if self.llm.model != other.llm.model {
             fields.push("llm.model");
         }
+        if self.llm.api_key != other.llm.api_key {
+            fields.push("llm.api_key");
+        }
         if self.llm.api_key_env != other.llm.api_key_env {
             fields.push("llm.api_key_env");
         }
@@ -362,6 +365,7 @@ impl Config {
         effective.embed.openai_compat = self.embed.openai_compat.clone();
         effective.llm.base_url = self.llm.base_url.clone();
         effective.llm.model = self.llm.model.clone();
+        effective.llm.api_key = self.llm.api_key.clone();
         effective.llm.api_key_env = self.llm.api_key_env.clone();
         effective
     }
@@ -566,6 +570,7 @@ pub struct LlmConfig {
     pub backend: String,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub request_timeout_secs: u64,
     pub retry_interval_secs: u64,
@@ -580,6 +585,7 @@ impl Default for LlmConfig {
             backend: DEFAULT_LLM_BACKEND.to_string(),
             base_url: None,
             model: None,
+            api_key: None,
             api_key_env: None,
             request_timeout_secs: DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
             retry_interval_secs: DEFAULT_LLM_RETRY_INTERVAL_SECS,

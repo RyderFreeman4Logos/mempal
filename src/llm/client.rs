@@ -105,11 +105,13 @@ impl LlmClient {
             .to_string();
 
         let mut headers = HeaderMap::new();
-        if let Some(api_key) = read_api_key(config.api_key_env.as_deref())? {
+        let resolved_key =
+            resolve_api_key(config.api_key.as_deref(), config.api_key_env.as_deref())?;
+        if let Some(api_key) = resolved_key {
             let header_value =
                 HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|error| {
                     LlmError::MissingConfiguration(format!(
-                        "llm.api_key_env produced an invalid Authorization header: {error}"
+                        "llm api_key produced an invalid Authorization header: {error}"
                     ))
                 })?;
             headers.insert(AUTHORIZATION, header_value);
@@ -212,6 +214,16 @@ impl LlmClient {
             model: response.model,
         })
     }
+}
+
+fn resolve_api_key(
+    direct: Option<&str>,
+    env_name: Option<&str>,
+) -> Result<Option<String>, LlmError> {
+    if let Some(key) = direct.filter(|k| !k.trim().is_empty()) {
+        return Ok(Some(key.to_string()));
+    }
+    read_api_key(env_name)
 }
 
 fn read_api_key(api_key_env: Option<&str>) -> Result<Option<String>, LlmError> {
