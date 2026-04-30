@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -5,6 +7,7 @@ use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 use crate::core::config::LlmConfig;
 
@@ -74,6 +77,8 @@ pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    semaphore: Arc<Semaphore>,
+    current_max: Arc<AtomicUsize>,
 }
 
 impl LlmClient {
@@ -116,14 +121,46 @@ impl LlmClient {
             .build()
             .map_err(|source| LlmError::HttpRequest { source })?;
 
+        let max_concurrent = config.max_concurrent.max(1);
         Ok(Self {
             http,
             base_url,
             model,
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            current_max: Arc::new(AtomicUsize::new(max_concurrent)),
         })
     }
 
+    pub async fn update_concurrency(&self, new_max: usize) {
+        let new_max = new_max.max(1);
+        let old_max = self.current_max.load(Ordering::SeqCst);
+        if new_max == old_max {
+            return;
+        }
+        if new_max > old_max {
+            self.semaphore.add_permits(new_max - old_max);
+        } else {
+            let diff = (old_max - new_max) as u32;
+            let permit = self
+                .semaphore
+                .acquire_many(diff)
+                .await
+                .expect("semaphore closed");
+            permit.forget();
+        }
+        self.current_max.store(new_max, Ordering::SeqCst);
+    }
+
+    pub fn current_max_concurrent(&self) -> usize {
+        self.current_max.load(Ordering::SeqCst)
+    }
+
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
     pub async fn chat_completion(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
         let endpoint = format!("{}/chat/completions", self.base_url);
         let model = request.model.as_deref().unwrap_or(&self.model);
         let response = self

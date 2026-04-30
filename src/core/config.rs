@@ -840,6 +840,25 @@ pub struct IngestGatingConfig {
     pub rules: Vec<GatingRuleConfig>,
     pub embedding_classifier: EmbeddingClassifierConfig,
     pub novelty: NoveltyConfig,
+    pub llm_judge: Option<LlmJudgeConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LlmJudgeConfig {
+    pub enabled: bool,
+    pub system_prompt: Option<String>,
+    pub threshold: f64,
+}
+
+impl Default for LlmJudgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            system_prompt: None,
+            threshold: 0.3,
+        }
+    }
 }
 
 impl IngestGatingConfig {

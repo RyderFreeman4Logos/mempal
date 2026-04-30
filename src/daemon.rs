@@ -77,6 +77,27 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .context("failed to reclaim stale daemon claims")?;
     tracing::info!("daemon startup reclaim_stale reclaimed={reclaimed}");
 
+    let llm_worker_handle = if context.config.llm.enabled {
+        match crate::llm::LlmClient::from_config(&context.config.llm) {
+            Ok(llm_client) => {
+                let llm_status = std::sync::Arc::new(crate::llm::LlmStatus::new(10));
+                let llm_store = std::sync::Arc::new(context.store.clone());
+                let llm_client = std::sync::Arc::new(llm_client);
+                let db_path = context.db.path().to_path_buf();
+                tracing::info!("spawning LLM worker task");
+                Some(tokio::spawn(crate::llm::worker::run_llm_worker(
+                    llm_store, llm_client, llm_status, db_path,
+                )))
+            }
+            Err(error) => {
+                tracing::warn!("LLM client init failed, skipping LLM worker: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     loop {
         if shutdown_requested() {
             tracing::info!("shutdown requested; stopping daemon loop");
@@ -125,6 +146,12 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
             }
             ClaimPollResult::RetryAfterError => continue,
         }
+    }
+
+    if let Some(handle) = llm_worker_handle {
+        handle.abort();
+        let _ = handle.await;
+        tracing::info!("LLM worker stopped");
     }
 
     Ok(())
@@ -604,6 +631,32 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
     }
 
+    if should_enqueue_llm_gating(context.daemon.config, &gating_decision) {
+        let system_prompt = context
+            .daemon
+            .config
+            .ingest_gating
+            .llm_judge
+            .as_ref()
+            .and_then(|j| j.system_prompt.clone());
+        let payload = serde_json::to_string(&crate::llm::LlmTaskPayload {
+            task_type: "gating".to_string(),
+            drawer_id: drawer_id.clone(),
+            content: analysis_content(&record.content).to_string(),
+            system_prompt,
+        })
+        .context("failed to serialize LLM gating payload")?;
+        if let Err(error) = context.store.enqueue("llm_task", &payload) {
+            tracing::warn!(
+                ?error,
+                "failed to enqueue LLM gating task for {}",
+                drawer_id
+            );
+        } else {
+            tracing::info!("enqueued LLM gating task for {}", drawer_id);
+        }
+    }
+
     let vector = match vector {
         Some(vector) => vector,
         None => {
@@ -885,6 +938,29 @@ fn persist_raw_payload(raw_payload: &str, mempal_home: &Path) -> Result<String> 
     Ok(path.to_string_lossy().to_string())
 }
 
+fn should_enqueue_llm_gating(
+    config: &crate::core::config::Config,
+    gating_decision: &Option<GatingDecision>,
+) -> bool {
+    if !config.llm.enabled {
+        return false;
+    }
+    if !config.llm.enabled_for.iter().any(|s| s == "gating") {
+        return false;
+    }
+    let Some(judge) = config.ingest_gating.llm_judge.as_ref() else {
+        return false;
+    };
+    if !judge.enabled {
+        return false;
+    }
+    match gating_decision {
+        Some(decision) if decision.is_rejected() => false,
+        Some(decision) if decision.tier <= 1 && decision.label.is_some() => false,
+        _ => true,
+    }
+}
+
 struct DaemonEmbedder {
     primary: Box<dyn Embedder>,
     fallback: Option<Box<dyn Embedder>>,
@@ -923,12 +999,12 @@ fn install_shutdown_handlers() -> Result<()> {
 }
 
 #[cfg(unix)]
-fn shutdown_requested() -> bool {
+pub fn shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
 }
 
 #[cfg(not(unix))]
-fn shutdown_requested() -> bool {
+pub fn shutdown_requested() -> bool {
     false
 }
 

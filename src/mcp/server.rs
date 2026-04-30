@@ -58,13 +58,13 @@ use super::tools::{
     KgRequest, KgResponse, KgStatsDto, KnowledgeDemoteRequest, KnowledgeDemoteResponse,
     KnowledgeDistillRequest, KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse,
     KnowledgePolicyResponse, KnowledgePromoteRequest, KnowledgePromoteResponse,
-    KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse, MAX_READ_DRAWERS_MAX_COUNT,
-    MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse,
-    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
-    RollbackRequest, RollbackResponse, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
-    SearchResultDto, StatusResponse, SystemWarning, TaxonomyEntryDto, TaxonomyRequest,
-    TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto, TunnelsRequest,
-    TunnelsResponse,
+    KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse, LlmStatusDto,
+    MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest,
+    PeekPartnerResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest,
+    ReadDrawersResponse, RollbackRequest, RollbackResponse, ScopeCount, ScrubStatsDto,
+    SearchRequest, SearchResponse, SearchResultDto, StatusResponse, SystemWarning,
+    TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto,
+    TunnelEndpointDto, TunnelsRequest, TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -906,6 +906,12 @@ impl MempalMcpServer {
             chunker_stats: ChunkerStatsDto::from(
                 crate::ingest::chunk::global_chunker_stats().snapshot(),
             ),
+            llm_status: LlmStatusDto {
+                enabled: config.llm.enabled,
+                backend: Some(config.llm.backend.clone()),
+                model: config.llm.model.clone(),
+                max_concurrent: config.llm.max_concurrent,
+            },
             system_warnings,
         }))
     }
