@@ -170,6 +170,73 @@ impl PendingMessageStore {
         }))
     }
 
+    pub fn claim_next_by_kind(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+        kind_filter: &str,
+    ) -> Result<Option<ClaimedMessage>> {
+        let mut conn = self.open_connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+
+        let now = now_secs();
+        let row = tx
+            .query_row(
+                r#"
+                SELECT id, kind, payload, retry_count, source_hash
+                FROM pending_messages
+                WHERE status = 'pending' AND next_attempt_at <= ?1 AND kind = ?2
+                ORDER BY next_attempt_at ASC, created_at ASC, id ASC
+                LIMIT 1
+                "#,
+                params![now, kind_filter],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((id, kind, payload, retry_count_i64, source_hash)) = row else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let retry_count = u32::try_from(retry_count_i64)
+            .map_err(|_| QueueError::RetryCountOverflow { id: id.clone() })?;
+        let claim_token = format!("{worker_id}:{}", next_id("claim"));
+        let updated = tx.execute(
+            r#"
+            UPDATE pending_messages
+            SET status = 'claimed',
+                claim_token = ?2,
+                claimed_at = ?3,
+                heartbeat_at = ?3
+            WHERE id = ?1 AND status = 'pending'
+            "#,
+            params![id, claim_token, now],
+        )?;
+        if updated == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        tx.commit()?;
+        Ok(Some(ClaimedMessage {
+            id,
+            kind,
+            payload,
+            retry_count,
+            claim_token,
+            source_hash,
+        }))
+    }
+
     pub fn confirm(&self, id: &str) -> Result<()> {
         let conn = self.open_connection()?;
         let updated = conn.execute("DELETE FROM pending_messages WHERE id = ?1", [id])?;

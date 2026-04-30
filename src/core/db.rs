@@ -386,6 +386,31 @@ impl Database {
         }
     }
 
+    pub fn upsert_llm_verdict(
+        &self,
+        drawer_id: &str,
+        verdict: &str,
+        score: Option<f64>,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            r#"
+            INSERT INTO gating_audit (id, candidate_hash, drawer_id, decision, tier, llm_verdict, llm_score, retained_until, created_at)
+            VALUES (?1, ?2, ?3, 'keep', 3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET llm_verdict = excluded.llm_verdict, llm_score = excluded.llm_score
+            "#,
+            params![
+                format!("gating_llm_{}", blake3::hash(drawer_id.as_bytes()).to_hex()),
+                drawer_id,
+                drawer_id,
+                verdict,
+                score,
+                super::utils::current_timestamp().parse::<i64>().unwrap_or_default() + 7 * 24 * 60 * 60,
+                super::utils::current_timestamp(),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn gating_drop_counts(&self) -> Result<GatingDropCounts, DbError> {
         let mut statement = self.conn.prepare(
             r#"

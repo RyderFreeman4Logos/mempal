@@ -3575,6 +3575,17 @@ fn status_command(db: &Database, config: &Config) -> Result<()> {
     } else {
         println!("  dropped_by_reason: {}", nonzero.join(", "));
     }
+    println!("LLM:");
+    println!("  enabled: {}", config.llm.enabled);
+    if config.llm.enabled {
+        println!("  backend: {}", config.llm.backend);
+        if let Some(model) = config.llm.model.as_deref() {
+            println!("  model: {model}");
+        }
+        println!("  max_concurrent: {}", config.llm.max_concurrent);
+        let llm_pending = queue_stats.pending;
+        println!("  queue_pending: {llm_pending}");
+    }
     if !runtime_warnings.is_empty() {
         println!("Warnings:");
         for w in runtime_warnings {

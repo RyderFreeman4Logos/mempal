@@ -364,6 +364,16 @@ impl HotReloadState {
             );
         }
 
+        if previous.config.llm.max_concurrent != candidate.llm.max_concurrent {
+            self.push_event(format!(
+                "config hot-reload: llm.max_concurrent changed from {} to {}",
+                previous.config.llm.max_concurrent, candidate.llm.max_concurrent
+            ));
+        }
+        if previous.config.llm.enabled_for != candidate.llm.enabled_for {
+            self.push_event("config hot-reload: llm.enabled_for changed".to_string());
+        }
+
         let effective = previous.config.merge_runtime_allowed(&candidate);
         let next_version = match effective.effective_hash() {
             Ok(version) => version,

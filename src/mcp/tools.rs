@@ -638,8 +638,19 @@ pub struct StatusResponse {
     pub queue_stats: QueueStatsDto,
     pub scrub_stats: ScrubStatsDto,
     pub chunker_stats: ChunkerStatsDto,
+    pub llm_status: LlmStatusDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct LlmStatusDto {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub max_concurrent: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]

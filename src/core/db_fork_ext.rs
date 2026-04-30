@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 7;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 8;
 
 pub const FORK_EXT_V1_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS pending_messages (
@@ -98,6 +98,11 @@ AFTER UPDATE OF content ON drawers BEGIN
     INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
     INSERT INTO drawers_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
+"#;
+
+pub const FORK_EXT_V8_SCHEMA_SQL: &str = r#"
+ALTER TABLE gating_audit ADD COLUMN llm_verdict TEXT;
+ALTER TABLE gating_audit ADD COLUMN llm_score REAL;
 "#;
 
 const GATING_DROP_COUNTER_KEYS: &[&str] = &[
@@ -185,6 +190,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 7,
             up: apply_v7,
         },
+        Migration {
+            version: 8,
+            up: apply_v8,
+        },
     ]
 }
 
@@ -265,6 +274,10 @@ fn apply_v7(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn apply_v8(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_gating_audit_llm_columns(conn)
+}
+
 fn ensure_gating_audit_columns(conn: &Connection) -> rusqlite::Result<()> {
     if conn
         .query_row(
@@ -291,6 +304,31 @@ fn ensure_gating_audit_columns(conn: &Connection) -> rusqlite::Result<()> {
         WHERE retained_until IS NULL OR retained_until = 0;
         "#,
     )?;
+    Ok(())
+}
+
+fn ensure_gating_audit_llm_columns(conn: &Connection) -> rusqlite::Result<()> {
+    if conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gating_audit'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+        == 0
+    {
+        return Ok(());
+    }
+
+    let has_llm_verdict = table_has_column(conn, "gating_audit", "llm_verdict")?;
+    let has_llm_score = table_has_column(conn, "gating_audit", "llm_score")?;
+    match (has_llm_verdict, has_llm_score) {
+        (false, false) => conn.execute_batch(FORK_EXT_V8_SCHEMA_SQL)?,
+        (false, true) => {
+            conn.execute_batch("ALTER TABLE gating_audit ADD COLUMN llm_verdict TEXT;")?
+        }
+        (true, false) => conn.execute_batch("ALTER TABLE gating_audit ADD COLUMN llm_score REAL;")?,
+        (true, true) => {}
+    }
     Ok(())
 }
 

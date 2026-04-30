@@ -33,7 +33,7 @@ test_gating_audit_records_decisions
 test_gating_disabled_short_circuits
 test_gating_preserves_vector_dim_consistency
 test_gating_stats_cli_output
-test_llm_judge_section_warns_and_ignores
+test_llm_judge_section_no_longer_warns
 test_tier1_skips_read_tool
 test_tier1_skips_short_content
 test_tier2_keeps_above_threshold
@@ -1090,10 +1090,14 @@ fn test_load_gating_audit_falls_back_to_explain_json_for_default_row() {
 }
 
 #[test]
-fn test_llm_judge_section_warns_and_ignores() {
+fn test_llm_judge_section_no_longer_warns() {
     let _guard = test_guard_blocking();
     let env = TestEnv::new(
         r#"
+[llm]
+enabled = true
+base_url = "http://localhost:8317/v1"
+
 [ingest_gating.llm_judge]
 enabled = true
 backend = "api"
@@ -1101,15 +1105,21 @@ backend = "api"
     );
 
     let config = env.config();
+    assert!(config.llm.enabled);
     assert!(!config.ingest_gating.enabled);
 
     let output = run_mempal(&env.home, &["status"]);
     assert!(output.status.success(), "{output:?}");
     let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
-    assert!(
-        stderr.contains("llm_judge tier ignored: external LLM API disabled by design"),
-        "{stderr}"
-    );
+    let obsolete_warning = [
+        "llm_judge tier",
+        " ignored",
+        ": ",
+        "external LLM",
+        " API disabled by design",
+    ]
+    .concat();
+    assert!(!stderr.contains(&obsolete_warning), "{stderr}");
 }
 
 #[test]
