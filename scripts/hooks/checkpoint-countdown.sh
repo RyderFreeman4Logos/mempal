@@ -31,8 +31,8 @@ fi
 PROJECT_HASH=$(echo -n "$(pwd)" | sha256sum | cut -c1-12)
 LOCKFILE="/tmp/mempal-checkpoint-${PROJECT_HASH}.lock"
 
-# Dedup: if a countdown is already pending for this project workspace, skip
-if [ -f "$LOCKFILE" ]; then
+# Dedup: mkdir is atomic — if it succeeds, we hold the lock
+if ! mkdir "$LOCKFILE" 2>/dev/null; then
     exit 0
 fi
 
@@ -44,7 +44,7 @@ cat <<CHECKPOINT_PROMPT
 before KV cache expires (1h TTL), run this background countdown:
 
 \`\`\`bash
-touch $LOCKFILE && sleep 3000 && mempal checkpoint save --project "$PROJECT_NAME" --content "$(echo 'Session checkpoint auto-saved. Summarize current work state here.')" && rm -f $LOCKFILE
+sleep 3000 && mempal checkpoint save --project "$PROJECT_NAME" --content "Session checkpoint auto-saved. Summarize current work state here." && rmdir "$LOCKFILE"
 \`\`\`
 
 Run the sleep command with run_in_background: true. When the notification fires

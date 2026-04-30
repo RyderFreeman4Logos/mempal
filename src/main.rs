@@ -1807,6 +1807,7 @@ fn extract_text_from_content(content: &Value) -> String {
 }
 
 fn parse_checkpoint_duration(raw: &str) -> Result<i64> {
+    let raw = raw.trim();
     if raw.is_empty() {
         bail!("empty duration");
     }
