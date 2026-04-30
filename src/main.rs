@@ -3708,6 +3708,8 @@ fn status_command(db: &Database, config: &Config) -> Result<()> {
     let cfg_meta = ConfigHandle::snapshot_meta();
     let scrub_stats = ConfigHandle::scrub_stats();
     let runtime_warnings = ConfigHandle::collect_runtime_warnings();
+    let endpoint_health = mempal::endpoint_health::probe_endpoints_blocking(config)
+        .context("failed to probe endpoint health")?;
     let embed_status = global_embed_status().snapshot();
     let queue_stats = mempal::core::queue::PendingMessageStore::new(db.path())
         .context("failed to open pending message store")?
@@ -3801,6 +3803,9 @@ fn status_command(db: &Database, config: &Config) -> Result<()> {
     if let Some(last_success_at) = embed_status.last_success_at_unix_ms {
         println!("embed_last_success_at_unix_ms: {last_success_at}");
     }
+    println!("Endpoints:");
+    println!("  embedding: {}", endpoint_health.embedding.display());
+    println!("  llm: {}", endpoint_health.llm.display());
     println!("Daemon:");
     println!("  running: {daemon_running}");
     match daemon_pid {
@@ -3815,9 +3820,18 @@ fn status_command(db: &Database, config: &Config) -> Result<()> {
     println!("  pending: {}", queue_stats.pending);
     println!("  claimed: {}", queue_stats.claimed);
     println!("  failed: {}", queue_stats.failed);
+    println!("  rate_per_min: {:.1}", queue_stats.rate_per_min);
     match queue_stats.oldest_pending_age_secs {
         Some(age) => println!("  oldest_pending_age_secs: {age}"),
         None => println!("  oldest_pending_age_secs: none"),
+    }
+    match queue_stats.avg_processing_ms {
+        Some(avg) => println!("  avg_processing_ms: {avg}"),
+        None => println!("  avg_processing_ms: n/a"),
+    }
+    match queue_stats.eta_secs {
+        Some(eta) => println!("  eta_secs: {eta}"),
+        None => println!("  eta_secs: n/a"),
     }
     println!("Scrub:");
     println!(
@@ -4124,12 +4138,7 @@ fn reindex_row_is_stale(db: &Database, row: &ReindexRow, target_fingerprint: &st
 }
 
 fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    PathBuf::from(path)
+    mempal::core::utils::expand_home(path)
 }
 fn prime_embedder_degraded() -> bool {
     if std::env::var_os("MEMPAL_TEST_EMBED_DEGRADED").is_some() {

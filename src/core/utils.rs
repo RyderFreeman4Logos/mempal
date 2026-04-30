@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -460,6 +461,15 @@ fn content_terms(content: &str) -> BTreeSet<String> {
         .filter(|term| !term.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+pub fn expand_home(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(path)
 }
 
 #[cfg(test)]

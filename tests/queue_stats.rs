@@ -1,6 +1,9 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::{Database, apply_fork_ext_migrations_to};
@@ -44,6 +47,72 @@ db_path = "{}"
     )
     .expect("write config");
     (tmp, db_path)
+}
+
+fn setup_home_with_status_endpoints(base_url: &str) -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().expect("tempdir");
+    let mempal_home = tmp.path().join(".mempal");
+    fs::create_dir_all(&mempal_home).expect("create mempal home");
+    let db_path = mempal_home.join("palace.db");
+    Database::open(&db_path).expect("open db");
+    fs::write(
+        mempal_home.join("config.toml"),
+        format!(
+            r#"
+db_path = "{}"
+
+[embed]
+backend = "openai_compat"
+
+[embed.openai_compat]
+base_url = "{}"
+model = "embed-test"
+
+[llm]
+enabled = true
+base_url = "{}"
+model = "llm-test"
+"#,
+            db_path.display(),
+            base_url,
+            base_url
+        ),
+    )
+    .expect("write config");
+    (tmp, db_path)
+}
+
+#[test]
+fn test_status_command_shows_endpoint_health() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handle = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 29\r\nconnection: close\r\n\r\n{\"object\":\"list\",\"data\":[]}",
+                )
+                .expect("write response");
+        }
+    });
+
+    let (home, _db_path) = setup_home_with_status_endpoints(&format!("http://{addr}/v1"));
+    let output = Command::new(mempal_bin())
+        .arg("status")
+        .env("HOME", home.path())
+        .output()
+        .expect("run mempal status");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
+    assert!(stdout.contains("Endpoints:"), "{stdout}");
+    assert!(stdout.contains("embedding: reachable ("), "{stdout}");
+    assert!(stdout.contains("llm: reachable ("), "{stdout}");
+
+    handle.join().expect("server join");
 }
 
 #[test]
@@ -136,6 +205,9 @@ fn test_queue_stats_reflects_current_state() {
     assert_eq!(stats.pending, 1);
     assert_eq!(stats.claimed, 1);
     assert_eq!(stats.failed, 1);
+    assert!((stats.rate_per_min - 0.1).abs() < f64::EPSILON, "{stats:?}");
+    assert!(stats.avg_processing_ms.is_some(), "{stats:?}");
+    assert_eq!(stats.eta_secs, Some(600), "{stats:?}");
     assert!(
         stats.oldest_pending_age_secs.is_some_and(|age| age >= 100),
         "{stats:?}"
@@ -161,6 +233,9 @@ fn test_oldest_pending_age_none_when_empty() {
     assert_eq!(stats.claimed, 0);
     assert_eq!(stats.failed, 0);
     assert_eq!(stats.oldest_pending_age_secs, None);
+    assert_eq!(stats.rate_per_min, 0.0);
+    assert_eq!(stats.avg_processing_ms, None);
+    assert_eq!(stats.eta_secs, None);
 }
 
 #[test]
@@ -219,6 +294,9 @@ fn test_status_command_shows_queue_stats() {
     assert!(stdout.contains("pending: 1"), "{stdout}");
     assert!(stdout.contains("claimed: 1"), "{stdout}");
     assert!(stdout.contains("failed: 1"), "{stdout}");
+    assert!(stdout.contains("rate_per_min: 0.1"), "{stdout}");
+    assert!(stdout.contains("avg_processing_ms:"), "{stdout}");
+    assert!(stdout.contains("eta_secs: 600"), "{stdout}");
     assert!(stdout.contains("oldest_pending_age_secs:"), "{stdout}");
 }
 

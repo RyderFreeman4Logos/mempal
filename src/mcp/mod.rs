@@ -1,5 +1,6 @@
 #![warn(clippy::all)]
 
+mod logging;
 mod server;
 mod timeline;
 mod tools;

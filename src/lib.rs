@@ -10,6 +10,7 @@ pub mod cowork;
 pub mod daemon;
 pub mod daemon_bootstrap;
 pub mod embed;
+pub mod endpoint_health;
 pub mod factcheck;
 pub mod field_taxonomy;
 pub mod hook;

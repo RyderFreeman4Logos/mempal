@@ -10,6 +10,7 @@ use super::config::scrub_sensitive_text;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STARTUP_RECLAIM_STALE_SECS: i64 = 60;
+const COMPLETION_METRICS_WINDOW_MINS: u64 = 10;
 pub const LAST_ERROR_MAX_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error)]
@@ -34,12 +35,15 @@ pub struct ClaimedMessage {
     pub source_hash: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QueueStats {
     pub pending: u64,
     pub claimed: u64,
     pub failed: u64,
     pub oldest_pending_age_secs: Option<u64>,
+    pub rate_per_min: f64,
+    pub avg_processing_ms: Option<u64>,
+    pub eta_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,11 +242,62 @@ impl PendingMessageStore {
     }
 
     pub fn confirm(&self, id: &str) -> Result<()> {
-        let conn = self.open_connection()?;
-        let updated = conn.execute("DELETE FROM pending_messages WHERE id = ?1", [id])?;
+        let mut conn = self.open_connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = tx
+            .query_row(
+                r#"
+                SELECT kind, created_at, claimed_at
+                FROM pending_messages
+                WHERE id = ?1
+                "#,
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| QueueError::MessageNotFound(id.to_string()))?;
+        let completed_at = now_millis();
+        let processing_ms = row
+            .2
+            .map(|claimed_at| completed_at.saturating_sub(claimed_at.saturating_mul(1_000)));
+        tx.execute(
+            r#"
+            INSERT INTO pending_message_completions (
+                message_id,
+                kind,
+                created_at,
+                claimed_at,
+                completed_at,
+                processing_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(message_id) DO UPDATE SET
+                kind = excluded.kind,
+                created_at = excluded.created_at,
+                claimed_at = excluded.claimed_at,
+                completed_at = excluded.completed_at,
+                processing_ms = excluded.processing_ms
+            "#,
+            params![
+                id,
+                row.0,
+                row.1.saturating_mul(1_000),
+                row.2.map(|s| s.saturating_mul(1_000)),
+                completed_at,
+                processing_ms
+            ],
+        )?;
+        let updated = tx.execute("DELETE FROM pending_messages WHERE id = ?1", [id])?;
         if updated == 0 {
             return Err(QueueError::MessageNotFound(id.to_string()));
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -359,11 +414,41 @@ impl PendingMessageStore {
         let oldest_pending_age_secs = oldest_pending_created_at
             .map(|created_at| i64_to_u64(now_secs().saturating_sub(created_at)));
 
+        let (rate_per_min, avg_processing_ms) =
+            if table_exists(&conn, "pending_message_completions")? {
+                let window_cutoff_ms = now_millis()
+                    .saturating_sub((COMPLETION_METRICS_WINDOW_MINS as i64).saturating_mul(60_000));
+                let (completed_count, avg_processing_ms) = conn.query_row(
+                    r#"
+                SELECT COUNT(*), AVG(processing_ms)
+                FROM pending_message_completions
+                WHERE completed_at >= ?1
+                "#,
+                    [window_cutoff_ms],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?)),
+                )?;
+                (
+                    (completed_count as f64) / (COMPLETION_METRICS_WINDOW_MINS as f64),
+                    avg_processing_ms.map(|value| value.round() as u64),
+                )
+            } else {
+                (0.0, None)
+            };
+        let pending_u64 = i64_to_u64(pending);
+        let eta_secs = if rate_per_min > 0.0 {
+            Some(((pending_u64 as f64 / rate_per_min) * 60.0).ceil() as u64)
+        } else {
+            None
+        };
+
         Ok(QueueStats {
-            pending: i64_to_u64(pending),
+            pending: pending_u64,
             claimed: i64_to_u64(claimed),
             failed: i64_to_u64(failed),
             oldest_pending_age_secs,
+            rate_per_min,
+            avg_processing_ms,
+            eta_secs,
         })
     }
 
@@ -431,6 +516,13 @@ fn now_secs() -> i64 {
     }
 }
 
+fn now_millis() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(_) => 0,
+    }
+}
+
 fn next_id(prefix: &str) -> String {
     let now_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis(),
@@ -453,6 +545,15 @@ fn div_ceil(lhs: i64, rhs: i64) -> i64 {
 
 fn i64_to_u64(value: i64) -> u64 {
     if value <= 0 { 0 } else { value as u64 }
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count > 0)
 }
 
 fn sanitize_last_error(error: &str) -> String {

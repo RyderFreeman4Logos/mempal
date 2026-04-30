@@ -53,16 +53,16 @@ use serde_json::Value;
 use super::timeline::{TimelineRequest, TimelineResponse};
 use super::tools::{
     ChunkerStatsDto, ContextRequest, ContextResponse, CoworkPushRequest, CoworkPushResponse,
-    DeleteRequest, DeleteResponse, DuplicateWarning, EmbedStatusDto, FactCheckRequest,
-    FactCheckResponse, FieldTaxonomyEntryDto, FieldTaxonomyResponse, IngestRequest, IngestResponse,
-    KgRequest, KgResponse, KgStatsDto, KnowledgeDemoteRequest, KnowledgeDemoteResponse,
-    KnowledgeDistillRequest, KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse,
-    KnowledgePolicyResponse, KnowledgePromoteRequest, KnowledgePromoteResponse,
-    KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse, LlmStatusDto,
-    MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest,
-    PeekPartnerResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest,
-    ReadDrawersResponse, RollbackRequest, RollbackResponse, ScopeCount, ScrubStatsDto,
-    SearchRequest, SearchResponse, SearchResultDto, StatusResponse, SystemWarning,
+    DeleteRequest, DeleteResponse, DuplicateWarning, EmbedStatusDto, EndpointHealthDto,
+    FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto, FieldTaxonomyResponse,
+    IngestRequest, IngestResponse, KgRequest, KgResponse, KgStatsDto, KnowledgeDemoteRequest,
+    KnowledgeDemoteResponse, KnowledgeDistillRequest, KnowledgeDistillResponse,
+    KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse, KnowledgePromoteRequest,
+    KnowledgePromoteResponse, KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse,
+    LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto,
+    PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
+    ReadDrawersRequest, ReadDrawersResponse, RollbackRequest, RollbackResponse, ScopeCount,
+    ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, StatusResponse, SystemWarning,
     TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto,
     TunnelEndpointDto, TunnelsRequest, TunnelsResponse,
 };
@@ -116,6 +116,8 @@ impl MempalMcpServer {
     pub async fn serve_stdio(
         self,
     ) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleServer, Self>> {
+        crate::mcp::logging::init_stdio_log_sink(ConfigHandle::current().as_ref())
+            .context("failed to initialize MCP log sink")?;
         self.gating_runtime
             .initialize_from_config()
             .await
@@ -836,6 +838,7 @@ impl MempalMcpServer {
             .map_err(|error| {
                 ErrorData::internal_error(format!("queue stats failed: {error}"), None)
             })?;
+        let endpoint_health = crate::endpoint_health::probe_endpoints(config.as_ref()).await;
         let embed_snapshot = global_embed_status().snapshot();
         let schema_version = db.schema_version().map_err(db_error)?;
         let stale_drawer_count = db
@@ -881,6 +884,12 @@ impl MempalMcpServer {
             scopes,
             aaak_spec: crate::aaak::generate_spec(),
             memory_protocol: crate::core::protocol::MEMORY_PROTOCOL.to_string(),
+            endpoint_health: EndpointHealthDto {
+                embedding_reachable: endpoint_health.embedding.reachable,
+                embedding_latency_ms: endpoint_health.embedding.latency_ms,
+                llm_reachable: endpoint_health.llm.reachable,
+                llm_latency_ms: endpoint_health.llm.latency_ms,
+            },
             embed_status: EmbedStatusDto {
                 backend: config.embed.backend.clone(),
                 base_url: config
@@ -900,7 +909,10 @@ impl MempalMcpServer {
                 pending: queue_stats.pending,
                 claimed: queue_stats.claimed,
                 failed: queue_stats.failed,
+                rate_per_min: queue_stats.rate_per_min,
                 oldest_pending_age_secs: queue_stats.oldest_pending_age_secs,
+                avg_processing_ms: queue_stats.avg_processing_ms,
+                eta_secs: queue_stats.eta_secs,
             },
             scrub_stats: ScrubStatsDto::from(ConfigHandle::scrub_stats()),
             chunker_stats: ChunkerStatsDto::from(
