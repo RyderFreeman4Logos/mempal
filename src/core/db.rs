@@ -1,9 +1,9 @@
 #[rustfmt::skip] #[path = "db_fork_ext.rs"] mod db_fork_ext;
 // harness-point: PR0 — re-export MigrationHook trait + hooked migration runner for tests
 pub use db_fork_ext::{
-    CURRENT_FORK_EXT_VERSION, FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL,
-    FORK_EXT_V3_SCHEMA_SQL, MigrationHook, apply_fork_ext_migrations, apply_fork_ext_migrations_to,
-    apply_fork_ext_migrations_with_hook, read_fork_ext_version, set_fork_ext_version,
+    apply_fork_ext_migrations, apply_fork_ext_migrations_to, apply_fork_ext_migrations_with_hook,
+    read_fork_ext_version, set_fork_ext_version, MigrationHook, CURRENT_FORK_EXT_VERSION,
+    FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL, FORK_EXT_V3_SCHEMA_SQL,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -12,8 +12,8 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Row, params, params_from_iter,
-    types::Value as SqlValue,
+    params, params_from_iter, types::Value as SqlValue, Connection, OpenFlags, OptionalExtension,
+    Row,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -2397,16 +2397,12 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
         .iter()
         .filter(|migration| migration.version > current_version)
     {
-        if migration.version == 5 && current_version < 5 {
-            // Fork: content_hash column added alongside upstream V5 columns.
-            // ALTER TABLE ADD COLUMN is not idempotent in SQLite, so guard
-            // it explicitly before the atomic migration block.
-            ensure_drawers_content_hash_column(conn)?;
-            if drawers_column_exists(conn, "memory_kind")? {
-                apply_migration_atomic(conn, &V5_ALREADY_APPLIED_MIGRATION)?;
-                backfill_content_hash(conn)?;
-                continue;
-            }
+        if migration.version == 5 {
+            // Some fork installs added content_hash early and bumped user_version
+            // past V5 without ever applying the upstream V5 drawer columns.
+            // Repair V5 by column existence, not only by schema version.
+            ensure_v5_drawers_schema(conn, current_version)?;
+            continue;
         }
         if migration.version == 7
             && current_version < 7
@@ -2416,13 +2412,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             continue;
         }
         apply_migration_atomic(conn, migration)?;
-        if migration.version == 5 {
-            // V5 introduces content_hash for indexed dedup; backfill existing
-            // rows so the new query path can rely on the column being populated
-            // for all live drawers. Batched commits keep the WAL bounded on
-            // installs with hundreds of thousands of drawers.
-            backfill_content_hash(conn)?;
-        }
+    }
+
+    if current_version >= 5 {
+        ensure_v5_drawers_schema(conn, read_user_version(conn)?)?;
     }
 
     Ok(())
@@ -2442,10 +2435,38 @@ fn apply_migration_atomic(conn: &Connection, migration: &Migration) -> Result<()
     Ok(())
 }
 
-fn ensure_drawers_content_hash_column(conn: &Connection) -> Result<(), DbError> {
-    if !drawers_column_exists(conn, "content_hash")? {
-        conn.execute_batch("ALTER TABLE drawers ADD COLUMN content_hash TEXT;")?;
+fn ensure_v5_drawers_schema(conn: &Connection, current_version: u32) -> Result<(), DbError> {
+    let existing_columns = drawers_column_names(conn)?;
+    let missing_columns = V5_DRAWER_COLUMN_MIGRATIONS
+        .iter()
+        .filter(|column| !existing_columns.contains(column.name))
+        .copied()
+        .collect::<Vec<_>>();
+
+    if missing_columns.is_empty() && current_version >= 5 {
+        return Ok(());
     }
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(error) = (|| -> Result<(), DbError> {
+        for column in missing_columns {
+            conn.execute_batch(column.sql)?;
+        }
+        conn.execute_batch(V5_DRAWER_METADATA_BACKFILL_SQL)?;
+        conn.execute_batch(V5_CONTENT_HASH_INDEX_SQL)?;
+        if current_version < 5 {
+            set_user_version(conn, 5)?;
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+
+    // Keep the large content_hash rewrite outside the schema transaction so
+    // the WAL stays bounded on legacy installs with many historical rows.
+    backfill_content_hash(conn)?;
     Ok(())
 }
 
@@ -2456,6 +2477,14 @@ fn drawers_column_exists(conn: &Connection, column: &str) -> Result<bool, DbErro
         |row| row.get::<_, i64>(0),
     )?;
     Ok(exists > 0)
+}
+
+fn drawers_column_names(conn: &Connection) -> Result<HashSet<String>, DbError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(drawers)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<HashSet<_>, _>>()?;
+    Ok(columns)
 }
 
 fn backfill_content_hash(conn: &Connection) -> Result<(), DbError> {
@@ -2601,6 +2630,110 @@ const V4_MIGRATION_SQL: &str = r#"
 ALTER TABLE drawers ADD COLUMN importance INTEGER DEFAULT 0;
 "#;
 
+#[derive(Clone, Copy)]
+struct DrawerColumnMigration {
+    name: &'static str,
+    sql: &'static str,
+}
+
+const V5_DRAWER_COLUMN_MIGRATIONS: &[DrawerColumnMigration] = &[
+    DrawerColumnMigration {
+        name: "memory_kind",
+        sql: "ALTER TABLE drawers ADD COLUMN memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge')) DEFAULT 'evidence';",
+    },
+    DrawerColumnMigration {
+        name: "domain",
+        sql: "ALTER TABLE drawers ADD COLUMN domain TEXT NOT NULL CHECK(domain IN ('project', 'agent', 'skill', 'global')) DEFAULT 'project';",
+    },
+    DrawerColumnMigration {
+        name: "field",
+        sql: "ALTER TABLE drawers ADD COLUMN field TEXT NOT NULL DEFAULT 'general';",
+    },
+    DrawerColumnMigration {
+        name: "anchor_kind",
+        sql: "ALTER TABLE drawers ADD COLUMN anchor_kind TEXT NOT NULL CHECK(anchor_kind IN ('global', 'repo', 'worktree')) DEFAULT 'repo';",
+    },
+    DrawerColumnMigration {
+        name: "anchor_id",
+        sql: "ALTER TABLE drawers ADD COLUMN anchor_id TEXT NOT NULL DEFAULT 'repo://legacy';",
+    },
+    DrawerColumnMigration {
+        name: "parent_anchor_id",
+        sql: "ALTER TABLE drawers ADD COLUMN parent_anchor_id TEXT;",
+    },
+    DrawerColumnMigration {
+        name: "provenance",
+        sql: "ALTER TABLE drawers ADD COLUMN provenance TEXT CHECK(provenance IN ('runtime', 'research', 'human'));",
+    },
+    DrawerColumnMigration {
+        name: "statement",
+        sql: "ALTER TABLE drawers ADD COLUMN statement TEXT;",
+    },
+    DrawerColumnMigration {
+        name: "tier",
+        sql: "ALTER TABLE drawers ADD COLUMN tier TEXT CHECK(tier IN ('qi', 'shu', 'dao_ren', 'dao_tian'));",
+    },
+    DrawerColumnMigration {
+        name: "status",
+        sql: "ALTER TABLE drawers ADD COLUMN status TEXT CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'));",
+    },
+    DrawerColumnMigration {
+        name: "supporting_refs",
+        sql: "ALTER TABLE drawers ADD COLUMN supporting_refs TEXT NOT NULL DEFAULT '[]';",
+    },
+    DrawerColumnMigration {
+        name: "counterexample_refs",
+        sql: "ALTER TABLE drawers ADD COLUMN counterexample_refs TEXT NOT NULL DEFAULT '[]';",
+    },
+    DrawerColumnMigration {
+        name: "teaching_refs",
+        sql: "ALTER TABLE drawers ADD COLUMN teaching_refs TEXT NOT NULL DEFAULT '[]';",
+    },
+    DrawerColumnMigration {
+        name: "verification_refs",
+        sql: "ALTER TABLE drawers ADD COLUMN verification_refs TEXT NOT NULL DEFAULT '[]';",
+    },
+    DrawerColumnMigration {
+        name: "scope_constraints",
+        sql: "ALTER TABLE drawers ADD COLUMN scope_constraints TEXT;",
+    },
+    DrawerColumnMigration {
+        name: "trigger_hints",
+        sql: "ALTER TABLE drawers ADD COLUMN trigger_hints TEXT;",
+    },
+    DrawerColumnMigration {
+        name: "content_hash",
+        sql: "ALTER TABLE drawers ADD COLUMN content_hash TEXT;",
+    },
+];
+
+const V5_DRAWER_METADATA_BACKFILL_SQL: &str = r#"
+UPDATE drawers
+SET memory_kind = 'evidence',
+    domain = 'project',
+    field = 'general',
+    anchor_kind = 'repo',
+    anchor_id = 'repo://legacy',
+    parent_anchor_id = NULL,
+    provenance = CASE source_type
+        WHEN 'project' THEN 'research'
+        WHEN 'conversation' THEN 'human'
+        WHEN 'manual' THEN 'human'
+        ELSE NULL
+    END
+WHERE memory_kind = 'evidence'
+  AND domain = 'project'
+  AND field = 'general'
+  AND anchor_kind = 'repo'
+  AND anchor_id = 'repo://legacy'
+  AND parent_anchor_id IS NULL
+  AND provenance IS NULL;
+"#;
+
+const V5_CONTENT_HASH_INDEX_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_drawers_content_hash ON drawers(wing, content_hash);
+"#;
+
 const V5_MIGRATION_SQL: &str = r#"
 ALTER TABLE drawers ADD COLUMN memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge')) DEFAULT 'evidence';
 ALTER TABLE drawers ADD COLUMN domain TEXT NOT NULL CHECK(domain IN ('project', 'agent', 'skill', 'global')) DEFAULT 'project';
@@ -2618,6 +2751,7 @@ ALTER TABLE drawers ADD COLUMN teaching_refs TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE drawers ADD COLUMN verification_refs TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE drawers ADD COLUMN scope_constraints TEXT;
 ALTER TABLE drawers ADD COLUMN trigger_hints TEXT;
+ALTER TABLE drawers ADD COLUMN content_hash TEXT;
 
 UPDATE drawers
 SET memory_kind = 'evidence',
@@ -2640,10 +2774,6 @@ WHERE memory_kind = 'evidence'
   AND parent_anchor_id IS NULL
   AND provenance IS NULL;
 
-CREATE INDEX IF NOT EXISTS idx_drawers_content_hash ON drawers(wing, content_hash);
-"#;
-
-const V5_ALREADY_APPLIED_MIGRATION_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_content_hash ON drawers(wing, content_hash);
 "#;
 
@@ -2799,11 +2929,6 @@ struct Migration {
     version: u32,
     sql: &'static str,
 }
-
-const V5_ALREADY_APPLIED_MIGRATION: Migration = Migration {
-    version: 5,
-    sql: V5_ALREADY_APPLIED_MIGRATION_SQL,
-};
 
 const V7_ALREADY_APPLIED_MIGRATION: Migration = Migration {
     version: 7,
@@ -3257,6 +3382,108 @@ mod tests {
         assert!(
             !columns.iter().any(|column| column == "memory_kind"),
             "failed migration must not leave partial columns behind"
+        );
+    }
+
+    #[test]
+    fn test_v5_repair_runs_when_user_version_is_already_past_v5() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE drawers (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                wing TEXT NOT NULL,
+                room TEXT,
+                source_file TEXT,
+                source_type TEXT NOT NULL CHECK(source_type IN ('project', 'conversation', 'manual')),
+                added_at TEXT NOT NULL,
+                chunk_index INTEGER,
+                deleted_at TEXT,
+                importance INTEGER DEFAULT 0,
+                content_hash TEXT
+            );
+            CREATE TABLE tunnels (
+                id TEXT PRIMARY KEY,
+                left_wing TEXT NOT NULL,
+                left_room TEXT,
+                right_wing TEXT NOT NULL,
+                right_room TEXT,
+                label TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                created_by TEXT,
+                deleted_at TEXT
+            );
+            INSERT INTO drawers (
+                id, content, wing, room, source_file, source_type, added_at, chunk_index, deleted_at, importance, content_hash
+            ) VALUES (
+                'legacy', 'legacy body', 'code', NULL, 'legacy.md', 'manual', '2026-04-29T00:00:00Z', 0, NULL, 0, NULL
+            );
+            PRAGMA user_version = 6;
+            "#,
+        )
+        .expect("create legacy schema");
+
+        apply_migrations(&conn).expect("repair schema");
+
+        assert_eq!(
+            read_user_version(&conn).expect("user_version"),
+            CURRENT_SCHEMA_VERSION
+        );
+
+        let columns = drawers_column_names(&conn).expect("drawer columns");
+        for required in [
+            "memory_kind",
+            "domain",
+            "field",
+            "anchor_kind",
+            "anchor_id",
+            "parent_anchor_id",
+            "provenance",
+            "statement",
+            "tier",
+            "status",
+            "supporting_refs",
+            "counterexample_refs",
+            "teaching_refs",
+            "verification_refs",
+            "scope_constraints",
+            "trigger_hints",
+            "content_hash",
+        ] {
+            assert!(
+                columns.contains(required),
+                "missing repaired V5 column: {required}"
+            );
+        }
+
+        let repaired = conn
+            .query_row(
+                "SELECT memory_kind, domain, field, anchor_kind, anchor_id, provenance, content_hash FROM drawers WHERE id = 'legacy'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .expect("read repaired row");
+
+        assert_eq!(repaired.0, "evidence");
+        assert_eq!(repaired.1, "project");
+        assert_eq!(repaired.2, "general");
+        assert_eq!(repaired.3, "repo");
+        assert_eq!(repaired.4, "repo://legacy");
+        assert_eq!(repaired.5.as_deref(), Some("human"));
+        assert_eq!(
+            repaired.6.as_deref(),
+            Some(blake3::hash(b"legacy body").to_hex().to_string().as_str())
         );
     }
 }
