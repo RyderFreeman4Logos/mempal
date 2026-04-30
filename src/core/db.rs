@@ -203,6 +203,7 @@ impl Database {
             }
             OpenMode::ReadWrite => Connection::open(path)?,
         };
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         if mode.allows_write() {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
