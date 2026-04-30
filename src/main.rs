@@ -421,6 +421,50 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         foreground: bool,
     },
+    /// Session checkpoint management (save/restore/cleanup).
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckpointCommands {
+    /// Save a session checkpoint drawer.
+    Save {
+        /// Explicit content. Reads from stdin if omitted.
+        #[arg(long)]
+        content: Option<String>,
+        /// Project ID override.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Retrieve the latest checkpoint content.
+    Latest {
+        /// Project ID filter.
+        #[arg(long)]
+        project: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Soft-delete checkpoints older than a given age.
+    Cleanup {
+        /// Max age to keep (e.g. '24h', '7d'). Default: 24h.
+        #[arg(long, default_value = "24h")]
+        max_age: String,
+        /// Show what would be deleted without doing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Extract session context from a Claude Code session JSONL file.
+    Extract {
+        /// Path to the session JSONL file.
+        path: PathBuf,
+        /// Only show the last N assistant messages. Default: 1.
+        #[arg(long, default_value_t = 1)]
+        last: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1049,6 +1093,9 @@ fn run() -> Result<()> {
             room,
             now,
         } => fact_check_command(&db, path.as_deref(), wing.as_deref(), room.as_deref(), now),
+        Commands::Checkpoint { command } => {
+            block_on_result(checkpoint_command(&db, config.as_ref(), command))
+        }
         Commands::CoworkDrain { .. }
         | Commands::CoworkStatus { .. }
         | Commands::CoworkInstallHooks { .. }
@@ -1558,6 +1605,219 @@ fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> 
         dry_run, stats.files, stats.chunks, stats.skipped, stats.dropped_by_gate
     );
     Ok(())
+}
+
+async fn checkpoint_command(
+    db: &Database,
+    config: &Config,
+    command: CheckpointCommands,
+) -> Result<()> {
+    use rusqlite::OptionalExtension;
+
+    match command {
+        CheckpointCommands::Save { content, project } => {
+            let raw_content = match content {
+                Some(c) => c,
+                None => {
+                    let mut input = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut input)
+                        .context("failed to read checkpoint content from stdin")?;
+                    input
+                }
+            };
+            if raw_content.trim().is_empty() {
+                bail!("checkpoint content must not be empty");
+            }
+            let content = normalize_stdin_content(&raw_content, false)?;
+
+            let wing = "session-checkpoint";
+            let room: Option<&str> = Some("claude");
+            let source_type = SourceType::Manual;
+            let drawer_id = build_bootstrap_evidence_drawer_id(wing, room, &content, &source_type);
+
+            let cwd = env::current_dir().ok();
+            let project_id = resolve_project_id(project.as_deref(), config, cwd.as_deref())
+                .context("failed to resolve checkpoint project id")?;
+
+            let embedder = build_embedder(config).await?;
+            let vectors = embedder
+                .embed(&[content.as_str()])
+                .await
+                .context("failed to embed checkpoint content")?;
+            let vector = vectors
+                .into_iter()
+                .next()
+                .context("embedder returned no vector for checkpoint")?;
+
+            let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+                id: drawer_id.clone(),
+                content,
+                wing: wing.to_string(),
+                room: room.map(ToOwned::to_owned),
+                source_file: Some("session-checkpoint".to_string()),
+                source_type,
+                added_at: iso_timestamp(),
+                chunk_index: Some(0),
+                importance: 4,
+            });
+            let drawer = Drawer {
+                normalize_version: CURRENT_NORMALIZE_VERSION,
+                ..drawer
+            };
+
+            db.insert_drawer_with_project(&drawer, project_id.as_deref())
+                .with_context(|| format!("failed to insert checkpoint drawer {}", drawer.id))?;
+            db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
+                .with_context(|| format!("failed to insert vector for checkpoint {drawer_id}"))?;
+
+            println!("checkpoint saved: {drawer_id}");
+        }
+        CheckpointCommands::Latest { project, json } => {
+            let cwd = env::current_dir().ok();
+            let project_id = resolve_project_id(project.as_deref(), config, cwd.as_deref())
+                .context("failed to resolve project id")?;
+
+            let row = db
+                .conn()
+                .query_row(
+                    "SELECT id, content, added_at FROM drawers \
+                     WHERE wing = 'session-checkpoint' AND deleted_at IS NULL \
+                     AND (?1 IS NULL OR project_id = ?1) \
+                     ORDER BY added_at DESC LIMIT 1",
+                    [&project_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            if let Some((id, content, added_at)) = row {
+                if json {
+                    let output = serde_json::json!({
+                        "id": id,
+                        "content": content,
+                        "added_at": added_at,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&output)
+                            .context("failed to serialize checkpoint JSON")?
+                    );
+                } else {
+                    println!("{content}");
+                }
+            } else if json {
+                println!("{{}}");
+            } else {
+                eprintln!("no checkpoints found");
+            }
+        }
+        CheckpointCommands::Cleanup { max_age, dry_run } => {
+            let duration_secs =
+                parse_checkpoint_duration(&max_age).context("invalid max-age duration")?;
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_secs() as i64;
+            let cutoff_secs = now_unix - duration_secs;
+            let cutoff_ts = mempal::cowork::peek::format_rfc3339(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(cutoff_secs as u64),
+            );
+
+            if dry_run {
+                let count: i64 = db.conn().query_row(
+                    "SELECT COUNT(*) FROM drawers \
+                     WHERE wing = 'session-checkpoint' AND deleted_at IS NULL \
+                     AND added_at < ?1",
+                    [&cutoff_ts],
+                    |row| row.get(0),
+                )?;
+                println!("dry-run: would delete {count} checkpoints older than {cutoff_ts}");
+            } else {
+                let now_ts = iso_timestamp();
+                let affected = db.conn().execute(
+                    "UPDATE drawers SET deleted_at = ?1 \
+                     WHERE wing = 'session-checkpoint' AND deleted_at IS NULL \
+                     AND added_at < ?2",
+                    [&now_ts, &cutoff_ts],
+                )?;
+                println!("deleted {affected} checkpoints older than {cutoff_ts}");
+            }
+        }
+        CheckpointCommands::Extract { path, last } => {
+            let file = std::fs::File::open(&path)
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            let reader = std::io::BufReader::new(file);
+            use std::io::BufRead;
+            let mut assistant_texts: Vec<String> = Vec::new();
+            for line in reader.lines() {
+                let line = line.context("failed to read JSONL line")?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let v: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if v.get("type").and_then(Value::as_str) != Some("assistant") {
+                    continue;
+                }
+                let msg = v.get("message").unwrap_or(&v);
+                if let Some(content) = msg.get("content") {
+                    let text = extract_text_from_content(content);
+                    if !text.is_empty() {
+                        assistant_texts.push(text);
+                    }
+                }
+            }
+            let start = assistant_texts.len().saturating_sub(last);
+            for text in &assistant_texts[start..] {
+                println!("{text}");
+                println!("---");
+            }
+            if assistant_texts.is_empty() {
+                eprintln!("no assistant messages found in {}", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_text_from_content(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => {
+            let mut parts = Vec::new();
+            for item in arr {
+                if item.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(t) = item.get("text").and_then(Value::as_str) {
+                        parts.push(t.to_string());
+                    }
+                }
+            }
+            parts.join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+fn parse_checkpoint_duration(raw: &str) -> Result<i64> {
+    if raw.is_empty() {
+        bail!("empty duration");
+    }
+    let (digits, unit) = raw.split_at(raw.len() - 1);
+    let value = digits.parse::<i64>().context("invalid duration digits")?;
+    let multiplier = match unit {
+        "h" => 3600,
+        "d" => 86400,
+        _ => bail!("unsupported duration unit: {unit} (use 'h' or 'd')"),
+    };
+    Ok(value * multiplier)
 }
 
 async fn ingest_path_with_options<'a, E: Embedder + ?Sized>(
