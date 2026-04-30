@@ -28,10 +28,11 @@ if [ ! -t 0 ] 2>/dev/null; then
     exit 0
 fi
 
-LOCKFILE="/tmp/mempal-checkpoint-pending-$$"
+PROJECT_HASH=$(echo -n "$(pwd)" | sha256sum | cut -c1-12)
+LOCKFILE="/tmp/mempal-checkpoint-${PROJECT_HASH}.lock"
 
-# Dedup: if a countdown is already pending for this session, skip
-if ls /tmp/mempal-checkpoint-pending-* 1>/dev/null 2>&1; then
+# Dedup: if a countdown is already pending for this project workspace, skip
+if [ -f "$LOCKFILE" ]; then
     exit 0
 fi
 

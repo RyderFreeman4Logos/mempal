@@ -1724,7 +1724,7 @@ async fn checkpoint_command(
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock before epoch")
                 .as_secs() as i64;
-            let cutoff_secs = now_unix - duration_secs;
+            let cutoff_secs = (now_unix - duration_secs).max(0);
             let cutoff_ts = mempal::cowork::peek::format_rfc3339(
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(cutoff_secs as u64),
             );
@@ -1810,12 +1810,16 @@ fn parse_checkpoint_duration(raw: &str) -> Result<i64> {
     if raw.is_empty() {
         bail!("empty duration");
     }
-    let (digits, unit) = raw.split_at(raw.len() - 1);
+    let (idx, unit_char) = raw
+        .char_indices()
+        .last()
+        .context("empty duration after trim")?;
+    let digits = &raw[..idx];
     let value = digits.parse::<i64>().context("invalid duration digits")?;
-    let multiplier = match unit {
-        "h" => 3600,
-        "d" => 86400,
-        _ => bail!("unsupported duration unit: {unit} (use 'h' or 'd')"),
+    let multiplier = match unit_char {
+        'h' => 3600,
+        'd' => 86400,
+        _ => bail!("unsupported duration unit: {unit_char} (use 'h' or 'd')"),
     };
     Ok(value * multiplier)
 }
