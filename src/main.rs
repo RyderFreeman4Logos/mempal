@@ -1634,7 +1634,8 @@ async fn checkpoint_command(
             let wing = "session-checkpoint";
             let room: Option<&str> = Some("claude");
             let source_type = SourceType::Manual;
-            let drawer_id = build_bootstrap_evidence_drawer_id(wing, room, &content, &source_type);
+            let drawer_id = build_checkpoint_drawer_id(wing, room, &content, &source_type)
+                .context("failed to build checkpoint drawer id")?;
 
             let cwd = env::current_dir().ok();
             let project_id = resolve_project_id(project.as_deref(), config, cwd.as_deref())
@@ -1806,6 +1807,20 @@ fn extract_text_from_content(content: &Value) -> String {
     }
 }
 
+fn build_checkpoint_drawer_id(
+    wing: &str,
+    room: Option<&str>,
+    content: &str,
+    source_type: &SourceType,
+) -> Result<String> {
+    let base_id = build_bootstrap_evidence_drawer_id(wing, room, content, source_type);
+    let timestamp_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock before epoch")?
+        .as_secs();
+    Ok(format!("{base_id}_{timestamp_secs:x}"))
+}
+
 fn parse_checkpoint_duration(raw: &str) -> Result<i64> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -1817,12 +1832,15 @@ fn parse_checkpoint_duration(raw: &str) -> Result<i64> {
         .context("empty duration after trim")?;
     let digits = &raw[..idx];
     let value = digits.parse::<i64>().context("invalid duration digits")?;
-    let multiplier = match unit_char {
+    if value <= 0 {
+        bail!("duration must be positive");
+    }
+    let multiplier: i64 = match unit_char {
         'h' => 3600,
         'd' => 86400,
         _ => bail!("unsupported duration unit: {unit_char} (use 'h' or 'd')"),
     };
-    Ok(value * multiplier)
+    value.checked_mul(multiplier).context("duration overflow")
 }
 
 async fn ingest_path_with_options<'a, E: Embedder + ?Sized>(
