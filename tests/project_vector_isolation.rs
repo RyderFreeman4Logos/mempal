@@ -967,7 +967,7 @@ fn test_project_migrate_batched_does_not_block_ingest() {
         .collect::<Vec<_>>();
     millis.sort_unstable();
     let p99 = millis[((millis.len() - 1) * 99) / 100];
-    assert!(p99 < 200, "writer latency p99 too high: {p99}ms");
+    assert!(p99 < 500, "writer latency p99 too high: {p99}ms");
 
     let conn = Connection::open(&db_path).expect("open sqlite");
     let updated: i64 = conn

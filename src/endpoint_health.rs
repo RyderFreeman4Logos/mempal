@@ -117,7 +117,7 @@ async fn probe_models_endpoint(
     .await
     {
         Ok(Ok(latency_ms)) => ProbeStatus::reachable(Some(latency_ms), "http probe".to_string()),
-        Ok(Err(error)) => ProbeStatus::unreachable(error.to_string()),
+        Ok(Err(error)) => ProbeStatus::unreachable(format!("{error:#}")),
         Err(_) => {
             ProbeStatus::unreachable(format!("timeout after {}ms", PROBE_TIMEOUT.as_millis()))
         }

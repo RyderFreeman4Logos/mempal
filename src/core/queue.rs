@@ -284,7 +284,14 @@ impl PendingMessageStore {
                 completed_at = excluded.completed_at,
                 processing_ms = excluded.processing_ms
             "#,
-            params![id, row.0, row.1, row.2, completed_at, processing_ms],
+            params![
+                id,
+                row.0,
+                row.1.saturating_mul(1_000),
+                row.2.map(|s| s.saturating_mul(1_000)),
+                completed_at,
+                processing_ms
+            ],
         )?;
         let updated = tx.execute("DELETE FROM pending_messages WHERE id = ?1", [id])?;
         if updated == 0 {

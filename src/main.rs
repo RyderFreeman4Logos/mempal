@@ -4138,12 +4138,7 @@ fn reindex_row_is_stale(db: &Database, row: &ReindexRow, target_fingerprint: &st
 }
 
 fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    PathBuf::from(path)
+    mempal::core::utils::expand_home(path)
 }
 fn prime_embedder_degraded() -> bool {
     if std::env::var_os("MEMPAL_TEST_EMBED_DEGRADED").is_some() {

@@ -55,12 +55,7 @@ fn prepare_log_file(path: &Path) -> Result<()> {
 }
 
 fn expand_home_path(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    PathBuf::from(path)
+    crate::core::utils::expand_home(path)
 }
 
 #[derive(Clone)]
