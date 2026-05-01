@@ -57,6 +57,9 @@ const DEFAULT_CONTEXT_T3_RATIO: f64 = 0.20;
 const DEFAULT_CONTEXT_MIN_T1_IMPORTANCE: u8 = 3;
 const DEFAULT_CONTEXT_T3_RECENCY_WINDOW_DAYS: u64 = 3;
 const DEFAULT_CONTEXT_T1_RECENCY_LAMBDA: f64 = 0.01;
+const DEFAULT_REPAIR_WINDOW_DAYS: u64 = 7;
+const DEFAULT_REPAIR_MIN_FAILURES: usize = 3;
+const DEFAULT_REPAIR_ALERT_THRESHOLD: usize = 3;
 static DEFAULT_SENSITIVE_SCRUBBER: OnceLock<Option<CompiledPrivacyConfig>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -80,6 +83,7 @@ pub struct Config {
     pub importance: ImportanceConfig,
     pub patterns: PatternsConfig,
     pub context: ContextConfig,
+    pub repair: RepairConfig,
 }
 
 impl Default for Config {
@@ -101,6 +105,7 @@ impl Default for Config {
             importance: ImportanceConfig::default(),
             patterns: PatternsConfig::default(),
             context: ContextConfig::default(),
+            repair: RepairConfig::default(),
         }
     }
 }
@@ -1228,6 +1233,35 @@ impl Default for ContextConfig {
             t3_recency_window_days: DEFAULT_CONTEXT_T3_RECENCY_WINDOW_DAYS,
             t1_recency_lambda: DEFAULT_CONTEXT_T1_RECENCY_LAMBDA,
             budget: ContextBudgetConfig::default(),
+        }
+    }
+}
+
+/// Configuration for P14 anti-pattern detection and repair warnings.
+/// All fields are hot-reload whitelisted.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RepairConfig {
+    /// Enable failure detection and anti-pattern analysis.
+    pub enabled: bool,
+    /// Additional failure keywords beyond the built-in list.
+    pub failure_keywords: Vec<String>,
+    /// Window in days for counting failure events when detecting patterns.
+    pub window_days: u64,
+    /// Minimum number of failure events on the same topic_sig to create a pattern.
+    pub min_failures: usize,
+    /// Minimum failure count to inject repair_warnings into mempal_context.
+    pub alert_threshold: usize,
+}
+
+impl Default for RepairConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            failure_keywords: vec![],
+            window_days: DEFAULT_REPAIR_WINDOW_DAYS,
+            min_failures: DEFAULT_REPAIR_MIN_FAILURES,
+            alert_threshold: DEFAULT_REPAIR_ALERT_THRESHOLD,
         }
     }
 }

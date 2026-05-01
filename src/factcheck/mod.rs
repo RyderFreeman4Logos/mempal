@@ -52,6 +52,10 @@ pub struct FactCheckReport {
     pub issues: Vec<FactIssue>,
     pub checked_entities: Vec<String>,
     pub kg_triples_scanned: usize,
+    /// Repeated failure patterns detected by P14 repair module.
+    /// Present only when `[repair] enabled = true` and patterns exist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_packages: Vec<crate::repair::RepairPackage>,
 }
 
 #[derive(Debug, Error)]
@@ -141,9 +145,25 @@ pub fn check(
         now_unix_secs,
     )?);
 
+    // P14: Repeated failure pattern detection.
+    let repair_config = crate::core::config::ConfigHandle::current();
+    let repair_packages = if repair_config.repair.enabled {
+        let now_ms = (now_unix_secs as i64).saturating_mul(1000);
+        let project_id = repair_config.project.id.clone();
+        crate::repair::detect_repeated_failures(
+            db.conn(),
+            &repair_config.repair,
+            project_id.as_deref(),
+            now_ms,
+        )
+    } else {
+        vec![]
+    };
+
     Ok(FactCheckReport {
         issues,
         checked_entities: text_names,
         kg_triples_scanned,
+        repair_packages,
     })
 }

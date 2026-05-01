@@ -14,7 +14,22 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 11;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 12;
+
+pub const FORK_EXT_V12_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS failure_events (
+    event_id      TEXT PRIMARY KEY,
+    drawer_id     TEXT NOT NULL,
+    wing          TEXT NOT NULL,
+    room          TEXT,
+    topic_sig     TEXT NOT NULL,
+    failure_type  TEXT NOT NULL,
+    detected_at   INTEGER NOT NULL,
+    project_id    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_failure_events_topic ON failure_events(topic_sig, detected_at);
+CREATE INDEX IF NOT EXISTS idx_failure_events_wing  ON failure_events(wing, room, detected_at);
+"#;
 
 pub const FORK_EXT_V11_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS patterns (
@@ -242,6 +257,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 11,
             up: apply_v11,
         },
+        Migration {
+            version: 12,
+            up: apply_v12,
+        },
     ]
 }
 
@@ -332,6 +351,10 @@ fn apply_v9(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v11(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V11_SCHEMA_SQL)
+}
+
+fn apply_v12(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V12_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {

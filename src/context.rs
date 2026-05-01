@@ -89,6 +89,9 @@ pub struct ContextPack {
     /// Tiered assembly result (P14). Present only when tiered_retrieval_enabled=true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tiered: Option<TieredAssembly>,
+    /// Active repair warnings injected at T1 priority (P14 decision-repair).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_warnings: Vec<crate::repair::RepairWarning>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -283,6 +286,7 @@ fn assemble_tiered(
 
     let anchors = context_anchors(&request)?;
     let recurring_themes = load_recurring_themes(db, project_id);
+    let repair_warnings = load_repair_warnings(db, project_id);
 
     Ok(ContextPack {
         query: request.query,
@@ -298,6 +302,7 @@ fn assemble_tiered(
         sections,
         recurring_themes,
         tiered: Some(tiered),
+        repair_warnings,
     })
 }
 
@@ -564,6 +569,7 @@ fn assemble_flat(
     }
 
     let recurring_themes = load_recurring_themes(db, request.project_id.as_deref());
+    let repair_warnings = load_repair_warnings(db, request.project_id.as_deref());
 
     Ok(ContextPack {
         query: request.query,
@@ -579,7 +585,23 @@ fn assemble_flat(
         sections,
         recurring_themes,
         tiered: None,
+        repair_warnings,
     })
+}
+
+fn load_repair_warnings(
+    db: &Database,
+    project_id: Option<&str>,
+) -> Vec<crate::repair::RepairWarning> {
+    let config = crate::core::config::ConfigHandle::current();
+    if !config.repair.enabled {
+        return vec![];
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    crate::repair::load_repair_warnings(db.conn(), &config.repair, project_id, now_ms)
 }
 
 fn load_recurring_themes(db: &Database, project_id: Option<&str>) -> Vec<PatternSummary> {
