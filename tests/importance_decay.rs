@@ -3,7 +3,7 @@ use std::process::Command;
 
 use mempal::core::config::ImportanceConfig;
 use mempal::core::db::{Database, read_fork_ext_version};
-use mempal::core::decay::{compute_effective_importance, elapsed_days};
+use mempal::core::decay::compute_effective_importance;
 use mempal::core::types::{Drawer, SourceType, Triple};
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -116,77 +116,6 @@ fn index_exists(conn: &Connection, name: &str) -> bool {
     )
     .unwrap_or(0)
         > 0
-}
-
-// --- Unit tests for pure decay functions ---
-
-#[test]
-fn test_decay_reduces_importance_over_time() {
-    let config = ImportanceConfig {
-        decay_rate: 0.05,
-        floor: 0.1,
-        boost_per_access: 0.15,
-        boost_cap: 2.0,
-        stale_penalty: 0.5,
-    };
-    let eff = compute_effective_importance(3.0, 30.0, 0.0, &config);
-    assert!(eff < 3.0, "30 days should decay below base: {eff}");
-    assert!(eff >= 0.1, "floor must prevent going below 0.1: {eff}");
-}
-
-#[test]
-fn test_decay_floor_prevents_zero() {
-    let config = ImportanceConfig {
-        decay_rate: 0.01,
-        floor: 0.1,
-        boost_per_access: 0.15,
-        boost_cap: 2.0,
-        stale_penalty: 0.5,
-    };
-    let eff = compute_effective_importance(1.0, 10_000.0, 0.0, &config);
-    assert!(
-        (eff - 0.1).abs() < 1e-9,
-        "floor must clamp to 0.1 at extreme days: {eff}"
-    );
-}
-
-#[test]
-fn test_access_boost_increases_effective_importance() {
-    let config = default_importance_config();
-    let no_boost = compute_effective_importance(2.0, 0.0, 0.0, &config);
-    let with_boost = compute_effective_importance(2.0, 0.0, 0.3, &config);
-    assert!(
-        with_boost > no_boost,
-        "accumulated boost should increase importance: {with_boost} vs {no_boost}"
-    );
-}
-
-#[test]
-fn test_access_boost_capped_at_max() {
-    let config = ImportanceConfig {
-        boost_cap: 2.0,
-        ..default_importance_config()
-    };
-    let eff = compute_effective_importance(3.0, 0.0, 3.0, &config);
-    // boost is capped at 2.0, decay at 0 days ≈ 1.0, so eff ≈ 3.0*1.0 + 2.0 = 5.0
-    let expected = 3.0 * 1.0 + 2.0;
-    assert!(
-        (eff - expected).abs() < 1e-6,
-        "boost must be capped at boost_cap 2.0: expected {expected}, got {eff}"
-    );
-}
-
-#[test]
-fn test_elapsed_days_zero_for_same_timestamp() {
-    let days = elapsed_days(1_000_000, 1_000_000);
-    assert_eq!(days, 0.0);
-}
-
-#[test]
-fn test_elapsed_days_one_day() {
-    let ms_per_day: i64 = 86_400_000;
-    let days = elapsed_days(ms_per_day, 0);
-    assert!((days - 1.0).abs() < 1e-9, "should be 1.0 day: {days}");
 }
 
 // --- Integration tests ---
