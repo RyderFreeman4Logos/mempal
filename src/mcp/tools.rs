@@ -160,6 +160,84 @@ pub struct ContextResponse {
     /// Active repair warnings (P14 decision-repair). Non-empty when anti-patterns detected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repair_warnings: Vec<crate::repair::RepairWarning>,
+    /// Active skills injected at T1 head priority (P15). Agent should consult these
+    /// trigger_descriptions before deciding which skills to invoke.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_skills: Vec<SkillSummaryDto>,
+}
+
+/// Lightweight skill summary for context responses and list actions (P15).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SkillSummaryDto {
+    pub skill_id: String,
+    pub name: String,
+    pub trigger_description: String,
+    /// Laplace-smoothed adoption rate (computed at query time).
+    pub eta: f64,
+    pub status: String,
+    pub adoption_count: i64,
+    pub rejection_count: i64,
+}
+
+/// Full skill detail for the `show` action.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SkillDto {
+    pub skill_id: String,
+    pub name: String,
+    pub trigger_description: String,
+    pub pattern_id: String,
+    pub exemplar_ids: Vec<String>,
+    pub adoption_count: i64,
+    pub rejection_count: i64,
+    /// Laplace-smoothed adoption rate (computed at query time).
+    pub eta: f64,
+    pub status: String,
+    pub promoted_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+}
+
+/// Request for the `mempal_skill` MCP tool (P15).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SkillRequest {
+    /// Action to perform: list | show | promote | adopt | reject | retire
+    pub action: String,
+    /// Skill ID (required for show, adopt, reject, retire).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_id: Option<String>,
+    /// Pattern ID (required for promote).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern_id: Option<String>,
+    /// Human-readable name for the skill (required for promote).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// When to invoke this skill — provided by agent, NOT generated (required for promote).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_description: Option<String>,
+    /// Filter by status for list: probationary | active | retired. Omit for all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Optional project scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+}
+
+/// Response from the `mempal_skill` MCP tool.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SkillResponse {
+    pub action: String,
+    /// New or updated status after the action (adopt/reject/retire).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Full skill detail (show action or promote).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill: Option<SkillDto>,
+    /// List of skills (list action).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub skills: Vec<SkillSummaryDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Lightweight pattern summary for context responses.
@@ -1250,6 +1328,19 @@ impl From<ContextPack> for ContextResponse {
             t3_qi,
             budget_used,
             repair_warnings: value.repair_warnings,
+            active_skills: value
+                .active_skills
+                .into_iter()
+                .map(|s| SkillSummaryDto {
+                    skill_id: s.skill_id,
+                    name: s.name,
+                    trigger_description: s.trigger_description,
+                    eta: s.eta,
+                    status: "active".to_string(),
+                    adoption_count: 0,
+                    rejection_count: 0,
+                })
+                .collect(),
         }
     }
 }

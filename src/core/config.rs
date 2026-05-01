@@ -60,6 +60,10 @@ const DEFAULT_CONTEXT_T1_RECENCY_LAMBDA: f64 = 0.01;
 const DEFAULT_REPAIR_WINDOW_DAYS: u64 = 7;
 const DEFAULT_REPAIR_MIN_FAILURES: usize = 3;
 const DEFAULT_REPAIR_ALERT_THRESHOLD: usize = 3;
+const DEFAULT_SKILLS_ACTIVE_THRESHOLD: i64 = 3;
+const DEFAULT_SKILLS_RETIRE_THRESHOLD: i64 = 3;
+const DEFAULT_SKILLS_MIN_SESSIONS: usize = 5;
+const DEFAULT_SKILLS_SURFACING_THRESHOLD: f64 = 0.70;
 static DEFAULT_SENSITIVE_SCRUBBER: OnceLock<Option<CompiledPrivacyConfig>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -84,6 +88,7 @@ pub struct Config {
     pub patterns: PatternsConfig,
     pub context: ContextConfig,
     pub repair: RepairConfig,
+    pub skills: SkillsConfig,
 }
 
 impl Default for Config {
@@ -106,6 +111,7 @@ impl Default for Config {
             patterns: PatternsConfig::default(),
             context: ContextConfig::default(),
             repair: RepairConfig::default(),
+            skills: SkillsConfig::default(),
         }
     }
 }
@@ -1262,6 +1268,33 @@ impl Default for RepairConfig {
             window_days: DEFAULT_REPAIR_WINDOW_DAYS,
             min_failures: DEFAULT_REPAIR_MIN_FAILURES,
             alert_threshold: DEFAULT_REPAIR_ALERT_THRESHOLD,
+        }
+    }
+}
+
+/// Configuration for skill crystallization (P15).
+/// All fields are hot-reload whitelisted.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// Minimum adopt signals needed to promote from probationary → active.
+    pub active_threshold: i64,
+    /// Minimum reject signals (with zero adoptions) to auto-retire a probationary skill.
+    pub retire_threshold: i64,
+    /// Minimum pattern session_count required to promote a pattern to a skill.
+    pub skill_min_sessions: usize,
+    /// Cosine similarity threshold between query vector and pattern signature for
+    /// surfacing matching active skills in T1 context.
+    pub skill_surfacing_threshold: f64,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            active_threshold: DEFAULT_SKILLS_ACTIVE_THRESHOLD,
+            retire_threshold: DEFAULT_SKILLS_RETIRE_THRESHOLD,
+            skill_min_sessions: DEFAULT_SKILLS_MIN_SESSIONS,
+            skill_surfacing_threshold: DEFAULT_SKILLS_SURFACING_THRESHOLD,
         }
     }
 }

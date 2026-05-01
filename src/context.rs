@@ -12,6 +12,7 @@ use crate::core::{
     db::Database,
     db::DbError,
     patterns::PatternSummary,
+    skills::SkillForContext,
     types::{
         AnchorKind, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, RouteDecision,
         SearchResult, TriggerHints,
@@ -69,6 +70,9 @@ pub struct TieredAssembly {
     pub t2_items: Vec<TieredItem>,
     pub t3_items: Vec<TieredItem>,
     pub budget_used: BudgetUsed,
+    /// Active skills injected at the head of T1 (P15).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_skills: Vec<SkillForContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -92,6 +96,9 @@ pub struct ContextPack {
     /// Active repair warnings injected at T1 priority (P14 decision-repair).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repair_warnings: Vec<crate::repair::RepairWarning>,
+    /// Active skills injected at T1 head priority (P15 skill crystallization).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_skills: Vec<SkillForContext>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,11 +284,19 @@ fn assemble_tiered(
     // Build legacy sections for backward compat.
     let sections = build_tiered_sections(db, &t1_items, &t2_results, &t3_all, &request)?;
 
+    let active_skills = load_active_skills(
+        db,
+        project_id,
+        query_vector,
+        &crate::core::config::ConfigHandle::current().skills,
+    );
+
     let tiered = TieredAssembly {
         t1_items,
         t2_items: t2_results,
         t3_items: t3_all,
         budget_used,
+        active_skills: active_skills.clone(),
     };
 
     let anchors = context_anchors(&request)?;
@@ -303,6 +318,7 @@ fn assemble_tiered(
         recurring_themes,
         tiered: Some(tiered),
         repair_warnings,
+        active_skills,
     })
 }
 
@@ -570,6 +586,12 @@ fn assemble_flat(
 
     let recurring_themes = load_recurring_themes(db, request.project_id.as_deref());
     let repair_warnings = load_repair_warnings(db, request.project_id.as_deref());
+    let active_skills = load_active_skills(
+        db,
+        request.project_id.as_deref(),
+        query_vector,
+        &crate::core::config::ConfigHandle::current().skills,
+    );
 
     Ok(ContextPack {
         query: request.query,
@@ -586,7 +608,31 @@ fn assemble_flat(
         recurring_themes,
         tiered: None,
         repair_warnings,
+        active_skills,
     })
+}
+
+fn load_active_skills(
+    db: &Database,
+    project_id: Option<&str>,
+    query_vector: &[f32],
+    skills_cfg: &crate::core::config::SkillsConfig,
+) -> Vec<SkillForContext> {
+    if !crate::core::skills::skills_table_exists(db.conn()) {
+        return vec![];
+    }
+    match crate::core::skills::load_active_skills_for_context(
+        db.conn(),
+        project_id,
+        query_vector,
+        skills_cfg.skill_surfacing_threshold as f32,
+    ) {
+        Ok(skills) => skills,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to load active skills for context");
+            vec![]
+        }
+    }
 }
 
 fn load_repair_warnings(
