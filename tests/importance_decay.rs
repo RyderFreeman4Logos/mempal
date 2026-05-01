@@ -409,6 +409,7 @@ fn test_search_result_dto_includes_effective_importance() {
         anchor_kind: "global".to_string(),
         anchor_id: "anc".to_string(),
         parent_anchor_id: None,
+        matched_pattern_id: None,
     };
     assert!((_dto.effective_importance - 2.5).abs() < 1e-9);
 }

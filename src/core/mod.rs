@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod decay;
 pub mod hot_reload;
+pub mod patterns;
 pub mod priming;
 pub mod project;
 pub mod protocol;

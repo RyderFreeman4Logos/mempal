@@ -281,11 +281,75 @@ pub fn search_with_vector_and_scope_options(
         inject_chunk_neighbors(db, &mut results)?;
     }
 
+    // Pattern boosting (P13): boost exemplar drawers of active patterns that
+    // match the query vector. Fire-and-forget on error.
+    apply_pattern_boost(db, query_vector, scope.project_id.as_deref(), &mut results);
+
     // Post-RRF secondary reranking by effective_importance (P13).
     // Does NOT alter the similarity field; purely reorders within the final set.
     rerank_by_effective_importance(&mut results);
 
     Ok(results)
+}
+
+/// Apply active-pattern score boost to matching exemplar drawers.
+///
+/// For each active pattern whose signature cosine similarity to `query_vector` exceeds
+/// `surfacing_threshold`, the matching exemplar drawers in `results` receive a
+/// `+pattern_boost` to their `effective_importance`. Non-matching drawers are unchanged.
+/// Failures are silently logged (never propagate to the caller).
+fn apply_pattern_boost(
+    db: &Database,
+    query_vector: &[f32],
+    project_id: Option<&str>,
+    results: &mut [SearchResult],
+) {
+    if results.is_empty() || query_vector.is_empty() {
+        return;
+    }
+    let config = crate::core::config::ConfigHandle::current();
+    if !config.patterns.enabled {
+        return;
+    }
+    let surfacing_threshold = config.patterns.surfacing_threshold as f32;
+    let pattern_boost = config.patterns.pattern_boost;
+
+    let model_id = config.embed.model.clone().unwrap_or_else(|| {
+        if config.embed.backend == "model2vec" {
+            "model2vec/potion-multilingual-128M".to_string()
+        } else {
+            String::new()
+        }
+    });
+
+    let patterns = match crate::core::patterns::load_active_patterns_for_search(
+        db.conn(),
+        &model_id,
+        project_id,
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to load active patterns for boost");
+            return;
+        }
+    };
+
+    for pattern in &patterns {
+        if pattern.signature.is_empty() {
+            continue;
+        }
+        let sim = crate::core::patterns::cosine_similarity(query_vector, &pattern.signature);
+        if sim < surfacing_threshold {
+            continue;
+        }
+        // Apply boost to all results whose drawer_id is in this pattern's exemplar_ids.
+        for result in results.iter_mut() {
+            if pattern.exemplar_ids.contains(&result.drawer_id) {
+                result.effective_importance += pattern_boost;
+                result.matched_pattern_id = Some(pattern.pattern_id.clone());
+            }
+        }
+    }
 }
 
 /// Post-RRF secondary sort by `effective_importance` (descending).
@@ -569,6 +633,7 @@ fn result_from_drawer(
         neighbors: None,
         tunnel_hints: vec![],
         effective_importance: drawer.effective_importance,
+        matched_pattern_id: None,
     }
 }
 
@@ -793,6 +858,7 @@ pub fn search_by_vector(
                     tunnel_hints: vec![],
                     // Hydrated by `hydrate_result_metadata` below.
                     effective_importance: 0.0,
+                    matched_pattern_id: None,
                 })
             },
         )
@@ -901,6 +967,7 @@ fn search_by_vector_scoped_exact(
                     tunnel_hints: vec![],
                     // Hydrated by `hydrate_result_metadata` below.
                     effective_importance: 0.0,
+                    matched_pattern_id: None,
                 })
             },
         )
@@ -1177,6 +1244,7 @@ mod tests {
             neighbors: None,
             tunnel_hints: vec![],
             effective_importance: 0.0,
+            matched_pattern_id: None,
         }
     }
 

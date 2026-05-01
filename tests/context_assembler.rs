@@ -71,6 +71,7 @@ fn default_request(query: &str, cwd: &Path) -> ContextRequest {
         include_evidence: false,
         max_items: 12,
         dao_tian_limit: 1,
+        project_id: None,
     }
 }
 

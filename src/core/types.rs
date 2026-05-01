@@ -425,4 +425,8 @@ pub struct SearchResult {
     /// Loaded from the `effective_importance` column; defaults to
     /// `importance as f64` when the column doesn't exist (pre-v10 DBs).
     pub effective_importance: f64,
+    /// Pattern ID of the active pattern this result's drawer belongs to (P13).
+    /// Non-NULL when the result received a pattern boost during search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_pattern_id: Option<String>,
 }
