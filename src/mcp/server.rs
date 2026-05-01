@@ -62,9 +62,10 @@ use super::tools::{
     LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto,
     PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
     ReadDrawersRequest, ReadDrawersResponse, RollbackRequest, RollbackResponse, ScopeCount,
-    ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, StatusResponse, SystemWarning,
-    TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto,
-    TunnelEndpointDto, TunnelsRequest, TunnelsResponse,
+    ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest,
+    SkillResponse, SkillSummaryDto, StatusResponse, SystemWarning, TaxonomyEntryDto,
+    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
+    TunnelsRequest, TunnelsResponse,
 };
 
 #[derive(Clone)]
@@ -2494,6 +2495,235 @@ impl MempalMcpServer {
             repair_packages: report.repair_packages,
             system_warnings: current_system_warnings(),
         }))
+    }
+
+    #[tool(
+        name = "mempal_skill",
+        description = "Skill crystallization (P15): manage skills promoted from validated recurring patterns. Actions: list (list skills, optional status/project_id filter), show (full detail for one skill), promote (promote an active pattern to a probationary skill — you MUST provide name and trigger_description; mempal does NOT generate these), adopt (signal the skill was useful — adoption_count += 1, may promote to active), reject (signal the skill was not useful — rejection_count += 1, may auto-retire), retire (manually retire a skill). Only active skills are injected into context. Probationary skills need adopt signals to graduate. eta = adoption / (adoption + rejection + 1.0), computed at query time."
+    )]
+    pub async fn mempal_skill(
+        &self,
+        Parameters(request): Parameters<SkillRequest>,
+    ) -> std::result::Result<Json<SkillResponse>, ErrorData> {
+        let db = self.open_db()?;
+        let config = ConfigHandle::current();
+        let project_id = self
+            .resolve_mcp_project_id(request.project_id.as_deref(), &config)
+            .await?;
+
+        if !crate::core::skills::skills_table_exists(db.conn()) {
+            return Err(ErrorData::internal_error(
+                "skills table not yet created — run `mempal init` to apply migrations",
+                None,
+            ));
+        }
+
+        match request.action.as_str() {
+            "list" => {
+                let skills = tokio::task::block_in_place(|| {
+                    crate::core::skills::list_skills(
+                        db.conn(),
+                        request.status.as_deref(),
+                        project_id.as_deref(),
+                    )
+                })
+                .map_err(|e| ErrorData::internal_error(format!("list_skills failed: {e}"), None))?;
+
+                let dtos: Vec<SkillSummaryDto> = skills
+                    .iter()
+                    .map(|s| SkillSummaryDto {
+                        skill_id: s.skill_id.clone(),
+                        name: s.name.clone(),
+                        trigger_description: s.trigger_description.clone(),
+                        eta: s.eta(),
+                        status: s.status.as_str().to_string(),
+                        adoption_count: s.adoption_count,
+                        rejection_count: s.rejection_count,
+                    })
+                    .collect();
+
+                Ok(Json(SkillResponse {
+                    action: "list".to_string(),
+                    status: None,
+                    skill: None,
+                    skills: dtos,
+                    message: None,
+                }))
+            }
+
+            "show" => {
+                let skill_id = request.skill_id.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("skill_id is required for show", None)
+                })?;
+                let skill = tokio::task::block_in_place(|| {
+                    crate::core::skills::get_skill(db.conn(), skill_id)
+                })
+                .map_err(|e| ErrorData::internal_error(format!("get_skill failed: {e}"), None))?
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(format!("skill not found: {skill_id}"), None)
+                })?;
+
+                Ok(Json(SkillResponse {
+                    action: "show".to_string(),
+                    status: Some(skill.status.as_str().to_string()),
+                    skill: Some(skill_to_dto(&skill)),
+                    skills: vec![],
+                    message: None,
+                }))
+            }
+
+            "promote" => {
+                let pattern_id = request.pattern_id.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("pattern_id is required for promote", None)
+                })?;
+                let name = request.name.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        "name is required for promote (agent must provide, mempal does not generate)",
+                        None,
+                    )
+                })?;
+                let trigger_description = request.trigger_description.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        "trigger_description is required for promote (agent must provide, mempal does not generate)",
+                        None,
+                    )
+                })?;
+
+                let skill_min_sessions = config.skills.skill_min_sessions;
+                let skill = tokio::task::block_in_place(|| {
+                    crate::core::skills::promote_pattern_to_skill(
+                        db.conn(),
+                        &crate::core::skills::PromoteArgs {
+                            pattern_id,
+                            name,
+                            trigger_description,
+                            skill_min_sessions,
+                            project_id: project_id.as_deref(),
+                        },
+                    )
+                })
+                .map_err(|e| match e {
+                    crate::core::skills::PromotionError::PatternNotFound(_)
+                    | crate::core::skills::PromotionError::PatternNotActive(_)
+                    | crate::core::skills::PromotionError::InsufficientSessions(_, _)
+                    | crate::core::skills::PromotionError::SkillAlreadyExists => {
+                        ErrorData::invalid_params(e.to_string(), None)
+                    }
+                    crate::core::skills::PromotionError::Db(db_err) => {
+                        ErrorData::internal_error(format!("promote_skill db error: {db_err}"), None)
+                    }
+                })?;
+
+                Ok(Json(SkillResponse {
+                    action: "promote".to_string(),
+                    status: Some(skill.status.as_str().to_string()),
+                    skill: Some(skill_to_dto(&skill)),
+                    skills: vec![],
+                    message: Some(format!("skill '{}' created as probationary", skill.name)),
+                }))
+            }
+
+            "adopt" => {
+                let skill_id = request.skill_id.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("skill_id is required for adopt", None)
+                })?;
+                let active_threshold = config.skills.active_threshold;
+                let new_status = tokio::task::block_in_place(|| {
+                    crate::core::skills::adopt_skill(db.conn(), skill_id, active_threshold)
+                })
+                .map_err(|e| ErrorData::internal_error(format!("adopt_skill failed: {e}"), None))?
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(format!("skill not found: {skill_id}"), None)
+                })?;
+
+                Ok(Json(SkillResponse {
+                    action: "adopt".to_string(),
+                    status: Some(new_status.as_str().to_string()),
+                    skill: None,
+                    skills: vec![],
+                    message: Some(format!(
+                        "adoption recorded; skill status: {}",
+                        new_status.as_str()
+                    )),
+                }))
+            }
+
+            "reject" => {
+                let skill_id = request.skill_id.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("skill_id is required for reject", None)
+                })?;
+                let retire_threshold = config.skills.retire_threshold;
+                let new_status = tokio::task::block_in_place(|| {
+                    crate::core::skills::reject_skill(db.conn(), skill_id, retire_threshold)
+                })
+                .map_err(|e| ErrorData::internal_error(format!("reject_skill failed: {e}"), None))?
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(format!("skill not found: {skill_id}"), None)
+                })?;
+
+                Ok(Json(SkillResponse {
+                    action: "reject".to_string(),
+                    status: Some(new_status.as_str().to_string()),
+                    skill: None,
+                    skills: vec![],
+                    message: Some(format!(
+                        "rejection recorded; skill status: {}",
+                        new_status.as_str()
+                    )),
+                }))
+            }
+
+            "retire" => {
+                let skill_id = request.skill_id.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("skill_id is required for retire", None)
+                })?;
+                let found = tokio::task::block_in_place(|| {
+                    crate::core::skills::retire_skill(db.conn(), skill_id)
+                })
+                .map_err(|e| {
+                    ErrorData::internal_error(format!("retire_skill failed: {e}"), None)
+                })?;
+
+                if !found {
+                    return Err(ErrorData::invalid_params(
+                        format!("skill not found or already retired: {skill_id}"),
+                        None,
+                    ));
+                }
+
+                Ok(Json(SkillResponse {
+                    action: "retire".to_string(),
+                    status: Some("retired".to_string()),
+                    skill: None,
+                    skills: vec![],
+                    message: Some(format!("skill {skill_id} retired")),
+                }))
+            }
+
+            unknown => Err(ErrorData::invalid_params(
+                format!(
+                    "unknown action '{unknown}'; valid: list, show, promote, adopt, reject, retire"
+                ),
+                None,
+            )),
+        }
+    }
+}
+
+fn skill_to_dto(skill: &crate::core::skills::Skill) -> SkillDto {
+    SkillDto {
+        skill_id: skill.skill_id.clone(),
+        name: skill.name.clone(),
+        trigger_description: skill.trigger_description.clone(),
+        pattern_id: skill.pattern_id.clone(),
+        exemplar_ids: skill.exemplar_ids.clone(),
+        adoption_count: skill.adoption_count,
+        rejection_count: skill.rejection_count,
+        eta: skill.eta(),
+        status: skill.status.as_str().to_string(),
+        promoted_at_unix_ms: skill.promoted_at,
+        updated_at_unix_ms: skill.updated_at,
+        project_id: skill.project_id.clone(),
     }
 }
 

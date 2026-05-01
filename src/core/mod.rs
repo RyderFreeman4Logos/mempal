@@ -11,6 +11,7 @@ pub mod project;
 pub mod protocol;
 pub mod queue;
 pub mod reindex;
+pub mod skills;
 pub mod timeline;
 pub mod types;
 pub mod utils;
