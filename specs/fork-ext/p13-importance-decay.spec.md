@@ -19,38 +19,46 @@ mempal 的 `importance` 是 ingest 时写死的 1-5 静态标量——经过验�
 ## Decisions
 
 - fork-ext `fork_ext_version` `5 → 6` migration：
-  - `drawers` 表加三列（`ALTER TABLE ADD COLUMN`，regular table 支持）：
-    - `last_accessed_at INTEGER` — unix epoch ms，NULL 表示从未命中
+  - `drawers` 表加四列（`ALTER TABLE ADD COLUMN`，regular table 支持）：
+    - `last_accessed_at INTEGER` — unix epoch ms，NULL 表示从未命中；**NULL → 使用 `added_at`（drawer 创建时间戳）作为 fallback**
     - `access_count INTEGER NOT NULL DEFAULT 0`
+    - `accumulated_boost REAL DEFAULT 0.0` — 累计 session ingest boost，持久化存储
     - `effective_importance REAL NOT NULL DEFAULT 0.0`
   - 存量 drawer migration 时 `effective_importance = CAST(importance AS REAL)`（与原始重要度一致）
   - `CREATE INDEX idx_drawers_eff_importance ON drawers(effective_importance DESC)`
 
 - **衰减公式**（参数均可热重载）：
   ```
-  let days = (now_ms - last_accessed_at) / 86_400_000.0   // NULL → use ingest age
-  let decay = (1.0 - decay_rate * (1.0 + days).ln()).max(floor)
-  effective_importance = base_importance as f64 * decay + min(access_boost, boost_cap)
+  let days = (now_ms - last_accessed_at.unwrap_or(added_at)) / 86_400_000.0
+  //         NULL fallback: use added_at (drawer creation timestamp)
+  let decay = (-decay_rate * days).exp().max(floor)
+  effective_importance = base_importance as f64 * decay + accumulated_boost.min(boost_cap)
   ```
   `[importance]` config 子段（default 值）：
-  - `decay_rate: f64 = 0.05`
+  - `decay_rate: f64 = 0.01`（半衰期约 69 天；旧对数衰减 0.05 约需 60 年减半）
   - `floor: f64 = 0.1`（防止有用 drawer 被完全压制）
   - `boost_per_access: f64 = 0.15`（每次 session ingest boost）
   - `boost_cap: f64 = 2.0`（防止无限膨胀）
   - `stale_penalty: f64 = 0.5`（KG invalidated 乘数）
 
-- **命中信号**：`mempal_search` 返回结果时，对每个命中的 drawer 异步执行：
+- **命中信号**：`mempal_search` 返回结果时，对每个命中的 drawer 异步执行单条 SQL UPDATE（**禁止先 SELECT 再 UPDATE 的 read-modify-write，整个计算和写回必须在一条 SQL UPDATE 语句内完成**）：
   ```sql
   UPDATE drawers SET
     last_accessed_at = :now_ms,
-    access_count = access_count + 1
+    access_count = access_count + 1,
+    effective_importance = (
+      CAST(importance AS REAL)
+      * MAX(EXP(-:decay_rate * (:now_ms - COALESCE(last_accessed_at, added_at)) / 86400000.0), :floor)
+      + MIN(accumulated_boost, :boost_cap)
+    )
   WHERE id = :id
   ```
   此写操作在 tokio task 中批量 commit，不阻塞 search 响应路径
 
-- **Session ingest boost**：MCP server 维护 per-session 命中 drawer id 集合（内存，不持久化）；同一 session 调用 `mempal_ingest` 时对命中集合内的 drawer 触发 `effective_importance` 提升并清空集合
+- **Session ingest boost**：MCP server 维护 per-session 命中 drawer id 集合（内存，不持久化）；同一 session 调用 `mempal_ingest` 时对命中集合内的 drawer 在单条 SQL UPDATE 内原子增加 `accumulated_boost` 并重算 `effective_importance`，然后清空集合
   - 结构：`MempalMcpContext` 加 `session_hit_drawers: HashSet<DrawerId>`
   - boost 触发条件：集合非空 AND `mempal_ingest` 在同 session 内被调用
+  - **boost 必须原子写入**：`accumulated_boost = accumulated_boost + :boost_per_access` 与 `effective_importance` 重算在同一 SQL UPDATE 语句内执行
 
 - **陈旧惩罚**：`mempal_fact_check` 发现 `StaleFact` 时，对关联 drawer 执行 `effective_importance *= stale_penalty`（同步，低频）
 

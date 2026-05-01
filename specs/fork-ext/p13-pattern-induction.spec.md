@@ -23,16 +23,20 @@ mempal 的语义去重（p5-semantic-dedup）在新内容与已有 drawer 相似
   - 新建 `patterns` 表：
     ```sql
     CREATE TABLE IF NOT EXISTS patterns (
-        pattern_id    TEXT PRIMARY KEY,     -- UUID v4
-        signature     BLOB NOT NULL,        -- centroid embedding (same dim as drawer_vectors)
-        exemplar_ids  TEXT NOT NULL,        -- JSON array of drawer_id strings
-        session_ids   TEXT NOT NULL,        -- JSON array of session_id strings (dedup)
-        session_count INTEGER NOT NULL DEFAULT 0,
-        topic_tags    TEXT,                 -- JSON array of top-N keywords (overlap heuristic)
-        status        TEXT NOT NULL DEFAULT 'candidate', -- candidate | active | retired
-        first_seen_at INTEGER NOT NULL,     -- unix epoch ms
-        updated_at    INTEGER NOT NULL,
-        project_id    TEXT                  -- optional, links to p10-project-vector-isolation
+        pattern_id     TEXT PRIMARY KEY,     -- UUID v4
+        signature      BLOB NOT NULL,        -- centroid embedding (same dim as drawer_vectors)
+        exemplar_ids   TEXT NOT NULL,        -- JSON array of drawer_id strings
+        exemplar_count INTEGER NOT NULL DEFAULT 0, -- used as divisor in incremental centroid mean
+        session_ids    TEXT NOT NULL,        -- JSON array of session_id strings (dedup)
+        session_count  INTEGER NOT NULL DEFAULT 0,
+        topic_tags     TEXT,                 -- JSON array of top-N keywords (overlap heuristic)
+        model_id       TEXT,                 -- embedder model that produced signature; patterns with
+                                             -- mismatched model_id are excluded from matching until
+                                             -- re-computed via `mempal reindex`
+        status         TEXT NOT NULL DEFAULT 'candidate', -- candidate | active | retired
+        first_seen_at  INTEGER NOT NULL,     -- unix epoch ms
+        updated_at     INTEGER NOT NULL,
+        project_id     TEXT                  -- optional, links to p10-project-vector-isolation
     );
     CREATE INDEX IF NOT EXISTS idx_patterns_status ON patterns(status);
     CREATE INDEX IF NOT EXISTS idx_patterns_project ON patterns(project_id);
@@ -42,14 +46,15 @@ mempal 的语义去重（p5-semantic-dedup）在新内容与已有 drawer 相似
   - 去重警告触发（cosine ≥ `similarity_threshold`）时，额外检查命中的已有 drawer 的 `session_id`
   - 如果已有 drawer 集中，来自 ≥ `min_sessions` 个**不同** session 的相似 drawer 数量 ≥ `min_exemplars`，则满足 pattern candidate 条件
   - 创建 pattern：
-    - `signature` = exemplar embeddings 的向量质心（逐元素算术均值）
+    - `signature` = exemplar embeddings 的向量质心（逐元素算术均值，`exemplar_count` 初始化为 exemplar 数量）
+    - `model_id` = 当前 embedder 的 model identifier（`OpenAiCompatibleEmbedder` 的 model 字段或 `model2vec` 常量）；**model_id 不匹配当前 embedder 的 pattern 在搜索时跳过，直到 `mempal reindex` 重计算质心**
     - `topic_tags` = exemplar drawers 中 TF-IDF top-5 词（基于 FTS5 已有词频，不新增依赖）
     - `exemplar_ids` = 满足条件的 drawer id 列表
     - `session_ids` = 对应 session id 去重列表
 
 - **Pattern 生命周期**：
   - `candidate`（初始）→ `active`（当 `session_count >= promote_threshold`，默认 5）→ `retired`（手动或 `session_count` 无新增超过 `retire_after_days`）
-  - 每次新的相似 ingest 命中已有 pattern 时：更新 `session_ids`（追加，去重）、更新质心（滑动平均）、检查升级条件
+  - 每次新的相似 ingest 命中已有 pattern 时：更新 `session_ids`（追加，去重）、更新质心（**增量均值**：`new_centroid = (old_centroid * (exemplar_count - 1) + new_embedding) / exemplar_count`，`exemplar_count` 列作为除数，禁用简单 `(old+new)/2` 均值）、检查升级条件
 
 - **Config** `[patterns]` 子段（可热重载）：
   - `enabled: bool = true`

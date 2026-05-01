@@ -28,7 +28,7 @@ mempal 目前只有一个检索入口 `mempal_search`，所有 drawer 均以同�
 - 候选来源：`WHERE drawer.type IN ('decision', 'feedback', 'rule')` 且 `importance >= min_t1_importance`（默认 3）
 - 排序：`score = (effective_importance OR CAST(importance AS REAL)) × recency_weight`
   - `recency_weight = exp(-λ × days_since_ingest)`，默认 `λ = 0.01`（缓慢衰减，决策记忆保持长期相关）
-- Budget：按 token 估算（字符数 / 4），取前 K 条直到 T1 budget 耗尽
+- Budget：按 token 估算，取前 K 条直到 T1 budget 耗尽；**Token 估算 MUST 使用 `crates/mempal-ingest` 中共享的 `estimate_tokens()` 函数（已处理 CJK 多字节字符），禁止使用 `chars / 4` 原始启发式**
 - Active patterns（p13-pattern-induction 已实现时）也在 T1 中注入 `recurring_themes`
 
 **T2 — shu 层**：
@@ -47,14 +47,14 @@ mempal 目前只有一个检索入口 `mempal_search`，所有 drawer 均以同�
 
 ```toml
 [context.budget]
-total_chars = 8000           # 总 token 预算（字符估算）
+total_tokens = 8000          # 总 token 预算（通过 estimate_tokens() 估算，非 chars/4）
 t1_ratio = 0.30              # T1 分配 30%
 t2_ratio = 0.50              # T2 分配 50%
 t3_ratio = 0.20              # T3 分配 20%
 overflow_to_t2 = true        # T1/T3 未用完的预算转入 T2
 ```
 
-各层独立截断：先按 ratio 分配 chars，各层取前 K 条不超过分配量；`overflow_to_t2 = true` 时将剩余 budget 追加给 T2。
+各层独立截断：先按 ratio 分配 token budget（使用 `estimate_tokens()` 计算，**禁止 `chars / 4`**），各层取前 K 条不超过分配量；`overflow_to_t2 = true` 时将剩余 budget 追加给 T2。
 
 ### Trigger 参数
 
@@ -66,7 +66,7 @@ overflow_to_t2 = true        # T1/T3 未用完的预算转入 T2
 | `on_demand` | 0.7 | 1.3 | 0.5 | 重视 query 相关性（深度任务中） |
 | `repair` | 1.5 | 0.8 | 0.5 | 重视决策记忆（出错修复场景）|
 
-Tier budget 按 weight 比例动态调整（权重归一化后再乘以 total_chars × tier_ratio）。
+Tier budget 按 weight 比例动态调整（权重归一化后再乘以 total_tokens × tier_ratio）。
 
 ### 输出结构变化
 
@@ -79,7 +79,7 @@ Tier budget 按 weight 比例动态调整（权重归一化后再乘以 total_ch
   "t3_qi": [ { "drawer_id": "...", "content": "...", "source": "recency|kg|tunnel", ... } ],
   "recurring_themes": [...],   // from p13-pattern-induction if available
   "system_warnings": [...],
-  "budget_used": { "t1_chars": 2100, "t2_chars": 3800, "t3_chars": 1200, "total": 7100 }
+  "budget_used": { "t1_tokens": 2100, "t2_tokens": 3800, "t3_tokens": 1200, "total_tokens": 7100 }
 }
 ```
 
@@ -132,7 +132,7 @@ Scenario: session_start trigger 按默认权重分层装配 context
   When 调用 `mempal_context({trigger: "session_start"})`
   Then 响应含 `t1_dao_tian`、`t2_shu`、`t3_qi` 三个非空数组（数据充足时）
   And `t1_dao_tian` 中每条 drawer 的 `type` 为 `"decision"` 或 `"feedback"` 或 `"rule"`
-  And `budget_used.total_chars` <= `total_chars` 配置值
+  And `budget_used.total_tokens` <= `total_tokens` 配置值
 
 Scenario: repair trigger 提升 T1 权重，T1 获得更多 budget
   Test:
@@ -141,7 +141,7 @@ Scenario: repair trigger 提升 T1 权重，T1 获得更多 budget
     Targets: crates/mempal-mcp/src/tools/context.rs
   Given 相同 palace.db
   When 分别调用 `mempal_context({trigger: "session_start"})` 和 `mempal_context({trigger: "repair"})`
-  Then repair 响应的 `budget_used.t1_chars` 大于 session_start 响应的 `budget_used.t1_chars`
+  Then repair 响应的 `budget_used.t1_tokens` 大于 session_start 响应的 `budget_used.t1_tokens`
   And repair 响应的 `t1_dao_tian` 数组长度 >= session_start 响应的同数组长度（相同数据集下）
 
 Scenario: on_demand trigger 向 T2 倾斜 budget
@@ -151,17 +151,17 @@ Scenario: on_demand trigger 向 T2 倾斜 budget
     Targets: crates/mempal-mcp/src/tools/context.rs
   Given 相同 palace.db
   When 分别调用 `mempal_context({trigger: "on_demand"})` 和 `mempal_context({trigger: "session_start"})`
-  Then on_demand 响应的 `budget_used.t2_chars` 大于 session_start 响应的 `budget_used.t2_chars`
+  Then on_demand 响应的 `budget_used.t2_tokens` 大于 session_start 响应的 `budget_used.t2_tokens`
 
-Scenario: budget 分配不超过 total_chars 上限
+Scenario: budget 分配不超过 total_tokens 上限
   Test:
     Filter: test_tiered_context_budget_does_not_exceed_total
     Level: integration
     Targets: crates/mempal-mcp/src/tools/context.rs
   Given palace.db 含大量 drawer（各层足以超出 budget）
   When 调用 `mempal_context({trigger: "session_start"})`
-  Then `budget_used.total_chars <= total_chars`（不溢出）
-  And `budget_used.t1_chars + budget_used.t2_chars + budget_used.t3_chars == budget_used.total_chars`
+  Then `budget_used.total_tokens <= total_tokens`（不溢出）
+  And `budget_used.t1_tokens + budget_used.t2_tokens + budget_used.t3_tokens == budget_used.total_tokens`
 
 Scenario: overflow_to_t2=true 时 T1 未用完的 budget 转给 T2
   Test:
@@ -170,7 +170,7 @@ Scenario: overflow_to_t2=true 时 T1 未用完的 budget 转给 T2
     Targets: crates/mempal-mcp/src/tools/context.rs
   Given `overflow_to_t2 = true`，T1 只有 1 条 drawer（远小于 t1 分配 budget）
   When 调用 `mempal_context`，T2 数据充足
-  Then `budget_used.t2_chars` 超过 `total_chars * t2_ratio`（接收了 T1 溢出）
+  Then `budget_used.t2_tokens` 超过 `total_tokens * t2_ratio`（接收了 T1 溢出）
 
 Scenario: T3 只包含 recency_window_days 内的 drawer
   Test:

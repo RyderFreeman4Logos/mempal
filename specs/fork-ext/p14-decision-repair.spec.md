@@ -43,7 +43,7 @@ mempal 的 `mempal_fact_check` 检测存储知识中的矛盾（SimilarNameConfl
 
 - **Topic 签名**（`topic_sig`）：
   - 取 drawer content 经 FTS5 已有词频计算的 top-5 TF-IDF 词（与 p13-pattern-induction 的 `topic_tags` 同一机制，可共用实现）
-  - `topic_sig = sha256(sorted_top5_words)[:16]`（固定长度字符串，便于精确匹配）
+  - `topic_sig = sha256(sorted_top5_words)[:32]`（固定长度字符串，便于精确匹配；32 字符提供足够的碰撞抵抗性，16 字符在大规模 failure 事件集中碰撞概率不可接受）
 
 - **RepeatedFailurePattern 检测** — 触发时机：
   1. 每次 `mempal_ingest` 写入 failure 事件后

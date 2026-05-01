@@ -54,7 +54,7 @@ mempal 存储原始记忆并让 agent 检索，但没有将频繁验证的知识
 - **Feedback 信号** — agent 显式调用：
   - `mempal_skill adopt <skill_id>` / CLI `mempal skills adopt <skill_id>`：`adoption_count += 1`，检查是否升为 active
   - `mempal_skill reject <skill_id>` / CLI `mempal skills reject <skill_id>`：`rejection_count += 1`；若 `rejection_count >= retire_threshold`（默认 3）且 `adoption_count == 0`，自动 retire
-  - **Eta 计算**（展示用）：`eta = adoption_count / (adoption_count + rejection_count + 1.0)`（Laplace smoothed，不影响状态机）
+  - **Eta 计算**（展示用，**查询时动态计算，不存储**）：`eta = adoption_count / (adoption_count + rejection_count + 1.0)`（Laplace smoothed，不影响状态机）；eta **不在 `skills` 表中存储**，由 SELECT 查询的 application layer 实时计算后附加到响应 DTO
 
 - **`mempal_context` T1 集成**：
   - Active skills 注入 T1 层（p14-tiered-retrieval），优先级高于普通 decision drawer
@@ -119,7 +119,8 @@ Scenario: fork-ext migration 8 → 9 创建 skills 表
   Given palace.db `fork_ext_version == "8"`
   When 启动 mempal
   Then `fork_ext_version == "9"`
-  And sqlite_master 中存在 table `skills`，含 `skill_id`、`name`、`trigger_description`、`pattern_id`、`adoption_count`、`rejection_count`、`status`、`eta` 相关列
+  And sqlite_master 中存在 table `skills`，含 `skill_id`、`name`、`trigger_description`、`pattern_id`、`adoption_count`、`rejection_count`、`status` 相关列
+  And `skills` 表**不含** `eta` 列（eta 为查询时动态计算，不存储）
   And 存在索引 `idx_skills_status`
 
 Scenario: active pattern 满足条件时可被提升为 probationary skill
