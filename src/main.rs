@@ -1601,6 +1601,22 @@ async fn ingest_stdin_command(
     db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
         .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
 
+    // Failure detection (P14) — synchronous, lightweight DB write.
+    {
+        let config_snap = ConfigHandle::current();
+        if config_snap.repair.enabled {
+            mempal::repair::try_record_failure(
+                db.path(),
+                &drawer_id,
+                &drawer.content,
+                wing,
+                room,
+                project_id.as_deref(),
+                &config_snap.repair,
+            );
+        }
+    }
+
     stats.chunks = 1;
     stats.drawer_ids.push(drawer_id);
     append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
