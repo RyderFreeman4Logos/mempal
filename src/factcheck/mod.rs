@@ -40,6 +40,10 @@ pub enum FactIssue {
         /// Unix seconds as stored in DB (triple.valid_to).
         valid_to: String,
         triple_id: String,
+        /// Source drawer linked to the stale triple, if any.
+        /// Used by the MCP handler to apply `stale_penalty` to `effective_importance`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_drawer: Option<String>,
     },
 }
 

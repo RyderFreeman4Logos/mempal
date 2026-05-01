@@ -281,7 +281,54 @@ pub fn search_with_vector_and_scope_options(
         inject_chunk_neighbors(db, &mut results)?;
     }
 
+    // Post-RRF secondary reranking by effective_importance (P13).
+    // Does NOT alter the similarity field; purely reorders within the final set.
+    rerank_by_effective_importance(&mut results);
+
     Ok(results)
+}
+
+/// Post-RRF secondary sort by `effective_importance` (descending).
+///
+/// Uses a stable sort so ties preserve the RRF score ordering.
+/// Per spec: must not modify the `similarity` field.
+fn rerank_by_effective_importance(results: &mut [SearchResult]) {
+    results.sort_by(|a, b| {
+        b.effective_importance
+            .partial_cmp(&a.effective_importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// Dispatch an async task to update access tracking fields for the given drawer IDs.
+///
+/// This must not block the search response path. The update runs on the current
+/// tokio runtime as a detached `spawn_blocking` task.
+pub fn dispatch_access_update(db_path: std::path::PathBuf, drawer_ids: Vec<String>) {
+    if drawer_ids.is_empty() {
+        return;
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let config = crate::core::config::ConfigHandle::current();
+    let decay_rate = config.importance.decay_rate;
+    let floor = config.importance.floor;
+    let boost_cap = config.importance.boost_cap;
+    tokio::task::spawn_blocking(move || match crate::core::db::Database::open(&db_path) {
+        Ok(db) => {
+            if let Err(err) =
+                db.update_access_fields_batch(&drawer_ids, now_ms, decay_rate, floor, boost_cap)
+            {
+                tracing::warn!(error = %err, "access field update failed");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to open db for access update");
+        }
+    });
 }
 
 /// BM25-only search path (fork API, used when embedder is unavailable).
@@ -521,6 +568,7 @@ fn result_from_drawer(
         chunk_index: drawer.chunk_index,
         neighbors: None,
         tunnel_hints: vec![],
+        effective_importance: drawer.effective_importance,
     }
 }
 
@@ -743,6 +791,8 @@ pub fn search_by_vector(
                     chunk_index: None,
                     neighbors: None,
                     tunnel_hints: vec![],
+                    // Hydrated by `hydrate_result_metadata` below.
+                    effective_importance: 0.0,
                 })
             },
         )
@@ -849,6 +899,8 @@ fn search_by_vector_scoped_exact(
                     chunk_index: None,
                     neighbors: None,
                     tunnel_hints: vec![],
+                    // Hydrated by `hydrate_result_metadata` below.
+                    effective_importance: 0.0,
                 })
             },
         )
@@ -1124,6 +1176,7 @@ mod tests {
             chunk_index: None,
             neighbors: None,
             tunnel_hints: vec![],
+            effective_importance: 0.0,
         }
     }
 

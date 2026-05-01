@@ -387,6 +387,8 @@ pub struct SearchResultDto {
     pub emotions: Vec<String>,
     /// Importance derived from AAAK flags, normalized to the existing 2-4 scale.
     pub importance_stars: u8,
+    /// Dynamic importance after time-decay + retrieval boost (P13).
+    pub effective_importance: f64,
     pub memory_kind: String,
     pub domain: String,
     pub field: String,
@@ -1045,6 +1047,7 @@ impl SearchResultDto {
             chunk_index: _,
             neighbors,
             tunnel_hints,
+            effective_importance,
         } = value;
         let analyzed_content = crate::session_review::analysis_content(&content);
         let signals = crate::aaak::analyze(analyzed_content);
@@ -1076,6 +1079,7 @@ impl SearchResultDto {
             flags: signals.flags,
             emotions: signals.emotions,
             importance_stars: signals.importance_stars,
+            effective_importance,
             memory_kind: memory_kind_slug(&memory_kind).to_string(),
             domain: domain_slug(&domain).to_string(),
             field,
@@ -1278,6 +1282,7 @@ mod tests {
             chunk_index: Some(0),
             neighbors: None,
             tunnel_hints: vec!["docs".to_string()],
+            effective_importance: 0.0,
         }
     }
 

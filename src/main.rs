@@ -367,7 +367,15 @@ enum Commands {
         since: Option<String>,
         #[arg(long, default_value_t = false)]
         raw: bool,
+        /// List drawers whose effective_importance is below this threshold (P13).
+        #[arg(long, default_value_t = false)]
+        stale: bool,
+        /// Threshold for --stale (default: 0.5).
+        #[arg(long, default_value_t = 0.5)]
+        threshold: f64,
     },
+    /// Recompute effective_importance for all active drawers using current decay params (P13).
+    RecomputeImportance,
     /// Run offline contradiction check on text against KG triples +
     /// known-entity registry. Pure read, no LLM, no network.
     FactCheck {
@@ -1078,15 +1086,28 @@ fn run() -> Result<()> {
                 raw,
             },
         ),
-        Commands::Audit { kind, since, raw } => observability::audit_command(
-            &db,
-            config.as_ref(),
-            observability::AuditOptions {
-                kind: kind.as_deref(),
-                since: since.as_deref(),
-                raw,
-            },
-        ),
+        Commands::Audit {
+            kind,
+            since,
+            raw,
+            stale,
+            threshold,
+        } => {
+            if stale {
+                audit_stale_command(&db, threshold)
+            } else {
+                observability::audit_command(
+                    &db,
+                    config.as_ref(),
+                    observability::AuditOptions {
+                        kind: kind.as_deref(),
+                        since: since.as_deref(),
+                        raw,
+                    },
+                )
+            }
+        }
+        Commands::RecomputeImportance => recompute_effective_importance_command(&db),
         Commands::FactCheck {
             path,
             wing,
@@ -2507,6 +2528,56 @@ fn recompute_importance_command(db: &Database, only_zero: bool) -> Result<()> {
         .bulk_update_importance(&updates)
         .context("failed to apply importance scores")?;
     println!("updated {updated} drawers with recomputed importance scores");
+    Ok(())
+}
+
+fn audit_stale_command(db: &Database, threshold: f64) -> Result<()> {
+    let rows = db
+        .drawers_below_importance_threshold(threshold, 200)
+        .context("failed to query stale drawers")?;
+    if rows.is_empty() {
+        println!("no drawers below effective_importance threshold {threshold:.3}");
+        return Ok(());
+    }
+    println!(
+        "{:<44}  {:<20}  {:<16}  {:>8}  {:>10}  {:>16}",
+        "drawer_id", "wing", "room", "eff_imp", "accesses", "last_accessed_at"
+    );
+    println!("{}", "-".repeat(120));
+    for (id, wing, room, eff_imp, access_count, last_accessed_ms) in &rows {
+        let room_str = room.as_deref().unwrap_or("-");
+        let last_str = last_accessed_ms
+            .map(|ms| {
+                use std::time::{Duration, UNIX_EPOCH};
+                let secs = (ms / 1000) as u64;
+                let t = UNIX_EPOCH + Duration::from_secs(secs);
+                mempal::cowork::peek::format_rfc3339(t)
+            })
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{id:<44}  {wing:<20}  {room_str:<16}  {eff_imp:>8.3}  {access_count:>10}  {last_str:>16}"
+        );
+    }
+    println!("\n{} drawer(s) below threshold {threshold:.3}", rows.len());
+    Ok(())
+}
+
+fn recompute_effective_importance_command(db: &Database) -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let config = mempal::core::config::ConfigHandle::current();
+    let imp = &config.importance;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    println!(
+        "recomputing effective_importance (decay_rate={}, floor={}, boost_cap={})...",
+        imp.decay_rate, imp.floor, imp.boost_cap
+    );
+    let updated = db
+        .recompute_all_effective_importance(now_ms, imp.decay_rate, imp.floor, imp.boost_cap)
+        .context("failed to recompute effective_importance")?;
+    println!("updated {updated} drawers");
     Ok(())
 }
 

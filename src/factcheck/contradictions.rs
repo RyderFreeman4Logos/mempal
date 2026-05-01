@@ -78,6 +78,7 @@ pub fn detect_stale_facts(
                     object: kg.object.clone(),
                     valid_to: valid_to.to_string(),
                     triple_id: kg.id.clone(),
+                    source_drawer: kg.source_drawer.clone(),
                 });
             }
         }

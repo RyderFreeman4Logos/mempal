@@ -38,6 +38,11 @@ const DEFAULT_SESSION_REVIEW_MIN_LENGTH: usize = 100;
 const DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES: usize = 1;
 const DEFAULT_HOTPATCH_MIN_IMPORTANCE_STARS: i32 = 4;
 const DEFAULT_HOTPATCH_MAX_SUGGESTION_LENGTH: usize = 80;
+const DEFAULT_IMPORTANCE_DECAY_RATE: f64 = 0.01;
+const DEFAULT_IMPORTANCE_FLOOR: f64 = 0.1;
+const DEFAULT_IMPORTANCE_BOOST_PER_ACCESS: f64 = 0.15;
+const DEFAULT_IMPORTANCE_BOOST_CAP: f64 = 2.0;
+const DEFAULT_IMPORTANCE_STALE_PENALTY: f64 = 0.5;
 static DEFAULT_SENSITIVE_SCRUBBER: OnceLock<Option<CompiledPrivacyConfig>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -58,6 +63,7 @@ pub struct Config {
     pub hooks: HooksConfig,
     pub daemon: DaemonConfig,
     pub mcp: McpConfig,
+    pub importance: ImportanceConfig,
 }
 
 impl Default for Config {
@@ -76,6 +82,7 @@ impl Default for Config {
             hooks: HooksConfig::default(),
             daemon: DaemonConfig::default(),
             mcp: McpConfig::default(),
+            importance: ImportanceConfig::default(),
         }
     }
 }
@@ -1078,4 +1085,34 @@ impl ConfigHandle {
 fn global_scrub_stats() -> &'static Mutex<ScrubStats> {
     static SCRUB_STATS: OnceLock<Mutex<ScrubStats>> = OnceLock::new();
     SCRUB_STATS.get_or_init(|| Mutex::new(ScrubStats::default()))
+}
+
+/// Parameters for time-decay and retrieval-boost of `effective_importance`.
+/// All fields are hot-reload whitelisted.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ImportanceConfig {
+    /// Exponential decay rate per day. Half-life ≈ ln(2)/decay_rate days.
+    /// Default 0.01 → half-life ~69 days.
+    pub decay_rate: f64,
+    /// Minimum value `effective_importance` can decay to (prevents full suppression).
+    pub floor: f64,
+    /// How much `accumulated_boost` increases per session-ingest boost event.
+    pub boost_per_access: f64,
+    /// Upper cap on `accumulated_boost` contribution (prevents runaway inflation).
+    pub boost_cap: f64,
+    /// Multiplicative penalty applied to `effective_importance` when a StaleFact is found.
+    pub stale_penalty: f64,
+}
+
+impl Default for ImportanceConfig {
+    fn default() -> Self {
+        Self {
+            decay_rate: DEFAULT_IMPORTANCE_DECAY_RATE,
+            floor: DEFAULT_IMPORTANCE_FLOOR,
+            boost_per_access: DEFAULT_IMPORTANCE_BOOST_PER_ACCESS,
+            boost_cap: DEFAULT_IMPORTANCE_BOOST_CAP,
+            stale_penalty: DEFAULT_IMPORTANCE_STALE_PENALTY,
+        }
+    }
 }

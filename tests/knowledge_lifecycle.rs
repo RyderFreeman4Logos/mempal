@@ -192,6 +192,7 @@ fn insert_knowledge_with_refs(
         verification_refs: refs.verification,
         scope_constraints: None,
         trigger_hints: None,
+        effective_importance: 4.0,
     };
     db.insert_drawer(&drawer).expect("insert knowledge");
     db.insert_vector(id, &vector())
@@ -238,6 +239,7 @@ fn insert_knowledge_with_anchor(
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        effective_importance: 4.0,
     };
     db.insert_drawer(&drawer)
         .expect("insert anchored knowledge");

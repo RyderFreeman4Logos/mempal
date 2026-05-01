@@ -12,8 +12,8 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Row, params, params_from_iter,
-    types::Value as SqlValue,
+    Connection, OpenFlags, OptionalExtension, Row, functions::FunctionFlags, params,
+    params_from_iter, types::Value as SqlValue,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -70,7 +70,8 @@ const DRAWER_SELECT_COLUMNS: &str = r#"
     teaching_refs,
     verification_refs,
     scope_constraints,
-    trigger_hints
+    trigger_hints,
+    COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) as effective_importance
 "#;
 
 const V1_SCHEMA_SQL: &str = r#"
@@ -173,6 +174,19 @@ impl OpenMode {
     }
 }
 
+fn register_math_functions(conn: &Connection) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        "EXP",
+        1,
+        FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx: &rusqlite::functions::Context<'_>| {
+            let x: f64 = ctx.get(0)?;
+            Ok(x.exp())
+        },
+    )?;
+    Ok(())
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         Self::open_with_mode(path, OpenMode::ReadWrite)
@@ -204,6 +218,7 @@ impl Database {
             OpenMode::ReadWrite => Connection::open(path)?,
         };
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        register_math_functions(&conn)?;
         if mode.allows_write() {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -1140,9 +1155,11 @@ impl Database {
         ))?;
         let mut rows = statement.query_map([drawer_id], |row| {
             let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-            let updated_at = row.get::<_, Option<String>>(26)?;
-            let merge_count = row.get::<_, u32>(27)?;
-            let project_id = row.get::<_, Option<String>>(28)?;
+            // DRAWER_SELECT_COLUMNS now has 27 columns (indices 0-26), so
+            // the extra columns appended here start at index 27.
+            let updated_at = row.get::<_, Option<String>>(27)?;
+            let merge_count = row.get::<_, u32>(28)?;
+            let project_id = row.get::<_, Option<String>>(29)?;
             Ok(DrawerDetails {
                 drawer,
                 updated_at,
@@ -1194,9 +1211,10 @@ impl Database {
             let mut statement = self.conn.prepare(&sql)?;
             let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
                 let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-                let updated_at = row.get::<_, Option<String>>(26)?;
-                let merge_count = row.get::<_, u32>(27)?;
-                let project_id = row.get::<_, Option<String>>(28)?;
+                // DRAWER_SELECT_COLUMNS is 27 columns (0-26); extra columns start at 27.
+                let updated_at = row.get::<_, Option<String>>(27)?;
+                let merge_count = row.get::<_, u32>(28)?;
+                let project_id = row.get::<_, Option<String>>(29)?;
                 Ok((
                     drawer.id.clone(),
                     DrawerDetails {
@@ -1852,7 +1870,8 @@ impl Database {
                 rusqlite::params![room, exclude_drawer_id, current_project_id, sql_limit],
                 |row| {
                     let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-                    let project_id = row.get::<_, Option<String>>(26)?;
+                    // DRAWER_SELECT_COLUMNS is 27 columns (0-26); project_id appended at 27.
+                    let project_id = row.get::<_, Option<String>>(27)?;
                     Ok(TunnelDrawer {
                         drawer,
                         target_project_id: project_id,
@@ -2345,6 +2364,236 @@ impl Database {
             }
         }
         Ok(total)
+    }
+
+    // -----------------------------------------------------------------------
+    // P13: importance decay — access tracking + boost + stale penalty
+    // -----------------------------------------------------------------------
+
+    /// Atomically update access tracking and recompute `effective_importance`
+    /// for a batch of drawer IDs using a single SQL UPDATE per drawer.
+    ///
+    /// Uses WAL + deferred transaction (NOT `BEGIN IMMEDIATE`) to avoid lock
+    /// contention during high-frequency concurrent searches.
+    pub fn update_access_fields_batch(
+        &self,
+        drawer_ids: &[String],
+        now_ms: i64,
+        decay_rate: f64,
+        floor: f64,
+        boost_cap: f64,
+    ) -> Result<(), DbError> {
+        if drawer_ids.is_empty() {
+            return Ok(());
+        }
+        // Single UPDATE per drawer; all arithmetic is done inside SQLite to
+        // guarantee atomicity without a read-modify-write round-trip.
+        let sql = r#"
+            UPDATE drawers SET
+                last_accessed_at = ?1,
+                access_count = access_count + 1,
+                effective_importance = (
+                    CAST(COALESCE(importance, 0) AS REAL)
+                    * MIN(1.0, MAX(
+                        EXP(-?2 * MAX(0, ?1 - COALESCE(last_accessed_at, CAST(added_at AS INTEGER))) / 86400000.0),
+                        ?3
+                    ))
+                    + MIN(COALESCE(accumulated_boost, 0.0), ?4)
+                )
+            WHERE id = ?5 AND deleted_at IS NULL
+        "#;
+        let mut stmt = self.conn.prepare_cached(sql)?;
+        self.conn.execute_batch("BEGIN")?;
+        let result: Result<(), DbError> = (|| {
+            for id in drawer_ids {
+                stmt.execute(rusqlite::params![now_ms, decay_rate, floor, boost_cap, id])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Atomically apply session-ingest boost and recompute `effective_importance`
+    /// for a batch of drawer IDs.
+    ///
+    /// Note: SQLite SET clauses use pre-update column values, so
+    /// `effective_importance` must reference `(accumulated_boost + boost_per_access)`
+    /// explicitly rather than relying on the already-updated `accumulated_boost`.
+    pub fn apply_ingest_boost_batch(
+        &self,
+        drawer_ids: &[String],
+        now_ms: i64,
+        boost_per_access: f64,
+        boost_cap: f64,
+        decay_rate: f64,
+        floor: f64,
+    ) -> Result<(), DbError> {
+        if drawer_ids.is_empty() {
+            return Ok(());
+        }
+        let sql = r#"
+            UPDATE drawers SET
+                accumulated_boost = COALESCE(accumulated_boost, 0.0) + ?1,
+                effective_importance = (
+                    CAST(COALESCE(importance, 0) AS REAL)
+                    * MIN(1.0, MAX(
+                        EXP(-?3 * MAX(0, ?2 - COALESCE(last_accessed_at, CAST(added_at AS INTEGER))) / 86400000.0),
+                        ?4
+                    ))
+                    + MIN(COALESCE(accumulated_boost, 0.0) + ?1, ?5)
+                )
+            WHERE id = ?6 AND deleted_at IS NULL
+        "#;
+        let mut stmt = self.conn.prepare_cached(sql)?;
+        self.conn.execute_batch("BEGIN")?;
+        let result: Result<(), DbError> = (|| {
+            for id in drawer_ids {
+                stmt.execute(rusqlite::params![
+                    boost_per_access,
+                    now_ms,
+                    decay_rate,
+                    floor,
+                    boost_cap,
+                    id
+                ])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Apply stale penalty: multiply `effective_importance` by `stale_penalty`
+    /// for a specific drawer. Used when `mempal_fact_check` detects a StaleFact.
+    pub fn apply_stale_penalty_to_drawer(
+        &self,
+        drawer_id: &str,
+        stale_penalty: f64,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE drawers SET effective_importance = effective_importance * ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            rusqlite::params![stale_penalty, drawer_id],
+        )?;
+        Ok(())
+    }
+
+    /// Batch recompute `effective_importance` for all active drawers using the
+    /// provided decay parameters. Used by `mempal recompute-importance --effective`.
+    ///
+    /// Runs in batches of 1000 using `BEGIN IMMEDIATE` to avoid blocking readers.
+    pub fn recompute_all_effective_importance(
+        &self,
+        now_ms: i64,
+        decay_rate: f64,
+        floor: f64,
+        boost_cap: f64,
+    ) -> Result<usize, DbError> {
+        const BATCH_SIZE: i64 = 1000;
+        let mut total = 0usize;
+        let mut last_rowid: i64 = -1;
+
+        loop {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result: std::result::Result<(usize, i64), DbError> = (|| {
+                let sql = r#"
+                    UPDATE drawers SET
+                        effective_importance = (
+                            CAST(COALESCE(importance, 0) AS REAL)
+                            * MIN(1.0, MAX(
+                                EXP(-?1 * MAX(0, ?2 - COALESCE(last_accessed_at, CAST(added_at AS INTEGER))) / 86400000.0),
+                                ?3
+                            ))
+                            + MIN(COALESCE(accumulated_boost, 0.0), ?4)
+                        )
+                    WHERE rowid IN (
+                        SELECT rowid FROM drawers
+                        WHERE deleted_at IS NULL AND rowid > ?5
+                        ORDER BY rowid ASC LIMIT ?6
+                    )
+                "#;
+                let updated = self.conn.execute(
+                    sql,
+                    rusqlite::params![decay_rate, now_ms, floor, boost_cap, last_rowid, BATCH_SIZE],
+                )?;
+                // Find the last rowid processed in this batch.
+                let new_last_rowid: i64 = self
+                    .conn
+                    .query_row(
+                        "SELECT MAX(rowid) FROM drawers WHERE deleted_at IS NULL AND rowid > ?1 ORDER BY rowid ASC LIMIT ?2",
+                        rusqlite::params![last_rowid, BATCH_SIZE],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )?
+                    .unwrap_or(last_rowid);
+                Ok((updated, new_last_rowid))
+            })();
+            match result {
+                Ok((n, new_last_rowid)) => {
+                    self.conn.execute_batch("COMMIT")?;
+                    total += n;
+                    if n == 0 || new_last_rowid == last_rowid {
+                        break;
+                    }
+                    last_rowid = new_last_rowid;
+                }
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// List drawers with `effective_importance < threshold`, ordered by
+    /// `effective_importance ASC` (most decayed first). Used by `mempal audit --stale`.
+    ///
+    /// Each tuple: `(id, wing, room, effective_importance, access_count, last_accessed_at_ms)`.
+    #[allow(clippy::type_complexity)]
+    pub fn drawers_below_importance_threshold(
+        &self,
+        threshold: f64,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Option<String>, f64, i64, Option<i64>)>, DbError> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, wing, room, effective_importance, access_count, last_accessed_at
+            FROM drawers
+            WHERE deleted_at IS NULL AND effective_importance < ?1
+            ORDER BY effective_importance ASC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![threshold, limit_i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Normalise `added_at` values in batched `BEGIN IMMEDIATE` transactions.
@@ -3272,6 +3521,7 @@ fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
     let verification_refs = parse_string_list(row.get::<_, Option<String>>(23)?.as_deref())?;
     let scope_constraints = row.get::<_, Option<String>>(24)?;
     let trigger_hints = parse_optional_json(row.get::<_, Option<String>>(25)?.as_deref())?;
+    let effective_importance = row.get::<_, f64>(26)?;
 
     anchor::validate_anchor_domain(&domain, &anchor_kind)
         .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
@@ -3303,6 +3553,7 @@ fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
         verification_refs,
         scope_constraints,
         trigger_hints,
+        effective_importance,
     })
 }
 

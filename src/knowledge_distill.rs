@@ -161,6 +161,7 @@ pub fn prepare_distill(db: &Database, request: DistillRequest) -> Result<Distill
         verification_refs: Vec::new(),
         scope_constraints,
         trigger_hints,
+        effective_importance: request.importance as f64,
     };
 
     Ok(DistillPlan::Create(Box::new(PreparedDistill {

@@ -3,6 +3,7 @@
 pub mod anchor;
 pub mod config;
 pub mod db;
+pub mod decay;
 pub mod hot_reload;
 pub mod priming;
 pub mod project;
