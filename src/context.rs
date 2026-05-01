@@ -228,12 +228,11 @@ fn assemble_tiered(
     // T3 KG supplement: drawers related by KG triples.
     let query_terms: Vec<&str> = request.query.split_whitespace().collect();
     let kg_budget = t3_budget.saturating_sub(t3_tokens_used);
-    let mut all_t3_ids = t1_ids.clone();
-    all_t3_ids.extend(t3_ids);
+    let mut exclude_ids = t1_ids.clone();
+    exclude_ids.extend(t3_ids);
     let t3_kg_items = if kg_budget > 0 {
-        let mut exclude = all_t3_ids.clone();
-        exclude.sort();
-        fetch_t3_kg(db, &query_terms, kg_budget, project_id, &exclude, now)
+        exclude_ids.sort();
+        fetch_t3_kg(db, &query_terms, kg_budget, project_id, &exclude_ids, now)
             .map_err(ContextError::Tiered)?
     } else {
         vec![]
