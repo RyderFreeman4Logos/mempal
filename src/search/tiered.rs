@@ -131,7 +131,7 @@ pub fn fetch_t1(db: &Database, params: T1Params<'_>) -> Result<Vec<TieredItem>, 
 
     // Build project filter clause.
     let project_clause = if params.project_id.is_some() {
-        "(project_id = ?5 OR project_id IS NULL)"
+        "(project_id = ?2 OR project_id IS NULL)"
     } else {
         "1 = 1"
     };
