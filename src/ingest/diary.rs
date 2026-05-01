@@ -146,6 +146,7 @@ pub fn commit_prepared_diary_rollup(
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        effective_importance: prepared.importance as f64,
     };
 
     db.upsert_drawer_and_replace_vector(&drawer, vector)

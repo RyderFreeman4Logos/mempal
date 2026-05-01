@@ -448,6 +448,7 @@ fn bootstrap_drawer(
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        effective_importance: 2.0,
     }
 }
 
@@ -650,6 +651,7 @@ fn test_insert_load_roundtrip_preserves_json_metadata_and_read_paths() {
             workflow_bias: vec!["tdd".to_string()],
             tool_needs: vec!["cargo-check".to_string()],
         }),
+        effective_importance: 3.0,
     };
 
     db.insert_drawer(&drawer).expect("insert drawer");

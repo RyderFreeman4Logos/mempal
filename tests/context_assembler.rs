@@ -108,6 +108,7 @@ fn knowledge_drawer(
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        effective_importance: 3.0,
     }
 }
 
@@ -139,6 +140,7 @@ fn evidence_drawer(id: &str, content: &str) -> Drawer {
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        effective_importance: 2.0,
     }
 }
 

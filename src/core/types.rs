@@ -198,7 +198,7 @@ pub struct ReindexSource {
     pub drawer_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Drawer {
     pub id: String,
     pub content: String,
@@ -233,6 +233,10 @@ pub struct Drawer {
     pub verification_refs: Vec<String>,
     pub scope_constraints: Option<String>,
     pub trigger_hints: Option<TriggerHints>,
+    /// Dynamic importance after time-decay + retrieval boost (P13).
+    /// Defaults to `importance as f64` when the column doesn't exist (pre-v10 DBs).
+    #[serde(default)]
+    pub effective_importance: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +282,7 @@ impl Drawer {
             verification_refs: Vec::new(),
             scope_constraints: None,
             trigger_hints: None,
+            effective_importance: args.importance as f64,
         }
     }
 }
@@ -313,6 +318,7 @@ impl Default for Drawer {
             verification_refs: Vec::new(),
             scope_constraints: None,
             trigger_hints: None,
+            effective_importance: 0.0,
         }
     }
 }
@@ -321,7 +327,7 @@ fn default_normalize_version() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DrawerDetails {
     pub drawer: Drawer,
     pub updated_at: Option<String>,
@@ -329,7 +335,7 @@ pub struct DrawerDetails {
     pub project_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunnelDrawer {
     pub drawer: Drawer,
     pub target_project_id: Option<String>,
@@ -415,4 +421,8 @@ pub struct SearchResult {
     /// are replaced by a single `"… +N more"` sentinel as the last element.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tunnel_hints: Vec<String>,
+    /// Dynamic importance after time-decay + retrieval boost (P13).
+    /// Loaded from the `effective_importance` column; defaults to
+    /// `importance as f64` when the column doesn't exist (pre-v10 DBs).
+    pub effective_importance: f64,
 }

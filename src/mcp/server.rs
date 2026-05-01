@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,7 +37,7 @@ use crate::knowledge_lifecycle::{
     promote_knowledge,
 };
 use crate::search::{
-    SearchFilters, SearchOptions, resolve_route, search_bm25_only,
+    SearchFilters, SearchOptions, dispatch_access_update, resolve_route, search_bm25_only,
     search_with_vector_and_scope_options,
 };
 use anyhow::Context;
@@ -78,6 +78,9 @@ pub struct MempalMcpServer {
     client_name: Arc<Mutex<Option<String>>>,
     client_project_id: Arc<Mutex<Option<String>>>,
     client_peer: Arc<Mutex<Option<Peer<rmcp::RoleServer>>>>,
+    /// Per-session drawer IDs that were returned by `mempal_search`.
+    /// Flushed and boosted on the next `mempal_ingest` call (P13).
+    session_hit_drawers: Arc<Mutex<HashSet<String>>>,
 }
 
 impl MempalMcpServer {
@@ -110,6 +113,7 @@ impl MempalMcpServer {
             client_name: Arc::new(Mutex::new(None)),
             client_project_id: Arc::new(Mutex::new(None)),
             client_peer: Arc::new(Mutex::new(None)),
+            session_hit_drawers: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -596,6 +600,7 @@ fn drawer_from_ingest_metadata(
         verification_refs: metadata.verification_refs.clone(),
         scope_constraints: metadata.scope_constraints.clone(),
         trigger_hints: metadata.trigger_hints.clone(),
+        effective_importance: request.importance.unwrap_or(0) as f64,
     }
 }
 
@@ -1023,6 +1028,15 @@ impl MempalMcpServer {
                 })?
             }
         };
+
+        // Track hit drawer IDs for session-ingest boost (P13).
+        let hit_ids: Vec<String> = results.iter().map(|r| r.drawer_id.clone()).collect();
+        if !hit_ids.is_empty() {
+            if let Ok(mut guard) = self.session_hit_drawers.lock() {
+                guard.extend(hit_ids.iter().cloned());
+            }
+            dispatch_access_update(self.db_path.clone(), hit_ids);
+        }
 
         let mut system_warnings = current_system_warnings();
         system_warnings.extend(extra_warnings);
@@ -1844,6 +1858,38 @@ impl MempalMcpServer {
 
         drop(lock_guard);
 
+        // Apply session-ingest boost to previously searched drawers (P13).
+        {
+            let hit_ids: Vec<String> = self
+                .session_hit_drawers
+                .lock()
+                .map(|mut guard| {
+                    let ids: Vec<String> = guard.iter().cloned().collect();
+                    guard.clear();
+                    ids
+                })
+                .unwrap_or_default();
+            if !hit_ids.is_empty() {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let imp = &config.importance;
+                let db_boost = self.open_db()?;
+                if let Err(err) = db_boost.apply_ingest_boost_batch(
+                    &hit_ids,
+                    now_ms,
+                    imp.boost_per_access,
+                    imp.boost_cap,
+                    imp.decay_rate,
+                    imp.floor,
+                ) {
+                    tracing::warn!(error = %err, "session-ingest boost failed");
+                }
+            }
+        }
+
         if !inserted_drawer_ids.is_empty() {
             response_drawer_id = inserted_drawer_ids[0].clone();
         }
@@ -2387,6 +2433,20 @@ impl MempalMcpServer {
             crate::factcheck::check(&request.text, &db, now_secs, scope)
         })
         .map_err(fact_check_error)?;
+
+        // Apply stale penalty to drawers associated with StaleFact triples (P13).
+        let stale_penalty = ConfigHandle::current().importance.stale_penalty;
+        for issue in &report.issues {
+            if let crate::factcheck::FactIssue::StaleFact {
+                source_drawer: Some(drawer_id),
+                ..
+            } = issue
+            {
+                if let Err(err) = db.apply_stale_penalty_to_drawer(drawer_id, stale_penalty) {
+                    tracing::warn!(drawer_id, error = %err, "stale penalty application failed");
+                }
+            }
+        }
 
         Ok(Json(FactCheckResponse {
             issues: report.issues,

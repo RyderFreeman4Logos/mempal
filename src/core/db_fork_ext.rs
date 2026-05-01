@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 9;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 10;
 
 pub const FORK_EXT_V1_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS pending_messages (
@@ -215,6 +215,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 9,
             up: apply_v9,
         },
+        Migration {
+            version: 10,
+            up: apply_v10,
+        },
     ]
 }
 
@@ -301,6 +305,28 @@ fn apply_v8(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v9(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V9_SCHEMA_SQL)
+}
+
+fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {
+    // Each ALTER TABLE must succeed idempotently — use ensure_* helpers.
+    ensure_nullable_column(conn, "drawers", "last_accessed_at", "INTEGER")?;
+    ensure_default_column(conn, "drawers", "access_count", "INTEGER", "0")?;
+    ensure_default_column(conn, "drawers", "accumulated_boost", "REAL", "0.0")?;
+    ensure_default_column(conn, "drawers", "effective_importance", "REAL", "0.0")?;
+    // Persists the cumulative stale penalty so recompute_all_effective_importance
+    // doesn't silently drop penalties applied by apply_stale_penalty_to_drawer.
+    ensure_default_column(conn, "drawers", "stale_penalty_applied", "REAL", "1.0")?;
+
+    // Backfill: set effective_importance = base importance for existing rows.
+    conn.execute_batch(
+        "UPDATE drawers SET effective_importance = CAST(COALESCE(importance, 0) AS REAL) WHERE effective_importance = 0.0;",
+    )?;
+
+    // Index for efficient reranking / audit queries.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_drawers_eff_importance ON drawers(effective_importance DESC);",
+    )?;
+    Ok(())
 }
 
 fn ensure_gating_audit_columns(conn: &Connection) -> rusqlite::Result<()> {
