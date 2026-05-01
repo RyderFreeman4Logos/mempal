@@ -1902,6 +1902,21 @@ impl MempalMcpServer {
             response_drawer_id = inserted_drawer_ids[0].clone();
         }
 
+        // Failure detection (P14) — fire-and-forget for each inserted drawer.
+        if config.repair.enabled && !inserted_drawer_ids.is_empty() {
+            for (drawer_id_r, chunk_r) in inserted_drawer_ids.iter().zip(chunks.iter()) {
+                crate::repair::spawn_failure_detection(
+                    db.path().to_path_buf(),
+                    drawer_id_r.clone(),
+                    chunk_r.to_string(),
+                    request.wing.clone(),
+                    room.map(ToOwned::to_owned),
+                    project_id.clone(),
+                    config.repair.clone(),
+                );
+            }
+        }
+
         // Pattern detection (P13) — fire-and-forget for each inserted drawer.
         if config.patterns.enabled && !inserted_drawer_ids.is_empty() {
             let session_id = request

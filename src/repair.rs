@@ -172,10 +172,43 @@ pub fn record_failure_event(
     Ok(())
 }
 
-/// Fire-and-forget async failure detection after an ingest.
-///
-/// Opens a fresh DB connection (required because `Connection` is !Send) and
-/// records the event if a failure keyword is found.
+/// Synchronous failure detection: check content for failure keywords, record
+/// event if found.  Opens a fresh DB connection so it can be called from any
+/// context (sync or async, any thread).
+pub fn try_record_failure(
+    db_path: &Path,
+    drawer_id: &str,
+    content: &str,
+    wing: &str,
+    room: Option<&str>,
+    project_id: Option<&str>,
+    config: &RepairConfig,
+) {
+    if let Some(failure_type) = detect_failure_keyword(content, &config.failure_keywords) {
+        let topic_sig = compute_topic_sig(content);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let event_id = new_event_id();
+        let args = FailureEventArgs {
+            event_id: &event_id,
+            drawer_id,
+            wing,
+            room,
+            topic_sig: &topic_sig,
+            failure_type: &failure_type,
+            project_id,
+            detected_at_ms: now_ms,
+        };
+        if let Err(e) = write_failure_event_to_path(db_path, &args) {
+            tracing::warn!(error = %e, drawer_id, "failure event write failed");
+        }
+    }
+}
+
+/// Fire-and-forget async failure detection after an ingest (MCP / long-lived
+/// runtime).  Spawns a tokio task that calls [`try_record_failure`].
 pub fn spawn_failure_detection(
     db_path: PathBuf,
     drawer_id: String,
@@ -186,27 +219,15 @@ pub fn spawn_failure_detection(
     config: RepairConfig,
 ) {
     tokio::spawn(async move {
-        if let Some(failure_type) = detect_failure_keyword(&content, &config.failure_keywords) {
-            let topic_sig = compute_topic_sig(&content);
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let event_id = new_event_id();
-            let args = FailureEventArgs {
-                event_id: &event_id,
-                drawer_id: &drawer_id,
-                wing: &wing,
-                room: room.as_deref(),
-                topic_sig: &topic_sig,
-                failure_type: &failure_type,
-                project_id: project_id.as_deref(),
-                detected_at_ms: now_ms,
-            };
-            if let Err(e) = write_failure_event_to_path(&db_path, &args) {
-                tracing::warn!(error = %e, drawer_id, "failure event write failed");
-            }
-        }
+        try_record_failure(
+            &db_path,
+            &drawer_id,
+            &content,
+            &wing,
+            room.as_deref(),
+            project_id.as_deref(),
+            &config,
+        );
     });
 }
 
