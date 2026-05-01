@@ -2395,11 +2395,11 @@ impl Database {
                 effective_importance = (
                     CAST(COALESCE(importance, 0) AS REAL)
                     * MIN(1.0, MAX(
-                        EXP(-?2 * MAX(0, ?1 - COALESCE(last_accessed_at, CAST(added_at AS INTEGER))) / 86400000.0),
+                        EXP(-?2 * MAX(0, ?1 - COALESCE(last_accessed_at, strftime('%s', added_at) * 1000, CAST(added_at AS INTEGER) * 1000)) / 86400000.0),
                         ?3
                     ))
                     + MIN(COALESCE(accumulated_boost, 0.0), ?4)
-                )
+                ) * COALESCE(stale_penalty_applied, 1.0)
             WHERE id = ?5 AND deleted_at IS NULL
         "#;
         let mut stmt = self.conn.prepare_cached(sql)?;
@@ -2446,11 +2446,11 @@ impl Database {
                 effective_importance = (
                     CAST(COALESCE(importance, 0) AS REAL)
                     * MIN(1.0, MAX(
-                        EXP(-?3 * MAX(0, ?2 - COALESCE(last_accessed_at, CAST(added_at AS INTEGER))) / 86400000.0),
+                        EXP(-?3 * MAX(0, ?2 - COALESCE(last_accessed_at, strftime('%s', added_at) * 1000, CAST(added_at AS INTEGER) * 1000)) / 86400000.0),
                         ?4
                     ))
                     + MIN(COALESCE(accumulated_boost, 0.0) + ?1, ?5)
-                )
+                ) * COALESCE(stale_penalty_applied, 1.0)
             WHERE id = ?6 AND deleted_at IS NULL
         "#;
         let mut stmt = self.conn.prepare_cached(sql)?;
@@ -2480,15 +2480,19 @@ impl Database {
         }
     }
 
-    /// Apply stale penalty: multiply `effective_importance` by `stale_penalty`
-    /// for a specific drawer. Used when `mempal_fact_check` detects a StaleFact.
+    /// Apply stale penalty: persist the multiplier in `stale_penalty_applied` and
+    /// immediately reduce `effective_importance` for a specific drawer.
+    /// `stale_penalty_applied` survives `recompute_all_effective_importance`.
     pub fn apply_stale_penalty_to_drawer(
         &self,
         drawer_id: &str,
         stale_penalty: f64,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "UPDATE drawers SET effective_importance = effective_importance * ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            r#"UPDATE drawers SET
+                stale_penalty_applied = COALESCE(stale_penalty_applied, 1.0) * ?1,
+                effective_importance = effective_importance * ?1
+            WHERE id = ?2 AND deleted_at IS NULL"#,
             rusqlite::params![stale_penalty, drawer_id],
         )?;
         Ok(())
@@ -2517,11 +2521,11 @@ impl Database {
                         effective_importance = (
                             CAST(COALESCE(importance, 0) AS REAL)
                             * MIN(1.0, MAX(
-                                EXP(-?1 * MAX(0, ?2 - COALESCE(last_accessed_at, CAST(added_at AS INTEGER))) / 86400000.0),
+                                EXP(-?1 * MAX(0, ?2 - COALESCE(last_accessed_at, strftime('%s', added_at) * 1000, CAST(added_at AS INTEGER) * 1000)) / 86400000.0),
                                 ?3
                             ))
                             + MIN(COALESCE(accumulated_boost, 0.0), ?4)
-                        )
+                        ) * COALESCE(stale_penalty_applied, 1.0)
                     WHERE rowid IN (
                         SELECT rowid FROM drawers
                         WHERE deleted_at IS NULL AND rowid > ?5

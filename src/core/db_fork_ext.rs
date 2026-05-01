@@ -313,6 +313,9 @@ fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {
     ensure_default_column(conn, "drawers", "access_count", "INTEGER", "0")?;
     ensure_default_column(conn, "drawers", "accumulated_boost", "REAL", "0.0")?;
     ensure_default_column(conn, "drawers", "effective_importance", "REAL", "0.0")?;
+    // Persists the cumulative stale penalty so recompute_all_effective_importance
+    // doesn't silently drop penalties applied by apply_stale_penalty_to_drawer.
+    ensure_default_column(conn, "drawers", "stale_penalty_applied", "REAL", "1.0")?;
 
     // Backfill: set effective_importance = base importance for existing rows.
     conn.execute_batch(

@@ -39,6 +39,11 @@ backend = "model2vec"
 }
 
 fn insert_test_drawer(db_path: &std::path::Path, id: &str, wing: &str, importance: i32) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1_746_000_000);
     let db = Database::open(db_path).expect("open db");
     db.insert_drawer(&Drawer {
         id: id.to_string(),
@@ -46,11 +51,19 @@ fn insert_test_drawer(db_path: &std::path::Path, id: &str, wing: &str, importanc
         wing: wing.to_string(),
         source_file: Some(format!("{id}.md")),
         source_type: SourceType::Manual,
-        added_at: "1713000000".to_string(),
+        added_at: now_secs.to_string(),
         importance,
         ..Drawer::default()
     })
     .expect("insert drawer");
+    // Set effective_importance to the base importance so tests start from a
+    // meaningful baseline rather than the default 0.0.
+    db.conn()
+        .execute(
+            "UPDATE drawers SET effective_importance = CAST(importance AS REAL) WHERE id = ?1",
+            [id],
+        )
+        .expect("backfill initial effective_importance");
 }
 
 fn read_effective_importance(db_path: &std::path::Path, id: &str) -> f64 {
@@ -209,6 +222,10 @@ fn test_fork_ext_migration_v9_to_v10_adds_importance_columns() {
         table_has_column(conn, "drawers", "effective_importance"),
         "effective_importance column must exist"
     );
+    assert!(
+        table_has_column(conn, "drawers", "stale_penalty_applied"),
+        "stale_penalty_applied column must exist"
+    );
 
     // Verify index exists
     assert!(
@@ -359,6 +376,21 @@ fn test_stale_kg_triple_penalizes_importance() {
     assert!(
         (penalized_eff - expected).abs() < 1e-6,
         "stale penalty should multiply by {}: expected {expected}, got {penalized_eff}",
+        config.stale_penalty
+    );
+
+    // Verify stale_penalty_applied is persisted so recompute doesn't lose it.
+    let stored_penalty: f64 = db
+        .conn()
+        .query_row(
+            "SELECT COALESCE(stale_penalty_applied, 1.0) FROM drawers WHERE id = 'drawer-stale-test'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read stale_penalty_applied");
+    assert!(
+        (stored_penalty - config.stale_penalty).abs() < 1e-6,
+        "stale_penalty_applied must be persisted: expected {}, got {stored_penalty}",
         config.stale_penalty
     );
 }
