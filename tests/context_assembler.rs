@@ -72,6 +72,8 @@ fn default_request(query: &str, cwd: &Path) -> ContextRequest {
         max_items: 12,
         dao_tian_limit: 1,
         project_id: None,
+        trigger: None,
+        context_cfg_override: None,
     }
 }
 

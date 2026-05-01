@@ -122,6 +122,7 @@ struct ContextCommandArgs {
     include_evidence: bool,
     max_items: usize,
     dao_tian_limit: usize,
+    trigger: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -215,6 +216,9 @@ enum Commands {
         max_items: usize,
         #[arg(long = "dao-tian-limit", default_value_t = 1)]
         dao_tian_limit: usize,
+        /// Tiered retrieval trigger: session_start (default), on_demand, repair.
+        #[arg(long)]
+        trigger: Option<String>,
     },
     Project {
         #[command(subcommand)]
@@ -950,6 +954,7 @@ fn run() -> Result<()> {
             include_evidence,
             max_items,
             dao_tian_limit,
+            trigger,
         } => block_on_result(context_command(
             &db,
             config.as_ref(),
@@ -962,6 +967,7 @@ fn run() -> Result<()> {
                 include_evidence,
                 max_items,
                 dao_tian_limit,
+                trigger,
             },
         )),
         Commands::Project { command } => project_command(&db, command),
@@ -2032,6 +2038,11 @@ async fn context_command(db: &Database, config: &Config, args: ContextCommandArg
         Some(cwd) => cwd,
         None => env::current_dir().context("failed to read current directory")?,
     };
+    let trigger = args.trigger.as_deref().map(|s| match s {
+        "on_demand" => mempal::search::tiered::ContextTrigger::OnDemand,
+        "repair" => mempal::search::tiered::ContextTrigger::Repair,
+        _ => mempal::search::tiered::ContextTrigger::SessionStart,
+    });
     let embedder = build_embedder(config).await?;
     let pack = assemble_context(
         db,
@@ -2045,6 +2056,8 @@ async fn context_command(db: &Database, config: &Config, args: ContextCommandArg
             max_items: args.max_items,
             dao_tian_limit: args.dao_tian_limit,
             project_id: config.project.id.clone(),
+            trigger,
+            context_cfg_override: None,
         },
     )
     .await?;

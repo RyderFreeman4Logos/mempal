@@ -1258,6 +1258,7 @@ impl MempalMcpServer {
             .next()
             .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
 
+        let trigger = request.trigger.as_deref().map(parse_context_trigger);
         let db = self.open_db()?;
         let pack = assemble_context_with_vector(
             &db,
@@ -1275,6 +1276,8 @@ impl MempalMcpServer {
                     .project
                     .id
                     .clone(),
+                trigger,
+                context_cfg_override: None,
             },
             &query_vector,
         )
@@ -2643,9 +2646,18 @@ fn context_error(error: crate::context::ContextError) -> ErrorData {
         crate::context::ContextError::EmbedQuery(_)
         | crate::context::ContextError::MissingQueryVector
         | crate::context::ContextError::Search(_)
-        | crate::context::ContextError::LoadDrawer(_) => {
+        | crate::context::ContextError::LoadDrawer(_)
+        | crate::context::ContextError::Tiered(_) => {
             ErrorData::internal_error(format!("context assembly failed: {error}"), None)
         }
+    }
+}
+
+fn parse_context_trigger(s: &str) -> crate::search::tiered::ContextTrigger {
+    match s {
+        "on_demand" => crate::search::tiered::ContextTrigger::OnDemand,
+        "repair" => crate::search::tiered::ContextTrigger::Repair,
+        _ => crate::search::tiered::ContextTrigger::SessionStart,
     }
 }
 
