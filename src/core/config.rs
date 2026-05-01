@@ -50,6 +50,13 @@ const DEFAULT_PATTERNS_PROMOTE_THRESHOLD: usize = 5;
 const DEFAULT_PATTERNS_RETIRE_AFTER_DAYS: u64 = 90;
 const DEFAULT_PATTERNS_SURFACING_THRESHOLD: f64 = 0.75;
 const DEFAULT_PATTERNS_BOOST: f64 = 0.2;
+const DEFAULT_CONTEXT_TOTAL_TOKENS: usize = 8_000;
+const DEFAULT_CONTEXT_T1_RATIO: f64 = 0.30;
+const DEFAULT_CONTEXT_T2_RATIO: f64 = 0.50;
+const DEFAULT_CONTEXT_T3_RATIO: f64 = 0.20;
+const DEFAULT_CONTEXT_MIN_T1_IMPORTANCE: u8 = 3;
+const DEFAULT_CONTEXT_T3_RECENCY_WINDOW_DAYS: u64 = 3;
+const DEFAULT_CONTEXT_T1_RECENCY_LAMBDA: f64 = 0.01;
 static DEFAULT_SENSITIVE_SCRUBBER: OnceLock<Option<CompiledPrivacyConfig>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -72,6 +79,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub importance: ImportanceConfig,
     pub patterns: PatternsConfig,
+    pub context: ContextConfig,
 }
 
 impl Default for Config {
@@ -92,6 +100,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             importance: ImportanceConfig::default(),
             patterns: PatternsConfig::default(),
+            context: ContextConfig::default(),
         }
     }
 }
@@ -1160,6 +1169,65 @@ impl Default for PatternsConfig {
             retire_after_days: DEFAULT_PATTERNS_RETIRE_AFTER_DAYS,
             surfacing_threshold: DEFAULT_PATTERNS_SURFACING_THRESHOLD,
             pattern_boost: DEFAULT_PATTERNS_BOOST,
+        }
+    }
+}
+
+/// Token budget allocation for `mempal_context` tiered assembly.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ContextBudgetConfig {
+    /// Total token budget for the assembled context.
+    pub total_tokens: usize,
+    /// Fraction of budget allocated to T1 (dao_tian decisions/rules).
+    pub t1_ratio: f64,
+    /// Fraction of budget allocated to T2 (shu evidence via hybrid search).
+    pub t2_ratio: f64,
+    /// Fraction of budget allocated to T3 (qi recent/operational).
+    pub t3_ratio: f64,
+    /// When true, unused budget from T1/T3 is transferred to T2.
+    pub overflow_to_t2: bool,
+}
+
+impl Default for ContextBudgetConfig {
+    fn default() -> Self {
+        Self {
+            total_tokens: DEFAULT_CONTEXT_TOTAL_TOKENS,
+            t1_ratio: DEFAULT_CONTEXT_T1_RATIO,
+            t2_ratio: DEFAULT_CONTEXT_T2_RATIO,
+            t3_ratio: DEFAULT_CONTEXT_T3_RATIO,
+            overflow_to_t2: true,
+        }
+    }
+}
+
+/// Configuration for `mempal_context` tiered retrieval assembly (P14).
+/// All fields are hot-reload whitelisted.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Enable tiered retrieval (T1/T2/T3). When false, falls back to flat assembly.
+    pub tiered_retrieval_enabled: bool,
+    /// Minimum importance for T1 candidate drawers.
+    pub min_t1_importance: u8,
+    /// Window in days for T3 recency candidates.
+    pub t3_recency_window_days: u64,
+    /// Decay rate λ for T1 recency scoring: score = eff_importance × exp(-λ × days).
+    pub t1_recency_lambda: f64,
+    /// Token budget allocation per tier.
+    pub budget: ContextBudgetConfig,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            // Off by default so existing agent sessions and tests are unaffected;
+            // users opt-in via `[context] tiered_retrieval_enabled = true`.
+            tiered_retrieval_enabled: false,
+            min_t1_importance: DEFAULT_CONTEXT_MIN_T1_IMPORTANCE,
+            t3_recency_window_days: DEFAULT_CONTEXT_T3_RECENCY_WINDOW_DAYS,
+            t1_recency_lambda: DEFAULT_CONTEXT_T1_RECENCY_LAMBDA,
+            budget: ContextBudgetConfig::default(),
         }
     }
 }

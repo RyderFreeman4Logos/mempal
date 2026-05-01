@@ -148,9 +148,15 @@ pub trait Embedder: Send + Sync {
     /// heuristic: `ceil(chars / 2.5)` — safe upper bound for most
     /// tokenizers including CJK-heavy and base64-dense content.
     fn estimate_tokens(&self, text: &str) -> usize {
-        let chars = text.chars().count();
-        (chars * 2).div_ceil(5)
+        estimate_tokens(text)
     }
+}
+
+/// Standalone token estimator: `ceil(chars / 2.5)`, CJK-safe.
+/// Use this wherever an `Embedder` instance is not available.
+pub fn estimate_tokens(text: &str) -> usize {
+    let chars = text.chars().count();
+    (chars * 2).div_ceil(5)
 }
 
 pub async fn from_config(config: &Config) -> Result<Box<dyn Embedder>> {

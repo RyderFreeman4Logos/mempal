@@ -19,6 +19,7 @@ pub mod filter;
 pub mod preview;
 pub mod rerank;
 pub mod route;
+pub mod tiered;
 
 pub type Result<T> = std::result::Result<T, SearchError>;
 

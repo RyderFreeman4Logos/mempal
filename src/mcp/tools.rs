@@ -1,4 +1,4 @@
-use crate::context::{ContextItem, ContextPack, ContextSection};
+use crate::context::{ContextItem, ContextPack, ContextSection, TieredAssembly};
 use crate::core::types::{
     AnchorKind, ChunkNeighbors, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
     NeighborChunk, RouteDecision, SearchResult, TaxonomyEntry, TunnelEndpoint,
@@ -94,6 +94,36 @@ pub struct ContextRequest {
     /// Maximum number of `dao_tian` items to include. Defaults to 1; 0 disables
     /// the `dao_tian` section while preserving lower-tier context.
     pub dao_tian_limit: Option<usize>,
+    /// Trigger hint for tiered retrieval budget weights (P14).
+    /// One of: "session_start" (default), "on_demand", "repair".
+    pub trigger: Option<String>,
+}
+
+/// A single item from a tiered retrieval result (P14).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct TieredContextItemDto {
+    pub drawer_id: String,
+    pub content: String,
+    pub source_file: String,
+    /// Drawer room — maps to "type" in the spec (e.g. "decision", "feedback", "rule").
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub drawer_type: Option<String>,
+    /// T3 provenance: "recency", "kg", or "tunnel".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub effective_importance: f64,
+    /// Pattern ID boosting this result (P13). None when no pattern matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_pattern_id: Option<String>,
+}
+
+/// Token budget usage breakdown (P14).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BudgetUsedDto {
+    pub t1_tokens: usize,
+    pub t2_tokens: usize,
+    pub t3_tokens: usize,
+    pub total_tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -106,6 +136,27 @@ pub struct ContextResponse {
     /// Active patterns surfaced as recurring themes (P13).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recurring_themes: Vec<PatternSummaryDto>,
+    /// T1 tier (dao_tian): decision/feedback/rule drawers (P14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t1_dao_tian: Option<Vec<TieredContextItemDto>>,
+    /// T2 tier (shu): hybrid search results (P14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t2_shu: Option<Vec<TieredContextItemDto>>,
+    /// T3 tier (qi): recent drawers by recency + KG neighbors (P14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t3_qi: Option<Vec<TieredContextItemDto>>,
+    /// Alias for t1_dao_tian — backward compat with existing agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dao_tian: Option<Vec<TieredContextItemDto>>,
+    /// Alias for t2_shu — backward compat with existing agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shu: Option<Vec<TieredContextItemDto>>,
+    /// Alias for t3_qi — backward compat with existing agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qi: Option<Vec<TieredContextItemDto>>,
+    /// Token budget usage (P14). Present only when tiered_retrieval_enabled=true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_used: Option<BudgetUsedDto>,
 }
 
 /// Lightweight pattern summary for context responses.
@@ -1114,8 +1165,50 @@ impl SearchResultDto {
     }
 }
 
+impl From<&crate::search::tiered::TieredItem> for TieredContextItemDto {
+    fn from(item: &crate::search::tiered::TieredItem) -> Self {
+        Self {
+            drawer_id: item.drawer_id.clone(),
+            content: item.content.clone(),
+            source_file: item.source_file.clone(),
+            drawer_type: item.room.clone(),
+            source: item.t3_source.clone(),
+            effective_importance: item.effective_importance,
+            matched_pattern_id: item.matched_pattern_id.clone(),
+        }
+    }
+}
+
+fn tiered_assembly_to_dto(
+    tiered: TieredAssembly,
+) -> (
+    Vec<TieredContextItemDto>,
+    Vec<TieredContextItemDto>,
+    Vec<TieredContextItemDto>,
+    BudgetUsedDto,
+) {
+    let t1: Vec<TieredContextItemDto> = tiered.t1_items.iter().map(|i| i.into()).collect();
+    let t2: Vec<TieredContextItemDto> = tiered.t2_items.iter().map(|i| i.into()).collect();
+    let t3: Vec<TieredContextItemDto> = tiered.t3_items.iter().map(|i| i.into()).collect();
+    let budget = BudgetUsedDto {
+        t1_tokens: tiered.budget_used.t1_tokens,
+        t2_tokens: tiered.budget_used.t2_tokens,
+        t3_tokens: tiered.budget_used.t3_tokens,
+        total_tokens: tiered.budget_used.total_tokens(),
+    };
+    (t1, t2, t3, budget)
+}
+
 impl From<ContextPack> for ContextResponse {
     fn from(value: ContextPack) -> Self {
+        let (t1_dao_tian, t2_shu, t3_qi, budget_used) = match value.tiered {
+            Some(tiered) => {
+                let (t1, t2, t3, budget) = tiered_assembly_to_dto(tiered);
+                (Some(t1), Some(t2), Some(t3), Some(budget))
+            }
+            None => (None, None, None, None),
+        };
+
         Self {
             query: value.query,
             domain: domain_slug(&value.domain).to_string(),
@@ -1143,6 +1236,13 @@ impl From<ContextPack> for ContextResponse {
                     exemplar_preview: p.exemplar_preview,
                 })
                 .collect(),
+            dao_tian: t1_dao_tian.clone(),
+            shu: t2_shu.clone(),
+            qi: t3_qi.clone(),
+            t1_dao_tian,
+            t2_shu,
+            t3_qi,
+            budget_used,
         }
     }
 }
