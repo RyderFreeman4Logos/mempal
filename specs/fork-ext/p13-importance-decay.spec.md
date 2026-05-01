@@ -48,7 +48,7 @@ mempal 的 `importance` 是 ingest 时写死的 1-5 静态标量——经过验�
     access_count = access_count + 1,
     effective_importance = (
       CAST(importance AS REAL)
-      * MAX(EXP(-:decay_rate * (:now_ms - COALESCE(last_accessed_at, added_at)) / 86400000.0), :floor)
+      * MIN(1.0, MAX(EXP(-:decay_rate * MAX(0, :now_ms - COALESCE(last_accessed_at, added_at)) / 86400000.0), :floor))
       + MIN(accumulated_boost, :boost_cap)
     )
   WHERE id = :id
@@ -58,7 +58,7 @@ mempal 的 `importance` 是 ingest 时写死的 1-5 静态标量——经过验�
 - **Session ingest boost**：MCP server 维护 per-session 命中 drawer id 集合（内存，不持久化）；同一 session 调用 `mempal_ingest` 时对命中集合内的 drawer 在单条 SQL UPDATE 内原子增加 `accumulated_boost` 并重算 `effective_importance`，然后清空集合
   - 结构：`MempalMcpContext` 加 `session_hit_drawers: HashSet<DrawerId>`
   - boost 触发条件：集合非空 AND `mempal_ingest` 在同 session 内被调用
-  - **boost 必须原子写入**：`accumulated_boost = accumulated_boost + :boost_per_access` 与 `effective_importance` 重算在同一 SQL UPDATE 语句内执行
+  - **boost 必须原子写入**：`accumulated_boost = accumulated_boost + :boost_per_access` 与 `effective_importance` 重算在同一 SQL UPDATE 语句内执行；注意 SQLite SET 子句使用 pre-update 值，因此 `effective_importance` 公式中必须显式使用 `(accumulated_boost + :boost_per_access)` 而非依赖同语句中已更新的 `accumulated_boost`
 
 - **陈旧惩罚**：`mempal_fact_check` 发现 `StaleFact` 时，对关联 drawer 执行 `effective_importance *= stale_penalty`（同步，低频）
 
