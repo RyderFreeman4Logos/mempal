@@ -243,7 +243,7 @@ fn test_fork_ext_migration_v6_to_v7_creates_patterns_table() {
     let version = read_fork_ext_version(db.conn()).expect("read version");
     assert!(
         version >= 11,
-        "expected fork_ext_version >= 11, got {version}"
+        "expected fork_ext_version >= 12, got {version}"
     );
 
     assert!(

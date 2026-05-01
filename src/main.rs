@@ -66,6 +66,7 @@ mod longmemeval;
 mod patterns;
 #[path = "cli/prime.rs"]
 mod prime_cli;
+mod repair_cli;
 
 use crate::longmemeval::{BenchMode, LongMemEvalArgs, LongMemEvalGranularity, default_top_k};
 use crate::prime_cli::{PrimeArgs, PrimeFormat};
@@ -443,6 +444,11 @@ enum Commands {
     Patterns {
         #[command(subcommand)]
         command: patterns::PatternsCommands,
+    },
+    /// Anti-pattern detection and repair (list, show).
+    Repair {
+        #[command(subcommand)]
+        command: repair_cli::RepairCommands,
     },
 }
 
@@ -1130,6 +1136,7 @@ fn run() -> Result<()> {
             block_on_result(checkpoint_command(&db, config.as_ref(), command))
         }
         Commands::Patterns { command } => patterns::run_command(config.as_ref(), command),
+        Commands::Repair { command } => repair_cli::run_command(config.as_ref(), command),
         Commands::CoworkDrain { .. }
         | Commands::CoworkStatus { .. }
         | Commands::CoworkInstallHooks { .. }

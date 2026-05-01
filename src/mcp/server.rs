@@ -2491,6 +2491,7 @@ impl MempalMcpServer {
             issues: report.issues,
             checked_entities: report.checked_entities,
             kg_triples_scanned: report.kg_triples_scanned,
+            repair_packages: report.repair_packages,
             system_warnings: current_system_warnings(),
         }))
     }

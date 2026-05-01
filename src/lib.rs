@@ -26,5 +26,6 @@ pub mod knowledge_lifecycle;
 pub mod llm;
 pub mod mcp;
 pub mod observability;
+pub mod repair;
 pub mod search;
 pub mod session_review;

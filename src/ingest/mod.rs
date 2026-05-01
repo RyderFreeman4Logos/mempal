@@ -473,6 +473,22 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
                 source,
             })?;
 
+        // Failure detection (P14) — fire-and-forget, never blocks ingest.
+        {
+            let config_snap = ConfigHandle::current();
+            if config_snap.repair.enabled {
+                crate::repair::spawn_failure_detection(
+                    db.path().to_path_buf(),
+                    drawer_id.clone(),
+                    chunk.to_string(),
+                    wing.to_string(),
+                    Some(resolved_room.clone()),
+                    options.project_id.map(ToOwned::to_owned),
+                    config_snap.repair.clone(),
+                );
+            }
+        }
+
         // Pattern detection (P13) — fire-and-forget, never blocks or fails ingest.
         {
             let config_snap = ConfigHandle::current();

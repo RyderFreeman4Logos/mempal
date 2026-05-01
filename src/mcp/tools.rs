@@ -157,6 +157,9 @@ pub struct ContextResponse {
     /// Token budget usage (P14). Present only when tiered_retrieval_enabled=true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_used: Option<BudgetUsedDto>,
+    /// Active repair warnings (P14 decision-repair). Non-empty when anti-patterns detected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_warnings: Vec<crate::repair::RepairWarning>,
 }
 
 /// Lightweight pattern summary for context responses.
@@ -1083,6 +1086,9 @@ pub struct FactCheckResponse {
     pub issues: Vec<crate::factcheck::FactIssue>,
     pub checked_entities: Vec<String>,
     pub kg_triples_scanned: usize,
+    /// Repeated failure patterns detected during this check (P14).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_packages: Vec<crate::repair::RepairPackage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
 }
@@ -1243,6 +1249,7 @@ impl From<ContextPack> for ContextResponse {
             t2_shu,
             t3_qi,
             budget_used,
+            repair_warnings: value.repair_warnings,
         }
     }
 }
