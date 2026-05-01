@@ -1271,6 +1271,10 @@ impl MempalMcpServer {
                 include_evidence: request.include_evidence.unwrap_or(false),
                 max_items,
                 dao_tian_limit,
+                project_id: crate::core::config::ConfigHandle::current()
+                    .project
+                    .id
+                    .clone(),
             },
             &query_vector,
         )
@@ -1892,6 +1896,38 @@ impl MempalMcpServer {
 
         if !inserted_drawer_ids.is_empty() {
             response_drawer_id = inserted_drawer_ids[0].clone();
+        }
+
+        // Pattern detection (P13) — fire-and-forget for each inserted drawer.
+        if config.patterns.enabled && !inserted_drawer_ids.is_empty() {
+            let session_id = request
+                .source
+                .as_deref()
+                .unwrap_or_else(|| inserted_drawer_ids[0].as_str());
+            let model_id = config.embed.model.clone().unwrap_or_else(|| {
+                if config.embed.backend == "model2vec" {
+                    "model2vec/potion-multilingual-128M".to_string()
+                } else {
+                    config.embed.model.clone().unwrap_or_default()
+                }
+            });
+            for (drawer_id_p, vector_p) in inserted_drawer_ids.iter().zip(vectors.iter()) {
+                crate::core::patterns::run_pattern_detection(
+                    db.conn(),
+                    &crate::core::patterns::PatternDetectionArgs {
+                        new_drawer_id: drawer_id_p.as_str(),
+                        session_id,
+                        embedding: vector_p.as_slice(),
+                        project_id: project_id.as_deref(),
+                        model_id: &model_id,
+                        similarity_threshold: config.patterns.similarity_threshold,
+                        min_sessions: config.patterns.min_sessions,
+                        min_exemplars: config.patterns.min_exemplars,
+                        promote_threshold: config.patterns.promote_threshold,
+                        top_tags: 5,
+                    },
+                );
+            }
         }
 
         Ok(Json(IngestResponse {

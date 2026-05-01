@@ -43,6 +43,13 @@ const DEFAULT_IMPORTANCE_FLOOR: f64 = 0.1;
 const DEFAULT_IMPORTANCE_BOOST_PER_ACCESS: f64 = 0.15;
 const DEFAULT_IMPORTANCE_BOOST_CAP: f64 = 2.0;
 const DEFAULT_IMPORTANCE_STALE_PENALTY: f64 = 0.5;
+const DEFAULT_PATTERNS_SIMILARITY_THRESHOLD: f64 = 0.82;
+const DEFAULT_PATTERNS_MIN_SESSIONS: usize = 3;
+const DEFAULT_PATTERNS_MIN_EXEMPLARS: usize = 3;
+const DEFAULT_PATTERNS_PROMOTE_THRESHOLD: usize = 5;
+const DEFAULT_PATTERNS_RETIRE_AFTER_DAYS: u64 = 90;
+const DEFAULT_PATTERNS_SURFACING_THRESHOLD: f64 = 0.75;
+const DEFAULT_PATTERNS_BOOST: f64 = 0.2;
 static DEFAULT_SENSITIVE_SCRUBBER: OnceLock<Option<CompiledPrivacyConfig>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -64,6 +71,7 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub mcp: McpConfig,
     pub importance: ImportanceConfig,
+    pub patterns: PatternsConfig,
 }
 
 impl Default for Config {
@@ -83,6 +91,7 @@ impl Default for Config {
             daemon: DaemonConfig::default(),
             mcp: McpConfig::default(),
             importance: ImportanceConfig::default(),
+            patterns: PatternsConfig::default(),
         }
     }
 }
@@ -1113,6 +1122,44 @@ impl Default for ImportanceConfig {
             boost_per_access: DEFAULT_IMPORTANCE_BOOST_PER_ACCESS,
             boost_cap: DEFAULT_IMPORTANCE_BOOST_CAP,
             stale_penalty: DEFAULT_IMPORTANCE_STALE_PENALTY,
+        }
+    }
+}
+
+/// Configuration for cross-session pattern induction (P13).
+/// All fields are hot-reload whitelisted.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PatternsConfig {
+    /// Enable pattern detection during ingest.
+    pub enabled: bool,
+    /// Cosine similarity threshold for pattern candidate detection.
+    pub similarity_threshold: f64,
+    /// Minimum number of distinct sessions required to create a candidate.
+    pub min_sessions: usize,
+    /// Minimum number of exemplar drawers required to create a candidate.
+    pub min_exemplars: usize,
+    /// session_count threshold to promote a candidate to active.
+    pub promote_threshold: usize,
+    /// Days without new exemplars before auto-retiring an active pattern.
+    pub retire_after_days: u64,
+    /// Cosine similarity threshold for surfacing patterns in search.
+    pub surfacing_threshold: f64,
+    /// Score boost applied to exemplar drawers matching an active pattern.
+    pub pattern_boost: f64,
+}
+
+impl Default for PatternsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            similarity_threshold: DEFAULT_PATTERNS_SIMILARITY_THRESHOLD,
+            min_sessions: DEFAULT_PATTERNS_MIN_SESSIONS,
+            min_exemplars: DEFAULT_PATTERNS_MIN_EXEMPLARS,
+            promote_threshold: DEFAULT_PATTERNS_PROMOTE_THRESHOLD,
+            retire_after_days: DEFAULT_PATTERNS_RETIRE_AFTER_DAYS,
+            surfacing_threshold: DEFAULT_PATTERNS_SURFACING_THRESHOLD,
+            pattern_boost: DEFAULT_PATTERNS_BOOST,
         }
     }
 }

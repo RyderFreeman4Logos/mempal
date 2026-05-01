@@ -472,6 +472,37 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
                 drawer_id: drawer.id.clone(),
                 source,
             })?;
+
+        // Pattern detection (P13) — fire-and-forget, never blocks or fails ingest.
+        {
+            let config_snap = ConfigHandle::current();
+            if config_snap.patterns.enabled {
+                let model_id = config_snap.embed.model.clone().unwrap_or_else(|| {
+                    if config_snap.embed.backend == "model2vec" {
+                        "model2vec/potion-multilingual-128M".to_string()
+                    } else {
+                        config_snap.embed.model.clone().unwrap_or_default()
+                    }
+                });
+                let session_id = source_file.as_str();
+                crate::core::patterns::run_pattern_detection(
+                    db.conn(),
+                    &crate::core::patterns::PatternDetectionArgs {
+                        new_drawer_id: &drawer_id,
+                        session_id,
+                        embedding: &vector,
+                        project_id: options.project_id,
+                        model_id: &model_id,
+                        similarity_threshold: config_snap.patterns.similarity_threshold,
+                        min_sessions: config_snap.patterns.min_sessions,
+                        min_exemplars: config_snap.patterns.min_exemplars,
+                        promote_threshold: config_snap.patterns.promote_threshold,
+                        top_tags: 5,
+                    },
+                );
+            }
+        }
+
         stats.drawer_ids.push(drawer_id);
         stats.chunks += 1;
     }

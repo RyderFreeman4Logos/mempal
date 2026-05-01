@@ -103,6 +103,19 @@ pub struct ContextResponse {
     pub field: String,
     pub anchors: Vec<ContextAnchorDto>,
     pub sections: Vec<ContextSectionDto>,
+    /// Active patterns surfaced as recurring themes (P13).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recurring_themes: Vec<PatternSummaryDto>,
+}
+
+/// Lightweight pattern summary for context responses.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PatternSummaryDto {
+    pub pattern_id: String,
+    pub topic_tags: Vec<String>,
+    pub session_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exemplar_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -402,6 +415,9 @@ pub struct SearchResultDto {
     pub anchor_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_anchor_id: Option<String>,
+    /// Pattern ID of the active pattern boosting this result (P13). None when no pattern matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_pattern_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1048,6 +1064,7 @@ impl SearchResultDto {
             neighbors,
             tunnel_hints,
             effective_importance,
+            matched_pattern_id,
         } = value;
         let analyzed_content = crate::session_review::analysis_content(&content);
         let signals = crate::aaak::analyze(analyzed_content);
@@ -1092,6 +1109,7 @@ impl SearchResultDto {
             anchor_kind: anchor_kind_slug(&anchor_kind).to_string(),
             anchor_id,
             parent_anchor_id,
+            matched_pattern_id,
         }
     }
 }
@@ -1114,6 +1132,16 @@ impl From<ContextPack> for ContextResponse {
                 .sections
                 .into_iter()
                 .map(ContextSectionDto::from)
+                .collect(),
+            recurring_themes: value
+                .recurring_themes
+                .into_iter()
+                .map(|p| PatternSummaryDto {
+                    pattern_id: p.pattern_id,
+                    topic_tags: p.topic_tags,
+                    session_count: p.session_count,
+                    exemplar_preview: p.exemplar_preview,
+                })
                 .collect(),
         }
     }
@@ -1283,6 +1311,7 @@ mod tests {
             neighbors: None,
             tunnel_hints: vec!["docs".to_string()],
             effective_importance: 0.0,
+            matched_pattern_id: None,
         }
     }
 

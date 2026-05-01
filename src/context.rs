@@ -10,6 +10,7 @@ use crate::core::{
     anchor,
     db::Database,
     db::DbError,
+    patterns::PatternSummary,
     types::{
         AnchorKind, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, RouteDecision,
         SearchResult, TriggerHints,
@@ -43,6 +44,8 @@ pub struct ContextRequest {
     pub include_evidence: bool,
     pub max_items: usize,
     pub dao_tian_limit: usize,
+    /// Optional project scope for pattern filtering (P13).
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -58,6 +61,8 @@ pub struct ContextPack {
     pub field: String,
     pub anchors: Vec<ContextAnchor>,
     pub sections: Vec<ContextSection>,
+    /// Active patterns surfaced as recurring themes (P13).
+    pub recurring_themes: Vec<PatternSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -230,6 +235,41 @@ pub fn assemble_context_with_vector(
         }
     }
 
+    // Load active patterns for recurring_themes (P13).
+    let recurring_themes = if crate::core::patterns::patterns_table_exists(db.conn()) {
+        match crate::core::patterns::load_active_patterns_for_context(
+            db.conn(),
+            request.project_id.as_deref(),
+        ) {
+            Ok(patterns) => patterns
+                .into_iter()
+                .map(|p| {
+                    let exemplar_preview = p.exemplar_ids.first().and_then(|id| {
+                        db.conn()
+                            .query_row(
+                                "SELECT SUBSTR(content, 1, 120) FROM drawers WHERE id = ?1",
+                                [id],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .ok()
+                    });
+                    PatternSummary {
+                        pattern_id: p.pattern_id,
+                        topic_tags: p.topic_tags,
+                        session_count: p.session_count,
+                        exemplar_preview,
+                    }
+                })
+                .collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to load active patterns for context");
+                vec![]
+            }
+        }
+    } else {
+        vec![]
+    };
+
     Ok(ContextPack {
         query: request.query,
         domain: request.domain,
@@ -242,6 +282,7 @@ pub fn assemble_context_with_vector(
             })
             .collect(),
         sections,
+        recurring_themes,
     })
 }
 

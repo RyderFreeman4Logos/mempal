@@ -63,6 +63,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod longmemeval;
+mod patterns;
 #[path = "cli/prime.rs"]
 mod prime_cli;
 
@@ -433,6 +434,11 @@ enum Commands {
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommands,
+    },
+    /// Pattern management (list, show, retire, promote).
+    Patterns {
+        #[command(subcommand)]
+        command: patterns::PatternsCommands,
     },
 }
 
@@ -1117,6 +1123,7 @@ fn run() -> Result<()> {
         Commands::Checkpoint { command } => {
             block_on_result(checkpoint_command(&db, config.as_ref(), command))
         }
+        Commands::Patterns { command } => patterns::run_command(config.as_ref(), command),
         Commands::CoworkDrain { .. }
         | Commands::CoworkStatus { .. }
         | Commands::CoworkInstallHooks { .. }
@@ -2037,6 +2044,7 @@ async fn context_command(db: &Database, config: &Config, args: ContextCommandArg
             include_evidence: args.include_evidence,
             max_items: args.max_items,
             dao_tian_limit: args.dao_tian_limit,
+            project_id: config.project.id.clone(),
         },
     )
     .await?;
