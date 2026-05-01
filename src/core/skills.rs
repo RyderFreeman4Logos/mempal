@@ -535,7 +535,8 @@ pub fn load_active_skills_for_context(
 fn blob_to_vec(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .filter_map(|chunk| chunk.try_into().ok())
+        .map(f32::from_le_bytes)
         .collect()
 }
 
