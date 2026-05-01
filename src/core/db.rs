@@ -2540,7 +2540,7 @@ impl Database {
                 let new_last_rowid: i64 = self
                     .conn
                     .query_row(
-                        "SELECT MAX(rowid) FROM drawers WHERE deleted_at IS NULL AND rowid > ?1 ORDER BY rowid ASC LIMIT ?2",
+                        "SELECT MAX(rowid) FROM (SELECT rowid FROM drawers WHERE deleted_at IS NULL AND rowid > ?1 ORDER BY rowid ASC LIMIT ?2)",
                         rusqlite::params![last_rowid, BATCH_SIZE],
                         |row| row.get::<_, Option<i64>>(0),
                     )?
