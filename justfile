@@ -48,6 +48,10 @@ test-onnx:
 build:
     cargo build --release --all-features
 
+# Install mempal binary to /usr/local/bin.
+install:
+    CARGO_HOME=/usr/local cargo install --path . --force
+
 # Bump patch version (requires cargo-edit).
 bump-patch:
     cargo set-version --bump patch
