@@ -316,6 +316,7 @@ impl MempalMcpServer {
         novelty: &crate::ingest::novelty::NoveltyDecision,
         audit_decision: Option<&str>,
         inserted_drawer_ids: &mut Vec<String>,
+        newly_created_drawer_ids: &mut Vec<String>,
     ) -> std::result::Result<(), ErrorData> {
         let source_type = SourceType::Manual;
         let metadata = validate_ingest_request(request, &source_type)?;
@@ -352,6 +353,8 @@ impl MempalMcpServer {
             };
             let exists = db.drawer_exists(chunk_did).map_err(db_error)?;
             if exists {
+                // Dedup-resolved: drawer pre-existed; include in response list but NOT
+                // in newly_created_drawer_ids so LLM reject cannot soft-delete it.
                 inserted_drawer_ids.push(chunk_did.clone());
                 continue;
             }
@@ -368,6 +371,7 @@ impl MempalMcpServer {
             db.insert_vector_with_project(chunk_did, vector, project_id)
                 .map_err(db_error)?;
             inserted_drawer_ids.push(chunk_did.clone());
+            newly_created_drawer_ids.push(chunk_did.clone());
         }
         Ok(())
     }
@@ -1680,6 +1684,9 @@ impl MempalMcpServer {
         let (novelty_action, near_drawer_id);
 
         let mut inserted_drawer_ids: Vec<String> = Vec::new();
+        // Tracks only drawers freshly created in this request — dedup-resolved IDs (pre-existing
+        // drawers found by hash) must NOT appear here, so LLM reject cannot soft-delete them.
+        let mut newly_created_drawer_ids: Vec<String> = Vec::new();
 
         match novelty.action {
             NoveltyAction::Insert => {
@@ -1702,6 +1709,8 @@ impl MempalMcpServer {
                     .zip(chunks.iter().zip(vectors.iter()))
                 {
                     if *chunk_exists {
+                        // Dedup-resolved pre-lock: include in response but NOT in
+                        // newly_created_drawer_ids so LLM reject cannot delete it.
                         inserted_drawer_ids.push(chunk_did.clone());
                         continue;
                     }
@@ -1724,6 +1733,8 @@ impl MempalMcpServer {
                     };
                     let exists_after_lock = db.drawer_exists(chunk_did).map_err(db_error)?;
                     if exists_after_lock {
+                        // Dedup-resolved post-lock: include in response but NOT in
+                        // newly_created_drawer_ids so LLM reject cannot delete it.
                         inserted_drawer_ids.push(chunk_did.clone());
                         continue;
                     }
@@ -1740,6 +1751,7 @@ impl MempalMcpServer {
                     db.insert_vector_with_project(chunk_did, vector, project_id.as_deref())
                         .map_err(db_error)?;
                     inserted_drawer_ids.push(chunk_did.clone());
+                    newly_created_drawer_ids.push(chunk_did.clone());
                 }
             }
             NoveltyAction::Drop => {
@@ -1804,6 +1816,7 @@ impl MempalMcpServer {
                         &novelty,
                         Some("insert_due_to_merge_cap"),
                         &mut inserted_drawer_ids,
+                        &mut newly_created_drawer_ids,
                     )?;
                     novelty_action = Some(NoveltyAction::Insert);
                     near_drawer_id = Some(target_id);
@@ -1853,6 +1866,7 @@ impl MempalMcpServer {
                                     &novelty,
                                     Some("insert_due_to_embed_error"),
                                     &mut inserted_drawer_ids,
+                                    &mut newly_created_drawer_ids,
                                 )?;
                                 novelty_action = Some(NoveltyAction::Insert);
                                 near_drawer_id = Some(target_id);
@@ -1877,6 +1891,7 @@ impl MempalMcpServer {
                                 &novelty,
                                 Some("insert_due_to_embed_error"),
                                 &mut inserted_drawer_ids,
+                                &mut newly_created_drawer_ids,
                             )?;
                             novelty_action = Some(NoveltyAction::Insert);
                             near_drawer_id = Some(target_id);
@@ -1926,7 +1941,10 @@ impl MempalMcpServer {
 
         // Tier 3 LLM judge (P12) — fire-and-forget after drawer is stored.
         // Only runs when Tier 2 returned "prototype_below_threshold" and LLM judge is active.
-        if should_enqueue_llm_task && !inserted_drawer_ids.is_empty() {
+        // Guard: only enqueue for NEWLY CREATED drawers. Dedup-resolved IDs (pre-existing drawers
+        // found by hash) are excluded from newly_created_drawer_ids so a subsequent LLM reject
+        // cannot soft-delete a drawer that predated this ingest request.
+        if should_enqueue_llm_task && !newly_created_drawer_ids.is_empty() {
             let system_prompt = config
                 .ingest_gating
                 .llm_judge
@@ -1934,8 +1952,8 @@ impl MempalMcpServer {
                 .and_then(|j| j.system_prompt.clone());
             let payload = crate::llm::LlmTaskPayload {
                 task_type: "gating".to_string(),
-                drawer_id: inserted_drawer_ids[0].clone(),
-                drawer_ids: inserted_drawer_ids.clone(),
+                drawer_id: newly_created_drawer_ids[0].clone(),
+                drawer_ids: newly_created_drawer_ids.clone(),
                 content: scrubbed_content.clone(),
                 system_prompt,
             };
@@ -1945,7 +1963,7 @@ impl MempalMcpServer {
                         if let Err(err) = queue.enqueue("llm_task", &payload_json) {
                             tracing::warn!(
                                 error = %err,
-                                drawer_ids = ?inserted_drawer_ids,
+                                drawer_ids = ?newly_created_drawer_ids,
                                 "Tier 3 LLM gating task enqueue failed; fail-open keep"
                             );
                         }

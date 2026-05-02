@@ -38,6 +38,7 @@ test_gating_audit_records_decisions
 test_gating_disabled_short_circuits
 test_gating_preserves_vector_dim_consistency
 test_gating_stats_cli_output
+test_gating_tier3_does_not_delete_preexisting_dedup_drawer
 test_gating_tier3_fail_open
 test_gating_tier3_multichunk_rejects_all_drawers
 test_gating_tier3_only_for_unclassified
@@ -1770,5 +1771,107 @@ threshold = 0.5
         env.db().drawer_count().expect("drawer count after reject"),
         0,
         "LLM reject must soft-delete ALL chunk drawers, not just the first"
+    );
+}
+
+/// Guard: when a re-ingest deduplicates to a pre-existing drawer (same content hash), the Tier 3
+/// LLM task must NOT be enqueued — because newly_created_drawer_ids is empty. This prevents a
+/// subsequent LLM reject from soft-deleting a drawer that predated the ingest request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_gating_tier3_does_not_delete_preexisting_dedup_drawer() {
+    let _guard = test_guard().await;
+
+    // Phase 1: Store the drawer with gating disabled so it is definitely persisted.
+    let env = TestEnv::new(
+        r#"
+[gating]
+enabled = false
+"#,
+    );
+    let config_phase1 = env.config();
+    let server_phase1 = MempalMcpServer::new_with_factory_and_config(
+        env.db_path.clone(),
+        config_phase1,
+        deterministic_factory(
+            &[("ambiguous dedup content", vec![0.5, 0.5])],
+            vec![0.5, 0.5],
+            &[],
+        ),
+    );
+    let first_response = ingest_mcp(&server_phase1, "ambiguous dedup content").await;
+    assert!(!first_response.dropped, "phase1 must store the drawer");
+    assert_eq!(env.db().drawer_count().expect("drawer count phase1"), 1);
+    let preexisting_id = first_response.drawer_id.clone();
+
+    // Phase 2: Re-ingest the exact same content with gating + LLM judge active.
+    // Tier 2 sees the content as "prototype_below_threshold" (vector far from prototype),
+    // which would normally set should_enqueue_llm_task=true. But because the chunk hash
+    // matches the pre-existing drawer, newly_created_drawer_ids stays empty and no LLM task
+    // is enqueued — the guard prevents a spurious reject from deleting the pre-existing drawer.
+    let config_phase2 = Config::parse(&format!(
+        r#"
+db_path = "{}"
+
+[config_hot_reload]
+enabled = false
+
+[llm]
+enabled = true
+base_url = "http://localhost:18317/v1"
+model = "test-model"
+
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.9
+prototypes = ["valuable"]
+
+[gating.llm_judge]
+enabled = true
+threshold = 0.5
+"#,
+        env.db_path.display()
+    ))
+    .expect("parse config phase2");
+    let server_phase2 = MempalMcpServer::new_with_factory_and_config(
+        env.db_path.clone(),
+        config_phase2,
+        deterministic_factory(
+            &[
+                ("valuable", vec![1.0, 0.0]),
+                ("ambiguous dedup content", vec![0.5, 0.5]),
+            ],
+            vec![0.5, 0.5],
+            &[],
+        ),
+    );
+    let second_response = ingest_mcp(&server_phase2, "ambiguous dedup content").await;
+
+    // Fail-open: not dropped (dedup re-ingest keeps the existing drawer).
+    assert!(!second_response.dropped, "dedup re-ingest must not drop");
+
+    // Critical invariant: no LLM task enqueued because all chunk IDs were dedup-resolved
+    // (newly_created_drawer_ids was empty).
+    assert_eq!(
+        pending_llm_task_count(&env.db()),
+        0,
+        "no LLM task must be enqueued when all drawers are dedup-resolved pre-existing"
+    );
+
+    // The pre-existing drawer must still be present and not soft-deleted.
+    assert_eq!(
+        env.db()
+            .drawer_count()
+            .expect("drawer count after re-ingest"),
+        1,
+        "pre-existing drawer must survive dedup re-ingest"
+    );
+    assert!(
+        env.db()
+            .drawer_exists(&preexisting_id)
+            .expect("drawer exists check"),
+        "pre-existing drawer {preexisting_id} must not be soft-deleted by LLM reject guard"
     );
 }
