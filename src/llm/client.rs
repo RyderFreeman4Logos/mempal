@@ -173,6 +173,9 @@ impl LlmClient {
                 messages: &request.messages,
                 temperature: request.temperature,
                 max_tokens: request.max_tokens,
+                chat_template_kwargs: Some(ChatTemplateKwargs {
+                    enable_thinking: false,
+                }),
             })
             .send()
             .await
@@ -196,7 +199,7 @@ impl LlmClient {
             .json::<OpenAiChatResponse>()
             .await
             .map_err(map_decode_error)?;
-        let content = response
+        let message = response
             .choices
             .into_iter()
             .next()
@@ -205,8 +208,8 @@ impl LlmClient {
                     "chat completion response did not include any choices".to_string(),
                 )
             })?
-            .message
-            .content;
+            .message;
+        let content = message.content.or(message.reasoning).unwrap_or_default();
 
         Ok(LlmResponse {
             content,
@@ -295,6 +298,13 @@ struct OpenAiChatRequest<'a> {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,5 +321,8 @@ struct OpenAiChoice {
 
 #[derive(Debug, Deserialize)]
 struct OpenAiMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
 }
