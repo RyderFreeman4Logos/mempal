@@ -33,6 +33,8 @@ test_gating_audit_records_decisions
 test_gating_disabled_short_circuits
 test_gating_preserves_vector_dim_consistency
 test_gating_stats_cli_output
+test_gating_tier3_fail_open
+test_gating_tier3_only_for_unclassified
 test_llm_judge_section_no_longer_warns
 test_tier1_skips_read_tool
 test_tier1_skips_short_content
@@ -1480,4 +1482,150 @@ prototypes = ["valuable"]
             .iter()
             .any(|message| message.contains("tier-2 gating is fail-open on embedder errors"))
     );
+}
+
+fn pending_llm_task_count(db: &Database) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM pending_messages WHERE kind = 'llm_task' AND status = 'pending'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_gating_tier3_only_for_unclassified() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(
+        r#"
+[llm]
+enabled = true
+base_url = "http://localhost:18317/v1"
+model = "test-model"
+
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.8
+prototypes = ["valuable", "noise"]
+
+[gating.llm_judge]
+enabled = true
+"#,
+    );
+    let config = env.config();
+    let server = MempalMcpServer::new_with_factory_and_config(
+        env.db_path.clone(),
+        config,
+        deterministic_factory(
+            &[
+                ("valuable", vec![1.0, 0.0]),
+                ("noise", vec![0.0, 1.0]),
+                ("tier2_keep_content", vec![0.99, 0.01]),
+                ("tier2_unclassified_content", vec![0.5, 0.5]),
+            ],
+            vec![0.2, 0.2],
+            &[],
+        ),
+    );
+
+    // Case 1: Tier 1 Skip (too short) — no LLM task enqueued.
+    let response = ingest_mcp(&server, "tiny").await;
+    assert!(response.dropped, "tier1 skip should drop");
+    assert_eq!(
+        pending_llm_task_count(&env.db()),
+        0,
+        "tier1 skip must not enqueue LLM task"
+    );
+
+    // Case 2: Tier 2 Keep (high score above threshold) — no LLM task enqueued.
+    let response = ingest_mcp(&server, "tier2_keep_content").await;
+    assert!(!response.dropped, "tier2 keep should not drop");
+    assert_eq!(
+        pending_llm_task_count(&env.db()),
+        0,
+        "tier2 keep must not enqueue LLM task"
+    );
+
+    // Case 3: Tier 2 Unclassified (score below threshold) — LLM task enqueued, fail-open.
+    let response = ingest_mcp(&server, "tier2_unclassified_content").await;
+    assert!(
+        !response.dropped,
+        "unclassified should fail-open (not dropped)"
+    );
+    assert_eq!(
+        response
+            .gating_decision
+            .as_ref()
+            .and_then(|d| d.label.as_deref()),
+        Some("llm_pending"),
+        "unclassified should carry llm_pending label"
+    );
+    assert_eq!(
+        pending_llm_task_count(&env.db()),
+        1,
+        "tier2 unclassified must enqueue exactly one LLM task"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_gating_tier3_fail_open() {
+    let _guard = test_guard().await;
+    // LLM judge enabled with a URL that won't be reachable during the test — that's fine
+    // because the enqueue is synchronous but LLM processing is async (daemon worker).
+    let env = TestEnv::new(
+        r#"
+[llm]
+enabled = true
+base_url = "http://localhost:18317/v1"
+model = "test-model"
+
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.9
+prototypes = ["valuable"]
+
+[gating.llm_judge]
+enabled = true
+threshold = 0.5
+"#,
+    );
+    let config = env.config();
+    let server = MempalMcpServer::new_with_factory_and_config(
+        env.db_path.clone(),
+        config,
+        deterministic_factory(
+            &[
+                ("valuable", vec![1.0, 0.0]),
+                ("ambiguous content to judge", vec![0.5, 0.5]),
+            ],
+            vec![0.2, 0.2],
+            &[],
+        ),
+    );
+
+    // Content below threshold → Tier 2 unclassified → Tier 3 LLM judge (fail-open).
+    let response = ingest_mcp(&server, "ambiguous content to judge").await;
+
+    // Fail-open: drawer must be stored even though LLM endpoint may be unreachable.
+    assert!(!response.dropped, "tier3 must fail-open (drawer stored)");
+    assert_eq!(env.db().drawer_count().expect("drawer count"), 1);
+
+    // LLM task must be in the queue for async processing.
+    assert_eq!(
+        pending_llm_task_count(&env.db()),
+        1,
+        "one LLM gating task must be enqueued"
+    );
+
+    let rows = gating_rows(&env.db());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].decision, "keep");
+    assert_eq!(rows[0].label.as_deref(), Some("llm_pending"));
 }

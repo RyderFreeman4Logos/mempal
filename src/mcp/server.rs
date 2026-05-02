@@ -1553,6 +1553,7 @@ impl MempalMcpServer {
         let first_chunk = chunks.first().map(|c| c.as_str()).unwrap_or("");
         let mut first_vector = None;
         let mut gating_audit_recorded = false;
+        let mut should_enqueue_llm_task = false;
         if gating_decision.is_none() {
             let tier2_classifier = if config.ingest_gating.enabled
                 && config.ingest_gating.embedding_classifier.enabled
@@ -1572,11 +1573,32 @@ impl MempalMcpServer {
                     config.ingest_gating.embedding_classifier.threshold,
                 )
                 .await;
-                db.record_gating_audit(&drawer_id, &tier2.decision, project_id.as_deref())
-                    .map_err(db_error)?;
-                gating_audit_recorded = true;
                 first_vector = tier2.vector;
-                gating_decision = Some(tier2.decision);
+                // Tier 3: intercept uncertain Tier 2 results ("prototype_below_threshold")
+                // and route to LLM judge when enabled (fail-open: store now, judge async).
+                let llm_judge_active = config.llm.enabled
+                    && config.llm.enabled_for.contains(&"gating".to_string())
+                    && config
+                        .ingest_gating
+                        .llm_judge
+                        .as_ref()
+                        .is_some_and(|j| j.enabled);
+                let is_unclassified =
+                    tier2.decision.gating_reason.as_deref() == Some("prototype_below_threshold");
+                if llm_judge_active && is_unclassified {
+                    let llm_decision =
+                        GatingDecision::accepted(0, Some("llm_pending".to_string()), None);
+                    db.record_gating_audit(&drawer_id, &llm_decision, project_id.as_deref())
+                        .map_err(db_error)?;
+                    gating_audit_recorded = true;
+                    gating_decision = Some(llm_decision);
+                    should_enqueue_llm_task = true;
+                } else {
+                    db.record_gating_audit(&drawer_id, &tier2.decision, project_id.as_deref())
+                        .map_err(db_error)?;
+                    gating_audit_recorded = true;
+                    gating_decision = Some(tier2.decision);
+                }
             } else if config.ingest_gating.enabled {
                 gating_decision = Some(GatingDecision::accepted(
                     0,
@@ -1900,6 +1922,51 @@ impl MempalMcpServer {
 
         if !inserted_drawer_ids.is_empty() {
             response_drawer_id = inserted_drawer_ids[0].clone();
+        }
+
+        // Tier 3 LLM judge (P12) — fire-and-forget after drawer is stored.
+        // Only runs when Tier 2 returned "prototype_below_threshold" and LLM judge is active.
+        if should_enqueue_llm_task {
+            if let Some(judge_drawer_id) = inserted_drawer_ids.first() {
+                let system_prompt = config
+                    .ingest_gating
+                    .llm_judge
+                    .as_ref()
+                    .and_then(|j| j.system_prompt.clone());
+                let payload = crate::llm::LlmTaskPayload {
+                    task_type: "gating".to_string(),
+                    drawer_id: judge_drawer_id.clone(),
+                    content: scrubbed_content.clone(),
+                    system_prompt,
+                };
+                match serde_json::to_string(&payload) {
+                    Ok(payload_json) => {
+                        match crate::core::queue::PendingMessageStore::new(db.path()) {
+                            Ok(queue) => {
+                                if let Err(err) = queue.enqueue("llm_task", &payload_json) {
+                                    tracing::warn!(
+                                        error = %err,
+                                        drawer_id = judge_drawer_id,
+                                        "Tier 3 LLM gating task enqueue failed; fail-open keep"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "Tier 3 LLM gating queue init failed; fail-open keep"
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "Tier 3 LLM gating payload serialization failed; fail-open keep"
+                        );
+                    }
+                }
+            }
         }
 
         // Failure detection (P14) — fire-and-forget for each inserted drawer.
