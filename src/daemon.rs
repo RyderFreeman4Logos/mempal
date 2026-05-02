@@ -649,6 +649,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         let payload = serde_json::to_string(&crate::llm::LlmTaskPayload {
             task_type: "gating".to_string(),
             drawer_id: drawer_id.clone(),
+            drawer_ids: vec![drawer_id.clone()],
             content: analysis_content(&record.content).to_string(),
             system_prompt,
         })

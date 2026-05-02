@@ -409,21 +409,17 @@ impl Database {
         verdict: &str,
         score: Option<f64>,
     ) -> Result<(), DbError> {
+        // Update the existing llm_pending row written during ingest (identified by drawer_id +
+        // llm_pending label). The row already has a valid explain_json; we only patch the two
+        // LLM-specific columns. Using an UPDATE avoids fighting the NOT NULL constraint on
+        // explain_json that a fresh INSERT would trigger.
         self.conn.execute(
             r#"
-            INSERT INTO gating_audit (id, candidate_hash, drawer_id, decision, tier, llm_verdict, llm_score, retained_until, created_at)
-            VALUES (?1, ?2, ?3, 'keep', 3, ?4, ?5, ?6, ?7)
-            ON CONFLICT(id) DO UPDATE SET llm_verdict = excluded.llm_verdict, llm_score = excluded.llm_score
+            UPDATE gating_audit
+            SET llm_verdict = ?1, llm_score = ?2
+            WHERE drawer_id = ?3 AND label = 'llm_pending'
             "#,
-            params![
-                format!("gating_llm_{}", blake3::hash(drawer_id.as_bytes()).to_hex()),
-                drawer_id,
-                drawer_id,
-                verdict,
-                score,
-                super::utils::current_timestamp().parse::<i64>().unwrap_or_default() + 7 * 24 * 60 * 60,
-                super::utils::current_timestamp(),
-            ],
+            params![verdict, score, drawer_id],
         )?;
         Ok(())
     }

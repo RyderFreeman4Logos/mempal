@@ -122,6 +122,7 @@ fn test_llm_task_payload_roundtrip() {
     let payload = mempal::llm::LlmTaskPayload {
         task_type: "gating".to_string(),
         drawer_id: "drawer_test_123".to_string(),
+        drawer_ids: vec![],
         content: "Some test content".to_string(),
         system_prompt: Some("Judge this.".to_string()),
     };
