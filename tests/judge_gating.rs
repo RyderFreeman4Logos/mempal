@@ -11,16 +11,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::harness::AlwaysFailMigrationHook;
-use mempal::core::config::{Config, ConfigHandle, GatingRuleConfig};
+use mempal::core::config::{
+    Config, ConfigHandle, GatingRuleConfig, IngestGatingConfig, LlmConfig, LlmJudgeConfig,
+};
 use mempal::core::db::{
     Database, apply_fork_ext_migrations_to, apply_fork_ext_migrations_with_hook,
     read_fork_ext_version, set_fork_ext_version,
 };
+use mempal::core::queue::PendingMessageStore;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::ingest::gating::{
     GatingRuntime, IngestCandidate, compile_classifier_from_config,
     compile_classifier_from_embedder, evaluate_tier1, evaluate_tier2,
 };
+use mempal::llm::client::LlmClient;
+use mempal::llm::status::LlmStatus;
 use mempal::mcp::{IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
@@ -34,6 +39,7 @@ test_gating_disabled_short_circuits
 test_gating_preserves_vector_dim_consistency
 test_gating_stats_cli_output
 test_gating_tier3_fail_open
+test_gating_tier3_multichunk_rejects_all_drawers
 test_gating_tier3_only_for_unclassified
 test_llm_judge_section_no_longer_warns
 test_tier1_skips_read_tool
@@ -1628,4 +1634,141 @@ threshold = 0.5
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].decision, "keep");
     assert_eq!(rows[0].label.as_deref(), Some("llm_pending"));
+}
+
+/// Multi-chunk ingest with Tier 3 LLM reject must soft-delete every chunk drawer,
+/// not just the first one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_gating_tier3_multichunk_rejects_all_drawers() {
+    let _guard = test_guard().await;
+
+    // Start a mock LLM server that always returns a reject verdict (score=0.1 < threshold=0.5).
+    let mut mock_server = mockito::Server::new_async().await;
+    let _reject_mock = mock_server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"test","choices":[{"message":{"role":"assistant","content":"{\"verdict\":\"reject\",\"score\":0.1}"},"finish_reason":"stop"}],"model":"test","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#)
+        .create_async()
+        .await;
+
+    // Use a very small chunker so the content splits into multiple chunks.
+    // target_tokens=5, max_tokens=10, overlap_tokens=2 — content ~60 chars splits into 2+ chunks.
+    let env = TestEnv::new(&format!(
+        r#"
+[llm]
+enabled = true
+base_url = "{}/v1"
+model = "test-model"
+retry_interval_secs = 1
+
+[chunker]
+max_tokens = 10
+target_tokens = 5
+overlap_tokens = 2
+
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.9
+prototypes = ["keep_proto"]
+
+[gating.llm_judge]
+enabled = true
+threshold = 0.5
+"#,
+        mock_server.url()
+    ));
+
+    let config = env.config();
+    // Prototype vec far from ambiguous content vec → triggers Tier 3.
+    let server = MempalMcpServer::new_with_factory_and_config(
+        env.db_path.clone(),
+        config,
+        deterministic_factory(
+            &[("keep_proto", vec![1.0, 0.0])],
+            // Default vec (0.5, 0.5) is far from prototype → below threshold → LLM judge.
+            vec![0.5, 0.5],
+            &[],
+        ),
+    );
+
+    // Content long enough to produce multiple chunks with max_tokens=10.
+    let long_content = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa";
+    let response = ingest_mcp(&server, long_content).await;
+
+    // Fail-open: all chunks stored initially.
+    assert!(
+        !response.dropped,
+        "multi-chunk ingest should fail-open before LLM verdict"
+    );
+
+    let initial_count = env.db().drawer_count().expect("drawer count");
+    assert!(
+        initial_count >= 2,
+        "content must produce at least 2 chunks, got {initial_count}"
+    );
+
+    // Exactly one LLM task enqueued for the whole ingest (not one per chunk).
+    assert_eq!(
+        pending_llm_task_count(&env.db()),
+        1,
+        "exactly one LLM gating task per ingest, regardless of chunk count"
+    );
+
+    // Verify the queued payload carries ALL drawer IDs.
+    let store = PendingMessageStore::new(&env.db_path).expect("queue store");
+    let claimed = store
+        .claim_next_by_kind("test-worker", 300, "llm_task")
+        .expect("claim")
+        .expect("task present");
+    let payload: mempal::llm::LlmTaskPayload =
+        serde_json::from_str(&claimed.payload).expect("deserialize payload");
+    assert_eq!(
+        payload.drawer_ids.len(),
+        initial_count as usize,
+        "drawer_ids must list every chunk's drawer ID (got {:?})",
+        payload.drawer_ids,
+    );
+
+    // Process the LLM task using the mock server (returns reject, score=0.1 < threshold=0.5).
+    let llm_config = LlmConfig {
+        enabled: true,
+        base_url: Some(format!("{}/v1", mock_server.url())),
+        model: Some("test-model".to_string()),
+        retry_interval_secs: 1,
+        ..Default::default()
+    };
+    let client = LlmClient::from_config(&llm_config).expect("build LLM client");
+    let status = LlmStatus::new(5);
+    let judge_config = Config {
+        ingest_gating: IngestGatingConfig {
+            llm_judge: Some(LlmJudgeConfig {
+                enabled: true,
+                threshold: 0.5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    mempal::llm::process_llm_task(
+        &client,
+        &status,
+        &env.db_path,
+        &claimed.payload,
+        &judge_config,
+        None,
+    )
+    .await
+    .expect("process LLM task");
+
+    // All chunk drawers must be soft-deleted after rejection.
+    assert_eq!(
+        env.db().drawer_count().expect("drawer count after reject"),
+        0,
+        "LLM reject must soft-delete ALL chunk drawers, not just the first"
+    );
 }

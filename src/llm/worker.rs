@@ -19,7 +19,12 @@ const LLM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmTaskPayload {
     pub task_type: String,
+    /// Primary drawer ID; kept for backward compat with tasks already in the queue.
     pub drawer_id: String,
+    /// All drawer IDs for multi-chunk ingests. When non-empty, takes precedence
+    /// over `drawer_id` so every chunk is acted on (e.g. rejected together).
+    #[serde(default)]
+    pub drawer_ids: Vec<String>,
     pub content: String,
     pub system_prompt: Option<String>,
 }
@@ -118,7 +123,7 @@ pub async fn run_llm_worker(
     Ok(())
 }
 
-async fn process_llm_task(
+pub async fn process_llm_task(
     client: &LlmClient,
     status: &LlmStatus,
     db_path: &std::path::Path,
@@ -175,6 +180,10 @@ async fn process_gating_task(
             status.record_success();
             let (verdict, score) = parse_gating_verdict(&response.content);
             let db = Database::open(db_path).context("failed to open database for LLM verdict")?;
+
+            // The gating_audit row exists only for the primary drawer_id (recorded during ingest
+            // before chunking). Record the verdict there; the remaining chunk IDs have no audit
+            // row and updating them would violate the NOT NULL explain_json constraint.
             db.upsert_llm_verdict(&task.drawer_id, &verdict, Some(score))
                 .context("failed to upsert LLM verdict")?;
 
@@ -186,14 +195,23 @@ async fn process_gating_task(
                 .unwrap_or(0.3);
 
             if score < threshold {
+                // Resolve all drawer IDs: prefer the multi-chunk list when present,
+                // fall back to the single drawer_id for backward-compat queue tasks.
+                let all_ids: Vec<&str> = if task.drawer_ids.is_empty() {
+                    vec![task.drawer_id.as_str()]
+                } else {
+                    task.drawer_ids.iter().map(String::as_str).collect()
+                };
                 tracing::info!(
-                    drawer_id = task.drawer_id,
+                    drawer_ids = ?all_ids,
                     score,
                     threshold,
-                    "LLM rejected drawer, executing soft-delete"
+                    "LLM rejected drawers, executing soft-delete for all chunks"
                 );
-                db.soft_delete_drawer(&task.drawer_id)
-                    .context("failed to soft-delete rejected drawer")?;
+                for id in &all_ids {
+                    db.soft_delete_drawer(id)
+                        .context("failed to soft-delete rejected drawer")?;
+                }
             }
 
             Ok(())

@@ -1926,45 +1926,42 @@ impl MempalMcpServer {
 
         // Tier 3 LLM judge (P12) — fire-and-forget after drawer is stored.
         // Only runs when Tier 2 returned "prototype_below_threshold" and LLM judge is active.
-        if should_enqueue_llm_task {
-            if let Some(judge_drawer_id) = inserted_drawer_ids.first() {
-                let system_prompt = config
-                    .ingest_gating
-                    .llm_judge
-                    .as_ref()
-                    .and_then(|j| j.system_prompt.clone());
-                let payload = crate::llm::LlmTaskPayload {
-                    task_type: "gating".to_string(),
-                    drawer_id: judge_drawer_id.clone(),
-                    content: scrubbed_content.clone(),
-                    system_prompt,
-                };
-                match serde_json::to_string(&payload) {
-                    Ok(payload_json) => {
-                        match crate::core::queue::PendingMessageStore::new(db.path()) {
-                            Ok(queue) => {
-                                if let Err(err) = queue.enqueue("llm_task", &payload_json) {
-                                    tracing::warn!(
-                                        error = %err,
-                                        drawer_id = judge_drawer_id,
-                                        "Tier 3 LLM gating task enqueue failed; fail-open keep"
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    "Tier 3 LLM gating queue init failed; fail-open keep"
-                                );
-                            }
+        if should_enqueue_llm_task && !inserted_drawer_ids.is_empty() {
+            let system_prompt = config
+                .ingest_gating
+                .llm_judge
+                .as_ref()
+                .and_then(|j| j.system_prompt.clone());
+            let payload = crate::llm::LlmTaskPayload {
+                task_type: "gating".to_string(),
+                drawer_id: inserted_drawer_ids[0].clone(),
+                drawer_ids: inserted_drawer_ids.clone(),
+                content: scrubbed_content.clone(),
+                system_prompt,
+            };
+            match serde_json::to_string(&payload) {
+                Ok(payload_json) => match crate::core::queue::PendingMessageStore::new(db.path()) {
+                    Ok(queue) => {
+                        if let Err(err) = queue.enqueue("llm_task", &payload_json) {
+                            tracing::warn!(
+                                error = %err,
+                                drawer_ids = ?inserted_drawer_ids,
+                                "Tier 3 LLM gating task enqueue failed; fail-open keep"
+                            );
                         }
                     }
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
-                            "Tier 3 LLM gating payload serialization failed; fail-open keep"
+                            "Tier 3 LLM gating queue init failed; fail-open keep"
                         );
                     }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "Tier 3 LLM gating payload serialization failed; fail-open keep"
+                    );
                 }
             }
         }
