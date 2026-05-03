@@ -79,6 +79,7 @@ fn request_with_cfg(cwd: &Path, cfg: ContextConfig) -> ContextRequest {
         field: "general".to_string(),
         cwd: cwd.to_path_buf(),
         include_evidence: false,
+        include_cards: false,
         max_items: 20,
         dao_tian_limit: 5,
         project_id: None,

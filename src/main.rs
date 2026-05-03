@@ -26,8 +26,9 @@ use mempal::core::{
     types::{
         AnchorKind, BootstrapEvidenceArgs, Drawer, KnowledgeCard, KnowledgeCardEvent,
         KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole,
-        KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, SourceType, TaxonomyEntry,
-        TriggerHints, TunnelEndpoint,
+        KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, RuntimeAdoptionEvent,
+        RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack, SourceType,
+        TaxonomyEntry, TriggerHints, TunnelEndpoint,
     },
     utils::{
         build_bootstrap_evidence_drawer_id, build_triple_id, current_timestamp,
@@ -48,6 +49,17 @@ use mempal::ingest::{
     reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
 };
 use mempal::knowledge_anchor::{PublishAnchorRequest, publish_anchor};
+use mempal::knowledge_card_backfill::{
+    KnowledgeCardBackfillApplyOptions, KnowledgeCardBackfillApplyResult,
+    KnowledgeCardBackfillReport, apply_backfill, build_backfill_report,
+};
+use mempal::knowledge_card_lifecycle::{
+    DemoteCardOutcome, DemoteCardRequest, KnowledgeCardGateReport, PromoteCardOutcome,
+    PromoteCardRequest, demote_card, evaluate_card_gate_by_id, promote_card,
+};
+use mempal::knowledge_card_retrieval::{
+    KnowledgeCardRetrievalRequest, RetrievedKnowledgeCard, retrieve_knowledge_cards,
+};
 use mempal::knowledge_distill::{DistillPlan, DistillRequest, commit_distill, prepare_distill};
 use mempal::knowledge_gate::{
     GateReport, PromotionPolicyEntry, evaluate_gate_by_id, promotion_policy,
@@ -122,6 +134,7 @@ struct ContextCommandArgs {
     cwd: Option<PathBuf>,
     format: String,
     include_evidence: bool,
+    include_cards: bool,
     max_items: usize,
     dao_tian_limit: usize,
     trigger: Option<String>,
@@ -214,6 +227,8 @@ enum Commands {
         format: String,
         #[arg(long)]
         include_evidence: bool,
+        #[arg(long)]
+        include_cards: bool,
         #[arg(long, default_value_t = 12)]
         max_items: usize,
         #[arg(long = "dao-tian-limit", default_value_t = 1)]
@@ -301,6 +316,10 @@ enum Commands {
     KnowledgeCard {
         #[command(subcommand)]
         command: KnowledgeCardCommands,
+    },
+    Phase3 {
+        #[command(subcommand)]
+        command: Phase3Commands,
     },
     Tunnels {
         #[command(subcommand)]
@@ -691,6 +710,21 @@ enum KnowledgeCardCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    Retrieve {
+        query: String,
+        #[arg(long, default_value = "project")]
+        domain: String,
+        #[arg(long, default_value = "general")]
+        field: String,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long = "top-k", default_value_t = 5)]
+        top_k: usize,
+        #[arg(long = "evidence-top-k", default_value_t = 20)]
+        evidence_top_k: usize,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
     Link {
         card_id: String,
         evidence_drawer_id: String,
@@ -720,6 +754,149 @@ enum KnowledgeCardCommands {
     },
     Events {
         card_id: String,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    Gate {
+        card_id: String,
+        #[arg(long = "target-status")]
+        target_status: Option<String>,
+        #[arg(long)]
+        reviewer: Option<String>,
+        #[arg(long, default_value_t = false)]
+        allow_counterexamples: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    Promote {
+        card_id: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long = "verification-ref")]
+        verification_refs: Vec<String>,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        reviewer: Option<String>,
+        #[arg(long, default_value_t = false)]
+        allow_counterexamples: bool,
+        #[arg(long, default_value_t = true)]
+        enforce_gate: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    Demote {
+        card_id: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long = "evidence-ref")]
+        evidence_refs: Vec<String>,
+        #[arg(long)]
+        reason: String,
+        #[arg(long = "reason-type")]
+        reason_type: String,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    BackfillPlan {
+        #[arg(long)]
+        tier: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        field: Option<String>,
+        #[arg(long = "anchor-kind")]
+        anchor_kind: Option<String>,
+        #[arg(long = "anchor-id")]
+        anchor_id: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    BackfillApply {
+        #[arg(long)]
+        tier: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        field: Option<String>,
+        #[arg(long = "anchor-kind")]
+        anchor_kind: Option<String>,
+        #[arg(long = "anchor-id")]
+        anchor_id: Option<String>,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // clap command enums favor direct argument fields over boxing.
+enum Phase3Commands {
+    Adoption {
+        #[command(subcommand)]
+        command: Phase3AdoptionCommands,
+    },
+    Gate {
+        candidate: String,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    ResearchValidatePlan {
+        path: PathBuf,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // `record` intentionally carries the full event payload.
+enum Phase3AdoptionCommands {
+    Record {
+        #[arg(long)]
+        track: String,
+        #[arg(long)]
+        signal: String,
+        #[arg(long)]
+        feature: String,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long = "context-hash")]
+        context_hash: Option<String>,
+        #[arg(long = "card-id")]
+        card_id: Option<String>,
+        #[arg(long = "evaluator-id")]
+        evaluator_id: Option<String>,
+        #[arg(long = "research-report-id")]
+        research_report_id: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long = "metadata-json")]
+        metadata_json: Option<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    List {
+        #[arg(long)]
+        track: Option<String>,
+        #[arg(long)]
+        feature: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    Stats {
+        #[arg(long)]
+        track: Option<String>,
+        #[arg(long)]
+        feature: Option<String>,
         #[arg(long, default_value = "plain")]
         format: String,
     },
@@ -964,6 +1141,7 @@ fn run() -> Result<()> {
             cwd,
             format,
             include_evidence,
+            include_cards,
             max_items,
             dao_tian_limit,
             trigger,
@@ -977,6 +1155,7 @@ fn run() -> Result<()> {
                 cwd,
                 format,
                 include_evidence,
+                include_cards,
                 max_items,
                 dao_tian_limit,
                 trigger,
@@ -1058,7 +1237,10 @@ fn run() -> Result<()> {
         Commands::Knowledge { command } => {
             block_on_result(knowledge_command(&db, config.as_ref(), command))
         }
-        Commands::KnowledgeCard { command } => knowledge_card_command(&db, command),
+        Commands::KnowledgeCard { command } => {
+            block_on_result(knowledge_card_command(&db, config.as_ref(), command))
+        }
+        Commands::Phase3 { command } => phase3_command(&db, command),
         Commands::Tunnels { command } => tunnels_command(&db, command),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
         Commands::FieldTaxonomy { format } => field_taxonomy_command(&format),
@@ -2083,6 +2265,7 @@ async fn context_command(db: &Database, config: &Config, args: ContextCommandArg
             field: args.field,
             cwd,
             include_evidence: args.include_evidence,
+            include_cards: args.include_cards,
             max_items: args.max_items,
             dao_tian_limit: args.dao_tian_limit,
             project_id: config.project.id.clone(),
@@ -2123,6 +2306,9 @@ fn print_context_plain(pack: &ContextPack) {
             println!("- {}", item.text);
             println!("  source: {}", item.source_file);
             println!("  drawer: {}", item.drawer_id);
+            if let Some(card_id) = item.card_id.as_deref() {
+                println!("  card: {card_id}");
+            }
             println!(
                 "  anchor: {} {}",
                 anchor_kind_slug(&item.anchor_kind),
@@ -2141,6 +2327,14 @@ fn print_context_plain(pack: &ContextPack) {
                     trigger_hints.intent_tags.join(","),
                     trigger_hints.workflow_bias.join(","),
                     trigger_hints.tool_needs.join(",")
+                );
+            }
+            for citation in &item.evidence_citations {
+                println!(
+                    "  evidence: {} role={} source={}",
+                    citation.evidence_drawer_id,
+                    knowledge_evidence_role_slug(&citation.role),
+                    citation.source_file
                 );
             }
         }
@@ -2398,6 +2592,52 @@ fn parse_knowledge_event_type(v: &str) -> Result<KnowledgeEventType> {
         "updated" => Ok(KnowledgeEventType::Updated),
         "published_anchor" => Ok(KnowledgeEventType::PublishedAnchor),
         o => bail!("unsupported knowledge event type: {o}"),
+    }
+}
+
+fn runtime_adoption_track_slug(value: &RuntimeAdoptionTrack) -> &'static str {
+    match value {
+        RuntimeAdoptionTrack::RuntimeAdoption => "runtime_adoption",
+        RuntimeAdoptionTrack::CardContext => "card_context",
+        RuntimeAdoptionTrack::CardEmbedding => "card_embedding",
+        RuntimeAdoptionTrack::Evaluator => "evaluator",
+        RuntimeAdoptionTrack::ResearchAdapter => "research_adapter",
+    }
+}
+
+fn parse_runtime_adoption_track(value: &str) -> Result<RuntimeAdoptionTrack> {
+    match value {
+        "runtime_adoption" => Ok(RuntimeAdoptionTrack::RuntimeAdoption),
+        "card_context" => Ok(RuntimeAdoptionTrack::CardContext),
+        "card_embedding" => Ok(RuntimeAdoptionTrack::CardEmbedding),
+        "evaluator" => Ok(RuntimeAdoptionTrack::Evaluator),
+        "research_adapter" => Ok(RuntimeAdoptionTrack::ResearchAdapter),
+        other => bail!("unsupported runtime adoption track: {other}"),
+    }
+}
+
+fn runtime_adoption_signal_slug(value: &RuntimeAdoptionSignal) -> &'static str {
+    match value {
+        RuntimeAdoptionSignal::Used => "used",
+        RuntimeAdoptionSignal::Accepted => "accepted",
+        RuntimeAdoptionSignal::Rejected => "rejected",
+        RuntimeAdoptionSignal::Miss => "miss",
+        RuntimeAdoptionSignal::Rollback => "rollback",
+        RuntimeAdoptionSignal::Contradiction => "contradiction",
+        RuntimeAdoptionSignal::Neutral => "neutral",
+    }
+}
+
+fn parse_runtime_adoption_signal(value: &str) -> Result<RuntimeAdoptionSignal> {
+    match value {
+        "used" => Ok(RuntimeAdoptionSignal::Used),
+        "accepted" => Ok(RuntimeAdoptionSignal::Accepted),
+        "rejected" => Ok(RuntimeAdoptionSignal::Rejected),
+        "miss" => Ok(RuntimeAdoptionSignal::Miss),
+        "rollback" => Ok(RuntimeAdoptionSignal::Rollback),
+        "contradiction" => Ok(RuntimeAdoptionSignal::Contradiction),
+        "neutral" => Ok(RuntimeAdoptionSignal::Neutral),
+        other => bail!("unsupported runtime adoption signal: {other}"),
     }
 }
 
@@ -3016,7 +3256,11 @@ async fn knowledge_command(
     Ok(())
 }
 
-fn knowledge_card_command(db: &Database, command: KnowledgeCardCommands) -> Result<()> {
+async fn knowledge_card_command(
+    db: &Database,
+    config: &Config,
+    command: KnowledgeCardCommands,
+) -> Result<()> {
     match command {
         KnowledgeCardCommands::Create {
             id,
@@ -3113,6 +3357,37 @@ fn knowledge_card_command(db: &Database, command: KnowledgeCardCommands) -> Resu
                 .context("failed to list knowledge cards")?;
             print_knowledge_cards(&cards, &format)?;
         }
+        KnowledgeCardCommands::Retrieve {
+            query,
+            domain,
+            field,
+            cwd,
+            top_k,
+            evidence_top_k,
+            format,
+        } => {
+            if top_k == 0 {
+                bail!("--top-k must be greater than 0");
+            }
+            let domain = parse_domain(&domain)?;
+            let cwd = cwd.unwrap_or(env::current_dir().context("failed to read current dir")?);
+            let embedder = build_embedder(config).await?;
+            let results = retrieve_knowledge_cards(
+                db,
+                &*embedder,
+                KnowledgeCardRetrievalRequest {
+                    query,
+                    domain,
+                    field,
+                    cwd,
+                    top_k,
+                    evidence_top_k,
+                },
+            )
+            .await
+            .context("failed to retrieve knowledge cards")?;
+            print_retrieved_knowledge_cards(&results, &format)?;
+        }
         KnowledgeCardCommands::Link {
             card_id,
             evidence_drawer_id,
@@ -3201,8 +3476,513 @@ fn knowledge_card_command(db: &Database, command: KnowledgeCardCommands) -> Resu
                 .context("failed to list knowledge card events")?;
             print_knowledge_card_events(&events, &format)?;
         }
+        KnowledgeCardCommands::Gate {
+            card_id,
+            target_status,
+            reviewer,
+            allow_counterexamples,
+            format,
+        } => {
+            let report = evaluate_card_gate_by_id(
+                db,
+                &card_id,
+                target_status.as_deref(),
+                reviewer.as_deref(),
+                allow_counterexamples,
+            )
+            .context("failed to evaluate knowledge card gate")?;
+            print_knowledge_card_gate_report(&report, &format)?;
+        }
+        KnowledgeCardCommands::Promote {
+            card_id,
+            status,
+            verification_refs,
+            reason,
+            reviewer,
+            allow_counterexamples,
+            enforce_gate,
+            format,
+        } => {
+            let outcome = promote_card(
+                db,
+                PromoteCardRequest {
+                    card_id,
+                    status,
+                    verification_refs,
+                    reason,
+                    reviewer,
+                    allow_counterexamples,
+                    enforce_gate,
+                },
+            )
+            .context("failed to promote knowledge card")?;
+            print_knowledge_card_promote_outcome(&outcome, &format)?;
+        }
+        KnowledgeCardCommands::Demote {
+            card_id,
+            status,
+            evidence_refs,
+            reason,
+            reason_type,
+            format,
+        } => {
+            let outcome = demote_card(
+                db,
+                DemoteCardRequest {
+                    card_id,
+                    status,
+                    evidence_refs,
+                    reason,
+                    reason_type,
+                },
+            )
+            .context("failed to demote knowledge card")?;
+            print_knowledge_card_demote_outcome(&outcome, &format)?;
+        }
+        KnowledgeCardCommands::BackfillPlan {
+            tier,
+            status,
+            domain,
+            field,
+            anchor_kind,
+            anchor_id,
+            format,
+        } => {
+            let filter = KnowledgeCardFilter {
+                tier: tier.as_deref().map(parse_knowledge_tier).transpose()?,
+                status: status.as_deref().map(parse_knowledge_status).transpose()?,
+                domain: domain.as_deref().map(parse_domain).transpose()?,
+                field,
+                anchor_kind: anchor_kind.as_deref().map(parse_anchor_kind).transpose()?,
+                anchor_id,
+            };
+            let report = build_backfill_report(db, &filter)
+                .context("failed to build knowledge card backfill plan")?;
+            print_knowledge_card_backfill_report(&report, &format)?;
+        }
+        KnowledgeCardCommands::BackfillApply {
+            tier,
+            status,
+            domain,
+            field,
+            anchor_kind,
+            anchor_id,
+            execute,
+            format,
+        } => {
+            let filter = KnowledgeCardFilter {
+                tier: tier.as_deref().map(parse_knowledge_tier).transpose()?,
+                status: status.as_deref().map(parse_knowledge_status).transpose()?,
+                domain: domain.as_deref().map(parse_domain).transpose()?,
+                field,
+                anchor_kind: anchor_kind.as_deref().map(parse_anchor_kind).transpose()?,
+                anchor_id,
+            };
+            let result = apply_backfill(db, &filter, KnowledgeCardBackfillApplyOptions { execute })
+                .context("failed to apply knowledge card backfill")?;
+            print_knowledge_card_backfill_apply_result(&result, &format)?;
+        }
     }
     Ok(())
+}
+
+fn phase3_command(db: &Database, command: Phase3Commands) -> Result<()> {
+    match command {
+        Phase3Commands::Adoption { command } => phase3_adoption_command(db, command),
+        Phase3Commands::Gate { candidate, format } => {
+            let report = phase3_gate_report(db, &candidate)?;
+            print_phase3_gate_report(&report, &format)
+        }
+        Phase3Commands::ResearchValidatePlan { path, format } => {
+            let report = validate_research_adapter_plan(&path)?;
+            print_research_adapter_plan(&report, &format)
+        }
+    }
+}
+
+fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Result<()> {
+    match command {
+        Phase3AdoptionCommands::Record {
+            track,
+            signal,
+            feature,
+            query,
+            context_hash,
+            card_id,
+            evaluator_id,
+            research_report_id,
+            note,
+            metadata_json,
+            id,
+            format,
+        } => {
+            let track = parse_runtime_adoption_track(&track)?;
+            let signal = parse_runtime_adoption_signal(&signal)?;
+            let metadata = metadata_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .context("failed to parse --metadata-json")?;
+            let created_at = current_timestamp();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos().to_string())
+                .unwrap_or_else(|_| "0".to_string());
+            let id = id.unwrap_or_else(|| {
+                stable_cli_id(
+                    "adoption",
+                    &[
+                        runtime_adoption_track_slug(&track),
+                        runtime_adoption_signal_slug(&signal),
+                        feature.as_str(),
+                        query.as_deref().unwrap_or(""),
+                        context_hash.as_deref().unwrap_or(""),
+                        card_id.as_deref().unwrap_or(""),
+                        evaluator_id.as_deref().unwrap_or(""),
+                        research_report_id.as_deref().unwrap_or(""),
+                        created_at.as_str(),
+                        nonce.as_str(),
+                    ],
+                )
+            });
+            let event = RuntimeAdoptionEvent {
+                id: id.clone(),
+                track,
+                signal,
+                feature,
+                query,
+                context_hash,
+                card_id,
+                evaluator_id,
+                research_report_id,
+                note,
+                metadata,
+                created_at,
+            };
+            db.insert_runtime_adoption_event(&event)
+                .context("failed to insert runtime adoption event")?;
+            match format.as_str() {
+                "plain" => println!("event_id={id} created=true"),
+                "json" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&event)
+                        .context("failed to serialize adoption event")?
+                ),
+                other => bail!("unsupported phase3 adoption format: {other}"),
+            }
+            Ok(())
+        }
+        Phase3AdoptionCommands::List {
+            track,
+            feature,
+            limit,
+            format,
+        } => {
+            let events = db
+                .list_runtime_adoption_events(
+                    &RuntimeAdoptionFilter {
+                        track: track
+                            .as_deref()
+                            .map(parse_runtime_adoption_track)
+                            .transpose()?,
+                        feature,
+                    },
+                    limit,
+                )
+                .context("failed to list runtime adoption events")?;
+            print_runtime_adoption_events(&events, &format)
+        }
+        Phase3AdoptionCommands::Stats {
+            track,
+            feature,
+            format,
+        } => {
+            let events = db
+                .list_runtime_adoption_events(
+                    &RuntimeAdoptionFilter {
+                        track: track
+                            .as_deref()
+                            .map(parse_runtime_adoption_track)
+                            .transpose()?,
+                        feature,
+                    },
+                    10_000,
+                )
+                .context("failed to list runtime adoption events")?;
+            let stats = RuntimeAdoptionStats::from_events(&events);
+            print_runtime_adoption_stats(&stats, &format)
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeAdoptionStats {
+    total: usize,
+    used: usize,
+    accepted: usize,
+    rejected: usize,
+    misses: usize,
+    rollbacks: usize,
+    contradictions: usize,
+    neutral: usize,
+}
+
+impl RuntimeAdoptionStats {
+    fn from_events(events: &[RuntimeAdoptionEvent]) -> Self {
+        let mut stats = Self {
+            total: events.len(),
+            used: 0,
+            accepted: 0,
+            rejected: 0,
+            misses: 0,
+            rollbacks: 0,
+            contradictions: 0,
+            neutral: 0,
+        };
+        for event in events {
+            match event.signal {
+                RuntimeAdoptionSignal::Used => stats.used += 1,
+                RuntimeAdoptionSignal::Accepted => stats.accepted += 1,
+                RuntimeAdoptionSignal::Rejected => stats.rejected += 1,
+                RuntimeAdoptionSignal::Miss => stats.misses += 1,
+                RuntimeAdoptionSignal::Rollback => stats.rollbacks += 1,
+                RuntimeAdoptionSignal::Contradiction => stats.contradictions += 1,
+                RuntimeAdoptionSignal::Neutral => stats.neutral += 1,
+            }
+        }
+        stats
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct Phase3GateReport {
+    candidate: String,
+    ready: bool,
+    required_track: &'static str,
+    stats: RuntimeAdoptionStats,
+    reasons: Vec<String>,
+}
+
+fn phase3_gate_report(db: &Database, candidate: &str) -> Result<Phase3GateReport> {
+    let (track, ready_fn): (RuntimeAdoptionTrack, fn(&RuntimeAdoptionStats) -> bool) =
+        match candidate {
+            "card-context-default" => (RuntimeAdoptionTrack::CardContext, |stats| {
+                stats.accepted >= 3 && stats.rollbacks == 0 && stats.rejected <= stats.accepted
+            }),
+            "card-embeddings" => (RuntimeAdoptionTrack::CardEmbedding, |stats| {
+                stats.misses >= 3 && stats.rollbacks == 0
+            }),
+            "evaluator-api" => (RuntimeAdoptionTrack::Evaluator, |stats| {
+                stats.accepted >= 3 && stats.rollbacks == 0 && stats.contradictions == 0
+            }),
+            "research-adapter" => (RuntimeAdoptionTrack::ResearchAdapter, |stats| {
+                stats.accepted >= 1 && stats.contradictions == 0 && stats.rollbacks == 0
+            }),
+            other => bail!("unsupported phase3 candidate: {other}"),
+        };
+    let events = db
+        .list_runtime_adoption_events(
+            &RuntimeAdoptionFilter {
+                track: Some(track.clone()),
+                feature: None,
+            },
+            10_000,
+        )
+        .context("failed to list runtime adoption events")?;
+    let stats = RuntimeAdoptionStats::from_events(&events);
+    let ready = ready_fn(&stats);
+    let mut reasons = Vec::new();
+    if ready {
+        reasons.push("minimum evidence threshold satisfied".to_string());
+    } else {
+        reasons.push("minimum evidence threshold not satisfied".to_string());
+    }
+    if stats.rollbacks > 0 {
+        reasons.push("rollback signals block default or authority changes".to_string());
+    }
+    if stats.contradictions > 0 {
+        reasons.push("contradiction signals require review before implementation".to_string());
+    }
+    Ok(Phase3GateReport {
+        candidate: candidate.to_string(),
+        ready,
+        required_track: runtime_adoption_track_slug(&track),
+        stats,
+        reasons,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct ResearchAdapterPlanReport {
+    valid: bool,
+    report_id: String,
+    title: String,
+    source_count: usize,
+    finding_count: usize,
+    candidate_insight_count: usize,
+    errors: Vec<String>,
+}
+
+fn validate_research_adapter_plan(path: &Path) -> Result<ResearchAdapterPlanReport> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read research report {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse research report {}", path.display()))?;
+    let mut errors = Vec::new();
+    let report_id = required_string(&value, "report_id", &mut errors);
+    let title = required_string(&value, "title", &mut errors);
+    let sources = value
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    if sources == 0 {
+        errors.push("sources must contain at least one item".to_string());
+    }
+    let findings = value
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    if findings == 0 {
+        errors.push("findings must contain at least one item".to_string());
+    }
+    let candidate_insights = value
+        .get("candidate_insights")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    Ok(ResearchAdapterPlanReport {
+        valid: errors.is_empty(),
+        report_id,
+        title,
+        source_count: sources,
+        finding_count: findings,
+        candidate_insight_count: candidate_insights,
+        errors,
+    })
+}
+
+fn required_string(
+    value: &serde_json::Value,
+    field: &'static str,
+    errors: &mut Vec<String>,
+) -> String {
+    match value.get(field).and_then(serde_json::Value::as_str) {
+        Some(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
+        _ => {
+            errors.push(format!("{field} is required"));
+            String::new()
+        }
+    }
+}
+
+fn print_runtime_adoption_events(events: &[RuntimeAdoptionEvent], format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            if events.is_empty() {
+                println!("no runtime adoption events");
+                return Ok(());
+            }
+            for event in events {
+                println!(
+                    "{} track={} signal={} feature={} at={}",
+                    event.id,
+                    runtime_adoption_track_slug(&event.track),
+                    runtime_adoption_signal_slug(&event.signal),
+                    event.feature,
+                    event.created_at
+                );
+                if let Some(note) = event.note.as_deref() {
+                    println!("  note: {note}");
+                }
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(events)
+                    .context("failed to serialize runtime adoption events")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 adoption format: {other}"),
+    }
+}
+
+fn print_runtime_adoption_stats(stats: &RuntimeAdoptionStats, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("total={}", stats.total);
+            println!("used={}", stats.used);
+            println!("accepted={}", stats.accepted);
+            println!("rejected={}", stats.rejected);
+            println!("misses={}", stats.misses);
+            println!("rollbacks={}", stats.rollbacks);
+            println!("contradictions={}", stats.contradictions);
+            println!("neutral={}", stats.neutral);
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(stats)
+                    .context("failed to serialize runtime adoption stats")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 adoption format: {other}"),
+    }
+}
+
+fn print_phase3_gate_report(report: &Phase3GateReport, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("candidate={}", report.candidate);
+            println!("ready={}", report.ready);
+            println!("required_track={}", report.required_track);
+            println!("accepted={}", report.stats.accepted);
+            println!("misses={}", report.stats.misses);
+            println!("rollbacks={}", report.stats.rollbacks);
+            for reason in &report.reasons {
+                println!("reason={reason}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize phase3 gate report")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 gate format: {other}"),
+    }
+}
+
+fn print_research_adapter_plan(report: &ResearchAdapterPlanReport, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("valid={}", report.valid);
+            println!("report_id={}", report.report_id);
+            println!("title={}", report.title);
+            println!("source_count={}", report.source_count);
+            println!("finding_count={}", report.finding_count);
+            println!("candidate_insight_count={}", report.candidate_insight_count);
+            for error in &report.errors {
+                println!("error={error}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize research adapter plan")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported research adapter plan format: {other}"),
+    }
 }
 
 fn normalized_nonempty_strings(values: &[String]) -> Vec<String> {
@@ -3278,6 +4058,49 @@ fn print_knowledge_card(card: &KnowledgeCard, format: &str) -> Result<()> {
         other => bail!("unsupported knowledge-card format: {other}"),
     }
 }
+
+fn print_retrieved_knowledge_cards(results: &[RetrievedKnowledgeCard], format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            if results.is_empty() {
+                println!("no retrieved knowledge cards");
+                return Ok(());
+            }
+            for result in results {
+                let card = &result.card;
+                println!(
+                    "{} score={:.6} tier={} status={} domain={} field={}",
+                    card.id,
+                    result.score,
+                    knowledge_tier_slug(&card.tier),
+                    knowledge_status_slug(&card.status),
+                    domain_slug(&card.domain),
+                    card.field
+                );
+                println!("statement: {}", card.statement);
+                for citation in &result.evidence_citations {
+                    println!(
+                        "evidence: {} role={} source={} score={:.6}",
+                        citation.evidence_drawer_id,
+                        knowledge_evidence_role_slug(&citation.role),
+                        citation.source_file,
+                        citation.score
+                    );
+                }
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(results)
+                    .context("failed to serialize retrieved knowledge cards")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported knowledge-card retrieve format: {other}"),
+    }
+}
 fn print_knowledge_card_events(events: &[KnowledgeCardEvent], format: &str) -> Result<()> {
     match format {
         "plain" => {
@@ -3305,6 +4128,187 @@ fn print_knowledge_card_events(events: &[KnowledgeCardEvent], format: &str) -> R
             Ok(())
         }
         other => bail!("unsupported knowledge-card format: {other}"),
+    }
+}
+
+fn print_knowledge_card_gate_report(report: &KnowledgeCardGateReport, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("card_id={}", report.card_id);
+            println!("tier={}", report.tier);
+            println!("status={}", report.status);
+            println!("target_status={}", report.target_status);
+            println!("allowed={}", report.allowed);
+            println!(
+                "evidence_counts supporting={} verification={} teaching={} counterexample={}",
+                report.evidence_counts.supporting,
+                report.evidence_counts.verification,
+                report.evidence_counts.teaching,
+                report.evidence_counts.counterexample
+            );
+            println!(
+                "requirements supporting>={} verification>={} teaching>={} reviewer_required={} counterexamples_block={}",
+                report.requirements.min_supporting_refs,
+                report.requirements.min_verification_refs,
+                report.requirements.min_teaching_refs,
+                report.requirements.reviewer_required,
+                report.requirements.counterexamples_block
+            );
+            if !report.reasons.is_empty() {
+                println!("reasons={}", report.reasons.join("; "));
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize knowledge card gate report")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported knowledge-card gate format: {other}"),
+    }
+}
+
+fn print_knowledge_card_promote_outcome(outcome: &PromoteCardOutcome, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!(
+                "card_id={} old_status={} new_status={} verification_refs={}",
+                outcome.card_id,
+                outcome.old_status,
+                outcome.new_status,
+                outcome.verification_refs.join(",")
+            );
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(outcome)
+                    .context("failed to serialize knowledge card promote outcome")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported knowledge-card promote format: {other}"),
+    }
+}
+
+fn print_knowledge_card_demote_outcome(outcome: &DemoteCardOutcome, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!(
+                "card_id={} old_status={} new_status={} counterexample_refs={}",
+                outcome.card_id,
+                outcome.old_status,
+                outcome.new_status,
+                outcome.counterexample_refs.join(",")
+            );
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(outcome)
+                    .context("failed to serialize knowledge card demote outcome")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported knowledge-card demote format: {other}"),
+    }
+}
+
+fn print_knowledge_card_backfill_report(
+    report: &KnowledgeCardBackfillReport,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "plain" => {
+            println!(
+                "ready={} skipped={} already_exists={}",
+                report.ready_count, report.skipped_count, report.already_exists_count
+            );
+            if report.candidates.is_empty() {
+                println!("no knowledge drawers");
+                return Ok(());
+            }
+            for candidate in &report.candidates {
+                println!(
+                    "{} -> {} status={:?}",
+                    candidate.source_drawer_id, candidate.prospective_card_id, candidate.status
+                );
+                if !candidate.reasons.is_empty() {
+                    println!("  reasons: {}", candidate.reasons.join("; "));
+                }
+                if let Some(statement) = candidate.statement.as_deref() {
+                    println!("  statement: {statement}");
+                }
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize knowledge card backfill report")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported knowledge-card backfill-plan format: {other}"),
+    }
+}
+
+fn print_knowledge_card_backfill_apply_result(
+    result: &KnowledgeCardBackfillApplyResult,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "plain" => {
+            println!(
+                "dry_run={} ready={} skipped={} already_exists={} created_count={} linked_count={} event_count={} link_errors={}",
+                result.dry_run,
+                result.ready_count,
+                result.skipped_count,
+                result.already_exists_count,
+                result.created_count,
+                result.linked_count,
+                result.event_count,
+                result.link_errors.len()
+            );
+            if result.candidates.is_empty() {
+                println!("no knowledge drawers");
+            } else {
+                for candidate in &result.candidates {
+                    println!(
+                        "{} -> {} status={:?}",
+                        candidate.source_drawer_id, candidate.prospective_card_id, candidate.status
+                    );
+                    if !candidate.reasons.is_empty() {
+                        println!("  reasons: {}", candidate.reasons.join("; "));
+                    }
+                    if let Some(statement) = candidate.statement.as_deref() {
+                        println!("  statement: {statement}");
+                    }
+                }
+            }
+            for error in &result.link_errors {
+                println!(
+                    "link_error card_id={} evidence_drawer_id={} role={} error={}",
+                    error.card_id, error.evidence_drawer_id, error.role, error.error
+                );
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(result)
+                    .context("failed to serialize knowledge card backfill apply result")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported knowledge-card backfill-apply format: {other}"),
     }
 }
 fn print_gate_report(report: &GateReport) {
