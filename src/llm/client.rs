@@ -173,9 +173,7 @@ impl LlmClient {
                 messages: &request.messages,
                 temperature: request.temperature,
                 max_tokens: request.max_tokens,
-                chat_template_kwargs: Some(ChatTemplateKwargs {
-                    enable_thinking: false,
-                }),
+                chat_template_kwargs: None,
             })
             .send()
             .await

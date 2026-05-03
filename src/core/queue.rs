@@ -124,6 +124,7 @@ impl PendingMessageStore {
                 SELECT id, kind, payload, retry_count, source_hash
                 FROM pending_messages
                 WHERE status = 'pending' AND next_attempt_at <= ?1
+                  AND kind != 'llm_task'
                 ORDER BY next_attempt_at ASC, created_at ASC, id ASC
                 LIMIT 1
                 "#,
