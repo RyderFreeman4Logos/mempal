@@ -77,32 +77,40 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .context("failed to reclaim stale daemon claims")?;
     tracing::info!("daemon startup reclaim_stale reclaimed={reclaimed}");
 
-    let llm_worker_handle = if context.config.llm.enabled {
+    let llm_worker_handles: Vec<tokio::task::JoinHandle<_>> = if context.config.llm.enabled {
         match crate::llm::LlmClient::from_config(&context.config.llm) {
             Ok(llm_client) => {
+                let num_workers = context.config.llm.max_concurrent.max(1);
                 let llm_status = std::sync::Arc::new(crate::llm::LlmStatus::new(10));
                 let llm_store = std::sync::Arc::new(context.store.clone());
                 let llm_client = std::sync::Arc::new(llm_client);
                 let db_path = context.db.path().to_path_buf();
-                tracing::info!("spawning LLM worker task");
-                Some(tokio::spawn(async move {
-                    if let Err(e) = crate::llm::worker::run_llm_worker(
-                        llm_store, llm_client, llm_status, db_path,
-                    )
-                    .await
-                    {
-                        tracing::error!("LLM worker fatal error: {e:#}");
-                    }
-                    Ok::<(), anyhow::Error>(())
-                }))
+                tracing::info!("spawning {num_workers} LLM worker tasks");
+                (0..num_workers)
+                    .map(|i| {
+                        let store = llm_store.clone();
+                        let client = llm_client.clone();
+                        let status = llm_status.clone();
+                        let path = db_path.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::llm::worker::run_llm_worker(store, client, status, path)
+                                    .await
+                            {
+                                tracing::error!("LLM worker {i} fatal error: {e:#}");
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        })
+                    })
+                    .collect()
             }
             Err(error) => {
                 tracing::warn!("LLM client init failed, skipping LLM worker: {error}");
-                None
+                vec![]
             }
         }
     } else {
-        None
+        vec![]
     };
 
     loop {
@@ -155,11 +163,11 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         }
     }
 
-    if let Some(handle) = llm_worker_handle {
+    for handle in llm_worker_handles {
         handle.abort();
         let _ = handle.await;
-        tracing::info!("LLM worker stopped");
     }
+    tracing::info!("LLM workers stopped");
 
     Ok(())
 }

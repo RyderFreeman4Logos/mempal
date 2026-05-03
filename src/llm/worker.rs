@@ -35,14 +35,19 @@ pub async fn run_llm_worker(
     status: Arc<LlmStatus>,
     db_path: std::path::PathBuf,
 ) -> Result<()> {
-    let worker_id = format!("llm-worker-{}", std::process::id());
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WORKER_INDEX: AtomicUsize = AtomicUsize::new(0);
+    let idx = WORKER_INDEX.fetch_add(1, Ordering::SeqCst);
+    let worker_id = format!("llm-worker-{}-{idx}", std::process::id());
     tracing::info!("LLM worker started: {worker_id}");
 
-    let reclaimed = store
-        .reclaim_stale(LLM_CLAIM_TTL_SECS)
-        .context("LLM worker failed to reclaim stale claims")?;
-    if reclaimed > 0 {
-        tracing::info!("LLM worker reclaimed {reclaimed} stale tasks");
+    if idx == 0 {
+        let reclaimed = store
+            .reclaim_stale(LLM_CLAIM_TTL_SECS)
+            .context("LLM worker failed to reclaim stale claims")?;
+        if reclaimed > 0 {
+            tracing::info!("LLM worker reclaimed {reclaimed} stale tasks");
+        }
     }
 
     loop {
@@ -166,7 +171,7 @@ async fn process_gating_task(
         ],
         model: None,
         temperature: Some(0.0),
-        max_tokens: Some(256),
+        max_tokens: Some(1024),
     };
 
     let retry_interval = config.llm.retry_interval_secs;
