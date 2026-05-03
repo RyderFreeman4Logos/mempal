@@ -409,15 +409,14 @@ impl Database {
         verdict: &str,
         score: Option<f64>,
     ) -> Result<(), DbError> {
-        // Update the existing llm_pending row written during ingest (identified by drawer_id +
-        // llm_pending label). The row already has a valid explain_json; we only patch the two
-        // LLM-specific columns. Using an UPDATE avoids fighting the NOT NULL constraint on
-        // explain_json that a fresh INSERT would trigger.
+        // Patch the LLM verdict columns on the existing gating_audit row for this drawer.
+        // The row may carry label='llm_pending' (MCP path) or the original Tier 2 label
+        // (daemon path), so we match only on drawer_id.
         self.conn.execute(
             r#"
             UPDATE gating_audit
             SET llm_verdict = ?1, llm_score = ?2
-            WHERE drawer_id = ?3 AND label = 'llm_pending'
+            WHERE drawer_id = ?3
             "#,
             params![verdict, score, drawer_id],
         )?;
