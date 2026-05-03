@@ -47,10 +47,10 @@ You have persistent project memory via mempal. Follow these rules in every sessi
 3b. USE MIND-MODEL CONTEXT FOR GUIDANCE
    When you need ordered operating guidance rather than raw evidence search,
    call mempal_context. It assembles typed knowledge in the intended runtime
-   order: dao_tian -> dao_ren -> shu -> qi, with evidence opt-in. Use this
-   before choosing a workflow or skill when the user asks "how should we
-   approach this?" or when a task benefits from high-level principles plus
-   concrete tool bindings.
+   order: dao_tian -> dao_ren -> shu -> qi, with evidence and Phase-2 card
+   context opt-in. Use this before choosing a workflow or skill when the user
+   asks "how should we approach this?" or when a task benefits from high-level
+   principles plus concrete tool bindings.
    dao_tian is intentionally sparse in runtime context: by default at most one
    dao_tian item is injected. Set dao_tian_limit=0 when universal principles
    are not needed, or raise it only when explicitly reasoning about
@@ -224,15 +224,24 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    updates only anchor metadata and audit history; it does not rewrite content,
    re-embed vectors, or change knowledge tier/status.
 
+16. INSPECT AND GOVERN PHASE-2 KNOWLEDGE CARDS
+   Use mempal_knowledge_cards to inspect Phase-2 knowledge card records and
+   append-only event history. It also supports linked-evidence retrieval of
+   active cards and governed card lifecycle actions: gate is read-only, promote
+   requires verification evidence and a passing gate, and demote requires
+   counterexample evidence. It does not create cards, replace mempal_search,
+   assemble default context, or backfill drawers.
+
 TOOLS:
   mempal_status        — current state + this protocol + AAAK format spec
   mempal_timeline      — project-scoped overview without a query, ordered by importance+recency
   mempal_search        — semantic search with wing/room filters, citation-bearing
-  mempal_context       — ordered mind-model runtime context (dao_tian -> dao_ren -> shu -> qi)
+  mempal_context       — ordered mind-model runtime context (dao_tian -> dao_ren -> shu -> qi; evidence/cards opt-in)
   mempal_field_taxonomy — read-only recommended mind-model field values
   mempal_knowledge_distill — create candidate knowledge from evidence refs
   mempal_knowledge_policy — read-only Stage-1 promotion policy thresholds
   mempal_knowledge_gate — read-only knowledge promotion readiness check
+  mempal_knowledge_cards — Phase-2 knowledge card list/get/retrieve/events/gate/promote/demote
   mempal_knowledge_promote — gate-enforced knowledge lifecycle promotion
   mempal_knowledge_demote — evidence-backed knowledge demotion or retirement
   mempal_knowledge_publish_anchor — metadata-only outward anchor publication
@@ -519,10 +528,10 @@ mod tests {
     }
 
     #[test]
-    fn protocol_update_does_not_change_schema_version() {
+    fn protocol_schema_version_matches_phase3_runtime_events() {
         let tempdir = tempfile::tempdir().expect("create temp dir");
         let db_path = tempdir.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
-        assert_eq!(db.schema_version().expect("schema version"), 8);
+        assert_eq!(db.schema_version().expect("schema version"), 9);
     }
 }

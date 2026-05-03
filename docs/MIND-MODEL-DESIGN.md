@@ -1,8 +1,29 @@
 # MIND MODEL DESIGN
 
 **Date**: 2026-04-21
-**Status**: Draft - discussion capture for review
+**Status**: P42 baseline implemented - future work remains explicit
 **Scope**: Capture the mind-model decisions discussed in this conversation and map them to a practical system design.
+
+## Implementation Checkpoint
+
+P42 baseline means the core mind-model architecture is implemented enough to
+operate as a governed memory system:
+
+- Stage 1 typed drawers separate raw evidence from governed knowledge.
+- `dao_tian -> dao_ren -> shu -> qi` runtime context assembly exists through
+  `mempal context` and `mempal_context`.
+- Stage 1 knowledge supports distill, gate, promote, demote, and outward anchor
+  publication through CLI and MCP surfaces.
+- Phase-2 `knowledge_cards`, `knowledge_evidence_links`, and
+  `knowledge_events` exist in the same SQLite `palace.db`.
+- Stage-1 knowledge drawers can be backfilled into Phase-2 cards through an
+  explicit dry-run-first apply command.
+- Phase-2 cards now have governed gate, promote, and demote lifecycle surfaces
+  in CLI and MCP.
+
+P42 baseline is not a claim that every future runtime integration is complete.
+It marks the point where the design is no longer only a discussion capture: the
+main storage, governance, and lifecycle surfaces exist and are test-backed.
 
 ## One-Sentence Thesis
 
@@ -470,6 +491,19 @@ Therefore:
 - `research-rs` organizes the external world
 - memory governs what is promoted from those results
 
+P49 defines the research-rs ingestion path:
+
+- raw/source research output enters as `memory_kind=evidence` with `provenance=research`
+- structured summaries from research remain evidence unless explicitly distilled
+- candidate knowledge only through distill from existing evidence refs
+- contradiction signals become evidence or counterexamples for later demotion or
+  gate evaluation
+
+research must not directly create dao_tian. Research must not directly create
+canonical or promoted knowledge. It must not bypass lifecycle gates. The highest
+trust level research can supply by itself is source-backed evidence; memory owns
+distillation, promotion, demotion, and canonicalization.
+
 ## Runtime Wake-Up Order
 
 The runtime order should be explicit, not left to ad hoc semantic retrieval.
@@ -933,6 +967,153 @@ Rationale:
 - using a second database or service would add operational complexity before the
   Phase-2 model has proven it needs independent scaling
 
+Implemented Phase-2 surface at P42 baseline:
+
+- `knowledge_cards`, `knowledge_evidence_links`, and `knowledge_events` are
+  schema v8 tables in `palace.db`
+- Rust core APIs can create/read/update/list cards, link evidence, and append
+  events
+- `mempal knowledge-card` exposes create/get/list/link/event/events
+- `mempal_knowledge_cards` exposes list/get/events to MCP-connected agents
+- `mempal knowledge-card backfill-plan` reports Stage-1 knowledge drawers that
+  are ready to become cards without writing
+- `mempal knowledge-card backfill-apply` defaults to dry-run and only writes
+  cards, links, and created events with `--execute`
+- `mempal knowledge-card gate` evaluates card readiness from role-separated
+  evidence links
+- `mempal knowledge-card promote` and `mempal knowledge-card demote` mutate
+  card status transactionally with role-specific evidence links and append-only
+  events
+- `mempal_knowledge_cards` also exposes `gate`, `promote`, and `demote` actions
+  over the same core lifecycle logic
+
+Phase-2 cards are governed objects, but they are not yet the default
+context/search source. At P42, `mempal context`, `mempal_context`, and
+`mempal_search` remains drawer/citation based. Cards now have an explicit
+linked-evidence retrieval path, but they are still not returned by default
+search.
+
+### Phase-2 Card Retrieval Contract
+
+P43 defines the contract for future card-aware runtime consumption without
+implementing retrieval behavior yet.
+
+A card retrieval item is a governed knowledge result, not a raw drawer result.
+The minimum returned card fields are: `card_id`, `statement`, `content`, `tier`,
+`status`, `domain`, `field`, `anchor_kind`, and `anchor_id`.
+
+Each card retrieval item must expose role-separated evidence citations derived
+from `knowledge_evidence_links`. The minimum evidence citation fields are:
+`evidence_drawer_id`, `role`, and `source_file`.
+
+Default runtime eligibility is status-gated:
+
+- `promoted` and `canonical` cards are runtime-eligible by default
+- `candidate`, `demoted`, and `retired` cards are excluded by default
+
+This preserves the governance boundary:
+
+- card records carry distilled belief
+- linked evidence drawers remain the citation root
+- inactive card states remain inspectable but are not injected into ordinary
+  runtime context
+
+P43 does not change `mempal context` or `mempal_context` behavior.
+P43 does not change `mempal_search` behavior.
+Card embeddings, ranking strategy, and card-aware context/search surfaces are
+deferred to later specs.
+
+P44 adds the first explicit card-aware context surface:
+
+- `mempal context --include-cards`
+- `mempal_context` with `include_cards=true`
+
+This remains opt-in. Default context assembly is still drawer-only. When enabled,
+active Phase-2 cards are appended inside the existing
+`dao_tian -> dao_ren -> shu -> qi` sections and expose `card_id` plus
+role-separated `evidence_citations`. Each citation keeps the evidence drawer as
+the citation root through `evidence_drawer_id`, `role`, and `source_file`.
+
+P44 does not change `mempal_search`, does not add card embeddings, and does not
+make cards the default runtime source.
+
+P45 chooses the first card retrieval strategy:
+
+- `mempal knowledge-card retrieve <query>`
+- `mempal_knowledge_cards` with `action="retrieve"`
+
+The strategy is linked-evidence-first. It searches evidence drawers through the
+existing BM25+vector drawer search path, follows `knowledge_evidence_links`, and
+returns active cards linked to matched evidence. Returned card items include the
+card record, a score derived from matched evidence, and role-separated evidence
+citations with `evidence_drawer_id`, `role`, `source_file`, and score.
+
+P45 intentionally does not add card embeddings, does not add card vector
+storage, and does not make `mempal_search` return cards.
+
+P46 keeps card-aware context opt-in. The default context remains drawer-only for
+both `mempal context` and `mempal_context`; operators must still pass
+`--include-cards` or `include_cards=true` to inject Phase-2 cards into the
+typed context pack.
+
+This is a deliberate default policy, not an unfinished implementation gap.
+Cards are now retrievable and context-injectable, but default runtime context is
+a high-trust path. It should not silently switch from drawer-backed active
+knowledge to mixed drawer/card guidance until real runtime evidence shows the
+change improves agent behavior without weakening citations.
+
+Evidence required before default enablement:
+
+- repeated runtime traces where card-aware context causes better skill/tool
+  selection than drawer-only context
+- no observed citation loss: every default card item must preserve linked
+  evidence citations as the citation root
+- no material context bloat: card items must not crowd out higher-priority
+  `dao_tian`, `dao_ren`, `shu`, or `qi` guidance
+- no lifecycle confusion: inactive cards must remain excluded and demoted cards
+  must not re-enter default context through linked evidence
+- explicit rollback criteria: a future default-on spec must define how to return
+  to drawer-only defaults if card injection degrades runtime behavior
+
+P47 keeps card-level embeddings deferred. P45 linked-evidence retrieval remains
+the only implemented card retrieval strategy: cards are found through matched
+evidence drawers, not through a separate card vector index.
+
+This keeps the citation model simple. Card statements are distilled beliefs;
+evidence drawers remain the source-backed material. A card embedding index would
+make card statements directly retrievable, which may improve recall, but it also
+adds a new stale-vector surface and can make unsupported belief text feel like a
+primary source unless every result still carries linked evidence citations.
+
+Evidence required before card embeddings:
+
+- statement-match misses: repeated retrieval traces where linked-evidence search
+  misses useful active cards because evidence wording does not match the query
+  but the card statement does
+- citation preservation: card-embedding results must still return linked
+  evidence citations as the citation root
+- measurable recall improvement over P45 linked-evidence retrieval without
+  unacceptable precision loss
+- schema and maintenance plan for card vector storage, reindexing, and
+  stale-vector handling
+- rollback behavior that can disable card-vector retrieval and fall back to P45
+  linked-evidence retrieval without data loss
+
+P48 keeps `knowledge_events` as the authoritative Phase-2 card audit trail, with
+no default JSONL dual-write for card lifecycle mutations. This keeps card
+promote/demote/backfill behavior transactionally bound to the same SQLite
+database that owns `knowledge_cards` and `knowledge_evidence_links`.
+
+Stage-1 drawer lifecycle continues to use `audit.jsonl` where already defined.
+Phase-2 card lifecycle does not mirror those entries into `audit.jsonl` by
+default because that would create two audit surfaces with different durability
+and transaction semantics. The append-only `knowledge_events` table is the
+source of truth for card lifecycle history.
+
+If an external integration needs JSONL card history, it should be added as an
+explicit export surface. JSONL export must be derived from `knowledge_events`,
+must be reproducible, and must not become a second source of truth.
+
 ## Decision on Bootstrap vs Final Architecture
 
 Current recommendation:
@@ -990,6 +1171,132 @@ Proceed with the following assumptions unless future evidence rejects them:
   `qi`; wake-up remains a refresh surface, not the typed assembler
 - the implementation should begin with drawer bootstrap and evolve into a
   dedicated knowledge model inside the same SQLite `palace.db`
+
+## Future Work After P42
+
+P42 originally left one explicit follow-up:
+
+- add evaluator-assisted promotion only behind deterministic gates and human
+  review rules for high-level knowledge
+
+P50 closes that item as policy. P50 defines evaluator-assisted promotion as advisory-only.
+Evaluators are not lifecycle actors.
+
+Evaluators may:
+
+- recommend promotion or demotion candidates
+- propose supporting, verification, teaching, and counterexample evidence refs
+- produce contradiction candidates and risk notes
+- explain why a knowledge item appears ready or unsafe
+
+Evaluators must not directly mutate status or otherwise act as lifecycle writers:
+
+- append lifecycle refs as authoritative gate input
+- bypass deterministic promotion or demotion gates
+- satisfy reviewer requirements by evaluator-only review
+- create automatic promotion or demotion paths
+
+The deterministic gates remain authoritative. Promotion and demotion still go
+through the existing gate-enforced CLI/MCP lifecycle surfaces. `dao_tian`
+canonicalization still requires a human reviewer; evaluator-only canonization is forbidden.
+If a future implementation adds evaluator APIs, that work must be a separate
+spec and preserve deterministic replay, evidence citation, and audit semantics.
+
+No open Future Work remains in the P42 list.
+
+## Completion Status After P50
+
+P51 closure audit: the MIND-MODEL baseline is complete.
+
+No open implementation tasks remain in the P12-P50 baseline. The completed
+baseline includes:
+
+- typed evidence and knowledge drawers
+- `dao_tian`, `dao_ren`, `shu`, and `qi` governance boundaries
+- worktree/repo/global anchor behavior
+- wake-up/context separation
+- context-guided skill/tool selection
+- distill, gate, promote, demote, and anchor publication lifecycle surfaces
+- Phase-2 knowledge card storage, lifecycle, retrieval, and opt-in context
+- research ingestion and evaluator promotion policies
+
+Completion does not mean every optional future enhancement is implemented. It
+means the current design baseline has no known open implementation task. Future
+evaluator APIs, card-level embeddings, default card context, research adapters,
+or other expansions must start as new-stage specs with their own evidence,
+rollback criteria, and acceptance checks.
+
+## Phase 3 Intake Roadmap
+
+P52 Phase-3 intake roadmap defines how work starts after baseline closure.
+Phase 3 is new-stage work, not unfinished P12-P50 baseline work.
+
+Candidate tracks:
+
+- evaluator APIs
+- card retrieval maturity
+- research adapter ingestion
+- runtime adoption evidence
+
+Intake rules:
+
+- each candidate must state evidence, rollback criteria, and acceptance checks before implementation begins
+- default-enabling card context or card embeddings requires measured retrieval benefit
+- Evaluator APIs must preserve the P50 advisory-only lifecycle boundary
+- Research adapters must preserve the P49 evidence-first ingestion boundary
+- card retrieval changes must preserve citation and audit semantics
+- runtime adoption work must include rollback criteria for agent behavior changes
+
+The first Phase-3 implementation should be selected only after one candidate has
+enough evidence to justify implementation. Until then, Phase 3 remains an intake
+queue, not an implementation commitment.
+
+## Phase 3 Candidate Evidence Audit
+
+P53 Phase-3 candidate evidence audit records current readiness. No Phase-3 candidate is ready for direct implementation yet.
+
+Candidate readiness:
+
+- Runtime adoption evidence: recommended first measurement track. It should collect concrete agent-behavior evidence before default policy changes.
+- Card retrieval maturity: partial evidence from P43-P45, but it still needs measured retrieval misses and context impact before default context changes or card embeddings.
+- Evaluator APIs: blocked on advisory output contracts and lifecycle replay requirements.
+- Research adapter ingestion: blocked on an explicit external report/input contract.
+
+Recommended first Phase-3 track: runtime adoption evidence. Runtime adoption evidence is the common measurement substrate for deciding whether card-aware context should become default, whether card embeddings are justified, and what evaluator advice is actually useful to agents.
+
+This keeps Phase 3 evidence-first: implement measurement before implementing
+new authority, new retrieval defaults, or new external ingestion adapters.
+
+## Phase 3 Runtime Surfaces
+
+P54 runtime adoption evidence adds schema v9 table `runtime_adoption_events`.
+Events capture explicit agent/runtime signals with `track`, `signal`, `feature`,
+optional query/context/card/evaluator/research references, note, metadata, and
+timestamp.
+
+P55 runtime adoption CLI exposes this evidence substrate:
+
+- `mempal phase3 adoption record`
+- `mempal phase3 adoption list`
+- `mempal phase3 adoption stats`
+
+P56 implements `mempal phase3 gate card-context-default`. Card context default gate remains read-only; `include_cards` remains opt-in. The gate requires
+accepted `card_context` adoption evidence and zero rollback signals before a
+future default-on spec can even be considered.
+
+P57 implements `mempal phase3 gate card-embeddings`. The gate remains read-only
+and adds no card vector schema. Card embeddings require repeated measured
+`card_embedding` miss signals, and linked evidence remains the citation root.
+
+P58 implements `mempal phase3 gate evaluator-api`. Evaluator API gate remains advisory-only and preserves the P50 advisory-only lifecycle boundary: evaluator
+signals cannot mutate status, satisfy reviewer requirements, or bypass
+deterministic gates.
+
+P59 implements `mempal phase3 research-validate-plan`. The command validates an
+external JSON report/input contract with `report_id`, `title`, `sources`,
+`findings`, and optional `candidate_insights`. It only validates and plans;
+research adapter ingestion still preserves the P49 evidence-first boundary and
+does not create promoted/canonical knowledge.
 
 ## Closing Summary
 

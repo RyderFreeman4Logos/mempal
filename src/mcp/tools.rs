@@ -1,12 +1,17 @@
 use crate::context::{ContextItem, ContextPack, ContextSection, TieredAssembly};
 use crate::core::types::{
-    AnchorKind, ChunkNeighbors, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
-    NeighborChunk, RouteDecision, SearchResult, TaxonomyEntry, TunnelEndpoint,
+    AnchorKind, ChunkNeighbors, KnowledgeCard, KnowledgeCardEvent, KnowledgeStatus, KnowledgeTier,
+    MemoryDomain, MemoryKind, NeighborChunk, RouteDecision, SearchResult, TaxonomyEntry,
+    TunnelEndpoint,
 };
 use crate::field_taxonomy::FieldTaxonomyEntry;
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 use crate::knowledge_anchor::PublishAnchorOutcome;
+use crate::knowledge_card_lifecycle::{
+    DemoteCardOutcome, KnowledgeCardGateReport, PromoteCardOutcome,
+};
+use crate::knowledge_card_retrieval::{RetrievedEvidenceCitation, RetrievedKnowledgeCard};
 use crate::knowledge_distill::DistillOutcome;
 use crate::knowledge_gate::{GateReport, PromotionPolicyEntry};
 use crate::knowledge_lifecycle::{DemoteOutcome, PromoteOutcome};
@@ -90,6 +95,7 @@ pub struct ContextRequest {
     pub domain: Option<String>,
     pub cwd: Option<String>,
     pub include_evidence: Option<bool>,
+    pub include_cards: Option<bool>,
     pub max_items: Option<usize>,
     /// Maximum number of `dao_tian` items to include. Defaults to 1; 0 disables
     /// the `dao_tian` section while preserving lower-tier context.
@@ -429,6 +435,119 @@ pub struct KnowledgePolicyEntryDto {
     pub requirements: KnowledgeGateRequirementsDto,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct KnowledgeCardsRequest {
+    pub action: String,
+    pub query: Option<String>,
+    pub card_id: Option<String>,
+    pub target_status: Option<String>,
+    pub reviewer: Option<String>,
+    pub allow_counterexamples: Option<bool>,
+    pub verification_refs: Option<Vec<String>>,
+    pub evidence_refs: Option<Vec<String>>,
+    pub reason: Option<String>,
+    pub reason_type: Option<String>,
+    pub enforce_gate: Option<bool>,
+    pub tier: Option<String>,
+    pub status: Option<String>,
+    pub domain: Option<String>,
+    pub field: Option<String>,
+    pub anchor_kind: Option<String>,
+    pub anchor_id: Option<String>,
+    pub cwd: Option<String>,
+    pub top_k: Option<usize>,
+    pub evidence_top_k: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct KnowledgeCardsResponse {
+    pub cards: Vec<KnowledgeCardDto>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub retrieved: Vec<RetrievedKnowledgeCardDto>,
+    pub events: Vec<KnowledgeCardEventDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<KnowledgeCardGateDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promote: Option<KnowledgeCardPromoteDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demote: Option<KnowledgeCardDemoteDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct KnowledgeCardDto {
+    pub id: String,
+    pub statement: String,
+    pub content: String,
+    pub tier: String,
+    pub status: String,
+    pub domain: String,
+    pub field: String,
+    pub anchor_kind: String,
+    pub anchor_id: String,
+    pub parent_anchor_id: Option<String>,
+    pub scope_constraints: Option<String>,
+    pub trigger_hints: Option<TriggerHintsDto>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RetrievedKnowledgeCardDto {
+    pub card: KnowledgeCardDto,
+    pub evidence_citations: Vec<RetrievedEvidenceCitationDto>,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RetrievedEvidenceCitationDto {
+    pub evidence_drawer_id: String,
+    pub role: String,
+    pub source_file: String,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct KnowledgeCardEventDto {
+    pub id: String,
+    pub card_id: String,
+    pub event_type: String,
+    pub from_status: Option<String>,
+    pub to_status: Option<String>,
+    pub reason: String,
+    pub actor: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct KnowledgeCardGateDto {
+    pub card_id: String,
+    pub tier: String,
+    pub status: String,
+    pub target_status: String,
+    pub allowed: bool,
+    pub reasons: Vec<String>,
+    pub requirements: KnowledgeGateRequirementsDto,
+    pub evidence_counts: KnowledgeGateEvidenceCountsDto,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct KnowledgeCardPromoteDto {
+    pub card_id: String,
+    pub old_status: String,
+    pub new_status: String,
+    pub verification_refs: Vec<String>,
+    pub gate: Option<KnowledgeCardGateDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct KnowledgeCardDemoteDto {
+    pub card_id: String,
+    pub old_status: String,
+    pub new_status: String,
+    pub counterexample_refs: Vec<String>,
+}
+
 impl From<Vec<PromotionPolicyEntry>> for KnowledgePolicyResponse {
     fn from(entries: Vec<PromotionPolicyEntry>) -> Self {
         Self {
@@ -494,6 +613,8 @@ pub struct ContextItemDto {
     pub source_file: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -503,6 +624,15 @@ pub struct ContextItemDto {
     pub parent_anchor_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_hints: Option<TriggerHintsDto>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub evidence_citations: Vec<ContextEvidenceCitationDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ContextEvidenceCitationDto {
+    pub evidence_drawer_id: String,
+    pub role: String,
+    pub source_file: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1360,6 +1490,7 @@ impl From<ContextItem> for ContextItemDto {
             drawer_id: value.drawer_id,
             source_file: value.source_file,
             text: value.text,
+            card_id: value.card_id,
             tier: value
                 .tier
                 .as_ref()
@@ -1374,6 +1505,15 @@ impl From<ContextItem> for ContextItemDto {
             anchor_id: value.anchor_id,
             parent_anchor_id: value.parent_anchor_id,
             trigger_hints: value.trigger_hints.map(TriggerHintsDto::from),
+            evidence_citations: value
+                .evidence_citations
+                .into_iter()
+                .map(|citation| ContextEvidenceCitationDto {
+                    evidence_drawer_id: citation.evidence_drawer_id,
+                    role: knowledge_evidence_role_slug(&citation.role).to_string(),
+                    source_file: citation.source_file,
+                })
+                .collect(),
         }
     }
 }
@@ -1384,6 +1524,125 @@ impl From<crate::core::types::TriggerHints> for TriggerHintsDto {
             intent_tags: value.intent_tags,
             workflow_bias: value.workflow_bias,
             tool_needs: value.tool_needs,
+        }
+    }
+}
+
+impl From<KnowledgeCard> for KnowledgeCardDto {
+    fn from(value: KnowledgeCard) -> Self {
+        Self {
+            id: value.id,
+            statement: value.statement,
+            content: value.content,
+            tier: knowledge_tier_slug(&value.tier).to_string(),
+            status: knowledge_status_slug(&value.status).to_string(),
+            domain: domain_slug(&value.domain).to_string(),
+            field: value.field,
+            anchor_kind: anchor_kind_slug(&value.anchor_kind).to_string(),
+            anchor_id: value.anchor_id,
+            parent_anchor_id: value.parent_anchor_id,
+            scope_constraints: value.scope_constraints,
+            trigger_hints: value.trigger_hints.map(TriggerHintsDto::from),
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+impl From<RetrievedKnowledgeCard> for RetrievedKnowledgeCardDto {
+    fn from(value: RetrievedKnowledgeCard) -> Self {
+        Self {
+            card: KnowledgeCardDto::from(value.card),
+            evidence_citations: value
+                .evidence_citations
+                .into_iter()
+                .map(RetrievedEvidenceCitationDto::from)
+                .collect(),
+            score: value.score,
+        }
+    }
+}
+
+impl From<RetrievedEvidenceCitation> for RetrievedEvidenceCitationDto {
+    fn from(value: RetrievedEvidenceCitation) -> Self {
+        Self {
+            evidence_drawer_id: value.evidence_drawer_id,
+            role: knowledge_evidence_role_slug(&value.role).to_string(),
+            source_file: value.source_file,
+            score: value.score,
+        }
+    }
+}
+
+impl From<KnowledgeCardEvent> for KnowledgeCardEventDto {
+    fn from(value: KnowledgeCardEvent) -> Self {
+        Self {
+            id: value.id,
+            card_id: value.card_id,
+            event_type: knowledge_event_type_slug(&value.event_type).to_string(),
+            from_status: value
+                .from_status
+                .as_ref()
+                .map(knowledge_status_slug)
+                .map(str::to_string),
+            to_status: value
+                .to_status
+                .as_ref()
+                .map(knowledge_status_slug)
+                .map(str::to_string),
+            reason: value.reason,
+            actor: value.actor,
+            metadata: value.metadata,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<KnowledgeCardGateReport> for KnowledgeCardGateDto {
+    fn from(value: KnowledgeCardGateReport) -> Self {
+        Self {
+            card_id: value.card_id,
+            tier: value.tier,
+            status: value.status,
+            target_status: value.target_status,
+            allowed: value.allowed,
+            reasons: value.reasons,
+            requirements: KnowledgeGateRequirementsDto {
+                min_supporting_refs: value.requirements.min_supporting_refs,
+                min_verification_refs: value.requirements.min_verification_refs,
+                min_teaching_refs: value.requirements.min_teaching_refs,
+                reviewer_required: value.requirements.reviewer_required,
+                counterexamples_block: value.requirements.counterexamples_block,
+            },
+            evidence_counts: KnowledgeGateEvidenceCountsDto {
+                supporting: value.evidence_counts.supporting,
+                counterexample: value.evidence_counts.counterexample,
+                teaching: value.evidence_counts.teaching,
+                verification: value.evidence_counts.verification,
+            },
+        }
+    }
+}
+
+impl From<PromoteCardOutcome> for KnowledgeCardPromoteDto {
+    fn from(value: PromoteCardOutcome) -> Self {
+        Self {
+            card_id: value.card_id,
+            old_status: value.old_status,
+            new_status: value.new_status,
+            verification_refs: value.verification_refs,
+            gate: value.gate.map(KnowledgeCardGateDto::from),
+        }
+    }
+}
+
+impl From<DemoteCardOutcome> for KnowledgeCardDemoteDto {
+    fn from(value: DemoteCardOutcome) -> Self {
+        Self {
+            card_id: value.card_id,
+            old_status: value.old_status,
+            new_status: value.new_status,
+            counterexample_refs: value.counterexample_refs,
         }
     }
 }
@@ -1442,11 +1701,33 @@ fn knowledge_status_slug(value: &KnowledgeStatus) -> &'static str {
     }
 }
 
+fn knowledge_evidence_role_slug(value: &crate::core::types::KnowledgeEvidenceRole) -> &'static str {
+    match value {
+        crate::core::types::KnowledgeEvidenceRole::Supporting => "supporting",
+        crate::core::types::KnowledgeEvidenceRole::Verification => "verification",
+        crate::core::types::KnowledgeEvidenceRole::Counterexample => "counterexample",
+        crate::core::types::KnowledgeEvidenceRole::Teaching => "teaching",
+    }
+}
+
 fn anchor_kind_slug(value: &AnchorKind) -> &'static str {
     match value {
         AnchorKind::Global => "global",
         AnchorKind::Repo => "repo",
         AnchorKind::Worktree => "worktree",
+    }
+}
+
+fn knowledge_event_type_slug(value: &crate::core::types::KnowledgeEventType) -> &'static str {
+    match value {
+        crate::core::types::KnowledgeEventType::Created => "created",
+        crate::core::types::KnowledgeEventType::Promoted => "promoted",
+        crate::core::types::KnowledgeEventType::Demoted => "demoted",
+        crate::core::types::KnowledgeEventType::Retired => "retired",
+        crate::core::types::KnowledgeEventType::Linked => "linked",
+        crate::core::types::KnowledgeEventType::Unlinked => "unlinked",
+        crate::core::types::KnowledgeEventType::Updated => "updated",
+        crate::core::types::KnowledgeEventType::PublishedAnchor => "published_anchor",
     }
 }
 
