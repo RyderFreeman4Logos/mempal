@@ -9,7 +9,7 @@
 # Guards:
 #   - Sub-agents (CLAUDE_CODE_ENTRY_POINT=task) skip
 #   - CSA sessions (CSA_SESSION_ID set) skip
-#   - Non-interactive (stdin not TTY) skip
+#   - Non-interactive (no TERM, no CLAUDE_CODE_SESSION_ID) skip
 #   - Dedup via flag file prevents stacked countdowns
 set -euo pipefail
 
@@ -23,8 +23,10 @@ if [ -n "${CSA_SESSION_ID:-}" ]; then
     exit 0
 fi
 
-# Guard: non-interactive sessions (piped stdin)
-if [ ! -t 0 ] 2>/dev/null; then
+# Guard: non-interactive sessions (headless CI, cron, pipe)
+# NOTE: Cannot use `[ -t 0 ]` — Claude Code hooks always run as subprocesses
+# without a TTY. Use TERM/CLAUDE_CODE_SESSION_ID as proxy instead.
+if [ -z "${TERM:-}" ] && [ -z "${CLAUDE_CODE_SESSION_ID:-}" ]; then
     exit 0
 fi
 
@@ -82,7 +84,7 @@ before KV cache expires (1h TTL), run this background countdown:
 \`\`\`bash
 export MEMPAL_CHECKPOINT_LOCKFILE=$LOCKFILE_SHELL
 export MEMPAL_CHECKPOINT_PROJECT=$PROJECT_NAME_SHELL
-bash -lc 'trap '\''rmdir "$MEMPAL_CHECKPOINT_LOCKFILE" 2>/dev/null || true'\'' EXIT; sleep 3000; mempal checkpoint save --project "$MEMPAL_CHECKPOINT_PROJECT" --content "Session checkpoint auto-saved. Summarize current work state here."'
+bash -lc 'trap '\''rmdir "\$MEMPAL_CHECKPOINT_LOCKFILE" 2>/dev/null || true'\'' EXIT; sleep 3000; mempal checkpoint save --project "\$MEMPAL_CHECKPOINT_PROJECT" --content "Session checkpoint auto-saved. Summarize current work state here."'
 \`\`\`
 
 Run the countdown command with run_in_background: true. When the notification fires
