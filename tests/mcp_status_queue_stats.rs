@@ -1,21 +1,32 @@
+mod common;
+
+use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::{Json, Router, routing::get};
+use common::harness::McpStdio;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
 use mempal::core::queue::{PendingMessageStore, QueueConfig};
 use mempal::mcp::MempalMcpServer;
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
-fn setup_env() -> (TempDir, PathBuf, Config) {
+fn setup_home() -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("tempdir");
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
     let db_path = mempal_home.join("palace.db");
     Database::open(&db_path).expect("open db");
+    (tmp, db_path)
+}
+
+fn setup_env() -> (TempDir, PathBuf, Config) {
+    let (tmp, db_path) = setup_home();
+    let mempal_home = tmp.path().join(".mempal");
     let config_path = mempal_home.join("config.toml");
     fs::write(
         &config_path,
@@ -49,6 +60,32 @@ async fn spawn_models_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         axum::serve(listener, app).await.expect("serve");
     });
     (addr, handle)
+}
+
+async fn call_mcp_status(client: &mut McpStdio) -> Value {
+    let result = match tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call(
+            "tools/call",
+            json!({
+                "name": "mempal_status",
+                "arguments": {},
+            }),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            let stderr = client.stderr_lines().await.join("\n");
+            panic!("call mempal_status failed: {error}\nstderr:\n{stderr}");
+        }
+        Err(_) => {
+            let stderr = client.stderr_lines().await.join("\n");
+            panic!("call mempal_status timed out\nstderr:\n{stderr}");
+        }
+    };
+    result["structuredContent"].clone()
 }
 
 #[tokio::test]
@@ -86,53 +123,49 @@ async fn test_mcp_status_surfaces_queue_stats() {
 
 #[tokio::test]
 async fn test_mcp_status_surfaces_endpoint_health() {
-    let (tmp, db_path, mut config) = setup_env();
+    let (_tmp, db_path) = setup_home();
     let (addr, handle) = spawn_models_server().await;
     let base_url = format!("http://{addr}/v1");
-    let config_path = tmp.path().join(".mempal").join("config.toml");
-    fs::write(
-        &config_path,
-        format!(
-            r#"
-db_path = "{}"
-
-[embed]
-backend = "openai_compat"
-
-[embed.openai_compat]
-base_url = "{}"
-model = "embed-test"
-
-[llm]
-enabled = true
-base_url = "{}"
-model = "llm-test"
-"#,
-            db_path.display(),
-            base_url,
-            base_url
-        ),
+    let mut client = McpStdio::start(
+        &db_path,
+        HashMap::from([
+            ("MEMPAL_TEST_EMBED_BASE_URL".to_string(), base_url.clone()),
+            ("MEMPAL_TEST_LLM_BASE_URL".to_string(), base_url),
+        ]),
     )
-    .expect("write config");
-    ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
-
-    config.embed.backend = "openai_compat".to_string();
-    config.embed.openai_compat.base_url = Some(base_url.clone());
-    config.embed.openai_compat.model = Some("embed-test".to_string());
-    config.llm.enabled = true;
-    config.llm.base_url = Some(base_url);
-    config.llm.model = Some("llm-test".to_string());
-
-    let server = MempalMcpServer::new(db_path, config);
-    let response = server.mempal_status().await.expect("status").0;
+    .await
+    .expect("start mcp stdio");
+    tokio::time::timeout(Duration::from_secs(5), client.initialize())
+        .await
+        .expect("initialize timed out")
+        .expect("initialize mcp client");
+    let response = call_mcp_status(&mut client).await;
+    client.shutdown().await.expect("shutdown mcp client");
 
     assert!(
-        response.endpoint_health.embedding_reachable,
+        response["endpoint_health"]["embedding_reachable"]
+            .as_bool()
+            .expect("embedding_reachable bool"),
         "{response:#?}"
     );
-    assert!(response.endpoint_health.embedding_latency_ms.is_some());
-    assert!(response.endpoint_health.llm_reachable, "{response:#?}");
-    assert!(response.endpoint_health.llm_latency_ms.is_some());
+    assert!(
+        response["endpoint_health"]["embedding_latency_ms"]
+            .as_u64()
+            .is_some(),
+        "{response:#?}"
+    );
+    assert!(
+        response["endpoint_health"]["llm_reachable"]
+            .as_bool()
+            .expect("llm_reachable bool"),
+        "{response:#?}"
+    );
+    assert!(
+        response["endpoint_health"]["llm_latency_ms"]
+            .as_u64()
+            .is_some(),
+        "{response:#?}"
+    );
 
     handle.abort();
     let _ = handle.await;

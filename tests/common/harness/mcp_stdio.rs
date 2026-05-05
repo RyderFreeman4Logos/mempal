@@ -31,11 +31,10 @@ impl McpStdio {
         let home = mempal_home.parent().unwrap_or(mempal_home);
         let config_path = mempal_home.join("config.toml");
         let embed_base_url = extra_env.get("MEMPAL_TEST_EMBED_BASE_URL").cloned();
-        let config = if let Some(embed_base_url) = embed_base_url {
+        let llm_base_url = extra_env.get("MEMPAL_TEST_LLM_BASE_URL").cloned();
+        let embed_section = if let Some(embed_base_url) = embed_base_url {
             format!(
                 r#"
-db_path = "{}"
-
 [embed]
 backend = "openai_compat"
 base_url = "{}"
@@ -47,36 +46,44 @@ base_url = "{}"
 model = "test-embed"
 dim = 4
 request_timeout_secs = 2
-
-[hooks]
-enabled = true
-
-[daemon]
-log_path = "{}"
 "#,
-                db_path.display(),
-                embed_base_url,
-                embed_base_url,
-                mempal_home.join("daemon.log").display()
+                embed_base_url, embed_base_url
             )
         } else {
-            format!(
-                r#"
-db_path = "{}"
-
+            r#"
 [embed]
 backend = "model2vec"
-
+"#
+            .to_string()
+        };
+        let llm_section = llm_base_url
+            .map(|llm_base_url| {
+                format!(
+                    r#"
+[llm]
+enabled = true
+base_url = "{}"
+model = "test-llm"
+"#,
+                    llm_base_url
+                )
+            })
+            .unwrap_or_default();
+        let config = format!(
+            r#"
+db_path = "{}"
+{}{}
 [hooks]
 enabled = true
 
 [daemon]
 log_path = "{}"
 "#,
-                db_path.display(),
-                mempal_home.join("daemon.log").display()
-            )
-        };
+            db_path.display(),
+            embed_section,
+            llm_section,
+            mempal_home.join("daemon.log").display()
+        );
         tokio::fs::create_dir_all(mempal_home)
             .await
             .with_context(|| format!("create {}", mempal_home.display()))?;

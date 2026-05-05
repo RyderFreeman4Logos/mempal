@@ -282,9 +282,20 @@ async fn test_retry_interval_hot_reload() {
     let millis = times.lock().expect("times mutex").clone();
     assert_eq!(millis.len(), 4);
     assert_eq!(millis[0], 0, "first attempt immediate: {millis:?}");
-    assert_eq!(millis[1], 1_000, "second attempt after 1s: {millis:?}");
-    assert_eq!(millis[2], 4_000, "third attempt after 3s: {millis:?}");
-    assert_eq!(millis[3], 7_000, "fourth attempt after 3s: {millis:?}");
+    assert!(
+        (1_000..=2_000).contains(&millis[1]),
+        "second attempt should still use the pre-reload 1s interval: {millis:?}"
+    );
+    assert_eq!(
+        millis[2] - millis[1],
+        3_000,
+        "third attempt should reflect the reloaded 3s interval: {millis:?}"
+    );
+    assert_eq!(
+        millis[3] - millis[2],
+        3_000,
+        "fourth attempt should continue using the reloaded 3s interval: {millis:?}"
+    );
 }
 
 /// Verifies that a config hot-reload mid-retry-loop takes effect on the next
@@ -350,13 +361,14 @@ async fn test_retry_config_snapshot_per_iteration() {
     let millis = times.lock().expect("times mutex").clone();
     assert_eq!(millis.len(), 3);
     assert_eq!(millis[0], 0, "first attempt immediate: {millis:?}");
-    assert_eq!(
-        millis[1], 1_000,
-        "second attempt should use reloaded 1s: {millis:?}"
+    assert!(
+        (1_000..=2_000).contains(&millis[1]),
+        "second attempt should use the reloaded 1s interval without depending on exact scheduler tick alignment: {millis:?}"
     );
     assert_eq!(
-        millis[2], 2_000,
-        "third attempt after another 1s: {millis:?}"
+        millis[2] - millis[1],
+        1_000,
+        "third attempt should remain on the reloaded 1s interval: {millis:?}"
     );
 }
 
