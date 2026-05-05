@@ -16,6 +16,8 @@ const LLM_TASK_KIND: &str = "llm_task";
 const LLM_CLAIM_TTL_SECS: i64 = 300;
 const LLM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+pub const DEFAULT_GATING_JUDGE_PROMPT: &str = "You are a memory importance judge for a software engineering project memory system.\n\nGiven a piece of content captured from a coding session, determine if it contains IMPORTANT information worth storing long-term. Score from 0.0 to 1.0.\n\nIMPORTANT (score >= 0.7):\n- Architecture or design decisions and their rationale\n- Bug root cause analysis and fix strategies\n- User preferences, workflow choices, or explicit feedback\n- Configuration decisions and why they were made\n- Trade-off evaluations between approaches\n- Security concerns or mitigation strategies\n- Project milestones, status changes, or completion records\n- Integration decisions (which tools, which APIs, why)\n\nNOT IMPORTANT (score < 0.4):\n- Raw tool output (file listings, grep results, git status)\n- Routine code edits without design rationale\n- Build/test output logs\n- Boilerplate file content\n- Simple command execution without decision context\n- Repetitive status checks\n\nRespond with ONLY a JSON object: {\"score\": 0.0-1.0, \"reason\": \"brief explanation\"}";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmTaskPayload {
     pub task_type: String,
@@ -156,7 +158,7 @@ async fn process_gating_task(
     let system_prompt = task
         .system_prompt
         .as_deref()
-        .unwrap_or("You are a memory quality judge. Evaluate the following content and respond with a JSON object containing 'verdict' (keep/reject) and 'score' (0.0-1.0).");
+        .unwrap_or(DEFAULT_GATING_JUDGE_PROMPT);
 
     let request = LlmRequest {
         messages: vec![

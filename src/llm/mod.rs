@@ -6,4 +6,4 @@ pub mod worker;
 pub use client::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, Usage};
 pub use retry::retry_llm_operation;
 pub use status::{LlmStatus, LlmWarning};
-pub use worker::{LlmTaskPayload, process_llm_task};
+pub use worker::{DEFAULT_GATING_JUDGE_PROMPT, LlmTaskPayload, process_llm_task};
