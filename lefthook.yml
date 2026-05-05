@@ -2,6 +2,11 @@
 # Install: just install-hooks  (or: lefthook install)
 # Docs: https://github.com/evilmartians/lefthook
 
+post-merge:
+  commands:
+    auto-install:
+      run: scripts/hooks/post-merge.sh
+
 pre-commit:
   commands:
     branch-protection:
