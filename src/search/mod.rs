@@ -499,8 +499,8 @@ fn inject_chunk_neighbors(db: &Database, results: &mut [SearchResult]) -> Result
 /// If so, add the other wing names as tunnel_hints and append any explicit
 /// cross-project tunnel targets without applying the project filter.
 ///
-/// Reads `[search].tunnel_fanout_cap` and `[search].tunnel_hints_display_cap`
-/// from the hot-reload config snapshot.
+/// Reads `[search].tunnel_fanout_cap`, `[search].tunnel_hints_display_cap`, and
+/// `[search].tunnel_penalty` from the hot-reload config snapshot.
 fn inject_tunnel_hints_and_results(
     db: &Database,
     results: &mut Vec<SearchResult>,
@@ -516,6 +516,7 @@ fn inject_tunnel_hints_and_results(
         scope,
         search_cfg.tunnel_fanout_cap,
         search_cfg.tunnel_hints_display_cap,
+        search_cfg.tunnel_penalty,
     );
 }
 
@@ -525,12 +526,16 @@ fn inject_tunnel_hints_and_results(
 /// `fanout_cap` bounds the number of injected cross-project rows per source result.
 /// `hints_display_cap` bounds `tunnel_hints` string entries per result; excess wings
 /// are replaced by a single `"… +N more"` sentinel as the last element.
+/// `tunnel_penalty` (0.0..=1.0) multiplies each tunnel-resolved result's
+/// `similarity` and `effective_importance` so cross-project rows rank below direct
+/// in-project matches at equal raw scores. `1.0` disables the penalty.
 pub(crate) fn inject_tunnel_hints_with_cap(
     db: &Database,
     results: &mut Vec<SearchResult>,
     scope: &ProjectSearchScope,
     fanout_cap: usize,
     hints_display_cap: usize,
+    tunnel_penalty: f32,
 ) {
     let tunnels = match db.find_tunnels() {
         Ok(t) => t,
@@ -591,12 +596,15 @@ pub(crate) fn inject_tunnel_hints_with_cap(
                     }
                     let drawer = tunnel.drawer;
                     if seen_ids.insert(drawer.id.clone()) {
-                        tunnel_results.push(result_from_drawer(
+                        let mut tunnel_result = result_from_drawer(
                             drawer,
                             SearchResultSource::TunnelCrossProject,
                             result.similarity,
                             result.route.clone(),
-                        ));
+                        );
+                        tunnel_result.similarity *= tunnel_penalty;
+                        tunnel_result.effective_importance *= tunnel_penalty as f64;
+                        tunnel_results.push(tunnel_result);
                         added_from_this_result += 1;
                     }
                 }
@@ -1272,7 +1280,7 @@ mod tests {
         seed_cross_project(&db, &source, 10);
 
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 3, usize::MAX);
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 3, usize::MAX, 1.0);
 
         assert_eq!(
             results.len(),
@@ -1295,7 +1303,7 @@ mod tests {
         seed_cross_project(&db, &source, 5);
 
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 0, usize::MAX);
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 0, usize::MAX, 1.0);
 
         assert_eq!(results.len(), 1, "cap=0 must not add tunnel drawers");
         assert_eq!(
@@ -1313,7 +1321,7 @@ mod tests {
         seed_cross_project(&db, &source, 2);
 
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 100, usize::MAX);
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 100, usize::MAX, 1.0);
 
         assert_eq!(
             results.len(),
@@ -1342,7 +1350,7 @@ mod tests {
         }
 
         let mut results = vec![make_result(&alpha), make_result(&gamma)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 2, usize::MAX);
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 2, usize::MAX, 1.0);
 
         // SQL LIMIT = fanout_cap + 1 = 3.  Alpha's query returns 3 beta rows
         // (beta-9, beta-8, beta-7 DESC order); alpha's Rust cap adds 2 (beta-9,
@@ -1354,6 +1362,80 @@ mod tests {
             5,
             "expected 2 source + 2 (alpha) + 1 (gamma) = 5, got {}",
             results.len()
+        );
+    }
+
+    #[test]
+    fn tunnel_penalty_scales_similarity_and_effective_importance() {
+        // GIVEN: source result with similarity=0.9 and one cross-project tunnel target
+        //        whose drawer row carries effective_importance=4.0 (set directly to bypass
+        //        the migration default of 0.0; INSERT does not write this column).
+        // WHEN:  inject_tunnel_hints_with_cap runs with penalty=0.5
+        // THEN:  tunnel.similarity == 0.9 * 0.5 = 0.45 and
+        //        tunnel.effective_importance == 4.0 * 0.5 = 2.0, so an in-project peer at
+        //        the same raw similarity outranks the tunnel on the RRF similarity axis.
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        let source = make_drawer("alpha-1", "alpha", "decision");
+        db.insert_drawer_with_project(&source, Some("proj-a"))
+            .expect("insert source");
+        let tunnel_target = make_drawer("beta-1", "beta", "decision");
+        db.insert_drawer_with_project(&tunnel_target, Some("proj-b"))
+            .expect("insert tunnel target");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 4.0 WHERE id = ?1",
+                rusqlite::params!["beta-1"],
+            )
+            .expect("set effective_importance on tunnel row");
+
+        let mut results = vec![make_result(&source)];
+
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 1, usize::MAX, 0.5);
+
+        assert_eq!(results.len(), 2, "expected 1 source + 1 tunnel = 2");
+        let tunnel = results
+            .iter()
+            .find(|r| r.source == SearchResultSource::TunnelCrossProject)
+            .expect("tunnel result present");
+        assert!(
+            (tunnel.similarity - 0.45).abs() < 1e-6,
+            "tunnel similarity should be 0.9 * 0.5 = 0.45, got {}",
+            tunnel.similarity
+        );
+        assert!(
+            (tunnel.effective_importance - 2.0).abs() < 1e-6,
+            "tunnel effective_importance should be 4.0 * 0.5 = 2.0, got {}",
+            tunnel.effective_importance
+        );
+        assert!(
+            tunnel.similarity < results[0].similarity,
+            "penalized tunnel similarity ({}) must be below source ({}) at equal raw score",
+            tunnel.similarity,
+            results[0].similarity
+        );
+    }
+
+    #[test]
+    fn tunnel_penalty_one_preserves_raw_similarity() {
+        // penalty=1.0 must be a no-op: tunnel result's similarity equals the source's.
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        let source = make_drawer("alpha-1", "alpha", "decision");
+        seed_cross_project(&db, &source, 1);
+
+        let mut results = vec![make_result(&source)];
+        inject_tunnel_hints_with_cap(&db, &mut results, &scoped_to_proj_a(), 1, usize::MAX, 1.0);
+
+        let tunnel = results
+            .iter()
+            .find(|r| r.source == SearchResultSource::TunnelCrossProject)
+            .expect("tunnel result present");
+        assert!(
+            (tunnel.similarity - 0.9).abs() < 1e-6,
+            "penalty=1.0 must leave similarity=0.9 unchanged, got {}",
+            tunnel.similarity
         );
     }
 
@@ -1401,7 +1483,14 @@ mod tests {
 
         let source = make_drawer("alpha-1", "alpha", "room-shared");
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &ProjectSearchScope::all_projects(), 0, 8);
+        inject_tunnel_hints_with_cap(
+            &db,
+            &mut results,
+            &ProjectSearchScope::all_projects(),
+            0,
+            8,
+            1.0,
+        );
 
         // 8 real hints + 1 sentinel = 9 = display_cap + 1
         assert!(
@@ -1421,7 +1510,14 @@ mod tests {
 
         let source = make_drawer("alpha-1", "alpha", "room-shared");
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &ProjectSearchScope::all_projects(), 0, 8);
+        inject_tunnel_hints_with_cap(
+            &db,
+            &mut results,
+            &ProjectSearchScope::all_projects(),
+            0,
+            8,
+            1.0,
+        );
 
         assert_eq!(results[0].tunnel_hints.len(), 5, "exactly 5 sibling hints");
         assert!(
@@ -1439,7 +1535,14 @@ mod tests {
 
         let source = make_drawer("alpha-1", "alpha", "room-shared");
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &ProjectSearchScope::all_projects(), 0, 8);
+        inject_tunnel_hints_with_cap(
+            &db,
+            &mut results,
+            &ProjectSearchScope::all_projects(),
+            0,
+            8,
+            1.0,
+        );
 
         let sentinel = results[0].tunnel_hints.last().expect("has sentinel");
         assert_eq!(sentinel, "… +41 more");
@@ -1453,7 +1556,14 @@ mod tests {
 
         let source = make_drawer("alpha-1", "alpha", "room-shared");
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &ProjectSearchScope::all_projects(), 0, 8);
+        inject_tunnel_hints_with_cap(
+            &db,
+            &mut results,
+            &ProjectSearchScope::all_projects(),
+            0,
+            8,
+            1.0,
+        );
 
         assert!(
             !results[0].tunnel_hints.iter().any(|h| h == "alpha"),
@@ -1470,7 +1580,14 @@ mod tests {
 
         let source = make_drawer("alpha-1", "alpha", "room-shared");
         let mut results = vec![make_result(&source)];
-        inject_tunnel_hints_with_cap(&db, &mut results, &ProjectSearchScope::all_projects(), 0, 3);
+        inject_tunnel_hints_with_cap(
+            &db,
+            &mut results,
+            &ProjectSearchScope::all_projects(),
+            0,
+            3,
+            1.0,
+        );
 
         assert_eq!(
             results[0].tunnel_hints.len(),

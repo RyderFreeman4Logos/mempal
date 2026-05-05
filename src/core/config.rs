@@ -26,6 +26,7 @@ const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 5;
 const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
 const DEFAULT_SEARCH_TUNNEL_FANOUT_CAP: usize = 5;
 const DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP: usize = 8;
+const DEFAULT_SEARCH_TUNNEL_PENALTY: f32 = 0.7;
 const DEFAULT_ALERT_EVERY_N_FAILURES: u64 = 100;
 const DEFAULT_DEGRADE_AFTER_N_FAILURES: u64 = 10;
 const DEFAULT_HOOK_WING: &str = "agent-diary";
@@ -192,6 +193,13 @@ impl Config {
         if self.search.preview_chars == 0 {
             return Err(ConfigError::InvalidConfig(
                 "search.preview_chars must be greater than 0".to_string(),
+            ));
+        }
+        if !self.search.tunnel_penalty.is_finite()
+            || !(0.0..=1.0).contains(&self.search.tunnel_penalty)
+        {
+            return Err(ConfigError::InvalidConfig(
+                "search.tunnel_penalty must be a finite value in 0.0..=1.0".to_string(),
             ));
         }
         if !(0..=5).contains(&self.hotpatch.min_importance_stars) {
@@ -844,7 +852,7 @@ impl Default for ConfigHotReloadConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SearchConfig {
     pub strict_project_isolation: bool,
@@ -854,6 +862,11 @@ pub struct SearchConfig {
     /// Maximum wing names shown per result in `tunnel_hints`. Excess entries are
     /// replaced by a single `"… +N more"` sentinel. Default: 8.
     pub tunnel_hints_display_cap: usize,
+    /// Multiplier applied to a tunnel-resolved (`tunnel_cross_project`) result's
+    /// similarity AND `effective_importance` before final ranking. Range `0.0..=1.0`;
+    /// `1.0` disables the penalty. Default `0.7` deprioritizes cross-project rows
+    /// when their raw embedding score clusters near direct in-project matches.
+    pub tunnel_penalty: f32,
 }
 
 impl Default for SearchConfig {
@@ -864,6 +877,7 @@ impl Default for SearchConfig {
             preview_chars: DEFAULT_SEARCH_PREVIEW_CHARS,
             tunnel_fanout_cap: DEFAULT_SEARCH_TUNNEL_FANOUT_CAP,
             tunnel_hints_display_cap: DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP,
+            tunnel_penalty: DEFAULT_SEARCH_TUNNEL_PENALTY,
         }
     }
 }
