@@ -3,8 +3,8 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::process::Command;
 
-use mempal::hook_install::install_claude_code;
-use serde_json::Value;
+use mempal::hook_install::{McpInstallStatus, install_claude_code, install_user_mcp};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn parse_json(path: &std::path::Path) -> Value {
@@ -308,5 +308,202 @@ fn test_hook_install_public_wrapper_uses_home_env() {
     assert_eq!(
         parsed["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
         expected_hook_command("hook_session_end")
+    );
+
+    // Issue #129: the same install also seeds `~/.mcp.json` with the mempal
+    // server entry so non-mempal projects expose mempal_* tools.
+    let mcp = parse_json(&home.join(".mcp.json"));
+    assert_eq!(
+        mcp["mcpServers"]["mempal"]["command"], "mempal",
+        "mempal MCP server entry must be installed in ~/.mcp.json"
+    );
+    assert_eq!(
+        mcp["mcpServers"]["mempal"]["args"],
+        json!(["serve", "--mcp"])
+    );
+}
+
+#[test]
+fn test_install_user_mcp_creates_file_when_missing() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("create home");
+
+    let outcome = install_user_mcp(&home, false, false).expect("install mcp");
+    assert_eq!(outcome.status, McpInstallStatus::Created);
+    assert!(home.join(".mcp.json").exists(), "mcp file must be written");
+
+    let parsed = parse_json(&home.join(".mcp.json"));
+    assert_eq!(parsed["mcpServers"]["mempal"]["command"], "mempal");
+    assert_eq!(
+        parsed["mcpServers"]["mempal"]["args"],
+        json!(["serve", "--mcp"])
+    );
+}
+
+#[test]
+fn test_install_user_mcp_idempotent_when_already_present() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("create home");
+
+    let first = install_user_mcp(&home, false, false).expect("first install");
+    assert_eq!(first.status, McpInstallStatus::Created);
+
+    let second = install_user_mcp(&home, false, false).expect("second install");
+    assert_eq!(second.status, McpInstallStatus::AlreadyPresent);
+}
+
+#[test]
+fn test_install_user_mcp_merges_with_existing_servers() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("create home");
+    fs::write(
+        home.join(".mcp.json"),
+        r#"{
+          "mcpServers": {
+            "other-server": {
+              "command": "other",
+              "args": ["--bar"]
+            }
+          }
+        }"#,
+    )
+    .expect("seed mcp.json with other server");
+
+    let outcome = install_user_mcp(&home, false, false).expect("install mcp");
+    assert_eq!(outcome.status, McpInstallStatus::Added);
+
+    let parsed = parse_json(&home.join(".mcp.json"));
+    assert_eq!(parsed["mcpServers"]["other-server"]["command"], "other");
+    assert_eq!(parsed["mcpServers"]["mempal"]["command"], "mempal");
+}
+
+#[test]
+fn test_install_user_mcp_reports_conflict_on_divergent_entry() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("create home");
+    fs::write(
+        home.join(".mcp.json"),
+        r#"{
+          "mcpServers": {
+            "mempal": {
+              "command": "/custom/mempal-wrapper",
+              "args": ["--special"]
+            }
+          }
+        }"#,
+    )
+    .expect("seed mcp.json with custom mempal entry");
+
+    let outcome = install_user_mcp(&home, false, false).expect("install mcp");
+    assert_eq!(outcome.status, McpInstallStatus::Conflict);
+
+    // Existing user customization must be preserved untouched.
+    let parsed = parse_json(&home.join(".mcp.json"));
+    assert_eq!(
+        parsed["mcpServers"]["mempal"]["command"],
+        "/custom/mempal-wrapper"
+    );
+}
+
+#[test]
+fn test_install_user_mcp_dry_run_does_not_write() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("create home");
+
+    let outcome = install_user_mcp(&home, true, false).expect("dry-run install");
+    assert!(!home.join(".mcp.json").exists());
+    let rendered = outcome.rendered.expect("dry-run renders preview");
+    assert!(rendered.contains("mempal"));
+    assert!(rendered.contains("serve"));
+}
+
+#[test]
+fn test_install_user_mcp_uninstall_removes_only_mempal_entry() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("create home");
+    fs::write(
+        home.join(".mcp.json"),
+        r#"{
+          "mcpServers": {
+            "mempal": {
+              "command": "mempal",
+              "args": ["serve", "--mcp"]
+            },
+            "other-server": {
+              "command": "other",
+              "args": ["--bar"]
+            }
+          }
+        }"#,
+    )
+    .expect("seed mcp.json with mempal + other");
+
+    let outcome = install_user_mcp(&home, false, true).expect("uninstall mcp");
+    assert_eq!(outcome.status, McpInstallStatus::Removed);
+
+    let parsed = parse_json(&home.join(".mcp.json"));
+    assert!(parsed["mcpServers"].get("mempal").is_none());
+    assert_eq!(parsed["mcpServers"]["other-server"]["command"], "other");
+}
+
+#[test]
+fn test_install_user_mcp_uninstall_removes_empty_file() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("create home");
+    fs::write(
+        home.join(".mcp.json"),
+        r#"{
+          "mcpServers": {
+            "mempal": {
+              "command": "mempal",
+              "args": ["serve", "--mcp"]
+            }
+          }
+        }"#,
+    )
+    .expect("seed mcp.json with only mempal");
+
+    let outcome = install_user_mcp(&home, false, true).expect("uninstall mcp");
+    assert_eq!(outcome.status, McpInstallStatus::Removed);
+    assert!(
+        !home.join(".mcp.json").exists(),
+        "uninstall must drop empty .mcp.json instead of leaving a stub"
+    );
+}
+
+#[test]
+fn test_hook_install_skip_mcp_does_not_touch_user_mcp() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(&home).expect("create home");
+
+    let output = Command::new(mempal_bin())
+        .args(["hook", "install", "--target", "claude-code", "--skip-mcp"])
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .output()
+        .expect("wrapper install with --skip-mcp");
+    assert!(
+        output.status.success(),
+        "install --skip-mcp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        home.join(".claude/settings.json").exists(),
+        "claude settings still written"
+    );
+    assert!(
+        !home.join(".mcp.json").exists(),
+        "--skip-mcp must not touch ~/.mcp.json"
     );
 }

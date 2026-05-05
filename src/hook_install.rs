@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 const CLAUDE_SETTINGS_RELATIVE: &str = ".claude/settings.json";
 const CLAUDE_SETTINGS_DIR: &str = ".claude";
 const CLAUDE_SETTINGS_FILE: &str = "settings.json";
+const USER_MCP_FILE: &str = ".mcp.json";
+const MEMPAL_MCP_SERVER_NAME: &str = "mempal";
 const FORBIDDEN_TARGET_NAMES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", "GEMINI.md"];
 const HOOK_COMMAND_EVENTS: [(&str, &str); 4] = [
     ("PostToolUse", "hook_post_tool"),
@@ -36,13 +38,43 @@ pub struct InstallOutcome {
     pub removed_commands: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpInstallStatus {
+    /// New `~/.mcp.json` created with mempal entry.
+    Created,
+    /// Existing `~/.mcp.json` updated to add the mempal entry.
+    Added,
+    /// `~/.mcp.json` already had a mempal entry — left unchanged.
+    AlreadyPresent,
+    /// Skipped: dry-run, uninstall, or user opted out.
+    Skipped,
+    /// Removed mempal entry from `~/.mcp.json` (uninstall path).
+    Removed,
+    /// File exists with a different (non-mempal) `mcpServers.mempal` entry that
+    /// we declined to overwrite. Caller should warn the user.
+    Conflict,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpInstallOutcome {
+    pub display_path: PathBuf,
+    pub write_path: PathBuf,
+    pub status: McpInstallStatus,
+    pub rendered: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ResolvedSettingsPath {
     display_path: PathBuf,
     write_path: PathBuf,
 }
 
-pub fn install(target: HookInstallTarget, dry_run: bool, uninstall: bool) -> Result<()> {
+pub fn install(
+    target: HookInstallTarget,
+    dry_run: bool,
+    uninstall: bool,
+    skip_mcp: bool,
+) -> Result<()> {
     match target {
         HookInstallTarget::ClaudeCode => {
             let cwd = env::current_dir().context("failed to resolve current working directory")?;
@@ -80,11 +112,56 @@ pub fn install(target: HookInstallTarget, dry_run: bool, uninstall: bool) -> Res
                     outcome.write_path.display()
                 );
             }
+
+            // Issue #129: ensure mempal MCP server is registered at the user
+            // level so any project (not just the mempal repo) can call
+            // mempal_ingest / mempal_search and reach the daemon-driven
+            // capture pipeline.
+            if !skip_mcp {
+                let mcp_outcome = install_user_mcp(&home, dry_run, uninstall)?;
+                report_mcp_outcome(&mcp_outcome, dry_run);
+            }
             Ok(())
         }
         HookInstallTarget::GeminiCli | HookInstallTarget::Codex => {
             bail!("hook install currently supports only --target claude-code");
         }
+    }
+}
+
+fn report_mcp_outcome(outcome: &McpInstallOutcome, dry_run: bool) {
+    match outcome.status {
+        McpInstallStatus::Created => println!(
+            "created {} with mempal MCP server entry",
+            outcome.display_path.display()
+        ),
+        McpInstallStatus::Added => println!(
+            "added mempal MCP server entry to {}",
+            outcome.display_path.display()
+        ),
+        McpInstallStatus::AlreadyPresent => println!(
+            "= mempal MCP server already registered in {}",
+            outcome.display_path.display()
+        ),
+        McpInstallStatus::Removed => println!(
+            "removed mempal MCP server entry from {}",
+            outcome.display_path.display()
+        ),
+        McpInstallStatus::Skipped => {
+            if dry_run && let Some(rendered) = outcome.rendered.as_deref() {
+                println!(
+                    "--- dry run: {} ---\n{}",
+                    outcome.display_path.display(),
+                    rendered
+                );
+            }
+        }
+        McpInstallStatus::Conflict => eprintln!(
+            "warning: {} already has a different `mcpServers.{}` entry; left unchanged. \
+             Inspect the file and add `command: \"mempal\", args: [\"serve\", \"--mcp\"]` manually.",
+            outcome.display_path.display(),
+            MEMPAL_MCP_SERVER_NAME
+        ),
     }
 }
 
@@ -157,6 +234,150 @@ fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("cannot resolve $HOME"))
+}
+
+/// Ensure `~/.mcp.json` registers the mempal MCP server so any project (not
+/// just the mempal repo itself) exposes mempal_ingest / mempal_search to
+/// Claude Code. Issue #129.
+///
+/// Behavior:
+/// - File missing       → write a minimal file with one mempal entry.
+/// - File exists, no entry → merge in the mempal entry (preserving siblings).
+/// - File exists, mempal entry already correct → no-op.
+/// - File exists, mempal entry differs from canonical → leave alone, surface
+///   a Conflict status so the user can resolve manually (avoids overwriting
+///   an intentional override).
+/// - `dry_run = true`   → never writes; renders the would-be JSON for display.
+/// - `uninstall = true` → removes only our `mempal` entry; leaves the file
+///   (and other servers) intact. Removes the file if it becomes empty.
+pub fn install_user_mcp(home: &Path, dry_run: bool, uninstall: bool) -> Result<McpInstallOutcome> {
+    let path = home.join(USER_MCP_FILE);
+    let existed = path.exists();
+    let mut root = if existed {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let parsed: Value = serde_json::from_str(&content)
+            .with_context(|| format!("invalid JSON in {}", path.display()))?;
+        if !parsed.is_object() {
+            bail!(
+                "refusing to overwrite {}: top-level JSON must be an object",
+                path.display()
+            );
+        }
+        parsed
+    } else {
+        json!({ "mcpServers": {} })
+    };
+
+    let canonical = canonical_mempal_entry();
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("`{}` JSON root is not an object", path.display()))?;
+    let servers_value = root_obj.entry("mcpServers").or_insert_with(|| json!({}));
+    if !servers_value.is_object() {
+        bail!(
+            "refusing to overwrite {}: `mcpServers` field is not an object",
+            path.display()
+        );
+    }
+    let servers = servers_value
+        .as_object_mut()
+        .expect("just verified mcpServers is an object");
+
+    let existing_entry = servers.get(MEMPAL_MCP_SERVER_NAME).cloned();
+
+    let (status, mutated) = if uninstall {
+        if existing_entry.is_some() {
+            servers.remove(MEMPAL_MCP_SERVER_NAME);
+            (McpInstallStatus::Removed, true)
+        } else {
+            (McpInstallStatus::Skipped, false)
+        }
+    } else {
+        match existing_entry {
+            Some(existing) if mempal_entry_matches_canonical(&existing) => {
+                (McpInstallStatus::AlreadyPresent, false)
+            }
+            Some(_) => (McpInstallStatus::Conflict, false),
+            None => {
+                servers.insert(MEMPAL_MCP_SERVER_NAME.to_string(), canonical);
+                if existed {
+                    (McpInstallStatus::Added, true)
+                } else {
+                    (McpInstallStatus::Created, true)
+                }
+            }
+        }
+    };
+
+    let rendered = if mutated || dry_run {
+        Some(serde_json::to_string_pretty(&root).context("failed to serialize MCP servers JSON")?)
+    } else {
+        None
+    };
+
+    if mutated && !dry_run {
+        if uninstall && servers_is_empty(&root) {
+            // Remove the now-empty file so we don't leave behind a stub.
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error)
+                        .with_context(|| format!("failed to remove {}", path.display()));
+                }
+            }
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create MCP file parent {}", parent.display())
+                })?;
+            }
+            let serialized = rendered
+                .as_deref()
+                .expect("rendered JSON populated when mutating");
+            fs::write(&path, serialized)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+        }
+    }
+
+    Ok(McpInstallOutcome {
+        display_path: path.clone(),
+        write_path: path,
+        status,
+        rendered,
+    })
+}
+
+fn canonical_mempal_entry() -> Value {
+    json!({
+        "command": "mempal",
+        "args": ["serve", "--mcp"]
+    })
+}
+
+fn mempal_entry_matches_canonical(entry: &Value) -> bool {
+    let Some(obj) = entry.as_object() else {
+        return false;
+    };
+    let command_ok = obj
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "mempal");
+    let args_ok = obj
+        .get("args")
+        .and_then(Value::as_array)
+        .and_then(|args| {
+            args.iter()
+                .all(|item| item.is_string())
+                .then(|| args.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        })
+        .is_some_and(|args| args == ["serve", "--mcp"]);
+    command_ok && args_ok
+}
+
+fn servers_is_empty(root: &Value) -> bool {
+    root.get("mcpServers")
+        .and_then(Value::as_object)
+        .is_some_and(|map| map.is_empty())
 }
 
 fn resolve_claude_settings_path(cwd: &Path, home: &Path) -> Result<ResolvedSettingsPath> {

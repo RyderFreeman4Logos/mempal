@@ -35,6 +35,11 @@ pub enum HookCommands {
         dry_run: bool,
         #[arg(long, default_value_t = false)]
         uninstall: bool,
+        /// Skip ensuring `~/.mcp.json` registers the mempal MCP server.
+        /// By default the install also wires user-level MCP so projects
+        /// without their own `.mcp.json` still expose mempal_* tools.
+        #[arg(long, default_value_t = false)]
+        skip_mcp: bool,
     },
 }
 
@@ -71,7 +76,8 @@ pub fn run_command(command: HookCommands) -> Result<()> {
             target,
             dry_run,
             uninstall,
-        } => hook_install::install(target, dry_run, uninstall),
+            skip_mcp,
+        } => hook_install::install(target, dry_run, uninstall, skip_mcp),
     }
 }
 
