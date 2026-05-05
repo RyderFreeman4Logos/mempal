@@ -1,9 +1,14 @@
+#![cfg(feature = "integration")]
+
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "integration")]
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(feature = "integration")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use mempal::core::config::ConfigHandle;
@@ -11,11 +16,14 @@ use mempal::core::db::Database;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::mcp::{IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
+#[cfg(feature = "integration")]
 use rmcp::{model::CallToolRequestParams, serve_client};
 use tempfile::TempDir;
+#[cfg(feature = "integration")]
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+#[cfg(feature = "integration")]
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
 }
@@ -514,6 +522,7 @@ async fn test_notify_watcher_crash_falls_back_to_poll() {
     );
 }
 
+#[cfg(feature = "integration")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_status_prints_config_version_and_loaded_at() {
     let _guard = test_guard().await;
@@ -565,6 +574,7 @@ async fn test_status_prints_config_version_and_loaded_at() {
     assert!(stdout.contains("  redactions_per_pattern: none"));
 }
 
+#[cfg(feature = "integration")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mcp_status_returns_config_version() {
     let _guard = test_guard().await;
@@ -596,6 +606,7 @@ async fn test_mcp_status_returns_config_version() {
     assert!(second.config_loaded_at_unix_ms >= first.config_loaded_at_unix_ms);
 }
 
+#[cfg(feature = "integration")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mcp_stdio_child_hot_reloads() {
     let _guard = test_guard().await;

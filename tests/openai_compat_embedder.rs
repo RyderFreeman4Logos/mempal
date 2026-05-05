@@ -1,3 +1,5 @@
+#![cfg(feature = "integration")]
+
 use std::sync::{Arc, OnceLock};
 
 use mempal::core::config::Config;

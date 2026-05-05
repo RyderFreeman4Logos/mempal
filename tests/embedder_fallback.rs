@@ -1,3 +1,5 @@
+#![cfg(feature = "integration")]
+
 use std::fs;
 use std::sync::{Arc, OnceLock};
 
