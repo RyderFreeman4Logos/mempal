@@ -6,5 +6,8 @@ pre-commit:
   commands:
     branch-protection:
       run: scripts/hooks/branch-protection.sh
+    quick-format-check:
+      run: cargo fmt --check
     quality-gates:
-      run: just pre-commit
+      files: git diff --cached --name-only --diff-filter=ACMR | grep -E '(^|/)(Cargo\.toml|Cargo\.lock)$|\.rs$' || true
+      run: just quality-gates

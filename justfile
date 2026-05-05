@@ -13,9 +13,17 @@ export MISE_TRUSTED_CONFIG_PATHS := _repo_root
 # Default recipe
 default: pre-commit
 
-# Full pre-commit gate (fmt, clippy, test).
+# Full pre-commit gate (fmt, clippy, test) for manual use.
 pre-commit:
     just fmt
+    just quality-gates
+
+# Read-only format check for fast hook paths.
+fmt-check:
+    cargo fmt --check
+
+# Full quality gates for Rust source or Cargo dependency changes.
+quality-gates:
     just clippy
     just test
 
