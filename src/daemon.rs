@@ -12,7 +12,7 @@ use crate::core::{
     project::resolve_project_id,
     queue::{ClaimedMessage, PendingMessageStore},
     types::{BootstrapEvidenceArgs, Drawer, SourceType},
-    utils::{current_timestamp, iso_timestamp, synthetic_source_file},
+    utils::{current_timestamp, iso_timestamp, route_room_from_taxonomy, synthetic_source_file},
 };
 use crate::embed::{
     EmbedError, Embedder, build_backend_from_name, global_embed_status,
@@ -316,7 +316,7 @@ async fn embed_text_with_heartbeat<E: Embedder + ?Sized>(
         .ok_or_else(|| EmbedError::Runtime("embedder returned no vectors".to_string()))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DrawerRecord {
     wing: String,
     room: String,
@@ -333,7 +333,11 @@ fn build_drawer_records(
     config: &crate::core::config::Config,
     mempal_home: &Path,
 ) -> Result<Vec<DrawerRecord>> {
-    let mut records = vec![build_audit_drawer_record(envelope, config, mempal_home)?];
+    let audit_record = build_audit_drawer_record(envelope, config, mempal_home)?;
+    let mut records = vec![audit_record.clone()];
+    if let Some(record) = build_user_prompt_project_record(db, envelope, config, &audit_record)? {
+        records.push(record);
+    }
     if envelope.event == crate::hook::HookEvent::SessionEnd.display_name() {
         let session_review_payload = if config.hooks.session_end.extract_self_review {
             load_session_review_payload(envelope)?
@@ -397,6 +401,47 @@ fn build_drawer_records(
     }
 
     Ok(records)
+}
+
+fn build_user_prompt_project_record(
+    db: &Database,
+    envelope: &CapturedHookEnvelope,
+    config: &crate::core::config::Config,
+    audit_record: &DrawerRecord,
+) -> Result<Option<DrawerRecord>> {
+    if envelope.event != crate::hook::HookEvent::UserPromptSubmit.display_name() {
+        return Ok(None);
+    }
+    if envelope.truncated {
+        return Ok(None);
+    }
+
+    let raw_payload = envelope.payload.as_deref().unwrap_or_default();
+    let content = config.scrub_content(&user_prompt_content(raw_payload));
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let wing = config.hooks.wing.trim();
+    if wing.is_empty() || wing == "hooks-raw" {
+        return Ok(None);
+    }
+
+    let taxonomy = db
+        .taxonomy_entries()
+        .context("failed to load taxonomy for hook user-prompt promotion")?;
+    let room = route_room_from_taxonomy(&content, wing, &taxonomy);
+    let project_id = resolve_hook_project_id(envelope, config)?;
+
+    Ok(Some(DrawerRecord {
+        wing: wing.to_string(),
+        room,
+        source_file: audit_record.source_file.clone(),
+        content,
+        importance: 0,
+        bypass_novelty: false,
+        project_id,
+    }))
 }
 
 fn record_session_review_rejection(db: &Database) {
@@ -918,6 +963,19 @@ fn preview_for_event(event: &str, raw_payload: &str) -> String {
             .unwrap_or_else(|| raw_payload.to_string()),
         _ => raw_payload.to_string(),
     }
+}
+
+fn user_prompt_content(raw_payload: &str) -> String {
+    serde_json::from_str::<Value>(raw_payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("prompt")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| raw_payload.to_string())
 }
 
 fn hook_payload_session_id(raw_payload: &str) -> Option<String> {
