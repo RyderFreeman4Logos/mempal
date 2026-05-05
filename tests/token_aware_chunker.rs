@@ -1,3 +1,5 @@
+#![cfg(feature = "integration")]
+
 //! Integration tests for token-aware chunking (issue #56).
 //!
 //! Verifies that the ingest pipeline respects `max_input_tokens` from the

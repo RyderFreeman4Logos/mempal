@@ -1,3 +1,5 @@
+#![cfg(feature = "integration")]
+
 use mempal::core::config::LlmConfig;
 use mempal::llm::client::{LlmClient, LlmError, LlmMessage, LlmRequest};
 use mempal::llm::retry::retry_llm_operation;

@@ -1,17 +1,20 @@
+#[cfg(feature = "integration")]
 mod common;
 
-use std::collections::HashMap;
 use std::fs;
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+#[cfg(feature = "integration")]
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
+#[cfg(feature = "integration")]
 use axum::{Json, Router, routing::get};
+#[cfg(feature = "integration")]
 use common::harness::McpStdio;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
 use mempal::core::queue::{PendingMessageStore, QueueConfig};
 use mempal::mcp::MempalMcpServer;
+#[cfg(feature = "integration")]
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -47,6 +50,7 @@ db_path = "{}"
     (tmp, db_path, config)
 }
 
+#[cfg(feature = "integration")]
 async fn spawn_models_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let app = Router::new().route(
         "/v1/models",
@@ -62,6 +66,7 @@ async fn spawn_models_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
+#[cfg(feature = "integration")]
 async fn call_mcp_status(client: &mut McpStdio) -> Value {
     let result = match tokio::time::timeout(
         Duration::from_secs(5),
@@ -121,6 +126,7 @@ async fn test_mcp_status_surfaces_queue_stats() {
     assert!(response.queue_stats.oldest_pending_age_secs.is_some());
 }
 
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn test_mcp_status_surfaces_endpoint_health() {
     let (_tmp, db_path) = setup_home();

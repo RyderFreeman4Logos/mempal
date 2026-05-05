@@ -1,9 +1,12 @@
+#![cfg(feature = "integration")]
+
 mod common;
 
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[cfg(feature = "integration")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
@@ -855,6 +858,7 @@ fn test_status_escapes_project_id_with_control_chars() {
     );
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn test_project_migrate_batched_does_not_block_ingest() {
     let _guard = home_guard();

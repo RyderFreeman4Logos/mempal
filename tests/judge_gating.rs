@@ -1098,6 +1098,7 @@ fn test_load_gating_audit_falls_back_to_explain_json_for_default_row() {
     assert!(!stdout.contains("unlabeled=1"), "{stdout}");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn test_llm_judge_section_no_longer_warns() {
     let _guard = test_guard_blocking();

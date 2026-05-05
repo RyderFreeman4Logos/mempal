@@ -36,17 +36,19 @@ fmt:
 clippy:
     cargo clippy --all-features --all-targets -- -D warnings
 
-# All tests (default features + `rest`; `onnx` intentionally excluded — the
-# bundled onnxruntime C++ libs reference `__isoc23_strtoull`, which mold on
-# this host fails to resolve. `just test-onnx` is an opt-in for runs where
-# that toolchain is fixed.)
+# Fast test tier for pre-commit. Slow endpoint and long-running migration tests
+# are behind the `integration` feature.
 test:
-    cargo test --features rest
+    cargo test
+
+# Full test tier, including integration-gated endpoint and long-running tests.
+test-all:
+    cargo test --features integration
 
 # Tests matching a pattern.
 # Usage: just test-f name
 test-f pattern:
-    cargo test --features rest {{pattern}}
+    cargo test {{pattern}}
 
 # ONNX feature test (opt-in; may fail due to mold linker `__isoc23_strtoull`).
 test-onnx:

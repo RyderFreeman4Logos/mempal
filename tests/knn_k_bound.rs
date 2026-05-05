@@ -1,3 +1,5 @@
+#![cfg(feature = "integration")]
+
 //! Integration test for issue #58: sqlite-vec KNN k must not exceed 4096.
 //!
 //! Populates a database with >4096 drawers + vectors, then runs

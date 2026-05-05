@@ -1,8 +1,11 @@
 use std::fs;
+#[cfg(feature = "integration")]
 use std::io::{Read, Write};
+#[cfg(feature = "integration")]
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(feature = "integration")]
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,6 +52,7 @@ db_path = "{}"
     (tmp, db_path)
 }
 
+#[cfg(feature = "integration")]
 fn setup_home_with_status_endpoints(base_url: &str) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("tempdir");
     let mempal_home = tmp.path().join(".mempal");
@@ -82,6 +86,7 @@ model = "llm-test"
     (tmp, db_path)
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn test_status_command_shows_endpoint_health() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
