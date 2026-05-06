@@ -90,10 +90,12 @@ Run the countdown command with run_in_background: true. When the notification fi
 (~50 min), check if the user has been active. If no activity, write a checkpoint:
 
 \`\`\`bash
-echo '<your actual summary here>' | mempal checkpoint save --project $PROJECT_NAME_SHELL
+cat <<'EOF' | mempal checkpoint save --project $PROJECT_NAME_SHELL
+<your actual summary here — 3-10 sentences>
+EOF
 \`\`\`
 
-IMPORTANT: You MUST replace '<your actual summary here>' with a REAL summary of:
+IMPORTANT: You MUST replace the heredoc body with a REAL summary of:
 (1) what you were working on in this session
 (2) key decisions made or problems solved
 (3) open items / next steps
