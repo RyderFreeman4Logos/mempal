@@ -341,6 +341,7 @@ fn build_gating_candidate(
 
     IngestCandidate {
         content: analysis_content(&record.content).to_string(),
+        event: Some(envelope.event.clone()),
         tool_name,
         exit_code,
     }

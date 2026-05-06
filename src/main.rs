@@ -1779,6 +1779,7 @@ async fn ingest_stdin_command(
     if !options.no_gate {
         let candidate = IngestCandidate {
             content: content.clone(),
+            event: None,
             tool_name: None,
             exit_code: None,
         };

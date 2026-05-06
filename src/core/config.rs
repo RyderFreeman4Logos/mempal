@@ -914,14 +914,43 @@ pub struct ProjectConfig {
     pub id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct IngestGatingConfig {
     pub enabled: bool,
+    #[serde(default = "default_tier1_skip_events")]
+    pub tier1_skip_events: Vec<String>,
     pub rules: Vec<GatingRuleConfig>,
     pub embedding_classifier: EmbeddingClassifierConfig,
     pub novelty: NoveltyConfig,
     pub llm_judge: Option<LlmJudgeConfig>,
+}
+
+impl Default for IngestGatingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tier1_skip_events: default_tier1_skip_events(),
+            rules: Vec::new(),
+            embedding_classifier: EmbeddingClassifierConfig::default(),
+            novelty: NoveltyConfig::default(),
+            llm_judge: None,
+        }
+    }
+}
+
+fn default_tier1_skip_events() -> Vec<String> {
+    [
+        "bash_tool",
+        "Bash",
+        "edit_tool",
+        "Edit",
+        "apply_patch",
+        "ApplyPatch",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -973,7 +1002,7 @@ impl Default for EmbeddingClassifierConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            threshold: 0.35,
+            threshold: 0.55,
             prototypes: Vec::new(),
         }
     }

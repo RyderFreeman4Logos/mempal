@@ -367,6 +367,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         if let Some(gating) = options.gating {
             let candidate = gating::IngestCandidate {
                 content: chunk.to_string(),
+                event: None,
                 tool_name: None,
                 exit_code: None,
             };
