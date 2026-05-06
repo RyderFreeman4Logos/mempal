@@ -129,6 +129,15 @@ impl EmbedError {
                 | Self::ReadApiKeyEnv { .. }
         )
     }
+
+    pub fn endpoint(&self) -> Option<&str> {
+        match self {
+            Self::HttpRequest { endpoint, .. }
+            | Self::HttpStatus { endpoint, .. }
+            | Self::DecodeResponse { endpoint, .. } => Some(endpoint.as_str()),
+            _ => None,
+        }
+    }
 }
 
 #[async_trait::async_trait]

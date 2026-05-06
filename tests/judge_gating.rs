@@ -1157,7 +1157,12 @@ fn test_tier1_skips_read_tool() {
     )
     .expect("tier1 decision");
     env.db()
-        .record_gating_audit("read-tool-candidate", &decision, None)
+        .record_gating_audit(
+            "read-tool-candidate",
+            &decision,
+            None,
+            Some("long enough content to hit tool rule"),
+        )
         .expect("record gating audit");
     let rows = gating_rows(&env.db());
 

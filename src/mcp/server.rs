@@ -1784,8 +1784,13 @@ impl MempalMcpServer {
         if let Some(decision) = gating_decision.as_ref()
             && decision.is_rejected()
         {
-            db.record_gating_audit(&drawer_id, decision, project_id.as_deref())
-                .map_err(db_error)?;
+            db.record_gating_audit(
+                &drawer_id,
+                decision,
+                project_id.as_deref(),
+                Some(&candidate.content),
+            )
+            .map_err(db_error)?;
             return Ok(Json(IngestResponse {
                 drawer_id,
                 drawer_ids: Vec::new(),
@@ -1853,14 +1858,24 @@ impl MempalMcpServer {
                 if llm_judge_active && is_unclassified {
                     let llm_decision =
                         GatingDecision::accepted(0, Some("llm_pending".to_string()), None);
-                    db.record_gating_audit(&drawer_id, &llm_decision, project_id.as_deref())
-                        .map_err(db_error)?;
+                    db.record_gating_audit(
+                        &drawer_id,
+                        &llm_decision,
+                        project_id.as_deref(),
+                        Some(&candidate.content),
+                    )
+                    .map_err(db_error)?;
                     gating_audit_recorded = true;
                     gating_decision = Some(llm_decision);
                     should_enqueue_llm_task = true;
                 } else {
-                    db.record_gating_audit(&drawer_id, &tier2.decision, project_id.as_deref())
-                        .map_err(db_error)?;
+                    db.record_gating_audit(
+                        &drawer_id,
+                        &tier2.decision,
+                        project_id.as_deref(),
+                        Some(&candidate.content),
+                    )
+                    .map_err(db_error)?;
                     gating_audit_recorded = true;
                     gating_decision = Some(tier2.decision);
                 }
@@ -1890,8 +1905,13 @@ impl MempalMcpServer {
             }));
         }
         if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
-            db.record_gating_audit(&drawer_id, decision, project_id.as_deref())
-                .map_err(db_error)?;
+            db.record_gating_audit(
+                &drawer_id,
+                decision,
+                project_id.as_deref(),
+                Some(&candidate.content),
+            )
+            .map_err(db_error)?;
         }
 
         let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();

@@ -2,9 +2,9 @@
 // harness-point: PR0 — re-export MigrationHook trait + hooked migration runner for tests
 pub use db_fork_ext::{
     CURRENT_FORK_EXT_VERSION, FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL,
-    FORK_EXT_V3_SCHEMA_SQL, FORK_EXT_V13_SCHEMA_SQL, MigrationHook, apply_fork_ext_migrations,
-    apply_fork_ext_migrations_to, apply_fork_ext_migrations_with_hook, read_fork_ext_version,
-    set_fork_ext_version,
+    FORK_EXT_V3_SCHEMA_SQL, FORK_EXT_V13_SCHEMA_SQL, FORK_EXT_V14_SCHEMA_SQL, MigrationHook,
+    apply_fork_ext_migrations, apply_fork_ext_migrations_to, apply_fork_ext_migrations_with_hook,
+    read_fork_ext_version, set_fork_ext_version,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -39,12 +39,23 @@ use crate::ingest::novelty::NoveltyAction;
 
 const CURRENT_SCHEMA_VERSION: u32 = 9;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
+const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
 const CONTENT_HASH_BACKFILL_BATCH: usize = 1_000;
 
 fn content_hash_hex(content: &str) -> String {
     blake3::hash(content.as_bytes()).to_hex().to_string()
 }
+
+fn truncate_preview(content: &str, max_chars: usize) -> String {
+    let mut chars = content.chars();
+    let mut preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
 const DRAWER_SELECT_COLUMNS: &str = r#"
     id,
     content,
@@ -329,12 +340,13 @@ impl Database {
         candidate_hash: &str,
         decision: &GatingDecision,
         project_id: Option<&str>,
+        content: Option<&str>,
     ) -> Result<(), DbError> {
         let explain_json = serde_json::to_string(decision)?;
         let created_at = super::utils::current_timestamp()
             .parse::<i64>()
             .unwrap_or_default();
-        let retained_until = created_at + 7 * 24 * 60 * 60;
+        let retained_until = created_at + AUDIT_RETENTION_SECS;
         let unique_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
@@ -350,6 +362,10 @@ impl Database {
             "keep"
         };
         let drawer_id = (!decision.is_rejected()).then_some(candidate_hash);
+        let content_preview = decision
+            .is_rejected()
+            .then(|| content.map(|text| truncate_preview(text, 500)))
+            .flatten();
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<(), DbError> {
             self.conn.execute(
@@ -366,9 +382,10 @@ impl Database {
                     explain_json,
                     retained_until,
                     created_at,
-                    project_id
+                    project_id,
+                    content_preview
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 "#,
                 params![
                     id,
@@ -383,6 +400,7 @@ impl Database {
                     retained_until,
                     created_at,
                     project_id,
+                    content_preview.as_deref(),
                 ],
             )?;
             if let Some(reason) = decision.drop_reason() {
@@ -401,6 +419,67 @@ impl Database {
                 Err(error)
             }
         }
+    }
+
+    pub fn record_embed_failure(
+        &self,
+        error_message: &str,
+        endpoint: Option<&str>,
+        consecutive_failures: u64,
+        duration_ms: Option<u64>,
+    ) -> Result<(), DbError> {
+        let timestamp = super::utils::current_timestamp()
+            .parse::<i64>()
+            .unwrap_or_default();
+        let retained_until = timestamp + AUDIT_RETENTION_SECS;
+        let unique_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let id_seed = format!("{timestamp}:{unique_nanos}:{consecutive_failures}:{error_message}");
+        let id = format!(
+            "embed_failure_{}",
+            blake3::hash(id_seed.as_bytes()).to_hex()
+        );
+        self.conn.execute(
+            r#"
+            INSERT INTO embed_failure_log (
+                id,
+                timestamp,
+                error_message,
+                endpoint,
+                consecutive_failures,
+                duration_ms,
+                retained_until
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                id,
+                timestamp,
+                error_message,
+                endpoint,
+                i64::try_from(consecutive_failures).unwrap_or(i64::MAX),
+                duration_ms.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+                retained_until,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_expired_audit_logs(&self) -> Result<(), DbError> {
+        let now = super::utils::current_timestamp()
+            .parse::<i64>()
+            .unwrap_or_default();
+        self.conn.execute(
+            "DELETE FROM gating_audit WHERE retained_until < ?1",
+            params![now],
+        )?;
+        self.conn.execute(
+            "DELETE FROM embed_failure_log WHERE retained_until < ?1",
+            params![now],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_llm_verdict(

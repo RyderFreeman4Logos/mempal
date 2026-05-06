@@ -15,11 +15,14 @@ where
     Fut: Future<Output = Result<Vec<Vec<f32>>>>,
 {
     loop {
+        let attempt_started = tokio::time::Instant::now();
         match operation().await {
             Ok(vectors) => return Ok(vectors),
             Err(error) => {
                 let config = status.retry_config_snapshot();
-                status.record_failure_with_snapshot(&error, &config);
+                let duration_ms = attempt_started.elapsed().as_millis();
+                let duration_ms = u64::try_from(duration_ms).unwrap_or(u64::MAX);
+                status.record_failure_with_snapshot(&error, &config, Some(duration_ms));
                 if !error.is_retryable() {
                     return Err(error);
                 }

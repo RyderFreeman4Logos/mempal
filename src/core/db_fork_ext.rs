@@ -14,7 +14,24 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 13;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 14;
+
+pub const FORK_EXT_V14_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS embed_failure_log (
+    id TEXT PRIMARY KEY,
+    timestamp INTEGER NOT NULL,
+    error_message TEXT NOT NULL,
+    endpoint TEXT,
+    consecutive_failures INTEGER,
+    duration_ms INTEGER,
+    retained_until INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_embed_failure_log_timestamp
+    ON embed_failure_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_embed_failure_log_retained_until
+    ON embed_failure_log(retained_until);
+"#;
 
 pub const FORK_EXT_V13_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS skills (
@@ -283,6 +300,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 13,
             up: apply_v13,
         },
+        Migration {
+            version: 14,
+            up: apply_v14,
+        },
     ]
 }
 
@@ -383,6 +404,11 @@ fn apply_v13(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V13_SCHEMA_SQL)
 }
 
+fn apply_v14(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V14_SCHEMA_SQL)?;
+    ensure_gating_audit_content_preview_column(conn)
+}
+
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {
     // Each ALTER TABLE must succeed idempotently — use ensure_* helpers.
     ensure_nullable_column(conn, "drawers", "last_accessed_at", "INTEGER")?;
@@ -457,6 +483,21 @@ fn ensure_gating_audit_llm_columns(conn: &Connection) -> rusqlite::Result<()> {
         (true, true) => {}
     }
     Ok(())
+}
+
+fn ensure_gating_audit_content_preview_column(conn: &Connection) -> rusqlite::Result<()> {
+    if conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gating_audit'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+        == 0
+    {
+        return Ok(());
+    }
+
+    ensure_nullable_column(conn, "gating_audit", "content_preview", "TEXT")
 }
 
 fn backfill_gating_audit_from_explain_json(conn: &Connection) -> rusqlite::Result<()> {

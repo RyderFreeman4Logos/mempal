@@ -1733,7 +1733,7 @@ async fn ingest_stdin_command(
             gating_decision = Some(tier2.decision);
         }
         if let Some(decision) = gating_decision.as_ref() {
-            db.record_gating_audit(&drawer_id, decision, project_id.as_deref())
+            db.record_gating_audit(&drawer_id, decision, project_id.as_deref(), Some(&content))
                 .with_context(|| format!("failed to record gating audit for {drawer_id}"))?;
             if decision.is_rejected() {
                 stats.dropped_by_gate = 1;

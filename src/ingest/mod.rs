@@ -384,7 +384,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
                 gating_decision = Some(tier2.decision);
             }
             if let Some(decision) = gating_decision.as_ref() {
-                db.record_gating_audit(&drawer_id, decision, options.project_id)
+                db.record_gating_audit(&drawer_id, decision, options.project_id, Some(chunk))
                     .map_err(|source| IngestError::InsertDrawer {
                         drawer_id: drawer_id.clone(),
                         source,

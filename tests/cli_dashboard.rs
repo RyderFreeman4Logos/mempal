@@ -144,8 +144,13 @@ fn record_gating_audit(db_path: &Path, drawer_id: &str, accepted: bool) {
     } else {
         GatingDecision::rejected(1, Some("drop".to_string()), None, None)
     };
-    db.record_gating_audit(drawer_id, &decision, None)
-        .expect("record gating audit");
+    db.record_gating_audit(
+        drawer_id,
+        &decision,
+        None,
+        Some("dashboard audit candidate"),
+    )
+    .expect("record gating audit");
 }
 
 fn record_novelty_audit(db_path: &Path, drawer_id: &str, action: NoveltyAction, created_at: i64) {
