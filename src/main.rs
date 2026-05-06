@@ -382,17 +382,8 @@ enum Commands {
         raw: bool,
     },
     Audit {
-        #[arg(long)]
-        kind: Option<String>,
-        #[arg(
-            long,
-            help = "Filter to audit records created after this point. \
-                    Duration: '10s', '15m', '2h', '3d'. \
-                    ISO 8601: '2026-04-25T20:00:00Z' or '2026-04-25T20:00:00+08:00'."
-        )]
-        since: Option<String>,
-        #[arg(long, default_value_t = false)]
-        raw: bool,
+        #[command(subcommand)]
+        command: Option<AuditCommands>,
         /// List drawers whose effective_importance is below this threshold (P13).
         #[arg(long, default_value_t = false)]
         stale: bool,
@@ -513,6 +504,52 @@ enum CheckpointCommands {
         /// Only show the last N assistant messages. Default: 1.
         #[arg(long, default_value_t = 1)]
         last: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditCommands {
+    /// Show gating decisions (keep/skip) with optional filters.
+    Gating {
+        /// Filter by decision: keep or skip.
+        #[arg(long)]
+        decision: Option<String>,
+        /// Filter by time: '10m', '2h', '24h', '3d'.
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter by project ID.
+        #[arg(long)]
+        project: Option<String>,
+        /// Output format: text (default) or json.
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Show raw (unescaped) text in text format.
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// Show embedding failure logs.
+    Embed {
+        /// Filter by time: '10m', '2h', '24h', '3d'.
+        #[arg(long)]
+        since: Option<String>,
+        /// Output format: text (default) or json.
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Show raw (unescaped) text in text format.
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// Show novelty (de-duplication) decisions.
+    Novelty {
+        /// Filter by time: '10m', '2h', '24h', '3d'.
+        #[arg(long)]
+        since: Option<String>,
+        /// Output format: text (default) or json.
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Show raw (unescaped) text in text format.
+        #[arg(long, default_value_t = false)]
+        raw: bool,
     },
 }
 
@@ -1293,24 +1330,50 @@ fn run() -> Result<()> {
             },
         ),
         Commands::Audit {
-            kind,
-            since,
-            raw,
+            command,
             stale,
             threshold,
         } => {
             if stale {
                 audit_stale_command(&db, threshold)
-            } else {
-                observability::audit_command(
-                    &db,
-                    config.as_ref(),
-                    observability::AuditOptions {
-                        kind: kind.as_deref(),
-                        since: since.as_deref(),
+            } else if let Some(cmd) = command {
+                match cmd {
+                    AuditCommands::Gating {
+                        decision,
+                        since,
+                        project,
+                        format,
                         raw,
-                    },
-                )
+                    } => observability::audit_gating_command(
+                        &db,
+                        config.as_ref(),
+                        decision,
+                        since.as_deref(),
+                        project.as_deref(),
+                        &format,
+                        raw,
+                    ),
+                    AuditCommands::Embed { since, format, raw } => {
+                        observability::audit_embed_command(
+                            &db,
+                            config.as_ref(),
+                            since.as_deref(),
+                            &format,
+                            raw,
+                        )
+                    }
+                    AuditCommands::Novelty { since, format, raw } => {
+                        observability::audit_novelty_command(
+                            &db,
+                            config.as_ref(),
+                            since.as_deref(),
+                            &format,
+                            raw,
+                        )
+                    }
+                }
+            } else {
+                bail!("`mempal audit` requires a subcommand (gating, embed, novelty) or --stale");
             }
         }
         Commands::RecomputeImportance => recompute_effective_importance_command(&db),
@@ -1733,7 +1796,7 @@ async fn ingest_stdin_command(
             gating_decision = Some(tier2.decision);
         }
         if let Some(decision) = gating_decision.as_ref() {
-            db.record_gating_audit(&drawer_id, decision, project_id.as_deref())
+            db.record_gating_audit(&drawer_id, decision, project_id.as_deref(), Some(&content))
                 .with_context(|| format!("failed to record gating audit for {drawer_id}"))?;
             if decision.is_rejected() {
                 stats.dropped_by_gate = 1;

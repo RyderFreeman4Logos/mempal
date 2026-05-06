@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arc_swap::{ArcSwap, ArcSwapOption};
 
 use crate::core::config::ConfigHandle;
+use crate::core::db::Database;
 
 use super::alerting;
 
@@ -46,6 +47,7 @@ pub struct EmbedStatus {
     last_error: ArcSwapOption<String>,
     last_success_at_unix_ms: AtomicU64,
     fallback_warning: ArcSwapOption<String>,
+    audit_db_path: ArcSwapOption<PathBuf>,
 }
 
 impl Default for EmbedStatus {
@@ -73,6 +75,7 @@ impl EmbedStatus {
             last_error: ArcSwapOption::from(None),
             last_success_at_unix_ms: AtomicU64::new(0),
             fallback_warning: ArcSwapOption::from(None),
+            audit_db_path: ArcSwapOption::from(None),
         }
     }
 
@@ -134,13 +137,15 @@ impl EmbedStatus {
         if fail_count >= degrade_after {
             self.degraded.store(true, Ordering::SeqCst);
         }
+        self.persist_failure_event(&message, None, fail_count, None);
         self.maybe_fire_alert(fail_count, &message);
     }
 
     pub fn record_failure_with_snapshot(
         &self,
-        error: &impl std::fmt::Display,
+        error: &super::EmbedError,
         snapshot: &RetryConfigSnapshot,
+        duration_ms: Option<u64>,
     ) {
         let message = crate::core::config::scrub_sensitive_text(&error.to_string());
         self.last_error
@@ -149,6 +154,10 @@ impl EmbedStatus {
         if fail_count >= snapshot.degrade_threshold {
             self.degraded.store(true, Ordering::SeqCst);
         }
+        let endpoint = error
+            .endpoint()
+            .map(crate::core::config::scrub_sensitive_text);
+        self.persist_failure_event(&message, endpoint.as_deref(), fail_count, duration_ms);
         self.maybe_fire_alert_with_snapshot(snapshot, fail_count, &message);
     }
 
@@ -222,6 +231,11 @@ impl EmbedStatus {
         self.last_error.store(None);
         self.last_success_at_unix_ms.store(0, Ordering::SeqCst);
         self.fallback_warning.store(None);
+        self.audit_db_path.store(None);
+    }
+
+    pub fn set_audit_db_path(&self, db_path: Option<PathBuf>) {
+        self.audit_db_path.store(db_path.map(std::sync::Arc::new));
     }
 
     fn maybe_fire_alert(&self, fail_count: u64, error_message: &str) {
@@ -254,6 +268,23 @@ impl EmbedStatus {
             return;
         };
         alerting::fire_alert(path, fail_count, error_message);
+    }
+
+    fn persist_failure_event(
+        &self,
+        error_message: &str,
+        endpoint: Option<&str>,
+        fail_count: u64,
+        duration_ms: Option<u64>,
+    ) {
+        let Some(db_path) = self.audit_db_path.load_full() else {
+            return;
+        };
+        if let Err(error) = Database::open(db_path.as_ref()).and_then(|db| {
+            db.record_embed_failure(error_message, endpoint, fail_count, duration_ms)
+        }) {
+            tracing::warn!(error = %error, "failed to persist embed failure audit log");
+        }
     }
 }
 

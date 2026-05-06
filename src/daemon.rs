@@ -52,6 +52,12 @@ pub fn run_command_with_bootstrap_events(
 }
 
 async fn run_loop(context: &DaemonContext) -> Result<()> {
+    global_embed_status().set_audit_db_path(Some(context.db.path().to_path_buf()));
+    context
+        .db
+        .prune_expired_audit_logs()
+        .context("failed to prune expired audit logs")?;
+
     if !context.config.hooks.enabled {
         eprintln!("hooks not enabled; daemon exiting without starting worker loop");
         return Ok(());
@@ -638,7 +644,12 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     {
         context
             .db
-            .record_gating_audit(&drawer_id, decision, record.project_id.as_deref())
+            .record_gating_audit(
+                &drawer_id,
+                decision,
+                record.project_id.as_deref(),
+                Some(&candidate.content),
+            )
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
         return Ok(drawer_id);
     }
@@ -675,7 +686,12 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         );
         context
             .db
-            .record_gating_audit(&drawer_id, &decision, record.project_id.as_deref())
+            .record_gating_audit(
+                &drawer_id,
+                &decision,
+                record.project_id.as_deref(),
+                Some(&candidate.content),
+            )
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
         gating_audit_recorded = true;
         if decision.is_rejected() {
@@ -687,7 +703,12 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
         context
             .db
-            .record_gating_audit(&drawer_id, decision, record.project_id.as_deref())
+            .record_gating_audit(
+                &drawer_id,
+                decision,
+                record.project_id.as_deref(),
+                Some(&candidate.content),
+            )
             .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
     }
 
