@@ -12,7 +12,7 @@ use crate::core::{
     project::resolve_project_id,
     queue::{ClaimedMessage, PendingMessageStore},
     types::{BootstrapEvidenceArgs, Drawer, SourceType},
-    utils::{current_timestamp, iso_timestamp, route_room_from_taxonomy, synthetic_source_file},
+    utils::{current_timestamp, route_room_from_taxonomy, synthetic_source_file},
 };
 use crate::embed::{
     EmbedError, Embedder, build_backend_from_name, global_embed_status,
@@ -368,6 +368,7 @@ struct DrawerRecord {
     room: String,
     source_file: String,
     content: String,
+    added_at: String,
     importance: i32,
     bypass_novelty: bool,
     project_id: Option<String>,
@@ -418,6 +419,7 @@ fn build_drawer_records(
                         room: review.room,
                         source_file: review.source_file,
                         content: config.scrub_content(&review.content),
+                        added_at: envelope.captured_at.clone(),
                         importance: review.importance,
                         bypass_novelty: true,
                         project_id,
@@ -484,6 +486,7 @@ fn build_user_prompt_project_record(
         room,
         source_file: audit_record.source_file.clone(),
         content,
+        added_at: audit_record.added_at.clone(),
         importance: 0,
         bypass_novelty: false,
         project_id,
@@ -559,6 +562,7 @@ fn build_audit_drawer_record(
             room: "truncated".to_string(),
             source_file,
             content,
+            added_at: envelope.captured_at.clone(),
             importance: 0,
             bypass_novelty: false,
             project_id,
@@ -592,6 +596,7 @@ fn build_audit_drawer_record(
         room,
         source_file: payload_path,
         content,
+        added_at: envelope.captured_at.clone(),
         importance: 0,
         bypass_novelty: false,
         project_id,
@@ -973,7 +978,7 @@ fn insert_drawer_with_vector(
         room: Some(record.room.clone()),
         source_file: Some(record.source_file.clone()),
         source_type: SourceType::Conversation,
-        added_at: iso_timestamp(),
+        added_at: record.added_at.clone(),
         chunk_index: Some(0),
         importance: record.importance,
     });
@@ -1196,9 +1201,18 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::core::queue::{ClaimedMessage, QueueError};
+    use crate::core::{
+        config::Config,
+        db::Database,
+        queue::{ClaimedMessage, PendingMessageStore, QueueError},
+    };
+    use crate::embed::Embedder;
+    use crate::hook::{CapturedHookEnvelope, HookEvent};
 
-    use super::{ClaimNextSource, ClaimPollResult, poll_claim_next};
+    use super::{
+        ClaimNextSource, ClaimPollResult, DaemonIngestContext, poll_claim_next,
+        process_claimed_message_with_embedder,
+    };
 
     struct StubClaimSource {
         responses: Mutex<VecDeque<Result<Option<ClaimedMessage>, QueueError>>>,
@@ -1267,5 +1281,86 @@ mod tests {
                 panic!("expected claimed message on retry")
             }
         }
+    }
+
+    struct StaticEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for StaticEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "static-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_daemon_uses_envelope_captured_at_for_drawer_added_at() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let captured_at = "2026-05-01T12:34:56Z";
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "date",
+            "output": "Fri May  1 12:34:56 UTC 2026",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: captured_at.to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        let queued_id = store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("timestamp-test-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+        assert_eq!(message.id, queued_id);
+
+        let mut config = Config::default();
+        config.project.id = Some("timestamp-test".to_string());
+        process_claimed_message_with_embedder(
+            &db,
+            &store,
+            "timestamp-test-worker",
+            &message,
+            &StaticEmbedder,
+            DaemonIngestContext {
+                prototype_classifier: None,
+                config: &config,
+                mempal_home: tmp.path(),
+            },
+        )
+        .await
+        .expect("process hook envelope");
+
+        let added_at: String = db
+            .conn()
+            .query_row(
+                "SELECT added_at FROM drawers WHERE room = 'Bash' AND deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query drawer added_at");
+        assert_eq!(added_at, captured_at);
     }
 }
