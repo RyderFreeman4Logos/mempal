@@ -634,3 +634,65 @@ fn test_hook_install_codex_no_warning_when_feature_enabled() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("warning: Codex hook runtime (codex_hooks) is currently disabled"));
 }
+
+#[test]
+fn test_hook_install_removes_legacy_aliases() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(cwd.join(".claude")).expect("create local .claude");
+    fs::create_dir_all(&home).expect("create home");
+
+    // Seed with a legacy hook command
+    let legacy_cmd = "/usr/local/bin/mempal hook hook_post_tool";
+    fs::write(
+        cwd.join(".claude/settings.json"),
+        json!({
+          "hooks": {
+            "PostToolUse": [{
+              "hooks": [{
+                "type": "command",
+                "command": legacy_cmd
+              }]
+            }]
+          }
+        })
+        .to_string(),
+    )
+    .expect("write seed settings");
+
+    let outcome = install_claude_code(&cwd, &home, false, false).expect("install");
+    let parsed = parse_json(&outcome.write_path);
+
+    let entries = parsed["hooks"]["PostToolUse"].as_array().expect("array");
+    // Should have only 1 entry (the new one), legacy should be gone
+    assert_eq!(entries.len(), 1);
+    let command = entries[0]["hooks"][0]["command"].as_str().expect("command");
+    assert_ne!(command, legacy_cmd);
+    assert_eq!(command, expected_hook_command("PostToolUse"));
+    assert_eq!(outcome.removed_commands, 1);
+}
+
+#[test]
+fn test_hook_install_codex_no_warning_when_feature_enabled_in_section() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(home.join(".codex")).expect("create .codex");
+    fs::write(
+        home.join(".codex/config.toml"),
+        "[features]\ncodex_hooks = true",
+    )
+    .expect("enable hooks");
+
+    let output = Command::new(mempal_bin())
+        .args(["hook", "install", "--target", "codex"])
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .output()
+        .expect("install codex");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("warning: Codex hook runtime (codex_hooks) is currently disabled"));
+}

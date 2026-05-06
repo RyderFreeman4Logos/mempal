@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 const CLAUDE_SETTINGS_RELATIVE: &str = ".claude/settings.json";
@@ -20,6 +21,12 @@ const HOOK_COMMAND_EVENTS: [(&str, &str); 4] = [
     ("UserPromptSubmit", "UserPromptSubmit"),
     ("SessionStart", "SessionStart"),
     ("SessionEnd", "SessionEnd"),
+];
+const LEGACY_ALIASES: [(&str, &str); 4] = [
+    ("hook_post_tool", "PostToolUse"),
+    ("hook_user_prompt", "UserPromptSubmit"),
+    ("hook_session_start", "SessionStart"),
+    ("hook_session_end", "SessionEnd"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -324,20 +331,21 @@ fn check_codex_feature_flag(home: &Path) -> Result<()> {
     let mut enabled = false;
 
     if path.exists() {
-        let content = fs::read_to_string(&path).unwrap_or_default();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            // Match both "codex_hooks = true" and "[features]\ncodex_hooks = true"
-            if (trimmed.starts_with("codex_hooks") || trimmed.starts_with("\"codex_hooks\""))
-                && trimmed.contains('=')
-            {
-                if let Some(val) = trimmed.split('=').nth(1) {
-                    if val.trim() == "true" {
-                        enabled = true;
-                        break;
-                    }
-                }
-            }
+        let content = fs::read_to_string(&path).context("failed to read Codex config")?;
+
+        #[derive(Deserialize)]
+        struct CodexConfig {
+            codex_hooks: Option<bool>,
+            features: Option<CodexFeatures>,
+        }
+        #[derive(Deserialize)]
+        struct CodexFeatures {
+            codex_hooks: Option<bool>,
+        }
+
+        if let Ok(config) = toml::from_str::<CodexConfig>(&content) {
+            enabled = config.codex_hooks.unwrap_or(false)
+                || config.features.and_then(|f| f.codex_hooks).unwrap_or(false);
         }
     }
 
@@ -558,12 +566,38 @@ fn ensure_hook_event_array<'a>(
 }
 
 fn entry_contains_command(entry: &Value, expected: &str) -> bool {
-    entry
-        .get("hooks")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|hook| hook.get("command").and_then(Value::as_str) == Some(expected))
+    let hooks = match entry.get("hooks").and_then(Value::as_array) {
+        Some(h) => h,
+        None => return false,
+    };
+
+    hooks.iter().any(|hook| {
+        let cmd = match hook.get("command").and_then(Value::as_str) {
+            Some(c) => c,
+            None => return false,
+        };
+
+        if cmd == expected {
+            return true;
+        }
+
+        // Check for aliases. Both cmd and expected should share the same
+        // '.../mempal hook ' prefix for us to consider them related.
+        if let (Some((_base_cmd, sub_cmd)), Some((_base_expected, sub_expected))) =
+            (cmd.rsplit_once(" hook "), expected.rsplit_once(" hook "))
+        {
+            if sub_cmd == sub_expected {
+                return true;
+            }
+            for (old, new) in LEGACY_ALIASES {
+                if sub_expected == new && sub_cmd == old {
+                    return true;
+                }
+            }
+        }
+
+        false
+    })
 }
 
 fn is_symlink(path: &Path) -> Result<bool> {
