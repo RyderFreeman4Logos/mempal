@@ -83,14 +83,24 @@ before KV cache expires (1h TTL), run this background countdown:
 
 \`\`\`bash
 export MEMPAL_CHECKPOINT_LOCKFILE=$LOCKFILE_SHELL
-export MEMPAL_CHECKPOINT_PROJECT=$PROJECT_NAME_SHELL
-bash -lc 'trap '\''rmdir "\$MEMPAL_CHECKPOINT_LOCKFILE" 2>/dev/null || true'\'' EXIT; sleep 3000; mempal checkpoint save --project "\$MEMPAL_CHECKPOINT_PROJECT" --content "Session checkpoint auto-saved. Summarize current work state here."'
+bash -lc 'trap '\''rmdir "\$MEMPAL_CHECKPOINT_LOCKFILE" 2>/dev/null || true'\'' EXIT; sleep 3000; echo "CHECKPOINT_TIMER_FIRED"'
 \`\`\`
 
 Run the countdown command with run_in_background: true. When the notification fires
-(~50 min), check if the user has been active. If no activity, write a checkpoint
-summarizing: (1) what you were working on, (2) key decisions made, (3) next steps.
-The write itself generates tokens that refresh the KV cache.
+(~50 min), check if the user has been active. If no activity, write a checkpoint:
+
+\`\`\`bash
+echo '<your actual summary here>' | mempal checkpoint save --project $PROJECT_NAME_SHELL
+\`\`\`
+
+IMPORTANT: You MUST replace '<your actual summary here>' with a REAL summary of:
+(1) what you were working on in this session
+(2) key decisions made or problems solved
+(3) open items / next steps
+DO NOT pass placeholder text. The summary should be 3-10 sentences that let a
+future session resume without re-reading the full conversation.
+
+The checkpoint write generates tokens that refresh the KV cache.
 
 CHECKPOINT_PROMPT
 PROMPT_EMITTED=1
