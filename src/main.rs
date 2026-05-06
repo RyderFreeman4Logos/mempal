@@ -514,6 +514,9 @@ enum AuditCommands {
         /// Filter by decision: keep or skip.
         #[arg(long)]
         decision: Option<String>,
+        /// Filter by LLM verdict: keep or reject.
+        #[arg(long)]
+        llm_verdict: Option<String>,
         /// Filter by time: '10m', '2h', '24h', '3d'.
         #[arg(long)]
         since: Option<String>,
@@ -1340,6 +1343,7 @@ fn run() -> Result<()> {
                 match cmd {
                     AuditCommands::Gating {
                         decision,
+                        llm_verdict,
                         since,
                         project,
                         format,
@@ -1347,11 +1351,14 @@ fn run() -> Result<()> {
                     } => observability::audit_gating_command(
                         &db,
                         config.as_ref(),
-                        decision,
-                        since.as_deref(),
-                        project.as_deref(),
-                        &format,
-                        raw,
+                        observability::GatingAuditOptions {
+                            decision_filter: decision,
+                            llm_verdict_filter: llm_verdict,
+                            since: since.as_deref(),
+                            project_filter: project.as_deref(),
+                            format: &format,
+                            raw,
+                        },
                     ),
                     AuditCommands::Embed { since, format, raw } => {
                         observability::audit_embed_command(
