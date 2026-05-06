@@ -11,6 +11,7 @@ use crate::core::project::{ProjectSearchScope, resolve_project_id};
 use crate::cowork::peek::{format_rfc3339, parse_rfc3339};
 use anyhow::{Context, Result, bail};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rusqlite::params;
 use serde::Serialize;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -46,6 +47,12 @@ pub struct ViewOptions<'a> {
 
 pub struct GatingStatsOptions<'a> {
     pub since: Option<&'a str>,
+}
+
+pub struct AuditCleanupOptions<'a> {
+    pub dry_run: bool,
+    pub score_threshold: f32,
+    pub wing_filter: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,6 +544,67 @@ pub fn audit_gating_command(
             }
         }
     }
+    Ok(())
+}
+
+pub fn audit_cleanup_command(db: &Database, options: AuditCleanupOptions<'_>) -> Result<()> {
+    let sql = r#"
+        SELECT d.id
+        FROM gating_audit a
+        JOIN drawers d ON d.id = COALESCE(a.drawer_id, a.candidate_hash)
+        WHERE a.decision = 'keep'
+          AND a.score < ?
+          AND d.wing = ?
+          AND d.deleted_at IS NULL
+    "#;
+
+    let mut stmt = db.conn().prepare(sql)?;
+    let drawer_ids: Vec<String> = stmt
+        .query_map(
+            params![options.score_threshold, options.wing_filter],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let count = drawer_ids.len();
+
+    if options.dry_run {
+        println!(
+            "(dry-run) found {} drawers to delete (score < {}, wing = {})",
+            count, options.score_threshold, options.wing_filter
+        );
+        for id in drawer_ids.iter().take(20) {
+            println!("  - {}", id);
+        }
+        if count > 20 {
+            println!("  ... and {} more", count - 20);
+        }
+    } else {
+        if count > 0 {
+            let update_sql = r#"
+                UPDATE drawers
+                SET deleted_at = datetime('now')
+                WHERE id IN (
+                    SELECT d.id
+                    FROM gating_audit a
+                    JOIN drawers d ON d.id = COALESCE(a.drawer_id, a.candidate_hash)
+                    WHERE a.decision = 'keep'
+                      AND a.score < ?
+                      AND d.wing = ?
+                      AND d.deleted_at IS NULL
+                )
+            "#;
+            db.conn().execute(
+                update_sql,
+                params![options.score_threshold, options.wing_filter],
+            )?;
+        }
+        println!(
+            "soft-deleted {} drawers (score < {}, wing = {})",
+            count, options.score_threshold, options.wing_filter
+        );
+    }
+
     Ok(())
 }
 

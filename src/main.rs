@@ -554,6 +554,18 @@ enum AuditCommands {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// Soft-delete low-confidence kept drawers.
+    Cleanup {
+        /// Show what would be deleted without actually deleting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Score threshold below which to delete (default 0.55).
+        #[arg(long)]
+        score_threshold: Option<f32>,
+        /// Filter by wing (default 'hooks-raw').
+        #[arg(long)]
+        wing: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1378,6 +1390,18 @@ fn run() -> Result<()> {
                             raw,
                         )
                     }
+                    AuditCommands::Cleanup {
+                        dry_run,
+                        score_threshold,
+                        wing,
+                    } => observability::audit_cleanup_command(
+                        &db,
+                        observability::AuditCleanupOptions {
+                            dry_run,
+                            score_threshold: score_threshold.unwrap_or(0.55),
+                            wing_filter: wing.as_deref().unwrap_or("hooks-raw"),
+                        },
+                    ),
                 }
             } else {
                 bail!("`mempal audit` requires a subcommand (gating, embed, novelty) or --stale");
