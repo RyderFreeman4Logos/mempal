@@ -1432,14 +1432,16 @@ fn run() -> Result<()> {
 }
 
 fn is_dashboard_command(command: &Commands) -> bool {
-    matches!(
-        command,
+    match command {
         Commands::Tail { .. }
-            | Commands::Timeline { .. }
-            | Commands::Stats { .. }
-            | Commands::View { .. }
-            | Commands::Audit { .. }
-    )
+        | Commands::Timeline { .. }
+        | Commands::Stats { .. }
+        | Commands::View { .. } => true,
+        Commands::Audit { command, .. } => {
+            !matches!(command, Some(AuditCommands::Cleanup { dry_run: false, .. }))
+        }
+        _ => false,
+    }
 }
 
 fn open_dashboard_database(path: &Path) -> Result<Database> {
