@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::config::ConfigHandle;
 use crate::core::db::Database;
 use crate::core::queue::PendingMessageStore;
+use crate::daemon_bootstrap::{DaemonWriteObserver, SharedDatabase};
 
 use super::client::{LlmClient, LlmError, LlmMessage, LlmRequest};
 use super::retry::{self, HeartbeatCallback};
@@ -35,7 +36,8 @@ pub async fn run_llm_worker(
     store: Arc<PendingMessageStore>,
     client: Arc<LlmClient>,
     status: Arc<LlmStatus>,
-    db_path: std::path::PathBuf,
+    db: SharedDatabase,
+    write_observer: DaemonWriteObserver,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static WORKER_INDEX: AtomicUsize = AtomicUsize::new(0);
@@ -100,10 +102,10 @@ pub async fn run_llm_worker(
             Ok(())
         });
 
-        let result = process_llm_task(
+        let result = process_llm_task_shared(
             &client,
             &status,
-            &db_path,
+            &db,
             &message.payload,
             &config,
             Some(heartbeat.as_ref()),
@@ -117,9 +119,11 @@ pub async fn run_llm_worker(
                 store
                     .confirm(&message_id)
                     .with_context(|| format!("failed to confirm LLM task {message_id}"))?;
+                write_observer.record_successful_write();
             }
             Err(error) => {
                 tracing::error!("LLM task {message_id} failed after {latency_ms}ms: {error}");
+                write_observer.record_error(error.to_string());
                 store
                     .mark_failed(&message_id, &error.to_string())
                     .with_context(|| format!("failed to mark_failed LLM task {message_id}"))?;
@@ -130,10 +134,10 @@ pub async fn run_llm_worker(
     Ok(())
 }
 
-pub async fn process_llm_task(
+async fn process_llm_task_shared(
     client: &LlmClient,
     status: &LlmStatus,
-    db_path: &std::path::Path,
+    db: &SharedDatabase,
     payload: &str,
     config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
@@ -142,7 +146,7 @@ pub async fn process_llm_task(
         serde_json::from_str(payload).context("failed to decode LLM task payload")?;
 
     match task.task_type.as_str() {
-        "gating" => process_gating_task(client, status, db_path, &task, config, heartbeat).await,
+        "gating" => process_gating_task(client, status, db, &task, config, heartbeat).await,
         other => anyhow::bail!("unknown LLM task type: {other}"),
     }
 }
@@ -150,11 +154,44 @@ pub async fn process_llm_task(
 async fn process_gating_task(
     client: &LlmClient,
     status: &LlmStatus,
-    db_path: &std::path::Path,
+    db: &SharedDatabase,
     task: &LlmTaskPayload,
     config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
 ) -> Result<()> {
+    let (verdict, score) = request_gating_verdict(client, status, task, config, heartbeat).await?;
+    let db = db.lock().await;
+    apply_gating_verdict(&db, task, config, &verdict, score)
+}
+
+pub async fn process_llm_task(
+    client: &LlmClient,
+    status: &LlmStatus,
+    db: &Database,
+    payload: &str,
+    config: &crate::core::config::Config,
+    heartbeat: Option<&HeartbeatCallback>,
+) -> Result<()> {
+    let task: LlmTaskPayload =
+        serde_json::from_str(payload).context("failed to decode LLM task payload")?;
+
+    match task.task_type.as_str() {
+        "gating" => {
+            let (verdict, score) =
+                request_gating_verdict(client, status, &task, config, heartbeat).await?;
+            apply_gating_verdict(db, &task, config, &verdict, score)
+        }
+        other => anyhow::bail!("unknown LLM task type: {other}"),
+    }
+}
+
+async fn request_gating_verdict(
+    client: &LlmClient,
+    status: &LlmStatus,
+    task: &LlmTaskPayload,
+    config: &crate::core::config::Config,
+    heartbeat: Option<&HeartbeatCallback>,
+) -> Result<(String, f64)> {
     let system_prompt = task
         .system_prompt
         .as_deref()
@@ -185,49 +222,56 @@ async fn process_gating_task(
     match response {
         Ok(response) => {
             status.record_success();
-            let (verdict, score) = parse_gating_verdict(&response.content);
-            let db = Database::open(db_path).context("failed to open database for LLM verdict")?;
-
-            // The gating_audit row exists only for the primary drawer_id (recorded during ingest
-            // before chunking). Record the verdict there; the remaining chunk IDs have no audit
-            // row and updating them would violate the NOT NULL explain_json constraint.
-            db.upsert_llm_verdict(&task.drawer_id, &verdict, Some(score))
-                .context("failed to upsert LLM verdict")?;
-
-            let threshold = config
-                .ingest_gating
-                .llm_judge
-                .as_ref()
-                .map(|judge| judge.threshold)
-                .unwrap_or(0.3);
-
-            if score < threshold {
-                // Resolve all drawer IDs: prefer the multi-chunk list when present,
-                // fall back to the single drawer_id for backward-compat queue tasks.
-                let all_ids: Vec<&str> = if task.drawer_ids.is_empty() {
-                    vec![task.drawer_id.as_str()]
-                } else {
-                    task.drawer_ids.iter().map(String::as_str).collect()
-                };
-                tracing::info!(
-                    drawer_ids = ?all_ids,
-                    score,
-                    threshold,
-                    "LLM rejected drawers, executing soft-delete for all chunks"
-                );
-                for id in &all_ids {
-                    db.soft_delete_drawer(id)
-                        .context("failed to soft-delete rejected drawer")?;
-                }
-            }
-
-            Ok(())
+            Ok(parse_gating_verdict(&response.content))
         }
         Err(error) => {
             status.record_failure(&error);
             Err(error).context("LLM gating request failed")
         }
     }
+}
+
+fn apply_gating_verdict(
+    db: &Database,
+    task: &LlmTaskPayload,
+    config: &crate::core::config::Config,
+    verdict: &str,
+    score: f64,
+) -> Result<()> {
+    // The gating_audit row exists only for the primary drawer_id (recorded during ingest
+    // before chunking). Record the verdict there; the remaining chunk IDs have no audit
+    // row and updating them would violate the NOT NULL explain_json constraint.
+    db.upsert_llm_verdict(&task.drawer_id, verdict, Some(score))
+        .context("failed to upsert LLM verdict")?;
+
+    let threshold = config
+        .ingest_gating
+        .llm_judge
+        .as_ref()
+        .map(|judge| judge.threshold)
+        .unwrap_or(0.3);
+
+    if score < threshold {
+        // Resolve all drawer IDs: prefer the multi-chunk list when present,
+        // fall back to the single drawer_id for backward-compat queue tasks.
+        let all_ids: Vec<&str> = if task.drawer_ids.is_empty() {
+            vec![task.drawer_id.as_str()]
+        } else {
+            task.drawer_ids.iter().map(String::as_str).collect()
+        };
+        tracing::info!(
+            drawer_ids = ?all_ids,
+            score,
+            threshold,
+            "LLM rejected drawers, executing soft-delete for all chunks"
+        );
+        for id in &all_ids {
+            db.soft_delete_drawer(id)
+                .context("failed to soft-delete rejected drawer")?;
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_gating_verdict(content: &str) -> (String, f64) {
