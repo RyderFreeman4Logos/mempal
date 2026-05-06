@@ -119,24 +119,26 @@ fn test_embed_status_records_failure_with_snapshot_to_db() {
 #[test]
 fn test_audit_cleanup_dry_run_does_not_delete() {
     let (_tmp, _db_path, db) = new_test_db();
+    let project_id = "test-project";
 
     // 1. Insert a drawer
     db.conn()
         .execute(
-            "INSERT INTO drawers (id, content, wing, source_type, added_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO drawers (id, content, wing, source_type, added_at, project_id) VALUES (?, ?, ?, ?, ?, ?)",
             params![
                 "d1",
                 "content 1",
                 "hooks-raw",
                 "project",
-                "2024-05-05T10:00:00Z"
+                "2024-05-05T10:00:00Z",
+                project_id
             ],
         )
         .expect("insert drawer 1");
 
     // 2. Insert corresponding gating audit entry (decision=keep, score=0.5)
     let decision = GatingDecision::accepted(1, Some("test".to_string()), Some(0.5));
-    db.record_gating_audit("h1", &decision, None, Some("content 1"))
+    db.record_gating_audit("h1", &decision, Some(project_id), Some("content 1"))
         .expect("record gating audit");
 
     // Fixup: record_gating_audit might not set drawer_id if it's not a merge.
@@ -154,7 +156,9 @@ fn test_audit_cleanup_dry_run_does_not_delete() {
         score_threshold: 0.55,
         wing_filter: "hooks-raw",
     };
-    mempal::observability::audit_cleanup_command(&db, options).expect("cleanup command");
+    let mut config = mempal::core::config::Config::default();
+    config.project.id = Some(project_id.to_string());
+    mempal::observability::audit_cleanup_command(&db, &config, options).expect("cleanup command");
 
     // 4. Verify drawer still exists (not deleted)
     let deleted_at: Option<String> = db
@@ -171,6 +175,7 @@ fn test_audit_cleanup_dry_run_does_not_delete() {
 #[test]
 fn test_audit_cleanup_soft_deletes_low_score_drawers() {
     let (_tmp, _db_path, db) = new_test_db();
+    let project_id = "test-project";
 
     // 1. Insert some drawers
     // d1: hooks-raw, score 0.5 (should be deleted)
@@ -178,44 +183,47 @@ fn test_audit_cleanup_soft_deletes_low_score_drawers() {
     // d3: other-wing, score 0.5 (should be kept)
     db.conn()
         .execute(
-            "INSERT INTO drawers (id, content, wing, source_type, added_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO drawers (id, content, wing, source_type, added_at, project_id) VALUES (?, ?, ?, ?, ?, ?)",
             params![
                 "d1",
                 "content 1",
                 "hooks-raw",
                 "project",
-                "2024-05-05T10:00:00Z"
+                "2024-05-05T10:00:00Z",
+                project_id
             ],
         )
         .expect("insert drawer 1");
     db.conn()
         .execute(
-            "INSERT INTO drawers (id, content, wing, source_type, added_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO drawers (id, content, wing, source_type, added_at, project_id) VALUES (?, ?, ?, ?, ?, ?)",
             params![
                 "d2",
                 "content 2",
                 "hooks-raw",
                 "project",
-                "2024-05-05T10:00:00Z"
+                "2024-05-05T10:00:00Z",
+                project_id
             ],
         )
         .expect("insert drawer 2");
     db.conn()
         .execute(
-            "INSERT INTO drawers (id, content, wing, source_type, added_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO drawers (id, content, wing, source_type, added_at, project_id) VALUES (?, ?, ?, ?, ?, ?)",
             params![
                 "d3",
                 "content 3",
                 "other-wing",
                 "project",
-                "2024-05-05T10:00:00Z"
+                "2024-05-05T10:00:00Z",
+                project_id
             ],
         )
         .expect("insert drawer 3");
 
     // 2. Insert corresponding gating audit entries
     let d1_audit = GatingDecision::accepted(1, Some("test".to_string()), Some(0.5));
-    db.record_gating_audit("h1", &d1_audit, None, Some("content 1"))
+    db.record_gating_audit("h1", &d1_audit, Some(project_id), Some("content 1"))
         .expect("record audit 1");
     db.conn()
         .execute(
@@ -225,7 +233,7 @@ fn test_audit_cleanup_soft_deletes_low_score_drawers() {
         .expect("update audit 1");
 
     let d2_audit = GatingDecision::accepted(1, Some("test".to_string()), Some(0.6));
-    db.record_gating_audit("h2", &d2_audit, None, Some("content 2"))
+    db.record_gating_audit("h2", &d2_audit, Some(project_id), Some("content 2"))
         .expect("record audit 2");
     db.conn()
         .execute(
@@ -235,7 +243,7 @@ fn test_audit_cleanup_soft_deletes_low_score_drawers() {
         .expect("update audit 2");
 
     let d3_audit = GatingDecision::accepted(1, Some("test".to_string()), Some(0.5));
-    db.record_gating_audit("h3", &d3_audit, None, Some("content 3"))
+    db.record_gating_audit("h3", &d3_audit, Some(project_id), Some("content 3"))
         .expect("record audit 3");
     db.conn()
         .execute(
@@ -250,7 +258,9 @@ fn test_audit_cleanup_soft_deletes_low_score_drawers() {
         score_threshold: 0.55,
         wing_filter: "hooks-raw",
     };
-    mempal::observability::audit_cleanup_command(&db, options).expect("cleanup command");
+    let mut config = mempal::core::config::Config::default();
+    config.project.id = Some(project_id.to_string());
+    mempal::observability::audit_cleanup_command(&db, &config, options).expect("cleanup command");
 
     // 4. Verify d1 is deleted
     let d1_deleted_at: Option<String> = db
@@ -284,4 +294,97 @@ fn test_audit_cleanup_soft_deletes_low_score_drawers() {
         )
         .expect("query d3 deleted_at");
     assert!(d3_deleted_at.is_none());
+}
+
+#[test]
+fn test_audit_cleanup_respects_project_isolation() {
+    let (_tmp, _db_path, db) = new_test_db();
+
+    // 1. Insert two drawers with different project_ids
+    // d1: project_id = 'A', wing = 'hooks-raw', score = 0.5
+    // d2: project_id = 'B', wing = 'hooks-raw', score = 0.5
+    db.conn()
+        .execute(
+            "INSERT INTO drawers (id, content, wing, source_type, added_at, project_id) VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                "d1",
+                "content 1",
+                "hooks-raw",
+                "project",
+                "2024-05-05T10:00:00Z",
+                "A"
+            ],
+        )
+        .expect("insert drawer 1");
+    db.conn()
+        .execute(
+            "INSERT INTO drawers (id, content, wing, source_type, added_at, project_id) VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                "d2",
+                "content 2",
+                "hooks-raw",
+                "project",
+                "2024-05-05T10:00:00Z",
+                "B"
+            ],
+        )
+        .expect("insert drawer 2");
+
+    // 2. Insert corresponding gating audit entries
+    let d1_audit = GatingDecision::accepted(1, Some("test".to_string()), Some(0.5));
+    db.record_gating_audit("h1", &d1_audit, None, Some("content 1"))
+        .expect("record audit 1");
+    db.conn()
+        .execute(
+            "UPDATE gating_audit SET drawer_id = 'd1', project_id = 'A' WHERE candidate_hash = 'h1'",
+            [],
+        )
+        .expect("update audit 1");
+
+    let d2_audit = GatingDecision::accepted(1, Some("test".to_string()), Some(0.5));
+    db.record_gating_audit("h2", &d2_audit, None, Some("content 2"))
+        .expect("record audit 2");
+    db.conn()
+        .execute(
+            "UPDATE gating_audit SET drawer_id = 'd2', project_id = 'B' WHERE candidate_hash = 'h2'",
+            [],
+        )
+        .expect("update audit 2");
+
+    // 3. Create a config with project_id = 'A'
+    let mut config = mempal::core::config::Config::default();
+    config.project.id = Some("A".to_string());
+
+    // 4. Run cleanup scoped to project A
+    let options = mempal::observability::AuditCleanupOptions {
+        dry_run: false,
+        score_threshold: 0.55,
+        wing_filter: "hooks-raw",
+    };
+    mempal::observability::audit_cleanup_command(&db, &config, options).expect("cleanup command");
+
+    // 5. Verify d1 is deleted
+    let d1_deleted_at: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT deleted_at FROM drawers WHERE id = ?",
+            params!["d1"],
+            |row| row.get(0),
+        )
+        .expect("query d1 deleted_at");
+    assert!(d1_deleted_at.is_some());
+
+    // 6. Verify d2 is NOT deleted
+    let d2_deleted_at: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT deleted_at FROM drawers WHERE id = ?",
+            params!["d2"],
+            |row| row.get(0),
+        )
+        .expect("query d2 deleted_at");
+    assert!(
+        d2_deleted_at.is_none(),
+        "d2 should not be deleted as it belongs to project B"
+    );
 }

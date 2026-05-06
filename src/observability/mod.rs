@@ -547,7 +547,12 @@ pub fn audit_gating_command(
     Ok(())
 }
 
-pub fn audit_cleanup_command(db: &Database, options: AuditCleanupOptions<'_>) -> Result<()> {
+pub fn audit_cleanup_command(
+    db: &Database,
+    config: &Config,
+    options: AuditCleanupOptions<'_>,
+) -> Result<()> {
+    let scope = dashboard_scope(config)?;
     let sql = r#"
         SELECT d.id
         FROM gating_audit a
@@ -556,12 +561,17 @@ pub fn audit_cleanup_command(db: &Database, options: AuditCleanupOptions<'_>) ->
           AND a.score < ?
           AND d.wing = ?
           AND d.deleted_at IS NULL
+          AND d.project_id IS ?
     "#;
 
     let mut stmt = db.conn().prepare(sql)?;
     let drawer_ids: Vec<String> = stmt
         .query_map(
-            params![options.score_threshold, options.wing_filter],
+            params![
+                options.score_threshold,
+                options.wing_filter,
+                scope.project_id
+            ],
             |row| row.get::<_, String>(0),
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -570,8 +580,8 @@ pub fn audit_cleanup_command(db: &Database, options: AuditCleanupOptions<'_>) ->
 
     if options.dry_run {
         println!(
-            "(dry-run) found {} drawers to delete (score < {}, wing = {})",
-            count, options.score_threshold, options.wing_filter
+            "(dry-run) found {} drawers to delete (score < {}, wing = {}, project_id = {:?})",
+            count, options.score_threshold, options.wing_filter, scope.project_id
         );
         for id in drawer_ids.iter().take(20) {
             println!("  - {}", id);
@@ -592,16 +602,21 @@ pub fn audit_cleanup_command(db: &Database, options: AuditCleanupOptions<'_>) ->
                       AND a.score < ?
                       AND d.wing = ?
                       AND d.deleted_at IS NULL
+                      AND d.project_id IS ?
                 )
             "#;
             db.conn().execute(
                 update_sql,
-                params![options.score_threshold, options.wing_filter],
+                params![
+                    options.score_threshold,
+                    options.wing_filter,
+                    scope.project_id
+                ],
             )?;
         }
         println!(
-            "soft-deleted {} drawers (score < {}, wing = {})",
-            count, options.score_threshold, options.wing_filter
+            "soft-deleted {} drawers (score < {}, wing = {}, project_id = {:?})",
+            count, options.score_threshold, options.wing_filter, scope.project_id
         );
     }
 

@@ -1396,6 +1396,7 @@ fn run() -> Result<()> {
                         wing,
                     } => observability::audit_cleanup_command(
                         &db,
+                        config.as_ref(),
                         observability::AuditCleanupOptions {
                             dry_run,
                             score_threshold: score_threshold.unwrap_or(0.55),
