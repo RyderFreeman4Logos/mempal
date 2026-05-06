@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::core::config::{Config, ConfigHandle};
 use crate::core::db::{Database, read_fork_ext_version};
-use crate::core::project::{ProjectSearchScope, resolve_project_id};
+use crate::core::project::{ProjectFilterMode, ProjectSearchScope, resolve_project_id};
 use crate::cowork::peek::{format_rfc3339, parse_rfc3339};
 use anyhow::{Context, Result, bail};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -553,20 +553,33 @@ pub fn audit_cleanup_command(
     options: AuditCleanupOptions<'_>,
 ) -> Result<()> {
     let scope = dashboard_scope(config)?;
-    let sql = r#"
+
+    let (project_clause, use_project_param) = match scope.mode {
+        ProjectFilterMode::AllProjects => ("", false),
+        ProjectFilterMode::ProjectScoped => ("AND d.project_id = ?3", true),
+        ProjectFilterMode::ProjectPlusGlobal => {
+            ("AND (d.project_id IS NULL OR d.project_id = ?3)", true)
+        }
+        ProjectFilterMode::NullOnly => ("AND d.project_id IS NULL", false),
+    };
+
+    let sql = format!(
+        r#"
         SELECT d.id
         FROM gating_audit a
         JOIN drawers d ON d.id = COALESCE(a.drawer_id, a.candidate_hash)
         WHERE a.decision = 'keep'
-          AND a.score < ?
-          AND d.wing = ?
+          AND a.score < ?1
+          AND d.wing = ?2
           AND d.deleted_at IS NULL
-          AND d.project_id IS ?
-    "#;
+          {}
+    "#,
+        project_clause
+    );
 
-    let mut stmt = db.conn().prepare(sql)?;
-    let drawer_ids: Vec<String> = stmt
-        .query_map(
+    let drawer_ids: Vec<String> = if use_project_param {
+        let mut stmt = db.conn().prepare(&sql)?;
+        stmt.query_map(
             params![
                 options.score_threshold,
                 options.wing_filter,
@@ -574,14 +587,22 @@ pub fn audit_cleanup_command(
             ],
             |row| row.get::<_, String>(0),
         )?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        let mut stmt = db.conn().prepare(&sql)?;
+        stmt.query_map(
+            params![options.score_threshold, options.wing_filter],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    };
 
     let count = drawer_ids.len();
 
     if options.dry_run {
         println!(
-            "(dry-run) found {} drawers to delete (score < {}, wing = {}, project_id = {:?})",
-            count, options.score_threshold, options.wing_filter, scope.project_id
+            "(dry-run) found {} drawers to delete (score < {}, wing = {}, scope = {:?})",
+            count, options.score_threshold, options.wing_filter, scope.mode
         );
         for id in drawer_ids.iter().take(20) {
             println!("  - {}", id);
@@ -591,7 +612,8 @@ pub fn audit_cleanup_command(
         }
     } else {
         if count > 0 {
-            let update_sql = r#"
+            let update_sql = format!(
+                r#"
                 UPDATE drawers
                 SET deleted_at = datetime('now')
                 WHERE id IN (
@@ -599,24 +621,33 @@ pub fn audit_cleanup_command(
                     FROM gating_audit a
                     JOIN drawers d ON d.id = COALESCE(a.drawer_id, a.candidate_hash)
                     WHERE a.decision = 'keep'
-                      AND a.score < ?
-                      AND d.wing = ?
+                      AND a.score < ?1
+                      AND d.wing = ?2
                       AND d.deleted_at IS NULL
-                      AND d.project_id IS ?
+                      {}
                 )
-            "#;
-            db.conn().execute(
-                update_sql,
-                params![
-                    options.score_threshold,
-                    options.wing_filter,
-                    scope.project_id
-                ],
-            )?;
+            "#,
+                project_clause
+            );
+            if use_project_param {
+                db.conn().execute(
+                    &update_sql,
+                    params![
+                        options.score_threshold,
+                        options.wing_filter,
+                        scope.project_id
+                    ],
+                )?;
+            } else {
+                db.conn().execute(
+                    &update_sql,
+                    params![options.score_threshold, options.wing_filter],
+                )?;
+            }
         }
         println!(
-            "soft-deleted {} drawers (score < {}, wing = {}, project_id = {:?})",
-            count, options.score_threshold, options.wing_filter, scope.project_id
+            "soft-deleted {} drawers (score < {}, wing = {}, scope = {:?})",
+            count, options.score_threshold, options.wing_filter, scope.mode
         );
     }
 
