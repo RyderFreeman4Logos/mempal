@@ -251,7 +251,8 @@ fn apply_gating_verdict(
         .map(|judge| judge.threshold)
         .unwrap_or(0.3);
 
-    if score < threshold {
+    let rejected_by_verdict = is_reject_verdict(verdict);
+    if rejected_by_verdict || score < threshold {
         // Resolve all drawer IDs: prefer the multi-chunk list when present,
         // fall back to the single drawer_id for backward-compat queue tasks.
         let all_ids: Vec<&str> = if task.drawer_ids.is_empty() {
@@ -261,17 +262,35 @@ fn apply_gating_verdict(
         };
         tracing::info!(
             drawer_ids = ?all_ids,
+            verdict,
             score,
             threshold,
-            "LLM rejected drawers, executing soft-delete for all chunks"
+            "LLM verdict triggered retroactive soft-delete for drawers"
         );
         for id in &all_ids {
-            db.soft_delete_drawer(id)
-                .context("failed to soft-delete rejected drawer")?;
+            let deleted = db
+                .soft_delete_drawer(id)
+                .with_context(|| format!("failed to soft-delete rejected drawer {id}"))?;
+            if deleted {
+                tracing::info!(
+                    drawer_id = %id,
+                    verdict,
+                    score,
+                    threshold,
+                    "LLM verdict retroactively soft-deleted drawer"
+                );
+            }
         }
     }
 
     Ok(())
+}
+
+fn is_reject_verdict(verdict: &str) -> bool {
+    matches!(
+        verdict.trim().to_ascii_lowercase().as_str(),
+        "reject" | "rejected" | "skip" | "skipped"
+    )
 }
 
 fn parse_gating_verdict(content: &str) -> (String, f64) {

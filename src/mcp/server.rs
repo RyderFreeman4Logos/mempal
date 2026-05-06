@@ -1777,6 +1777,7 @@ impl MempalMcpServer {
 
         let candidate = IngestCandidate {
             content: scrubbed_content.clone(),
+            event: None,
             tool_name: None,
             exit_code: None,
         };

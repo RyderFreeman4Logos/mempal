@@ -514,6 +514,9 @@ enum AuditCommands {
         /// Filter by decision: keep or skip.
         #[arg(long)]
         decision: Option<String>,
+        /// Filter by LLM verdict: keep or reject.
+        #[arg(long)]
+        llm_verdict: Option<String>,
         /// Filter by time: '10m', '2h', '24h', '3d'.
         #[arg(long)]
         since: Option<String>,
@@ -550,6 +553,18 @@ enum AuditCommands {
         /// Show raw (unescaped) text in text format.
         #[arg(long, default_value_t = false)]
         raw: bool,
+    },
+    /// Soft-delete low-confidence kept drawers.
+    Cleanup {
+        /// Show what would be deleted without actually deleting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Score threshold below which to delete (default 0.55).
+        #[arg(long)]
+        score_threshold: Option<f32>,
+        /// Filter by wing (default 'hooks-raw').
+        #[arg(long)]
+        wing: Option<String>,
     },
 }
 
@@ -1340,6 +1355,7 @@ fn run() -> Result<()> {
                 match cmd {
                     AuditCommands::Gating {
                         decision,
+                        llm_verdict,
                         since,
                         project,
                         format,
@@ -1347,11 +1363,14 @@ fn run() -> Result<()> {
                     } => observability::audit_gating_command(
                         &db,
                         config.as_ref(),
-                        decision,
-                        since.as_deref(),
-                        project.as_deref(),
-                        &format,
-                        raw,
+                        observability::GatingAuditOptions {
+                            decision_filter: decision,
+                            llm_verdict_filter: llm_verdict,
+                            since: since.as_deref(),
+                            project_filter: project.as_deref(),
+                            format: &format,
+                            raw,
+                        },
                     ),
                     AuditCommands::Embed { since, format, raw } => {
                         observability::audit_embed_command(
@@ -1371,6 +1390,19 @@ fn run() -> Result<()> {
                             raw,
                         )
                     }
+                    AuditCommands::Cleanup {
+                        dry_run,
+                        score_threshold,
+                        wing,
+                    } => observability::audit_cleanup_command(
+                        &db,
+                        config.as_ref(),
+                        observability::AuditCleanupOptions {
+                            dry_run,
+                            score_threshold: score_threshold.unwrap_or(0.55),
+                            wing_filter: wing.as_deref().unwrap_or("hooks-raw"),
+                        },
+                    ),
                 }
             } else {
                 bail!("`mempal audit` requires a subcommand (gating, embed, novelty) or --stale");
@@ -1779,6 +1811,7 @@ async fn ingest_stdin_command(
     if !options.no_gate {
         let candidate = IngestCandidate {
             content: content.clone(),
+            event: None,
             tool_name: None,
             exit_code: None,
         };

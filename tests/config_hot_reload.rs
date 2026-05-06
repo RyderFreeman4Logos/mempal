@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use mempal::core::config::ConfigHandle;
 use mempal::core::db::Database;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
+use mempal::ingest::gating::{IngestCandidate, evaluate_tier1};
 use mempal::mcp::{IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
 #[cfg(feature = "integration")]
@@ -244,6 +245,25 @@ enabled = false"#,
     )
 }
 
+fn config_with_tier1_skip_events(db_path: &Path, events: &[&str]) -> String {
+    let events = events
+        .iter()
+        .map(|event| format!("{event:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    base_config(db_path).replace(
+        "[ingest_gating.embedding_classifier]\nprototypes = [\"A\", \"B\", \"C\"]",
+        &format!(
+            r#"[ingest_gating]
+enabled = true
+tier1_skip_events = [{events}]
+
+[ingest_gating.embedding_classifier]
+enabled = false"#
+        ),
+    )
+}
+
 async fn ingest(server: &MempalMcpServer, content: &str) -> String {
     let response = server
         .mempal_ingest(Parameters(IngestRequest {
@@ -354,6 +374,39 @@ async fn test_ingest_gating_hot_reload_applies_without_server_restart() {
     assert_eq!(decision.decision, "rejected");
     assert_eq!(decision.tier, 1);
     assert_eq!(env.db().drawer_count().expect("drawer count"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tier1_skip_events_hot_reload_applies_without_restart() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(&base_config(&PathBuf::from("/tmp/placeholder")));
+    let config = config_with_tier1_skip_events(&env.db_path, &["Bash"]);
+    write_config_atomic(&env.config_path, &config);
+    ConfigHandle::bootstrap(&env.config_path).expect("rebootstrap config");
+
+    let previous = ConfigHandle::version();
+    write_config_atomic(
+        &env.config_path,
+        &config_with_tier1_skip_events(&env.db_path, &["CustomMechanical"]),
+    );
+    wait_for_version_change(&previous);
+
+    let current = ConfigHandle::current();
+    assert_eq!(
+        current.ingest_gating.tier1_skip_events,
+        vec!["CustomMechanical".to_string()]
+    );
+    let decision = evaluate_tier1(
+        &IngestCandidate {
+            content: "long enough custom event output".to_string(),
+            event: Some("CustomMechanicalEvent".to_string()),
+            tool_name: None,
+            exit_code: Some(0),
+        },
+        &current.ingest_gating,
+    )
+    .expect("hot reloaded tier1 event decision");
+    assert_eq!(decision.gating_reason.as_deref(), Some("mechanical_tool"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

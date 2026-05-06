@@ -7,10 +7,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::core::config::{Config, ConfigHandle};
 use crate::core::db::{Database, read_fork_ext_version};
-use crate::core::project::{ProjectSearchScope, resolve_project_id};
+use crate::core::project::{ProjectFilterMode, ProjectSearchScope, resolve_project_id};
 use crate::cowork::peek::{format_rfc3339, parse_rfc3339};
 use anyhow::{Context, Result, bail};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rusqlite::params;
 use serde::Serialize;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -46,6 +47,12 @@ pub struct ViewOptions<'a> {
 
 pub struct GatingStatsOptions<'a> {
     pub since: Option<&'a str>,
+}
+
+pub struct AuditCleanupOptions<'a> {
+    pub dry_run: bool,
+    pub score_threshold: f32,
+    pub wing_filter: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +104,8 @@ struct GatingAuditDetail {
     label: Option<String>,
     reason: Option<String>,
     score: Option<f32>,
+    llm_verdict: Option<String>,
+    llm_score: Option<f64>,
     content_preview: Option<String>,
     created_at: i64,
     project_id: Option<String>,
@@ -130,8 +139,19 @@ pub struct GatingAuditRecord {
     pub label: Option<String>,
     pub reason: Option<String>,
     pub score: Option<f32>,
+    pub llm_verdict: Option<String>,
+    pub llm_score: Option<f64>,
     pub content_preview: Option<String>,
     pub created_at: i64,
+}
+
+pub struct GatingAuditOptions<'a> {
+    pub decision_filter: Option<String>,
+    pub llm_verdict_filter: Option<String>,
+    pub since: Option<&'a str>,
+    pub project_filter: Option<&'a str>,
+    pub format: &'a str,
+    pub raw: bool,
 }
 
 struct GatingExplainFields {
@@ -432,25 +452,30 @@ pub fn view_command(db: &Database, config: &Config, options: ViewOptions<'_>) ->
 pub fn audit_gating_command(
     db: &Database,
     config: &Config,
-    decision_filter: Option<String>,
-    since: Option<&str>,
-    project_filter: Option<&str>,
-    format: &str,
-    raw: bool,
+    options: GatingAuditOptions<'_>,
 ) -> Result<()> {
     let scope = dashboard_scope(config)?;
-    let since_cutoff = parse_since_cutoff(since)?;
+    let since_cutoff = parse_since_cutoff(options.since)?;
     let rows = load_gating_audit_details(db, &scope, since_cutoff)?;
 
     let filtered: Vec<_> = rows
         .into_iter()
         .filter(|row| {
-            decision_filter.as_deref().is_none_or(|d| row.decision == d)
-                && project_filter.is_none_or(|p| row.project_id.as_deref() == Some(p))
+            options
+                .decision_filter
+                .as_deref()
+                .is_none_or(|d| row.decision == d)
+                && options
+                    .llm_verdict_filter
+                    .as_deref()
+                    .is_none_or(|verdict| row.llm_verdict.as_deref() == Some(verdict))
+                && options
+                    .project_filter
+                    .is_none_or(|p| row.project_id.as_deref() == Some(p))
         })
         .collect();
 
-    if format == "json" {
+    if options.format == "json" {
         let json_rows: Vec<_> = filtered
             .into_iter()
             .map(|row| GatingAuditRecord {
@@ -461,6 +486,8 @@ pub fn audit_gating_command(
                 label: row.label,
                 reason: row.reason,
                 score: row.score,
+                llm_verdict: row.llm_verdict,
+                llm_score: row.llm_score,
                 content_preview: row.content_preview,
                 created_at: row.created_at,
             })
@@ -479,6 +506,17 @@ pub fn audit_gating_command(
                     .score
                     .map(|s| format!(" score={:.3}", s))
                     .unwrap_or_default();
+                let llm_str = row
+                    .llm_verdict
+                    .as_deref()
+                    .map(|verdict| {
+                        let score = row
+                            .llm_score
+                            .map(|s| format!(" llm_score={:.3}", s))
+                            .unwrap_or_default();
+                        format!(" llm_verdict={verdict}{score}")
+                    })
+                    .unwrap_or_default();
                 let preview = row
                     .content_preview
                     .as_deref()
@@ -488,23 +526,131 @@ pub fn audit_gating_command(
                         } else {
                             p.to_string()
                         };
-                        format!(" preview={:?}", maybe_escape(&truncated, raw))
+                        format!(" preview={:?}", maybe_escape(&truncated, options.raw))
                     })
                     .unwrap_or_default();
                 println!(
-                    "  {} decision={} label={:?} reason={:?}{} candidate_hash={} audit_id={}{}",
+                    "  {} decision={} label={:?} reason={:?}{}{} candidate_hash={} audit_id={}{}",
                     format_created_at(row.created_at),
                     row.decision,
                     row.label.as_deref().unwrap_or("none"),
                     row.reason.as_deref().unwrap_or("none"),
                     score_str,
-                    maybe_escape(&row.candidate_hash, raw),
-                    maybe_escape(&row.audit_id, raw),
+                    llm_str,
+                    maybe_escape(&row.candidate_hash, options.raw),
+                    maybe_escape(&row.audit_id, options.raw),
                     preview
                 );
             }
         }
     }
+    Ok(())
+}
+
+pub fn audit_cleanup_command(
+    db: &Database,
+    config: &Config,
+    options: AuditCleanupOptions<'_>,
+) -> Result<()> {
+    let scope = dashboard_scope(config)?;
+
+    let (project_clause, use_project_param) = match scope.mode {
+        ProjectFilterMode::AllProjects => ("", false),
+        ProjectFilterMode::ProjectScoped => ("AND d.project_id = ?3", true),
+        ProjectFilterMode::ProjectPlusGlobal => {
+            ("AND (d.project_id IS NULL OR d.project_id = ?3)", true)
+        }
+        ProjectFilterMode::NullOnly => ("AND d.project_id IS NULL", false),
+    };
+
+    let sql = format!(
+        r#"
+        SELECT d.id
+        FROM gating_audit a
+        JOIN drawers d ON d.id = COALESCE(a.drawer_id, a.candidate_hash)
+        WHERE a.decision = 'keep'
+          AND a.score < ?1
+          AND d.wing = ?2
+          AND d.deleted_at IS NULL
+          {}
+    "#,
+        project_clause
+    );
+
+    let drawer_ids: Vec<String> = if use_project_param {
+        let mut stmt = db.conn().prepare(&sql)?;
+        stmt.query_map(
+            params![
+                options.score_threshold,
+                options.wing_filter,
+                scope.project_id
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        let mut stmt = db.conn().prepare(&sql)?;
+        stmt.query_map(
+            params![options.score_threshold, options.wing_filter],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let count = drawer_ids.len();
+
+    if options.dry_run {
+        println!(
+            "(dry-run) found {} drawers to delete (score < {}, wing = {}, scope = {:?})",
+            count, options.score_threshold, options.wing_filter, scope.mode
+        );
+        for id in drawer_ids.iter().take(20) {
+            println!("  - {}", id);
+        }
+        if count > 20 {
+            println!("  ... and {} more", count - 20);
+        }
+    } else {
+        if count > 0 {
+            let update_sql = format!(
+                r#"
+                UPDATE drawers
+                SET deleted_at = datetime('now')
+                WHERE id IN (
+                    SELECT d.id
+                    FROM gating_audit a
+                    JOIN drawers d ON d.id = COALESCE(a.drawer_id, a.candidate_hash)
+                    WHERE a.decision = 'keep'
+                      AND a.score < ?1
+                      AND d.wing = ?2
+                      AND d.deleted_at IS NULL
+                      {}
+                )
+            "#,
+                project_clause
+            );
+            if use_project_param {
+                db.conn().execute(
+                    &update_sql,
+                    params![
+                        options.score_threshold,
+                        options.wing_filter,
+                        scope.project_id
+                    ],
+                )?;
+            } else {
+                db.conn().execute(
+                    &update_sql,
+                    params![options.score_threshold, options.wing_filter],
+                )?;
+            }
+        }
+        println!(
+            "soft-deleted {} drawers (score < {}, wing = {}, scope = {:?})",
+            count, options.score_threshold, options.wing_filter, scope.mode
+        );
+    }
+
     Ok(())
 }
 
@@ -1017,6 +1163,8 @@ fn load_gating_audit_details(
 
     let has_score = columns.iter().any(|name| name == "score");
     let has_content_preview = columns.iter().any(|name| name == "content_preview");
+    let has_llm_verdict = columns.iter().any(|name| name == "llm_verdict");
+    let has_llm_score = columns.iter().any(|name| name == "llm_score");
 
     let rows = if modern {
         let score_expr = if has_score { "a.score" } else { "NULL" };
@@ -1025,11 +1173,18 @@ fn load_gating_audit_details(
         } else {
             "NULL"
         };
+        let llm_verdict_expr = if has_llm_verdict {
+            "a.llm_verdict"
+        } else {
+            "NULL"
+        };
+        let llm_score_expr = if has_llm_score { "a.llm_score" } else { "NULL" };
 
         let sql = format!(
             r#"
             SELECT a.id, a.candidate_hash, a.decision, a.tier, a.label, a.reason,
-                   a.explain_json, a.created_at, {project_expr}, {score_expr}, {preview_expr}
+                   a.explain_json, a.created_at, {project_expr}, {score_expr}, {preview_expr},
+                   {llm_verdict_expr}, {llm_score_expr}
             FROM gating_audit a
             LEFT JOIN drawers d ON d.id = COALESCE(a.drawer_id, a.candidate_hash)
             ORDER BY a.created_at DESC, a.id DESC
@@ -1062,6 +1217,8 @@ fn load_gating_audit_details(
                 project_id: row.get::<_, Option<String>>(8)?,
                 score: row.get::<_, Option<f32>>(9)?,
                 content_preview: row.get::<_, Option<String>>(10)?,
+                llm_verdict: row.get::<_, Option<String>>(11)?,
+                llm_score: row.get::<_, Option<f64>>(12)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?
@@ -1091,6 +1248,8 @@ fn load_gating_audit_details(
                 created_at: row.get::<_, i64>(4)?,
                 project_id: row.get::<_, Option<String>>(5)?,
                 score: None,
+                llm_verdict: None,
+                llm_score: None,
                 content_preview: None,
             })
         })?

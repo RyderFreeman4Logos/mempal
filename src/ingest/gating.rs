@@ -16,6 +16,7 @@ const MAX_PROTOTYPE_LEN_BYTES: usize = 256;
 #[derive(Debug, Clone)]
 pub struct IngestCandidate {
     pub content: String,
+    pub event: Option<String>,
     pub tool_name: Option<String>,
     pub exit_code: Option<i32>,
 }
@@ -227,11 +228,28 @@ pub fn evaluate_tier1(
         return None;
     }
 
+    if is_user_prompt_submit(candidate) {
+        return Some(GatingDecision::accepted(
+            1,
+            Some("user_prompt_submit".to_string()),
+            None,
+        ));
+    }
+
     if candidate.tool_name.as_deref() == Some("Read") {
         return Some(GatingDecision::rejected(
             1,
             Some("read_tool".to_string()),
             Some("Read".to_string()),
+            None,
+        ));
+    }
+
+    if let Some(matched_pattern) = match_tier1_skip_event(candidate, &gating.tier1_skip_events) {
+        return Some(GatingDecision::rejected(
+            1,
+            Some("mechanical_tool".to_string()),
+            Some(matched_pattern),
             None,
         ));
     }
@@ -494,6 +512,35 @@ fn normalize_rule_action(action: &str) -> RuleAction {
 
 fn is_too_short(candidate: &IngestCandidate) -> bool {
     candidate.content.trim().len() < MIN_SIGNAL_BYTES
+}
+
+fn is_user_prompt_submit(candidate: &IngestCandidate) -> bool {
+    candidate
+        .event
+        .as_deref()
+        .is_some_and(|event| event.eq_ignore_ascii_case("UserPromptSubmit"))
+}
+
+fn match_tier1_skip_event(candidate: &IngestCandidate, patterns: &[String]) -> Option<String> {
+    let event = candidate.event.as_deref();
+    let tool_name = candidate.tool_name.as_deref();
+    let values = event.into_iter().chain(tool_name);
+
+    for raw_pattern in patterns {
+        let pattern = raw_pattern.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        let pattern_lower = pattern.to_ascii_lowercase();
+        if values
+            .clone()
+            .any(|value| value.to_ascii_lowercase().contains(&pattern_lower))
+        {
+            return Some(pattern.to_string());
+        }
+    }
+
+    None
 }
 
 fn is_boilerplate(candidate: &IngestCandidate) -> bool {

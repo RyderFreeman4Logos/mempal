@@ -21,7 +21,7 @@ use mempal::core::db::{
 use mempal::core::queue::PendingMessageStore;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::ingest::gating::{
-    GatingRuntime, IngestCandidate, compile_classifier_from_config,
+    GatingDecision, GatingRuntime, IngestCandidate, compile_classifier_from_config,
     compile_classifier_from_embedder, evaluate_tier1, evaluate_tier2,
 };
 use mempal::llm::client::LlmClient;
@@ -444,6 +444,7 @@ prototypes = ["valuable"]
     let outcome = evaluate_tier2(
         &IngestCandidate {
             content: "candidate triggers embedder failure".to_string(),
+            event: None,
             tool_name: None,
             exit_code: None,
         },
@@ -1150,6 +1151,7 @@ fn test_tier1_skips_read_tool() {
     let decision = evaluate_tier1(
         &IngestCandidate {
             content: "long enough content to hit tool rule".to_string(),
+            event: None,
             tool_name: Some("Read".to_string()),
             exit_code: None,
         },
@@ -1172,6 +1174,158 @@ fn test_tier1_skips_read_tool() {
     assert_eq!(rows[0].decision, "skip");
     assert_eq!(rows[0].tier, 1);
     assert_eq!(rows[0].reason.as_deref(), Some("read_tool"));
+}
+
+#[test]
+fn test_tier1_skips_configured_mechanical_events() {
+    let _guard = test_guard_blocking();
+    let config = Config::parse(
+        r#"
+[gating]
+enabled = true
+"#,
+    )
+    .expect("parse config");
+
+    for (event, tool_name, matched_pattern) in [
+        (Some("PostToolUse"), Some("Bash"), "Bash"),
+        (Some("PostToolUse"), Some("Edit"), "Edit"),
+        (Some("PostToolUse"), Some("apply_patch"), "apply_patch"),
+        (Some("bash_tool"), None, "bash_tool"),
+        (Some("ApplyPatch"), None, "ApplyPatch"),
+    ] {
+        let decision = evaluate_tier1(
+            &IngestCandidate {
+                content: "long enough mechanical operation output".to_string(),
+                event: event.map(ToOwned::to_owned),
+                tool_name: tool_name.map(ToOwned::to_owned),
+                exit_code: Some(0),
+            },
+            &config.ingest_gating,
+        )
+        .expect("tier1 mechanical decision");
+
+        assert!(decision.is_rejected());
+        assert_eq!(decision.gating_reason.as_deref(), Some("mechanical_tool"));
+        assert_eq!(decision.matched_pattern.as_deref(), Some(matched_pattern));
+    }
+}
+
+#[test]
+fn test_tier1_skip_events_are_configurable() {
+    let _guard = test_guard_blocking();
+    let config = Config::parse(
+        r#"
+[gating]
+enabled = true
+tier1_skip_events = ["CustomMechanical"]
+"#,
+    )
+    .expect("parse config");
+
+    let custom = evaluate_tier1(
+        &IngestCandidate {
+            content: "long enough custom mechanical operation".to_string(),
+            event: Some("BeforeCustomMechanical".to_string()),
+            tool_name: None,
+            exit_code: Some(0),
+        },
+        &config.ingest_gating,
+    )
+    .expect("custom mechanical decision");
+    assert_eq!(custom.gating_reason.as_deref(), Some("mechanical_tool"));
+    assert_eq!(custom.matched_pattern.as_deref(), Some("CustomMechanical"));
+
+    let bash = evaluate_tier1(
+        &IngestCandidate {
+            content: "long enough Bash output that custom config keeps".to_string(),
+            event: Some("PostToolUse".to_string()),
+            tool_name: Some("Bash".to_string()),
+            exit_code: Some(0),
+        },
+        &config.ingest_gating,
+    );
+    assert!(bash.is_none(), "custom skip list should replace defaults");
+}
+
+#[test]
+fn test_tier1_keeps_user_prompt_submit_events() {
+    let _guard = test_guard_blocking();
+    let config = Config::parse(
+        r#"
+[gating]
+enabled = true
+"#,
+    )
+    .expect("parse config");
+
+    let decision = evaluate_tier1(
+        &IngestCandidate {
+            content: "tiny".to_string(),
+            event: Some("UserPromptSubmit".to_string()),
+            tool_name: Some("Bash".to_string()),
+            exit_code: Some(0),
+        },
+        &config.ingest_gating,
+    )
+    .expect("user prompt decision");
+
+    assert!(!decision.is_rejected());
+    assert_eq!(decision.tier, 1);
+    assert_eq!(decision.label.as_deref(), Some("user_prompt_submit"));
+}
+
+#[test]
+fn test_tier2_default_threshold_is_055() {
+    let _guard = test_guard_blocking();
+    let config = Config::parse(
+        r#"
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+prototypes = ["valuable"]
+"#,
+    )
+    .expect("parse config");
+
+    assert_eq!(config.ingest_gating.embedding_classifier.threshold, 0.55);
+}
+
+#[test]
+fn test_audit_gating_filters_by_llm_verdict() {
+    let _guard = test_guard_blocking();
+    let env = TestEnv::new("[gating]\nenabled = true\n");
+    let db = env.db();
+    let decision = GatingDecision::accepted(1, Some("llm_pending".to_string()), None);
+
+    db.record_gating_audit(
+        "llm-keep-candidate",
+        &decision,
+        None,
+        Some("LLM keep candidate"),
+    )
+    .expect("record keep audit row");
+    db.upsert_llm_verdict("llm-keep-candidate", "keep", Some(0.9))
+        .expect("upsert keep verdict");
+    db.record_gating_audit(
+        "llm-reject-candidate",
+        &decision,
+        None,
+        Some("LLM reject candidate"),
+    )
+    .expect("record reject audit row");
+    db.upsert_llm_verdict("llm-reject-candidate", "reject", Some(0.2))
+        .expect("upsert reject verdict");
+
+    let output = run_mempal(&env.home, &["audit", "gating", "--llm-verdict", "reject"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.contains("llm-reject-candidate"), "{stdout}");
+    assert!(stdout.contains("llm_verdict=reject"), "{stdout}");
+    assert!(!stdout.contains("llm-keep-candidate"), "{stdout}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1226,6 +1380,7 @@ backend = "unsupported-backend"
     let decision = evaluate_tier1(
         &IngestCandidate {
             content: "content that should pass tier1 without tier2".to_string(),
+            event: None,
             tool_name: None,
             exit_code: None,
         },
@@ -1772,6 +1927,112 @@ threshold = 0.5
         0,
         "LLM reject must soft-delete ALL chunk drawers, not just the first"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_gating_tier3_reject_verdict_soft_deletes_even_above_threshold() {
+    let _guard = test_guard().await;
+
+    let mut mock_server = mockito::Server::new_async().await;
+    let _reject_mock = mock_server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"test","choices":[{"message":{"role":"assistant","content":"{\"verdict\":\"reject\",\"score\":0.9}"},"finish_reason":"stop"}],"model":"test","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#)
+        .create_async()
+        .await;
+
+    let env = TestEnv::new(&format!(
+        r#"
+[llm]
+enabled = true
+base_url = "{}/v1"
+model = "test-model"
+retry_interval_secs = 1
+
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.9
+prototypes = ["keep_proto"]
+
+[gating.llm_judge]
+enabled = true
+threshold = 0.5
+"#,
+        mock_server.url()
+    ));
+
+    let config = env.config();
+    let server = MempalMcpServer::new_with_factory_and_config(
+        env.db_path.clone(),
+        config,
+        deterministic_factory(&[("keep_proto", vec![1.0, 0.0])], vec![0.5, 0.5], &[]),
+    );
+
+    let response = ingest_mcp(&server, "ambiguous high-score reject content").await;
+    assert!(!response.dropped, "tier3 must fail-open before verdict");
+    assert_eq!(
+        env.db()
+            .drawer_count()
+            .expect("drawer count before verdict"),
+        1
+    );
+    assert_eq!(
+        pending_llm_task_count(&env.db()),
+        1,
+        "tier3 should enqueue one LLM task"
+    );
+
+    let store = PendingMessageStore::new(&env.db_path).expect("queue store");
+    let claimed = store
+        .claim_next_by_kind("test-worker", 300, "llm_task")
+        .expect("claim")
+        .expect("task present");
+
+    let llm_config = LlmConfig {
+        enabled: true,
+        base_url: Some(format!("{}/v1", mock_server.url())),
+        model: Some("test-model".to_string()),
+        retry_interval_secs: 1,
+        ..Default::default()
+    };
+    let client = LlmClient::from_config(&llm_config).expect("build LLM client");
+    let status = LlmStatus::new(5);
+    let db = env.db();
+    let judge_config = Config {
+        ingest_gating: IngestGatingConfig {
+            llm_judge: Some(LlmJudgeConfig {
+                enabled: true,
+                threshold: 0.5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    mempal::llm::process_llm_task(&client, &status, &db, &claimed.payload, &judge_config, None)
+        .await
+        .expect("process LLM task");
+
+    assert_eq!(
+        env.db().drawer_count().expect("drawer count after verdict"),
+        0,
+        "explicit reject verdict must soft-delete even when score is above threshold"
+    );
+
+    let audit_verdict = env
+        .db()
+        .conn()
+        .query_row(
+            "SELECT llm_verdict FROM gating_audit WHERE drawer_id = ?1",
+            [&response.drawer_id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("audit verdict");
+    assert_eq!(audit_verdict, "reject");
 }
 
 /// Guard: when a re-ingest deduplicates to a pre-existing drawer (same content hash), the Tier 3
