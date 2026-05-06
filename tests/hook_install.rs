@@ -3,7 +3,9 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::process::Command;
 
-use mempal::hook_install::{McpInstallStatus, install_claude_code, install_user_mcp};
+use mempal::hook_install::{
+    McpInstallStatus, install_claude_code, install_codex, install_user_mcp,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -15,9 +17,9 @@ fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
 }
 
-fn expected_hook_command(alias: &str) -> String {
+fn expected_hook_command(name: &str) -> String {
     let binary = fs::canonicalize(mempal_bin()).expect("canonical mempal bin");
-    format!("{} hook {alias}", binary.display())
+    format!("{} hook {name}", binary.display())
 }
 
 #[test]
@@ -34,14 +36,14 @@ fn test_hook_install_writes_claude_code_settings() {
     assert!(outcome.display_path.ends_with(".claude/settings.json"));
     assert!(outcome.changed);
     assert_eq!(outcome.removed_commands, 0);
-    assert!(outcome.rendered.contains("hook_post_tool"));
+    assert!(outcome.rendered.contains("PostToolUse"));
     assert_eq!(
         parsed["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-        expected_hook_command("hook_post_tool")
+        expected_hook_command("PostToolUse")
     );
     assert_eq!(
         parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
-        expected_hook_command("hook_user_prompt")
+        expected_hook_command("UserPromptSubmit")
     );
 }
 
@@ -63,7 +65,7 @@ fn test_hook_install_respects_project_local_settings() {
     assert_eq!(parsed["theme"], "dark");
     assert_eq!(
         parsed["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-        expected_hook_command("hook_post_tool")
+        expected_hook_command("PostToolUse")
     );
     assert!(
         !home.join(".claude/settings.json").exists(),
@@ -104,7 +106,7 @@ fn test_hook_install_merges_existing_settings() {
     );
     assert_eq!(
         parsed["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-        expected_hook_command("hook_post_tool")
+        expected_hook_command("PostToolUse")
     );
     assert!(outcome.changed);
 }
@@ -136,10 +138,10 @@ fn test_hook_install_follows_symlink_target() {
     );
     assert_eq!(parsed["theme"], "dark");
     assert_eq!(outcome.write_path, real_target);
-    assert!(outcome.rendered.contains("hook_post_tool"));
+    assert!(outcome.rendered.contains("PostToolUse"));
     assert_eq!(
         parsed["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-        expected_hook_command("hook_post_tool")
+        expected_hook_command("PostToolUse")
     );
 }
 
@@ -175,7 +177,7 @@ fn test_hook_install_coexists_with_upstream_cowork_entry() {
         .flat_map(|entry| entry["hooks"].as_array().expect("hook array").iter())
         .filter_map(|hook| hook["command"].as_str())
         .collect();
-    let expected = expected_hook_command("hook_user_prompt");
+    let expected = expected_hook_command("UserPromptSubmit");
 
     assert!(commands.contains(&".claude/hooks/user-prompt-submit.sh"));
     assert!(commands.iter().any(|command| *command == expected));
@@ -218,7 +220,7 @@ fn test_hook_install_dry_run_does_not_write() {
     assert!(
         outcome
             .rendered
-            .contains(&expected_hook_command("hook_post_tool"))
+            .contains(&expected_hook_command("PostToolUse"))
     );
     assert!(
         !home.join(".claude/settings.json").exists(),
@@ -265,7 +267,7 @@ fn test_hook_install_absolute_path_binary() {
         command.starts_with('/'),
         "hook command must use absolute binary path, got {command}"
     );
-    assert_eq!(command, expected_hook_command("hook_post_tool"));
+    assert_eq!(command, expected_hook_command("PostToolUse"));
 
     let outside = TempDir::new().expect("outside tempdir");
     let outside_target = outside.path().join(".claude/settings.json");
@@ -307,7 +309,7 @@ fn test_hook_install_public_wrapper_uses_home_env() {
     let parsed = parse_json(&home.join(".claude/settings.json"));
     assert_eq!(
         parsed["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
-        expected_hook_command("hook_session_end")
+        expected_hook_command("SessionEnd")
     );
 
     // Issue #129: the same install also seeds `~/.mcp.json` with the mempal
@@ -506,4 +508,191 @@ fn test_hook_install_skip_mcp_does_not_touch_user_mcp() {
         !home.join(".mcp.json").exists(),
         "--skip-mcp must not touch ~/.mcp.json"
     );
+}
+
+#[test]
+fn test_hook_install_writes_codex_hooks() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(&home).expect("create home");
+
+    let outcome = install_codex(&cwd, &home, false, false).expect("install codex");
+    let parsed = parse_json(&outcome.write_path);
+
+    assert!(outcome.display_path.ends_with(".codex/hooks.json"));
+    assert!(outcome.changed);
+    assert_eq!(
+        parsed["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        expected_hook_command("PostToolUse")
+    );
+    assert_eq!(
+        parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        expected_hook_command("UserPromptSubmit")
+    );
+}
+
+#[test]
+fn test_hook_install_codex_merges_existing() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("create .codex");
+    fs::write(
+        home.join(".codex/hooks.json"),
+        r#"{
+          "hooks": {
+            "UserPromptSubmit": [{
+              "hooks": [{
+                "type": "command",
+                "command": "mempal cowork-drain --target codex --format codex-hook-json --cwd-source stdin-json"
+              }]
+            }]
+          }
+        }"#,
+    )
+    .expect("write seed codex hooks");
+
+    let outcome = install_codex(&cwd, &home, false, false).expect("install codex");
+    let parsed = parse_json(&outcome.write_path);
+    let entries = parsed["hooks"]["UserPromptSubmit"]
+        .as_array()
+        .expect("prompt array");
+
+    // Should have 2 entries in UserPromptSubmit array
+    assert_eq!(entries.len(), 2);
+    let commands: Vec<&str> = entries
+        .iter()
+        .flat_map(|entry| entry["hooks"].as_array().expect("hook array").iter())
+        .filter_map(|hook| hook["command"].as_str())
+        .collect();
+
+    assert!(commands.contains(
+        &"mempal cowork-drain --target codex --format codex-hook-json --cwd-source stdin-json"
+    ));
+    assert!(commands.contains(&expected_hook_command("UserPromptSubmit").as_str()));
+}
+
+#[test]
+fn test_hook_install_all_target() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(&home).expect("create home");
+
+    let output = Command::new(mempal_bin())
+        .args(["hook", "install", "--target", "all"])
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .output()
+        .expect("install all");
+
+    assert!(output.status.success());
+    assert!(home.join(".claude/settings.json").exists());
+    assert!(home.join(".codex/hooks.json").exists());
+    assert!(home.join(".mcp.json").exists());
+}
+
+#[test]
+fn test_hook_install_codex_warns_on_missing_feature_flag() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(&home).expect("create home");
+
+    let output = Command::new(mempal_bin())
+        .args(["hook", "install", "--target", "codex"])
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .output()
+        .expect("install codex");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("warning: Codex hook runtime (codex_hooks) is currently disabled"));
+    assert!(stdout.contains("codex features enable codex_hooks"));
+}
+
+#[test]
+fn test_hook_install_codex_no_warning_when_feature_enabled() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(home.join(".codex")).expect("create .codex");
+    fs::write(home.join(".codex/config.toml"), "codex_hooks = true").expect("enable hooks");
+
+    let output = Command::new(mempal_bin())
+        .args(["hook", "install", "--target", "codex"])
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .output()
+        .expect("install codex");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("warning: Codex hook runtime (codex_hooks) is currently disabled"));
+}
+
+#[test]
+fn test_hook_install_removes_legacy_aliases() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(cwd.join(".claude")).expect("create local .claude");
+    fs::create_dir_all(&home).expect("create home");
+
+    // Seed with a legacy hook command
+    let legacy_cmd = "/usr/local/bin/mempal hook hook_post_tool";
+    fs::write(
+        cwd.join(".claude/settings.json"),
+        json!({
+          "hooks": {
+            "PostToolUse": [{
+              "hooks": [{
+                "type": "command",
+                "command": legacy_cmd
+              }]
+            }]
+          }
+        })
+        .to_string(),
+    )
+    .expect("write seed settings");
+
+    let outcome = install_claude_code(&cwd, &home, false, false).expect("install");
+    let parsed = parse_json(&outcome.write_path);
+
+    let entries = parsed["hooks"]["PostToolUse"].as_array().expect("array");
+    // Should have only 1 entry (the new one), legacy should be gone
+    assert_eq!(entries.len(), 1);
+    let command = entries[0]["hooks"][0]["command"].as_str().expect("command");
+    assert_ne!(command, legacy_cmd);
+    assert_eq!(command, expected_hook_command("PostToolUse"));
+    assert_eq!(outcome.removed_commands, 1);
+}
+
+#[test]
+fn test_hook_install_codex_no_warning_when_feature_enabled_in_section() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cwd = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(home.join(".codex")).expect("create .codex");
+    fs::write(
+        home.join(".codex/config.toml"),
+        "[features]\ncodex_hooks = true",
+    )
+    .expect("enable hooks");
+
+    let output = Command::new(mempal_bin())
+        .args(["hook", "install", "--target", "codex"])
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .output()
+        .expect("install codex");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("warning: Codex hook runtime (codex_hooks) is currently disabled"));
 }

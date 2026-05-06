@@ -4,19 +4,29 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 const CLAUDE_SETTINGS_RELATIVE: &str = ".claude/settings.json";
 const CLAUDE_SETTINGS_DIR: &str = ".claude";
 const CLAUDE_SETTINGS_FILE: &str = "settings.json";
+const CODEX_SETTINGS_DIR: &str = ".codex";
+const CODEX_SETTINGS_FILE: &str = "hooks.json";
+const CODEX_HOOKS_RELATIVE: &str = ".codex/hooks.json";
 const USER_MCP_FILE: &str = ".mcp.json";
 const MEMPAL_MCP_SERVER_NAME: &str = "mempal";
 const FORBIDDEN_TARGET_NAMES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", "GEMINI.md"];
 const HOOK_COMMAND_EVENTS: [(&str, &str); 4] = [
-    ("PostToolUse", "hook_post_tool"),
-    ("UserPromptSubmit", "hook_user_prompt"),
-    ("SessionStart", "hook_session_start"),
-    ("SessionEnd", "hook_session_end"),
+    ("PostToolUse", "PostToolUse"),
+    ("UserPromptSubmit", "UserPromptSubmit"),
+    ("SessionStart", "SessionStart"),
+    ("SessionEnd", "SessionEnd"),
+];
+const LEGACY_ALIASES: [(&str, &str); 4] = [
+    ("hook_post_tool", "PostToolUse"),
+    ("hook_user_prompt", "UserPromptSubmit"),
+    ("hook_session_start", "SessionStart"),
+    ("hook_session_end", "SessionEnd"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -27,6 +37,8 @@ pub enum HookInstallTarget {
     GeminiCli,
     #[value(name = "codex")]
     Codex,
+    #[value(name = "all")]
+    All,
 }
 
 #[derive(Debug, Clone)]
@@ -75,57 +87,76 @@ pub fn install(
     uninstall: bool,
     skip_mcp: bool,
 ) -> Result<()> {
-    match target {
-        HookInstallTarget::ClaudeCode => {
-            let cwd = env::current_dir().context("failed to resolve current working directory")?;
-            let home = home_dir()?;
-            let outcome = install_claude_code(&cwd, &home, dry_run, uninstall)?;
-            if dry_run {
-                println!(
-                    "--- dry run: {} ({}) ---\n{}",
-                    outcome.display_path.display(),
-                    outcome.write_path.display(),
-                    outcome.rendered
-                );
-            } else if uninstall {
-                println!(
-                    "removed {} hook entr{} from {} ({})",
-                    outcome.removed_commands,
-                    if outcome.removed_commands == 1 {
-                        "y"
-                    } else {
-                        "ies"
-                    },
-                    outcome.display_path.display(),
-                    outcome.write_path.display()
-                );
-            } else if outcome.changed {
-                println!(
-                    "updated {} ({})",
-                    outcome.display_path.display(),
-                    outcome.write_path.display()
-                );
-            } else {
-                println!(
-                    "no-op {} ({})",
-                    outcome.display_path.display(),
-                    outcome.write_path.display()
-                );
-            }
+    let home = home_dir()?;
+    let cwd = env::current_dir().context("failed to resolve current working directory")?;
 
-            // Issue #129: ensure mempal MCP server is registered at the user
-            // level so any project (not just the mempal repo) can call
-            // mempal_ingest / mempal_search and reach the daemon-driven
-            // capture pipeline.
-            if !skip_mcp {
-                let mcp_outcome = install_user_mcp(&home, dry_run, uninstall)?;
-                report_mcp_outcome(&mcp_outcome, dry_run);
+    let targets = match target {
+        HookInstallTarget::All => vec![HookInstallTarget::ClaudeCode, HookInstallTarget::Codex],
+        other => vec![other],
+    };
+
+    for t in targets {
+        match t {
+            HookInstallTarget::ClaudeCode => {
+                let outcome = install_claude_code(&cwd, &home, dry_run, uninstall)?;
+                report_install_outcome(&outcome, dry_run, uninstall);
             }
-            Ok(())
+            HookInstallTarget::Codex => {
+                let outcome = install_codex(&cwd, &home, dry_run, uninstall)?;
+                report_install_outcome(&outcome, dry_run, uninstall);
+                if !dry_run && !uninstall {
+                    if let Err(e) = check_codex_feature_flag(&home) {
+                        eprintln!("warning: failed to check Codex feature flag: {}", e);
+                    }
+                }
+            }
+            HookInstallTarget::GeminiCli => {
+                bail!("hook install currently supports only --target claude-code, codex, and all");
+            }
+            HookInstallTarget::All => unreachable!(),
         }
-        HookInstallTarget::GeminiCli | HookInstallTarget::Codex => {
-            bail!("hook install currently supports only --target claude-code");
-        }
+    }
+
+    if !skip_mcp {
+        let mcp_outcome = install_user_mcp(&home, dry_run, uninstall)?;
+        report_mcp_outcome(&mcp_outcome, dry_run);
+    }
+
+    Ok(())
+}
+
+fn report_install_outcome(outcome: &InstallOutcome, dry_run: bool, uninstall: bool) {
+    if dry_run {
+        println!(
+            "--- dry run: {} ({}) ---\n{}",
+            outcome.display_path.display(),
+            outcome.write_path.display(),
+            outcome.rendered
+        );
+    } else if uninstall {
+        println!(
+            "removed {} hook entr{} from {} ({})",
+            outcome.removed_commands,
+            if outcome.removed_commands == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            outcome.display_path.display(),
+            outcome.write_path.display()
+        );
+    } else if outcome.changed {
+        println!(
+            "updated {} ({})",
+            outcome.display_path.display(),
+            outcome.write_path.display()
+        );
+    } else {
+        println!(
+            "no-op {} ({})",
+            outcome.display_path.display(),
+            outcome.write_path.display()
+        );
     }
 }
 
@@ -228,6 +259,105 @@ pub fn install_claude_code(
         changed,
         removed_commands,
     })
+}
+
+pub fn install_codex(
+    cwd: &Path,
+    home: &Path,
+    dry_run: bool,
+    uninstall: bool,
+) -> Result<InstallOutcome> {
+    let path = home.join(CODEX_HOOKS_RELATIVE);
+    let write_path = canonicalize_if_symlink(&path)?;
+    validate_write_target(cwd, home, &write_path, HookInstallTarget::Codex)?;
+
+    let hook_commands = hook_commands()?;
+    let mut root = read_settings_json(&write_path)?;
+    let mut removed_commands = 0usize;
+    let mut changed = false;
+
+    for (event_name, command) in &hook_commands {
+        let event_array = ensure_hook_event_array(&mut root, event_name)?;
+        let before_len = event_array.len();
+        event_array.retain(|entry| !entry_contains_command(entry, command));
+        let removed = before_len.saturating_sub(event_array.len());
+        removed_commands += removed;
+
+        let inserted = !uninstall
+            && !event_array
+                .iter()
+                .any(|entry| entry_contains_command(entry, command));
+
+        if inserted {
+            event_array.push(json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": command
+                }]
+            }));
+        }
+
+        changed |= removed > 0 || inserted;
+    }
+
+    let rendered =
+        serde_json::to_string_pretty(&root).context("failed to serialize hook settings JSON")?;
+    if !dry_run {
+        if let Some(parent) = write_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create hook settings parent {}", parent.display())
+            })?;
+        }
+        let existing = fs::read_to_string(&write_path).ok();
+        changed = existing.as_deref() != Some(rendered.as_str());
+        if changed {
+            fs::write(&write_path, &rendered).with_context(|| {
+                format!("failed to write hook settings {}", write_path.display())
+            })?;
+        }
+    }
+
+    Ok(InstallOutcome {
+        display_path: path,
+        write_path,
+        rendered,
+        changed,
+        removed_commands,
+    })
+}
+
+fn check_codex_feature_flag(home: &Path) -> Result<()> {
+    let path = home.join(".codex/config.toml");
+    let mut enabled = false;
+
+    if path.exists() {
+        let content = fs::read_to_string(&path).context("failed to read Codex config")?;
+
+        #[derive(Deserialize)]
+        struct CodexConfig {
+            codex_hooks: Option<bool>,
+            features: Option<CodexFeatures>,
+        }
+        #[derive(Deserialize)]
+        struct CodexFeatures {
+            codex_hooks: Option<bool>,
+        }
+
+        if let Ok(config) = toml::from_str::<CodexConfig>(&content) {
+            enabled = config.codex_hooks.unwrap_or(false)
+                || config.features.and_then(|f| f.codex_hooks).unwrap_or(false);
+        }
+    }
+
+    if !enabled {
+        println!(
+            "warning: Codex hook runtime (codex_hooks) is currently disabled. hooks in {} will be ignored.",
+            home.join(CODEX_HOOKS_RELATIVE).display()
+        );
+        println!("Run `codex features enable codex_hooks` to activate hook support.");
+    }
+
+    Ok(())
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -384,7 +514,7 @@ fn resolve_claude_settings_path(cwd: &Path, home: &Path) -> Result<ResolvedSetti
     let local_path = cwd.join(CLAUDE_SETTINGS_RELATIVE);
     if local_path.exists() || is_symlink(&local_path)? {
         let write_path = canonicalize_if_symlink(&local_path)?;
-        validate_write_target(cwd, home, &write_path)?;
+        validate_write_target(cwd, home, &write_path, HookInstallTarget::ClaudeCode)?;
         return Ok(ResolvedSettingsPath {
             display_path: local_path,
             write_path,
@@ -393,7 +523,7 @@ fn resolve_claude_settings_path(cwd: &Path, home: &Path) -> Result<ResolvedSetti
 
     let global_path = home.join(CLAUDE_SETTINGS_RELATIVE);
     let write_path = canonicalize_if_symlink(&global_path)?;
-    validate_write_target(cwd, home, &write_path)?;
+    validate_write_target(cwd, home, &write_path, HookInstallTarget::ClaudeCode)?;
     Ok(ResolvedSettingsPath {
         display_path: global_path.clone(),
         write_path,
@@ -436,12 +566,38 @@ fn ensure_hook_event_array<'a>(
 }
 
 fn entry_contains_command(entry: &Value, expected: &str) -> bool {
-    entry
-        .get("hooks")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|hook| hook.get("command").and_then(Value::as_str) == Some(expected))
+    let hooks = match entry.get("hooks").and_then(Value::as_array) {
+        Some(h) => h,
+        None => return false,
+    };
+
+    hooks.iter().any(|hook| {
+        let cmd = match hook.get("command").and_then(Value::as_str) {
+            Some(c) => c,
+            None => return false,
+        };
+
+        if cmd == expected {
+            return true;
+        }
+
+        // Check for aliases. Both cmd and expected should share the same
+        // '.../mempal hook ' prefix for us to consider them related.
+        if let (Some((_base_cmd, sub_cmd)), Some((_base_expected, sub_expected))) =
+            (cmd.rsplit_once(" hook "), expected.rsplit_once(" hook "))
+        {
+            if sub_cmd == sub_expected {
+                return true;
+            }
+            for (old, new) in LEGACY_ALIASES {
+                if sub_expected == new && sub_cmd == old {
+                    return true;
+                }
+            }
+        }
+
+        false
+    })
 }
 
 fn is_symlink(path: &Path) -> Result<bool> {
@@ -461,7 +617,12 @@ fn canonicalize_if_symlink(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-fn validate_write_target(cwd: &Path, home: &Path, path: &Path) -> Result<()> {
+fn validate_write_target(
+    cwd: &Path,
+    home: &Path,
+    path: &Path,
+    target: HookInstallTarget,
+) -> Result<()> {
     if path
         .file_name()
         .and_then(|name| name.to_str())
@@ -487,11 +648,25 @@ fn validate_write_target(cwd: &Path, home: &Path, path: &Path) -> Result<()> {
         .and_then(Path::file_name)
         .and_then(|name| name.to_str());
     let file_name = path.file_name().and_then(|name| name.to_str());
-    if parent_name != Some(CLAUDE_SETTINGS_DIR) || file_name != Some(CLAUDE_SETTINGS_FILE) {
-        bail!(
-            "refusing to edit non-canonical Claude settings target {}",
-            path.display()
-        );
+
+    match target {
+        HookInstallTarget::ClaudeCode => {
+            if parent_name != Some(CLAUDE_SETTINGS_DIR) || file_name != Some(CLAUDE_SETTINGS_FILE) {
+                bail!(
+                    "refusing to edit non-canonical Claude settings target {}",
+                    path.display()
+                );
+            }
+        }
+        HookInstallTarget::Codex => {
+            if parent_name != Some(CODEX_SETTINGS_DIR) || file_name != Some(CODEX_SETTINGS_FILE) {
+                bail!(
+                    "refusing to edit non-canonical Codex settings target {}",
+                    path.display()
+                );
+            }
+        }
+        _ => {}
     }
 
     let allowed_roots = [
