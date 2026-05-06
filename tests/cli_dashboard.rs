@@ -381,11 +381,7 @@ fn test_audit_novelty_lists_decisions() {
         );
     }
 
-    let output = run_mempal(
-        &env.home,
-        env.cwd(),
-        &["audit", "--kind", "novelty", "--since", "7d"],
-    );
+    let output = run_mempal(&env.home, env.cwd(), &["audit", "novelty", "--since", "7d"]);
     assert!(
         output.status.success(),
         "stderr={}",
@@ -505,7 +501,7 @@ fn test_observability_subcommands_readonly() {
         vec!["timeline", "--format", "json"],
         vec!["stats"],
         vec!["view", "readonly-1"],
-        vec!["audit", "--kind", "novelty", "--since", "7d"],
+        vec!["audit", "novelty", "--since", "7d"],
     ] {
         let output = run_mempal(&env.home, env.cwd(), &args);
         assert!(
@@ -1162,11 +1158,7 @@ fn test_audit_filters_by_project_when_isolation_strict() {
         now_unix_secs(),
     );
 
-    let output = run_mempal(
-        &env.home,
-        env.cwd(),
-        &["audit", "--kind", "novelty", "--since", "7d"],
-    );
+    let output = run_mempal(&env.home, env.cwd(), &["audit", "novelty", "--since", "7d"]);
     assert!(
         output.status.success(),
         "stderr={}",

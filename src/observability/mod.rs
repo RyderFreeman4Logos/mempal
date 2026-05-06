@@ -44,12 +44,6 @@ pub struct ViewOptions<'a> {
     pub raw: bool,
 }
 
-pub struct AuditOptions<'a> {
-    pub kind: Option<&'a str>,
-    pub since: Option<&'a str>,
-    pub raw: bool,
-}
-
 pub struct GatingStatsOptions<'a> {
     pub since: Option<&'a str>,
 }
@@ -102,8 +96,42 @@ struct GatingAuditDetail {
     tier: u8,
     label: Option<String>,
     reason: Option<String>,
+    score: Option<f32>,
+    content_preview: Option<String>,
     created_at: i64,
     project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbedFailureRecord {
+    pub id: String,
+    pub timestamp: i64,
+    pub error_message: String,
+    pub endpoint: Option<String>,
+    pub consecutive_failures: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NoveltyAuditRecord {
+    pub id: String,
+    pub candidate_hash: String,
+    pub decision: String,
+    pub near_drawer_id: Option<String>,
+    pub cosine: Option<f32>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GatingAuditRecord {
+    pub audit_id: String,
+    pub candidate_hash: String,
+    pub decision: String,
+    pub tier: u8,
+    pub label: Option<String>,
+    pub reason: Option<String>,
+    pub score: Option<f32>,
+    pub content_preview: Option<String>,
+    pub created_at: i64,
 }
 
 struct GatingExplainFields {
@@ -401,39 +429,198 @@ pub fn view_command(db: &Database, config: &Config, options: ViewOptions<'_>) ->
     Ok(())
 }
 
-pub fn audit_command(db: &Database, config: &Config, options: AuditOptions<'_>) -> Result<()> {
+pub fn audit_gating_command(
+    db: &Database,
+    config: &Config,
+    decision_filter: Option<String>,
+    since: Option<&str>,
+    project_filter: Option<&str>,
+    format: &str,
+    raw: bool,
+) -> Result<()> {
     let scope = dashboard_scope(config)?;
-    let since_cutoff = parse_since_cutoff(options.since)?;
-    match options.kind.unwrap_or("all") {
-        "all" => {
-            print_audit_section(
-                "gating",
-                &load_audit_records(db, "gating", &scope, since_cutoff)?,
-                options.raw,
-            );
-            print_audit_section(
-                "novelty",
-                &load_audit_records(db, "novelty", &scope, since_cutoff)?,
-                options.raw,
-            );
+    let since_cutoff = parse_since_cutoff(since)?;
+    let rows = load_gating_audit_details(db, &scope, since_cutoff)?;
+
+    let filtered: Vec<_> = rows
+        .into_iter()
+        .filter(|row| {
+            decision_filter.as_deref().is_none_or(|d| row.decision == d)
+                && project_filter.is_none_or(|p| row.project_id.as_deref() == Some(p))
+        })
+        .collect();
+
+    if format == "json" {
+        let json_rows: Vec<_> = filtered
+            .into_iter()
+            .map(|row| GatingAuditRecord {
+                audit_id: row.audit_id,
+                candidate_hash: row.candidate_hash,
+                decision: row.decision,
+                tier: row.tier,
+                label: row.label,
+                reason: row.reason,
+                score: row.score,
+                content_preview: row.content_preview,
+                created_at: row.created_at,
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_rows).context("failed to serialize gating audit")?
+        );
+    } else {
+        println!("gating_audit:");
+        if filtered.is_empty() {
+            println!("  none");
+        } else {
+            for row in filtered {
+                let score_str = row
+                    .score
+                    .map(|s| format!(" score={:.3}", s))
+                    .unwrap_or_default();
+                let preview = row
+                    .content_preview
+                    .as_deref()
+                    .map(|p| {
+                        let truncated = if p.len() > 80 {
+                            format!("{}...", &p[..77])
+                        } else {
+                            p.to_string()
+                        };
+                        format!(" preview={:?}", maybe_escape(&truncated, raw))
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "  {} decision={} label={:?} reason={:?}{} candidate_hash={} audit_id={}{}",
+                    format_created_at(row.created_at),
+                    row.decision,
+                    row.label.as_deref().unwrap_or("none"),
+                    row.reason.as_deref().unwrap_or("none"),
+                    score_str,
+                    maybe_escape(&row.candidate_hash, raw),
+                    maybe_escape(&row.audit_id, raw),
+                    preview
+                );
+            }
         }
-        "gating" => {
-            print_audit_section(
-                "gating",
-                &load_audit_records(db, "gating", &scope, since_cutoff)?,
-                options.raw,
-            );
-        }
-        "novelty" => {
-            print_audit_section(
-                "novelty",
-                &load_audit_records(db, "novelty", &scope, since_cutoff)?,
-                options.raw,
-            );
-        }
-        other => bail!("unsupported audit kind: {other}"),
     }
     Ok(())
+}
+
+pub fn audit_embed_command(
+    db: &Database,
+    config: &Config,
+    since: Option<&str>,
+    format: &str,
+    raw: bool,
+) -> Result<()> {
+    let _scope = dashboard_scope(config)?;
+    let since_cutoff = parse_since_cutoff(since)?;
+    let rows = load_embed_failure_records(db, since_cutoff)?;
+
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).context("failed to serialize embed audit")?
+        );
+    } else {
+        println!("embed_failure_log:");
+        if rows.is_empty() {
+            println!("  none");
+        } else {
+            for row in rows {
+                let endpoint = row.endpoint.as_deref().unwrap_or("unknown");
+                let consecutive = row.consecutive_failures.unwrap_or(1);
+                let truncated_error = if row.error_message.len() > 80 {
+                    format!("{}...", &row.error_message[..77])
+                } else {
+                    row.error_message.clone()
+                };
+                println!(
+                    "  {} endpoint={} consecutive={} error={:?} id={}",
+                    format_created_at(row.timestamp),
+                    maybe_escape(endpoint, raw),
+                    consecutive,
+                    maybe_escape(&truncated_error, raw),
+                    maybe_escape(&row.id, raw)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn audit_novelty_command(
+    db: &Database,
+    config: &Config,
+    since: Option<&str>,
+    format: &str,
+    raw: bool,
+) -> Result<()> {
+    let scope = dashboard_scope(config)?;
+    let since_cutoff = parse_since_cutoff(since)?;
+    let records = load_audit_records(db, "novelty", &scope, since_cutoff)?;
+
+    if format == "json" {
+        let json_rows: Vec<_> = records
+            .into_iter()
+            .map(|row| NoveltyAuditRecord {
+                id: row.audit_id,
+                candidate_hash: row.candidate_drawer_id,
+                decision: row.decision,
+                near_drawer_id: row.near_drawer_id,
+                cosine: row.similarity_score,
+                created_at: row.created_at,
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_rows)
+                .context("failed to serialize novelty audit")?
+        );
+    } else {
+        print_audit_section("novelty", &records, raw);
+    }
+    Ok(())
+}
+
+fn load_embed_failure_records(
+    db: &Database,
+    since_cutoff: Option<i64>,
+) -> Result<Vec<EmbedFailureRecord>> {
+    if db.conn().query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embed_failure_log'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? == 0
+    {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = db.conn().prepare(
+        r#"
+        SELECT id, timestamp, error_message, endpoint, consecutive_failures
+        FROM embed_failure_log
+        ORDER BY timestamp DESC
+        "#,
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(EmbedFailureRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                error_message: row.get(2)?,
+                endpoint: row.get(3)?,
+                consecutive_failures: row.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(rows
+        .into_iter()
+        .filter(|row| since_cutoff.is_none_or(|cutoff| row.timestamp >= cutoff))
+        .collect())
 }
 
 pub fn gating_stats(
@@ -825,11 +1012,21 @@ fn load_gating_audit_details(
         .into_iter()
         .all(|column| columns.iter().any(|name| name == column));
 
+    let has_score = columns.iter().any(|name| name == "score");
+    let has_content_preview = columns.iter().any(|name| name == "content_preview");
+
     let rows = if modern {
+        let score_expr = if has_score { "a.score" } else { "NULL" };
+        let preview_expr = if has_content_preview {
+            "a.content_preview"
+        } else {
+            "NULL"
+        };
+
         let sql = format!(
             r#"
             SELECT a.id, a.candidate_hash, a.decision, a.tier, a.label, a.reason,
-                   a.explain_json, a.created_at, {project_expr}
+                   a.explain_json, a.created_at, {project_expr}, {score_expr}, {preview_expr}
             FROM gating_audit a
             LEFT JOIN drawers d ON d.id = COALESCE(a.drawer_id, a.candidate_hash)
             ORDER BY a.created_at DESC, a.id DESC
@@ -860,6 +1057,8 @@ fn load_gating_audit_details(
                 reason,
                 created_at: row.get::<_, i64>(7)?,
                 project_id: row.get::<_, Option<String>>(8)?,
+                score: row.get::<_, Option<f32>>(9)?,
+                content_preview: row.get::<_, Option<String>>(10)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?
@@ -888,6 +1087,8 @@ fn load_gating_audit_details(
                 reason: parsed.and_then(|value| value.reason),
                 created_at: row.get::<_, i64>(4)?,
                 project_id: row.get::<_, Option<String>>(5)?,
+                score: None,
+                content_preview: None,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?
@@ -1339,5 +1540,17 @@ mod tests {
         assert_eq!(try_parse_duration_secs("2026-04-25T20:00:00Z"), None);
         assert_eq!(try_parse_duration_secs("not-a-duration"), None);
         assert_eq!(try_parse_duration_secs(""), None);
+    }
+
+    #[test]
+    fn test_parse_since_24_hours() {
+        let cutoff = parse_since_str("24h", FIXED_NOW).unwrap();
+        assert_eq!(cutoff, FIXED_NOW - 86400);
+    }
+
+    #[test]
+    fn test_parse_since_7_days() {
+        let cutoff = parse_since_str("7d", FIXED_NOW).unwrap();
+        assert_eq!(cutoff, FIXED_NOW - 7 * 86400);
     }
 }
