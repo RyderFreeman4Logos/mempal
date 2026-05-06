@@ -52,11 +52,16 @@ pub fn run_command_with_bootstrap_events(
 }
 
 async fn run_loop(context: &DaemonContext) -> Result<()> {
-    global_embed_status().set_audit_db_path(Some(context.db.path().to_path_buf()));
-    context
-        .db
-        .prune_expired_audit_logs()
-        .context("failed to prune expired audit logs")?;
+    let db_path = {
+        let db = context.db.lock().await;
+        db.path().to_path_buf()
+    };
+    global_embed_status().set_audit_db_path(Some(db_path));
+    {
+        let db = context.db.lock().await;
+        db.prune_expired_audit_logs()
+            .context("failed to prune expired audit logs")?;
+    }
 
     if !context.config.hooks.enabled {
         eprintln!("hooks not enabled; daemon exiting without starting worker loop");
@@ -82,6 +87,11 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .reclaim_stale(claim_ttl_secs)
         .context("failed to reclaim stale daemon claims")?;
     tracing::info!("daemon startup reclaim_stale reclaimed={reclaimed}");
+    let stall_watchdog_handle = spawn_stall_watchdog(
+        context.write_observer.clone(),
+        context.store.clone(),
+        Duration::from_secs(60),
+    );
 
     let llm_worker_handles: Vec<tokio::task::JoinHandle<_>> = if context.config.llm.enabled {
         match crate::llm::LlmClient::from_config(&context.config.llm) {
@@ -90,18 +100,21 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                 let llm_status = std::sync::Arc::new(crate::llm::LlmStatus::new(10));
                 let llm_store = std::sync::Arc::new(context.store.clone());
                 let llm_client = std::sync::Arc::new(llm_client);
-                let db_path = context.db.path().to_path_buf();
+                let shared_db = context.db.clone();
+                let write_observer = context.write_observer.clone();
                 tracing::info!("spawning {num_workers} LLM worker tasks");
                 (0..num_workers)
                     .map(|i| {
                         let store = llm_store.clone();
                         let client = llm_client.clone();
                         let status = llm_status.clone();
-                        let path = db_path.clone();
+                        let db = shared_db.clone();
+                        let observer = write_observer.clone();
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                crate::llm::worker::run_llm_worker(store, client, status, path)
-                                    .await
+                            if let Err(e) = crate::llm::worker::run_llm_worker(
+                                store, client, status, db, observer,
+                            )
+                            .await
                             {
                                 tracing::error!("LLM worker {i} fatal error: {e:#}");
                             }
@@ -120,6 +133,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     };
 
     loop {
+        context.write_observer.maybe_log_stall(&context.store);
+
         if shutdown_requested() {
             tracing::info!("shutdown requested; stopping daemon loop");
             break;
@@ -132,19 +147,22 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         {
             ClaimPollResult::Claimed(message) => {
                 let message_id = message.id.clone();
-                let result = process_claimed_message_with_embedder(
-                    &context.db,
-                    &context.store,
-                    &worker_id,
-                    &message,
-                    &embedder,
-                    DaemonIngestContext {
-                        prototype_classifier: prototype_classifier.as_ref(),
-                        config: context.config.as_ref(),
-                        mempal_home: &context.mempal_home,
-                    },
-                )
-                .await;
+                let result = {
+                    let db = context.db.lock().await;
+                    process_claimed_message_with_embedder(
+                        &db,
+                        &context.store,
+                        &worker_id,
+                        &message,
+                        &embedder,
+                        DaemonIngestContext {
+                            prototype_classifier: prototype_classifier.as_ref(),
+                            config: context.config.as_ref(),
+                            mempal_home: &context.mempal_home,
+                        },
+                    )
+                    .await
+                };
 
                 match result {
                     Ok(_) => {
@@ -152,9 +170,11 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                             .store
                             .confirm(&message_id)
                             .with_context(|| format!("failed to confirm {message_id}"))?;
+                        context.write_observer.record_successful_write();
                     }
                     Err(error) => {
                         tracing::error!("daemon message {message_id} failed: {error}");
+                        context.write_observer.record_error(error.to_string());
                         context
                             .store
                             .mark_failed(&message_id, &error.to_string())
@@ -174,8 +194,28 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         let _ = handle.await;
     }
     tracing::info!("LLM workers stopped");
+    stall_watchdog_handle.abort();
+    let _ = stall_watchdog_handle.await;
 
     Ok(())
+}
+
+fn spawn_stall_watchdog(
+    observer: crate::daemon_bootstrap::DaemonWriteObserver,
+    store: PendingMessageStore,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if shutdown_requested() {
+                break;
+            }
+            observer.maybe_log_stall(&store);
+        }
+    })
 }
 
 trait ClaimNextSource {
@@ -898,9 +938,8 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         record.project_id.as_deref(),
                     )
                     .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
-                let mut db_for_merge = Database::open(context.db.path())
-                    .with_context(|| format!("failed to reopen db for merge {}", target_id))?;
-                db_for_merge
+                context
+                    .db
                     .update_drawer_after_merge(
                         &target_id,
                         &merged_content,

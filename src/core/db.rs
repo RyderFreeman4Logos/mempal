@@ -576,7 +576,7 @@ impl Database {
     }
 
     pub fn update_drawer_after_merge(
-        &mut self,
+        &self,
         drawer_id: &str,
         merged_content: &str,
         updated_at: &str,
@@ -584,29 +584,41 @@ impl Database {
     ) -> Result<(), DbError> {
         self.ensure_vectors_table(vector.len())?;
         let vector_json = serde_json::to_string(vector)?;
-        let transaction = self.conn.transaction()?;
-        transaction.execute(
-            r#"
-            UPDATE drawers
-            SET content = ?2,
-                updated_at = ?3,
-                merge_count = COALESCE(merge_count, 0) + 1
-            WHERE id = ?1
-            "#,
-            params![drawer_id, merged_content, updated_at],
-        )?;
-        transaction.execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])?;
-        let project_id = transaction.query_row(
-            "SELECT project_id FROM drawers WHERE id = ?1",
-            [drawer_id],
-            |row| row.get::<_, Option<String>>(0),
-        )?;
-        transaction.execute(
-            "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
-            params![drawer_id, vector_json, project_id],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), DbError> {
+            self.conn.execute(
+                r#"
+                UPDATE drawers
+                SET content = ?2,
+                    updated_at = ?3,
+                    merge_count = COALESCE(merge_count, 0) + 1
+                WHERE id = ?1
+                "#,
+                params![drawer_id, merged_content, updated_at],
+            )?;
+            self.conn
+                .execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])?;
+            let project_id = self.conn.query_row(
+                "SELECT project_id FROM drawers WHERE id = ?1",
+                [drawer_id],
+                |row| row.get::<_, Option<String>>(0),
+            )?;
+            self.conn.execute(
+                "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
+                params![drawer_id, vector_json, project_id],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn record_novelty_audit(

@@ -1750,6 +1750,7 @@ threshold = 0.5
     };
     let client = LlmClient::from_config(&llm_config).expect("build LLM client");
     let status = LlmStatus::new(5);
+    let db = env.db();
     let judge_config = Config {
         ingest_gating: IngestGatingConfig {
             llm_judge: Some(LlmJudgeConfig {
@@ -1761,16 +1762,9 @@ threshold = 0.5
         },
         ..Default::default()
     };
-    mempal::llm::process_llm_task(
-        &client,
-        &status,
-        &env.db_path,
-        &claimed.payload,
-        &judge_config,
-        None,
-    )
-    .await
-    .expect("process LLM task");
+    mempal::llm::process_llm_task(&client, &status, &db, &claimed.payload, &judge_config, None)
+        .await
+        .expect("process LLM task");
 
     // All chunk drawers must be soft-deleted after rejection.
     assert_eq!(

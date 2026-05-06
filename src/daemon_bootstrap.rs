@@ -1,6 +1,11 @@
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
@@ -9,16 +14,143 @@ use crate::core::{
     queue::PendingMessageStore,
 };
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
+
+const DAEMON_STALL_SECONDS: u64 = 5 * 60;
+const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
+
+pub type SharedDatabase = Arc<AsyncMutex<Database>>;
+
+#[derive(Clone)]
+pub struct DaemonWriteObserver {
+    inner: Arc<DaemonWriteObserverInner>,
+}
+
+struct DaemonWriteObserverInner {
+    started_at: Instant,
+    last_successful_write_secs: AtomicU64,
+    last_stall_log_secs: AtomicU64,
+    last_error: Mutex<Option<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonStallDiagnostic {
+    queued_count: u64,
+    seconds_since_successful_write: u64,
+    last_error: String,
+    uptime_secs: u64,
+}
 
 pub struct DaemonContext {
     pub runtime: tokio::runtime::Runtime,
-    pub db: Database,
+    pub db: SharedDatabase,
     pub store: PendingMessageStore,
+    pub write_observer: DaemonWriteObserver,
     pub config: std::sync::Arc<crate::core::config::Config>,
     pub mempal_home: PathBuf,
     pub log_path: PathBuf,
     _pid_guard: PidFileGuard,
+}
+
+impl DaemonWriteObserver {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(DaemonWriteObserverInner {
+                started_at: Instant::now(),
+                last_successful_write_secs: AtomicU64::new(unix_secs()),
+                last_stall_log_secs: AtomicU64::new(0),
+                last_error: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub fn record_successful_write(&self) {
+        self.inner
+            .last_successful_write_secs
+            .store(unix_secs(), Ordering::Relaxed);
+    }
+
+    pub fn record_error(&self, error: impl Into<String>) {
+        if let Ok(mut last_error) = self.inner.last_error.lock() {
+            *last_error = Some(error.into());
+        }
+    }
+
+    pub fn maybe_log_stall(&self, store: &PendingMessageStore) {
+        let now = unix_secs();
+        let Some(diagnostic) = self.stall_diagnostic(store, now) else {
+            return;
+        };
+        let last_log = self.inner.last_stall_log_secs.load(Ordering::Relaxed);
+        if now.saturating_sub(last_log) < DAEMON_STALL_LOG_THROTTLE_SECONDS {
+            return;
+        }
+        if self
+            .inner
+            .last_stall_log_secs
+            .compare_exchange(last_log, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        tracing::error!(
+            queued_count = diagnostic.queued_count,
+            seconds_since_successful_write = diagnostic.seconds_since_successful_write,
+            last_error = %diagnostic.last_error,
+            uptime_secs = diagnostic.uptime_secs,
+            "daemon write stall detected: queued messages exist but no successful write has completed for at least 5 minutes"
+        );
+    }
+
+    fn stall_diagnostic(
+        &self,
+        store: &PendingMessageStore,
+        now_secs: u64,
+    ) -> Option<DaemonStallDiagnostic> {
+        let stats = match store.stats() {
+            Ok(stats) => stats,
+            Err(error) => {
+                tracing::warn!(?error, "daemon stall detector failed to read queue stats");
+                return None;
+            }
+        };
+        let queued_count = stats.pending.saturating_add(stats.claimed);
+        if queued_count == 0 {
+            return None;
+        }
+
+        let last_successful_write = self
+            .inner
+            .last_successful_write_secs
+            .load(Ordering::Relaxed);
+        let seconds_since_successful_write = now_secs.saturating_sub(last_successful_write);
+        if seconds_since_successful_write < DAEMON_STALL_SECONDS {
+            return None;
+        }
+
+        let last_error = self
+            .inner
+            .last_error
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| "none recorded".to_string());
+
+        Some(DaemonStallDiagnostic {
+            queued_count,
+            seconds_since_successful_write,
+            last_error,
+            uptime_secs: self.inner.started_at.elapsed().as_secs(),
+        })
+    }
+
+    #[cfg(test)]
+    fn force_last_successful_write_for_test(&self, timestamp_secs: u64) {
+        self.inner
+            .last_successful_write_secs
+            .store(timestamp_secs, Ordering::Relaxed);
+    }
 }
 
 impl DaemonContext {
@@ -75,6 +207,8 @@ fn bootstrap_inner(
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::DbOpen);
     let db = Database::open(&db_path).context("failed to open daemon database")?;
     let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
+    let db = Arc::new(AsyncMutex::new(db));
+    let write_observer = DaemonWriteObserver::new();
 
     // harness-point: PR0
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::TracingInit);
@@ -88,11 +222,19 @@ fn bootstrap_inner(
         runtime,
         db,
         store,
+        write_observer,
         config,
         mempal_home,
         log_path,
         _pid_guard: pid_guard,
     })
+}
+
+fn unix_secs() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    }
 }
 
 fn init_tracing_subscriber() {
@@ -227,4 +369,46 @@ fn redirect_stdin_to_dev_null() -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("failed to redirect daemon stdin");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(&db_path).expect("open queue");
+        store
+            .enqueue("hook:user-prompt-submit", "{}")
+            .expect("enqueue pending message");
+
+        let observer = DaemonWriteObserver::new();
+        let now = unix_secs();
+        observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
+        observer.record_error("failed to merge drawer");
+
+        let diagnostic = observer
+            .stall_diagnostic(&store, now)
+            .expect("stall diagnostic");
+        assert_eq!(diagnostic.queued_count, 1);
+        assert!(diagnostic.seconds_since_successful_write >= DAEMON_STALL_SECONDS);
+        assert_eq!(diagnostic.last_error, "failed to merge drawer");
+    }
+
+    #[test]
+    fn write_observer_ignores_empty_queue() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(&db_path).expect("open queue");
+
+        let observer = DaemonWriteObserver::new();
+        let now = unix_secs();
+        observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
+
+        assert_eq!(observer.stall_diagnostic(&store, now), None);
+    }
 }
