@@ -483,8 +483,8 @@ pub fn audit_gating_command(
                     .content_preview
                     .as_deref()
                     .map(|p| {
-                        let truncated = if p.len() > 80 {
-                            format!("{}...", &p[..77])
+                        let truncated = if p.chars().count() > 80 {
+                            format!("{}...", p.chars().take(77).collect::<String>())
                         } else {
                             p.to_string()
                         };
@@ -532,8 +532,11 @@ pub fn audit_embed_command(
             for row in rows {
                 let endpoint = row.endpoint.as_deref().unwrap_or("unknown");
                 let consecutive = row.consecutive_failures.unwrap_or(1);
-                let truncated_error = if row.error_message.len() > 80 {
-                    format!("{}...", &row.error_message[..77])
+                let truncated_error = if row.error_message.chars().count() > 80 {
+                    format!(
+                        "{}...",
+                        row.error_message.chars().take(77).collect::<String>()
+                    )
                 } else {
                     row.error_message.clone()
                 };
