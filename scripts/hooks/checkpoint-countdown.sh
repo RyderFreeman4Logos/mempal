@@ -14,6 +14,10 @@
 # Debug log: /tmp/mempal-checkpoint-debug.log
 set -eu
 
+# Kill switch: `mempal checkpoint disable` creates this file, `enable` removes it.
+DISABLE_FLAG="$HOME/.mempal/checkpoint-disabled"
+[ -f "$DISABLE_FLAG" ] && exit 0
+
 LOG="/tmp/mempal-checkpoint-debug.log"
 log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG"; }
 
