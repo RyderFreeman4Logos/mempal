@@ -6,14 +6,15 @@
 # required (Stop hook output is not injected back into agent context).
 #
 # Guards:
-#   - Sub-agents (CLAUDE_CODE_ENTRY_POINT=task) skip
+#   - Sub-agents (CLAUDE_CODE_ENTRYPOINT=task) skip
 #   - CSA sessions (CSA_SESSION_ID set) skip
-#   - Non-interactive (no TERM, no CLAUDE_CODE_SESSION_ID) skip
+#   - Non-interactive (no TERM, no CLAUDECODE) skip
 #   - Dedup via atomic mkdir lock (TTL: 300s — Stop-event dedup window)
 set -euo pipefail
 
 # Guard: sub-agents should not trigger checkpoints
-if [ "${CLAUDE_CODE_ENTRY_POINT:-}" = "task" ]; then
+# NOTE: env var is CLAUDE_CODE_ENTRYPOINT (no underscore), not CLAUDE_CODE_ENTRY_POINT
+if [ "${CLAUDE_CODE_ENTRYPOINT:-}" = "task" ]; then
     exit 0
 fi
 
@@ -24,8 +25,8 @@ fi
 
 # Guard: non-interactive sessions (headless CI, cron, pipe)
 # NOTE: Cannot use `[ -t 0 ]` — Claude Code hooks always run as subprocesses
-# without a TTY. Use TERM/CLAUDE_CODE_SESSION_ID as proxy instead.
-if [ -z "${TERM:-}" ] && [ -z "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+# without a TTY. CLAUDECODE=1 is set in all Claude Code sessions.
+if [ -z "${TERM:-}" ] && [ -z "${CLAUDECODE:-}" ]; then
     exit 0
 fi
 
@@ -69,11 +70,18 @@ LOCK_HELD=1
 
 PROJECT_NAME="${MEMPAL_PROJECT:-$(basename "$(pwd)")}"
 
-# Locate session JSONL via CLAUDE_CODE_SESSION_ID env var
+# Locate session JSONL: try CLAUDE_CODE_SESSION_ID first, fall back to most
+# recent *.jsonl by mtime (CLAUDE_CODE_SESSION_ID is often not in hook env).
+# Project dir in ~/.claude/projects/ is cwd with / replaced by -.
+PROJECT_DIR_NAME=$(pwd | sed 's|/|-|g')
+PROJECT_DIR="$HOME/.claude/projects/${PROJECT_DIR_NAME}"
 SESSION_JSONL=""
 if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
-    SESSION_JSONL=$(find ~/.claude/projects -maxdepth 2 \
-        -name "${CLAUDE_CODE_SESSION_ID}.jsonl" 2>/dev/null | head -1)
+    SESSION_JSONL="${PROJECT_DIR}/${CLAUDE_CODE_SESSION_ID}.jsonl"
+    [ -f "$SESSION_JSONL" ] || SESSION_JSONL=""
+fi
+if [ -z "$SESSION_JSONL" ]; then
+    SESSION_JSONL=$(ls -t "$PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)
 fi
 
 if [ -z "$SESSION_JSONL" ] || [ ! -f "$SESSION_JSONL" ]; then
