@@ -505,6 +505,12 @@ enum CheckpointCommands {
         #[arg(long, default_value_t = 1)]
         last: usize,
     },
+    /// Enable automatic checkpoint on Stop hook.
+    Enable,
+    /// Disable automatic checkpoint on Stop hook.
+    Disable,
+    /// Show whether automatic checkpoint is enabled or disabled.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -2127,6 +2133,41 @@ async fn checkpoint_command(
             }
             if assistant_texts.is_empty() {
                 eprintln!("no assistant messages found in {}", path.display());
+            }
+        }
+        CheckpointCommands::Enable | CheckpointCommands::Disable | CheckpointCommands::Status => {
+            let flag = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .expect("HOME not set")
+                .join(".mempal")
+                .join("checkpoint-disabled");
+            match command {
+                CheckpointCommands::Enable => {
+                    if flag.exists() {
+                        std::fs::remove_file(&flag)
+                            .with_context(|| format!("failed to remove {}", flag.display()))?;
+                        println!("checkpoint enabled");
+                    } else {
+                        println!("checkpoint already enabled");
+                    }
+                }
+                CheckpointCommands::Disable => {
+                    if !flag.exists() {
+                        std::fs::write(&flag, "disabled by mempal checkpoint disable\n")
+                            .with_context(|| format!("failed to create {}", flag.display()))?;
+                        println!("checkpoint disabled");
+                    } else {
+                        println!("checkpoint already disabled");
+                    }
+                }
+                CheckpointCommands::Status => {
+                    if flag.exists() {
+                        println!("checkpoint: disabled");
+                    } else {
+                        println!("checkpoint: enabled");
+                    }
+                }
+                _ => unreachable!(),
             }
         }
     }
