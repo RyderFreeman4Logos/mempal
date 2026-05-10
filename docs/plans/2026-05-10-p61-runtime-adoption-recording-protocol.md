@@ -22,7 +22,7 @@ adoption events through `mempal_phase3`.
 - [x] Update memory protocol with recording semantics.
 - [x] Update design and repository inventories.
 - [x] Run spec checks and Rust verification.
-- [ ] Commit, ingest decision memory, push, and open/merge PR.
+- [x] Commit, ingest decision memory, push, and open/merge PR.
 
 ## Verification
 
