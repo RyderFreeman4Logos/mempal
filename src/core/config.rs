@@ -987,6 +987,12 @@ pub struct GatingRuleConfig {
     pub content_bytes_lt: Option<usize>,
     pub content_bytes_gt: Option<usize>,
     pub exit_code_eq: Option<i32>,
+    /// Skip when `content` starts with this literal prefix (case-sensitive).
+    /// Useful for filtering raw JSON event lines like `{"type":"turn.completed",...}`.
+    pub content_starts_with: Option<String>,
+    /// Skip when `content` contains this literal substring (case-sensitive).
+    /// More flexible than `content_starts_with`; use for patterns that may appear mid-content.
+    pub content_contains: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

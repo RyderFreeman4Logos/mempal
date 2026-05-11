@@ -472,6 +472,20 @@ fn match_rule<'a>(candidate: &IngestCandidate, rule: &'a GatingRuleConfig) -> Op
         matched = Some("exit_code_eq");
     }
 
+    if let Some(prefix) = &rule.content_starts_with {
+        if !candidate.content.starts_with(prefix.as_str()) {
+            return None;
+        }
+        matched = Some("content_starts_with");
+    }
+
+    if let Some(needle) = &rule.content_contains {
+        if !candidate.content.contains(needle.as_str()) {
+            return None;
+        }
+        matched = Some("content_contains");
+    }
+
     matched
 }
 

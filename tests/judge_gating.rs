@@ -1146,6 +1146,8 @@ fn test_tier1_skips_read_tool() {
         content_bytes_lt: None,
         content_bytes_gt: None,
         exit_code_eq: None,
+        content_starts_with: None,
+        content_contains: None,
     }];
 
     let decision = evaluate_tier1(
@@ -1355,6 +1357,8 @@ backend = "unsupported-backend"
         content_bytes_lt: None,
         content_bytes_gt: Some(1),
         exit_code_eq: None,
+        content_starts_with: None,
+        content_contains: None,
     }];
 
     let build_attempts = Arc::new(AtomicUsize::new(0));
@@ -2135,4 +2139,188 @@ threshold = 0.5
             .expect("drawer exists check"),
         "pre-existing drawer {preexisting_id} must not be soft-deleted by LLM reject guard"
     );
+}
+
+#[test]
+fn test_tier1_content_starts_with_matching_skips() {
+    let _guard = test_guard_blocking();
+    let mut config = Config::parse(
+        r#"
+[gating]
+enabled = true
+"#,
+    )
+    .expect("parse config");
+    config.ingest_gating.rules = vec![GatingRuleConfig {
+        action: "reject".to_string(),
+        content_starts_with: Some("{\"type\":".to_string()),
+        ..Default::default()
+    }];
+
+    let decision = evaluate_tier1(
+        &IngestCandidate {
+            content: r#"{"type":"turn.completed","session_id":"abc","token_count":123}"#
+                .to_string(),
+            event: None,
+            tool_name: None,
+            exit_code: None,
+        },
+        &config.ingest_gating,
+    )
+    .expect("tier1 decision");
+
+    assert!(decision.is_rejected());
+    assert_eq!(decision.tier, 1);
+    assert_eq!(
+        decision.matched_pattern.as_deref(),
+        Some("content_starts_with")
+    );
+}
+
+#[test]
+fn test_tier1_content_starts_with_non_matching_passes_through() {
+    let _guard = test_guard_blocking();
+    let mut config = Config::parse(
+        r#"
+[gating]
+enabled = true
+"#,
+    )
+    .expect("parse config");
+    config.ingest_gating.rules = vec![GatingRuleConfig {
+        action: "reject".to_string(),
+        content_starts_with: Some("{\"type\":".to_string()),
+        ..Default::default()
+    }];
+
+    let decision = evaluate_tier1(
+        &IngestCandidate {
+            content: "This is a regular assistant message with substantive content".to_string(),
+            event: None,
+            tool_name: None,
+            exit_code: None,
+        },
+        &config.ingest_gating,
+    );
+
+    // Rule should not match; tier1 returns None (no early decision from rules).
+    assert!(
+        decision.is_none(),
+        "non-matching content_starts_with should not produce a tier1 decision"
+    );
+}
+
+#[test]
+fn test_tier1_content_contains_matching_skips() {
+    let _guard = test_guard_blocking();
+    let mut config = Config::parse(
+        r#"
+[gating]
+enabled = true
+"#,
+    )
+    .expect("parse config");
+    config.ingest_gating.rules = vec![GatingRuleConfig {
+        action: "reject".to_string(),
+        content_contains: Some("turn.completed".to_string()),
+        ..Default::default()
+    }];
+
+    let decision = evaluate_tier1(
+        &IngestCandidate {
+            content: r#"{"type":"turn.completed","session_id":"abc"}"#.to_string(),
+            event: None,
+            tool_name: None,
+            exit_code: None,
+        },
+        &config.ingest_gating,
+    )
+    .expect("tier1 decision");
+
+    assert!(decision.is_rejected());
+    assert_eq!(decision.tier, 1);
+    assert_eq!(
+        decision.matched_pattern.as_deref(),
+        Some("content_contains")
+    );
+}
+
+#[test]
+fn test_tier1_content_contains_non_matching_passes_through() {
+    let _guard = test_guard_blocking();
+    let mut config = Config::parse(
+        r#"
+[gating]
+enabled = true
+"#,
+    )
+    .expect("parse config");
+    config.ingest_gating.rules = vec![GatingRuleConfig {
+        action: "reject".to_string(),
+        content_contains: Some("turn.completed".to_string()),
+        ..Default::default()
+    }];
+
+    let decision = evaluate_tier1(
+        &IngestCandidate {
+            content: "Substantial assistant message without any JSON event markers".to_string(),
+            event: None,
+            tool_name: None,
+            exit_code: None,
+        },
+        &config.ingest_gating,
+    );
+
+    assert!(
+        decision.is_none(),
+        "non-matching content_contains should not produce a tier1 decision"
+    );
+}
+
+#[test]
+fn test_tier1_content_starts_with_and_contains_both_required() {
+    let _guard = test_guard_blocking();
+    // A rule with both fields set is only satisfied when BOTH conditions hold.
+    let mut config = Config::parse(
+        r#"
+[gating]
+enabled = true
+"#,
+    )
+    .expect("parse config");
+    config.ingest_gating.rules = vec![GatingRuleConfig {
+        action: "reject".to_string(),
+        content_starts_with: Some("{\"type\":".to_string()),
+        content_contains: Some("item.completed".to_string()),
+        ..Default::default()
+    }];
+
+    // Starts with prefix, but does NOT contain "item.completed" → rule should not fire.
+    let no_match = evaluate_tier1(
+        &IngestCandidate {
+            content: r#"{"type":"turn.completed","session_id":"abc"}"#.to_string(),
+            event: None,
+            tool_name: None,
+            exit_code: None,
+        },
+        &config.ingest_gating,
+    );
+    assert!(
+        no_match.is_none(),
+        "rule requires both fields; missing content_contains should not match"
+    );
+
+    // Starts with prefix AND contains "item.completed" → rule fires.
+    let matched = evaluate_tier1(
+        &IngestCandidate {
+            content: r#"{"type":"item.completed","item_id":"xyz"}"#.to_string(),
+            event: None,
+            tool_name: None,
+            exit_code: None,
+        },
+        &config.ingest_gating,
+    )
+    .expect("both conditions met");
+    assert!(matched.is_rejected());
+    assert_eq!(matched.matched_pattern.as_deref(), Some("content_contains"));
 }
