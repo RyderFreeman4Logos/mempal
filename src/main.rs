@@ -1479,7 +1479,8 @@ fn run() -> Result<()> {
 
 fn is_dashboard_command(command: &Commands) -> bool {
     match command {
-        Commands::Tail { .. }
+        Commands::Status { .. }
+        | Commands::Tail { .. }
         | Commands::Timeline { .. }
         | Commands::Stats { .. }
         | Commands::View { .. } => true,
@@ -5022,9 +5023,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         None
     };
     let embed_status = global_embed_status().snapshot();
-    let queue_stats = mempal::core::queue::PendingMessageStore::new(db.path())
-        .context("failed to open pending message store")?
-        .stats()
+    let queue_stats = mempal::core::queue::queue_stats_readonly(db.path())
         .context("failed to query pending message stats")?;
     let schema_version = db
         .schema_version()

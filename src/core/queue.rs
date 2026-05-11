@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 
 use super::config::scrub_sensitive_text;
@@ -403,77 +403,7 @@ impl PendingMessageStore {
 
     pub fn stats(&self) -> Result<QueueStats> {
         let conn = self.open_connection()?;
-        let mut pending = 0;
-        let mut claimed = 0;
-        let mut failed = 0;
-
-        let mut statement = conn.prepare(
-            r#"
-            SELECT status, COUNT(*)
-            FROM pending_messages
-            GROUP BY status
-            "#,
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (status, count) = row?;
-            match status.as_str() {
-                "pending" => pending = count,
-                "claimed" => claimed = count,
-                "failed" => failed = count,
-                _ => {}
-            }
-        }
-
-        let oldest_pending_created_at = conn
-            .query_row(
-                "SELECT MIN(created_at) FROM pending_messages WHERE status = 'pending'",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .optional()?
-            .flatten();
-        let oldest_pending_age_secs = oldest_pending_created_at
-            .map(|created_at| i64_to_u64(now_secs().saturating_sub(created_at)));
-
-        let (rate_per_min, avg_processing_ms) =
-            if table_exists(&conn, "pending_message_completions")? {
-                let window_cutoff_ms = now_millis()
-                    .saturating_sub((COMPLETION_METRICS_WINDOW_MINS as i64).saturating_mul(60_000));
-                let (completed_count, avg_processing_ms) = conn.query_row(
-                    r#"
-                SELECT COUNT(*), AVG(processing_ms)
-                FROM pending_message_completions
-                WHERE completed_at >= ?1
-                "#,
-                    [window_cutoff_ms],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?)),
-                )?;
-                (
-                    (completed_count as f64) / (COMPLETION_METRICS_WINDOW_MINS as f64),
-                    avg_processing_ms.map(|value| value.round() as u64),
-                )
-            } else {
-                (0.0, None)
-            };
-        let pending_u64 = i64_to_u64(pending);
-        let eta_secs = if rate_per_min > 0.0 {
-            Some(((pending_u64 as f64 / rate_per_min) * 60.0).ceil() as u64)
-        } else {
-            None
-        };
-
-        Ok(QueueStats {
-            pending: pending_u64,
-            claimed: i64_to_u64(claimed),
-            failed: i64_to_u64(failed),
-            oldest_pending_age_secs,
-            rate_per_min,
-            avg_processing_ms,
-            eta_secs,
-        })
+        compute_queue_stats(&conn)
     }
 
     fn open_connection(&self) -> Result<Connection> {
@@ -491,6 +421,89 @@ impl PendingMessageStore {
             .saturating_mul(multiplier)
             .min(self.config.max_delay_ms)
     }
+}
+
+/// Open a WAL-mode-compatible read-only connection and return queue statistics.
+///
+/// Unlike `PendingMessageStore::new(...).stats()`, this skips `reclaim_stale` and
+/// opens with `SQLITE_OPEN_READ_ONLY` so WAL readers never block daemon write transactions.
+/// Used by `mempal status` to avoid the ~5s lock contention described in issue #182.
+pub fn queue_stats_readonly(path: &Path) -> Result<QueueStats> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    compute_queue_stats(&conn)
+}
+
+fn compute_queue_stats(conn: &Connection) -> Result<QueueStats> {
+    let mut pending = 0i64;
+    let mut claimed = 0i64;
+    let mut failed = 0i64;
+
+    let mut statement = conn.prepare(
+        r#"
+        SELECT status, COUNT(*)
+        FROM pending_messages
+        GROUP BY status
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (status, count) = row?;
+        match status.as_str() {
+            "pending" => pending = count,
+            "claimed" => claimed = count,
+            "failed" => failed = count,
+            _ => {}
+        }
+    }
+
+    let oldest_pending_created_at = conn
+        .query_row(
+            "SELECT MIN(created_at) FROM pending_messages WHERE status = 'pending'",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    let oldest_pending_age_secs = oldest_pending_created_at
+        .map(|created_at| i64_to_u64(now_secs().saturating_sub(created_at)));
+
+    let (rate_per_min, avg_processing_ms) = if table_exists(conn, "pending_message_completions")? {
+        let window_cutoff_ms = now_millis()
+            .saturating_sub((COMPLETION_METRICS_WINDOW_MINS as i64).saturating_mul(60_000));
+        let (completed_count, avg_processing_ms) = conn.query_row(
+            r#"
+            SELECT COUNT(*), AVG(processing_ms)
+            FROM pending_message_completions
+            WHERE completed_at >= ?1
+            "#,
+            [window_cutoff_ms],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?)),
+        )?;
+        (
+            (completed_count as f64) / (COMPLETION_METRICS_WINDOW_MINS as f64),
+            avg_processing_ms.map(|value| value.round() as u64),
+        )
+    } else {
+        (0.0, None)
+    };
+    let pending_u64 = i64_to_u64(pending);
+    let eta_secs = if rate_per_min > 0.0 {
+        Some(((pending_u64 as f64 / rate_per_min) * 60.0).ceil() as u64)
+    } else {
+        None
+    };
+
+    Ok(QueueStats {
+        pending: pending_u64,
+        claimed: i64_to_u64(claimed),
+        failed: i64_to_u64(failed),
+        oldest_pending_age_secs,
+        rate_per_min,
+        avg_processing_ms,
+        eta_secs,
+    })
 }
 
 fn reclaim_stale_tx(conn: &rusqlite::Transaction<'_>, stale_cutoff: i64) -> rusqlite::Result<u64> {
