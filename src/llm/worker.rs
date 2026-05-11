@@ -54,12 +54,19 @@ pub async fn run_llm_worker(
         }
     }
 
+    // Subscribe to LLM config generation changes. When a hot-reloadable LLM
+    // field changes (e.g. model), the receiver value is bumped and any
+    // in-flight task is cancelled so the worker restarts with the new config.
+    let mut llm_gen_rx = ConfigHandle::subscribe_llm_gen();
+
     loop {
         if crate::daemon::shutdown_requested() {
             tracing::info!("LLM worker: shutdown requested");
             break;
         }
 
+        // Re-read config at the start of each claim cycle so model/timeout
+        // changes are picked up without a full daemon restart.
         let config = ConfigHandle::current();
         if !config.llm.enabled {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -86,6 +93,10 @@ pub async fn run_llm_worker(
             }
         };
 
+        // Mark the current generation as seen AFTER claiming so that `changed()`
+        // only fires for changes that happen while THIS task is in-flight.
+        let _ = llm_gen_rx.borrow_and_update();
+
         let message_id = message.id.clone();
         tracing::info!("LLM worker claimed task {message_id}");
         let start = Instant::now();
@@ -102,31 +113,54 @@ pub async fn run_llm_worker(
             Ok(())
         });
 
-        let result = process_llm_task_shared(
-            &client,
-            &status,
-            &db,
-            &message.payload,
-            &config,
-            Some(heartbeat.as_ref()),
-        )
-        .await;
+        // Race the LLM task against a config-change signal. If the LLM config
+        // changes while a request is in-flight, the task future is dropped
+        // (reqwest futures are cancel-safe), the task is released back to
+        // pending (no retry count increment), and the worker restarts the loop
+        // with the fresh config snapshot.
+        let task_result = tokio::select! {
+            result = process_llm_task_shared(
+                &client,
+                &status,
+                &db,
+                &message.payload,
+                &config,
+                Some(heartbeat.as_ref()),
+            ) => Some(result),
+            _ = llm_gen_rx.changed() => None,
+        };
 
         let latency_ms = start.elapsed().as_millis();
-        match result {
-            Ok(()) => {
+        match task_result {
+            Some(Ok(())) => {
                 tracing::info!("LLM task {message_id} completed in {latency_ms}ms");
                 store
                     .confirm(&message_id)
                     .with_context(|| format!("failed to confirm LLM task {message_id}"))?;
                 write_observer.record_successful_write();
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 tracing::error!("LLM task {message_id} failed after {latency_ms}ms: {error}");
                 write_observer.record_error(error.to_string());
                 store
                     .mark_failed(&message_id, &error.to_string())
                     .with_context(|| format!("failed to mark_failed LLM task {message_id}"))?;
+            }
+            None => {
+                tracing::info!(
+                    worker_id,
+                    message_id,
+                    "LLM worker restarting due to config change; releasing task back to pending"
+                );
+                if let Err(error) = store.release_claim(&message_id) {
+                    tracing::warn!(
+                        ?error,
+                        message_id,
+                        "failed to release claimed LLM task on config change; \
+                         task will be reclaimed by TTL or next startup"
+                    );
+                }
+                // Continue loop — next iteration picks up the updated config.
             }
         }
     }
