@@ -386,9 +386,8 @@ impl Config {
         if self.llm.base_url != other.llm.base_url {
             fields.push("llm.base_url");
         }
-        if self.llm.model != other.llm.model {
-            fields.push("llm.model");
-        }
+        // llm.model is just a request parameter — safe to hot-reload
+
         if self.llm.api_key != other.llm.api_key {
             fields.push("llm.api_key");
         }
@@ -414,7 +413,7 @@ impl Config {
         effective.embed.api_model = self.embed.api_model.clone();
         effective.embed.openai_compat = self.embed.openai_compat.clone();
         effective.llm.base_url = self.llm.base_url.clone();
-        effective.llm.model = self.llm.model.clone();
+        // llm.model is hot-reloadable — don't pin it
         effective.llm.api_key = self.llm.api_key.clone();
         effective.llm.api_key_env = self.llm.api_key_env.clone();
         effective.daemon.log_path = self.daemon.log_path.clone();
