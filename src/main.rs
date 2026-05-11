@@ -443,6 +443,9 @@ enum Commands {
         command: mempal::hotpatch::HotpatchCommands,
     },
     Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonSubcommand>,
+        /// Run in foreground without daemonizing (legacy; applies when no subcommand is given).
         #[arg(long, default_value_t = false)]
         foreground: bool,
     },
@@ -510,6 +513,22 @@ enum CheckpointCommands {
     /// Disable automatic checkpoint on Stop hook.
     Disable,
     /// Show whether automatic checkpoint is enabled or disabled.
+    Status,
+}
+
+#[derive(Subcommand, Clone, Debug)]
+enum DaemonSubcommand {
+    /// Start the daemon. Fails if already running.
+    Start {
+        /// Run in foreground without daemonizing.
+        #[arg(long, default_value_t = false)]
+        foreground: bool,
+    },
+    /// Gracefully stop the running daemon (waits up to 30s).
+    Stop,
+    /// Stop and restart the daemon.
+    Restart,
+    /// Show daemon status, PID, and queue stats.
     Status,
 }
 
@@ -1072,8 +1091,24 @@ fn run() -> Result<()> {
                 .unwrap_or_else(|| PathBuf::from("."));
             return mempal::hotpatch::run_command(&config, &mempal_home, command.clone());
         }
-        Commands::Daemon { foreground } => {
-            return mempal::daemon::run_command(default_config_path(), *foreground);
+        Commands::Daemon {
+            command,
+            foreground,
+        } => {
+            let cfg_path = default_config_path();
+            return match command.as_ref() {
+                None => mempal::daemon::run_command(cfg_path, *foreground),
+                Some(DaemonSubcommand::Start { foreground: fg }) => run_daemon_start(cfg_path, *fg),
+                Some(DaemonSubcommand::Stop) => {
+                    let db_path = daemon_config_db_path(&cfg_path)?;
+                    run_daemon_stop(&db_path)
+                }
+                Some(DaemonSubcommand::Restart) => run_daemon_restart(cfg_path),
+                Some(DaemonSubcommand::Status) => {
+                    let db_path = daemon_config_db_path(&cfg_path)?;
+                    run_daemon_status(&db_path)
+                }
+            };
         }
         Commands::Prime(args) => {
             return prime_command(&config_path, args.clone());
@@ -5404,6 +5439,110 @@ fn reindex_row_is_stale(db: &Database, row: &ReindexRow, target_fingerprint: &st
 
 fn expand_home(path: &str) -> PathBuf {
     mempal::core::utils::expand_home(path)
+}
+
+fn daemon_config_db_path(config_path: &Path) -> Result<PathBuf> {
+    let config = Config::load_from(config_path)
+        .with_context(|| format!("failed to load config {}", config_path.display()))?;
+    Ok(expand_home(&config.db_path))
+}
+
+fn run_daemon_start(config_path: PathBuf, foreground: bool) -> Result<()> {
+    let db_path = daemon_config_db_path(&config_path)?;
+    if let Some(pid) = read_daemon_pid(&db_path)? {
+        if process_is_running(pid)? {
+            bail!("daemon already running (pid {pid}); stop with `mempal daemon stop`");
+        }
+        // Stale pidfile: remove so bootstrap can write a fresh one.
+        if let Some(mempal_home) = db_path.parent() {
+            let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
+        }
+    }
+    mempal::daemon::run_command(config_path, foreground)
+}
+
+#[cfg(unix)]
+fn run_daemon_stop(db_path: &Path) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let pid = read_daemon_pid(db_path)?
+        .ok_or_else(|| anyhow::anyhow!("daemon is not running (no pid file)"))?;
+    if !process_is_running(pid)? {
+        if let Some(mempal_home) = db_path.parent() {
+            let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
+        }
+        bail!("daemon is not running (stale pid {pid})");
+    }
+    // SAFETY: kill(2) with SIGTERM is safe; we only write the signal number.
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        bail!("failed to send SIGTERM to daemon (pid {pid}): {error}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if !process_is_running(pid)? {
+            println!("daemon stopped");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!("daemon (pid {pid}) did not exit within 30s")
+}
+
+#[cfg(not(unix))]
+fn run_daemon_stop(_db_path: &Path) -> Result<()> {
+    bail!("daemon stop is only supported on Unix")
+}
+
+fn run_daemon_restart(config_path: PathBuf) -> Result<()> {
+    let db_path = daemon_config_db_path(&config_path)?;
+    match read_daemon_pid(&db_path)? {
+        Some(pid) if process_is_running(pid)? => {
+            run_daemon_stop(&db_path)?;
+        }
+        Some(_) => {
+            if let Some(mempal_home) = db_path.parent() {
+                let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
+            }
+        }
+        None => {}
+    }
+    mempal::daemon::run_command(config_path, false)
+}
+
+fn run_daemon_status(db_path: &Path) -> Result<()> {
+    match read_daemon_pid(db_path)? {
+        None => {
+            println!("status: stopped");
+        }
+        Some(pid) => {
+            if process_is_running(pid)? {
+                println!("status: running");
+                println!("pid: {pid}");
+                if let Some(mempal_home) = db_path.parent() {
+                    let pid_path = mempal_home.join("daemon.pid");
+                    if let Ok(meta) = std::fs::metadata(&pid_path) {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
+                                println!("uptime_secs: {}", age.as_secs());
+                            }
+                        }
+                    }
+                }
+                if let Ok(store) = mempal::core::queue::PendingMessageStore::new(db_path) {
+                    if let Ok(stats) = store.stats() {
+                        println!("queue.pending: {}", stats.pending);
+                        println!("queue.claimed: {}", stats.claimed);
+                        println!("queue.failed: {}", stats.failed);
+                    }
+                }
+            } else {
+                println!("status: stopped (stale pid file, pid {pid} not running)");
+            }
+        }
+    }
+    Ok(())
 }
 fn prime_embedder_degraded() -> bool {
     if std::env::var_os("MEMPAL_TEST_EMBED_DEGRADED").is_some() {
