@@ -15,4 +15,11 @@ pre-commit:
       run: cargo fmt --check
     quality-gates:
       files: git diff --cached --name-only --diff-filter=ACMR | grep -E '(^|/)(Cargo\.toml|Cargo\.lock)$|\.rs$' || true
+      env:
+        CARGO_BUILD_JOBS: "2"
       run: just quality-gates
+
+pre-push:
+  commands:
+    review-check:
+      run: scripts/hooks/review-check.sh
