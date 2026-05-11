@@ -1,11 +1,16 @@
 //! Tests for fix/llm-worker-hot-reload (issue #176):
 //! LLM workers stuck after config hot-reload model change.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use mempal::core::config::ConfigHandle;
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
+
+// Tests in this file share the global HotReloadState (OnceLock singleton).
+// Serialize them to prevent cross-test config snapshot contamination.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -91,6 +96,7 @@ fn test_release_claim_returns_error_for_unknown_id() {
 
 #[test]
 fn test_llm_gen_increments_on_model_change() {
+    let _guard = TEST_LOCK.lock().expect("test lock");
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config_path = tmp.path().join("config.toml");
 
@@ -132,6 +138,7 @@ model = "model-b"
 
 #[test]
 fn test_llm_gen_does_not_increment_on_unrelated_change() {
+    let _guard = TEST_LOCK.lock().expect("test lock");
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config_path = tmp.path().join("config.toml");
 
