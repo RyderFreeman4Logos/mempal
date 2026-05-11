@@ -14,7 +14,22 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 14;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 15;
+
+// Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
+// idx_drawers_project_id_active is a partial replacement for the non-partial
+// idx_drawers_project_id (added in fork_ext v5), cutting project_breakdown() from ~8s to
+// sub-second on 500K+ row databases. idx_drawers_wing_room_active does the same for
+// scope_counts() (GROUP BY wing, room WHERE deleted_at IS NULL).
+pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_drawers_project_id_active
+    ON drawers(project_id)
+    WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_drawers_wing_room_active
+    ON drawers(wing, room)
+    WHERE deleted_at IS NULL;
+"#;
 
 pub const FORK_EXT_V14_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS embed_failure_log (
@@ -304,6 +319,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 14,
             up: apply_v14,
         },
+        Migration {
+            version: 15,
+            up: apply_v15,
+        },
     ]
 }
 
@@ -407,6 +426,10 @@ fn apply_v13(conn: &Connection) -> rusqlite::Result<()> {
 fn apply_v14(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V14_SCHEMA_SQL)?;
     ensure_gating_audit_content_preview_column(conn)
+}
+
+fn apply_v15(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V15_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {
