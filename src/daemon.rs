@@ -189,13 +189,38 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         }
     }
 
+    // Give LLM workers a 30s window to finish their current tasks, then abort.
+    let drain_start = tokio::time::Instant::now();
+    let drain_budget = Duration::from_secs(30);
     for handle in llm_worker_handles {
-        handle.abort();
-        let _ = handle.await;
+        let elapsed = drain_start.elapsed();
+        let remaining = drain_budget.saturating_sub(elapsed);
+        if remaining.is_zero() {
+            handle.abort();
+            let _ = handle.await;
+        } else {
+            match tokio::time::timeout(remaining, handle).await {
+                Ok(_) => {}
+                Err(_) => {
+                    tracing::warn!(
+                        "LLM worker did not exit within drain deadline; task claim will be released on next startup"
+                    );
+                }
+            }
+        }
     }
     tracing::info!("LLM workers stopped");
     stall_watchdog_handle.abort();
     let _ = stall_watchdog_handle.await;
+
+    // Release any tasks still claimed by workers that were aborted or did not finish.
+    let released = context.store.reclaim_stale(0).unwrap_or_else(|error| {
+        tracing::warn!(?error, "failed to release claimed messages on shutdown");
+        0
+    });
+    if released > 0 {
+        tracing::info!("released {released} claimed messages back to pending on shutdown");
+    }
 
     Ok(())
 }
