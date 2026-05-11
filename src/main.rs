@@ -337,7 +337,12 @@ enum Commands {
         #[arg(long)]
         mcp: bool,
     },
-    Status,
+    /// Show current status. Fast by default. Use --full for per-project and scope breakdown.
+    Status {
+        /// Include per-project drawer counts and scope breakdown (expensive on large databases).
+        #[arg(long, default_value_t = false)]
+        full: bool,
+    },
     Tail {
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -1338,7 +1343,7 @@ fn run() -> Result<()> {
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
         Commands::FieldTaxonomy { format } => field_taxonomy_command(&format),
         Commands::Serve { mcp } => block_on_result(serve_command(config.as_ref(), mcp)),
-        Commands::Status => status_command(&db, config.as_ref()),
+        Commands::Status { full } => status_command(&db, config.as_ref(), full),
         Commands::Gating { command } => gating_command(&db, config.as_ref(), command),
         Commands::Tail {
             limit,
@@ -5004,7 +5009,7 @@ fn fact_check_command(
     Ok(())
 }
 
-fn status_command(db: &Database, config: &Config) -> Result<()> {
+fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     let cfg_meta = ConfigHandle::snapshot_meta();
     let scrub_stats = ConfigHandle::scrub_stats();
     let runtime_warnings = ConfigHandle::collect_runtime_warnings();
@@ -5029,9 +5034,14 @@ fn status_command(db: &Database, config: &Config) -> Result<()> {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
     let drawer_count = db.drawer_count().context("failed to count drawers")?;
-    let project_breakdown = db
-        .project_breakdown()
-        .context("failed to count drawers per project")?;
+    let project_breakdown: Option<Vec<(Option<String>, i64)>> = if full {
+        Some(
+            db.project_breakdown()
+                .context("failed to count drawers per project")?,
+        )
+    } else {
+        None
+    };
     let null_project_backfill_pending = db
         .null_project_backfill_pending_count()
         .context("failed to count pending project backfill drawers")?;
@@ -5064,16 +5074,21 @@ fn status_command(db: &Database, config: &Config) -> Result<()> {
     println!("schema_version: {schema_version}");
     println!("fork_ext_version: {fork_ext_version}");
     println!("drawer_count: {drawer_count}");
-    println!("drawers per project:");
-    if project_breakdown.is_empty() {
-        println!("(none)");
-    } else {
-        for (pid, count) in project_breakdown {
-            match pid {
-                Some(pid) => println!("{}={count}", escape_project_id_for_display(&pid)),
-                None => println!("NULL={count}"),
+    match project_breakdown {
+        Some(breakdown) => {
+            println!("drawers per project:");
+            if breakdown.is_empty() {
+                println!("(none)");
+            } else {
+                for (pid, count) in breakdown {
+                    match pid {
+                        Some(pid) => println!("{}={count}", escape_project_id_for_display(&pid)),
+                        None => println!("NULL={count}"),
+                    }
+                }
             }
         }
+        None => println!("drawers per project: (use --full for breakdown)"),
     }
     println!(
         "null_project_backfill_pending: {}",
@@ -5194,14 +5209,18 @@ fn status_command(db: &Database, config: &Config) -> Result<()> {
             );
         }
     }
-    let counts = db.scope_counts().context("failed to query scope counts")?;
-    println!("scopes:");
-    if counts.is_empty() {
-        println!("- none");
-    } else {
-        for (wing, room, count) in counts {
-            println!("- {wing}/{}: {count}", render_room(room.as_deref()));
+    if full {
+        let counts = db.scope_counts().context("failed to query scope counts")?;
+        println!("scopes:");
+        if counts.is_empty() {
+            println!("- none");
+        } else {
+            for (wing, room, count) in counts {
+                println!("- {wing}/{}: {count}", render_room(room.as_deref()));
+            }
         }
+    } else {
+        println!("scopes: (use --full for breakdown)");
     }
     Ok(())
 }
