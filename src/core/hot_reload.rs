@@ -94,6 +94,10 @@ pub struct HotReloadState {
     // harness-point: PR0 — counts successful reload applications (version changes)
     reload_count: Arc<AtomicUsize>,
     runtime_prototypes: ArcSwap<Vec<String>>,
+    /// Incremented whenever a hot-reloadable LLM field changes (model,
+    /// retry_interval_secs, enabled_for, max_concurrent). LLM workers subscribe
+    /// to this to cancel in-flight requests and restart with the new config.
+    llm_gen_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl HotReloadState {
@@ -101,6 +105,7 @@ impl HotReloadState {
         let initial = Config::default();
         let snapshot =
             ConfigSnapshot::from_config(initial.clone()).expect("default config is valid");
+        let (llm_gen_tx, _) = tokio::sync::watch::channel(0u64);
         Self {
             snapshot: ArcSwap::from_pointee(snapshot),
             runtime: Mutex::new(None),
@@ -110,6 +115,7 @@ impl HotReloadState {
             runtime_prototypes: ArcSwap::from_pointee(
                 initial.ingest_gating.embedding_classifier.prototypes,
             ),
+            llm_gen_tx,
         }
     }
 
@@ -204,6 +210,23 @@ impl HotReloadState {
         {
             let _ = runtime.control_tx.send(WatchMessage::NotifyFailed);
         }
+    }
+
+    /// Subscribe to LLM generation changes.
+    ///
+    /// The channel value is a monotonically-increasing counter that is bumped
+    /// whenever a hot-reloadable LLM field (model, retry_interval_secs,
+    /// enabled_for, max_concurrent) changes. LLM workers use this to detect
+    /// config changes and cancel in-flight requests.
+    pub fn subscribe_llm_gen(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.llm_gen_tx.subscribe()
+    }
+
+    /// Trigger a reload from the given path without going through the watcher.
+    /// Only for use in tests via `ConfigHandle::harness_reload_from_path`.
+    #[doc(hidden)]
+    pub fn reload_from_disk_for_test(&self, path: &Path) {
+        self.reload_from_disk(path);
     }
 
     fn start_runtime(
@@ -388,6 +411,12 @@ impl HotReloadState {
             return;
         }
 
+        // Compute LLM gen change before `effective` is consumed by from_config.
+        let llm_hot_changed = previous.config.llm.model != effective.llm.model
+            || previous.config.llm.max_concurrent != effective.llm.max_concurrent
+            || previous.config.llm.retry_interval_secs != effective.llm.retry_interval_secs
+            || previous.config.llm.enabled_for != effective.llm.enabled_for;
+
         let next_snapshot = match ConfigSnapshot::from_config(effective) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -400,6 +429,18 @@ impl HotReloadState {
         self.snapshot.store(Arc::new(next_snapshot));
         // harness-point: PR0 — increment reload counter on successful version change
         self.reload_count.fetch_add(1, Ordering::SeqCst);
+
+        // Notify LLM workers when any hot-reloadable LLM field changes so they
+        // can cancel in-flight requests and restart with the new configuration.
+        if llm_hot_changed {
+            let prev_gen = *self.llm_gen_tx.borrow();
+            let _ = self.llm_gen_tx.send(prev_gen.wrapping_add(1));
+            self.push_event(format!(
+                "config hot-reload: LLM config changed, generation bumped to {}",
+                prev_gen.wrapping_add(1)
+            ));
+        }
+
         self.push_event(format!(
             "config hot-reload: version changed from {} to {}",
             previous.version, next_version

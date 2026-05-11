@@ -352,6 +352,29 @@ impl PendingMessageStore {
         Ok(())
     }
 
+    /// Return a claimed message to pending without counting it as a failure.
+    ///
+    /// Used by LLM workers cancelled due to a config hot-reload so the task is
+    /// retried with the new configuration rather than charged a retry.
+    pub fn release_claim(&self, id: &str) -> Result<()> {
+        let conn = self.open_connection()?;
+        let updated = conn.execute(
+            r#"
+            UPDATE pending_messages
+            SET status = 'pending',
+                claim_token = NULL,
+                claimed_at = NULL,
+                heartbeat_at = NULL
+            WHERE id = ?1 AND status = 'claimed'
+            "#,
+            [id],
+        )?;
+        if updated == 0 {
+            return Err(QueueError::MessageNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     pub fn refresh_heartbeat(&self, id: &str, worker_id: &str) -> Result<()> {
         let claim_prefix = format!("{worker_id}:");
         let now = now_secs();

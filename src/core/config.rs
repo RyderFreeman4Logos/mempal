@@ -1153,9 +1153,25 @@ impl ConfigHandle {
         super::hot_reload::global_hot_reload_state().simulate_notify_failure();
     }
 
+    /// Subscribe to LLM config generation changes.
+    ///
+    /// The counter increments whenever a hot-reloadable LLM field (model,
+    /// retry_interval_secs, enabled_for, max_concurrent) changes via hot-reload.
+    /// LLM workers subscribe here to cancel in-flight requests on config change.
+    pub fn subscribe_llm_gen() -> tokio::sync::watch::Receiver<u64> {
+        super::hot_reload::global_hot_reload_state().subscribe_llm_gen()
+    }
+
     #[doc(hidden)]
     pub fn harness_reload_counter() -> Arc<AtomicUsize> {
         super::hot_reload::global_hot_reload_state().reload_counter_arc()
+    }
+
+    /// Force a config reload from the given path, bypassing the file watcher.
+    /// Intended only for tests that need to trigger `reload_from_disk` directly.
+    #[doc(hidden)]
+    pub fn harness_reload_from_path(path: &std::path::Path) {
+        super::hot_reload::global_hot_reload_state().reload_from_disk_for_test(path);
     }
 }
 
