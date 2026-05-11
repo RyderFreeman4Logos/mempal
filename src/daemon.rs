@@ -452,6 +452,14 @@ fn build_drawer_records(
     Ok(records)
 }
 
+fn wing_from_cwd(cwd: &str) -> Option<String> {
+    let name = Path::new(cwd).file_name()?.to_str()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 fn build_user_prompt_project_record(
     db: &Database,
     envelope: &CapturedHookEnvelope,
@@ -471,7 +479,8 @@ fn build_user_prompt_project_record(
         return Ok(None);
     }
 
-    let wing = config.hooks.wing.trim();
+    let wing = wing_from_cwd(&envelope.claude_cwd).unwrap_or_else(|| config.hooks.wing.clone());
+    let wing = wing.trim().to_string();
     if wing.is_empty() || wing == "hooks-raw" {
         return Ok(None);
     }
@@ -479,11 +488,11 @@ fn build_user_prompt_project_record(
     let taxonomy = db
         .taxonomy_entries()
         .context("failed to load taxonomy for hook user-prompt promotion")?;
-    let room = route_room_from_taxonomy(&content, wing, &taxonomy);
+    let room = route_room_from_taxonomy(&content, &wing, &taxonomy);
     let project_id = resolve_hook_project_id(envelope, config)?;
 
     Ok(Some(DrawerRecord {
-        wing: wing.to_string(),
+        wing,
         room,
         source_file: audit_record.source_file.clone(),
         content,
@@ -1212,7 +1221,7 @@ mod tests {
 
     use super::{
         ClaimNextSource, ClaimPollResult, DaemonIngestContext, poll_claim_next,
-        process_claimed_message_with_embedder,
+        process_claimed_message_with_embedder, wing_from_cwd,
     };
 
     struct StubClaimSource {
@@ -1363,5 +1372,27 @@ mod tests {
             )
             .expect("query drawer added_at");
         assert_eq!(added_at, captured_at);
+    }
+
+    #[test]
+    fn test_wing_from_cwd_returns_basename() {
+        assert_eq!(
+            wing_from_cwd("/home/obj/project/github/RyderFreeman4Logos/mempal"),
+            Some("mempal".to_string())
+        );
+        assert_eq!(
+            wing_from_cwd("/home/user/projects/warifu-ce"),
+            Some("warifu-ce".to_string())
+        );
+        assert_eq!(
+            wing_from_cwd("/home/user/my-project/"),
+            Some("my-project".to_string())
+        );
+    }
+
+    #[test]
+    fn test_wing_from_cwd_returns_none_for_root_and_empty() {
+        assert_eq!(wing_from_cwd("/"), None);
+        assert_eq!(wing_from_cwd(""), None);
     }
 }
