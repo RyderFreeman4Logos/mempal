@@ -90,7 +90,8 @@ fn test_llm_restart_required_fields() {
     let fields = config.restart_required_fields_changed(&changed);
 
     assert!(fields.contains(&"llm.base_url"));
-    assert!(fields.contains(&"llm.model"));
+    // llm.model is now hot-reloadable
+    assert!(!fields.contains(&"llm.model"));
     assert!(fields.contains(&"llm.api_key_env"));
 }
 
@@ -111,7 +112,8 @@ fn test_llm_runtime_allowed_fields_hot_reload() {
     let effective = current.merge_runtime_allowed(&candidate);
 
     assert_eq!(effective.llm.base_url, current.llm.base_url);
-    assert_eq!(effective.llm.model, current.llm.model);
+    // llm.model is hot-reloadable — candidate value takes effect
+    assert_eq!(effective.llm.model, candidate.llm.model);
     assert_eq!(effective.llm.api_key_env, current.llm.api_key_env);
     assert_eq!(effective.llm.max_concurrent, 4);
     assert_eq!(
