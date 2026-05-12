@@ -20,7 +20,7 @@ Expose the P61 runtime adoption recording protocol through CLI parity:
 - [x] Keep MCP guidance on the shared implementation.
 - [x] Update design and repository inventories.
 - [x] Run spec checks and Rust verification.
-- [ ] Commit, ingest decision memory, push, and open/merge PR.
+- [x] Commit, ingest decision memory, push, and open/merge PR.
 
 ## Verification
 
