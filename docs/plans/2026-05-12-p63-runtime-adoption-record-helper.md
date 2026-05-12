@@ -22,7 +22,7 @@ without appending an event.
 - [x] Wire CLI and MCP surfaces.
 - [x] Update protocol, design, and repository inventories.
 - [x] Run spec checks and Rust verification.
-- [ ] Commit, ingest decision memory, push, and open/merge PR.
+- [x] Commit, ingest decision memory, push, and open/merge PR.
 
 ## Verification
 
