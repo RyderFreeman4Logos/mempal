@@ -147,7 +147,16 @@ struct HermesError {
 
 impl IntoResponse for HermesError {
     fn into_response(self) -> axum::response::Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(json!({
+                "error": {
+                    "message": self.message,
+                    "status": self.status.as_u16(),
+                },
+            })),
+        )
+            .into_response()
     }
 }
 

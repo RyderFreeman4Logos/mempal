@@ -10,7 +10,7 @@ use crate::core::{
     },
     utils::source_file_or_synthetic,
 };
-use crate::embed::{EmbedError, Embedder};
+use crate::embed::{EmbedError, Embedder, global_embed_status};
 use thiserror::Error;
 
 use crate::search::filter::{build_filter_clause, build_vector_search_sql};
@@ -42,6 +42,46 @@ pub struct SearchOptions {
     pub with_neighbors: bool,
     pub include_raw_turns: bool,
     pub include_expired: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Hybrid,
+    Bm25Only,
+}
+
+impl SearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Bm25Only => "bm25_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    pub search_mode: SearchMode,
+    pub warnings: Vec<String>,
+}
+
+impl SearchOutcome {
+    fn hybrid(results: Vec<SearchResult>) -> Self {
+        Self {
+            results,
+            search_mode: SearchMode::Hybrid,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn bm25_only(results: Vec<SearchResult>, warning: String) -> Self {
+        Self {
+            results,
+            search_mode: SearchMode::Bm25Only,
+            warnings: vec![warning],
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -94,30 +134,18 @@ pub async fn search<E: Embedder + ?Sized>(
     scope: &ProjectSearchScope,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
-    if top_k == 0 {
-        return Ok(Vec::new());
-    }
-
-    let route = resolve_route(db, query, wing, room)?;
-
-    let embeddings = embedder
-        .embed(&[query])
-        .await
-        .map_err(SearchError::EmbedQuery)?;
-    let query_vector = embeddings
-        .into_iter()
-        .next()
-        .ok_or(SearchError::MissingQueryVector)?;
-    if let Some(current_dim) = current_vector_dim(db).map_err(SearchError::KeywordSearch)?
-        && current_dim != query_vector.len()
-    {
-        return Err(SearchError::VectorDimensionMismatch {
-            current_dim,
-            new_dim: query_vector.len(),
-        });
-    }
-
-    search_with_vector(db, query, &query_vector, route, scope, top_k)
+    Ok(search_with_all_options_outcome(
+        db,
+        embedder,
+        query,
+        wing,
+        room,
+        scope,
+        SearchOptions::default(),
+        top_k,
+    )
+    .await?
+    .results)
 }
 
 /// Async search with upstream knowledge filters + options (upstream API).
@@ -133,7 +161,7 @@ pub async fn search_with_options<E: Embedder + ?Sized>(
     options: SearchOptions,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
-    search_with_all_options(
+    Ok(search_with_all_options_outcome(
         db,
         embedder,
         query,
@@ -143,7 +171,8 @@ pub async fn search_with_options<E: Embedder + ?Sized>(
         options,
         top_k,
     )
-    .await
+    .await?
+    .results)
 }
 
 /// Async search with both project scope AND knowledge filter options (merged API).
@@ -158,30 +187,138 @@ pub async fn search_with_all_options<E: Embedder + ?Sized>(
     options: SearchOptions,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
+    Ok(
+        search_with_all_options_outcome(db, embedder, query, wing, room, scope, options, top_k)
+            .await?
+            .results,
+    )
+}
+
+/// Async search that reports whether the response used hybrid or BM25-only
+/// retrieval. Existing callers use [`search_with_all_options`] to preserve the
+/// historical `Vec<SearchResult>` API.
+#[allow(clippy::too_many_arguments)]
+pub async fn search_with_all_options_outcome<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    query: &str,
+    wing: Option<&str>,
+    room: Option<&str>,
+    scope: &ProjectSearchScope,
+    options: SearchOptions,
+    top_k: usize,
+) -> Result<SearchOutcome> {
     if top_k == 0 {
-        return Ok(Vec::new());
+        return Ok(SearchOutcome::hybrid(Vec::new()));
     }
 
     let route = resolve_route(db, query, wing, room)?;
+    search_with_route_options_outcome(db, embedder, query, route, scope, options, top_k).await
+}
 
-    let embeddings = embedder
-        .embed(&[query])
-        .await
-        .map_err(SearchError::EmbedQuery)?;
-    let query_vector = embeddings
-        .into_iter()
-        .next()
-        .ok_or(SearchError::MissingQueryVector)?;
+pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    query: &str,
+    route: RouteDecision,
+    scope: &ProjectSearchScope,
+    options: SearchOptions,
+    top_k: usize,
+) -> Result<SearchOutcome> {
+    if top_k == 0 {
+        return Ok(SearchOutcome::hybrid(Vec::new()));
+    }
+
+    let config = crate::core::config::ConfigHandle::current();
+    if config.search.bm25_fallback && global_embed_status().is_degraded() {
+        return bm25_fallback_outcome(
+            db,
+            query,
+            route,
+            scope,
+            options,
+            top_k,
+            "embedding backend is degraded; using BM25-only search".to_string(),
+        );
+    }
+
+    let embeddings = match embedder.embed(&[query]).await {
+        Ok(embeddings) => embeddings,
+        Err(error) if config.search.bm25_fallback => {
+            return bm25_fallback_outcome(
+                db,
+                query,
+                route,
+                scope,
+                options,
+                top_k,
+                format!(
+                    "embedding unavailable; using BM25-only search: {}",
+                    crate::core::config::scrub_sensitive_text(&error.to_string())
+                ),
+            );
+        }
+        Err(error) => return Err(SearchError::EmbedQuery(error)),
+    };
+    let Some(query_vector) = embeddings.into_iter().next() else {
+        if config.search.bm25_fallback {
+            return bm25_fallback_outcome(
+                db,
+                query,
+                route,
+                scope,
+                options,
+                top_k,
+                "embedding returned no query vector; using BM25-only search".to_string(),
+            );
+        }
+        return Err(SearchError::MissingQueryVector);
+    };
     if let Some(current_dim) = current_vector_dim(db).map_err(SearchError::KeywordSearch)?
         && current_dim != query_vector.len()
     {
+        if config.search.bm25_fallback {
+            return bm25_fallback_outcome(
+                db,
+                query,
+                route,
+                scope,
+                options,
+                top_k,
+                format!(
+                    "embedding dimension mismatch ({new_dim}d query vs {current_dim}d index); using BM25-only search",
+                    new_dim = query_vector.len()
+                ),
+            );
+        }
         return Err(SearchError::VectorDimensionMismatch {
             current_dim,
             new_dim: query_vector.len(),
         });
     }
 
-    search_with_vector_and_scope_options(db, query, &query_vector, route, scope, options, top_k)
+    Ok(SearchOutcome::hybrid(search_with_vector_and_scope_options(
+        db,
+        query,
+        &query_vector,
+        route,
+        scope,
+        options,
+        top_k,
+    )?))
+}
+
+fn bm25_fallback_outcome(
+    db: &Database,
+    query: &str,
+    route: RouteDecision,
+    scope: &ProjectSearchScope,
+    options: SearchOptions,
+    top_k: usize,
+    warning: String,
+) -> Result<SearchOutcome> {
+    let results = search_bm25_only_with_options(db, query, route, scope, options, top_k)?;
+    Ok(SearchOutcome::bm25_only(results, warning))
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +712,9 @@ pub fn search_bm25_only_with_options(
         .map_err(SearchError::KeywordSearch)?;
 
     let mut results = rrf_merge(Vec::new(), &fts_ids, &route, scope, db, candidate_top_k);
+    if !options.filters.is_empty() {
+        results.retain(|result| matches_filters(result, &options.filters));
+    }
     if exclude_raw_turns {
         results.retain(|result| {
             !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
@@ -597,7 +737,11 @@ pub fn search_bm25_only_with_options(
         &config.search.decay,
         now_secs,
     );
+    rerank_by_effective_importance(&mut results);
     results.truncate(top_k);
+    if options.with_neighbors && top_k <= 10 {
+        inject_chunk_neighbors(db, &mut results)?;
+    }
     Ok(results)
 }
 

@@ -6468,6 +6468,7 @@ async fn serve_mcp_and_rest_command(config: &Config) -> Result<()> {
         db_path.clone(),
         Arc::new(ConfiguredEmbedderFactory::new(config.clone())),
     );
+    let rest_state = state.clone();
     let mut rest_task = tokio::spawn(async move {
         serve_rest_api(listener, state)
             .await
@@ -6479,7 +6480,7 @@ async fn serve_mcp_and_rest_command(config: &Config) -> Result<()> {
         service.waiting().await.context("MCP server failed")?;
         Ok(())
     });
-    tokio::select! { mcp_result = &mut mcp_task => { rest_task.abort(); match rest_task.await { Ok(Ok(())) => {} Ok(Err(e)) => return Err(e), Err(je) if je.is_cancelled() => {} Err(je) => return Err(anyhow::Error::new(je).context("failed to join REST task")) } mcp_result } rest_result = &mut rest_task => match rest_result { Ok(Ok(())) => bail!("REST server exited unexpectedly"), Ok(Err(e)) => Err(e), Err(je) => Err(anyhow::Error::new(je).context("failed to join REST task")) } }
+    tokio::select! { mcp_result = &mut mcp_task => { let _ = rest_state.drain_write_queue().await; rest_task.abort(); match rest_task.await { Ok(Ok(())) => {} Ok(Err(e)) => return Err(e), Err(je) if je.is_cancelled() => {} Err(je) => return Err(anyhow::Error::new(je).context("failed to join REST task")) } mcp_result } rest_result = &mut rest_task => match rest_result { Ok(Ok(())) => bail!("REST server exited unexpectedly"), Ok(Err(e)) => Err(e), Err(je) => Err(anyhow::Error::new(je).context("failed to join REST task")) } }
 }
 
 async fn build_embedder(config: &Config) -> Result<Box<dyn Embedder>> {

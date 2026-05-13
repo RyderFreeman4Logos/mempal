@@ -90,6 +90,9 @@ pub struct SearchRequest {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct SearchResponse {
     pub results: Vec<SearchResultDto>,
+    pub search_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
 }

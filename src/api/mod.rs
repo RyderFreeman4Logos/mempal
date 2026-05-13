@@ -8,6 +8,6 @@ mod hermes_compat;
 mod state;
 
 #[cfg(feature = "rest")]
-pub use handlers::{DEFAULT_REST_ADDR, router, serve};
+pub use handlers::{DEFAULT_REST_ADDR, router, serve, serve_with_shutdown};
 #[cfg(feature = "rest")]
 pub use state::ApiState;

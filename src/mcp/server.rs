@@ -50,7 +50,7 @@ use crate::knowledge_lifecycle::{
     promote_knowledge,
 };
 use crate::search::{
-    SearchFilters, SearchOptions, dispatch_access_update, resolve_route,
+    SearchFilters, SearchMode, SearchOptions, dispatch_access_update, resolve_route,
     search_bm25_only_with_options, search_with_vector_and_scope_options,
 };
 use anyhow::Context;
@@ -1220,72 +1220,139 @@ impl MempalMcpServer {
             include_expired: request.include_expired.unwrap_or(false),
         };
         let mut extra_warnings = Vec::new();
-        let embedder = self.embedder_factory.build().await.map_err(|error| {
-            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
-        })?;
-        let results = match tokio::time::timeout(
-            Duration::from_secs(config.embed.retry.search_deadline_secs),
-            embedder.embed(&[request.query.as_str()]),
-        )
-        .await
-        {
-            Ok(Ok(vectors)) => {
-                let query_vector = vectors.into_iter().next().ok_or_else(|| {
-                    ErrorData::internal_error("embedder returned no query vector", None)
-                })?;
-                search_with_vector_and_scope_options(
+        let mut search_mode = SearchMode::Hybrid;
+        let mut response_warnings = Vec::new();
+        let results = if config.search.bm25_fallback && global_embed_status().is_degraded() {
+            search_mode = SearchMode::Bm25Only;
+            let warning = "embedding backend is degraded; using BM25-only search".to_string();
+            response_warnings.push(warning.clone());
+            extra_warnings.push(SystemWarning {
+                level: "warn".to_string(),
+                message: warning,
+                source: "embed".to_string(),
+            });
+            search_bm25_only_with_options(
+                &db,
+                &request.query,
+                route.clone(),
+                &scope,
+                search_options.clone(),
+                top_k,
+            )
+            .map_err(|error| {
+                ErrorData::internal_error(format!("BM25 fallback search failed: {error}"), None)
+            })?
+        } else {
+            let embedder = match self.embedder_factory.build().await {
+                Ok(embedder) => Some(embedder),
+                Err(error) if config.search.bm25_fallback => {
+                    search_mode = SearchMode::Bm25Only;
+                    let warning = format!(
+                        "embedding unavailable; using BM25-only search: {}",
+                        crate::core::config::scrub_sensitive_text(&error.to_string())
+                    );
+                    response_warnings.push(warning.clone());
+                    extra_warnings.push(SystemWarning {
+                        level: "warn".to_string(),
+                        message: warning,
+                        source: "embed".to_string(),
+                    });
+                    None
+                }
+                Err(error) => {
+                    return Err(ErrorData::internal_error(
+                        format!("failed to build embedder: {error}"),
+                        None,
+                    ));
+                }
+            };
+            if let Some(embedder) = embedder {
+                match tokio::time::timeout(
+                    Duration::from_secs(config.embed.retry.search_deadline_secs),
+                    embedder.embed(&[request.query.as_str()]),
+                )
+                .await
+                {
+                    Ok(Ok(vectors)) => {
+                        let query_vector = vectors.into_iter().next().ok_or_else(|| {
+                            ErrorData::internal_error("embedder returned no query vector", None)
+                        })?;
+                        search_with_vector_and_scope_options(
+                            &db,
+                            &request.query,
+                            &query_vector,
+                            route.clone(),
+                            &scope,
+                            search_options.clone(),
+                            top_k,
+                        )
+                        .map_err(|error| {
+                            ErrorData::internal_error(format!("search failed: {error}"), None)
+                        })?
+                    }
+                    Ok(Err(error)) => {
+                        search_mode = SearchMode::Bm25Only;
+                        let warning = "vector unavailable, BM25 fallback".to_string();
+                        response_warnings.push(warning.clone());
+                        extra_warnings.push(SystemWarning {
+                            level: "warn".to_string(),
+                            message: warning,
+                            source: "embed".to_string(),
+                        });
+                        search_bm25_only_with_options(
+                            &db,
+                            &request.query,
+                            route.clone(),
+                            &scope,
+                            search_options.clone(),
+                            top_k,
+                        )
+                        .map_err(|bm25_error| {
+                            ErrorData::internal_error(
+                                format!(
+                                    "search failed after vector fallback: {error}; bm25 fallback failed: {bm25_error}"
+                                ),
+                                None,
+                            )
+                        })?
+                    }
+                    Err(_) => {
+                        search_mode = SearchMode::Bm25Only;
+                        let warning = "vector unavailable, BM25 fallback".to_string();
+                        response_warnings.push(warning.clone());
+                        extra_warnings.push(SystemWarning {
+                            level: "warn".to_string(),
+                            message: warning,
+                            source: "embed".to_string(),
+                        });
+                        search_bm25_only_with_options(
+                            &db,
+                            &request.query,
+                            route.clone(),
+                            &scope,
+                            search_options.clone(),
+                            top_k,
+                        )
+                        .map_err(|error| {
+                            ErrorData::internal_error(
+                                format!("search deadline fallback failed: {error}"),
+                                None,
+                            )
+                        })?
+                    }
+                }
+            } else {
+                search_bm25_only_with_options(
                     &db,
                     &request.query,
-                    &query_vector,
                     route.clone(),
                     &scope,
                     search_options.clone(),
                     top_k,
                 )
                 .map_err(|error| {
-                    ErrorData::internal_error(format!("search failed: {error}"), None)
-                })?
-            }
-            Ok(Err(error)) => {
-                extra_warnings.push(SystemWarning {
-                    level: "warn".to_string(),
-                    message: "vector unavailable, BM25 fallback".to_string(),
-                    source: "embed".to_string(),
-                });
-                search_bm25_only_with_options(
-                    &db,
-                    &request.query,
-                    route,
-                    &scope,
-                    search_options.clone(),
-                    top_k,
-                )
-                .map_err(|bm25_error| {
                     ErrorData::internal_error(
-                        format!(
-                            "search failed after vector fallback: {error}; bm25 fallback failed: {bm25_error}"
-                        ),
-                        None,
-                    )
-                })?
-            }
-            Err(_) => {
-                extra_warnings.push(SystemWarning {
-                    level: "warn".to_string(),
-                    message: "vector unavailable, BM25 fallback".to_string(),
-                    source: "embed".to_string(),
-                });
-                search_bm25_only_with_options(
-                    &db,
-                    &request.query,
-                    route,
-                    &scope,
-                    search_options.clone(),
-                    top_k,
-                )
-                .map_err(|error| {
-                    ErrorData::internal_error(
-                        format!("search deadline fallback failed: {error}"),
+                        format!("search failed after embedder build fallback: {error}"),
                         None,
                     )
                 })?
@@ -1323,6 +1390,8 @@ impl MempalMcpServer {
                     )
                 })
                 .collect(),
+            search_mode: search_mode.as_str().to_string(),
+            warnings: response_warnings,
             system_warnings,
         }))
     }

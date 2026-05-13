@@ -1,3 +1,13 @@
+use std::{
+    future::Future,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
 use crate::core::{
     config::ConfigHandle,
     db::Database,
@@ -14,7 +24,10 @@ use crate::core::{
 };
 use crate::ingest::gating::evaluate_fact_check_gate;
 use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
-use crate::search::{SearchOptions, resolve_route, search_with_vector_and_scope_options};
+use crate::search::{
+    SearchMode, SearchOptions, resolve_route, search_bm25_only_with_options,
+    search_with_vector_and_scope_options,
+};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -24,14 +37,58 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use super::state::ApiState;
 
 pub const DEFAULT_REST_ADDR: &str = "127.0.0.1:3080";
+const HERMES_COMPAT_VERSION: &str = "mempal-hermes-compat/1";
 
 pub async fn serve(listener: tokio::net::TcpListener, state: ApiState) -> std::io::Result<()> {
-    axum::serve(listener, router(state)).await
+    serve_with_shutdown(listener, state, shutdown_signal()).await
+}
+
+pub async fn serve_with_shutdown<F>(
+    listener: tokio::net::TcpListener,
+    state: ApiState,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let drain_state = state.clone();
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            if !drain_state.drain_write_queue().await {
+                tracing::warn!("REST write queue drain timed out during graceful shutdown");
+            }
+        })
+        .await
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                if let Some(signal) = sigterm.as_mut() {
+                    let _ = signal.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -155,10 +212,25 @@ struct StatusResponse {
     drawer_count: i64,
     taxonomy_count: i64,
     db_size_bytes: u64,
+    embedding_status: String,
+    search_mode: String,
+    write_queue: WriteQueueStats,
+    feature_flags: FeatureFlags,
+    hermes_compat_version: String,
     search_decay_mode: String,
     wings: Vec<ScopeCount>,
     source_type_distribution: Vec<SourceTypeCount>,
     turn_storage: TurnStorageStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct FeatureFlags {
+    typed_ingest: bool,
+    pinned_facts: bool,
+    compaction: bool,
+    sleep_cycle: bool,
+    crystallize: bool,
+    intelligence_modes: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +267,9 @@ struct SearchResultDto {
     confidence: f64,
     similarity: f32,
     route: RouteDecisionDto,
+    search_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,27 +291,7 @@ struct TaxonomyEntryDto {
 async fn search_handler(
     State(state): State<ApiState>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<Vec<SearchResultDto>>, ApiError> {
-    let embedder: Box<dyn crate::embed::Embedder> = state
-        .embedder_factory
-        .build()
-        .await
-        .map_err(internal_error)?;
-    let query_vector: Vec<f32> = embedder
-        .embed(&[query.q.as_str()])
-        .await
-        .map_err(internal_error)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "embedder returned no vector",
-            )
-        })?;
-    let db = Database::open(&state.db_path).map_err(internal_error)?;
-    let route = resolve_route(&db, &query.q, query.wing.as_deref(), query.room.as_deref())
-        .map_err(internal_error)?;
+) -> Result<Response, ApiError> {
     let config = ConfigHandle::current();
     let scope = ProjectSearchScope::from_request(
         resolve_project_id(query.project_id.as_deref(), config.as_ref(), None)
@@ -245,36 +300,145 @@ async fn search_handler(
         query.all_projects.unwrap_or(false),
         config.search.strict_project_isolation,
     );
-    let results = search_with_vector_and_scope_options(
-        &db,
-        &query.q,
-        &query_vector,
-        route,
-        &scope,
-        SearchOptions {
-            include_raw_turns: query.include_raw_turns.unwrap_or(false),
-            include_expired: query.include_expired.unwrap_or(false),
-            ..SearchOptions::default()
-        },
-        query.top_k.unwrap_or(10),
-    )
-    .map_err(internal_error)?;
+    let search_options = SearchOptions {
+        include_raw_turns: query.include_raw_turns.unwrap_or(false),
+        include_expired: query.include_expired.unwrap_or(false),
+        ..SearchOptions::default()
+    };
+    let top_k = query.top_k.unwrap_or(10);
+    let mut search_mode = SearchMode::Hybrid;
+    let mut warnings = Vec::new();
+    let query_vector = if config.search.bm25_fallback
+        && crate::embed::global_embed_status().is_degraded()
+    {
+        search_mode = SearchMode::Bm25Only;
+        warnings.push("embedding backend is degraded; using BM25-only search".to_string());
+        None
+    } else {
+        match state.embedder_factory.build().await {
+            Ok(embedder) => match tokio::time::timeout(
+                Duration::from_secs(config.embed.retry.search_deadline_secs),
+                embedder.embed(&[query.q.as_str()]),
+            )
+            .await
+            {
+                Ok(Ok(vectors)) => match vectors.into_iter().next() {
+                    Some(vector) => Some(vector),
+                    None if config.search.bm25_fallback => {
+                        search_mode = SearchMode::Bm25Only;
+                        warnings.push(
+                            "embedding returned no query vector; using BM25-only search"
+                                .to_string(),
+                        );
+                        None
+                    }
+                    None => {
+                        return Err(ApiError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "embedder returned no vector",
+                        ));
+                    }
+                },
+                Ok(Err(error)) if config.search.bm25_fallback => {
+                    search_mode = SearchMode::Bm25Only;
+                    warnings.push(format!(
+                        "embedding unavailable; using BM25-only search: {}",
+                        crate::core::config::scrub_sensitive_text(&error.to_string())
+                    ));
+                    None
+                }
+                Ok(Err(error)) => return Err(internal_error(error)),
+                Err(_) if config.search.bm25_fallback => {
+                    search_mode = SearchMode::Bm25Only;
+                    warnings
+                        .push("embedding deadline exceeded; using BM25-only search".to_string());
+                    None
+                }
+                Err(_) => {
+                    return Err(ApiError::new(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "embedding deadline exceeded",
+                    ));
+                }
+            },
+            Err(error) if config.search.bm25_fallback => {
+                search_mode = SearchMode::Bm25Only;
+                warnings.push(format!(
+                    "embedding unavailable; using BM25-only search: {}",
+                    crate::core::config::scrub_sensitive_text(&error.to_string())
+                ));
+                None
+            }
+            Err(error) => return Err(internal_error(error)),
+        }
+    };
+    let db = Database::open(&state.db_path).map_err(internal_error)?;
+    let route = resolve_route(&db, &query.q, query.wing.as_deref(), query.room.as_deref())
+        .map_err(internal_error)?;
+    let results = if let Some(query_vector) = query_vector {
+        match search_with_vector_and_scope_options(
+            &db,
+            &query.q,
+            &query_vector,
+            route.clone(),
+            &scope,
+            search_options.clone(),
+            top_k,
+        ) {
+            Ok(results) => results,
+            Err(error @ crate::search::SearchError::VectorDimensionMismatch { .. })
+                if config.search.bm25_fallback =>
+            {
+                search_mode = SearchMode::Bm25Only;
+                warnings.push(format!(
+                    "{}; using BM25-only search",
+                    crate::core::config::scrub_sensitive_text(&error.to_string())
+                ));
+                search_bm25_only_with_options(&db, &query.q, route, &scope, search_options, top_k)
+                    .map_err(internal_error)?
+            }
+            Err(error) => return Err(internal_error(error)),
+        }
+    } else {
+        search_bm25_only_with_options(&db, &query.q, route, &scope, search_options, top_k)
+            .map_err(internal_error)?
+    };
 
-    Ok(Json(
-        results.into_iter().map(SearchResultDto::from).collect(),
-    ))
+    let mut response = Json(
+        results
+            .into_iter()
+            .map(|result| SearchResultDto::from_result(result, search_mode, &warnings))
+            .collect::<Vec<_>>(),
+    )
+    .into_response();
+    response.headers_mut().insert(
+        "search-mode",
+        HeaderValue::from_static(search_mode.as_str()),
+    );
+    if search_mode == SearchMode::Bm25Only {
+        response
+            .headers_mut()
+            .insert("degraded", HeaderValue::from_static("true"));
+    }
+    Ok(response)
 }
 
 async fn ingest_handler(
     State(state): State<ApiState>,
     Json(request): Json<IngestRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let embedder: Box<dyn crate::embed::Embedder> = state
-        .embedder_factory
-        .build()
-        .await
-        .map_err(internal_error)?;
-    let db = Database::open(&state.db_path).map_err(internal_error)?;
+    let response = state.write_queue().enqueue(request).await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn process_ingest_request(
+    db_path: PathBuf,
+    embedder_factory: Arc<dyn crate::embed::EmbedderFactory>,
+    request: IngestRequest,
+) -> Result<IngestResponse, ApiError> {
+    let embedder: Box<dyn crate::embed::Embedder> =
+        embedder_factory.build().await.map_err(internal_error)?;
+    let db = Database::open(&db_path).map_err(internal_error)?;
     let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
     validate_temporal_param("valid_from", request.valid_from.as_deref())?;
     validate_temporal_param("valid_until", request.valid_until.as_deref())?;
@@ -284,17 +448,14 @@ async fn ingest_handler(
         .map_err(internal_error)?;
     let raw_turn = is_raw_turn(&request.wing, request.room.as_deref(), &config.turns);
     if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
-        return Ok((
-            StatusCode::CREATED,
-            Json(IngestResponse {
-                drawer_id: String::new(),
-                drawer_ids: Vec::new(),
-                chunk_count: 0,
-                dropped: false,
-                superseded_drawer_id: None,
-                fact_check_warnings: Vec::new(),
-            }),
-        ));
+        return Ok(IngestResponse {
+            drawer_id: String::new(),
+            drawer_ids: Vec::new(),
+            chunk_count: 0,
+            dropped: false,
+            superseded_drawer_id: None,
+            fact_check_warnings: Vec::new(),
+        });
     }
     let drawer_importance =
         raw_turn_importance(&request.wing, request.room.as_deref(), &config.turns).unwrap_or(0);
@@ -372,17 +533,14 @@ async fn ingest_handler(
     }
 
     if accepted_chunks.is_empty() {
-        return Ok((
-            StatusCode::CREATED,
-            Json(IngestResponse {
-                drawer_id: String::new(),
-                drawer_ids: Vec::new(),
-                chunk_count: 0,
-                dropped: true,
-                superseded_drawer_id: None,
-                fact_check_warnings,
-            }),
-        ));
+        return Ok(IngestResponse {
+            drawer_id: String::new(),
+            drawer_ids: Vec::new(),
+            chunk_count: 0,
+            dropped: true,
+            superseded_drawer_id: None,
+            fact_check_warnings,
+        });
     }
 
     if accepted_chunks.iter().all(|(_, _, _, exists)| *exists) {
@@ -396,17 +554,14 @@ async fn ingest_handler(
             superseded_response_id = Some(old_id.to_string());
         }
         let primary_drawer_id = drawer_ids.first().cloned().unwrap_or_default();
-        return Ok((
-            StatusCode::CREATED,
-            Json(IngestResponse {
-                drawer_id: primary_drawer_id,
-                drawer_ids,
-                chunk_count: accepted_chunks.len(),
-                dropped: false,
-                superseded_drawer_id: superseded_response_id,
-                fact_check_warnings,
-            }),
-        ));
+        return Ok(IngestResponse {
+            drawer_id: primary_drawer_id,
+            drawer_ids,
+            chunk_count: accepted_chunks.len(),
+            dropped: false,
+            superseded_drawer_id: superseded_response_id,
+            fact_check_warnings,
+        });
     }
 
     // Embed all accepted chunks in one batch call.
@@ -476,17 +631,14 @@ async fn ingest_handler(
 
     let primary_drawer_id = drawer_ids.first().cloned().unwrap_or_default();
     let chunk_count = drawer_ids.len();
-    Ok((
-        StatusCode::CREATED,
-        Json(IngestResponse {
-            drawer_id: primary_drawer_id,
-            drawer_ids,
-            chunk_count,
-            dropped: false,
-            superseded_drawer_id: superseded_response_id,
-            fact_check_warnings,
-        }),
-    ))
+    Ok(IngestResponse {
+        drawer_id: primary_drawer_id,
+        drawer_ids,
+        chunk_count,
+        dropped: false,
+        superseded_drawer_id: superseded_response_id,
+        fact_check_warnings,
+    })
 }
 
 async fn taxonomy_handler(
@@ -533,6 +685,18 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         drawer_count,
         taxonomy_count,
         db_size_bytes,
+        embedding_status: current_embedding_status().to_string(),
+        search_mode: current_search_mode(config.as_ref()).to_string(),
+        write_queue: state.write_queue().stats(),
+        feature_flags: FeatureFlags {
+            typed_ingest: true,
+            pinned_facts: true,
+            compaction: true,
+            sleep_cycle: true,
+            crystallize: true,
+            intelligence_modes: true,
+        },
+        hermes_compat_version: HERMES_COMPAT_VERSION.to_string(),
         search_decay_mode: config.search.decay.mode.to_string(),
         wings,
         source_type_distribution,
@@ -544,6 +708,25 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
             raw_turn_rooms: config.turns.raw_turn_rooms.clone(),
         },
     }))
+}
+
+fn current_embedding_status() -> &'static str {
+    let snapshot = crate::embed::global_embed_status().snapshot();
+    if snapshot.degraded {
+        "degraded"
+    } else if snapshot.fail_count > 0 && snapshot.last_success_at_unix_ms.is_none() {
+        "unavailable"
+    } else {
+        "healthy"
+    }
+}
+
+fn current_search_mode(config: &crate::core::config::Config) -> &'static str {
+    if config.search.bm25_fallback && crate::embed::global_embed_status().is_degraded() {
+        SearchMode::Bm25Only.as_str()
+    } else {
+        SearchMode::Hybrid.as_str()
+    }
 }
 
 #[derive(Debug)]
@@ -566,10 +749,168 @@ impl IntoResponse for ApiError {
         (
             self.status,
             Json(json!({
-                "error": self.message,
+                "error": {
+                    "message": self.message,
+                    "status": self.status.as_u16(),
+                },
             })),
         )
             .into_response()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WriteQueueStats {
+    pub queued: u64,
+    pub pending: u64,
+    pub completed: u64,
+    pub failed: u64,
+}
+
+pub(crate) struct WriteQueue {
+    sender: mpsc::Sender<WriteJob>,
+    stats: Arc<WriteQueueCounters>,
+    accepting: Arc<AtomicBool>,
+    drain_timeout: Duration,
+    drained: Arc<Notify>,
+}
+
+struct WriteQueueCounters {
+    queued: AtomicU64,
+    pending: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+}
+
+struct WriteJob {
+    request: IngestRequest,
+    respond_to: oneshot::Sender<Result<IngestResponse, ApiError>>,
+}
+
+impl WriteQueue {
+    pub(super) fn spawn(
+        db_path: PathBuf,
+        embedder_factory: Arc<dyn crate::embed::EmbedderFactory>,
+        capacity: usize,
+        drain_timeout: Duration,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let stats = Arc::new(WriteQueueCounters {
+            queued: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+        });
+        let accepting = Arc::new(AtomicBool::new(true));
+        let drained = Arc::new(Notify::new());
+        tokio::spawn(write_worker(
+            db_path,
+            embedder_factory,
+            receiver,
+            Arc::clone(&stats),
+            Arc::clone(&drained),
+        ));
+        Self {
+            sender,
+            stats,
+            accepting,
+            drain_timeout,
+            drained,
+        }
+    }
+
+    async fn enqueue(&self, request: IngestRequest) -> Result<IngestResponse, ApiError> {
+        if !self.accepting.load(Ordering::SeqCst) {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "REST write queue is draining",
+            ));
+        }
+
+        let (respond_to, response_rx) = oneshot::channel();
+        let job = WriteJob {
+            request,
+            respond_to,
+        };
+        match self.sender.try_send(job) {
+            Ok(()) => {
+                self.stats.queued.fetch_add(1, Ordering::SeqCst);
+                self.stats.pending.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "REST write queue is full",
+                ));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "REST write queue is closed",
+                ));
+            }
+        }
+
+        response_rx.await.map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "REST write queue worker stopped before completing the request",
+            )
+        })?
+    }
+
+    pub(super) async fn drain(&self) -> bool {
+        self.accepting.store(false, Ordering::SeqCst);
+        tokio::time::timeout(self.drain_timeout, async {
+            loop {
+                if self.stats.pending.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                self.drained.notified().await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    pub(crate) fn stats(&self) -> WriteQueueStats {
+        WriteQueueStats {
+            queued: self.stats.queued.load(Ordering::SeqCst),
+            pending: self.stats.pending.load(Ordering::SeqCst),
+            completed: self.stats.completed.load(Ordering::SeqCst),
+            failed: self.stats.failed.load(Ordering::SeqCst),
+        }
+    }
+}
+
+async fn write_worker(
+    db_path: PathBuf,
+    embedder_factory: Arc<dyn crate::embed::EmbedderFactory>,
+    mut receiver: mpsc::Receiver<WriteJob>,
+    stats: Arc<WriteQueueCounters>,
+    drained: Arc<Notify>,
+) {
+    while let Some(job) = receiver.recv().await {
+        let recovery_content = job.request.content.clone();
+        let result =
+            process_ingest_request(db_path.clone(), Arc::clone(&embedder_factory), job.request)
+                .await;
+        match &result {
+            Ok(_) => {
+                stats.completed.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(error) => {
+                stats.failed.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(
+                    error = %error.message,
+                    drawer_content = %recovery_content,
+                    "REST write failed; drawer content logged for manual recovery"
+                );
+            }
+        }
+        stats.pending.fetch_sub(1, Ordering::SeqCst);
+        drained.notify_waiters();
+        let _ = job.respond_to.send(result);
     }
 }
 
@@ -612,8 +953,8 @@ fn supersede_drawer_for_ingest(db: &Database, old_id: &str, new_id: &str) -> Res
     Ok(())
 }
 
-impl From<SearchResult> for SearchResultDto {
-    fn from(value: SearchResult) -> Self {
+impl SearchResultDto {
+    fn from_result(value: SearchResult, search_mode: SearchMode, warnings: &[String]) -> Self {
         Self {
             drawer_id: value.drawer_id,
             content: value.content,
@@ -625,6 +966,8 @@ impl From<SearchResult> for SearchResultDto {
             confidence: value.confidence,
             similarity: value.similarity,
             route: value.route.into(),
+            search_mode: search_mode.as_str().to_string(),
+            warnings: warnings.to_vec(),
         }
     }
 }
