@@ -1993,7 +1993,7 @@ impl Database {
         }
         values.push(SqlValue::Integer(sql_limit));
         sql.push_str(&format!(
-            "ORDER BY CASE WHEN added_at NOT GLOB '20*' THEN datetime(CAST(added_at AS INTEGER), 'unixepoch') ELSE added_at END DESC, id DESC LIMIT ?{}",
+            "ORDER BY CASE WHEN added_at NOT GLOB '20*' THEN strftime('%Y-%m-%dT%H:%M:%SZ', CAST(added_at AS INTEGER), 'unixepoch') ELSE added_at END DESC, id DESC LIMIT ?{}",
             values.len()
         ));
 
