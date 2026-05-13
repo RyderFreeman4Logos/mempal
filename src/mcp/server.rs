@@ -1019,6 +1019,7 @@ impl MempalMcpServer {
             },
             with_neighbors: request.with_neighbors.unwrap_or(false),
             include_raw_turns: request.include_raw_turns.unwrap_or(false),
+            include_expired: false,
         };
         let mut extra_warnings = Vec::new();
         let embedder = self.embedder_factory.build().await.map_err(|error| {

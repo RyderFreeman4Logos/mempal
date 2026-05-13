@@ -1,5 +1,6 @@
 #![warn(clippy::all)]
 
+use crate::core::decay::{search_decay_factor_at, validity_window_contains_at};
 use crate::core::{
     db::Database,
     project::{ProjectSearchScope, SearchResultSource},
@@ -13,7 +14,7 @@ use crate::embed::{EmbedError, Embedder};
 use thiserror::Error;
 
 use crate::search::filter::{build_filter_clause, build_vector_search_sql};
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, params_from_iter};
 
 pub mod filter;
 pub mod preview;
@@ -40,6 +41,7 @@ pub struct SearchOptions {
     pub filters: SearchFilters,
     pub with_neighbors: bool,
     pub include_raw_turns: bool,
+    pub include_expired: bool,
 }
 
 #[derive(Debug, Error)]
@@ -70,6 +72,8 @@ pub enum SearchError {
     LoadNeighbors(#[source] crate::core::db::DbError),
     #[error("failed to load search result drawer metadata")]
     LoadDrawer(#[source] crate::core::db::DbError),
+    #[error("failed to load temporal search metadata")]
+    LoadTemporalMetadata(#[source] rusqlite::Error),
     #[error(
         "embedding dimension mismatch: drawer_vectors uses {current_dim}d but embedder returned {new_dim}d; run `mempal reindex --embedder <name>` before searching with this backend"
     )]
@@ -246,7 +250,12 @@ pub fn search_with_vector_and_scope_options(
 
     let config = crate::core::config::ConfigHandle::current();
     let exclude_raw_turns = config.search.exclude_raw_turns && !options.include_raw_turns;
-    let has_filters = !options.filters.is_empty() || exclude_raw_turns;
+    let has_temporal_post_process = !options.include_expired
+        || !matches!(
+            config.search.decay.mode,
+            crate::core::config::DecayMode::None
+        );
+    let has_filters = !options.filters.is_empty() || exclude_raw_turns || has_temporal_post_process;
     let candidate_top_k = if has_filters {
         top_k.saturating_mul(20).max(100)
     } else {
@@ -274,13 +283,11 @@ pub fn search_with_vector_and_scope_options(
     };
     if !options.filters.is_empty() {
         results.retain(|result| matches_filters(result, &options.filters));
-        results.truncate(top_k);
     }
     if exclude_raw_turns {
         results.retain(|result| {
             !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
         });
-        results.truncate(top_k);
     }
 
     // Inject tunnel hints: for each result, check if its room exists in other wings
@@ -289,23 +296,132 @@ pub fn search_with_vector_and_scope_options(
         results.retain(|result| {
             !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
         });
-        results.truncate(top_k);
     }
+
+    let now_secs = current_unix_secs();
+    let temporal_metadata = load_temporal_metadata(db, &results)?;
+    if !options.include_expired {
+        retain_currently_valid_results(&mut results, &temporal_metadata, now_secs);
+    }
+
+    // Pattern boosting (P13): boost exemplar drawers of active patterns that
+    // match the query vector. Fire-and-forget on error.
+    apply_pattern_boost(db, query_vector, scope.project_id.as_deref(), &mut results);
+    apply_temporal_decay(
+        &mut results,
+        &temporal_metadata,
+        &config.search.decay,
+        now_secs,
+    );
+
+    // Post-RRF secondary reranking by effective_importance (P13).
+    // Does NOT alter the similarity field; purely reorders within the final set.
+    rerank_by_effective_importance(&mut results);
+    results.truncate(top_k);
 
     // Chunk neighbors hydration (upstream feature)
     if options.with_neighbors && top_k <= 10 {
         inject_chunk_neighbors(db, &mut results)?;
     }
 
-    // Pattern boosting (P13): boost exemplar drawers of active patterns that
-    // match the query vector. Fire-and-forget on error.
-    apply_pattern_boost(db, query_vector, scope.project_id.as_deref(), &mut results);
-
-    // Post-RRF secondary reranking by effective_importance (P13).
-    // Does NOT alter the similarity field; purely reorders within the final set.
-    rerank_by_effective_importance(&mut results);
-
     Ok(results)
+}
+
+#[derive(Debug, Clone)]
+struct TemporalMetadata {
+    added_at: String,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+}
+
+fn current_unix_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn load_temporal_metadata(
+    db: &Database,
+    results: &[SearchResult],
+) -> Result<std::collections::HashMap<String, TemporalMetadata>> {
+    let ids = results
+        .iter()
+        .map(|result| result.drawer_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let placeholders = (1..=ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, added_at, valid_from, valid_until FROM drawers WHERE id IN ({placeholders})"
+    );
+    let mut statement = db
+        .conn()
+        .prepare(&sql)
+        .map_err(SearchError::LoadTemporalMetadata)?;
+    let rows = statement
+        .query_map(params_from_iter(ids.iter().map(String::as_str)), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                TemporalMetadata {
+                    added_at: row.get(1)?,
+                    valid_from: row.get(2)?,
+                    valid_until: row.get(3)?,
+                },
+            ))
+        })
+        .map_err(SearchError::LoadTemporalMetadata)?
+        .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()
+        .map_err(SearchError::LoadTemporalMetadata)?;
+
+    Ok(rows)
+}
+
+fn retain_currently_valid_results(
+    results: &mut Vec<SearchResult>,
+    metadata: &std::collections::HashMap<String, TemporalMetadata>,
+    now_secs: i64,
+) {
+    results.retain(|result| {
+        metadata.get(&result.drawer_id).is_none_or(|temporal| {
+            validity_window_contains_at(
+                temporal.valid_from.as_deref(),
+                temporal.valid_until.as_deref(),
+                now_secs,
+            )
+        })
+    });
+}
+
+fn apply_temporal_decay(
+    results: &mut [SearchResult],
+    metadata: &std::collections::HashMap<String, TemporalMetadata>,
+    config: &crate::core::config::DecayConfig,
+    now_secs: i64,
+) {
+    if matches!(config.mode, crate::core::config::DecayMode::None) {
+        return;
+    }
+
+    for result in results.iter_mut() {
+        let factor = metadata
+            .get(&result.drawer_id)
+            .map(|temporal| search_decay_factor_at(&temporal.added_at, config, now_secs))
+            .unwrap_or(1.0);
+        result.similarity *= factor as f32;
+        result.effective_importance *= factor;
+    }
+    results.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 /// Apply active-pattern score boost to matching exemplar drawers.
@@ -437,7 +553,12 @@ pub fn search_bm25_only_with_options(
 
     let config = crate::core::config::ConfigHandle::current();
     let exclude_raw_turns = config.search.exclude_raw_turns && !options.include_raw_turns;
-    let candidate_top_k = if exclude_raw_turns {
+    let has_temporal_post_process = !options.include_expired
+        || !matches!(
+            config.search.decay.mode,
+            crate::core::config::DecayMode::None
+        );
+    let candidate_top_k = if exclude_raw_turns || has_temporal_post_process {
         top_k.saturating_mul(20).max(100)
     } else {
         top_k
@@ -458,15 +579,25 @@ pub fn search_bm25_only_with_options(
         results.retain(|result| {
             !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
         });
-        results.truncate(top_k);
     }
     inject_tunnel_hints_and_results(db, &mut results, scope);
     if exclude_raw_turns {
         results.retain(|result| {
             !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
         });
-        results.truncate(top_k);
     }
+    let now_secs = current_unix_secs();
+    let temporal_metadata = load_temporal_metadata(db, &results)?;
+    if !options.include_expired {
+        retain_currently_valid_results(&mut results, &temporal_metadata, now_secs);
+    }
+    apply_temporal_decay(
+        &mut results,
+        &temporal_metadata,
+        &config.search.decay,
+        now_secs,
+    );
+    results.truncate(top_k);
     Ok(results)
 }
 
@@ -1307,6 +1438,15 @@ mod tests {
         }
     }
 
+    fn route() -> RouteDecision {
+        RouteDecision {
+            wing: None,
+            room: None,
+            confidence: 0.0,
+            reason: "test".to_string(),
+        }
+    }
+
     fn seed_cross_project(db: &Database, source: &Drawer, beta_count: usize) {
         db.insert_drawer_with_project(source, Some("proj-a"))
             .expect("insert source");
@@ -1320,6 +1460,78 @@ mod tests {
 
     fn scoped_to_proj_a() -> ProjectSearchScope {
         ProjectSearchScope::from_request(Some("proj-a".to_string()), false, false, false)
+    }
+
+    #[test]
+    fn search_excludes_expired_drawers_by_default_and_include_expired_returns_them() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        let mut active = make_drawer("active", "alpha", "decision");
+        active.content = "needle active".to_string();
+        let mut expired = make_drawer("expired", "alpha", "decision");
+        expired.content = "needle expired".to_string();
+
+        db.insert_drawer_with_project_validity(&active, None, None, None)
+            .expect("insert active");
+        db.insert_drawer_with_project_validity(&expired, None, Some("0"), Some("1"))
+            .expect("insert expired");
+
+        let results = search_bm25_only_with_options(
+            &db,
+            "needle",
+            route(),
+            &ProjectSearchScope::all_projects(),
+            SearchOptions::default(),
+            10,
+        )
+        .expect("search");
+        let ids = results
+            .iter()
+            .map(|result| result.drawer_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"active"));
+        assert!(!ids.contains(&"expired"));
+
+        let results = search_bm25_only_with_options(
+            &db,
+            "needle",
+            route(),
+            &ProjectSearchScope::all_projects(),
+            SearchOptions {
+                include_expired: true,
+                ..SearchOptions::default()
+            },
+            10,
+        )
+        .expect("search include expired");
+        let ids = results
+            .iter()
+            .map(|result| result.drawer_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"active"));
+        assert!(ids.contains(&"expired"));
+    }
+
+    #[test]
+    fn search_excludes_future_valid_from_by_default() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        let mut future = make_drawer("future", "alpha", "decision");
+        future.content = "needle future".to_string();
+
+        db.insert_drawer_with_project_validity(&future, None, Some("4102444800"), None)
+            .expect("insert future");
+
+        let results = search_bm25_only_with_options(
+            &db,
+            "needle",
+            route(),
+            &ProjectSearchScope::all_projects(),
+            SearchOptions::default(),
+            10,
+        )
+        .expect("search");
+        assert!(results.is_empty(), "future-valid drawer must be hidden");
     }
 
     #[test]

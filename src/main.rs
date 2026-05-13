@@ -2702,6 +2702,7 @@ async fn search_command(
             filters: options.filters,
             with_neighbors: options.with_neighbors,
             include_raw_turns: options.include_raw_turns,
+            include_expired: false,
         },
         options.top_k,
     )
