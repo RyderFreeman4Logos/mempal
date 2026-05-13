@@ -245,10 +245,10 @@ fn insert_event(
 }
 
 #[test]
-fn test_new_database_schema_version_is_11() {
+fn test_new_database_schema_version_is_12() {
     let (_tmp, db) = new_db();
 
-    assert_eq!(db.schema_version().expect("schema version"), 11);
+    assert_eq!(db.schema_version().expect("schema version"), 12);
     for table in [
         "knowledge_cards",
         "knowledge_evidence_links",
@@ -267,7 +267,7 @@ fn test_migration_v7_to_v10_adds_phase2_phase3_and_validity_without_data_loss() 
 
     let db = Database::open(&db_path).expect("migrate v7 db");
 
-    assert_eq!(db.schema_version().expect("schema version"), 11);
+    assert_eq!(db.schema_version().expect("schema version"), 12);
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
     assert_eq!(db.triple_count().expect("triple count"), 1);
     let taxonomy_count: i64 = db

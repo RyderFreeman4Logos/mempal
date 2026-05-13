@@ -450,6 +450,7 @@ fn bootstrap_drawer(
         scope_constraints: None,
         trigger_hints: None,
         effective_importance: 2.0,
+        compacted_into: None,
     }
 }
 
@@ -558,7 +559,7 @@ fn test_migration_backfills_legacy_drawers_with_bootstrap_defaults() {
     }
 
     let db = Database::open(&db_path).expect("migrate db to latest");
-    assert_eq!(db.schema_version().expect("schema version"), 11);
+    assert_eq!(db.schema_version().expect("schema version"), 12);
 
     let drawer = db
         .get_drawer("drawer_legacy_001")
@@ -654,6 +655,7 @@ fn test_insert_load_roundtrip_preserves_json_metadata_and_read_paths() {
             tool_needs: vec!["cargo-check".to_string()],
         }),
         effective_importance: 3.0,
+        compacted_into: None,
     };
 
     db.insert_drawer(&drawer).expect("insert drawer");

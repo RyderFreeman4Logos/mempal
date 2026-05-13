@@ -693,6 +693,7 @@ fn drawer_from_ingest_metadata(
         scope_constraints: metadata.scope_constraints.clone(),
         trigger_hints: metadata.trigger_hints.clone(),
         effective_importance: importance as f64,
+        compacted_into: None,
     }
 }
 
@@ -4004,6 +4005,7 @@ mod tests {
             verification_refs: refs.verification,
             scope_constraints: None,
             trigger_hints: None,
+            compacted_into: None,
         };
         db.insert_drawer(&drawer).expect("insert knowledge drawer");
         db.insert_vector(id, &[0.1, 0.2, 0.3])
@@ -4047,6 +4049,7 @@ mod tests {
             verification_refs: Vec::new(),
             scope_constraints: None,
             trigger_hints: None,
+            compacted_into: None,
         };
         db.insert_drawer(&drawer)
             .expect("insert anchored knowledge drawer");
@@ -6640,6 +6643,7 @@ mod tests_duplicate_conflict_artifact {
             verification_refs: refs.verification,
             scope_constraints: None,
             trigger_hints: None,
+            compacted_into: None,
         };
         db.insert_drawer(&drawer).expect("insert knowledge drawer");
         db.insert_vector(id, &[0.1, 0.2, 0.3])
@@ -6681,6 +6685,7 @@ mod tests_duplicate_conflict_artifact {
             verification_refs: Vec::new(),
             scope_constraints: None,
             trigger_hints: None,
+            compacted_into: None,
         };
         db.insert_drawer(&drawer)
             .expect("insert anchored knowledge drawer");

@@ -180,6 +180,64 @@ pub enum RuntimeAdoptionSignal {
     Neutral,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStrategy {
+    RichestContent,
+    LlmSummary,
+}
+
+impl CompactionStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RichestContent => "richest_content",
+            Self::LlmSummary => "llm_summary",
+        }
+    }
+}
+
+impl fmt::Display for CompactionStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseCompactionStrategyError {
+    value: String,
+}
+
+impl fmt::Display for ParseCompactionStrategyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid compaction strategy: {}", self.value)
+    }
+}
+
+impl std::error::Error for ParseCompactionStrategyError {}
+
+impl FromStr for CompactionStrategy {
+    type Err = ParseCompactionStrategyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "richest_content" => Ok(Self::RichestContent),
+            "llm_summary" => Ok(Self::LlmSummary),
+            other => Err(ParseCompactionStrategyError {
+                value: other.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionResult {
+    pub target_id: String,
+    pub source_ids: Vec<String>,
+    pub strategy: CompactionStrategy,
+    pub cluster_size: usize,
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeAdoptionEvent {
     pub id: String,
@@ -345,6 +403,8 @@ pub struct Drawer {
     /// Defaults to `importance as f64` when the column doesn't exist (pre-v10 DBs).
     #[serde(default)]
     pub effective_importance: f64,
+    #[serde(default)]
+    pub compacted_into: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +453,7 @@ impl Drawer {
             scope_constraints: None,
             trigger_hints: None,
             effective_importance: args.importance as f64,
+            compacted_into: None,
         }
     }
 }
@@ -430,6 +491,7 @@ impl Default for Drawer {
             scope_constraints: None,
             trigger_hints: None,
             effective_importance: 0.0,
+            compacted_into: None,
         }
     }
 }

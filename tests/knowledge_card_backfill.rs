@@ -72,6 +72,7 @@ fn knowledge_drawer(id: &str, field: &str) -> Drawer {
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        compacted_into: None,
     }
 }
 
@@ -105,6 +106,7 @@ fn evidence_drawer(id: &str) -> Drawer {
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        compacted_into: None,
     }
 }
 

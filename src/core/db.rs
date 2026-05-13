@@ -38,7 +38,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 11;
+const CURRENT_SCHEMA_VERSION: u32 = 12;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -85,7 +85,8 @@ const DRAWER_SELECT_COLUMNS: &str = r#"
     verification_refs,
     scope_constraints,
     trigger_hints,
-    COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) as effective_importance
+    COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) as effective_importance,
+    compacted_into
 "#;
 
 const V1_SCHEMA_SQL: &str = r#"
@@ -1405,11 +1406,11 @@ impl Database {
         ))?;
         let mut rows = statement.query_map([drawer_id], |row| {
             let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-            // DRAWER_SELECT_COLUMNS has 28 columns (indices 0-27), so
-            // the extra columns appended here start at index 28.
-            let updated_at = row.get::<_, Option<String>>(28)?;
-            let merge_count = row.get::<_, u32>(29)?;
-            let project_id = row.get::<_, Option<String>>(30)?;
+            // DRAWER_SELECT_COLUMNS has 29 columns (indices 0-28), so
+            // the extra columns appended here start at index 29.
+            let updated_at = row.get::<_, Option<String>>(29)?;
+            let merge_count = row.get::<_, u32>(30)?;
+            let project_id = row.get::<_, Option<String>>(31)?;
             Ok(DrawerDetails {
                 drawer,
                 updated_at,
@@ -1461,10 +1462,10 @@ impl Database {
             let mut statement = self.conn.prepare(&sql)?;
             let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
                 let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-                // DRAWER_SELECT_COLUMNS is 28 columns (0-27); extra columns start at 28.
-                let updated_at = row.get::<_, Option<String>>(28)?;
-                let merge_count = row.get::<_, u32>(29)?;
-                let project_id = row.get::<_, Option<String>>(30)?;
+                // DRAWER_SELECT_COLUMNS is 29 columns (0-28); extra columns start at 29.
+                let updated_at = row.get::<_, Option<String>>(29)?;
+                let merge_count = row.get::<_, u32>(30)?;
+                let project_id = row.get::<_, Option<String>>(31)?;
                 Ok((
                     drawer.id.clone(),
                     DrawerDetails {
@@ -2370,8 +2371,8 @@ impl Database {
                 rusqlite::params![room, exclude_drawer_id, current_project_id, sql_limit],
                 |row| {
                     let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-                    // DRAWER_SELECT_COLUMNS is 28 columns (0-27); project_id appended at 28.
-                    let project_id = row.get::<_, Option<String>>(28)?;
+                    // DRAWER_SELECT_COLUMNS is 29 columns (0-28); project_id appended at 29.
+                    let project_id = row.get::<_, Option<String>>(29)?;
                     Ok(TunnelDrawer {
                         drawer,
                         target_project_id: project_id,
@@ -3173,6 +3174,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             ensure_v11_source_confidence_schema(conn, read_user_version(conn)?)?;
             continue;
         }
+        if migration.version == 12 {
+            ensure_v12_compaction_schema(conn, read_user_version(conn)?)?;
+            continue;
+        }
         apply_migration_atomic(conn, migration)?;
     }
 
@@ -3181,6 +3186,9 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     }
     if read_user_version(conn)? >= 11 {
         ensure_v11_source_confidence_schema(conn, read_user_version(conn)?)?;
+    }
+    if read_user_version(conn)? >= 12 {
+        ensure_v12_compaction_schema(conn, read_user_version(conn)?)?;
     }
 
     Ok(())
@@ -3288,6 +3296,31 @@ fn ensure_v11_source_confidence_schema(
         }
         if current_version < 11 {
             set_user_version(conn, 11)?;
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn ensure_v12_compaction_schema(conn: &Connection, current_version: u32) -> Result<(), DbError> {
+    let existing_columns = drawers_column_names(conn)?;
+    let missing_compacted_into = !existing_columns.contains("compacted_into");
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(error) = (|| -> Result<(), DbError> {
+        if missing_compacted_into {
+            conn.execute_batch(
+                "ALTER TABLE drawers ADD COLUMN compacted_into TEXT REFERENCES drawers(id);",
+            )?;
+        }
+        conn.execute_batch(V12_COMPACTION_SCHEMA_SQL)?;
+        if current_version < 12 {
+            set_user_version(conn, 12)?;
         }
         conn.execute_batch("COMMIT;")?;
         Ok(())
@@ -3868,6 +3901,31 @@ SET source_type = CASE
 "#;
 
 const V11_MIGRATION_SQL: &str = "";
+const V12_MIGRATION_SQL: &str = "";
+const V12_COMPACTION_SCHEMA_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
+    ON drawers(compacted_into)
+    WHERE compacted_into IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS consolidation_log (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    wing TEXT NOT NULL,
+    room TEXT,
+    project_id TEXT,
+    cluster_size INTEGER NOT NULL,
+    strategy TEXT NOT NULL CHECK(strategy IN ('richest_content', 'llm_summary')),
+    target_drawer_id TEXT NOT NULL REFERENCES drawers(id),
+    source_drawer_ids TEXT NOT NULL,
+    dry_run INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidation_log_created_at
+    ON consolidation_log(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_consolidation_log_scope
+    ON consolidation_log(wing, room, project_id);
+"#;
 
 fn migrations() -> &'static [Migration] {
     static MIGRATIONS: &[Migration] = &[
@@ -3914,6 +3972,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 11,
             sql: V11_MIGRATION_SQL,
+        },
+        Migration {
+            version: 12,
+            sql: V12_MIGRATION_SQL,
         },
     ];
     MIGRATIONS
@@ -4330,6 +4392,7 @@ fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
     let scope_constraints = row.get::<_, Option<String>>(25)?;
     let trigger_hints = parse_optional_json(row.get::<_, Option<String>>(26)?.as_deref())?;
     let effective_importance = row.get::<_, f64>(27)?;
+    let compacted_into = row.get::<_, Option<String>>(28)?;
 
     anchor::validate_anchor_domain(&domain, &anchor_kind)
         .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
@@ -4363,6 +4426,7 @@ fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
         scope_constraints,
         trigger_hints,
         effective_importance,
+        compacted_into,
     })
 }
 
@@ -4704,6 +4768,38 @@ mod tests {
             [],
         )
         .expect("new source_type check accepts user_explicit");
+    }
+
+    #[test]
+    fn test_v12_migration_adds_compaction_schema_idempotently() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE drawers (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                wing TEXT NOT NULL,
+                added_at TEXT NOT NULL
+            );
+            PRAGMA user_version = 11;
+            "#,
+        )
+        .expect("create v11 schema");
+
+        ensure_v12_compaction_schema(&conn, 11).expect("apply v12 migration");
+        ensure_v12_compaction_schema(&conn, 12).expect("reapply v12 migration");
+
+        assert_eq!(read_user_version(&conn).expect("user_version"), 12);
+        let columns = drawers_column_names(&conn).expect("drawer columns");
+        assert!(columns.contains("compacted_into"));
+        let log_exists = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='consolidation_log')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("table exists");
+        assert_eq!(log_exists, 1);
     }
 
     #[test]
