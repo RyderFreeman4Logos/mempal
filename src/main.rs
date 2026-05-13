@@ -14,8 +14,9 @@ use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::api::{ApiState, DEFAULT_REST_ADDR, serve as serve_rest_api};
 use mempal::context::{ContextPack, ContextRequest, assemble_context};
 use mempal::core::{
+    compaction::merge_cluster,
     config::{CompiledPrivacyConfig, Config, ConfigHandle, default_config_path},
-    db::Database,
+    db::{Database, find_similar_clusters},
     priming::PrimingRequest,
     project::{
         ProjectMigrationEvent, ProjectSearchScope, escape_project_id_for_display,
@@ -25,11 +26,11 @@ use mempal::core::{
     reindex::ReindexProgressStore,
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
-        AnchorKind, BootstrapEvidenceArgs, Drawer, KnowledgeCard, KnowledgeCardEvent,
-        KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole,
-        KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, RuntimeAdoptionEvent,
-        RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack, SourceType,
-        TaxonomyEntry, TriggerHints, TunnelEndpoint, default_confidence,
+        AnchorKind, BootstrapEvidenceArgs, CompactionStrategy, Drawer, KnowledgeCard,
+        KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink,
+        KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
+        RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack,
+        SourceType, TaxonomyEntry, TriggerHints, TunnelEndpoint, default_confidence,
     },
     utils::{
         build_bootstrap_evidence_drawer_id, build_triple_id, current_timestamp,
@@ -135,6 +136,16 @@ struct RollbackCommandOptions<'a> {
     project: Option<&'a str>,
     dry_run: bool,
     json: bool,
+}
+
+struct ConsolidateCommandOptions<'a> {
+    wing: Option<&'a str>,
+    room: Option<&'a str>,
+    threshold: Option<f64>,
+    min_cluster: Option<usize>,
+    dry_run: bool,
+    strategy: Option<&'a str>,
+    limit: Option<usize>,
 }
 
 struct ContextCommandArgs {
@@ -330,6 +341,22 @@ enum Commands {
         /// embedder-based reindex and --recompute-importance.
         #[arg(long, default_value_t = false)]
         normalize_added_at: bool,
+    },
+    Consolidate {
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long)]
+        room: Option<String>,
+        #[arg(long)]
+        threshold: Option<f64>,
+        #[arg(long = "min-cluster")]
+        min_cluster: Option<usize>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        strategy: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
     },
     Kg {
         #[command(subcommand)]
@@ -1373,6 +1400,27 @@ fn run() -> Result<()> {
                 ))
             }
         }
+        Commands::Consolidate {
+            wing,
+            room,
+            threshold,
+            min_cluster,
+            dry_run,
+            strategy,
+            limit,
+        } => consolidate_command(
+            &db,
+            config.as_ref(),
+            ConsolidateCommandOptions {
+                wing: wing.as_deref(),
+                room: room.as_deref(),
+                threshold,
+                min_cluster,
+                dry_run,
+                strategy: strategy.as_deref(),
+                limit,
+            },
+        ),
         Commands::Kg { command } => kg_command(&db, command),
         Commands::Knowledge { command } => {
             block_on_result(knowledge_command(&db, config.as_ref(), command))
@@ -3226,6 +3274,117 @@ fn compress_command(text: &str) -> Result<()> {
     );
     println!("{}", output.document);
     Ok(())
+}
+
+fn consolidate_command(
+    db: &Database,
+    config: &Config,
+    options: ConsolidateCommandOptions<'_>,
+) -> Result<()> {
+    let threshold = options
+        .threshold
+        .unwrap_or(config.consolidation.similarity_threshold);
+    let min_cluster = options
+        .min_cluster
+        .unwrap_or(config.consolidation.min_cluster_size);
+    let limit = options
+        .limit
+        .unwrap_or(config.consolidation.max_clusters_per_run);
+    let strategy_value = options.strategy.unwrap_or(&config.consolidation.strategy);
+    let strategy = match strategy_value.parse::<CompactionStrategy>() {
+        Ok(strategy) => strategy,
+        Err(_) => bail!("invalid compaction strategy: {strategy_value}"),
+    };
+    if strategy == CompactionStrategy::LlmSummary {
+        bail!("LLM compaction not yet implemented");
+    }
+
+    let current_dir = env::current_dir().ok();
+    let project_id = if config.search.strict_project_isolation {
+        resolve_project_id(None, config, current_dir.as_deref())
+            .context("failed to resolve project id for consolidation")?
+    } else {
+        None
+    };
+
+    let clusters = find_similar_clusters(
+        db.conn(),
+        options.wing,
+        options.room,
+        project_id.as_deref(),
+        threshold,
+        min_cluster,
+    )
+    .context("failed to find similar drawer clusters")?;
+
+    println!("clusters_found: {}", clusters.len());
+    let mut processed = 0usize;
+    let mut drawers_merged = 0usize;
+    for (index, cluster) in clusters.iter().take(limit).enumerate() {
+        let drawer_ids = cluster
+            .iter()
+            .map(|(drawer_id, _)| drawer_id.clone())
+            .collect::<Vec<_>>();
+        let result = merge_cluster(db, &drawer_ids, strategy, options.dry_run)
+            .context("failed to merge drawer cluster")?;
+        processed += 1;
+        if options.dry_run {
+            println!(
+                "cluster {}: size={} target={} strategy={} dry_run=true avg_similarity={:.4}",
+                index + 1,
+                result.cluster_size,
+                result.target_id,
+                result.strategy,
+                average_cluster_similarity(cluster)
+            );
+            for (drawer_id, similarity) in cluster {
+                let preview = db
+                    .get_drawer(drawer_id)
+                    .context("failed to load drawer preview")?
+                    .map(|drawer| preview_one_line(&drawer.content, 96))
+                    .unwrap_or_else(|| "<inactive>".to_string());
+                println!("  - {drawer_id} similarity={similarity:.4} preview=\"{preview}\"");
+            }
+        } else {
+            let source_count = result.source_ids.len().saturating_sub(1);
+            drawers_merged += source_count;
+            println!(
+                "merged cluster {}: target={} sources={} cluster_size={}",
+                index + 1,
+                result.target_id,
+                source_count,
+                result.cluster_size
+            );
+        }
+    }
+    println!(
+        "summary: clusters_found={} processed={} drawers_merged={}",
+        clusters.len(),
+        processed,
+        drawers_merged
+    );
+    Ok(())
+}
+
+fn average_cluster_similarity(cluster: &[(String, f64)]) -> f64 {
+    if cluster.is_empty() {
+        return 0.0;
+    }
+    cluster
+        .iter()
+        .map(|(_, similarity)| similarity)
+        .sum::<f64>()
+        / cluster.len() as f64
+}
+
+fn preview_one_line(content: &str, max_chars: usize) -> String {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let mut preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        preview.push_str("...");
+    }
+    preview.replace('"', "\\\"")
 }
 
 fn recompute_importance_command(db: &Database, only_zero: bool) -> Result<()> {
@@ -5318,6 +5477,9 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     let deleted_count = db
         .deleted_drawer_count()
         .context("failed to count deleted drawers")?;
+    let consolidation_stats = db
+        .consolidation_stats()
+        .context("failed to read consolidation stats")?;
     let daemon_pid = read_daemon_pid(db.path())?;
     let daemon_running = daemon_pid
         .map(process_is_running)
@@ -5361,6 +5523,19 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     }
     if deleted_count > 0 {
         println!("deleted_drawers: {deleted_count} (use `mempal purge` to remove)");
+    }
+    println!("Consolidation:");
+    println!(
+        "  total_compacted_drawers: {}",
+        consolidation_stats.total_compacted_drawers
+    );
+    println!(
+        "  consolidation_runs: {}",
+        consolidation_stats.consolidation_runs
+    );
+    match consolidation_stats.last_consolidation_at.as_deref() {
+        Some(last) => println!("  last_consolidation_at: {last}"),
+        None => println!("  last_consolidation_at: none"),
     }
     let triple_count = db.triple_count().context("failed to count triples")?;
     println!("taxonomy_entries: {taxonomy_count}");

@@ -238,6 +238,13 @@ pub struct CompactionResult {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConsolidationStats {
+    pub total_compacted_drawers: u64,
+    pub consolidation_runs: u64,
+    pub last_consolidation_at: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeAdoptionEvent {
     pub id: String,

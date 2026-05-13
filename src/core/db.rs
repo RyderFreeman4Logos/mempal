@@ -23,12 +23,13 @@ use thiserror::Error;
 use super::anchor;
 use super::{
     types::{
-        AnchorKind, ChunkNeighbors, CompactionStrategy, Drawer, DrawerDetails, DrawerSummary,
-        ExplicitTunnel, KnowledgeCard, KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType,
-        KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain,
-        MemoryKind, NeighborChunk, Provenance, ReindexSource, RuntimeAdoptionEvent,
-        RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack, SourceType,
-        TaxonomyEntry, Triple, TripleStats, TunnelDrawer, TunnelEndpoint, TunnelFollowResult,
+        AnchorKind, ChunkNeighbors, CompactionStrategy, ConsolidationStats, Drawer, DrawerDetails,
+        DrawerSummary, ExplicitTunnel, KnowledgeCard, KnowledgeCardEvent, KnowledgeCardFilter,
+        KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus,
+        KnowledgeTier, MemoryDomain, MemoryKind, NeighborChunk, Provenance, ReindexSource,
+        RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack,
+        SourceType, TaxonomyEntry, Triple, TripleStats, TunnelDrawer, TunnelEndpoint,
+        TunnelFollowResult,
     },
     utils::{
         build_drawer_id, build_scoped_drawer_id, build_tunnel_id, current_timestamp,
@@ -2433,6 +2434,29 @@ impl Database {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn consolidation_stats(&self) -> Result<ConsolidationStats, DbError> {
+        let total_compacted_drawers = self.conn.query_row(
+            "SELECT COUNT(*) FROM drawers WHERE compacted_into IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        let (consolidation_runs, last_consolidation_at) = self.conn.query_row(
+            "SELECT COUNT(*), MAX(created_at) FROM consolidation_log",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )?;
+        Ok(ConsolidationStats {
+            total_compacted_drawers,
+            consolidation_runs,
+            last_consolidation_at,
+        })
     }
 
     // --- FTS5 BM25 search ---
