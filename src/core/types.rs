@@ -276,6 +276,18 @@ pub struct ConsolidationStats {
     pub total_compacted_drawers: u64,
     pub consolidation_runs: u64,
     pub last_consolidation_at: Option<String>,
+    pub last_sleep_at: Option<String>,
+    pub sleep_items_pruned: u64,
+    pub sleep_items_compacted: u64,
+    pub sleep_conflicts_resolved: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SleepStats {
+    pub last_sleep_at: Option<String>,
+    pub items_pruned: u64,
+    pub items_compacted: u64,
+    pub conflicts_resolved: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
