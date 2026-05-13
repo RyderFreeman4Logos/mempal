@@ -30,7 +30,7 @@ fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
 fn test_runtime_adoption_event_roundtrip_db() {
     let tmp = TempDir::new().expect("tempdir");
     let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
-    assert_eq!(db.schema_version().expect("schema version"), 9);
+    assert_eq!(db.schema_version().expect("schema version"), 10);
 
     let event = RuntimeAdoptionEvent {
         id: "adoption_test".to_string(),
