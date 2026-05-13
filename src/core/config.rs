@@ -84,6 +84,7 @@ pub struct Config {
     pub ingest_gating: IngestGatingConfig,
     pub hooks: HooksConfig,
     pub daemon: DaemonConfig,
+    pub api: ApiConfig,
     pub mcp: McpConfig,
     pub importance: ImportanceConfig,
     pub patterns: PatternsConfig,
@@ -107,6 +108,7 @@ impl Default for Config {
             ingest_gating: IngestGatingConfig::default(),
             hooks: HooksConfig::default(),
             daemon: DaemonConfig::default(),
+            api: ApiConfig::default(),
             mcp: McpConfig::default(),
             importance: ImportanceConfig::default(),
             patterns: PatternsConfig::default(),
@@ -514,6 +516,25 @@ impl Default for HooksSessionEndConfig {
             trailing_messages: DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES,
             min_length: DEFAULT_SESSION_REVIEW_MIN_LENGTH,
             wing: DEFAULT_SESSION_REVIEW_WING.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ApiConfig {
+    /// Start the REST API server automatically when the daemon starts.
+    /// Requires the binary to be built with `--features rest`.
+    pub enabled: bool,
+    /// Address to bind the REST API server on.
+    pub addr: String,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            addr: "127.0.0.1:3080".to_string(),
         }
     }
 }

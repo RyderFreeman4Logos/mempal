@@ -63,13 +63,56 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
             .context("failed to prune expired audit logs")?;
     }
 
-    if !context.config.hooks.enabled {
-        eprintln!("hooks not enabled; daemon exiting without starting worker loop");
-        return Ok(());
-    }
-
     install_shutdown_handlers()?;
     tracing::info!("daemon log path: {}", context.log_path.display());
+
+    // Start REST API before the hooks check so the API remains available
+    // even when hooks are disabled.
+    #[cfg(feature = "rest")]
+    let _rest_task: Option<tokio::task::JoinHandle<_>> = if context.config.api.enabled {
+        use crate::api::{ApiState, serve as serve_rest_api};
+        use std::sync::Arc;
+
+        let addr = context.config.api.addr.clone();
+        let db_path_rest = {
+            let db = context.db.lock().await;
+            db.path().to_path_buf()
+        };
+        let config_for_rest = context.config.as_ref().clone();
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                let local_addr = listener
+                    .local_addr()
+                    .context("failed to resolve REST server address")?;
+                tracing::info!("daemon REST listening on http://{local_addr}");
+                eprintln!("daemon REST listening on http://{local_addr}");
+                let factory = crate::embed::ConfiguredEmbedderFactory::new(config_for_rest);
+                let state = ApiState::new(db_path_rest, Arc::new(factory));
+                Some(tokio::spawn(async move {
+                    if let Err(error) = serve_rest_api(listener, state).await {
+                        tracing::error!("daemon REST server error: {error}");
+                    }
+                }))
+            }
+            Err(error) => {
+                tracing::warn!("daemon REST server failed to bind {addr}: {error}");
+                eprintln!("warning: daemon REST server failed to bind {addr}: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if !context.config.hooks.enabled {
+        eprintln!("hooks not enabled; daemon running REST API only (no worker loop)");
+        // Keep the process alive for the REST server.
+        #[cfg(feature = "rest")]
+        if let Some(task) = _rest_task {
+            let _ = task.await;
+        }
+        return Ok(());
+    }
 
     let embedder = DaemonEmbedder::from_config(context.config.as_ref())
         .await
