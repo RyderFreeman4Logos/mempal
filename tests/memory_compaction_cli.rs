@@ -33,6 +33,9 @@ db_path = "{}"
 [embed]
 backend = "model2vec"
 
+[project]
+id = "project-a"
+
 [consolidation]
 similarity_threshold = 0.95
 min_cluster_size = 3
@@ -85,6 +88,26 @@ fn seed_cluster(db_path: &Path) {
         db.insert_drawer_with_project(&drawer, Some("project-a"))
             .expect("insert drawer");
         db.insert_vector_with_project(&drawer.id, &vector, Some("project-a"))
+            .expect("insert vector");
+    }
+}
+
+fn seed_same_cluster_for_project(db_path: &Path, project_id: &str, prefix: &str) {
+    let db = Database::open(db_path).expect("open db");
+    for (suffix, content, vector) in [
+        ("a", "alpha decision", vec![1.0_f32, 0.0, 0.0]),
+        (
+            "b",
+            "beta decision with more detail",
+            vec![0.99_f32, 0.01, 0.0],
+        ),
+        ("c", "gamma decision", vec![0.98_f32, 0.02, 0.0]),
+    ] {
+        let id = format!("{prefix}-{suffix}");
+        let drawer = drawer(&id, content, 1);
+        db.insert_drawer_with_project(&drawer, Some(project_id))
+            .expect("insert drawer");
+        db.insert_vector_with_project(&drawer.id, &vector, Some(project_id))
             .expect("insert vector");
     }
 }
@@ -166,4 +189,67 @@ fn test_consolidate_real_run_updates_status_stats() {
     assert!(stdout.contains("total_compacted_drawers: 2"), "{stdout}");
     assert!(stdout.contains("consolidation_runs: 1"), "{stdout}");
     assert!(!stdout.contains("last_consolidation_at: none"), "{stdout}");
+}
+
+#[test]
+fn test_consolidation_respects_project_boundary() {
+    let env = CompactionEnv::new();
+    seed_same_cluster_for_project(&env.db_path, "project-a", "project-a");
+    seed_same_cluster_for_project(&env.db_path, "project-b", "project-b");
+
+    let output = Command::new(mempal_bin())
+        .arg("consolidate")
+        .arg("--wing")
+        .arg("memory")
+        .arg("--room")
+        .arg("decision")
+        .arg("--threshold")
+        .arg("0.95")
+        .arg("--min-cluster")
+        .arg("3")
+        .env("HOME", &env.home)
+        .current_dir(&env.home)
+        .output()
+        .expect("run mempal consolidate");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.contains("clusters_found: 1"), "{stdout}");
+
+    let db = Database::open(&env.db_path).expect("open db");
+    let project_a_active: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawers WHERE project_id = 'project-a' AND deleted_at IS NULL AND compacted_into IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("project-a active count");
+    let project_a_compacted: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawers WHERE project_id = 'project-a' AND compacted_into IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("project-a compacted count");
+    let project_b_active: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawers WHERE project_id = 'project-b' AND deleted_at IS NULL AND compacted_into IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("project-b active count");
+    let project_b_compacted: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawers WHERE project_id = 'project-b' AND compacted_into IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("project-b compacted count");
+    assert_eq!(project_a_active, 1);
+    assert_eq!(project_a_compacted, 2);
+    assert_eq!(project_b_active, 3);
+    assert_eq!(project_b_compacted, 0);
 }

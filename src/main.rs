@@ -3300,12 +3300,11 @@ fn consolidate_command(
     }
 
     let current_dir = env::current_dir().ok();
-    let project_id = if config.search.strict_project_isolation {
-        resolve_project_id(None, config, current_dir.as_deref())
-            .context("failed to resolve project id for consolidation")?
-    } else {
-        None
-    };
+    let project_id = resolve_project_id(None, config, current_dir.as_deref())
+        .context("failed to resolve project id for consolidation")?;
+    if project_id.is_none() && options.wing.is_none() {
+        bail!("consolidation requires --wing when no project id can be resolved");
+    }
 
     let clusters = find_similar_clusters(
         db.conn(),

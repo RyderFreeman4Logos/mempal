@@ -3359,7 +3359,7 @@ pub fn find_similar_clusters(
     );
     let mut values = vec![SqlValue::Real(1.0 - threshold)];
 
-    for (column, value) in [("wing", wing), ("room", room), ("project_id", project_id)] {
+    for (column, value) in [("wing", wing), ("room", room)] {
         if let Some(value) = value {
             values.push(SqlValue::Text(value.to_string()));
             let placeholder = values.len();
@@ -3367,6 +3367,15 @@ pub fn find_similar_clusters(
                 " AND da.{column} = ?{placeholder} AND db.{column} = ?{placeholder}"
             ));
         }
+    }
+    if let Some(project_id) = project_id {
+        values.push(SqlValue::Text(project_id.to_string()));
+        let placeholder = values.len();
+        sql.push_str(&format!(
+            " AND da.project_id = ?{placeholder} AND db.project_id = ?{placeholder}"
+        ));
+    } else {
+        sql.push_str(" AND da.project_id IS NULL AND db.project_id IS NULL");
     }
 
     let mut statement = conn.prepare(&sql)?;
@@ -5240,6 +5249,39 @@ mod tests {
             ids,
             BTreeSet::from(["project-a-a", "project-a-b", "project-a-c"])
         );
+    }
+
+    #[test]
+    fn test_find_similar_clusters_null_project_filter_excludes_named_projects() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        for project_id in [None, Some("project-a")] {
+            let prefix = project_id.unwrap_or("global");
+            for suffix in ["a", "b", "c"] {
+                let id = format!("{prefix}-{suffix}");
+                insert_test_drawer(&db, &id, &id, project_id);
+                db.insert_vector_with_project(&id, &[1.0_f32, 0.0, 0.0], project_id)
+                    .expect("insert vector");
+            }
+        }
+
+        let clusters = find_similar_clusters(
+            db.conn(),
+            Some("test-wing"),
+            Some("test-room"),
+            None,
+            0.95,
+            3,
+        )
+        .expect("find null-project clusters");
+
+        assert_eq!(clusters.len(), 1);
+        let ids = clusters[0]
+            .iter()
+            .map(|(drawer_id, _)| drawer_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids, BTreeSet::from(["global-a", "global-b", "global-c"]));
     }
 
     #[test]
