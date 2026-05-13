@@ -25,7 +25,9 @@ use crate::core::{
     },
 };
 use crate::embed::{EmbedError, Embedder};
-use crate::ingest::gating::{PrototypeClassifier, evaluate_tier1, evaluate_tier2};
+use crate::ingest::gating::{
+    PrototypeClassifier, evaluate_fact_check_gate, evaluate_tier1, evaluate_tier2,
+};
 use thiserror::Error;
 
 use crate::ingest::{
@@ -55,6 +57,7 @@ pub struct IngestStats {
     pub skipped: usize,
     pub dropped_by_gate: usize,
     pub drawer_ids: Vec<String>,
+    pub fact_check_warnings: Vec<String>,
     pub noise_bytes_stripped: Option<u64>,
     /// Time waited acquiring the per-source ingest lock (P9-B). `None`
     /// when the lock was bypassed (e.g. dry-run) or when no wait was
@@ -391,6 +394,26 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
                         source,
                     })?;
                 if decision.is_rejected() {
+                    stats.dropped_by_gate += 1;
+                    continue;
+                }
+            }
+
+            if wing != "hooks-raw"
+                && let Some(outcome) = evaluate_fact_check_gate(
+                    &drawer_id,
+                    chunk,
+                    db,
+                    options.project_id,
+                    &gating.fact_check,
+                )
+                .map_err(|source| IngestError::InsertDrawer {
+                    drawer_id: drawer_id.clone(),
+                    source,
+                })?
+            {
+                stats.fact_check_warnings.extend(outcome.warnings);
+                if outcome.decision.is_rejected() {
                     stats.dropped_by_gate += 1;
                     continue;
                 }

@@ -886,6 +886,8 @@ pub struct IngestResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lock_wait_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fact_check_warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
 }
 
