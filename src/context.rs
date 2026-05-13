@@ -746,7 +746,7 @@ fn context_anchors(request: &ContextRequest) -> Result<Vec<AnchorCandidate>> {
     anchors.push(AnchorCandidate {
         anchor_kind: AnchorKind::Worktree,
         anchor_id: derived.anchor_id,
-        domain: request.domain.clone(),
+        domain: request.domain,
     });
 
     let repo_anchor_id = derived
@@ -755,7 +755,7 @@ fn context_anchors(request: &ContextRequest) -> Result<Vec<AnchorCandidate>> {
     anchors.push(AnchorCandidate {
         anchor_kind: AnchorKind::Repo,
         anchor_id: repo_anchor_id,
-        domain: request.domain.clone(),
+        domain: request.domain,
     });
 
     // P12 backfilled existing drawers to repo://legacy. Keep it as a fallback
@@ -763,7 +763,7 @@ fn context_anchors(request: &ContextRequest) -> Result<Vec<AnchorCandidate>> {
     anchors.push(AnchorCandidate {
         anchor_kind: AnchorKind::Repo,
         anchor_id: anchor::LEGACY_REPO_ANCHOR_ID.to_string(),
-        domain: request.domain.clone(),
+        domain: request.domain,
     });
 
     anchors.push(AnchorCandidate {
@@ -829,7 +829,7 @@ fn context_item_from_result(db: &Database, result: SearchResult) -> Result<Conte
             .filter(|value| !value.is_empty())
             .unwrap_or(result.content.as_str())
             .to_string(),
-        MemoryKind::Evidence => result.content,
+        MemoryKind::Evidence | MemoryKind::ProfileFact => result.content,
     };
     Ok(ContextItem {
         drawer_id: result.drawer_id,
@@ -865,7 +865,7 @@ fn append_card_context_items(
                 .list_knowledge_cards(&KnowledgeCardFilter {
                     tier: Some(tier.clone()),
                     status: Some(status.clone()),
-                    domain: Some(anchor.domain.clone()),
+                    domain: Some(anchor.domain),
                     field: Some(request.field.clone()),
                     anchor_kind: Some(anchor.anchor_kind.clone()),
                     anchor_id: Some(anchor.anchor_id.clone()),
@@ -943,12 +943,14 @@ fn memory_kind_slug(value: &MemoryKind) -> &'static str {
     match value {
         MemoryKind::Evidence => "evidence",
         MemoryKind::Knowledge => "knowledge",
+        MemoryKind::ProfileFact => "profile_fact",
     }
 }
 
 fn domain_slug(value: &MemoryDomain) -> &'static str {
     match value {
         MemoryDomain::Project => "project",
+        MemoryDomain::User => "user",
         MemoryDomain::Agent => "agent",
         MemoryDomain::Skill => "skill",
         MemoryDomain::Global => "global",
@@ -967,6 +969,8 @@ fn tier_slug(value: &KnowledgeTier) -> &'static str {
 fn status_slug(value: &KnowledgeStatus) -> &'static str {
     match value {
         KnowledgeStatus::Candidate => "candidate",
+        KnowledgeStatus::Active => "active",
+        KnowledgeStatus::Superseded => "superseded",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
         KnowledgeStatus::Demoted => "demoted",

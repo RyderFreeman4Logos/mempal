@@ -193,6 +193,9 @@ fn insert_knowledge_with_refs(
         verification_refs: refs.verification,
         scope_constraints: None,
         trigger_hints: None,
+        is_pinned: false,
+        pin_order: None,
+        supersedes: None,
         effective_importance: 4.0,
         compacted_into: None,
     };
@@ -242,6 +245,9 @@ fn insert_knowledge_with_anchor(
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        is_pinned: false,
+        pin_order: None,
+        supersedes: None,
         effective_importance: 4.0,
         compacted_into: None,
     };

@@ -583,6 +583,8 @@ fn tier_slug(value: &KnowledgeTier) -> &'static str {
 
 fn status_slug(value: &KnowledgeStatus) -> &'static str {
     match value {
+        KnowledgeStatus::Active => "active",
+        KnowledgeStatus::Superseded => "superseded",
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",

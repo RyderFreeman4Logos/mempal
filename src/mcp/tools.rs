@@ -675,6 +675,7 @@ pub struct SearchResultDto {
     pub memory_kind: String,
     pub domain: String,
     pub field: String,
+    pub is_pinned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -783,6 +784,43 @@ pub struct ReadDrawersResponse {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct PinnedFactsRequest {
+    /// Optional explicit project scope. When omitted, mempal resolves the
+    /// current project from MCP roots/config just like search.
+    pub project_id: Option<String>,
+    /// Maximum number of content characters returned across pinned facts.
+    /// Defaults to 4000.
+    pub budget_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PinnedFactsResponse {
+    pub project_id: Option<String>,
+    pub budget_chars: usize,
+    pub used_chars: usize,
+    pub text: String,
+    pub facts: Vec<PinnedFactDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PinnedFactDto {
+    pub drawer_id: String,
+    pub content: String,
+    pub wing: String,
+    pub room: Option<String>,
+    pub source_file: String,
+    pub memory_kind: String,
+    pub domain: String,
+    pub field: String,
+    pub status: Option<String>,
+    pub importance: i32,
+    pub pin_order: Option<i64>,
+    pub supersedes: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct IngestRequest {
     pub content: String,
     pub wing: String,
@@ -819,6 +857,7 @@ pub struct IngestRequest {
     pub memory_kind: Option<String>,
     pub domain: Option<String>,
     pub field: Option<String>,
+    pub is_pinned: Option<bool>,
     pub provenance: Option<String>,
     pub statement: Option<String>,
     pub tier: Option<String>,
@@ -943,6 +982,7 @@ pub struct StatusResponse {
     pub diary_rollup_days: u32,
     pub scopes: Vec<ScopeCount>,
     pub source_type_distribution: Vec<SourceTypeCount>,
+    pub pinned_fact_counts: Vec<PinnedFactProjectCount>,
     pub aaak_spec: String,
     pub memory_protocol: String,
     pub endpoint_health: EndpointHealthDto,
@@ -960,6 +1000,12 @@ pub struct StatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SourceTypeCount {
     pub source_type: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PinnedFactProjectCount {
+    pub project_id: Option<String>,
     pub count: i64,
 }
 
@@ -1384,6 +1430,7 @@ impl SearchResultDto {
             anchor_kind,
             anchor_id,
             parent_anchor_id,
+            is_pinned,
             importance: _,
             similarity,
             route,
@@ -1438,7 +1485,31 @@ impl SearchResultDto {
             anchor_kind: anchor_kind_slug(&anchor_kind).to_string(),
             anchor_id,
             parent_anchor_id,
+            is_pinned,
             matched_pattern_id,
+        }
+    }
+}
+
+impl From<crate::core::types::Drawer> for PinnedFactDto {
+    fn from(value: crate::core::types::Drawer) -> Self {
+        Self {
+            drawer_id: value.id.clone(),
+            content: value.content,
+            wing: value.wing,
+            room: value.room,
+            source_file: value.source_file.unwrap_or(value.id),
+            memory_kind: memory_kind_slug(&value.memory_kind).to_string(),
+            domain: domain_slug(&value.domain).to_string(),
+            field: value.field,
+            status: value
+                .status
+                .as_ref()
+                .map(knowledge_status_slug)
+                .map(str::to_string),
+            importance: value.importance,
+            pin_order: value.pin_order,
+            supersedes: value.supersedes,
         }
     }
 }
@@ -1734,12 +1805,14 @@ fn memory_kind_slug(value: &MemoryKind) -> &'static str {
     match value {
         MemoryKind::Evidence => "evidence",
         MemoryKind::Knowledge => "knowledge",
+        MemoryKind::ProfileFact => "profile_fact",
     }
 }
 
 fn domain_slug(value: &MemoryDomain) -> &'static str {
     match value {
         MemoryDomain::Project => "project",
+        MemoryDomain::User => "user",
         MemoryDomain::Agent => "agent",
         MemoryDomain::Skill => "skill",
         MemoryDomain::Global => "global",
@@ -1757,6 +1830,8 @@ fn knowledge_tier_slug(value: &KnowledgeTier) -> &'static str {
 
 fn knowledge_status_slug(value: &KnowledgeStatus) -> &'static str {
     match value {
+        KnowledgeStatus::Active => "active",
+        KnowledgeStatus::Superseded => "superseded",
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
@@ -1846,6 +1921,7 @@ mod tests {
             anchor_kind: AnchorKind::Repo,
             anchor_id: "repo://signals".to_string(),
             parent_anchor_id: None,
+            is_pinned: false,
             importance: 3,
             similarity: 0.91,
             route: RouteDecision {

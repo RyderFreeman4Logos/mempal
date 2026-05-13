@@ -234,6 +234,7 @@ You have persistent project memory via mempal. Follow these rules in every sessi
 
 TOOLS:
   mempal_status        — current state + this protocol + AAAK format spec
+  mempal_pinned_facts  — pinned/canonical facts for always-on session context, no embedding needed
   mempal_timeline      — project-scoped overview without a query, ordered by importance+recency
   mempal_search        — semantic search with wing/room filters, citation-bearing
   mempal_context       — ordered mind-model runtime context (dao_tian -> dao_ren -> shu -> qi; evidence/cards opt-in)
@@ -532,6 +533,6 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("create temp dir");
         let db_path = tempdir.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
-        assert_eq!(db.schema_version().expect("schema version"), 12);
+        assert_eq!(db.schema_version().expect("schema version"), 13);
     }
 }

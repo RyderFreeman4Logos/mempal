@@ -182,7 +182,7 @@ fn retrieval_anchors(request: &KnowledgeCardRetrievalRequest) -> Result<Vec<Anch
     anchors.push(AnchorCandidate {
         anchor_kind: AnchorKind::Worktree,
         anchor_id: derived.anchor_id,
-        domain: request.domain.clone(),
+        domain: request.domain,
     });
 
     let repo_anchor_id = derived
@@ -191,12 +191,12 @@ fn retrieval_anchors(request: &KnowledgeCardRetrievalRequest) -> Result<Vec<Anch
     anchors.push(AnchorCandidate {
         anchor_kind: AnchorKind::Repo,
         anchor_id: repo_anchor_id,
-        domain: request.domain.clone(),
+        domain: request.domain,
     });
     anchors.push(AnchorCandidate {
         anchor_kind: AnchorKind::Repo,
         anchor_id: anchor::LEGACY_REPO_ANCHOR_ID.to_string(),
-        domain: request.domain.clone(),
+        domain: request.domain,
     });
     anchors.push(AnchorCandidate {
         anchor_kind: AnchorKind::Global,
@@ -251,12 +251,14 @@ fn memory_kind_slug(value: &MemoryKind) -> &'static str {
     match value {
         MemoryKind::Evidence => "evidence",
         MemoryKind::Knowledge => "knowledge",
+        MemoryKind::ProfileFact => "profile_fact",
     }
 }
 
 fn domain_slug(value: &MemoryDomain) -> &'static str {
     match value {
         MemoryDomain::Project => "project",
+        MemoryDomain::User => "user",
         MemoryDomain::Agent => "agent",
         MemoryDomain::Skill => "skill",
         MemoryDomain::Global => "global",

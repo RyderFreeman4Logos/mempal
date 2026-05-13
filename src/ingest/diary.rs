@@ -148,6 +148,9 @@ pub fn commit_prepared_diary_rollup(
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        is_pinned: false,
+        pin_order: None,
+        supersedes: None,
         effective_importance: prepared.importance as f64,
         compacted_into: None,
     };
