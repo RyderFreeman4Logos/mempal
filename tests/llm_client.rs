@@ -116,6 +116,32 @@ async fn test_llm_client_chat_completion_success() {
 }
 
 #[tokio::test]
+async fn test_llm_client_sends_extra_body() {
+    let mut server = Server::new_async().await;
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
+        .match_body(Matcher::PartialJson(serde_json::json!({
+            "model": "local-test-model",
+            "chat_template_kwargs": {
+                "enable_thinking": false
+            }
+        })))
+        .with_status(200)
+        .with_body(success_body("extra"))
+        .create();
+    let config = config_for(
+        &server,
+        r#"extra_body = { chat_template_kwargs = { enable_thinking = false } }"#,
+    );
+    let client = LlmClient::from_config(&config).expect("build client");
+
+    let response = client.chat_completion(&request()).await.expect("chat");
+
+    mock.assert();
+    assert_eq!(response.content, "extra");
+}
+
+#[tokio::test]
 async fn test_llm_client_4xx_not_retryable() {
     let mut server = Server::new_async().await;
     let mock = server

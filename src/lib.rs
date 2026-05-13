@@ -19,6 +19,7 @@ pub mod hotpatch;
 pub mod importance;
 pub mod ingest;
 pub mod integrations;
+pub mod intelligence;
 pub mod knowledge_anchor;
 pub mod knowledge_card_backfill;
 pub mod knowledge_card_lifecycle;

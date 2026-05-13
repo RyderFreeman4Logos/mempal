@@ -76,11 +76,19 @@ async fn probe_embedding(config: &Config) -> ProbeStatus {
 }
 
 async fn probe_llm(config: &Config) -> ProbeStatus {
-    if !config.llm.enabled {
+    let effective_llm = if config.memory_intelligence.mode.uses_llm()
+        && config
+            .memory_intelligence
+            .has_effective_llm_endpoint(&config.llm)
+    {
+        config.memory_intelligence.effective_llm_config(&config.llm)
+    } else {
+        config.llm.clone()
+    };
+    if !effective_llm.enabled {
         return ProbeStatus::unreachable("disabled".to_string());
     }
-    let Some(base_url) = config
-        .llm
+    let Some(base_url) = effective_llm
         .base_url
         .as_deref()
         .filter(|value| !value.trim().is_empty())
@@ -89,8 +97,8 @@ async fn probe_llm(config: &Config) -> ProbeStatus {
     };
     probe_models_endpoint(
         base_url,
-        config.llm.api_key_env.as_deref(),
-        config.llm.api_key.as_deref(),
+        effective_llm.api_key_env.as_deref(),
+        effective_llm.api_key.as_deref(),
     )
     .await
 }

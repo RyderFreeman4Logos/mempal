@@ -6,6 +6,7 @@ use reqwest::StatusCode;
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
@@ -77,6 +78,7 @@ pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    extra_body: Option<Value>,
     semaphore: Arc<Semaphore>,
     current_max: Arc<AtomicUsize>,
 }
@@ -128,6 +130,7 @@ impl LlmClient {
             http,
             base_url,
             model,
+            extra_body: config.extra_body.clone(),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             current_max: Arc::new(AtomicUsize::new(max_concurrent)),
         })
@@ -165,16 +168,30 @@ impl LlmClient {
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
         let endpoint = format!("{}/chat/completions", self.base_url);
         let model = request.model.as_deref().unwrap_or(&self.model);
+        let mut body = serde_json::Map::new();
+        body.insert("model".to_string(), Value::String(model.to_string()));
+        body.insert(
+            "messages".to_string(),
+            serde_json::to_value(&request.messages)
+                .map_err(|error| LlmError::DecodeResponse(error.to_string()))?,
+        );
+        if let Some(temperature) = request.temperature {
+            let temperature = serde_json::Number::from_f64(temperature).ok_or_else(|| {
+                LlmError::DecodeResponse("temperature must be finite".to_string())
+            })?;
+            body.insert("temperature".to_string(), Value::Number(temperature));
+        }
+        if let Some(max_tokens) = request.max_tokens {
+            body.insert(
+                "max_tokens".to_string(),
+                Value::Number(serde_json::Number::from(max_tokens)),
+            );
+        }
+        merge_extra_body(&mut body, self.extra_body.as_ref())?;
         let response = self
             .http
             .post(&endpoint)
-            .json(&OpenAiChatRequest {
-                model,
-                messages: &request.messages,
-                temperature: request.temperature,
-                max_tokens: request.max_tokens,
-                chat_template_kwargs: None,
-            })
+            .json(&Value::Object(body))
             .send()
             .await
             .map_err(map_reqwest_error)?;
@@ -215,6 +232,30 @@ impl LlmClient {
             model: response.model,
         })
     }
+}
+
+fn merge_extra_body(
+    body: &mut serde_json::Map<String, Value>,
+    extra_body: Option<&Value>,
+) -> Result<(), LlmError> {
+    let Some(extra_body) = extra_body else {
+        return Ok(());
+    };
+    let Value::Object(extra) = extra_body else {
+        return Err(LlmError::MissingConfiguration(
+            "llm.extra_body must be a JSON object".to_string(),
+        ));
+    };
+    for (key, value) in extra {
+        if matches!(
+            key.as_str(),
+            "model" | "messages" | "temperature" | "max_tokens"
+        ) {
+            continue;
+        }
+        body.insert(key.clone(), value.clone());
+    }
+    Ok(())
 }
 
 fn resolve_api_key(
@@ -286,23 +327,6 @@ fn map_decode_error(source: reqwest::Error) -> LlmError {
     } else {
         LlmError::DecodeResponse(source.to_string())
     }
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiChatRequest<'a> {
-    model: &'a str,
-    messages: &'a [LlmMessage],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    chat_template_kwargs: Option<ChatTemplateKwargs>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ChatTemplateKwargs {
-    enable_thinking: bool,
 }
 
 #[derive(Debug, Deserialize)]

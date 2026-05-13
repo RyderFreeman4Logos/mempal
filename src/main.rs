@@ -274,6 +274,10 @@ enum Commands {
         #[arg(long)]
         trigger: Option<String>,
     },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     Project {
         #[command(subcommand)]
         command: ProjectCommands,
@@ -588,6 +592,12 @@ enum DaemonSubcommand {
     Restart,
     /// Show daemon status, PID, and queue stats.
     Status,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Show current memory intelligence mode and effective LLM settings.
+    Intelligence,
 }
 
 #[derive(Subcommand)]
@@ -1149,6 +1159,11 @@ fn run() -> Result<()> {
                 .unwrap_or_else(|| PathBuf::from("."));
             return mempal::hotpatch::run_command(&config, &mempal_home, command.clone());
         }
+        Commands::Config { command } => {
+            let config = Config::load_from(&config_path)
+                .with_context(|| format!("failed to load config {}", config_path.display()))?;
+            return config_command(&config, command);
+        }
         Commands::Daemon {
             command,
             foreground,
@@ -1329,6 +1344,7 @@ fn run() -> Result<()> {
             },
         )),
         Commands::Project { command } => project_command(&db, command),
+        Commands::Config { .. } => unreachable!(),
         Commands::Delete { drawer_id } => delete_command(&db, &drawer_id),
         Commands::Rollback {
             since,
@@ -5419,6 +5435,48 @@ fn fact_check_command(
     Ok(())
 }
 
+fn config_command(config: &Config, command: &ConfigCommands) -> Result<()> {
+    match command {
+        ConfigCommands::Intelligence => config_intelligence_command(config),
+    }
+}
+
+fn config_intelligence_command(config: &Config) -> Result<()> {
+    let effective_llm = config.memory_intelligence.effective_llm_config(&config.llm);
+    let llm_state = if !config.memory_intelligence.mode.uses_llm() {
+        "disabled"
+    } else if config
+        .memory_intelligence
+        .has_effective_llm_endpoint(&config.llm)
+    {
+        "healthy"
+    } else {
+        "disabled"
+    };
+    println!("memory_intelligence:");
+    println!("  mode: {}", config.memory_intelligence.mode);
+    println!("  llm_state: {llm_state}");
+    println!("  llm_backend: {}", effective_llm.backend);
+    match effective_llm.model.as_deref() {
+        Some(model) => println!("  llm_model: {model}"),
+        None => println!("  llm_model: none"),
+    }
+    match effective_llm.base_url.as_deref() {
+        Some(base_url) => println!("  llm_base_url: {base_url}"),
+        None => println!("  llm_base_url: none"),
+    }
+    println!("  timeout_secs: {}", effective_llm.request_timeout_secs);
+    println!(
+        "  extra_body: {}",
+        if effective_llm.extra_body.is_some() {
+            "configured"
+        } else {
+            "none"
+        }
+    );
+    Ok(())
+}
+
 fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     let cfg_meta = ConfigHandle::snapshot_meta();
     let scrub_stats = ConfigHandle::scrub_stats();
@@ -5432,6 +5490,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         None
     };
     let embed_status = global_embed_status().snapshot();
+    let intelligence_status = mempal::intelligence::global_intelligence_status().snapshot();
     let queue_stats = mempal::core::queue::queue_stats_readonly(db.path())
         .context("failed to query pending message stats")?;
     let schema_version = db
@@ -5658,6 +5717,30 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         println!("  max_concurrent: {}", config.llm.max_concurrent);
         let llm_pending = queue_stats.pending;
         println!("  queue_pending: {llm_pending}");
+    }
+    println!("Intelligence:");
+    println!("  mode: {}", config.memory_intelligence.mode);
+    let intelligence_llm_state = if !config.memory_intelligence.mode.uses_llm() {
+        "disabled"
+    } else if config
+        .memory_intelligence
+        .has_effective_llm_endpoint(&config.llm)
+    {
+        match &endpoint_health {
+            Some(health) if !health.llm.reachable => "degraded",
+            _ => "healthy",
+        }
+    } else {
+        "disabled"
+    };
+    println!("  llm_state: {intelligence_llm_state}");
+    match intelligence_status.last_success_at_unix_ms {
+        Some(last_success) => println!("  last_success_at_unix_ms: {last_success}"),
+        None => println!("  last_success_at_unix_ms: none"),
+    }
+    println!("  failure_count: {}", intelligence_status.failure_count);
+    if let Some(last_error) = intelligence_status.last_error.as_deref() {
+        println!("  last_error: {last_error}");
     }
     if !runtime_warnings.is_empty() {
         println!("Warnings:");

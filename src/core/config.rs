@@ -1,12 +1,16 @@
 use std::env;
 use std::fs;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use regex::Regex;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::types::IntelligenceMode;
 
 const DEFAULT_DB_PATH: &str = "~/.mempal/palace.db";
 const DEFAULT_EMBED_BACKEND: &str = "openai_compat";
@@ -22,6 +26,7 @@ const DEFAULT_LLM_BACKEND: &str = "openai_compat";
 const DEFAULT_LLM_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_LLM_RETRY_INTERVAL_SECS: u64 = 2;
 const DEFAULT_LLM_MAX_CONCURRENT: usize = 16;
+const DEFAULT_MEMORY_INTELLIGENCE_TIMEOUT_SECS: u64 = 1800;
 const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 5;
 const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
 const DEFAULT_SEARCH_TUNNEL_FANOUT_CAP: usize = 5;
@@ -83,6 +88,7 @@ pub struct Config {
     #[serde(alias = "embedder")]
     pub embed: EmbedConfig,
     pub llm: LlmConfig,
+    pub memory_intelligence: MemoryIntelligenceConfig,
     pub chunker: ChunkerConfig,
     pub project: ProjectConfig,
     pub privacy: PrivacyConfig,
@@ -110,6 +116,7 @@ impl Default for Config {
             db_path: DEFAULT_DB_PATH.to_string(),
             embed: EmbedConfig::default(),
             llm: LlmConfig::default(),
+            memory_intelligence: MemoryIntelligenceConfig::default(),
             chunker: ChunkerConfig::default(),
             project: ProjectConfig::default(),
             privacy: PrivacyConfig::default(),
@@ -204,6 +211,14 @@ impl Config {
             return Err(ConfigError::Validation(
                 "llm.base_url must be set when llm.enabled is true".to_string(),
             ));
+        }
+        if self.memory_intelligence.llm.timeout_secs == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "memory_intelligence.llm.timeout_secs must be greater than 0".to_string(),
+            ));
+        }
+        for warning in self.llm_base_url_locality_warnings() {
+            tracing::warn!(source = warning.source, "{}", warning.message);
         }
         if self.search.preview_chars == 0 {
             return Err(ConfigError::InvalidConfig(
@@ -452,6 +467,9 @@ impl Config {
         if self.llm.api_key_env != other.llm.api_key_env {
             fields.push("llm.api_key_env");
         }
+        if self.llm.extra_body != other.llm.extra_body {
+            fields.push("llm.extra_body");
+        }
         if self.daemon.log_path != other.daemon.log_path {
             fields.push("daemon.log_path");
         }
@@ -474,6 +492,7 @@ impl Config {
         // llm.model is hot-reloadable — don't pin it
         effective.llm.api_key = self.llm.api_key.clone();
         effective.llm.api_key_env = self.llm.api_key_env.clone();
+        effective.llm.extra_body = self.llm.extra_body.clone();
         effective.daemon.log_path = self.daemon.log_path.clone();
         effective.mcp.log_path = self.mcp.log_path.clone();
         effective
@@ -502,8 +521,61 @@ impl Config {
                 message: "hooks capture is enabled while tier-2 gating is fail-open on embedder errors; review warnings before trusting passive captures.".to_string(),
             });
         }
+        warnings.extend(self.llm_base_url_locality_warnings());
         warnings
     }
+
+    fn llm_base_url_locality_warnings(&self) -> Vec<RuntimeWarning> {
+        [
+            ("llm.base_url", self.llm.base_url.as_deref()),
+            (
+                "memory_intelligence.llm.base_url",
+                self.memory_intelligence.llm.base_url.as_deref(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(setting, base_url)| {
+            let base_url = base_url?.trim();
+            if base_url.is_empty() || llm_base_url_is_local_or_lan(base_url) {
+                return None;
+            }
+            let host = llm_base_url_host(base_url)
+                .map(|host| format!(" host `{host}`"))
+                .unwrap_or_default();
+            Some(RuntimeWarning {
+                level: "warn",
+                source: "llm",
+                message: format!(
+                    "{setting}{host} appears outside localhost/LAN; mempal assumes user-configured LLM endpoints are local or private network and does not block operation"
+                ),
+            })
+        })
+        .collect()
+    }
+}
+
+fn llm_base_url_is_local_or_lan(base_url: &str) -> bool {
+    let Some(host) = llm_base_url_host(base_url) else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") || !host.contains('.') {
+        return true;
+    }
+    if let Ok(addr) = host.parse::<Ipv4Addr>() {
+        let octets = addr.octets();
+        return octets[0] == 10
+            || octets[0] == 127
+            || (octets[0] == 192 && octets[1] == 168)
+            || (octets[0] == 172 && (16..=31).contains(&octets[1]));
+    }
+    host.parse::<Ipv6Addr>()
+        .is_ok_and(|addr| addr.is_loopback() || addr.is_unique_local())
+}
+
+fn llm_base_url_host(base_url: &str) -> Option<String> {
+    Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
 }
 
 pub(crate) fn scrub_sensitive_text(input: &str) -> String {
@@ -705,7 +777,7 @@ impl EmbedConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LlmConfig {
     pub enabled: bool,
@@ -714,6 +786,8 @@ pub struct LlmConfig {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
+    pub extra_body: Option<serde_json::Value>,
+    #[serde(alias = "timeout_secs")]
     pub request_timeout_secs: u64,
     pub retry_interval_secs: u64,
     pub max_concurrent: usize,
@@ -729,10 +803,91 @@ impl Default for LlmConfig {
             model: None,
             api_key: None,
             api_key_env: None,
+            extra_body: None,
             request_timeout_secs: DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
             retry_interval_secs: DEFAULT_LLM_RETRY_INTERVAL_SECS,
             max_concurrent: DEFAULT_LLM_MAX_CONCURRENT,
             enabled_for: vec!["gating".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MemoryIntelligenceConfig {
+    pub mode: IntelligenceMode,
+    pub llm: MemoryIntelligenceLlmConfig,
+}
+
+impl Default for MemoryIntelligenceConfig {
+    fn default() -> Self {
+        Self {
+            mode: IntelligenceMode::Deterministic,
+            llm: MemoryIntelligenceLlmConfig::default(),
+        }
+    }
+}
+
+impl MemoryIntelligenceConfig {
+    pub fn effective_llm_config(&self, base: &LlmConfig) -> LlmConfig {
+        let mut config = base.clone();
+        config.enabled = self.mode.uses_llm();
+        if self.llm.base_url.is_some() {
+            config.base_url = self.llm.base_url.clone();
+        }
+        if self.llm.model.is_some() {
+            config.model = self.llm.model.clone();
+        }
+        if self.llm.api_key.is_some() {
+            config.api_key = self.llm.api_key.clone();
+        }
+        if self.llm.api_key_env.is_some() {
+            config.api_key_env = self.llm.api_key_env.clone();
+        }
+        if self.llm.extra_body.is_some() {
+            config.extra_body = self.llm.extra_body.clone();
+        }
+        config.request_timeout_secs = self.llm.timeout_secs;
+        config
+    }
+
+    pub fn has_effective_llm_endpoint(&self, base: &LlmConfig) -> bool {
+        self.mode.uses_llm()
+            && self
+                .llm
+                .base_url
+                .as_deref()
+                .or(base.base_url.as_deref())
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .llm
+                .model
+                .as_deref()
+                .or(base.model.as_deref())
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MemoryIntelligenceLlmConfig {
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
+    pub timeout_secs: u64,
+    pub extra_body: Option<serde_json::Value>,
+}
+
+impl Default for MemoryIntelligenceLlmConfig {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            model: None,
+            api_key: None,
+            api_key_env: None,
+            timeout_secs: DEFAULT_MEMORY_INTELLIGENCE_TIMEOUT_SECS,
+            extra_body: None,
         }
     }
 }
