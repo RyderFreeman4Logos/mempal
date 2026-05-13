@@ -164,6 +164,7 @@ pub fn prepare_distill(db: &Database, request: DistillRequest) -> Result<Distill
         scope_constraints,
         trigger_hints,
         effective_importance: request.importance as f64,
+        compacted_into: None,
     };
 
     Ok(DistillPlan::Create(Box::new(PreparedDistill {

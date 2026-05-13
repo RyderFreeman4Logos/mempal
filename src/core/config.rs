@@ -70,6 +70,10 @@ const DEFAULT_SKILLS_ACTIVE_THRESHOLD: i64 = 3;
 const DEFAULT_SKILLS_RETIRE_THRESHOLD: i64 = 3;
 const DEFAULT_SKILLS_MIN_SESSIONS: usize = 5;
 const DEFAULT_SKILLS_SURFACING_THRESHOLD: f64 = 0.70;
+const DEFAULT_CONSOLIDATION_SIMILARITY_THRESHOLD: f64 = 0.85;
+const DEFAULT_CONSOLIDATION_MIN_CLUSTER_SIZE: usize = 3;
+const DEFAULT_CONSOLIDATION_MAX_CLUSTERS_PER_RUN: usize = 100;
+const DEFAULT_CONSOLIDATION_STRATEGY: &str = "richest_content";
 static DEFAULT_SENSITIVE_SCRUBBER: OnceLock<Option<CompiledPrivacyConfig>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -97,6 +101,7 @@ pub struct Config {
     pub context: ContextConfig,
     pub repair: RepairConfig,
     pub skills: SkillsConfig,
+    pub consolidation: ConsolidationConfig,
 }
 
 impl Default for Config {
@@ -122,6 +127,7 @@ impl Default for Config {
             context: ContextConfig::default(),
             repair: RepairConfig::default(),
             skills: SkillsConfig::default(),
+            consolidation: ConsolidationConfig::default(),
         }
     }
 }
@@ -267,6 +273,32 @@ impl Config {
             return Err(ConfigError::InvalidConfig(
                 "hooks.session_end.trailing_messages must be greater than 0".to_string(),
             ));
+        }
+        if !self.consolidation.similarity_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.consolidation.similarity_threshold)
+        {
+            return Err(ConfigError::InvalidConfig(
+                "consolidation.similarity_threshold must be a finite value in 0.0..=1.0"
+                    .to_string(),
+            ));
+        }
+        if self.consolidation.min_cluster_size < 2 {
+            return Err(ConfigError::InvalidConfig(
+                "consolidation.min_cluster_size must be at least 2".to_string(),
+            ));
+        }
+        if self.consolidation.max_clusters_per_run == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "consolidation.max_clusters_per_run must be greater than 0".to_string(),
+            ));
+        }
+        match self.consolidation.strategy.as_str() {
+            "richest_content" | "llm_summary" => {}
+            other => {
+                return Err(ConfigError::InvalidConfig(format!(
+                    "unsupported consolidation.strategy: {other}"
+                )));
+            }
         }
         if let Some(path) = self
             .embed
@@ -1528,6 +1560,26 @@ impl Default for SkillsConfig {
             retire_threshold: DEFAULT_SKILLS_RETIRE_THRESHOLD,
             skill_min_sessions: DEFAULT_SKILLS_MIN_SESSIONS,
             skill_surfacing_threshold: DEFAULT_SKILLS_SURFACING_THRESHOLD,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ConsolidationConfig {
+    pub similarity_threshold: f64,
+    pub min_cluster_size: usize,
+    pub max_clusters_per_run: usize,
+    pub strategy: String,
+}
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            similarity_threshold: DEFAULT_CONSOLIDATION_SIMILARITY_THRESHOLD,
+            min_cluster_size: DEFAULT_CONSOLIDATION_MIN_CLUSTER_SIZE,
+            max_clusters_per_run: DEFAULT_CONSOLIDATION_MAX_CLUSTERS_PER_RUN,
+            strategy: DEFAULT_CONSOLIDATION_STRATEGY.to_string(),
         }
     }
 }

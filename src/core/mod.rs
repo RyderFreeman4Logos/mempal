@@ -1,6 +1,7 @@
 #![warn(clippy::all)]
 
 pub mod anchor;
+pub mod compaction;
 pub mod config;
 pub mod db;
 pub mod decay;

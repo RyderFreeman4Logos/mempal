@@ -160,6 +160,7 @@ fn knowledge_drawer(
         scope_constraints: None,
         trigger_hints: None,
         effective_importance: 3.0,
+        compacted_into: None,
     }
 }
 
@@ -193,6 +194,7 @@ fn evidence_drawer(id: &str, content: &str) -> Drawer {
         scope_constraints: None,
         trigger_hints: None,
         effective_importance: 2.0,
+        compacted_into: None,
     }
 }
 
@@ -988,10 +990,10 @@ async fn test_context_assembler_returns_typed_pack() {
 #[test]
 fn test_context_assembler_does_not_bump_schema() {
     let (tmp, db) = setup_cli_home();
-    assert_eq!(db.schema_version().expect("schema"), 11);
+    assert_eq!(db.schema_version().expect("schema"), 12);
     let before_tables = table_names(&db);
     let _ = run_context_plain(tmp.path(), "debug", &[]);
-    assert_eq!(db.schema_version().expect("schema"), 11);
+    assert_eq!(db.schema_version().expect("schema"), 12);
     assert_eq!(table_names(&db), before_tables);
 }
 

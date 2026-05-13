@@ -528,10 +528,10 @@ mod tests {
     }
 
     #[test]
-    fn protocol_schema_version_matches_temporal_validity_windows() {
+    fn protocol_schema_version_matches_compaction_schema() {
         let tempdir = tempfile::tempdir().expect("create temp dir");
         let db_path = tempdir.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
-        assert_eq!(db.schema_version().expect("schema version"), 11);
+        assert_eq!(db.schema_version().expect("schema version"), 12);
     }
 }

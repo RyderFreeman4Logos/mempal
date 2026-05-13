@@ -149,6 +149,7 @@ pub fn commit_prepared_diary_rollup(
         scope_constraints: None,
         trigger_hints: None,
         effective_importance: prepared.importance as f64,
+        compacted_into: None,
     };
 
     db.upsert_drawer_and_replace_vector(&drawer, vector)

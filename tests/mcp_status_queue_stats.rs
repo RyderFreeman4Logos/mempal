@@ -10,10 +10,11 @@ use std::{collections::HashMap, net::SocketAddr, time::Duration};
 use axum::{Json, Router, routing::get};
 #[cfg(feature = "integration")]
 use common::harness::McpStdio;
+use mempal::core::compaction::merge_cluster;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
 use mempal::core::queue::{PendingMessageStore, QueueConfig};
-use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
+use mempal::core::types::{BootstrapEvidenceArgs, CompactionStrategy, Drawer, SourceType};
 use mempal::mcp::MempalMcpServer;
 #[cfg(feature = "integration")]
 use serde_json::{Value, json};
@@ -164,6 +165,36 @@ async fn test_mcp_status_surfaces_source_type_distribution() {
         .map(|entry| entry.count);
     assert_eq!(user_count, Some(1));
     assert_eq!(system_count, Some(1));
+}
+
+#[tokio::test]
+async fn test_mcp_status_surfaces_consolidation_stats() {
+    let (_tmp, db_path, config) = setup_env();
+    let db = Database::open(&db_path).expect("open db");
+    let mut ids = Vec::new();
+    for id in ["compact-a", "compact-b", "compact-c"] {
+        let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: id.to_string(),
+            content: format!("compaction fixture {id}"),
+            wing: "mempal".to_string(),
+            room: Some("status".to_string()),
+            source_file: Some(format!("{id}.md")),
+            source_type: SourceType::AgentInference,
+            added_at: "1700000000".to_string(),
+            chunk_index: Some(0),
+            importance: if id == "compact-a" { 5 } else { 1 },
+        });
+        db.insert_drawer(&drawer).expect("insert drawer");
+        ids.push(id.to_string());
+    }
+    merge_cluster(&db, &ids, CompactionStrategy::RichestContent, false).expect("merge cluster");
+
+    let server = MempalMcpServer::new(db_path, config);
+    let response = server.mempal_status().await.expect("status").0;
+
+    assert_eq!(response.total_compacted_drawers, 2);
+    assert_eq!(response.consolidation_runs, 1);
+    assert!(response.last_consolidation_at.is_some());
 }
 
 #[cfg(feature = "integration")]

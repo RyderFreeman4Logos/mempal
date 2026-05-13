@@ -109,6 +109,7 @@ fn evidence_drawer(id: &str, content: &str) -> Drawer {
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        compacted_into: None,
     }
 }
 

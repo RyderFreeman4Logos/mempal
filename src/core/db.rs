@@ -23,12 +23,13 @@ use thiserror::Error;
 use super::anchor;
 use super::{
     types::{
-        AnchorKind, ChunkNeighbors, Drawer, DrawerDetails, DrawerSummary, ExplicitTunnel,
-        KnowledgeCard, KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType,
-        KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain,
-        MemoryKind, NeighborChunk, Provenance, ReindexSource, RuntimeAdoptionEvent,
-        RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack, SourceType,
-        TaxonomyEntry, Triple, TripleStats, TunnelDrawer, TunnelEndpoint, TunnelFollowResult,
+        AnchorKind, ChunkNeighbors, CompactionStrategy, ConsolidationStats, Drawer, DrawerDetails,
+        DrawerSummary, ExplicitTunnel, KnowledgeCard, KnowledgeCardEvent, KnowledgeCardFilter,
+        KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus,
+        KnowledgeTier, MemoryDomain, MemoryKind, NeighborChunk, Provenance, ReindexSource,
+        RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack,
+        SourceType, TaxonomyEntry, Triple, TripleStats, TunnelDrawer, TunnelEndpoint,
+        TunnelFollowResult,
     },
     utils::{
         build_drawer_id, build_scoped_drawer_id, build_tunnel_id, current_timestamp,
@@ -38,7 +39,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 11;
+const CURRENT_SCHEMA_VERSION: u32 = 12;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -85,7 +86,8 @@ const DRAWER_SELECT_COLUMNS: &str = r#"
     verification_refs,
     scope_constraints,
     trigger_hints,
-    COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) as effective_importance
+    COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) as effective_importance,
+    compacted_into
 "#;
 
 const V1_SCHEMA_SQL: &str = r#"
@@ -192,6 +194,12 @@ pub enum DbError {
     ReplacementTextNotFound,
     #[error("multiple matching active facts found for replace_text; candidates: {candidate_ids:?}")]
     ReplacementTextAmbiguous { candidate_ids: Vec<String> },
+    #[error("compaction cluster is empty")]
+    CompactionClusterEmpty,
+    #[error("compaction drawer {drawer_id} was not found, inactive, or already compacted")]
+    CompactionDrawerNotFound { drawer_id: String },
+    #[error("LLM compaction not yet implemented")]
+    LlmCompactionNotImplemented,
 }
 
 pub struct Database {
@@ -1338,12 +1346,7 @@ impl Database {
     }
 
     fn table_exists(&self, table_name: &str) -> Result<bool, DbError> {
-        let exists = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1)",
-            [table_name],
-            |row| row.get::<_, i64>(0),
-        )?;
-        Ok(exists == 1)
+        table_exists_conn(&self.conn, table_name)
     }
 
     pub fn taxonomy_count(&self) -> Result<i64, DbError> {
@@ -1405,11 +1408,11 @@ impl Database {
         ))?;
         let mut rows = statement.query_map([drawer_id], |row| {
             let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-            // DRAWER_SELECT_COLUMNS has 28 columns (indices 0-27), so
-            // the extra columns appended here start at index 28.
-            let updated_at = row.get::<_, Option<String>>(28)?;
-            let merge_count = row.get::<_, u32>(29)?;
-            let project_id = row.get::<_, Option<String>>(30)?;
+            // DRAWER_SELECT_COLUMNS has 29 columns (indices 0-28), so
+            // the extra columns appended here start at index 29.
+            let updated_at = row.get::<_, Option<String>>(29)?;
+            let merge_count = row.get::<_, u32>(30)?;
+            let project_id = row.get::<_, Option<String>>(31)?;
             Ok(DrawerDetails {
                 drawer,
                 updated_at,
@@ -1461,10 +1464,10 @@ impl Database {
             let mut statement = self.conn.prepare(&sql)?;
             let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
                 let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-                // DRAWER_SELECT_COLUMNS is 28 columns (0-27); extra columns start at 28.
-                let updated_at = row.get::<_, Option<String>>(28)?;
-                let merge_count = row.get::<_, u32>(29)?;
-                let project_id = row.get::<_, Option<String>>(30)?;
+                // DRAWER_SELECT_COLUMNS is 29 columns (0-28); extra columns start at 29.
+                let updated_at = row.get::<_, Option<String>>(29)?;
+                let merge_count = row.get::<_, u32>(30)?;
+                let project_id = row.get::<_, Option<String>>(31)?;
                 Ok((
                     drawer.id.clone(),
                     DrawerDetails {
@@ -1486,6 +1489,161 @@ impl Database {
             .into_iter()
             .filter_map(|drawer_id| found_by_id.remove(&drawer_id))
             .collect())
+    }
+
+    pub(crate) fn apply_compaction(
+        &self,
+        target_id: &str,
+        source_ids: &[String],
+        merged_content: &str,
+        strategy: CompactionStrategy,
+    ) -> Result<(), DbError> {
+        if source_ids.is_empty() {
+            return Err(DbError::CompactionClusterEmpty);
+        }
+
+        let source_drawer_ids_json = serde_json::to_string(source_ids)?;
+        let timestamp = current_timestamp();
+        let unique_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let log_seed = format!("{target_id}:{timestamp}:{unique_nanos}:{source_drawer_ids_json}");
+        let log_digest = blake3::hash(log_seed.as_bytes()).to_hex().to_string();
+        let log_id = format!("consolidation_{}", &log_digest[..16]);
+        let content_hash = content_hash_hex(merged_content);
+
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), DbError> {
+            let (target_rowid, old_content, wing, room, project_id) = self
+                .conn
+                .query_row(
+                    r#"
+                    SELECT rowid, content, wing, room, project_id
+                    FROM drawers
+                    WHERE id = ?1
+                      AND deleted_at IS NULL
+                      AND compacted_into IS NULL
+                    "#,
+                    [target_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| DbError::CompactionDrawerNotFound {
+                    drawer_id: target_id.to_string(),
+                })?;
+
+            let fts_exists = self.table_exists("drawers_fts")?;
+            if fts_exists {
+                self.conn.execute(
+                    "INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', ?1, ?2)",
+                    params![target_rowid, old_content],
+                )?;
+            }
+
+            let updated = self.conn.execute(
+                r#"
+                UPDATE drawers
+                SET content = ?2,
+                    content_hash = ?3,
+                    updated_at = ?4,
+                    merge_count = COALESCE(merge_count, 0) + ?5
+                WHERE id = ?1
+                  AND deleted_at IS NULL
+                  AND compacted_into IS NULL
+                "#,
+                params![
+                    target_id,
+                    merged_content,
+                    content_hash,
+                    timestamp,
+                    i64::try_from(source_ids.len().saturating_sub(1)).unwrap_or(i64::MAX),
+                ],
+            )?;
+            if updated != 1 {
+                return Err(DbError::CompactionDrawerNotFound {
+                    drawer_id: target_id.to_string(),
+                });
+            }
+
+            if fts_exists {
+                self.conn.execute(
+                    "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
+                    params![target_rowid, merged_content],
+                )?;
+            }
+
+            for source_id in source_ids
+                .iter()
+                .filter(|source_id| source_id.as_str() != target_id)
+            {
+                let affected = self.conn.execute(
+                    r#"
+                    UPDATE drawers
+                    SET deleted_at = ?2,
+                        valid_until = ?2,
+                        compacted_into = ?3
+                    WHERE id = ?1
+                      AND deleted_at IS NULL
+                      AND compacted_into IS NULL
+                    "#,
+                    params![source_id, timestamp, target_id],
+                )?;
+                if affected != 1 {
+                    return Err(DbError::CompactionDrawerNotFound {
+                        drawer_id: source_id.clone(),
+                    });
+                }
+            }
+
+            self.conn.execute(
+                r#"
+                INSERT INTO consolidation_log (
+                    id,
+                    wing,
+                    room,
+                    project_id,
+                    cluster_size,
+                    strategy,
+                    target_drawer_id,
+                    source_drawer_ids,
+                    dry_run
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+                "#,
+                params![
+                    log_id,
+                    wing,
+                    room,
+                    project_id,
+                    i64::try_from(source_ids.len()).unwrap_or(i64::MAX),
+                    strategy.as_str(),
+                    target_id,
+                    source_drawer_ids_json,
+                ],
+            )?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn drawer_project_id(&self, drawer_id: &str) -> Result<Option<String>, DbError> {
@@ -2278,6 +2436,29 @@ impl Database {
         )?)
     }
 
+    pub fn consolidation_stats(&self) -> Result<ConsolidationStats, DbError> {
+        let total_compacted_drawers = self.conn.query_row(
+            "SELECT COUNT(*) FROM drawers WHERE compacted_into IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        let (consolidation_runs, last_consolidation_at) = self.conn.query_row(
+            "SELECT COUNT(*), MAX(created_at) FROM consolidation_log",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )?;
+        Ok(ConsolidationStats {
+            total_compacted_drawers,
+            consolidation_runs,
+            last_consolidation_at,
+        })
+    }
+
     // --- FTS5 BM25 search ---
 
     pub fn search_fts(
@@ -2370,8 +2551,8 @@ impl Database {
                 rusqlite::params![room, exclude_drawer_id, current_project_id, sql_limit],
                 |row| {
                     let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-                    // DRAWER_SELECT_COLUMNS is 28 columns (0-27); project_id appended at 28.
-                    let project_id = row.get::<_, Option<String>>(28)?;
+                    // DRAWER_SELECT_COLUMNS is 29 columns (0-28); project_id appended at 29.
+                    let project_id = row.get::<_, Option<String>>(29)?;
                     Ok(TunnelDrawer {
                         drawer,
                         target_project_id: project_id,
@@ -3138,6 +3319,194 @@ impl Database {
     }
 }
 
+pub fn find_similar_clusters(
+    conn: &Connection,
+    wing: Option<&str>,
+    room: Option<&str>,
+    project_id: Option<&str>,
+    threshold: f64,
+    min_cluster_size: usize,
+) -> Result<Vec<Vec<(String, f64)>>, DbError> {
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return Err(DbError::InvalidDrawerMetadata(
+            "compaction threshold must be finite and between 0.0 and 1.0".to_string(),
+        ));
+    }
+    if min_cluster_size < 2 {
+        return Err(DbError::InvalidDrawerMetadata(
+            "minimum compaction cluster size must be at least 2".to_string(),
+        ));
+    }
+    if !table_exists_conn(conn, "drawer_vectors")? {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = String::from(
+        r#"
+        SELECT da.id,
+               db.id,
+               CAST(1.0 - vec_distance_cosine(va.embedding, vb.embedding) AS REAL) AS similarity
+        FROM drawer_vectors va
+        JOIN drawer_vectors vb ON va.id < vb.id
+        JOIN drawers da ON da.id = va.id
+        JOIN drawers db ON db.id = vb.id
+        WHERE da.deleted_at IS NULL
+          AND db.deleted_at IS NULL
+          AND da.compacted_into IS NULL
+          AND db.compacted_into IS NULL
+          AND vec_distance_cosine(va.embedding, vb.embedding) < ?1
+        "#,
+    );
+    let mut values = vec![SqlValue::Real(1.0 - threshold)];
+
+    for (column, value) in [("wing", wing), ("room", room)] {
+        if let Some(value) = value {
+            values.push(SqlValue::Text(value.to_string()));
+            let placeholder = values.len();
+            sql.push_str(&format!(
+                " AND da.{column} = ?{placeholder} AND db.{column} = ?{placeholder}"
+            ));
+        }
+    }
+    if let Some(project_id) = project_id {
+        values.push(SqlValue::Text(project_id.to_string()));
+        let placeholder = values.len();
+        sql.push_str(&format!(
+            " AND da.project_id = ?{placeholder} AND db.project_id = ?{placeholder}"
+        ));
+    } else {
+        sql.push_str(" AND da.project_id IS NULL AND db.project_id IS NULL");
+    }
+
+    let mut statement = conn.prepare(&sql)?;
+    let pairs = statement
+        .query_map(params_from_iter(values.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut union_find = UnionFind::default();
+    let mut similarity_totals: HashMap<String, (f64, usize)> = HashMap::new();
+    for (left_id, right_id, similarity) in pairs {
+        if similarity <= threshold {
+            continue;
+        }
+        union_find.union(&left_id, &right_id);
+        let left_total = similarity_totals.entry(left_id).or_insert((0.0, 0));
+        left_total.0 += similarity;
+        left_total.1 += 1;
+        let right_total = similarity_totals.entry(right_id).or_insert((0.0, 0));
+        right_total.0 += similarity;
+        right_total.1 += 1;
+    }
+
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    for drawer_id in similarity_totals.keys().cloned().collect::<Vec<_>>() {
+        let root = union_find.find(&drawer_id);
+        grouped.entry(root).or_default().push(drawer_id);
+    }
+
+    let mut clusters = grouped
+        .into_values()
+        .filter(|component| component.len() >= min_cluster_size)
+        .map(|mut component| {
+            component.sort();
+            let mut cluster = component
+                .into_iter()
+                .map(|drawer_id| {
+                    let (total, count) = similarity_totals
+                        .get(&drawer_id)
+                        .copied()
+                        .unwrap_or((0.0, 1));
+                    (drawer_id, total / count as f64)
+                })
+                .collect::<Vec<_>>();
+            cluster.sort_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            cluster
+        })
+        .collect::<Vec<_>>();
+
+    clusters.sort_by(|left, right| {
+        let left_avg = cluster_average_similarity(left);
+        let right_avg = cluster_average_similarity(right);
+        right
+            .len()
+            .cmp(&left.len())
+            .then_with(|| right_avg.total_cmp(&left_avg))
+            .then_with(|| left[0].0.cmp(&right[0].0))
+    });
+    Ok(clusters)
+}
+
+fn cluster_average_similarity(cluster: &[(String, f64)]) -> f64 {
+    if cluster.is_empty() {
+        return 0.0;
+    }
+    cluster
+        .iter()
+        .map(|(_, similarity)| similarity)
+        .sum::<f64>()
+        / cluster.len() as f64
+}
+
+#[derive(Default)]
+struct UnionFind {
+    parents: HashMap<String, String>,
+    ranks: HashMap<String, u8>,
+}
+
+impl UnionFind {
+    fn ensure(&mut self, id: &str) {
+        self.parents
+            .entry(id.to_string())
+            .or_insert_with(|| id.to_string());
+        self.ranks.entry(id.to_string()).or_insert(0);
+    }
+
+    fn find(&mut self, id: &str) -> String {
+        self.ensure(id);
+        let parent = self
+            .parents
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_string());
+        if parent == id {
+            return parent;
+        }
+        let root = self.find(&parent);
+        self.parents.insert(id.to_string(), root.clone());
+        root
+    }
+
+    fn union(&mut self, left: &str, right: &str) {
+        let left_root = self.find(left);
+        let right_root = self.find(right);
+        if left_root == right_root {
+            return;
+        }
+
+        let left_rank = self.ranks.get(&left_root).copied().unwrap_or(0);
+        let right_rank = self.ranks.get(&right_root).copied().unwrap_or(0);
+        if left_rank < right_rank {
+            self.parents.insert(left_root, right_root);
+        } else if left_rank > right_rank {
+            self.parents.insert(right_root, left_root);
+        } else {
+            self.parents.insert(right_root.clone(), left_root.clone());
+            self.ranks.insert(left_root, left_rank.saturating_add(1));
+        }
+    }
+}
+
 fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     let current_version = read_user_version(conn)?;
     if current_version > CURRENT_SCHEMA_VERSION {
@@ -3173,6 +3542,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             ensure_v11_source_confidence_schema(conn, read_user_version(conn)?)?;
             continue;
         }
+        if migration.version == 12 {
+            ensure_v12_compaction_schema(conn, read_user_version(conn)?)?;
+            continue;
+        }
         apply_migration_atomic(conn, migration)?;
     }
 
@@ -3181,6 +3554,9 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     }
     if read_user_version(conn)? >= 11 {
         ensure_v11_source_confidence_schema(conn, read_user_version(conn)?)?;
+    }
+    if read_user_version(conn)? >= 12 {
+        ensure_v12_compaction_schema(conn, read_user_version(conn)?)?;
     }
 
     Ok(())
@@ -3288,6 +3664,31 @@ fn ensure_v11_source_confidence_schema(
         }
         if current_version < 11 {
             set_user_version(conn, 11)?;
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn ensure_v12_compaction_schema(conn: &Connection, current_version: u32) -> Result<(), DbError> {
+    let existing_columns = drawers_column_names(conn)?;
+    let missing_compacted_into = !existing_columns.contains("compacted_into");
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(error) = (|| -> Result<(), DbError> {
+        if missing_compacted_into {
+            conn.execute_batch(
+                "ALTER TABLE drawers ADD COLUMN compacted_into TEXT REFERENCES drawers(id);",
+            )?;
+        }
+        conn.execute_batch(V12_COMPACTION_SCHEMA_SQL)?;
+        if current_version < 12 {
+            set_user_version(conn, 12)?;
         }
         conn.execute_batch("COMMIT;")?;
         Ok(())
@@ -3411,6 +3812,15 @@ fn read_user_version(conn: &Connection) -> Result<u32, DbError> {
 fn set_user_version(conn: &Connection, version: u32) -> Result<(), DbError> {
     conn.execute_batch(&format!("PRAGMA user_version = {version};"))?;
     Ok(())
+}
+
+fn table_exists_conn(conn: &Connection, table_name: &str) -> Result<bool, DbError> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1)",
+        [table_name],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(exists == 1)
 }
 
 fn append_drawers_since_filters(
@@ -3868,6 +4278,31 @@ SET source_type = CASE
 "#;
 
 const V11_MIGRATION_SQL: &str = "";
+const V12_MIGRATION_SQL: &str = "";
+const V12_COMPACTION_SCHEMA_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
+    ON drawers(compacted_into)
+    WHERE compacted_into IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS consolidation_log (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    wing TEXT NOT NULL,
+    room TEXT,
+    project_id TEXT,
+    cluster_size INTEGER NOT NULL,
+    strategy TEXT NOT NULL CHECK(strategy IN ('richest_content', 'llm_summary')),
+    target_drawer_id TEXT NOT NULL REFERENCES drawers(id),
+    source_drawer_ids TEXT NOT NULL,
+    dry_run INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidation_log_created_at
+    ON consolidation_log(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_consolidation_log_scope
+    ON consolidation_log(wing, room, project_id);
+"#;
 
 fn migrations() -> &'static [Migration] {
     static MIGRATIONS: &[Migration] = &[
@@ -3914,6 +4349,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 11,
             sql: V11_MIGRATION_SQL,
+        },
+        Migration {
+            version: 12,
+            sql: V12_MIGRATION_SQL,
         },
     ];
     MIGRATIONS
@@ -4330,6 +4769,7 @@ fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
     let scope_constraints = row.get::<_, Option<String>>(25)?;
     let trigger_hints = parse_optional_json(row.get::<_, Option<String>>(26)?.as_deref())?;
     let effective_importance = row.get::<_, f64>(27)?;
+    let compacted_into = row.get::<_, Option<String>>(28)?;
 
     anchor::validate_anchor_domain(&domain, &anchor_kind)
         .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
@@ -4363,6 +4803,7 @@ fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
         scope_constraints,
         trigger_hints,
         effective_importance,
+        compacted_into,
     })
 }
 
@@ -4704,6 +5145,173 @@ mod tests {
             [],
         )
         .expect("new source_type check accepts user_explicit");
+    }
+
+    #[test]
+    fn test_v12_migration_adds_compaction_schema_idempotently() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE drawers (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                wing TEXT NOT NULL,
+                added_at TEXT NOT NULL
+            );
+            PRAGMA user_version = 11;
+            "#,
+        )
+        .expect("create v11 schema");
+
+        ensure_v12_compaction_schema(&conn, 11).expect("apply v12 migration");
+        ensure_v12_compaction_schema(&conn, 12).expect("reapply v12 migration");
+
+        assert_eq!(read_user_version(&conn).expect("user_version"), 12);
+        let columns = drawers_column_names(&conn).expect("drawer columns");
+        assert!(columns.contains("compacted_into"));
+        let log_exists = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='consolidation_log')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("table exists");
+        assert_eq!(log_exists, 1);
+    }
+
+    #[test]
+    fn test_find_similar_clusters_groups_connected_components() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        for (id, vector) in [
+            ("similar-a", vec![1.0_f32, 0.0, 0.0]),
+            ("similar-b", vec![0.99_f32, 0.01, 0.0]),
+            ("similar-c", vec![0.98_f32, 0.02, 0.0]),
+            ("distant", vec![0.0_f32, 1.0, 0.0]),
+        ] {
+            insert_test_drawer(&db, id, id, Some("project-a"));
+            db.insert_vector_with_project(id, &vector, Some("project-a"))
+                .expect("insert vector");
+        }
+
+        let clusters = find_similar_clusters(
+            db.conn(),
+            Some("test-wing"),
+            Some("test-room"),
+            Some("project-a"),
+            0.95,
+            3,
+        )
+        .expect("find clusters");
+
+        assert_eq!(clusters.len(), 1);
+        let ids = clusters[0]
+            .iter()
+            .map(|(drawer_id, similarity)| {
+                assert!(*similarity > 0.95);
+                drawer_id.as_str()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids, BTreeSet::from(["similar-a", "similar-b", "similar-c"]));
+    }
+
+    #[test]
+    fn test_find_similar_clusters_respects_project_filter() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        for project_id in ["project-a", "project-b"] {
+            for suffix in ["a", "b", "c"] {
+                let id = format!("{project_id}-{suffix}");
+                insert_test_drawer(&db, &id, &id, Some(project_id));
+                db.insert_vector_with_project(&id, &[1.0_f32, 0.0, 0.0], Some(project_id))
+                    .expect("insert vector");
+            }
+        }
+
+        let clusters = find_similar_clusters(
+            db.conn(),
+            Some("test-wing"),
+            Some("test-room"),
+            Some("project-a"),
+            0.95,
+            3,
+        )
+        .expect("find project clusters");
+
+        assert_eq!(clusters.len(), 1);
+        let ids = clusters[0]
+            .iter()
+            .map(|(drawer_id, _)| drawer_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids,
+            BTreeSet::from(["project-a-a", "project-a-b", "project-a-c"])
+        );
+    }
+
+    #[test]
+    fn test_find_similar_clusters_null_project_filter_excludes_named_projects() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        for project_id in [None, Some("project-a")] {
+            let prefix = project_id.unwrap_or("global");
+            for suffix in ["a", "b", "c"] {
+                let id = format!("{prefix}-{suffix}");
+                insert_test_drawer(&db, &id, &id, project_id);
+                db.insert_vector_with_project(&id, &[1.0_f32, 0.0, 0.0], project_id)
+                    .expect("insert vector");
+            }
+        }
+
+        let clusters = find_similar_clusters(
+            db.conn(),
+            Some("test-wing"),
+            Some("test-room"),
+            None,
+            0.95,
+            3,
+        )
+        .expect("find null-project clusters");
+
+        assert_eq!(clusters.len(), 1);
+        let ids = clusters[0]
+            .iter()
+            .map(|(drawer_id, _)| drawer_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids, BTreeSet::from(["global-a", "global-b", "global-c"]));
+    }
+
+    #[test]
+    fn test_find_similar_clusters_excludes_compacted_drawers() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        for id in ["active-a", "active-b", "compacted"] {
+            insert_test_drawer(&db, id, id, Some("project-a"));
+            db.insert_vector_with_project(id, &[1.0_f32, 0.0, 0.0], Some("project-a"))
+                .expect("insert vector");
+        }
+        db.conn()
+            .execute(
+                "UPDATE drawers SET compacted_into = 'active-a' WHERE id = 'compacted'",
+                [],
+            )
+            .expect("mark compacted");
+
+        let clusters = find_similar_clusters(
+            db.conn(),
+            Some("test-wing"),
+            Some("test-room"),
+            Some("project-a"),
+            0.95,
+            3,
+        )
+        .expect("find clusters");
+
+        assert!(clusters.is_empty());
     }
 
     #[test]
