@@ -105,6 +105,7 @@ struct SearchCommandOptions<'a> {
     json: bool,
     with_neighbors: bool,
     include_raw_turns: bool,
+    include_expired: bool,
 }
 
 struct IngestCommandOptions<'a> {
@@ -121,6 +122,8 @@ struct IngestCommandOptions<'a> {
     diary_rollup: bool,
     supersedes: Option<&'a str>,
     replace_text: Option<&'a str>,
+    valid_from: Option<&'a str>,
+    valid_until: Option<&'a str>,
 }
 
 struct RollbackCommandOptions<'a> {
@@ -192,6 +195,10 @@ enum Commands {
         supersedes: Option<String>,
         #[arg(long)]
         replace_text: Option<String>,
+        #[arg(long = "valid-from")]
+        valid_from: Option<String>,
+        #[arg(long = "valid-until")]
+        valid_until: Option<String>,
     },
     Search {
         query: String,
@@ -225,6 +232,8 @@ enum Commands {
         with_neighbors: bool,
         #[arg(long)]
         include_raw_turns: bool,
+        #[arg(long = "include-expired")]
+        include_expired: bool,
     },
     Context {
         query: String,
@@ -1189,6 +1198,8 @@ fn run() -> Result<()> {
             diary_rollup,
             supersedes,
             replace_text,
+            valid_from,
+            valid_until,
         } => block_on_result(ingest_command(
             &db,
             config.as_ref(),
@@ -1206,6 +1217,8 @@ fn run() -> Result<()> {
                 diary_rollup,
                 supersedes: supersedes.as_deref(),
                 replace_text: replace_text.as_deref(),
+                valid_from: valid_from.as_deref(),
+                valid_until: valid_until.as_deref(),
             },
         )),
         Commands::Search {
@@ -1225,6 +1238,7 @@ fn run() -> Result<()> {
             json,
             with_neighbors,
             include_raw_turns,
+            include_expired,
         } => block_on_result(search_command(
             &db,
             config.as_ref(),
@@ -1247,6 +1261,7 @@ fn run() -> Result<()> {
                 json,
                 with_neighbors,
                 include_raw_turns,
+                include_expired,
             },
         )),
         Commands::Context {
@@ -1686,6 +1701,8 @@ async fn ingest_command(
 
     let project_id = resolve_project_id(options.project, config, Some(path))
         .context("failed to resolve ingest project id")?;
+    let valid_from = validate_temporal_bound("--valid-from", options.valid_from)?;
+    let valid_until = validate_temporal_bound("--valid-until", options.valid_until)?;
     let base_options = IngestOptions {
         room: options.room,
         source_root: if path.is_file() {
@@ -1704,6 +1721,8 @@ async fn ingest_command(
         diary_rollup_day: None,
         supersedes: options.supersedes,
         replace_text: options.replace_text,
+        valid_from,
+        valid_until,
     };
 
     let stats = if options.dry_run {
@@ -1736,6 +1755,8 @@ async fn ingest_command(
             diary_rollup_day: None,
             supersedes: options.supersedes,
             replace_text: options.replace_text,
+            valid_from,
+            valid_until,
         };
         ingest_path_with_options(db, &*embedder, path, wing, live_options).await?
     };
@@ -1794,6 +1815,8 @@ struct StdinIngestRecord {
     source_file: Option<String>,
     supersedes: Option<String>,
     replace_text: Option<String>,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
     metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -1831,6 +1854,15 @@ fn exact_duplicate_drawer_id(
         .into_iter()
         .find(|summary| Some(summary.id.as_str()) != excluded_drawer_id)
         .map(|summary| summary.id))
+}
+
+fn validate_temporal_bound<'a>(field: &str, value: Option<&'a str>) -> Result<Option<&'a str>> {
+    if let Some(raw) = value {
+        if mempal::core::decay::parse_temporal_timestamp_secs(raw).is_none() {
+            bail!("{field} must be a Unix timestamp or RFC3339 timestamp");
+        }
+    }
+    Ok(value)
 }
 
 async fn ingest_stdin_command(
@@ -1878,6 +1910,14 @@ async fn ingest_stdin_command(
     let project = options.project.or(record.project.as_deref());
     let supersedes = options.supersedes.or(record.supersedes.as_deref());
     let replace_text = options.replace_text.or(record.replace_text.as_deref());
+    let valid_from = validate_temporal_bound(
+        "valid_from",
+        options.valid_from.or(record.valid_from.as_deref()),
+    )?;
+    let valid_until = validate_temporal_bound(
+        "valid_until",
+        options.valid_until.or(record.valid_until.as_deref()),
+    )?;
     let raw_turn = is_raw_turn(wing, room, &config.turns);
     let mut stats = IngestStats {
         files: 1,
@@ -2050,7 +2090,7 @@ async fn ingest_stdin_command(
         link_superseded_drawer(&mut drawer, old_id);
     }
 
-    db.insert_drawer_with_project(&drawer, project_id.as_deref())
+    db.insert_drawer_with_project_validity(&drawer, project_id.as_deref(), valid_from, valid_until)
         .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
     db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
         .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
@@ -2702,7 +2742,7 @@ async fn search_command(
             filters: options.filters,
             with_neighbors: options.with_neighbors,
             include_raw_turns: options.include_raw_turns,
-            include_expired: false,
+            include_expired: options.include_expired,
         },
         options.top_k,
     )
@@ -5236,6 +5276,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         .context("failed to query daemon heartbeat")?;
     println!("schema_version: {schema_version}");
     println!("fork_ext_version: {fork_ext_version}");
+    println!("search_decay_mode: {}", config.search.decay.mode);
     println!("drawer_count: {drawer_count}");
     match project_breakdown {
         Some(breakdown) => {

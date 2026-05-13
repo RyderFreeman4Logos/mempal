@@ -82,6 +82,9 @@ pub struct SearchRequest {
 
     /// Include low-importance raw dialogue turns that are excluded by default.
     pub include_raw_turns: Option<bool>,
+
+    /// Include drawers outside their validity window. Defaults to false.
+    pub include_expired: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -790,6 +793,12 @@ pub struct IngestRequest {
     /// Exact active content to replace within the same wing/room/project
     /// scope. Must match exactly; ambiguous matches return candidate IDs.
     pub replace_text: Option<String>,
+    /// Optional validity start timestamp for the new drawer.
+    /// Accepts Unix seconds or RFC3339. Defaults to the drawer's added_at.
+    pub valid_from: Option<String>,
+    /// Optional validity end timestamp for the new drawer.
+    /// Accepts Unix seconds or RFC3339. Null means still valid.
+    pub valid_until: Option<String>,
 
     /// If true, return the drawer_id that WOULD be created without actually
     /// writing to the database. Use this to preview before committing.
@@ -918,6 +927,7 @@ pub struct StatusResponse {
     pub schema_version: u32,
     pub normalize_version_current: u32,
     pub stale_drawer_count: u64,
+    pub search_decay_mode: String,
     pub drawer_count: i64,
     pub taxonomy_count: i64,
     pub db_size_bytes: u64,

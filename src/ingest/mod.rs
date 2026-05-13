@@ -82,6 +82,8 @@ pub struct IngestOptions<'a> {
     pub diary_rollup_day: Option<&'a str>,
     pub supersedes: Option<&'a str>,
     pub replace_text: Option<&'a str>,
+    pub valid_from: Option<&'a str>,
+    pub valid_until: Option<&'a str>,
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -224,6 +226,8 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             diary_rollup_day: None,
             supersedes: None,
             replace_text: None,
+            valid_from: None,
+            valid_until: None,
         },
     )
     .await
@@ -562,11 +566,16 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             link_superseded_drawer(&mut drawer, old_id);
         }
 
-        db.insert_drawer_with_project(&drawer, options.project_id)
-            .map_err(|source| IngestError::InsertDrawer {
-                drawer_id: drawer.id.clone(),
-                source,
-            })?;
+        db.insert_drawer_with_project_validity(
+            &drawer,
+            options.project_id,
+            options.valid_from,
+            options.valid_until,
+        )
+        .map_err(|source| IngestError::InsertDrawer {
+            drawer_id: drawer.id.clone(),
+            source,
+        })?;
         db.insert_vector_with_project(&drawer_id, &vector, options.project_id)
             .map_err(|source| IngestError::InsertVector {
                 drawer_id: drawer.id.clone(),
@@ -654,6 +663,8 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             diary_rollup_day: None,
             supersedes: None,
             replace_text: None,
+            valid_from: None,
+            valid_until: None,
         },
     )
     .await

@@ -393,8 +393,13 @@ impl MempalMcpServer {
                 &source_type,
                 importance,
             );
-            db.insert_drawer_with_project(&drawer, project_id)
-                .map_err(db_error)?;
+            db.insert_drawer_with_project_validity(
+                &drawer,
+                project_id,
+                request.valid_from.as_deref(),
+                request.valid_until.as_deref(),
+            )
+            .map_err(db_error)?;
             db.insert_vector_with_project(chunk_did, vector, project_id)
                 .map_err(db_error)?;
             inserted_drawer_ids.push(chunk_did.clone());
@@ -461,6 +466,9 @@ fn validate_ingest_request(
     request: &IngestRequest,
     source_type: &SourceType,
 ) -> std::result::Result<ValidatedIngestMetadata, ErrorData> {
+    validate_temporal_param("valid_from", request.valid_from.as_deref())?;
+    validate_temporal_param("valid_until", request.valid_until.as_deref())?;
+
     let memory_kind =
         parse_memory_kind(request.memory_kind.as_deref())?.unwrap_or(MemoryKind::Evidence);
     let domain = parse_domain(request.domain.as_deref())?.unwrap_or(MemoryDomain::Project);
@@ -579,6 +587,18 @@ fn validate_ingest_request(
             })
         }
     }
+}
+
+fn validate_temporal_param(name: &str, value: Option<&str>) -> std::result::Result<(), ErrorData> {
+    if let Some(raw) = value
+        && crate::core::decay::parse_temporal_timestamp_secs(raw).is_none()
+    {
+        return Err(ErrorData::invalid_params(
+            format!("{name} must be a Unix timestamp or RFC3339 timestamp"),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 fn drawer_from_ingest_metadata(
@@ -920,6 +940,7 @@ impl MempalMcpServer {
             schema_version,
             normalize_version_current: CURRENT_NORMALIZE_VERSION,
             stale_drawer_count,
+            search_decay_mode: config.search.decay.mode.to_string(),
             drawer_count,
             taxonomy_count,
             db_size_bytes,
@@ -1019,7 +1040,7 @@ impl MempalMcpServer {
             },
             with_neighbors: request.with_neighbors.unwrap_or(false),
             include_raw_turns: request.include_raw_turns.unwrap_or(false),
-            include_expired: false,
+            include_expired: request.include_expired.unwrap_or(false),
         };
         let mut extra_warnings = Vec::new();
         let embedder = self.embedder_factory.build().await.map_err(|error| {
@@ -2201,8 +2222,13 @@ impl MempalMcpServer {
                     if let Some(old_id) = superseded_drawer_id.as_deref() {
                         link_superseded_drawer(&mut drawer, old_id);
                     }
-                    db.insert_drawer_with_project(&drawer, project_id.as_deref())
-                        .map_err(db_error)?;
+                    db.insert_drawer_with_project_validity(
+                        &drawer,
+                        project_id.as_deref(),
+                        request.valid_from.as_deref(),
+                        request.valid_until.as_deref(),
+                    )
+                    .map_err(db_error)?;
                     db.insert_vector_with_project(chunk_did, vector, project_id.as_deref())
                         .map_err(db_error)?;
                     inserted_drawer_ids.push(chunk_did.clone());
@@ -4046,6 +4072,7 @@ mod tests {
                 all_projects: None,
                 disable_progressive: None,
                 include_raw_turns: None,
+                include_expired: None,
             }))
             .await
             .expect("search should succeed")
@@ -5806,6 +5833,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mcp_ingest_valid_until_is_respected_by_search_include_expired() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let ingested = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "temporal expired fact".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("temporal".to_string()),
+                valid_until: Some("1".to_string()),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("ingest should succeed")
+            .0;
+
+        let hidden = run_search(
+            &server,
+            "temporal expired fact",
+            Some("mempal"),
+            Some("temporal"),
+            10,
+        )
+        .await;
+        assert!(
+            hidden
+                .results
+                .iter()
+                .all(|result| result.drawer_id != ingested.drawer_id),
+            "expired drawer should be hidden by default"
+        );
+
+        let visible = server
+            .mempal_search(Parameters(SearchRequest {
+                query: "temporal expired fact".to_string(),
+                wing: Some("mempal".to_string()),
+                room: Some("temporal".to_string()),
+                top_k: Some(10),
+                include_expired: Some(true),
+                ..SearchRequest::default()
+            }))
+            .await
+            .expect("include expired search should succeed")
+            .0;
+        assert!(
+            visible
+                .results
+                .iter()
+                .any(|result| result.drawer_id == ingested.drawer_id),
+            "include_expired should return the expired drawer"
+        );
+    }
+
+    #[tokio::test]
     async fn test_mcp_ingest_supersedes_soft_deletes_old_and_links_new() {
         let (_tempdir, db_path, server) = setup_server();
         let old = ingest_manual(&server, "stale explicit fact", None, None, None).await;
@@ -6033,6 +6112,8 @@ mod tests {
                 diary_rollup: None,
                 supersedes: None,
                 replace_text: None,
+                valid_from: None,
+                valid_until: None,
                 memory_kind: None,
                 domain: None,
                 field: None,
@@ -6623,6 +6704,7 @@ mod tests_duplicate_conflict_artifact {
                 all_projects: None,
                 disable_progressive: None,
                 include_raw_turns: None,
+                include_expired: None,
             }))
             .await
             .expect("search should succeed")
@@ -8695,6 +8777,10 @@ mod tests_duplicate_conflict_artifact {
                 importance: None,
                 dry_run: None,
                 diary_rollup: None,
+                supersedes: None,
+                replace_text: None,
+                valid_from: None,
+                valid_until: None,
                 memory_kind: None,
                 domain: None,
                 field: None,

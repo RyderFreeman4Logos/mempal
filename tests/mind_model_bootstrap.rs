@@ -2113,7 +2113,7 @@ async fn test_search_filters_by_domain_field_status_and_anchor_kind() {
             "wing": "mempal",
             "room": "bootstrap",
             "anchor_kind": "repo",
-            "top_k": 5
+            "top_k": 10
         }))
         .await
         .expect("anchor-filtered search should succeed");
