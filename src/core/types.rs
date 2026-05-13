@@ -8,6 +8,37 @@ use crate::core::project::SearchResultSource;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum IntelligenceMode {
+    #[default]
+    Deterministic,
+    LocalLlm,
+    CloudLlm,
+    Auto,
+}
+
+impl IntelligenceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deterministic => "deterministic",
+            Self::LocalLlm => "local_llm",
+            Self::CloudLlm => "cloud_llm",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn uses_llm(self) -> bool {
+        !matches!(self, Self::Deterministic)
+    }
+}
+
+impl fmt::Display for IntelligenceMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceType {
     #[default]
     AgentInference,

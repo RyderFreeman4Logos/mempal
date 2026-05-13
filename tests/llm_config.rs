@@ -62,6 +62,43 @@ enabled_for = ["gating", "distill", "compress"]
 }
 
 #[test]
+fn test_memory_intelligence_config_parse_full() {
+    let config = Config::parse(
+        r#"
+[memory_intelligence]
+mode = "local_llm"
+
+[memory_intelligence.llm]
+base_url = "http://127.0.0.1:18009/v1"
+model = "qwen3.6-27b-decensor-by-aeon"
+timeout_secs = 1800
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+"#,
+    )
+    .expect("memory intelligence config should parse");
+
+    assert_eq!(config.memory_intelligence.mode.to_string(), "local_llm");
+    let effective = config.memory_intelligence.effective_llm_config(&config.llm);
+    assert_eq!(
+        effective.base_url.as_deref(),
+        Some("http://127.0.0.1:18009/v1")
+    );
+    assert_eq!(
+        effective.model.as_deref(),
+        Some("qwen3.6-27b-decensor-by-aeon")
+    );
+    assert_eq!(effective.request_timeout_secs, 1800);
+    assert_eq!(
+        effective
+            .extra_body
+            .as_ref()
+            .and_then(|body| body.pointer("/chat_template_kwargs/enable_thinking"))
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+}
+
+#[test]
 fn test_llm_config_missing_base_url_when_enabled() {
     let err = Config::parse(
         r#"

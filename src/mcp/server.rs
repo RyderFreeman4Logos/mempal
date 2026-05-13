@@ -68,18 +68,19 @@ use super::tools::{
     ChunkerStatsDto, ContextRequest, ContextResponse, CoworkPushRequest, CoworkPushResponse,
     DeleteRequest, DeleteResponse, DuplicateWarning, EmbedStatusDto, EndpointHealthDto,
     FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto, FieldTaxonomyResponse,
-    IngestRequest, IngestResponse, KgRequest, KgResponse, KgStatsDto, KnowledgeCardDto,
-    KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse, KnowledgeDemoteRequest,
-    KnowledgeDemoteResponse, KnowledgeDistillRequest, KnowledgeDistillResponse,
-    KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse, KnowledgePromoteRequest,
-    KnowledgePromoteResponse, KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse,
-    LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto,
-    PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
-    ReadDrawersRequest, ReadDrawersResponse, RetrievedKnowledgeCardDto, RollbackRequest,
-    RollbackResponse, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto,
-    SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, StatusResponse,
-    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
-    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto,
+    KnowledgeCardDto, KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse,
+    KnowledgeDemoteRequest, KnowledgeDemoteResponse, KnowledgeDistillRequest,
+    KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse,
+    KnowledgePromoteRequest, KnowledgePromoteResponse, KnowledgePublishAnchorRequest,
+    KnowledgePublishAnchorResponse, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT,
+    MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse,
+    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
+    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, ScopeCount, ScrubStatsDto,
+    SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
+    SkillSummaryDto, SourceTypeCount, StatusResponse, SystemWarning, TaxonomyEntryDto,
+    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
+    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 #[derive(Clone)]
@@ -944,6 +945,7 @@ impl MempalMcpServer {
             })?;
         let endpoint_health = crate::endpoint_health::probe_endpoints(config.as_ref()).await;
         let embed_snapshot = global_embed_status().snapshot();
+        let intelligence_snapshot = crate::intelligence::global_intelligence_status().snapshot();
         let schema_version = db.schema_version().map_err(db_error)?;
         let stale_drawer_count = db
             .stale_drawer_count(CURRENT_NORMALIZE_VERSION)
@@ -1043,6 +1045,13 @@ impl MempalMcpServer {
                 backend: Some(config.llm.backend.clone()),
                 model: config.llm.model.clone(),
                 max_concurrent: config.llm.max_concurrent,
+            },
+            intelligence_status: IntelligenceStatusDto {
+                mode: config.memory_intelligence.mode.to_string(),
+                llm_state: intelligence_llm_state(config.as_ref(), endpoint_health.llm.reachable),
+                last_success_at_unix_ms: intelligence_snapshot.last_success_at_unix_ms,
+                failure_count: intelligence_snapshot.failure_count,
+                last_error: intelligence_snapshot.last_error,
             },
             turn_storage: TurnStorageStatusDto {
                 storage_mode: config.turns.storage_mode.to_string(),
@@ -3728,6 +3737,23 @@ pub(super) fn current_system_warnings() -> Vec<SystemWarning> {
             }),
     );
     warnings
+}
+
+fn intelligence_llm_state(config: &crate::core::config::Config, reachable: bool) -> String {
+    if !config.memory_intelligence.mode.uses_llm() {
+        return "disabled".to_string();
+    }
+    if !config
+        .memory_intelligence
+        .has_effective_llm_endpoint(&config.llm)
+    {
+        return "disabled".to_string();
+    }
+    if reachable {
+        "healthy".to_string()
+    } else {
+        "degraded".to_string()
+    }
 }
 
 fn read_drawer_response(details: crate::core::types::DrawerDetails) -> ReadDrawerResponse {

@@ -951,6 +951,7 @@ pub struct StatusResponse {
     pub scrub_stats: ScrubStatsDto,
     pub chunker_stats: ChunkerStatsDto,
     pub llm_status: LlmStatusDto,
+    pub intelligence_status: IntelligenceStatusDto,
     pub turn_storage: TurnStorageStatusDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
@@ -989,6 +990,17 @@ pub struct LlmStatusDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub max_concurrent: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct IntelligenceStatusDto {
+    pub mode: String,
+    pub llm_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at_unix_ms: Option<u64>,
+    pub failure_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
