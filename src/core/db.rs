@@ -1466,6 +1466,21 @@ impl Database {
         Ok(exists == 1)
     }
 
+    pub fn resolve_available_drawer_id(&self, preferred_id: &str) -> Result<String, DbError> {
+        if !self.drawer_id_in_use(preferred_id)? {
+            return Ok(preferred_id.to_string());
+        }
+
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{preferred_id}_{suffix}");
+            if !self.drawer_id_in_use(&candidate)? {
+                return Ok(candidate);
+            }
+            suffix += 1;
+        }
+    }
+
     fn find_active_drawer_id_by_identity(
         &self,
         wing: &str,

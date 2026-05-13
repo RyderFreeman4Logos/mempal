@@ -781,6 +781,12 @@ pub struct IngestRequest {
     pub room: Option<String>,
     pub source: Option<String>,
     pub project_id: Option<String>,
+    /// Drawer ID to replace. The old drawer must be active and in the
+    /// same project scope as this ingest.
+    pub supersedes: Option<String>,
+    /// Exact active content to replace within the same wing/room/project
+    /// scope. Must match exactly; ambiguous matches return candidate IDs.
+    pub replace_text: Option<String>,
 
     /// If true, return the drawer_id that WOULD be created without actually
     /// writing to the database. Use this to preview before committing.
@@ -885,6 +891,8 @@ pub struct IngestResponse {
     /// concurrent ingest of the same content serialized with this call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lock_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_drawer_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fact_check_warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use super::{
     anchor,
     types::{
-        AnchorKind, BootstrapIdentityParts, KnowledgeStatus, KnowledgeTier, MemoryDomain,
+        AnchorKind, BootstrapIdentityParts, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain,
         MemoryKind, Provenance, SourceType, TaxonomyEntry, TunnelEndpoint,
     },
 };
@@ -160,6 +160,17 @@ pub fn build_bootstrap_evidence_drawer_id(
             trigger_hints: None,
         },
     )
+}
+
+pub fn link_superseded_drawer(drawer: &mut Drawer, old_id: &str) {
+    let marker = format!("supersedes:{old_id}");
+    match drawer.scope_constraints.as_mut() {
+        Some(existing) if !existing.trim().is_empty() => {
+            existing.push_str("; ");
+            existing.push_str(&marker);
+        }
+        _ => drawer.scope_constraints = Some(marker),
+    }
 }
 
 pub fn build_triple_id(subject: &str, predicate: &str, object: &str) -> String {
