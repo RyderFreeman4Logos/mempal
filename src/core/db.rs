@@ -23,8 +23,8 @@ use thiserror::Error;
 use super::anchor;
 use super::{
     types::{
-        AnchorKind, ChunkNeighbors, Drawer, DrawerDetails, DrawerSummary, ExplicitTunnel,
-        KnowledgeCard, KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType,
+        AnchorKind, ChunkNeighbors, CompactionStrategy, Drawer, DrawerDetails, DrawerSummary,
+        ExplicitTunnel, KnowledgeCard, KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType,
         KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain,
         MemoryKind, NeighborChunk, Provenance, ReindexSource, RuntimeAdoptionEvent,
         RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack, SourceType,
@@ -193,6 +193,12 @@ pub enum DbError {
     ReplacementTextNotFound,
     #[error("multiple matching active facts found for replace_text; candidates: {candidate_ids:?}")]
     ReplacementTextAmbiguous { candidate_ids: Vec<String> },
+    #[error("compaction cluster is empty")]
+    CompactionClusterEmpty,
+    #[error("compaction drawer {drawer_id} was not found, inactive, or already compacted")]
+    CompactionDrawerNotFound { drawer_id: String },
+    #[error("LLM compaction not yet implemented")]
+    LlmCompactionNotImplemented,
 }
 
 pub struct Database {
@@ -1339,12 +1345,7 @@ impl Database {
     }
 
     fn table_exists(&self, table_name: &str) -> Result<bool, DbError> {
-        let exists = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1)",
-            [table_name],
-            |row| row.get::<_, i64>(0),
-        )?;
-        Ok(exists == 1)
+        table_exists_conn(&self.conn, table_name)
     }
 
     pub fn taxonomy_count(&self) -> Result<i64, DbError> {
@@ -1487,6 +1488,161 @@ impl Database {
             .into_iter()
             .filter_map(|drawer_id| found_by_id.remove(&drawer_id))
             .collect())
+    }
+
+    pub(crate) fn apply_compaction(
+        &self,
+        target_id: &str,
+        source_ids: &[String],
+        merged_content: &str,
+        strategy: CompactionStrategy,
+    ) -> Result<(), DbError> {
+        if source_ids.is_empty() {
+            return Err(DbError::CompactionClusterEmpty);
+        }
+
+        let source_drawer_ids_json = serde_json::to_string(source_ids)?;
+        let timestamp = current_timestamp();
+        let unique_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let log_seed = format!("{target_id}:{timestamp}:{unique_nanos}:{source_drawer_ids_json}");
+        let log_digest = blake3::hash(log_seed.as_bytes()).to_hex().to_string();
+        let log_id = format!("consolidation_{}", &log_digest[..16]);
+        let content_hash = content_hash_hex(merged_content);
+
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), DbError> {
+            let (target_rowid, old_content, wing, room, project_id) = self
+                .conn
+                .query_row(
+                    r#"
+                    SELECT rowid, content, wing, room, project_id
+                    FROM drawers
+                    WHERE id = ?1
+                      AND deleted_at IS NULL
+                      AND compacted_into IS NULL
+                    "#,
+                    [target_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| DbError::CompactionDrawerNotFound {
+                    drawer_id: target_id.to_string(),
+                })?;
+
+            let fts_exists = self.table_exists("drawers_fts")?;
+            if fts_exists {
+                self.conn.execute(
+                    "INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', ?1, ?2)",
+                    params![target_rowid, old_content],
+                )?;
+            }
+
+            let updated = self.conn.execute(
+                r#"
+                UPDATE drawers
+                SET content = ?2,
+                    content_hash = ?3,
+                    updated_at = ?4,
+                    merge_count = COALESCE(merge_count, 0) + ?5
+                WHERE id = ?1
+                  AND deleted_at IS NULL
+                  AND compacted_into IS NULL
+                "#,
+                params![
+                    target_id,
+                    merged_content,
+                    content_hash,
+                    timestamp,
+                    i64::try_from(source_ids.len().saturating_sub(1)).unwrap_or(i64::MAX),
+                ],
+            )?;
+            if updated != 1 {
+                return Err(DbError::CompactionDrawerNotFound {
+                    drawer_id: target_id.to_string(),
+                });
+            }
+
+            if fts_exists {
+                self.conn.execute(
+                    "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
+                    params![target_rowid, merged_content],
+                )?;
+            }
+
+            for source_id in source_ids
+                .iter()
+                .filter(|source_id| source_id.as_str() != target_id)
+            {
+                let affected = self.conn.execute(
+                    r#"
+                    UPDATE drawers
+                    SET deleted_at = ?2,
+                        valid_until = ?2,
+                        compacted_into = ?3
+                    WHERE id = ?1
+                      AND deleted_at IS NULL
+                      AND compacted_into IS NULL
+                    "#,
+                    params![source_id, timestamp, target_id],
+                )?;
+                if affected != 1 {
+                    return Err(DbError::CompactionDrawerNotFound {
+                        drawer_id: source_id.clone(),
+                    });
+                }
+            }
+
+            self.conn.execute(
+                r#"
+                INSERT INTO consolidation_log (
+                    id,
+                    wing,
+                    room,
+                    project_id,
+                    cluster_size,
+                    strategy,
+                    target_drawer_id,
+                    source_drawer_ids,
+                    dry_run
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+                "#,
+                params![
+                    log_id,
+                    wing,
+                    room,
+                    project_id,
+                    i64::try_from(source_ids.len()).unwrap_or(i64::MAX),
+                    strategy.as_str(),
+                    target_id,
+                    source_drawer_ids_json,
+                ],
+            )?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn drawer_project_id(&self, drawer_id: &str) -> Result<Option<String>, DbError> {
@@ -3139,6 +3295,185 @@ impl Database {
     }
 }
 
+pub fn find_similar_clusters(
+    conn: &Connection,
+    wing: Option<&str>,
+    room: Option<&str>,
+    project_id: Option<&str>,
+    threshold: f64,
+    min_cluster_size: usize,
+) -> Result<Vec<Vec<(String, f64)>>, DbError> {
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return Err(DbError::InvalidDrawerMetadata(
+            "compaction threshold must be finite and between 0.0 and 1.0".to_string(),
+        ));
+    }
+    if min_cluster_size < 2 {
+        return Err(DbError::InvalidDrawerMetadata(
+            "minimum compaction cluster size must be at least 2".to_string(),
+        ));
+    }
+    if !table_exists_conn(conn, "drawer_vectors")? {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = String::from(
+        r#"
+        SELECT da.id,
+               db.id,
+               CAST(1.0 - vec_distance_cosine(va.embedding, vb.embedding) AS REAL) AS similarity
+        FROM drawer_vectors va
+        JOIN drawer_vectors vb ON va.id < vb.id
+        JOIN drawers da ON da.id = va.id
+        JOIN drawers db ON db.id = vb.id
+        WHERE da.deleted_at IS NULL
+          AND db.deleted_at IS NULL
+          AND da.compacted_into IS NULL
+          AND db.compacted_into IS NULL
+          AND vec_distance_cosine(va.embedding, vb.embedding) < ?1
+        "#,
+    );
+    let mut values = vec![SqlValue::Real(1.0 - threshold)];
+
+    for (column, value) in [("wing", wing), ("room", room), ("project_id", project_id)] {
+        if let Some(value) = value {
+            values.push(SqlValue::Text(value.to_string()));
+            let placeholder = values.len();
+            sql.push_str(&format!(
+                " AND da.{column} = ?{placeholder} AND db.{column} = ?{placeholder}"
+            ));
+        }
+    }
+
+    let mut statement = conn.prepare(&sql)?;
+    let pairs = statement
+        .query_map(params_from_iter(values.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut union_find = UnionFind::default();
+    let mut similarity_totals: HashMap<String, (f64, usize)> = HashMap::new();
+    for (left_id, right_id, similarity) in pairs {
+        if similarity <= threshold {
+            continue;
+        }
+        union_find.union(&left_id, &right_id);
+        let left_total = similarity_totals.entry(left_id).or_insert((0.0, 0));
+        left_total.0 += similarity;
+        left_total.1 += 1;
+        let right_total = similarity_totals.entry(right_id).or_insert((0.0, 0));
+        right_total.0 += similarity;
+        right_total.1 += 1;
+    }
+
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    for drawer_id in similarity_totals.keys().cloned().collect::<Vec<_>>() {
+        let root = union_find.find(&drawer_id);
+        grouped.entry(root).or_default().push(drawer_id);
+    }
+
+    let mut clusters = grouped
+        .into_values()
+        .filter(|component| component.len() >= min_cluster_size)
+        .map(|mut component| {
+            component.sort();
+            let mut cluster = component
+                .into_iter()
+                .map(|drawer_id| {
+                    let (total, count) = similarity_totals
+                        .get(&drawer_id)
+                        .copied()
+                        .unwrap_or((0.0, 1));
+                    (drawer_id, total / count as f64)
+                })
+                .collect::<Vec<_>>();
+            cluster.sort_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            cluster
+        })
+        .collect::<Vec<_>>();
+
+    clusters.sort_by(|left, right| {
+        let left_avg = cluster_average_similarity(left);
+        let right_avg = cluster_average_similarity(right);
+        right
+            .len()
+            .cmp(&left.len())
+            .then_with(|| right_avg.total_cmp(&left_avg))
+            .then_with(|| left[0].0.cmp(&right[0].0))
+    });
+    Ok(clusters)
+}
+
+fn cluster_average_similarity(cluster: &[(String, f64)]) -> f64 {
+    if cluster.is_empty() {
+        return 0.0;
+    }
+    cluster
+        .iter()
+        .map(|(_, similarity)| similarity)
+        .sum::<f64>()
+        / cluster.len() as f64
+}
+
+#[derive(Default)]
+struct UnionFind {
+    parents: HashMap<String, String>,
+    ranks: HashMap<String, u8>,
+}
+
+impl UnionFind {
+    fn ensure(&mut self, id: &str) {
+        self.parents
+            .entry(id.to_string())
+            .or_insert_with(|| id.to_string());
+        self.ranks.entry(id.to_string()).or_insert(0);
+    }
+
+    fn find(&mut self, id: &str) -> String {
+        self.ensure(id);
+        let parent = self
+            .parents
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_string());
+        if parent == id {
+            return parent;
+        }
+        let root = self.find(&parent);
+        self.parents.insert(id.to_string(), root.clone());
+        root
+    }
+
+    fn union(&mut self, left: &str, right: &str) {
+        let left_root = self.find(left);
+        let right_root = self.find(right);
+        if left_root == right_root {
+            return;
+        }
+
+        let left_rank = self.ranks.get(&left_root).copied().unwrap_or(0);
+        let right_rank = self.ranks.get(&right_root).copied().unwrap_or(0);
+        if left_rank < right_rank {
+            self.parents.insert(left_root, right_root);
+        } else if left_rank > right_rank {
+            self.parents.insert(right_root, left_root);
+        } else {
+            self.parents.insert(right_root.clone(), left_root.clone());
+            self.ranks.insert(left_root, left_rank.saturating_add(1));
+        }
+    }
+}
+
 fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     let current_version = read_user_version(conn)?;
     if current_version > CURRENT_SCHEMA_VERSION {
@@ -3444,6 +3779,15 @@ fn read_user_version(conn: &Connection) -> Result<u32, DbError> {
 fn set_user_version(conn: &Connection, version: u32) -> Result<(), DbError> {
     conn.execute_batch(&format!("PRAGMA user_version = {version};"))?;
     Ok(())
+}
+
+fn table_exists_conn(conn: &Connection, table_name: &str) -> Result<bool, DbError> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1)",
+        [table_name],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(exists == 1)
 }
 
 fn append_drawers_since_filters(
@@ -4800,6 +5144,108 @@ mod tests {
             )
             .expect("table exists");
         assert_eq!(log_exists, 1);
+    }
+
+    #[test]
+    fn test_find_similar_clusters_groups_connected_components() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        for (id, vector) in [
+            ("similar-a", vec![1.0_f32, 0.0, 0.0]),
+            ("similar-b", vec![0.99_f32, 0.01, 0.0]),
+            ("similar-c", vec![0.98_f32, 0.02, 0.0]),
+            ("distant", vec![0.0_f32, 1.0, 0.0]),
+        ] {
+            insert_test_drawer(&db, id, id, Some("project-a"));
+            db.insert_vector_with_project(id, &vector, Some("project-a"))
+                .expect("insert vector");
+        }
+
+        let clusters = find_similar_clusters(
+            db.conn(),
+            Some("test-wing"),
+            Some("test-room"),
+            Some("project-a"),
+            0.95,
+            3,
+        )
+        .expect("find clusters");
+
+        assert_eq!(clusters.len(), 1);
+        let ids = clusters[0]
+            .iter()
+            .map(|(drawer_id, similarity)| {
+                assert!(*similarity > 0.95);
+                drawer_id.as_str()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids, BTreeSet::from(["similar-a", "similar-b", "similar-c"]));
+    }
+
+    #[test]
+    fn test_find_similar_clusters_respects_project_filter() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        for project_id in ["project-a", "project-b"] {
+            for suffix in ["a", "b", "c"] {
+                let id = format!("{project_id}-{suffix}");
+                insert_test_drawer(&db, &id, &id, Some(project_id));
+                db.insert_vector_with_project(&id, &[1.0_f32, 0.0, 0.0], Some(project_id))
+                    .expect("insert vector");
+            }
+        }
+
+        let clusters = find_similar_clusters(
+            db.conn(),
+            Some("test-wing"),
+            Some("test-room"),
+            Some("project-a"),
+            0.95,
+            3,
+        )
+        .expect("find project clusters");
+
+        assert_eq!(clusters.len(), 1);
+        let ids = clusters[0]
+            .iter()
+            .map(|(drawer_id, _)| drawer_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids,
+            BTreeSet::from(["project-a-a", "project-a-b", "project-a-c"])
+        );
+    }
+
+    #[test]
+    fn test_find_similar_clusters_excludes_compacted_drawers() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        for id in ["active-a", "active-b", "compacted"] {
+            insert_test_drawer(&db, id, id, Some("project-a"));
+            db.insert_vector_with_project(id, &[1.0_f32, 0.0, 0.0], Some("project-a"))
+                .expect("insert vector");
+        }
+        db.conn()
+            .execute(
+                "UPDATE drawers SET compacted_into = 'active-a' WHERE id = 'compacted'",
+                [],
+            )
+            .expect("mark compacted");
+
+        let clusters = find_similar_clusters(
+            db.conn(),
+            Some("test-wing"),
+            Some("test-room"),
+            Some("project-a"),
+            0.95,
+            3,
+        )
+        .expect("find clusters");
+
+        assert!(clusters.is_empty());
     }
 
     #[test]
