@@ -942,6 +942,7 @@ pub struct IngestGatingConfig {
     pub tier1_skip_events: Vec<String>,
     pub rules: Vec<GatingRuleConfig>,
     pub embedding_classifier: EmbeddingClassifierConfig,
+    pub fact_check: AutoFactCheckConfig,
     pub novelty: NoveltyConfig,
     pub llm_judge: Option<LlmJudgeConfig>,
 }
@@ -953,8 +954,40 @@ impl Default for IngestGatingConfig {
             tier1_skip_events: default_tier1_skip_events(),
             rules: Vec::new(),
             embedding_classifier: EmbeddingClassifierConfig::default(),
+            fact_check: AutoFactCheckConfig::default(),
             novelty: NoveltyConfig::default(),
             llm_judge: None,
+        }
+    }
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AutoFactCheckConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub reject_on_contradiction: bool,
+    #[serde(default = "default_false")]
+    pub reject_on_stale: bool,
+    #[serde(default = "default_false")]
+    pub reject_on_similar_name: bool,
+}
+
+impl Default for AutoFactCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reject_on_contradiction: true,
+            reject_on_stale: false,
+            reject_on_similar_name: false,
         }
     }
 }
