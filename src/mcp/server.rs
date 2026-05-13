@@ -992,7 +992,7 @@ fn anchor_error(error: anchor::AnchorError) -> ErrorData {
 impl MempalMcpServer {
     #[tool(
         name = "mempal_status",
-        description = "Return schema version, drawer counts, taxonomy counts, database size, scope breakdown, the AAAK format spec, and the memory protocol. Call once at session start if you haven't seen the protocol yet."
+        description = "Return schema version, drawer counts, feature/status flags, intelligence mode, queue stats, pinned fact counts, sleep/crystallize stats, endpoint health, the AAAK format spec, and the memory protocol. Call once at session start if you haven't seen the protocol yet."
     )]
     pub async fn mempal_status(&self) -> std::result::Result<Json<StatusResponse>, ErrorData> {
         let cfg_meta = ConfigHandle::snapshot_meta();
@@ -1146,7 +1146,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_pinned_facts",
-        description = "Return canonical pinned facts for prompt injection without running embedding search. Use this at session start for always-on context. Results are pure SQL, scoped by project_id when provided, and capped by budget_chars."
+        description = "Return canonical pinned facts for prompt injection without running embedding search. Use this at session start for always-on context such as user preferences and durable constraints. Results are pure SQL, project-scoped, ordered by pin_order/importance, capped by budget_chars, and include typed metadata plus citations."
     )]
     pub async fn mempal_pinned_facts(
         &self,
@@ -1180,7 +1180,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_search",
-        description = "Search persistent project memory via vector embedding with optional wing/room filters. PREFER THIS over grepping files or guessing from general knowledge when answering ANY project-specific question — past decisions, design rationale, implementation details, bug history, how a component works, why something was built a certain way, or any other project knowledge. Every result includes drawer_id and source_file for citation, plus structured AAAK-derived signals (`entities`, `topics`, `flags`, `emotions`, `importance_stars`) for filtering and ranking."
+        description = "Search persistent project memory via hybrid vector+BM25 retrieval with optional wing/room/project and typed metadata filters. PREFER THIS over grepping files or guessing from general knowledge when answering ANY project-specific question. Response search_mode reports hybrid or bm25_only fallback. Every result includes drawer_id and source_file for citation, typed fields (`memory_kind`, `domain`, `field`, status/tier/anchor data), and structured AAAK-derived signals (`entities`, `topics`, `flags`, `emotions`, `importance_stars`) for filtering and ranking."
     )]
     pub async fn mempal_search(
         &self,
@@ -1704,7 +1704,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_knowledge_cards",
-        description = "Phase-2 knowledge card inspection, linked-evidence retrieval, and governed lifecycle. Actions: list/get/retrieve/events/gate/promote/demote. List supports auto_generated and pending_review filters. Retrieve searches linked evidence and returns active cards with citations; promote/demote require evidence refs and append knowledge_events transactionally."
+        description = "Phase-2 knowledge card inspection, linked-evidence retrieval, and governed lifecycle. Actions: list/get/retrieve/events/gate/promote/demote. List supports tier/status/domain/field plus auto_generated and pending_review filters. Retrieve searches linked evidence and returns active cards with citations; promote/demote require evidence refs and append knowledge_events transactionally."
     )]
     async fn mempal_knowledge_cards(
         &self,
@@ -2015,7 +2015,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_ingest",
-        description = "Persist a decision, bug fix, or design insight to project memory. Call this when a decision is reached in conversation — include the rationale, not just the outcome. Wing is required; let mempal auto-route the room. Set dry_run=true to preview the drawer_id without writing."
+        description = "Persist a decision, bug fix, design insight, profile fact, or typed knowledge/evidence drawer to project memory. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, `statement`, `tier`, `status`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, and dry_run preview."
     )]
     pub async fn mempal_ingest(
         &self,

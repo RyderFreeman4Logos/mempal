@@ -128,6 +128,23 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    reduce search noise. Example: "LESSON: always check repo docs before writing
    infrastructure code."
 
+6. USE TYPED INGEST FOR STRUCTURED MEMORY
+   When saving memory with mempal_ingest, set typed metadata when the meaning is
+   known: memory_kind (evidence, knowledge, profile_fact), domain (project,
+   user, agent, skill, global), and field (for example preferences, tooling, or
+   software-engineering). Typed metadata lets search, context assembly,
+   crystallization, and future recall filter precisely without rewriting raw
+   drawer content. Leave fields unset only when the default project/evidence
+   semantics are actually correct.
+
+7. LOAD PINNED FACTS FOR CANONICAL RECALL
+   Use mempal_pinned_facts at session start when you need always-on canonical
+   facts such as user preferences, durable profile facts, or high-confidence
+   operating constraints. Pinned recall is pure SQL, project-scoped, ordered by
+   pin_order/importance, budget-limited, and does not build or query an
+   embedder. Pinned drawers are protected from sleep pruning and
+   crystallization consumption.
+
 8. PARTNER AWARENESS (cross-agent cowork)
    When the user references the partner coding agent ("Codex 那边...",
    "ask Claude what...", "partner is working on...", "handoff..."), call
@@ -232,21 +249,36 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    counterexample evidence. It does not create cards, replace mempal_search,
    assemble default context, or backfill drawers.
 
+17. CHOOSE THE RIGHT INTELLIGENCE MODE
+   mempal can run deterministic, local_llm, or auto intelligence modes. Prefer
+   deterministic mode when tests, hooks, or constrained environments require
+   zero LLM calls. local_llm may enrich memory through a configured local
+   OpenAI-compatible endpoint. auto mode must degrade gracefully: if the local
+   LLM is unavailable, preserve raw content and continue deterministic behavior
+   instead of blocking recall.
+
+18. RUN SLEEP CYCLE MAINTENANCE DELIBERATELY
+   The sleep cycle is offline maintenance: NREM prunes stale low-importance
+   drawers and compacts similar evidence, REM checks KG contradictions and can
+   auto-resolve when the newer fact has higher confidence, and salience updates
+   retrieval priority. Sleep must respect project boundaries and pinned facts;
+   review status/sleep stats before trusting large maintenance runs.
+
 TOOLS:
-  mempal_status        — current state + this protocol + AAAK format spec
+  mempal_status        — current state, feature/status flags, intelligence mode, queue stats + this protocol + AAAK format spec
   mempal_pinned_facts  — pinned/canonical facts for always-on session context, no embedding needed
   mempal_timeline      — project-scoped overview without a query, ordered by importance+recency
-  mempal_search        — semantic search with wing/room filters, citation-bearing
+  mempal_search        — hybrid/BM25 search with search_mode, typed fields, wing/room/project filters, citation-bearing
   mempal_context       — ordered mind-model runtime context (dao_tian -> dao_ren -> shu -> qi; evidence/cards opt-in)
   mempal_field_taxonomy — read-only recommended mind-model field values
   mempal_knowledge_distill — create candidate knowledge from evidence refs
   mempal_knowledge_policy — read-only Stage-1 promotion policy thresholds
   mempal_knowledge_gate — read-only knowledge promotion readiness check
-  mempal_knowledge_cards — Phase-2 knowledge card list/get/retrieve/events/gate/promote/demote
+  mempal_knowledge_cards — Phase-2 knowledge card list/get/retrieve/events/gate/promote/demote with auto_generated filtering
   mempal_knowledge_promote — gate-enforced knowledge lifecycle promotion
   mempal_knowledge_demote — evidence-backed knowledge demotion or retirement
   mempal_knowledge_publish_anchor — metadata-only outward anchor publication
-  mempal_ingest        — save a new drawer (wing required, room optional, importance 0-5)
+  mempal_ingest        — save a new drawer (wing required, room optional, importance 0-5, typed metadata supported)
   mempal_delete        — soft-delete a drawer by ID
   mempal_taxonomy      — list or edit routing keywords
   mempal_kg            — knowledge graph: add/query/invalidate/timeline/stats triples
