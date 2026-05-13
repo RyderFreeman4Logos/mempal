@@ -4,9 +4,10 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::core::{
-    config::{Config, default_config_path},
+    config::{Config, ConfigHandle, TurnStorageMode, default_config_path},
     db::Database,
     queue::PendingMessageStore,
+    strata::is_raw_turn,
     utils::current_timestamp,
 };
 use anyhow::{Context, Result};
@@ -68,10 +69,10 @@ pub struct CapturedHookEnvelope {
 
 pub fn run_command(command: HookCommands) -> Result<()> {
     match command {
-        HookCommands::PostToolUse => enqueue_from_stdin(HookEvent::PostToolUse),
-        HookCommands::UserPromptSubmit => enqueue_from_stdin(HookEvent::UserPromptSubmit),
-        HookCommands::SessionStart => enqueue_from_stdin(HookEvent::SessionStart),
-        HookCommands::SessionEnd => enqueue_from_stdin(HookEvent::SessionEnd),
+        HookCommands::PostToolUse => run_capture_command(HookEvent::PostToolUse),
+        HookCommands::UserPromptSubmit => run_capture_command(HookEvent::UserPromptSubmit),
+        HookCommands::SessionStart => run_capture_command(HookEvent::SessionStart),
+        HookCommands::SessionEnd => run_capture_command(HookEvent::SessionEnd),
         HookCommands::Install {
             target,
             dry_run,
@@ -81,14 +82,24 @@ pub fn run_command(command: HookCommands) -> Result<()> {
     }
 }
 
+fn run_capture_command(event: HookEvent) -> Result<()> {
+    ConfigHandle::bootstrap(default_config_path()).context("failed to bootstrap config")?;
+    enqueue_from_stdin(event)
+}
+
 pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
-    let config = Config::load_from(&default_config_path()).context("failed to load config")?;
+    let config = ConfigHandle::current();
+    let stdin = stdin_bytes()?;
+    if should_drop_hook_capture(event, &stdin, config.as_ref()) {
+        return Ok(());
+    }
+
     let db_path = expand_home_path(&config.db_path);
     let db = Database::open(&db_path).context("failed to open database for hook enqueue")?;
     let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
     let mempal_home = mempal_home_from_db(db.path());
 
-    let captured = capture_stdin_payload(stdin_bytes()?, &mempal_home)?;
+    let captured = capture_stdin_payload(stdin, &mempal_home)?;
     let envelope = CapturedHookEnvelope {
         event: event.display_name().to_string(),
         kind: event.queue_kind().to_string(),
@@ -122,6 +133,33 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
         .enqueue(event.queue_kind(), &payload)
         .context("failed to enqueue hook payload")?;
     Ok(())
+}
+
+fn should_drop_hook_capture(event: HookEvent, bytes: &[u8], config: &Config) -> bool {
+    matches!(config.turns.storage_mode, TurnStorageMode::Off)
+        && is_raw_turn_for_hook_event(event, bytes, config)
+}
+
+fn is_raw_turn_for_hook_event(event: HookEvent, bytes: &[u8], config: &Config) -> bool {
+    let (wing, room) = raw_turn_target_for_hook_event(event, bytes);
+    is_raw_turn(wing, Some(room.as_str()), &config.turns)
+}
+
+fn raw_turn_target_for_hook_event(event: HookEvent, bytes: &[u8]) -> (&'static str, String) {
+    let room = match event {
+        HookEvent::PostToolUse => serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("tool_name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "unknown-tool".to_string()),
+        HookEvent::UserPromptSubmit => "user-prompt".to_string(),
+        HookEvent::SessionStart | HookEvent::SessionEnd => "session-lifecycle".to_string(),
+    };
+    ("hooks-raw", room)
 }
 
 fn stdin_bytes() -> Result<Vec<u8>> {
