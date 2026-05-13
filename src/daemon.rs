@@ -1090,7 +1090,7 @@ fn insert_drawer_with_vector(
         wing: record.wing.clone(),
         room: Some(record.room.clone()),
         source_file: Some(record.source_file.clone()),
-        source_type: SourceType::Conversation,
+        source_type: SourceType::SystemGenerated,
         added_at: record.added_at.clone(),
         chunk_index: Some(0),
         importance: record.importance,

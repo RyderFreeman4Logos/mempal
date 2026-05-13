@@ -65,7 +65,7 @@ mod tests {
             wing: wing.to_string(),
             room: None,
             source_file: None,
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: None,
             importance: 0,

@@ -98,7 +98,7 @@ fn insert_chunk_with_vector(db: &Database, seed: ChunkSeed<'_>, vector: &[f32]) 
         wing: seed.wing.to_string(),
         room: seed.room.map(str::to_string),
         source_file: Some(seed.source_file.to_string()),
-        source_type: SourceType::Project,
+        source_type: SourceType::AgentInference,
         added_at: format!("171000000{}", seed.chunk_index),
         chunk_index: Some(seed.chunk_index),
         importance: 0,
@@ -293,7 +293,7 @@ async fn test_neighbors_limited_to_same_wing() {
 fn test_current_schema_has_chunk_index() {
     let (_tmp, db) = new_db();
 
-    assert_eq!(db.schema_version().expect("schema version"), 10);
+    assert_eq!(db.schema_version().expect("schema version"), 11);
     let exists: bool = db
         .conn()
         .query_row(

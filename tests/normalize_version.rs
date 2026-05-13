@@ -177,7 +177,7 @@ fn insert_versioned_drawer(
         wing: "mempal".to_string(),
         room: Some("normalize".to_string()),
         source_file: Some(source_file.to_string()),
-        source_type: SourceType::Project,
+        source_type: SourceType::AgentInference,
         added_at: "1710000000".to_string(),
         chunk_index: Some(0),
         importance: 0,
@@ -245,7 +245,7 @@ fn test_migration_v6_to_v7_stamps_normalize_version_1() {
 
     let db = Database::open(&db_path).expect("migrate v6 db");
 
-    assert_eq!(db.schema_version().expect("schema version"), 10);
+    assert_eq!(db.schema_version().expect("schema version"), 11);
     assert_eq!(db.drawer_count().expect("drawer count"), 20);
     assert_eq!(count_normalize_version(&db, 1), 20);
 }

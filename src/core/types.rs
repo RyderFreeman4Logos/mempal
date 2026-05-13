@@ -1,15 +1,78 @@
+use std::fmt;
+use std::str::FromStr;
+
 use super::anchor;
 use serde::{Deserialize, Serialize};
 
 use crate::core::project::SearchResultSource;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
-    Project,
-    Conversation,
     #[default]
-    Manual,
+    AgentInference,
+    UserExplicit,
+    AgentObservation,
+    SystemGenerated,
+}
+
+impl SourceType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserExplicit => "user_explicit",
+            Self::AgentObservation => "agent_observation",
+            Self::AgentInference => "agent_inference",
+            Self::SystemGenerated => "system_generated",
+        }
+    }
+}
+
+impl fmt::Display for SourceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseSourceTypeError {
+    value: String,
+}
+
+impl fmt::Display for ParseSourceTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid source_type: {}", self.value)
+    }
+}
+
+impl std::error::Error for ParseSourceTypeError {}
+
+impl FromStr for SourceType {
+    type Err = ParseSourceTypeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "user_explicit" => Ok(Self::UserExplicit),
+            "agent_observation" => Ok(Self::AgentObservation),
+            "agent_inference" => Ok(Self::AgentInference),
+            "system_generated" => Ok(Self::SystemGenerated),
+            // Legacy source_type values from schema <= v10. They are accepted
+            // at read boundaries so older DB snapshots can still be inspected.
+            "manual" | "project" => Ok(Self::AgentInference),
+            "conversation" => Ok(Self::AgentObservation),
+            other => Err(ParseSourceTypeError {
+                value: other.to_string(),
+            }),
+        }
+    }
+}
+
+pub fn default_confidence(source_type: SourceType) -> f64 {
+    match source_type {
+        SourceType::UserExplicit => 0.9,
+        SourceType::AgentObservation => 0.7,
+        SourceType::AgentInference => 0.5,
+        SourceType::SystemGenerated => 0.3,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +313,7 @@ pub struct Drawer {
     pub room: Option<String>,
     pub source_file: Option<String>,
     pub source_type: SourceType,
+    pub confidence: f64,
     pub added_at: String,
     pub chunk_index: Option<i64>,
     #[serde(default = "default_normalize_version")]
@@ -299,6 +363,7 @@ pub struct BootstrapEvidenceArgs {
 impl Drawer {
     pub fn new_bootstrap_evidence(args: BootstrapEvidenceArgs) -> Self {
         let defaults = anchor::bootstrap_defaults(&args.source_type);
+        let confidence = default_confidence(args.source_type);
         Self {
             id: args.id,
             content: args.content,
@@ -306,6 +371,7 @@ impl Drawer {
             room: args.room,
             source_file: args.source_file,
             source_type: args.source_type,
+            confidence,
             added_at: args.added_at,
             chunk_index: args.chunk_index,
             normalize_version: default_normalize_version(),
@@ -342,6 +408,7 @@ impl Default for Drawer {
             room: None,
             source_file: None,
             source_type,
+            confidence: default_confidence(source_type),
             added_at: String::new(),
             chunk_index: None,
             normalize_version: default_normalize_version(),
@@ -455,6 +522,8 @@ pub struct SearchResult {
     pub room: Option<String>,
     pub source_file: String,
     pub source: SearchResultSource,
+    pub source_type: SourceType,
+    pub confidence: f64,
     pub memory_kind: MemoryKind,
     pub domain: MemoryDomain,
     pub field: String,

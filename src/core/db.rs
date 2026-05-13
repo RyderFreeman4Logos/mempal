@@ -38,7 +38,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 10;
+const CURRENT_SCHEMA_VERSION: u32 = 11;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -64,6 +64,7 @@ const DRAWER_SELECT_COLUMNS: &str = r#"
     room,
     source_file,
     source_type,
+    confidence,
     added_at,
     chunk_index,
     normalize_version,
@@ -96,7 +97,8 @@ CREATE TABLE IF NOT EXISTS drawers (
     wing TEXT NOT NULL,
     room TEXT,
     source_file TEXT,
-    source_type TEXT NOT NULL CHECK(source_type IN ('project', 'conversation', 'manual')),
+    source_type TEXT NOT NULL DEFAULT 'system_generated' CHECK(source_type IN ('user_explicit', 'agent_observation', 'agent_inference', 'system_generated')),
+    confidence REAL NOT NULL DEFAULT 0.5,
     added_at TEXT NOT NULL,
     chunk_index INTEGER
 );
@@ -314,6 +316,7 @@ impl Database {
                 room,
                 source_file,
                 source_type,
+                confidence,
                 added_at,
                 chunk_index,
                 normalize_version,
@@ -339,7 +342,7 @@ impl Database {
                 valid_from,
                 valid_until
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
             "#,
             params![
                 drawer.id.as_str(),
@@ -348,6 +351,7 @@ impl Database {
                 drawer.room.as_deref(),
                 drawer.source_file.as_deref(),
                 source_type_as_str(&drawer.source_type),
+                drawer.confidence,
                 drawer.added_at.as_str(),
                 drawer.chunk_index,
                 i64::from(drawer.normalize_version),
@@ -983,28 +987,29 @@ impl Database {
                     room = ?4,
                     source_file = ?5,
                     source_type = ?6,
-                    added_at = ?7,
-                    chunk_index = ?8,
-                    normalize_version = ?9,
-                    importance = ?10,
-                    memory_kind = ?11,
-                    domain = ?12,
-                    field = ?13,
-                    anchor_kind = ?14,
-                    anchor_id = ?15,
-                    parent_anchor_id = ?16,
-                    provenance = ?17,
-                    statement = ?18,
-                    tier = ?19,
-                    status = ?20,
-                    supporting_refs = ?21,
-                    counterexample_refs = ?22,
-                    teaching_refs = ?23,
-                    verification_refs = ?24,
-                    scope_constraints = ?25,
-                    trigger_hints = ?26,
-                    content_hash = ?27,
-                    valid_from = ?28,
+                    confidence = ?7,
+                    added_at = ?8,
+                    chunk_index = ?9,
+                    normalize_version = ?10,
+                    importance = ?11,
+                    memory_kind = ?12,
+                    domain = ?13,
+                    field = ?14,
+                    anchor_kind = ?15,
+                    anchor_id = ?16,
+                    parent_anchor_id = ?17,
+                    provenance = ?18,
+                    statement = ?19,
+                    tier = ?20,
+                    status = ?21,
+                    supporting_refs = ?22,
+                    counterexample_refs = ?23,
+                    teaching_refs = ?24,
+                    verification_refs = ?25,
+                    scope_constraints = ?26,
+                    trigger_hints = ?27,
+                    content_hash = ?28,
+                    valid_from = ?29,
                     valid_until = NULL
                 WHERE id = ?1 AND deleted_at IS NULL
                 "#,
@@ -1015,6 +1020,7 @@ impl Database {
                     drawer.room.as_deref(),
                     drawer.source_file.as_deref(),
                     source_type_as_str(&drawer.source_type),
+                    drawer.confidence,
                     drawer.added_at.as_str(),
                     drawer.chunk_index,
                     i64::from(drawer.normalize_version),
@@ -1187,6 +1193,26 @@ impl Database {
         )?;
         let rows = statement
             .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn source_type_counts(&self) -> Result<Vec<(SourceType, i64)>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT source_type, COUNT(*)
+            FROM drawers
+            WHERE deleted_at IS NULL
+            GROUP BY source_type
+            ORDER BY source_type
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let source_type = row.get::<_, String>(0)?;
+                let source_type = source_type_from_str(&source_type).map_err(row_decode_error)?;
+                Ok((source_type, row.get::<_, i64>(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -1379,11 +1405,11 @@ impl Database {
         ))?;
         let mut rows = statement.query_map([drawer_id], |row| {
             let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-            // DRAWER_SELECT_COLUMNS has 27 columns (indices 0-26), so
-            // the extra columns appended here start at index 27.
-            let updated_at = row.get::<_, Option<String>>(27)?;
-            let merge_count = row.get::<_, u32>(28)?;
-            let project_id = row.get::<_, Option<String>>(29)?;
+            // DRAWER_SELECT_COLUMNS has 28 columns (indices 0-27), so
+            // the extra columns appended here start at index 28.
+            let updated_at = row.get::<_, Option<String>>(28)?;
+            let merge_count = row.get::<_, u32>(29)?;
+            let project_id = row.get::<_, Option<String>>(30)?;
             Ok(DrawerDetails {
                 drawer,
                 updated_at,
@@ -1435,10 +1461,10 @@ impl Database {
             let mut statement = self.conn.prepare(&sql)?;
             let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
                 let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-                // DRAWER_SELECT_COLUMNS is 27 columns (0-26); extra columns start at 27.
-                let updated_at = row.get::<_, Option<String>>(27)?;
-                let merge_count = row.get::<_, u32>(28)?;
-                let project_id = row.get::<_, Option<String>>(29)?;
+                // DRAWER_SELECT_COLUMNS is 28 columns (0-27); extra columns start at 28.
+                let updated_at = row.get::<_, Option<String>>(28)?;
+                let merge_count = row.get::<_, u32>(29)?;
+                let project_id = row.get::<_, Option<String>>(30)?;
                 Ok((
                     drawer.id.clone(),
                     DrawerDetails {
@@ -2344,8 +2370,8 @@ impl Database {
                 rusqlite::params![room, exclude_drawer_id, current_project_id, sql_limit],
                 |row| {
                     let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-                    // DRAWER_SELECT_COLUMNS is 27 columns (0-26); project_id appended at 27.
-                    let project_id = row.get::<_, Option<String>>(27)?;
+                    // DRAWER_SELECT_COLUMNS is 28 columns (0-27); project_id appended at 28.
+                    let project_id = row.get::<_, Option<String>>(28)?;
                     Ok(TunnelDrawer {
                         drawer,
                         target_project_id: project_id,
@@ -3143,11 +3169,18 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             ensure_v10_drawers_schema(conn, read_user_version(conn)?)?;
             continue;
         }
+        if migration.version == 11 {
+            ensure_v11_source_confidence_schema(conn, read_user_version(conn)?)?;
+            continue;
+        }
         apply_migration_atomic(conn, migration)?;
     }
 
     if current_version >= 5 {
         ensure_v5_drawers_schema(conn, read_user_version(conn)?)?;
+    }
+    if read_user_version(conn)? >= 11 {
+        ensure_v11_source_confidence_schema(conn, read_user_version(conn)?)?;
     }
 
     Ok(())
@@ -3226,6 +3259,95 @@ fn ensure_v10_drawers_schema(conn: &Connection, current_version: u32) -> Result<
         return Err(error);
     }
 
+    Ok(())
+}
+
+fn ensure_v11_source_confidence_schema(
+    conn: &Connection,
+    current_version: u32,
+) -> Result<(), DbError> {
+    let existing_columns = drawers_column_names(conn)?;
+    let missing_source_type = !existing_columns.contains("source_type");
+    let missing_confidence = !existing_columns.contains("confidence");
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(error) = (|| -> Result<(), DbError> {
+        if missing_source_type {
+            conn.execute_batch(
+                "ALTER TABLE drawers ADD COLUMN source_type TEXT NOT NULL DEFAULT 'system_generated' CHECK(source_type IN ('user_explicit', 'agent_observation', 'agent_inference', 'system_generated'));",
+            )?;
+        }
+        if missing_confidence {
+            conn.execute_batch(
+                "ALTER TABLE drawers ADD COLUMN confidence REAL NOT NULL DEFAULT 0.5;",
+            )?;
+        }
+        let rewrote_check = rewrite_drawers_source_type_check(conn)?;
+        if current_version < 11 || missing_source_type || missing_confidence || rewrote_check {
+            conn.execute_batch(V11_SOURCE_CONFIDENCE_BACKFILL_SQL)?;
+        }
+        if current_version < 11 {
+            set_user_version(conn, 11)?;
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn rewrite_drawers_source_type_check(conn: &Connection) -> Result<bool, DbError> {
+    let table_sql = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drawers'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    if table_sql.contains("user_explicit")
+        && table_sql.contains("agent_observation")
+        && table_sql.contains("agent_inference")
+        && table_sql.contains("system_generated")
+    {
+        return Ok(false);
+    }
+
+    let replacements = [
+        (
+            "source_type TEXT NOT NULL CHECK(source_type IN ('project', 'conversation', 'manual'))",
+            "source_type TEXT NOT NULL DEFAULT 'system_generated' CHECK(source_type IN ('user_explicit', 'agent_observation', 'agent_inference', 'system_generated'))",
+        ),
+        (
+            "source_type TEXT NOT NULL CHECK(source_type IN ('project','conversation','manual'))",
+            "source_type TEXT NOT NULL DEFAULT 'system_generated' CHECK(source_type IN ('user_explicit', 'agent_observation', 'agent_inference', 'system_generated'))",
+        ),
+    ];
+    let mut new_sql = table_sql.clone();
+    for (old, new) in replacements {
+        new_sql = new_sql.replace(old, new);
+    }
+    if new_sql == table_sql {
+        return Ok(false);
+    }
+
+    conn.execute_batch("PRAGMA writable_schema = ON;")?;
+    let update_result = conn.execute(
+        "UPDATE sqlite_master SET sql = ?1 WHERE type = 'table' AND name = 'drawers'",
+        [new_sql],
+    );
+    conn.execute_batch("PRAGMA writable_schema = OFF;")?;
+    update_result?;
+    bump_sqlite_schema_version(conn)?;
+    Ok(true)
+}
+
+fn bump_sqlite_schema_version(conn: &Connection) -> Result<(), DbError> {
+    let schema_version = conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, u32>(0))?;
+    conn.execute_batch(&format!(
+        "PRAGMA schema_version = {};",
+        schema_version.saturating_add(1)
+    ))?;
     Ok(())
 }
 
@@ -3478,6 +3600,10 @@ SET memory_kind = 'evidence',
         WHEN 'project' THEN 'research'
         WHEN 'conversation' THEN 'human'
         WHEN 'manual' THEN 'human'
+        WHEN 'user_explicit' THEN 'human'
+        WHEN 'agent_observation' THEN 'human'
+        WHEN 'agent_inference' THEN 'research'
+        WHEN 'system_generated' THEN 'runtime'
         ELSE NULL
     END
 WHERE memory_kind = 'evidence'
@@ -3523,6 +3649,10 @@ SET memory_kind = 'evidence',
         WHEN 'project' THEN 'research'
         WHEN 'conversation' THEN 'human'
         WHEN 'manual' THEN 'human'
+        WHEN 'user_explicit' THEN 'human'
+        WHEN 'agent_observation' THEN 'human'
+        WHEN 'agent_inference' THEN 'research'
+        WHEN 'system_generated' THEN 'runtime'
         ELSE NULL
     END
 WHERE memory_kind = 'evidence'
@@ -3707,6 +3837,38 @@ CREATE INDEX IF NOT EXISTS idx_drawers_validity
     WHERE deleted_at IS NULL;
 "#;
 
+const V11_SOURCE_CONFIDENCE_BACKFILL_SQL: &str = r#"
+UPDATE drawers
+SET source_type = CASE
+        WHEN lower(COALESCE(source_file, '')) LIKE '%hook%' OR wing = 'hooks-raw'
+            THEN 'system_generated'
+        WHEN wing = 'agent-diary'
+            THEN 'agent_observation'
+        WHEN source_type = 'user_explicit'
+            THEN 'user_explicit'
+        WHEN source_type = 'agent_observation'
+            THEN 'agent_observation'
+        WHEN source_type = 'system_generated'
+            THEN 'system_generated'
+        ELSE 'agent_inference'
+    END,
+    confidence = CASE
+        WHEN lower(COALESCE(source_file, '')) LIKE '%hook%' OR wing = 'hooks-raw'
+            THEN 0.3
+        WHEN wing = 'agent-diary'
+            THEN 0.7
+        WHEN source_type = 'user_explicit'
+            THEN 0.9
+        WHEN source_type = 'agent_observation'
+            THEN 0.7
+        WHEN source_type = 'system_generated'
+            THEN 0.3
+        ELSE 0.5
+    END;
+"#;
+
+const V11_MIGRATION_SQL: &str = "";
+
 fn migrations() -> &'static [Migration] {
     static MIGRATIONS: &[Migration] = &[
         Migration {
@@ -3749,6 +3911,10 @@ fn migrations() -> &'static [Migration] {
             version: 10,
             sql: V10_MIGRATION_SQL,
         },
+        Migration {
+            version: 11,
+            sql: V11_MIGRATION_SQL,
+        },
     ];
     MIGRATIONS
 }
@@ -3782,20 +3948,13 @@ fn register_sqlite_vec() -> Result<(), DbError> {
 }
 
 fn source_type_as_str(source_type: &SourceType) -> &'static str {
-    match source_type {
-        SourceType::Project => "project",
-        SourceType::Conversation => "conversation",
-        SourceType::Manual => "manual",
-    }
+    source_type.as_str()
 }
 
 fn source_type_from_str(source_type: &str) -> Result<SourceType, DbError> {
-    match source_type {
-        "project" => Ok(SourceType::Project),
-        "conversation" => Ok(SourceType::Conversation),
-        "manual" => Ok(SourceType::Manual),
-        other => Err(DbError::InvalidSourceType(other.to_string())),
-    }
+    source_type
+        .parse()
+        .map_err(|_| DbError::InvalidSourceType(source_type.to_string()))
 }
 
 fn memory_kind_as_str(memory_kind: &MemoryKind) -> &'static str {
@@ -4141,35 +4300,36 @@ fn runtime_adoption_event_from_row(row: &Row<'_>) -> Result<RuntimeAdoptionEvent
 
 fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
     let source_type = source_type_from_str(&row.get::<_, String>(5)?)?;
-    let memory_kind = memory_kind_from_str(&row.get::<_, String>(10)?)?;
-    let domain = memory_domain_from_str(&row.get::<_, String>(11)?)?;
-    let field = row.get::<_, String>(12)?;
-    let anchor_kind = anchor_kind_from_str(&row.get::<_, String>(13)?)?;
-    let anchor_id = row.get::<_, String>(14)?;
-    let parent_anchor_id = row.get::<_, Option<String>>(15)?;
+    let confidence = row.get::<_, f64>(6)?;
+    let memory_kind = memory_kind_from_str(&row.get::<_, String>(11)?)?;
+    let domain = memory_domain_from_str(&row.get::<_, String>(12)?)?;
+    let field = row.get::<_, String>(13)?;
+    let anchor_kind = anchor_kind_from_str(&row.get::<_, String>(14)?)?;
+    let anchor_id = row.get::<_, String>(15)?;
+    let parent_anchor_id = row.get::<_, Option<String>>(16)?;
     let provenance = row
-        .get::<_, Option<String>>(16)?
+        .get::<_, Option<String>>(17)?
         .as_deref()
         .map(provenance_from_str)
         .transpose()?;
-    let statement = row.get::<_, Option<String>>(17)?;
+    let statement = row.get::<_, Option<String>>(18)?;
     let tier = row
-        .get::<_, Option<String>>(18)?
+        .get::<_, Option<String>>(19)?
         .as_deref()
         .map(knowledge_tier_from_str)
         .transpose()?;
     let status = row
-        .get::<_, Option<String>>(19)?
+        .get::<_, Option<String>>(20)?
         .as_deref()
         .map(knowledge_status_from_str)
         .transpose()?;
-    let supporting_refs = parse_string_list(row.get::<_, Option<String>>(20)?.as_deref())?;
-    let counterexample_refs = parse_string_list(row.get::<_, Option<String>>(21)?.as_deref())?;
-    let teaching_refs = parse_string_list(row.get::<_, Option<String>>(22)?.as_deref())?;
-    let verification_refs = parse_string_list(row.get::<_, Option<String>>(23)?.as_deref())?;
-    let scope_constraints = row.get::<_, Option<String>>(24)?;
-    let trigger_hints = parse_optional_json(row.get::<_, Option<String>>(25)?.as_deref())?;
-    let effective_importance = row.get::<_, f64>(26)?;
+    let supporting_refs = parse_string_list(row.get::<_, Option<String>>(21)?.as_deref())?;
+    let counterexample_refs = parse_string_list(row.get::<_, Option<String>>(22)?.as_deref())?;
+    let teaching_refs = parse_string_list(row.get::<_, Option<String>>(23)?.as_deref())?;
+    let verification_refs = parse_string_list(row.get::<_, Option<String>>(24)?.as_deref())?;
+    let scope_constraints = row.get::<_, Option<String>>(25)?;
+    let trigger_hints = parse_optional_json(row.get::<_, Option<String>>(26)?.as_deref())?;
+    let effective_importance = row.get::<_, f64>(27)?;
 
     anchor::validate_anchor_domain(&domain, &anchor_kind)
         .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
@@ -4181,10 +4341,11 @@ fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
         room: row.get(3)?,
         source_file: row.get(4)?,
         source_type,
-        added_at: row.get(6)?,
-        chunk_index: row.get(7)?,
-        normalize_version: row.get(8)?,
-        importance: row.get(9)?,
+        confidence,
+        added_at: row.get(7)?,
+        chunk_index: row.get(8)?,
+        normalize_version: row.get(9)?,
+        importance: row.get(10)?,
         memory_kind,
         domain,
         field,
@@ -4259,7 +4420,7 @@ mod tests {
             wing: "test-wing".to_string(),
             room: Some("test-room".to_string()),
             source_file: Some(format!("{id}.md")),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "2026-05-13T00:00:00Z".to_string(),
             chunk_index: Some(0),
             importance: 0,
@@ -4570,7 +4731,7 @@ mod tests {
         assert_eq!(repaired.2, "general");
         assert_eq!(repaired.3, "repo");
         assert_eq!(repaired.4, "repo://legacy");
-        assert_eq!(repaired.5.as_deref(), Some("human"));
+        assert_eq!(repaired.5.as_deref(), Some("research"));
         assert_eq!(
             repaired.6.as_deref(),
             Some(blake3::hash(b"legacy body").to_hex().to_string().as_str())

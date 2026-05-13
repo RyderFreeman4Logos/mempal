@@ -6,7 +6,7 @@ use crate::core::{
     project::{ProjectSearchScope, SearchResultSource},
     types::{
         AnchorKind, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
-        RouteDecision, SearchResult,
+        RouteDecision, SearchResult, SourceType,
     },
     utils::source_file_or_synthetic,
 };
@@ -804,6 +804,8 @@ fn result_from_drawer(
         room: drawer.room,
         source_file: source_file_or_synthetic(&drawer.id, drawer.source_file.as_deref()),
         source,
+        source_type: drawer.source_type,
+        confidence: drawer.confidence,
         memory_kind: drawer.memory_kind,
         domain: drawer.domain,
         field: drawer.field,
@@ -1026,6 +1028,8 @@ pub fn search_by_vector(
                     room: row.get(3)?,
                     source_file: source_file_or_synthetic(&drawer_id, source_file.as_deref()),
                     source: scope.classify_row(row_project_id.as_deref()),
+                    source_type: SourceType::AgentInference,
+                    confidence: crate::core::types::default_confidence(SourceType::AgentInference),
                     // Knowledge fields are not available from the vector-only
                     // SQL path; use defaults.  Callers that need them should
                     // hydrate via the drawer record.
@@ -1139,6 +1143,8 @@ fn search_by_vector_scoped_exact(
                     room,
                     source_file,
                     source: scope.classify_row(row_project_id.as_deref()),
+                    source_type: SourceType::AgentInference,
+                    confidence: crate::core::types::default_confidence(SourceType::AgentInference),
                     memory_kind: MemoryKind::Evidence,
                     domain: MemoryDomain::Project,
                     field: String::new(),
@@ -1397,7 +1403,7 @@ mod tests {
             wing: wing.to_string(),
             room: Some(room.to_string()),
             source_file: Some(format!("{id}.md")),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1700000000".to_string(),
             chunk_index: None,
             importance: 0,
@@ -1413,6 +1419,8 @@ mod tests {
             room: drawer.room.clone(),
             source_file: drawer.source_file.clone().unwrap_or_default(),
             source: SearchResultSource::Project,
+            source_type: drawer.source_type,
+            confidence: drawer.confidence,
             memory_kind: MemoryKind::Evidence,
             domain: MemoryDomain::Project,
             field: String::new(),

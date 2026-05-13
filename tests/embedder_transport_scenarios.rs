@@ -151,7 +151,7 @@ async fn test_search_deadline_bm25_fallback() {
             wing: "test".to_string(),
             room: Some("fallback".to_string()),
             source_file: Some("fixtures/fallback.txt".to_string()),
-            source_type: SourceType::Project,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance: 2,

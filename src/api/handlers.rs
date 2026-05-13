@@ -156,6 +156,8 @@ struct SearchResultDto {
     room: Option<String>,
     source_file: String,
     source: String,
+    source_type: String,
+    confidence: f64,
     similarity: f32,
     route: RouteDecisionDto,
 }
@@ -308,7 +310,7 @@ async fn ingest_handler(
             &request.wing,
             request.room.as_deref(),
             chunk,
-            &SourceType::Manual,
+            &SourceType::AgentInference,
         );
         let drawer_id = db
             .resolve_available_drawer_id(&preferred_drawer_id)
@@ -400,7 +402,7 @@ async fn ingest_handler(
                 wing: request.wing.clone(),
                 room: request.room.clone(),
                 source_file: Some(source_file),
-                source_type: SourceType::Manual,
+                source_type: SourceType::AgentInference,
                 added_at: iso_timestamp(),
                 chunk_index: Some(*chunk_idx as i64),
                 importance: drawer_importance,
@@ -570,6 +572,8 @@ impl From<SearchResult> for SearchResultDto {
             room: value.room,
             source_file: value.source_file,
             source: value.source.as_str().to_string(),
+            source_type: value.source_type.as_str().to_string(),
+            confidence: value.confidence,
             similarity: value.similarity,
             route: value.route.into(),
         }

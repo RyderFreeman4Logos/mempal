@@ -63,7 +63,7 @@ fn insert_passive_drawer(db: &Database, id: &str, wing: &str, room: &str) {
         wing: wing.to_string(),
         room: Some(room.to_string()),
         source_file: Some(format!("{wing}.md")),
-        source_type: SourceType::Project,
+        source_type: SourceType::AgentInference,
         added_at: "1710000000".to_string(),
         chunk_index: Some(0),
         importance: 0,
@@ -78,7 +78,7 @@ fn insert_search_drawer(db: &Database, id: &str, wing: &str, room: &str, content
         wing: wing.to_string(),
         room: Some(room.to_string()),
         source_file: Some(format!("{wing}-{room}.md")),
-        source_type: SourceType::Project,
+        source_type: SourceType::AgentInference,
         added_at: "1710000000".to_string(),
         chunk_index: Some(0),
         importance: 0,
@@ -203,7 +203,7 @@ fn test_schema_v5_to_v6_migration_preserves_data() {
 
     let db = Database::open(&db_path).expect("migrate v5 db");
 
-    assert_eq!(db.schema_version().expect("schema version"), 10);
+    assert_eq!(db.schema_version().expect("schema version"), 11);
     assert_eq!(db.drawer_count().expect("drawer count"), 2);
     assert_eq!(db.triple_count().expect("triple count"), 1);
     let tunnels_count: i64 = db

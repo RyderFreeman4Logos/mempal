@@ -552,7 +552,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             wing: wing.to_string(),
             room: Some(resolved_room.clone()),
             source_file: Some(source_file.clone()),
-            source_type: source_type.clone(),
+            source_type,
             added_at: iso_timestamp(),
             chunk_index: Some(chunk_index as i64),
             importance: drawer_importance,
@@ -753,9 +753,9 @@ fn supersede_after_successful_replacement(
 fn source_type_for(format: Format) -> SourceType {
     match format {
         Format::ClaudeJsonl | Format::ChatGptJson | Format::CodexJsonl | Format::SlackJson => {
-            SourceType::Conversation
+            SourceType::AgentObservation
         }
-        Format::PlainText => SourceType::Project,
+        Format::PlainText => SourceType::AgentInference,
     }
 }
 

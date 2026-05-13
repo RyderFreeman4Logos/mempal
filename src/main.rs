@@ -1936,7 +1936,7 @@ async fn ingest_stdin_command(
     let project_id = resolve_project_id(project, config, cwd.as_deref())
         .context("failed to resolve stdin ingest project id")?;
 
-    let source_type = SourceType::Manual;
+    let source_type = SourceType::AgentInference;
     let replacement_target = db
         .resolve_replacement_target(
             supersedes,
@@ -2211,7 +2211,7 @@ async fn checkpoint_command(
 
             let wing = "session-checkpoint";
             let room: Option<&str> = Some("claude");
-            let source_type = SourceType::Manual;
+            let source_type = SourceType::AgentInference;
             let drawer_id = build_checkpoint_drawer_id(wing, room, &content, &source_type)
                 .context("failed to build checkpoint drawer id")?;
 

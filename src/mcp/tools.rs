@@ -651,6 +651,8 @@ pub struct SearchResultDto {
     pub room: Option<String>,
     pub source_file: String,
     pub source: String,
+    pub source_type: String,
+    pub confidence: f64,
     pub similarity: f32,
     pub route: RouteDecisionDto,
     /// Other wings sharing this room (tunnel cross-references).
@@ -1347,6 +1349,8 @@ impl SearchResultDto {
             room,
             source_file,
             source,
+            source_type,
+            confidence,
             memory_kind,
             domain,
             field,
@@ -1386,6 +1390,8 @@ impl SearchResultDto {
             room,
             source_file,
             source: source.as_str().to_string(),
+            source_type: source_type.as_str().to_string(),
+            confidence,
             similarity,
             route: route.into(),
             tunnel_hints,
@@ -1791,12 +1797,13 @@ impl From<TaxonomyEntry> for TaxonomyEntryDto {
 mod tests {
     use crate::core::types::{
         AnchorKind, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, RouteDecision,
-        SearchResult,
+        SearchResult, SourceType,
     };
 
     use super::SearchResultDto;
 
     fn sample_result(content: &str) -> SearchResult {
+        let source_type = SourceType::AgentInference;
         SearchResult {
             drawer_id: "drawer-1".to_string(),
             content: content.to_string(),
@@ -1804,6 +1811,8 @@ mod tests {
             room: Some("signals".to_string()),
             source_file: "/tmp/signals.md".to_string(),
             source: crate::core::project::SearchResultSource::Project,
+            source_type,
+            confidence: crate::core::types::default_confidence(source_type),
             memory_kind: MemoryKind::Knowledge,
             domain: MemoryDomain::Project,
             field: "bootstrap".to_string(),

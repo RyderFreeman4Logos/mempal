@@ -209,7 +209,7 @@ fn insert_drawer(db_path: &Path, seed: DrawerSeed<'_>, vector: &[f32]) {
             wing: seed.wing.to_string(),
             room: Some(seed.room.to_string()),
             source_file: Some(format!("{}.md", seed.id)),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance: 0,

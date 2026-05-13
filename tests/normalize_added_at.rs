@@ -45,7 +45,7 @@ fn insert_drawer_with_raw_added_at(db_path: &Path, id: &str, added_at: &str) {
         wing: "test".to_string(),
         room: Some("default".to_string()),
         source_file: Some(format!("{id}.md")),
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
         added_at: "placeholder".to_string(), // will be overwritten below
         chunk_index: Some(0),
         importance: 0,
@@ -293,7 +293,7 @@ fn test_ingest_path_writes_iso_not_epoch() {
         wing: "test".to_string(),
         room: Some("default".to_string()),
         source_file: Some("test.md".to_string()),
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
         added_at: iso_timestamp(),
         chunk_index: Some(0),
         importance: 0,

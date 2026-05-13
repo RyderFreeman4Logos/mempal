@@ -344,7 +344,7 @@ impl MempalMcpServer {
         inserted_drawer_ids: &mut Vec<String>,
         newly_created_drawer_ids: &mut Vec<String>,
     ) -> std::result::Result<(), ErrorData> {
-        let source_type = SourceType::Manual;
+        let source_type = SourceType::AgentInference;
         let metadata = validate_ingest_request(request, &source_type)?;
         db.record_novelty_audit(
             primary_drawer_id,
@@ -632,7 +632,8 @@ fn drawer_from_ingest_metadata(
         wing: request.wing.clone(),
         room: request.room.clone(),
         source_file,
-        source_type: source_type.clone(),
+        source_type: *source_type,
+        confidence: crate::core::types::default_confidence(*source_type),
         added_at: iso_timestamp(),
         chunk_index: Some(chunk_idx as i64),
         normalize_version: CURRENT_NORMALIZE_VERSION,
@@ -1801,7 +1802,7 @@ impl MempalMcpServer {
         }
         let drawer_importance = raw_turn_importance(&request.wing, room, &config.turns)
             .unwrap_or_else(|| request.importance.unwrap_or(0));
-        let source_type = SourceType::Manual;
+        let source_type = SourceType::AgentInference;
         let metadata = validate_ingest_request(&request, &source_type)?;
 
         if !dry_run && global_embed_status().should_block_writes() {
@@ -3872,7 +3873,7 @@ mod tests {
             wing: wing.to_string(),
             room: room.map(str::to_string),
             source_file: Some(source_file.to_string()),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance,
@@ -3914,13 +3915,15 @@ mod tests {
         refs: KnowledgeRefs,
     ) {
         let db = Database::open(db_path).expect("open db");
+        let source_type = SourceType::AgentInference;
         let drawer = Drawer {
             id: id.to_string(),
             content: content.to_string(),
             wing: "mempal".to_string(),
             room: Some("context".to_string()),
             source_file: Some(format!("knowledge://project/context/{id}")),
-            source_type: SourceType::Manual,
+            source_type,
+            confidence: crate::core::types::default_confidence(source_type),
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             normalize_version: 1,
@@ -3955,13 +3958,15 @@ mod tests {
         anchor_args: KnowledgeAnchorArgs<'_>,
     ) {
         let db = Database::open(db_path).expect("open db");
+        let source_type = SourceType::AgentInference;
         let drawer = Drawer {
             id: id.to_string(),
             content: format!("{id} content"),
             wing: "mempal".to_string(),
             room: Some("context".to_string()),
             source_file: Some(format!("knowledge://project/context/{id}")),
-            source_type: SourceType::Manual,
+            source_type,
+            confidence: crate::core::types::default_confidence(source_type),
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             normalize_version: 1,
@@ -6504,7 +6509,7 @@ mod tests_duplicate_conflict_artifact {
             wing: wing.to_string(),
             room: room.map(str::to_string),
             source_file: Some(source_file.to_string()),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance,
@@ -6552,7 +6557,7 @@ mod tests_duplicate_conflict_artifact {
             wing: "mempal".to_string(),
             room: Some("context".to_string()),
             source_file: Some(format!("knowledge://project/context/{id}")),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             normalize_version: 1,
@@ -6593,7 +6598,7 @@ mod tests_duplicate_conflict_artifact {
             wing: "mempal".to_string(),
             room: Some("context".to_string()),
             source_file: Some(format!("knowledge://project/context/{id}")),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             normalize_version: 1,
