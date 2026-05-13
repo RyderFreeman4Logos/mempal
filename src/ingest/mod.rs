@@ -486,6 +486,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
                     db,
                     options.project_id,
                     &gating.fact_check,
+                    confidence,
                 )
                 .map_err(|source| IngestError::InsertDrawer {
                     drawer_id: drawer_id.clone(),

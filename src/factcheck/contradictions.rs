@@ -1,6 +1,7 @@
 //! KG-backed contradiction + staleness detection for extracted triples.
 
 use crate::core::db::{Database, DbError};
+use crate::core::types::Triple;
 
 use super::FactIssue;
 
@@ -33,6 +34,7 @@ pub fn are_incompatible(p1: &str, p2: &str) -> bool {
 pub fn detect_relation_contradictions(
     db: &Database,
     text_triples: &[(String, String, String)],
+    new_confidence: f64,
 ) -> Result<Vec<FactIssue>, DbError> {
     let mut issues = Vec::new();
 
@@ -42,17 +44,30 @@ pub fn detect_relation_contradictions(
         let active = db.query_triples(Some(subject), None, Some(object), true)?;
         for kg in active {
             if are_incompatible(text_pred, &kg.predicate) {
+                let existing_confidence = triple_confidence(db, &kg)?;
                 issues.push(FactIssue::RelationContradiction {
                     subject: subject.clone(),
                     text_claim: text_pred.clone(),
                     kg_fact: kg.predicate.clone(),
                     triple_id: kg.id.clone(),
                     source_drawer: kg.source_drawer.clone(),
+                    new_confidence,
+                    existing_confidence,
+                    confidence_gap: (new_confidence - existing_confidence).abs(),
                 });
             }
         }
     }
     Ok(issues)
+}
+
+fn triple_confidence(db: &Database, triple: &Triple) -> Result<f64, DbError> {
+    if let Some(source_drawer) = triple.source_drawer.as_deref()
+        && let Some(drawer) = db.get_drawer(source_drawer)?
+    {
+        return Ok(drawer.confidence);
+    }
+    Ok(triple.confidence)
 }
 
 pub fn detect_stale_facts(

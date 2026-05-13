@@ -384,6 +384,7 @@ pub fn evaluate_fact_check_gate(
     db: &Database,
     project_id: Option<&str>,
     config: &AutoFactCheckConfig,
+    new_confidence: f64,
 ) -> Result<Option<FactCheckGateOutcome>, DbError> {
     if !config.enabled {
         return Ok(None);
@@ -403,7 +404,7 @@ pub fn evaluate_fact_check_gate(
         }
     };
 
-    let report = match factcheck::check(chunk_text, db, now, None) {
+    let report = match factcheck::check_with_confidence(chunk_text, db, now, None, new_confidence) {
         Ok(report) => report,
         Err(error) => {
             let outcome = fact_check_fail_open_outcome(error.to_string());
@@ -474,7 +475,11 @@ fn fact_check_fail_open_outcome(error: String) -> FactCheckGateOutcome {
 
 fn fact_issue_rejects(issue: &FactIssue, config: &AutoFactCheckConfig) -> bool {
     match issue {
-        FactIssue::RelationContradiction { .. } => config.reject_on_contradiction,
+        FactIssue::RelationContradiction {
+            new_confidence,
+            existing_confidence,
+            ..
+        } => config.reject_on_contradiction && new_confidence <= existing_confidence,
         FactIssue::StaleFact { .. } => config.reject_on_stale,
         FactIssue::SimilarNameConflict { .. } => config.reject_on_similar_name,
     }
@@ -503,8 +508,11 @@ fn format_fact_issue_warning(issue: &FactIssue) -> String {
             kg_fact,
             triple_id,
             source_drawer,
+            new_confidence,
+            existing_confidence,
+            confidence_gap,
         } => format!(
-            "fact_check.relation_contradiction: subject={subject} text_claim={text_claim} kg_fact={kg_fact} triple_id={triple_id} source_drawer={}",
+            "fact_check.relation_contradiction: subject={subject} text_claim={text_claim} kg_fact={kg_fact} triple_id={triple_id} source_drawer={} new_confidence={new_confidence:.3} existing_confidence={existing_confidence:.3} confidence_gap={confidence_gap:.3}",
             source_drawer.as_deref().unwrap_or("")
         ),
         FactIssue::StaleFact {

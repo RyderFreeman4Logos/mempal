@@ -5,7 +5,7 @@ use std::path::Path;
 
 use mempal::core::config::{AutoFactCheckConfig, IngestGatingConfig};
 use mempal::core::db::Database;
-use mempal::core::types::Triple;
+use mempal::core::types::{SourceType, Triple};
 use mempal::core::utils::build_triple_id;
 use mempal::embed::{Embedder, Result as EmbedResult};
 use mempal::ingest::{IngestOptions, ingest_file_with_options};
@@ -42,6 +42,16 @@ fn write_input(dir: &Path, content: &str) -> std::path::PathBuf {
 }
 
 fn insert_triple(db: &Database, subject: &str, predicate: &str, object: &str) {
+    insert_triple_with_confidence(db, subject, predicate, object, 1.0);
+}
+
+fn insert_triple_with_confidence(
+    db: &Database,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    confidence: f64,
+) {
     let triple = Triple {
         id: build_triple_id(subject, predicate, object),
         subject: subject.to_string(),
@@ -49,7 +59,7 @@ fn insert_triple(db: &Database, subject: &str, predicate: &str, object: &str) {
         object: object.to_string(),
         valid_from: Some("1700000000".to_string()),
         valid_to: None,
-        confidence: 1.0,
+        confidence,
         source_drawer: None,
     };
     db.insert_triple(&triple).expect("insert triple");
@@ -131,6 +141,62 @@ async fn test_fact_check_contradiction_rejects_when_enabled() {
         rows[0].1.as_deref(),
         Some("fact_check.relation_contradiction")
     );
+}
+
+#[tokio::test]
+async fn test_fact_check_contradiction_allows_higher_confidence_new_fact() {
+    let (tmp, db) = new_test_db();
+    insert_triple_with_confidence(&db, "Bob", "husband_of", "Alice", 0.3);
+    let path = write_input(tmp.path(), "Bob is Alice's brother.");
+    let gating = gating(enabled_fact_check(true));
+
+    let stats = ingest_file_with_options(
+        &db,
+        &StubEmbedder,
+        &path,
+        "mempal",
+        IngestOptions {
+            room: Some("decision"),
+            gating: Some(&gating),
+            project_id: Some("test-project"),
+            source_type: Some(SourceType::UserExplicit),
+            confidence: Some(0.9),
+            ..IngestOptions::default()
+        },
+    )
+    .await
+    .expect("ingest");
+
+    assert_eq!(stats.dropped_by_gate, 0);
+    assert_eq!(stats.drawer_ids.len(), 1);
+    assert!(
+        stats
+            .fact_check_warnings
+            .iter()
+            .any(|w| w.contains("new_confidence=0.900")
+                && w.contains("existing_confidence=0.300")
+                && w.contains("confidence_gap=0.600"))
+    );
+    let rows = fact_audit_rows(&db);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "keep");
+    assert_eq!(
+        rows[0].1.as_deref(),
+        Some("fact_check.relation_contradiction")
+    );
+}
+
+#[tokio::test]
+async fn test_fact_check_contradiction_rejects_equal_confidence_new_fact() {
+    let (tmp, db) = new_test_db();
+    insert_triple_with_confidence(&db, "Bob", "husband_of", "Alice", 0.5);
+    let path = write_input(tmp.path(), "Bob is Alice's brother.");
+    let gating = gating(enabled_fact_check(true));
+
+    let stats = ingest_with_gating(&db, &path, "mempal", &gating).await;
+
+    assert_eq!(stats.dropped_by_gate, 1);
+    assert!(stats.drawer_ids.is_empty());
 }
 
 #[tokio::test]

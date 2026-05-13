@@ -2091,6 +2091,7 @@ async fn ingest_stdin_command(
                 db,
                 project_id.as_deref(),
                 &config.ingest_gating.fact_check,
+                confidence,
             )
             .with_context(|| format!("failed to record fact-check gate audit for {drawer_id}"))?
         {

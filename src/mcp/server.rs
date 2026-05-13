@@ -2111,6 +2111,7 @@ impl MempalMcpServer {
                 &db,
                 project_id.as_deref(),
                 &config.ingest_gating.fact_check,
+                confidence,
             )
             .map_err(db_error)?
         {

@@ -352,6 +352,7 @@ async fn ingest_handler(
                 &db,
                 project_id.as_deref(),
                 &config.ingest_gating.fact_check,
+                confidence,
             )
             .map_err(internal_error)?
         {
