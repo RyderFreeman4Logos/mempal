@@ -103,6 +103,30 @@ class MempalProviderScopeTests(unittest.TestCase):
         self.assertTrue(ingest_bodies)
         self.assertTrue(all(body["project_id"] == "project-alpha" for body in ingest_bodies))
 
+    def test_cwd_fallback_uses_directory_basename_as_project_id(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize(
+            "session-a",
+            user_id="alice",
+            profile="work",
+            cwd="/home/alice/my-project/",
+            chat_id="chat-a",
+        )
+
+        provider.responses["/api/timeline"] = [{"content": "fact"}]
+        provider.handle_tool_call("mempal_profile", {"limit": 5})
+        provider.handle_tool_call("mempal_search", {"query": "fact", "top_k": 3})
+        provider.handle_tool_call("mempal_conclude", {"conclusion": "durable fact"})
+
+        timeline_params = provider.gets[0][1]
+        search_params = provider.gets[1][1]
+        ingest_bodies = [body for path, body in provider.posts if path == "/api/ingest"]
+
+        self.assertEqual(timeline_params["project_id"], "my-project")
+        self.assertEqual(search_params["project_id"], "my-project")
+        self.assertTrue(ingest_bodies)
+        self.assertTrue(all(body["project_id"] == "my-project" for body in ingest_bodies))
+
     def test_session_switch_clears_prefetch_results(self) -> None:
         provider = RecordingProvider()
         provider.initialize("session-a", user_id="alice", profile="work")

@@ -174,7 +174,10 @@ class MempalMemoryProvider:
             thread_id = self._thread_id if preserve_existing else ""
 
         if "project_id" in context or "cwd" in context:
-            project_id = context.get("project_id") or context.get("cwd", "")
+            project_id = context.get("project_id") or ""
+            if not project_id:
+                cwd = str(context.get("cwd") or "")
+                project_id = os.path.basename(cwd.rstrip("/")) if cwd else ""
         else:
             project_id = self._project_id if preserve_existing else ""
 

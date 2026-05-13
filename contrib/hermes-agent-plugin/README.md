@@ -63,9 +63,10 @@ or `profile`.
 - Session summaries → `room="sessions/{session_id}"`
 - Built-in memory mirrors → `room="facts"`, scoped turns/session rooms, or `room="memory-mirror/{target}"`
 
-When Hermes provides `project_id` (or `cwd` as a fallback), the plugin forwards
-it to `/api/search`, `/api/timeline`, and `/api/ingest` for mempal project
-isolation.
+When Hermes provides `project_id`, the plugin forwards it to `/api/search`,
+`/api/timeline`, and `/api/ingest` for mempal project isolation. When only
+`cwd` is available, the plugin derives the project scope from the directory
+basename.
 
 ## Circuit breaker
 
