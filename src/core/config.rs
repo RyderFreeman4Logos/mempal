@@ -35,6 +35,7 @@ const DEFAULT_SEARCH_TUNNEL_PENALTY: f32 = 0.7;
 const DEFAULT_SEARCH_DECAY_HALF_LIFE_DAYS: u64 = 90;
 const DEFAULT_SEARCH_DECAY_STEP_FULL_DAYS: u64 = 30;
 const DEFAULT_SEARCH_DECAY_STEP_REDUCED_WEIGHT: f64 = 0.5;
+const DEFAULT_SEARCH_BM25_FALLBACK: bool = true;
 const DEFAULT_TURN_STORAGE_MODE: TurnStorageMode = TurnStorageMode::RawEvidence;
 const DEFAULT_TURN_IMPORTANCE: i32 = 0;
 const DEFAULT_ALERT_EVERY_N_FAILURES: u64 = 100;
@@ -47,6 +48,8 @@ const DEFAULT_MCP_LOG_PATH: &str = "~/.mempal/mcp.log";
 const DEFAULT_SESSION_REVIEW_WING: &str = "session-reviews";
 const DEFAULT_SESSION_REVIEW_MIN_LENGTH: usize = 100;
 const DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES: usize = 1;
+const DEFAULT_API_WRITE_QUEUE_CAPACITY: usize = 1_000;
+const DEFAULT_API_WRITE_DRAIN_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_HOTPATCH_MIN_IMPORTANCE_STARS: i32 = 4;
 const DEFAULT_HOTPATCH_MAX_SUGGESTION_LENGTH: usize = 80;
 const DEFAULT_IMPORTANCE_DECAY_RATE: f64 = 0.01;
@@ -235,6 +238,16 @@ impl Config {
         if self.search.preview_chars == 0 {
             return Err(ConfigError::InvalidConfig(
                 "search.preview_chars must be greater than 0".to_string(),
+            ));
+        }
+        if self.api.write_queue_capacity == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "api.write_queue_capacity must be greater than 0".to_string(),
+            ));
+        }
+        if self.api.write_drain_timeout_secs == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "api.write_drain_timeout_secs must be greater than 0".to_string(),
             ));
         }
         if !(0..=5).contains(&self.turns.default_importance) {
@@ -707,6 +720,10 @@ pub struct ApiConfig {
     pub enabled: bool,
     /// Address to bind the REST API server on.
     pub addr: String,
+    /// Maximum number of pending REST write requests before new writes get 503.
+    pub write_queue_capacity: usize,
+    /// Maximum time to wait for queued REST writes during graceful shutdown.
+    pub write_drain_timeout_secs: u64,
 }
 
 impl Default for ApiConfig {
@@ -714,6 +731,8 @@ impl Default for ApiConfig {
         Self {
             enabled: true,
             addr: "127.0.0.1:3080".to_string(),
+            write_queue_capacity: DEFAULT_API_WRITE_QUEUE_CAPACITY,
+            write_drain_timeout_secs: DEFAULT_API_WRITE_DRAIN_TIMEOUT_SECS,
         }
     }
 }
@@ -1138,6 +1157,7 @@ impl Default for ConfigHotReloadConfig {
 #[serde(default)]
 pub struct SearchConfig {
     pub strict_project_isolation: bool,
+    pub bm25_fallback: bool,
     pub progressive_disclosure: bool,
     pub exclude_raw_turns: bool,
     pub preview_chars: usize,
@@ -1157,6 +1177,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             strict_project_isolation: false,
+            bm25_fallback: DEFAULT_SEARCH_BM25_FALLBACK,
             progressive_disclosure: true,
             exclude_raw_turns: true,
             preview_chars: DEFAULT_SEARCH_PREVIEW_CHARS,

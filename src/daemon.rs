@@ -71,7 +71,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     // even when hooks are disabled.
     #[cfg(feature = "rest")]
     let _rest_task: Option<tokio::task::JoinHandle<_>> = if context.config.api.enabled {
-        use crate::api::{ApiState, serve as serve_rest_api};
+        use crate::api::{ApiState, serve_with_shutdown as serve_rest_api};
         use std::sync::Arc;
 
         let addr = context.config.api.addr.clone();
@@ -90,7 +90,13 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                 let factory = crate::embed::ConfiguredEmbedderFactory::new(config_for_rest);
                 let state = ApiState::new(db_path_rest, Arc::new(factory));
                 Some(tokio::spawn(async move {
-                    if let Err(error) = serve_rest_api(listener, state).await {
+                    if let Err(error) = serve_rest_api(listener, state, async {
+                        while !shutdown_requested() {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    })
+                    .await
+                    {
                         tracing::error!("daemon REST server error: {error}");
                     }
                 }))
