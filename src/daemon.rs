@@ -543,8 +543,12 @@ fn apply_turn_strata(record: &mut DrawerRecord, config: &crate::core::config::Co
 }
 
 fn should_keep_drawer_record(record: &DrawerRecord, config: &crate::core::config::Config) -> bool {
-    !is_raw_turn(&record.wing, Some(record.room.as_str()), &config.turns)
-        || should_store_raw_turns(&config.turns.storage_mode)
+    !raw_turn_storage_disabled(&record.wing, &record.room, config)
+}
+
+fn raw_turn_storage_disabled(wing: &str, room: &str, config: &crate::core::config::Config) -> bool {
+    is_raw_turn(wing, Some(room), &config.turns)
+        && !should_store_raw_turns(&config.turns.storage_mode)
 }
 
 fn wing_from_cwd(cwd: &str) -> Option<String> {
@@ -675,8 +679,13 @@ fn build_audit_drawer_record(
     }
 
     let raw_payload = envelope.payload.as_deref().unwrap_or_default();
+    let (wing, room) = audit_target_for_event(&envelope.event, raw_payload, config);
     let preview = config.scrub_content(&preview_for_event(&envelope.event, raw_payload));
-    let payload_path = persist_raw_payload(raw_payload, mempal_home)?;
+    let payload_path = if raw_turn_storage_disabled(&wing, &room, config) {
+        synthetic_source_file("hook-payload-skipped")
+    } else {
+        persist_raw_payload(raw_payload, mempal_home)?
+    };
     let content = serde_json::to_string(&json!({
         "event": envelope.event,
         "agent": envelope.agent,
@@ -694,7 +703,6 @@ fn build_audit_drawer_record(
         hook_payload_session_id(raw_payload).as_deref(),
         Some(envelope.captured_at.as_str()),
     );
-    let (wing, room) = audit_target_for_event(&envelope.event, raw_payload, config);
 
     Ok(DrawerRecord {
         wing,
@@ -1307,7 +1315,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::core::{
-        config::Config,
+        config::{Config, TurnStorageMode},
         db::Database,
         queue::{ClaimedMessage, PendingMessageStore, QueueError},
     };
@@ -1315,8 +1323,8 @@ mod tests {
     use crate::hook::{CapturedHookEnvelope, HookEvent};
 
     use super::{
-        ClaimNextSource, ClaimPollResult, DaemonIngestContext, poll_claim_next,
-        process_claimed_message_with_embedder, wing_from_cwd,
+        ClaimNextSource, ClaimPollResult, DaemonIngestContext, build_drawer_records,
+        poll_claim_next, process_claimed_message_with_embedder, wing_from_cwd,
     };
 
     struct StubClaimSource {
@@ -1467,6 +1475,47 @@ mod tests {
             )
             .expect("query drawer added_at");
         assert_eq!(added_at, captured_at);
+    }
+
+    #[test]
+    fn test_storage_mode_off_skips_hook_payload_file_for_raw_audit() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mempal_home = tmp.path().join(".mempal");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let raw_payload = serde_json::json!({
+            "session_id": "sess-raw-off",
+            "tool_name": "Bash",
+            "input": "printf secret",
+            "output": "raw payload must not be written",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(raw_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: raw_payload.len(),
+            truncated: false,
+        };
+        let mut config = Config::default();
+        config.turns.storage_mode = TurnStorageMode::Off;
+        config.turns.raw_turn_wings = vec!["hooks-raw".to_string()];
+        config.turns.raw_turn_rooms = Vec::new();
+
+        let records =
+            build_drawer_records(&db, &envelope, &config, &mempal_home).expect("drawer records");
+
+        assert!(records.is_empty());
+        assert!(
+            !mempal_home.join("hook-payloads").exists(),
+            "raw hook payload directory must not be created when turn storage is off"
+        );
     }
 
     #[test]
