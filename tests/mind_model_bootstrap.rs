@@ -747,6 +747,29 @@ async fn test_mcp_ingest_defaults_to_evidence_drawer_bootstrap_metadata() {
 }
 
 #[tokio::test]
+async fn test_mcp_ingest_stores_source_confidence_params() {
+    let (_tmp, db, server) = setup_mcp_server();
+    let response = server
+        .ingest_json_for_test(json!({
+            "content": "Explicit source confidence body",
+            "wing": "mempal",
+            "room": "confidence",
+            "source_type": "user_explicit",
+            "confidence": 0.82
+        }))
+        .await
+        .expect("ingest should succeed");
+
+    let drawer = db
+        .get_drawer(&response.drawer_id)
+        .expect("load drawer")
+        .expect("drawer exists");
+
+    assert_eq!(drawer.source_type, SourceType::UserExplicit);
+    assert!((drawer.confidence - 0.82).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
 async fn test_mcp_ingest_default_drawer_id_matches_bootstrap_identity() {
     let (_tmp, _db, server) = setup_mcp_server();
     let content = "Default MCP identity body";
@@ -803,6 +826,33 @@ async fn test_rest_ingest_default_evidence_drawer_id_matches_mcp() {
         body["drawer_id"],
         build_drawer_id("mempal", Some("identity"), content)
     );
+}
+
+#[cfg(feature = "rest")]
+#[tokio::test]
+async fn test_rest_ingest_stores_source_confidence_params() {
+    let (_tmp, db, _server, state) = setup_rest_mcp_server();
+    let (status, body) = post_rest_ingest(
+        state,
+        json!({
+            "content": "REST source confidence body",
+            "wing": "mempal",
+            "room": "confidence",
+            "source_type": "agent_observation",
+            "confidence": 0.73
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let drawer_id = body["drawer_id"].as_str().expect("drawer_id string");
+    let drawer = db
+        .get_drawer(drawer_id)
+        .expect("load drawer")
+        .expect("drawer exists");
+
+    assert_eq!(drawer.source_type, SourceType::AgentObservation);
+    assert!((drawer.confidence - 0.73).abs() < f64::EPSILON);
 }
 
 #[cfg(feature = "rest")]

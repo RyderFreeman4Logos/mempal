@@ -788,6 +788,8 @@ pub struct IngestRequest {
     pub wing: String,
     pub room: Option<String>,
     pub source: Option<String>,
+    pub source_type: Option<String>,
+    pub confidence: Option<f64>,
     pub project_id: Option<String>,
     /// Drawer ID to replace. The old drawer must be active and in the
     /// same project scope as this ingest.

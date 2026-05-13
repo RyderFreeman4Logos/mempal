@@ -19,7 +19,7 @@ use crate::core::{
     config::IngestGatingConfig,
     db::Database,
     strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
-    types::{BootstrapEvidenceArgs, Drawer, SourceType},
+    types::{BootstrapEvidenceArgs, Drawer, SourceType, default_confidence},
     utils::{
         build_bootstrap_evidence_drawer_id, build_drawer_id, iso_timestamp, link_superseded_drawer,
         route_room_from_taxonomy,
@@ -76,6 +76,8 @@ pub struct IngestOptions<'a> {
     pub gating: Option<&'a IngestGatingConfig>,
     pub prototype_classifier: Option<&'a PrototypeClassifier>,
     pub source_file_override: Option<&'a str>,
+    pub source_type: Option<SourceType>,
+    pub confidence: Option<f64>,
     pub replace_existing_source: bool,
     pub no_strip_noise: bool,
     pub diary_rollup: bool,
@@ -220,6 +222,8 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             gating: None,
             prototype_classifier: None,
             source_file_override: None,
+            source_type: None,
+            confidence: None,
             replace_existing_source: false,
             no_strip_noise: false,
             diary_rollup: false,
@@ -364,7 +368,10 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         Some(guard)
     };
 
-    let source_type = source_type_for(format);
+    let source_type = options.source_type.unwrap_or(SourceType::AgentInference);
+    let confidence = options
+        .confidence
+        .unwrap_or_else(|| default_confidence(source_type));
     if options.replace_existing_source && !options.dry_run {
         db.replace_active_source_drawers(&source_file, wing, Some(resolved_room.as_str()))
             .map_err(|source| IngestError::ReplaceSource {
@@ -558,6 +565,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             importance: drawer_importance,
         });
         let drawer = Drawer {
+            confidence,
             normalize_version: CURRENT_NORMALIZE_VERSION,
             ..drawer
         };
@@ -657,6 +665,8 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             gating: None,
             prototype_classifier: None,
             source_file_override: None,
+            source_type: None,
+            confidence: None,
             replace_existing_source: false,
             no_strip_noise: false,
             diary_rollup: false,
@@ -748,15 +758,6 @@ fn supersede_after_successful_replacement(
         stats.superseded_drawer_id = Some(target_id.to_string());
     }
     Ok(())
-}
-
-fn source_type_for(format: Format) -> SourceType {
-    match format {
-        Format::ClaudeJsonl | Format::ChatGptJson | Format::CodexJsonl | Format::SlackJson => {
-            SourceType::AgentObservation
-        }
-        Format::PlainText => SourceType::AgentInference,
-    }
 }
 
 fn should_skip_dir(path: &Path) -> bool {

@@ -557,3 +557,42 @@ pub struct SearchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_pattern_id: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_type_round_trips_as_snake_case() {
+        let encoded = serde_json::to_string(&SourceType::UserExplicit).expect("serialize");
+        assert_eq!(encoded, "\"user_explicit\"");
+        let decoded: SourceType = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, SourceType::UserExplicit);
+        assert_eq!(SourceType::SystemGenerated.to_string(), "system_generated");
+    }
+
+    #[test]
+    fn source_type_from_str_accepts_current_and_legacy_values() {
+        assert_eq!(
+            "agent_observation".parse::<SourceType>().expect("current"),
+            SourceType::AgentObservation
+        );
+        assert_eq!(
+            "conversation".parse::<SourceType>().expect("legacy"),
+            SourceType::AgentObservation
+        );
+        assert_eq!(
+            "manual".parse::<SourceType>().expect("legacy"),
+            SourceType::AgentInference
+        );
+        assert!("unknown".parse::<SourceType>().is_err());
+    }
+
+    #[test]
+    fn default_confidence_matches_trust_hierarchy() {
+        assert_eq!(default_confidence(SourceType::UserExplicit), 0.9);
+        assert_eq!(default_confidence(SourceType::AgentObservation), 0.7);
+        assert_eq!(default_confidence(SourceType::AgentInference), 0.5);
+        assert_eq!(default_confidence(SourceType::SystemGenerated), 0.3);
+    }
+}

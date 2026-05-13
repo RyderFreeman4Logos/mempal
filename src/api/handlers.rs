@@ -5,6 +5,7 @@ use crate::core::{
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
         BootstrapEvidenceArgs, Drawer, RouteDecision, SearchResult, SourceType, TaxonomyEntry,
+        default_confidence,
     },
     utils::{
         build_bootstrap_evidence_drawer_id, iso_timestamp, link_superseded_drawer,
@@ -84,6 +85,8 @@ struct IngestRequest {
     wing: String,
     room: Option<String>,
     source: Option<String>,
+    source_type: Option<String>,
+    confidence: Option<f64>,
     project_id: Option<String>,
     supersedes: Option<String>,
     replace_text: Option<String>,
@@ -120,6 +123,31 @@ fn validate_temporal_param(name: &str, value: Option<&str>) -> Result<(), ApiErr
         ));
     }
     Ok(())
+}
+
+fn parse_source_type_param(value: Option<&str>) -> Result<SourceType, ApiError> {
+    match value {
+        Some(raw) => raw.parse::<SourceType>().map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "source_type must be one of user_explicit, agent_observation, agent_inference, system_generated",
+            )
+        }),
+        None => Ok(SourceType::AgentInference),
+    }
+}
+
+fn resolve_confidence_param(source_type: SourceType, value: Option<f64>) -> Result<f64, ApiError> {
+    match value {
+        Some(confidence) if confidence.is_finite() && (0.0..=1.0).contains(&confidence) => {
+            Ok(confidence)
+        }
+        Some(_) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "confidence must be a finite float between 0.0 and 1.0",
+        )),
+        None => Ok(default_confidence(source_type)),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +271,8 @@ async fn ingest_handler(
     let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
     validate_temporal_param("valid_from", request.valid_from.as_deref())?;
     validate_temporal_param("valid_until", request.valid_until.as_deref())?;
+    let source_type = parse_source_type_param(request.source_type.as_deref())?;
+    let confidence = resolve_confidence_param(source_type, request.confidence)?;
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
         .map_err(internal_error)?;
     let raw_turn = is_raw_turn(&request.wing, request.room.as_deref(), &config.turns);
@@ -310,7 +340,7 @@ async fn ingest_handler(
             &request.wing,
             request.room.as_deref(),
             chunk,
-            &SourceType::AgentInference,
+            &source_type,
         );
         let drawer_id = db
             .resolve_available_drawer_id(&preferred_drawer_id)
@@ -402,12 +432,13 @@ async fn ingest_handler(
                 wing: request.wing.clone(),
                 room: request.room.clone(),
                 source_file: Some(source_file),
-                source_type: SourceType::AgentInference,
+                source_type,
                 added_at: iso_timestamp(),
                 chunk_index: Some(*chunk_idx as i64),
                 importance: drawer_importance,
             });
             let drawer = Drawer {
+                confidence,
                 normalize_version: CURRENT_NORMALIZE_VERSION,
                 ..drawer
             };
