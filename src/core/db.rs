@@ -1968,6 +1968,7 @@ impl Database {
         room: Option<&str>,
         project_id: Option<&str>,
         limit: usize,
+        strict_null_only: bool,
     ) -> Result<Vec<Drawer>, DbError> {
         let sql_limit =
             i64::try_from(limit).map_err(|_| DbError::InvalidSourceType("limit".to_string()))?;
@@ -1990,6 +1991,8 @@ impl Database {
         if let Some(p) = project_id {
             values.push(SqlValue::Text(p.to_string()));
             sql.push_str(&format!("AND project_id = ?{} ", values.len()));
+        } else if strict_null_only {
+            sql.push_str("AND project_id IS NULL ");
         }
         values.push(SqlValue::Integer(sql_limit));
         sql.push_str(&format!(

@@ -11,7 +11,7 @@ use serde_json::json;
 use super::state::ApiState;
 use crate::core::config::ConfigHandle;
 use crate::core::db::Database;
-use crate::core::project::resolve_project_id;
+use crate::core::project::{ProjectFilterMode, ProjectSearchScope, resolve_project_id};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -52,13 +52,21 @@ async fn timeline_handler(
     let config = ConfigHandle::current();
     let project_id = resolve_project_id(query.project_id.as_deref(), config.as_ref(), None)
         .map_err(hermes_internal)?;
+    let scope = ProjectSearchScope::from_request(
+        project_id,
+        false,
+        false,
+        config.search.strict_project_isolation,
+    );
     let limit = query.limit.unwrap_or(50).min(500);
+    let strict_null_only = scope.mode == ProjectFilterMode::NullOnly;
     let drawers = db
         .timeline_drawers(
             query.wing.as_deref(),
             query.room.as_deref(),
-            project_id.as_deref(),
+            scope.project_id.as_deref(),
             limit,
+            strict_null_only,
         )
         .map_err(hermes_internal)?;
 
@@ -85,16 +93,33 @@ async fn delete_handler(
     let config = ConfigHandle::current();
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
         .map_err(hermes_internal)?;
-    if let Some(ref pid) = project_id {
-        let drawer_project = db
-            .drawer_project_id(&request.drawer_id)
-            .map_err(hermes_internal)?;
-        if drawer_project.as_deref() != Some(pid.as_str()) {
-            return Err(HermesError {
-                status: StatusCode::FORBIDDEN,
-                message: format!("drawer '{}' belongs to another project", request.drawer_id),
-            });
+    let scope = ProjectSearchScope::from_request(
+        project_id,
+        false,
+        false,
+        config.search.strict_project_isolation,
+    );
+    let drawer_project = db
+        .drawer_project_id(&request.drawer_id)
+        .map_err(hermes_internal)?;
+    match scope.mode {
+        ProjectFilterMode::ProjectScoped | ProjectFilterMode::ProjectPlusGlobal => {
+            if drawer_project.as_deref() != scope.project_id.as_deref() {
+                return Err(HermesError {
+                    status: StatusCode::FORBIDDEN,
+                    message: format!("drawer '{}' belongs to another project", request.drawer_id),
+                });
+            }
         }
+        ProjectFilterMode::NullOnly => {
+            if drawer_project.is_some() {
+                return Err(HermesError {
+                    status: StatusCode::FORBIDDEN,
+                    message: format!("drawer '{}' belongs to another project", request.drawer_id),
+                });
+            }
+        }
+        ProjectFilterMode::AllProjects => {}
     }
     let deleted = db
         .soft_delete_drawer(&request.drawer_id)
