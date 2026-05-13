@@ -141,6 +141,9 @@ fn insert_existing_card(db: &Database, source_drawer_id: &str) {
         parent_anchor_id: None,
         scope_constraints: None,
         trigger_hints: None,
+        auto_generated: false,
+        crystallization_score: None,
+        source_drawer_ids: Vec::new(),
         created_at: "1710000000".to_string(),
         updated_at: "1710000000".to_string(),
     };

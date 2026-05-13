@@ -153,6 +153,20 @@ fn index_exists(db: &Database, index: &str) -> bool {
         .expect("query index existence")
 }
 
+fn column_exists(db: &Database, table: &str, column: &str) -> bool {
+    let mut statement = db
+        .conn()
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .expect("prepare table info");
+    statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query columns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect columns")
+        .iter()
+        .any(|name| name == column)
+}
+
 fn insert_evidence_drawer(db: &Database, id: &str) {
     db.insert_drawer(&Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: id.to_string(),
@@ -245,10 +259,10 @@ fn insert_event(
 }
 
 #[test]
-fn test_new_database_schema_version_is_12() {
+fn test_new_database_schema_version_is_15() {
     let (_tmp, db) = new_db();
 
-    assert_eq!(db.schema_version().expect("schema version"), 14);
+    assert_eq!(db.schema_version().expect("schema version"), 15);
     for table in [
         "knowledge_cards",
         "knowledge_evidence_links",
@@ -256,6 +270,16 @@ fn test_new_database_schema_version_is_12() {
         "runtime_adoption_events",
     ] {
         assert!(table_exists(&db, table), "{table} should exist");
+    }
+    for column in [
+        "auto_generated",
+        "crystallization_score",
+        "source_drawer_ids",
+    ] {
+        assert!(
+            column_exists(&db, "knowledge_cards", column),
+            "{column} should exist"
+        );
     }
 }
 
@@ -267,7 +291,7 @@ fn test_migration_v7_to_v10_adds_phase2_phase3_and_validity_without_data_loss() 
 
     let db = Database::open(&db_path).expect("migrate v7 db");
 
-    assert_eq!(db.schema_version().expect("schema version"), 14);
+    assert_eq!(db.schema_version().expect("schema version"), 15);
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
     assert_eq!(db.triple_count().expect("triple count"), 1);
     let taxonomy_count: i64 = db
@@ -301,6 +325,15 @@ fn test_migration_v7_to_v10_adds_phase2_phase3_and_validity_without_data_loss() 
 fn test_knowledge_cards_reject_invalid_tier_status_domain_anchor() {
     let (_tmp, db) = new_db();
 
+    insert_card_with(
+        &db,
+        "card_pending_review",
+        "shu",
+        "pending_review",
+        "project",
+        "repo",
+    )
+    .expect("pending_review should be allowed");
     assert!(insert_card_with(&db, "card_bad_tier", "bad", "promoted", "project", "repo").is_err());
     assert!(insert_card_with(&db, "card_bad_status", "shu", "bad", "project", "repo").is_err());
     assert!(insert_card_with(&db, "card_bad_domain", "shu", "promoted", "bad", "repo").is_err());
@@ -424,6 +457,7 @@ fn test_knowledge_card_schema_indexes_exist() {
         "idx_knowledge_cards_tier_status",
         "idx_knowledge_cards_domain_field",
         "idx_knowledge_cards_anchor",
+        "idx_knowledge_cards_auto_pending",
         "idx_knowledge_evidence_links_card",
         "idx_knowledge_evidence_links_evidence",
         "idx_knowledge_events_card_created_at",

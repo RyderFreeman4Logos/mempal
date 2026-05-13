@@ -39,6 +39,7 @@ use mempal::core::{
         source_file_or_synthetic,
     },
 };
+use mempal::crystallize::{CrystallizeOptions, CrystallizeSummary, run_crystallization};
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
 use mempal::field_taxonomy::{FieldTaxonomyEntry, field_taxonomy};
@@ -161,6 +162,19 @@ struct SleepCommandOptions {
     rem: bool,
     salience: bool,
     dry_run: bool,
+}
+
+struct CrystallizeCliOptions {
+    dry_run: bool,
+    project: Option<String>,
+    json: bool,
+}
+
+struct CardsCommandOptions {
+    pending: bool,
+    approve: Option<String>,
+    reject: Option<String>,
+    format: String,
 }
 
 struct ContextCommandArgs {
@@ -399,6 +413,14 @@ enum Commands {
         #[arg(long)]
         limit: Option<usize>,
     },
+    Crystallize {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     Sleep {
         #[arg(long)]
         nrem: bool,
@@ -420,6 +442,16 @@ enum Commands {
     KnowledgeCard {
         #[command(subcommand)]
         command: KnowledgeCardCommands,
+    },
+    Cards {
+        #[arg(long)]
+        pending: bool,
+        #[arg(long)]
+        approve: Option<String>,
+        #[arg(long)]
+        reject: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
     },
     Phase3 {
         #[command(subcommand)]
@@ -1499,6 +1531,19 @@ fn run() -> Result<()> {
                 limit,
             },
         ),
+        Commands::Crystallize {
+            dry_run,
+            project,
+            json,
+        } => block_on_result(crystallize_command(
+            &db,
+            config.as_ref(),
+            CrystallizeCliOptions {
+                dry_run,
+                project,
+                json,
+            },
+        )),
         Commands::Sleep {
             nrem,
             rem,
@@ -1521,6 +1566,20 @@ fn run() -> Result<()> {
         Commands::KnowledgeCard { command } => {
             block_on_result(knowledge_card_command(&db, config.as_ref(), command))
         }
+        Commands::Cards {
+            pending,
+            approve,
+            reject,
+            format,
+        } => cards_command(
+            &db,
+            CardsCommandOptions {
+                pending,
+                approve,
+                reject,
+                format,
+            },
+        ),
         Commands::Phase3 { command } => phase3_command(&db, command),
         Commands::Tunnels { command } => tunnels_command(&db, command),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
@@ -3153,6 +3212,7 @@ fn knowledge_status_slug(v: &KnowledgeStatus) -> &'static str {
     match v {
         KnowledgeStatus::Active => "active",
         KnowledgeStatus::Superseded => "superseded",
+        KnowledgeStatus::PendingReview => "pending_review",
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
@@ -3164,6 +3224,7 @@ fn parse_knowledge_status(v: &str) -> Result<KnowledgeStatus> {
     match v {
         "active" => Ok(KnowledgeStatus::Active),
         "superseded" => Ok(KnowledgeStatus::Superseded),
+        "pending_review" => Ok(KnowledgeStatus::PendingReview),
         "candidate" => Ok(KnowledgeStatus::Candidate),
         "promoted" => Ok(KnowledgeStatus::Promoted),
         "canonical" => Ok(KnowledgeStatus::Canonical),
@@ -3543,6 +3604,168 @@ fn sleep_command(db: &Database, config: &Config, options: SleepCommandOptions) -
     Ok(())
 }
 
+async fn crystallize_command(
+    db: &Database,
+    config: &Config,
+    options: CrystallizeCliOptions,
+) -> Result<()> {
+    let current_dir = env::current_dir().ok();
+    let project_id = match options.project {
+        Some(project) => Some(project),
+        None => resolve_project_id(None, config, current_dir.as_deref())
+            .context("failed to resolve project id for crystallization")?,
+    };
+    let summary = run_crystallization(
+        db,
+        config,
+        CrystallizeOptions {
+            dry_run: options.dry_run,
+            project_id,
+            use_llm: true,
+        },
+    )
+    .await
+    .context("auto-crystallization failed")?;
+    print_crystallize_summary(&summary, options.json)
+}
+
+fn print_crystallize_summary(summary: &CrystallizeSummary, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "candidates_found": summary.candidates_found,
+                "cards_created": summary.cards_created,
+                "dry_run": summary.dry_run,
+                "used_llm": summary.used_llm,
+                "fallback_count": summary.fallback_count,
+                "candidates": summary.candidates.iter().map(|candidate| {
+                    serde_json::json!({
+                        "card_id": &candidate.card.id,
+                        "status": knowledge_status_slug(&candidate.card.status),
+                        "cluster_key": &candidate.cluster_key,
+                        "drawer_count": candidate.drawer_count,
+                        "crystallization_score": candidate.crystallization_score,
+                        "source_drawer_ids": &candidate.source_drawer_ids,
+                        "source_files": &candidate.source_files,
+                        "used_llm": candidate.used_llm,
+                        "fallback_reason": &candidate.fallback_reason,
+                    })
+                }).collect::<Vec<_>>()
+            }))
+            .context("failed to serialize crystallize summary")?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "crystallize: candidates_found={} cards_created={} dry_run={}",
+        summary.candidates_found, summary.cards_created, summary.dry_run
+    );
+    for candidate in &summary.candidates {
+        println!(
+            "candidate card_id={} status={} score={:.3} drawers={} key={}",
+            candidate.card.id,
+            knowledge_status_slug(&candidate.card.status),
+            candidate.crystallization_score,
+            candidate.drawer_count,
+            candidate.cluster_key
+        );
+        println!("statement: {}", candidate.card.statement);
+        if !candidate.source_files.is_empty() {
+            println!("sources: {}", candidate.source_files.join(", "));
+        }
+    }
+    Ok(())
+}
+
+fn cards_command(db: &Database, options: CardsCommandOptions) -> Result<()> {
+    let selected = usize::from(options.pending)
+        + usize::from(options.approve.is_some())
+        + usize::from(options.reject.is_some());
+    if selected != 1 {
+        bail!("choose exactly one of --pending, --approve <card_id>, or --reject <card_id>");
+    }
+    if options.pending {
+        let cards = db
+            .list_knowledge_cards(&KnowledgeCardFilter {
+                status: Some(KnowledgeStatus::PendingReview),
+                auto_generated: Some(true),
+                pending_review: Some(true),
+                ..KnowledgeCardFilter::default()
+            })
+            .context("failed to list pending auto-generated cards")?;
+        return print_knowledge_cards(&cards, &options.format);
+    }
+    if let Some(card_id) = options.approve {
+        let card = set_pending_auto_card_status(
+            db,
+            &card_id,
+            KnowledgeStatus::Promoted,
+            "approved auto-generated card",
+        )?;
+        return print_knowledge_card(&card, &options.format);
+    }
+    if let Some(card_id) = options.reject {
+        let card = set_pending_auto_card_status(
+            db,
+            &card_id,
+            KnowledgeStatus::Retired,
+            "rejected auto-generated card",
+        )?;
+        return print_knowledge_card(&card, &options.format);
+    }
+    unreachable!()
+}
+
+fn set_pending_auto_card_status(
+    db: &Database,
+    card_id: &str,
+    status: KnowledgeStatus,
+    reason: &str,
+) -> Result<KnowledgeCard> {
+    let mut card = db
+        .get_knowledge_card(card_id)
+        .context("failed to get knowledge card")?
+        .with_context(|| format!("knowledge card not found: {card_id}"))?;
+    if !card.auto_generated || card.status != KnowledgeStatus::PendingReview {
+        bail!("card {card_id} is not a pending auto-generated card");
+    }
+    let old_status = card.status.clone();
+    card.status = status.clone();
+    card.updated_at = current_timestamp();
+    db.update_knowledge_card(&card)
+        .context("failed to update knowledge card")?;
+    db.append_knowledge_event(&KnowledgeCardEvent {
+        id: stable_cli_id(
+            "event",
+            &[
+                card.id.as_str(),
+                knowledge_status_slug(&status),
+                card.updated_at.as_str(),
+            ],
+        ),
+        card_id: card.id.clone(),
+        event_type: if status == KnowledgeStatus::Retired {
+            KnowledgeEventType::Retired
+        } else {
+            KnowledgeEventType::Promoted
+        },
+        from_status: Some(old_status),
+        to_status: Some(status),
+        reason: reason.to_string(),
+        actor: Some("mempal.cards".to_string()),
+        metadata: Some(serde_json::json!({
+            "auto_generated": true,
+            "crystallization_score": card.crystallization_score,
+            "source_drawer_ids": card.source_drawer_ids,
+        })),
+        created_at: card.updated_at.clone(),
+    })
+    .context("failed to append knowledge card event")?;
+    Ok(card)
+}
+
 fn print_sleep_summary(summary: &SleepCycleSummary) {
     println!(
         "sleep: phases={} dry_run={}",
@@ -3556,6 +3779,12 @@ fn print_sleep_summary(summary: &SleepCycleSummary) {
     );
     if let Some(nrem) = &summary.nrem {
         print_nrem_summary(nrem);
+    }
+    if summary.crystallize_candidates > 0 || summary.crystallized_cards > 0 {
+        println!(
+            "crystallize: candidates={} cards_created={}",
+            summary.crystallize_candidates, summary.crystallized_cards
+        );
     }
     if let Some(rem) = &summary.rem {
         print_rem_summary(rem);
@@ -4135,6 +4364,9 @@ async fn knowledge_card_command(
                 parent_anchor_id,
                 scope_constraints,
                 trigger_hints,
+                auto_generated: false,
+                crystallization_score: None,
+                source_drawer_ids: Vec::new(),
                 created_at: now.clone(),
                 updated_at: now,
             };
@@ -4173,6 +4405,7 @@ async fn knowledge_card_command(
                 field,
                 anchor_kind: anchor_kind.as_deref().map(parse_anchor_kind).transpose()?,
                 anchor_id,
+                ..KnowledgeCardFilter::default()
             };
             let cards = db
                 .list_knowledge_cards(&filter)
@@ -4377,6 +4610,7 @@ async fn knowledge_card_command(
                 field,
                 anchor_kind: anchor_kind.as_deref().map(parse_anchor_kind).transpose()?,
                 anchor_id,
+                ..KnowledgeCardFilter::default()
             };
             let report = build_backfill_report(db, &filter)
                 .context("failed to build knowledge card backfill plan")?;
@@ -4399,6 +4633,7 @@ async fn knowledge_card_command(
                 field,
                 anchor_kind: anchor_kind.as_deref().map(parse_anchor_kind).transpose()?,
                 anchor_id,
+                ..KnowledgeCardFilter::default()
             };
             let result = apply_backfill(db, &filter, KnowledgeCardBackfillApplyOptions { execute })
                 .context("failed to apply knowledge card backfill")?;
@@ -4843,12 +5078,16 @@ fn print_knowledge_cards(cards: &[KnowledgeCard], format: &str) -> Result<()> {
             }
             for card in cards {
                 println!(
-                    "{} tier={} status={} domain={} field={} anchor={} {}",
+                    "{} tier={} status={} domain={} field={} auto_generated={} score={} anchor={} {}",
                     card.id,
                     knowledge_tier_slug(&card.tier),
                     knowledge_status_slug(&card.status),
                     domain_slug(&card.domain),
                     card.field,
+                    card.auto_generated,
+                    card.crystallization_score
+                        .map(|score| format!("{score:.3}"))
+                        .unwrap_or_else(|| "none".to_string()),
                     anchor_kind_slug(&card.anchor_kind),
                     card.anchor_id
                 );
@@ -5866,6 +6105,12 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     let consolidation_stats = db
         .consolidation_stats()
         .context("failed to read consolidation stats")?;
+    let pending_card_count = db
+        .pending_auto_generated_knowledge_card_count()
+        .context("failed to count pending auto-generated cards")?;
+    let last_crystallization_at = db
+        .last_crystallization_at()
+        .context("failed to read last crystallization timestamp")?;
     let daemon_pid = read_daemon_pid(db.path())?;
     let daemon_running = daemon_pid
         .map(process_is_running)
@@ -5937,6 +6182,12 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         "  conflicts_resolved: {}",
         consolidation_stats.sleep_conflicts_resolved
     );
+    println!("Crystallize:");
+    println!("  pending_card_count: {pending_card_count}");
+    match last_crystallization_at.as_deref() {
+        Some(last) => println!("  last_crystallization_at: {last}"),
+        None => println!("  last_crystallization_at: none"),
+    }
     let triple_count = db.triple_count().context("failed to count triples")?;
     println!("taxonomy_entries: {taxonomy_count}");
     if triple_count > 0 {

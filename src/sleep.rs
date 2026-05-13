@@ -22,6 +22,7 @@ use crate::core::{
     types::CompactionStrategy,
     utils::{current_timestamp, iso_timestamp},
 };
+use crate::crystallize::{CrystallizeOptions, run_crystallization_deterministic};
 use crate::factcheck::{self, FactCheckError, FactIssue};
 
 #[derive(Debug, Error)]
@@ -30,6 +31,8 @@ pub enum SleepError {
     Db(#[from] DbError),
     #[error(transparent)]
     FactCheck(#[from] FactCheckError),
+    #[error(transparent)]
+    Crystallize(#[from] crate::crystallize::CrystallizeError),
     #[error("invalid sleep configuration: {0}")]
     InvalidConfig(String),
 }
@@ -133,6 +136,8 @@ pub struct SleepCycleSummary {
     pub nrem: Option<NremSummary>,
     pub rem: Option<RemSummary>,
     pub salience: Option<SalienceSummary>,
+    pub crystallize_candidates: usize,
+    pub crystallized_cards: usize,
 }
 
 impl SleepCycleSummary {
@@ -210,6 +215,21 @@ pub fn run_sleep_cycle(
         match phase {
             SleepPhase::Nrem => {
                 summary.nrem = Some(run_nrem(db, config, &project_ids, options.dry_run)?);
+                if config.crystallize.enabled {
+                    for project_id in &project_ids {
+                        let crystallize = run_crystallization_deterministic(
+                            db,
+                            config,
+                            CrystallizeOptions {
+                                dry_run: options.dry_run,
+                                project_id: project_id.clone(),
+                                use_llm: false,
+                            },
+                        )?;
+                        summary.crystallize_candidates += crystallize.candidates_found;
+                        summary.crystallized_cards += crystallize.cards_created;
+                    }
+                }
             }
             SleepPhase::Rem => {
                 summary.rem = Some(run_rem(db, config, &project_ids, options.dry_run)?);

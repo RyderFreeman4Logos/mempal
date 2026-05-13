@@ -869,6 +869,7 @@ fn append_card_context_items(
                     field: Some(request.field.clone()),
                     anchor_kind: Some(anchor.anchor_kind.clone()),
                     anchor_id: Some(anchor.anchor_id.clone()),
+                    ..KnowledgeCardFilter::default()
                 })
                 .map_err(ContextError::LoadCard)?;
             for card in cards {
@@ -971,6 +972,7 @@ fn status_slug(value: &KnowledgeStatus) -> &'static str {
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Active => "active",
         KnowledgeStatus::Superseded => "superseded",
+        KnowledgeStatus::PendingReview => "pending_review",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
         KnowledgeStatus::Demoted => "demoted",

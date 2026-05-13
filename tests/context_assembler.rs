@@ -97,6 +97,9 @@ fn knowledge_card(
         parent_anchor_id: None,
         scope_constraints: None,
         trigger_hints: None,
+        auto_generated: false,
+        crystallization_score: None,
+        source_drawer_ids: Vec::new(),
         created_at: "1710000000".to_string(),
         updated_at: "1710000000".to_string(),
     }
@@ -996,10 +999,10 @@ async fn test_context_assembler_returns_typed_pack() {
 #[test]
 fn test_context_assembler_does_not_bump_schema() {
     let (tmp, db) = setup_cli_home();
-    assert_eq!(db.schema_version().expect("schema"), 14);
+    assert_eq!(db.schema_version().expect("schema"), 15);
     let before_tables = table_names(&db);
     let _ = run_context_plain(tmp.path(), "debug", &[]);
-    assert_eq!(db.schema_version().expect("schema"), 14);
+    assert_eq!(db.schema_version().expect("schema"), 15);
     assert_eq!(table_names(&db), before_tables);
 }
 

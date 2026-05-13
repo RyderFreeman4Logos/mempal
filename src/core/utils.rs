@@ -435,6 +435,7 @@ fn knowledge_status_as_str(status: &KnowledgeStatus) -> &'static str {
     match status {
         KnowledgeStatus::Active => "active",
         KnowledgeStatus::Superseded => "superseded",
+        KnowledgeStatus::PendingReview => "pending_review",
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",

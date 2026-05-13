@@ -44,6 +44,9 @@ fn card(id: &str, tier: KnowledgeTier, status: KnowledgeStatus, field: &str) -> 
         parent_anchor_id: None,
         scope_constraints: None,
         trigger_hints: None,
+        auto_generated: false,
+        crystallization_score: None,
+        source_drawer_ids: Vec::new(),
         created_at: "1710000000".to_string(),
         updated_at: "1710000000".to_string(),
     }
@@ -107,12 +110,85 @@ fn insert_knowledge_drawer(db: &Database, id: &str) {
     db.insert_drawer(&drawer).expect("insert knowledge drawer");
 }
 
+fn insert_crystallize_drawers(db: &Database, project_id: &str) {
+    for (index, added_at) in [
+        "2026-01-01T00:00:00Z",
+        "2026-01-10T00:00:00Z",
+        "2026-01-20T00:00:00Z",
+        "2026-01-30T00:00:00Z",
+        "2026-02-10T00:00:00Z",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: format!("drawer_crystallize_{index}"),
+            content: "Decision: Mempal auto crystallization preserves source citations for review."
+                .to_string(),
+            wing: "mempal".to_string(),
+            room: Some("crystallize".to_string()),
+            source_file: Some(format!("tests://crystallize/{index}")),
+            source_type: SourceType::AgentInference,
+            added_at: added_at.to_string(),
+            chunk_index: Some(0),
+            importance: 5,
+        });
+        db.insert_drawer_with_project(&drawer, Some(project_id))
+            .expect("insert crystallize drawer");
+    }
+}
+
 fn stdout_text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 fn stderr_text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+#[test]
+fn test_cli_crystallize_dry_run_shows_candidates_without_creating_cards() {
+    let (home, db) = setup_home();
+    insert_crystallize_drawers(&db, "cli-crystallize");
+
+    let output = run_mempal(
+        home.path(),
+        &["crystallize", "--project", "cli-crystallize", "--dry-run"],
+    );
+
+    assert!(output.status.success(), "stderr={}", stderr_text(&output));
+    let stdout = stdout_text(&output);
+    assert!(stdout.contains("candidates_found=1"), "{stdout}");
+    assert!(stdout.contains("candidate card_id="), "{stdout}");
+    assert!(
+        db.list_knowledge_cards(&Default::default())
+            .expect("list cards")
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_cli_cards_pending_lists_auto_generated_cards() {
+    let (home, db) = setup_home();
+    insert_crystallize_drawers(&db, "cli-crystallize");
+
+    let created = run_mempal(
+        home.path(),
+        &["crystallize", "--project", "cli-crystallize"],
+    );
+    assert!(created.status.success(), "stderr={}", stderr_text(&created));
+
+    let pending = run_mempal(home.path(), &["cards", "--pending"]);
+
+    assert!(pending.status.success(), "stderr={}", stderr_text(&pending));
+    let stdout = stdout_text(&pending);
+    assert!(stdout.contains("status=pending_review"), "{stdout}");
+    assert!(stdout.contains("auto_generated=true"), "{stdout}");
+    assert!(
+        db.pending_auto_generated_knowledge_card_count()
+            .expect("pending count")
+            >= 1
+    );
 }
 
 #[test]

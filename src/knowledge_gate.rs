@@ -109,6 +109,7 @@ fn load_gate_knowledge_drawer(db: &Database, drawer_id: &str) -> Result<Drawer> 
 
 fn parse_status(value: &str) -> Result<KnowledgeStatus> {
     match value.trim() {
+        "pending_review" => Ok(KnowledgeStatus::PendingReview),
         "candidate" => Ok(KnowledgeStatus::Candidate),
         "promoted" => Ok(KnowledgeStatus::Promoted),
         "canonical" => Ok(KnowledgeStatus::Canonical),
@@ -129,17 +130,20 @@ fn validate_tier_status(tier: &KnowledgeTier, status: &KnowledgeStatus) -> Resul
     let allowed = match tier {
         KnowledgeTier::DaoTian => &[KnowledgeStatus::Canonical, KnowledgeStatus::Demoted][..],
         KnowledgeTier::DaoRen => &[
+            KnowledgeStatus::PendingReview,
             KnowledgeStatus::Candidate,
             KnowledgeStatus::Promoted,
             KnowledgeStatus::Demoted,
             KnowledgeStatus::Retired,
         ][..],
         KnowledgeTier::Shu => &[
+            KnowledgeStatus::PendingReview,
             KnowledgeStatus::Promoted,
             KnowledgeStatus::Demoted,
             KnowledgeStatus::Retired,
         ][..],
         KnowledgeTier::Qi => &[
+            KnowledgeStatus::PendingReview,
             KnowledgeStatus::Candidate,
             KnowledgeStatus::Promoted,
             KnowledgeStatus::Demoted,
@@ -306,6 +310,7 @@ fn status_slug(value: &KnowledgeStatus) -> &'static str {
     match value {
         KnowledgeStatus::Active => "active",
         KnowledgeStatus::Superseded => "superseded",
+        KnowledgeStatus::PendingReview => "pending_review",
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
