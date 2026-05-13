@@ -272,7 +272,10 @@ class MempalMemoryProvider:
 
         if tool_name == "mempal_profile":
             try:
-                limit = min(int(args.get("limit", 20)), 100)
+                try:
+                    limit = min(int(args.get("limit", 20)), 100)
+                except (ValueError, TypeError):
+                    limit = 20
                 entries = self._get(
                     "/api/timeline",
                     {"wing": self._wing, "limit": limit},
@@ -290,7 +293,10 @@ class MempalMemoryProvider:
             query = args.get("query", "")
             if not query:
                 return json.dumps({"error": "Missing required parameter: query"})
-            top_k = min(int(args.get("top_k", 10)), 50)
+            try:
+                top_k = min(int(args.get("top_k", 10)), 50)
+            except (ValueError, TypeError):
+                top_k = 10
             try:
                 results = self._get(
                     "/api/search",
