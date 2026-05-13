@@ -1743,6 +1743,12 @@ impl MempalMcpServer {
         })?;
         let chunks =
             crate::ingest::prepare_chunks(&scrubbed_content, &config.chunker, embedder.as_ref());
+        if chunks.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "content produced no chunks",
+                None,
+            ));
+        }
 
         let scrubbed_replace_text = request
             .replace_text
@@ -5776,6 +5782,31 @@ mod tests {
                 .unwrap_or_default()
                 .contains(&format!("supersedes:{}", old.drawer_id))
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_supersedes_empty_chunks_errors_without_retiring_old() {
+        let (_tempdir, db_path, server) = setup_server();
+        let old = ingest_manual(&server, "empty replacement old fact", None, None, None).await;
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "   \n\t  ".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("replace".to_string()),
+                supersedes: Some(old.drawer_id.clone()),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(_) => panic!("empty replacement should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("content produced no chunks"));
+        let db = Database::open(&db_path).expect("open db");
+        assert!(db.get_drawer(&old.drawer_id).expect("old lookup").is_some());
+        assert_eq!(db.drawer_count().expect("drawer count"), 1);
     }
 
     #[tokio::test]
