@@ -461,7 +461,7 @@ async fn ingest_corpus<E: Embedder + ?Sized>(
             wing: BENCH_WING.to_string(),
             room: room.clone(),
             source_file: Some(format!("longmemeval://{}", item.corpus_id)),
-            source_type: SourceType::Conversation,
+            source_type: SourceType::AgentObservation,
             added_at: item.timestamp.clone(),
             chunk_index: Some(0),
             importance: 0,

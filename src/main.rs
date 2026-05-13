@@ -29,7 +29,7 @@ use mempal::core::{
         KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole,
         KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, RuntimeAdoptionEvent,
         RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack, SourceType,
-        TaxonomyEntry, TriggerHints, TunnelEndpoint,
+        TaxonomyEntry, TriggerHints, TunnelEndpoint, default_confidence,
     },
     utils::{
         build_bootstrap_evidence_drawer_id, build_triple_id, current_timestamp,
@@ -120,6 +120,8 @@ struct IngestCommandOptions<'a> {
     json: bool,
     no_strip_noise: bool,
     diary_rollup: bool,
+    source_type: Option<&'a str>,
+    confidence: Option<f64>,
     supersedes: Option<&'a str>,
     replace_text: Option<&'a str>,
     valid_from: Option<&'a str>,
@@ -191,6 +193,10 @@ enum Commands {
         no_strip_noise: bool,
         #[arg(long)]
         diary_rollup: bool,
+        #[arg(long = "source-type")]
+        source_type: Option<String>,
+        #[arg(long)]
+        confidence: Option<f64>,
         #[arg(long)]
         supersedes: Option<String>,
         #[arg(long)]
@@ -1196,6 +1202,8 @@ fn run() -> Result<()> {
             json,
             no_strip_noise,
             diary_rollup,
+            source_type,
+            confidence,
             supersedes,
             replace_text,
             valid_from,
@@ -1215,6 +1223,8 @@ fn run() -> Result<()> {
                 json,
                 no_strip_noise,
                 diary_rollup,
+                source_type: source_type.as_deref(),
+                confidence,
                 supersedes: supersedes.as_deref(),
                 replace_text: replace_text.as_deref(),
                 valid_from: valid_from.as_deref(),
@@ -1703,6 +1713,9 @@ async fn ingest_command(
         .context("failed to resolve ingest project id")?;
     let valid_from = validate_temporal_bound("--valid-from", options.valid_from)?;
     let valid_until = validate_temporal_bound("--valid-until", options.valid_until)?;
+    let source_type = parse_source_type_bound("--source-type", options.source_type)?
+        .unwrap_or(SourceType::AgentInference);
+    let confidence = resolve_confidence_bound("--confidence", source_type, options.confidence)?;
     let base_options = IngestOptions {
         room: options.room,
         source_root: if path.is_file() {
@@ -1715,6 +1728,8 @@ async fn ingest_command(
         gating: None,
         prototype_classifier: None,
         source_file_override: None,
+        source_type: Some(source_type),
+        confidence: Some(confidence),
         replace_existing_source: false,
         no_strip_noise: options.no_strip_noise,
         diary_rollup: options.diary_rollup,
@@ -1749,6 +1764,8 @@ async fn ingest_command(
             gating: (!options.no_gate).then_some(&config.ingest_gating),
             prototype_classifier: prototype_classifier.as_ref(),
             source_file_override: None,
+            source_type: Some(source_type),
+            confidence: Some(confidence),
             replace_existing_source: false,
             no_strip_noise: options.no_strip_noise,
             diary_rollup: options.diary_rollup,
@@ -1813,6 +1830,8 @@ struct StdinIngestRecord {
     project: Option<String>,
     source: Option<String>,
     source_file: Option<String>,
+    source_type: Option<String>,
+    confidence: Option<f64>,
     supersedes: Option<String>,
     replace_text: Option<String>,
     valid_from: Option<String>,
@@ -1865,6 +1884,31 @@ fn validate_temporal_bound<'a>(field: &str, value: Option<&'a str>) -> Result<Op
     Ok(value)
 }
 
+fn parse_source_type_bound(field: &str, value: Option<&str>) -> Result<Option<SourceType>> {
+    value
+        .map(|raw| {
+            raw.parse::<SourceType>()
+                .with_context(|| format!("{field} must be one of user_explicit, agent_observation, agent_inference, system_generated"))
+        })
+        .transpose()
+}
+
+fn resolve_confidence_bound(
+    field: &str,
+    source_type: SourceType,
+    value: Option<f64>,
+) -> Result<f64> {
+    match value {
+        Some(confidence) if confidence.is_finite() && (0.0..=1.0).contains(&confidence) => {
+            Ok(confidence)
+        }
+        Some(confidence) => {
+            bail!("{field} must be a finite float between 0.0 and 1.0, got {confidence}")
+        }
+        None => Ok(default_confidence(source_type)),
+    }
+}
+
 async fn ingest_stdin_command(
     db: &Database,
     config: &Config,
@@ -1910,6 +1954,16 @@ async fn ingest_stdin_command(
     let project = options.project.or(record.project.as_deref());
     let supersedes = options.supersedes.or(record.supersedes.as_deref());
     let replace_text = options.replace_text.or(record.replace_text.as_deref());
+    let source_type = parse_source_type_bound(
+        "source_type",
+        options.source_type.or(record.source_type.as_deref()),
+    )?
+    .unwrap_or(SourceType::AgentInference);
+    let confidence = resolve_confidence_bound(
+        "confidence",
+        source_type,
+        options.confidence.or(record.confidence),
+    )?;
     let valid_from = validate_temporal_bound(
         "valid_from",
         options.valid_from.or(record.valid_from.as_deref()),
@@ -1936,7 +1990,6 @@ async fn ingest_stdin_command(
     let project_id = resolve_project_id(project, config, cwd.as_deref())
         .context("failed to resolve stdin ingest project id")?;
 
-    let source_type = SourceType::Manual;
     let replacement_target = db
         .resolve_replacement_target(
             supersedes,
@@ -2038,6 +2091,7 @@ async fn ingest_stdin_command(
                 db,
                 project_id.as_deref(),
                 &config.ingest_gating.fact_check,
+                confidence,
             )
             .with_context(|| format!("failed to record fact-check gate audit for {drawer_id}"))?
         {
@@ -2082,6 +2136,7 @@ async fn ingest_stdin_command(
         importance: drawer_importance,
     });
     let drawer = Drawer {
+        confidence,
         normalize_version: CURRENT_NORMALIZE_VERSION,
         ..drawer
     };
@@ -2211,7 +2266,7 @@ async fn checkpoint_command(
 
             let wing = "session-checkpoint";
             let room: Option<&str> = Some("claude");
-            let source_type = SourceType::Manual;
+            let source_type = SourceType::AgentInference;
             let drawer_id = build_checkpoint_drawer_id(wing, room, &content, &source_type)
                 .context("failed to build checkpoint drawer id")?;
 
@@ -5235,6 +5290,9 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
     let drawer_count = db.drawer_count().context("failed to count drawers")?;
+    let source_type_counts = db
+        .source_type_counts()
+        .context("failed to count drawers per source type")?;
     let raw_turn_count =
         count_raw_turn_drawers(db, &config.turns).context("failed to count raw turn drawers")?;
     let project_breakdown: Option<Vec<(Option<String>, i64)>> = if full {
@@ -5310,6 +5368,14 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         println!("triples: {triple_count}");
     }
     println!("db_size_bytes: {db_size_bytes}");
+    println!("Source Types:");
+    if source_type_counts.is_empty() {
+        println!("  none");
+    } else {
+        for (source_type, count) in source_type_counts {
+            println!("  {source_type}: {count}");
+        }
+    }
     println!("Turns:");
     println!("  storage_mode: {}", config.turns.storage_mode);
     println!("  default_importance: {}", config.turns.default_importance);

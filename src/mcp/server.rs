@@ -13,7 +13,7 @@ use crate::core::{
     types::{
         AnchorKind, BootstrapIdentityParts, Drawer, ExplicitTunnel, KnowledgeCardFilter,
         KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance, SourceType,
-        TriggerHints, Triple,
+        TriggerHints, Triple, default_confidence,
     },
     utils::{
         build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp, iso_timestamp,
@@ -77,9 +77,9 @@ use super::tools::{
     PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
     ReadDrawersRequest, ReadDrawersResponse, RetrievedKnowledgeCardDto, RollbackRequest,
     RollbackResponse, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto,
-    SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, StatusResponse, SystemWarning,
-    TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto,
-    TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, StatusResponse,
+    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
+    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 #[derive(Clone)]
@@ -341,10 +341,11 @@ impl MempalMcpServer {
         novelty: &crate::ingest::novelty::NoveltyDecision,
         audit_decision: Option<&str>,
         importance: i32,
+        source_type: SourceType,
+        confidence: f64,
         inserted_drawer_ids: &mut Vec<String>,
         newly_created_drawer_ids: &mut Vec<String>,
     ) -> std::result::Result<(), ErrorData> {
-        let source_type = SourceType::Manual;
         let metadata = validate_ingest_request(request, &source_type)?;
         db.record_novelty_audit(
             primary_drawer_id,
@@ -390,7 +391,10 @@ impl MempalMcpServer {
                 chunk_did,
                 chunk,
                 *chunk_idx,
-                &source_type,
+                SourceConfidence {
+                    source_type,
+                    confidence,
+                },
                 importance,
             );
             db.insert_drawer_with_project_validity(
@@ -601,13 +605,47 @@ fn validate_temporal_param(name: &str, value: Option<&str>) -> std::result::Resu
     Ok(())
 }
 
+fn parse_source_type_param(value: Option<&str>) -> std::result::Result<SourceType, ErrorData> {
+    match value {
+        Some(raw) => raw.parse::<SourceType>().map_err(|_| {
+            ErrorData::invalid_params(
+                "source_type must be one of user_explicit, agent_observation, agent_inference, system_generated",
+                None,
+            )
+        }),
+        None => Ok(SourceType::AgentInference),
+    }
+}
+
+fn resolve_confidence_param(
+    source_type: SourceType,
+    value: Option<f64>,
+) -> std::result::Result<f64, ErrorData> {
+    match value {
+        Some(confidence) if confidence.is_finite() && (0.0..=1.0).contains(&confidence) => {
+            Ok(confidence)
+        }
+        Some(_) => Err(ErrorData::invalid_params(
+            "confidence must be a finite float between 0.0 and 1.0",
+            None,
+        )),
+        None => Ok(default_confidence(source_type)),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SourceConfidence {
+    source_type: SourceType,
+    confidence: f64,
+}
+
 fn drawer_from_ingest_metadata(
     request: &IngestRequest,
     metadata: &ValidatedIngestMetadata,
     drawer_id: &str,
     content: &str,
     chunk_idx: usize,
-    source_type: &SourceType,
+    source_confidence: SourceConfidence,
     importance: i32,
 ) -> Drawer {
     let source_file = match metadata.memory_kind {
@@ -632,7 +670,8 @@ fn drawer_from_ingest_metadata(
         wing: request.wing.clone(),
         room: request.room.clone(),
         source_file,
-        source_type: source_type.clone(),
+        source_type: source_confidence.source_type,
+        confidence: source_confidence.confidence,
         added_at: iso_timestamp(),
         chunk_index: Some(chunk_idx as i64),
         normalize_version: CURRENT_NORMALIZE_VERSION,
@@ -925,6 +964,15 @@ impl MempalMcpServer {
                 drawer_count,
             })
             .collect();
+        let source_type_distribution = db
+            .source_type_counts()
+            .map_err(db_error)?
+            .into_iter()
+            .map(|(source_type, count)| SourceTypeCount {
+                source_type: source_type.to_string(),
+                count,
+            })
+            .collect();
         let mut system_warnings = current_system_warnings();
         if null_project_backfill_pending > 0 {
             system_warnings.push(SystemWarning {
@@ -948,6 +996,7 @@ impl MempalMcpServer {
             config_version: cfg_meta.version,
             config_loaded_at_unix_ms: cfg_meta.loaded_at_unix_ms,
             scopes,
+            source_type_distribution,
             aaak_spec: crate::aaak::generate_spec(),
             memory_protocol: crate::core::protocol::MEMORY_PROTOCOL.to_string(),
             endpoint_health: EndpointHealthDto {
@@ -1801,7 +1850,8 @@ impl MempalMcpServer {
         }
         let drawer_importance = raw_turn_importance(&request.wing, room, &config.turns)
             .unwrap_or_else(|| request.importance.unwrap_or(0));
-        let source_type = SourceType::Manual;
+        let source_type = parse_source_type_param(request.source_type.as_deref())?;
+        let confidence = resolve_confidence_param(source_type, request.confidence)?;
         let metadata = validate_ingest_request(&request, &source_type)?;
 
         if !dry_run && global_embed_status().should_block_writes() {
@@ -2071,6 +2121,7 @@ impl MempalMcpServer {
                 &db,
                 project_id.as_deref(),
                 &config.ingest_gating.fact_check,
+                confidence,
             )
             .map_err(db_error)?
         {
@@ -2216,7 +2267,10 @@ impl MempalMcpServer {
                         chunk_did,
                         chunk,
                         *chunk_idx,
-                        &source_type,
+                        SourceConfidence {
+                            source_type,
+                            confidence,
+                        },
                         drawer_importance,
                     );
                     if let Some(old_id) = superseded_drawer_id.as_deref() {
@@ -2297,6 +2351,8 @@ impl MempalMcpServer {
                         &novelty,
                         Some("insert_due_to_merge_cap"),
                         drawer_importance,
+                        source_type,
+                        confidence,
                         &mut inserted_drawer_ids,
                         &mut newly_created_drawer_ids,
                     )?;
@@ -2348,6 +2404,8 @@ impl MempalMcpServer {
                                     &novelty,
                                     Some("insert_due_to_embed_error"),
                                     drawer_importance,
+                                    source_type,
+                                    confidence,
                                     &mut inserted_drawer_ids,
                                     &mut newly_created_drawer_ids,
                                 )?;
@@ -2374,6 +2432,8 @@ impl MempalMcpServer {
                                 &novelty,
                                 Some("insert_due_to_embed_error"),
                                 drawer_importance,
+                                source_type,
+                                confidence,
                                 &mut inserted_drawer_ids,
                                 &mut newly_created_drawer_ids,
                             )?;
@@ -3872,7 +3932,7 @@ mod tests {
             wing: wing.to_string(),
             room: room.map(str::to_string),
             source_file: Some(source_file.to_string()),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance,
@@ -3914,13 +3974,15 @@ mod tests {
         refs: KnowledgeRefs,
     ) {
         let db = Database::open(db_path).expect("open db");
+        let source_type = SourceType::AgentInference;
         let drawer = Drawer {
             id: id.to_string(),
             content: content.to_string(),
             wing: "mempal".to_string(),
             room: Some("context".to_string()),
             source_file: Some(format!("knowledge://project/context/{id}")),
-            source_type: SourceType::Manual,
+            source_type,
+            confidence: crate::core::types::default_confidence(source_type),
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             normalize_version: 1,
@@ -3955,13 +4017,15 @@ mod tests {
         anchor_args: KnowledgeAnchorArgs<'_>,
     ) {
         let db = Database::open(db_path).expect("open db");
+        let source_type = SourceType::AgentInference;
         let drawer = Drawer {
             id: id.to_string(),
             content: format!("{id} content"),
             wing: "mempal".to_string(),
             room: Some("context".to_string()),
             source_file: Some(format!("knowledge://project/context/{id}")),
-            source_type: SourceType::Manual,
+            source_type,
+            confidence: crate::core::types::default_confidence(source_type),
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             normalize_version: 1,
@@ -6107,6 +6171,8 @@ mod tests {
                 wing: "mempal".to_string(),
                 room: Some("review".to_string()),
                 source: None,
+                source_type: None,
+                confidence: None,
                 importance: None,
                 dry_run: None,
                 diary_rollup: None,
@@ -6504,7 +6570,7 @@ mod tests_duplicate_conflict_artifact {
             wing: wing.to_string(),
             room: room.map(str::to_string),
             source_file: Some(source_file.to_string()),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance,
@@ -6552,7 +6618,7 @@ mod tests_duplicate_conflict_artifact {
             wing: "mempal".to_string(),
             room: Some("context".to_string()),
             source_file: Some(format!("knowledge://project/context/{id}")),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             normalize_version: 1,
@@ -6593,7 +6659,7 @@ mod tests_duplicate_conflict_artifact {
             wing: "mempal".to_string(),
             room: Some("context".to_string()),
             source_file: Some(format!("knowledge://project/context/{id}")),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             normalize_version: 1,

@@ -129,7 +129,7 @@ fn test_audit_cleanup_dry_run_does_not_delete() {
                 "d1",
                 "content 1",
                 "hooks-raw",
-                "project",
+                "agent_inference",
                 "2024-05-05T10:00:00Z",
                 project_id
             ],
@@ -188,7 +188,7 @@ fn test_audit_cleanup_soft_deletes_low_score_drawers() {
                 "d1",
                 "content 1",
                 "hooks-raw",
-                "project",
+                "agent_inference",
                 "2024-05-05T10:00:00Z",
                 project_id
             ],
@@ -201,7 +201,7 @@ fn test_audit_cleanup_soft_deletes_low_score_drawers() {
                 "d2",
                 "content 2",
                 "hooks-raw",
-                "project",
+                "agent_inference",
                 "2024-05-05T10:00:00Z",
                 project_id
             ],
@@ -214,7 +214,7 @@ fn test_audit_cleanup_soft_deletes_low_score_drawers() {
                 "d3",
                 "content 3",
                 "other-wing",
-                "project",
+                "agent_inference",
                 "2024-05-05T10:00:00Z",
                 project_id
             ],
@@ -310,7 +310,7 @@ fn test_audit_cleanup_respects_project_isolation() {
                 "d1",
                 "content 1",
                 "hooks-raw",
-                "project",
+                "agent_inference",
                 "2024-05-05T10:00:00Z",
                 "A"
             ],
@@ -323,7 +323,7 @@ fn test_audit_cleanup_respects_project_isolation() {
                 "d2",
                 "content 2",
                 "hooks-raw",
-                "project",
+                "agent_inference",
                 "2024-05-05T10:00:00Z",
                 "B"
             ],

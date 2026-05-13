@@ -209,7 +209,7 @@ fn insert_drawer(db_path: &Path, id: &str, content: &str, source_file: &str, ins
         wing: "code".to_string(),
         room: Some("preview".to_string()),
         source_file: Some(source_file.to_string()),
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
         added_at: "1713000000".to_string(),
         chunk_index: Some(0),
         importance: 4,

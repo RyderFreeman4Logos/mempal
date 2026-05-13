@@ -76,7 +76,7 @@ allowed_target_prefixes = ["{}"]
             wing: "hooks-raw".to_string(),
             room: Some("Edit".to_string()),
             source_file: Some(source_file.display().to_string()),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "1713000000".to_string(),
             chunk_index: Some(0),
             importance,

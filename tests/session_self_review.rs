@@ -252,7 +252,7 @@ preview_chars = 48
                 wing: "hooks-raw".to_string(),
                 room: Some("Bash".to_string()),
                 source_file: Some(payload_path.display().to_string()),
-                source_type: SourceType::Conversation,
+                source_type: SourceType::AgentObservation,
                 added_at: "1713000100".to_string(),
                 chunk_index: Some(0),
                 importance: 0,

@@ -420,7 +420,8 @@ fn bootstrap_drawer(
             MemoryKind::Evidence => format!("tests://{id}"),
             MemoryKind::Knowledge => format!("knowledge://project/bootstrap/{id}"),
         }),
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
+        confidence: 0.5,
         added_at: "1710009999".to_string(),
         chunk_index: Some(0),
         normalize_version: 1,
@@ -557,7 +558,7 @@ fn test_migration_backfills_legacy_drawers_with_bootstrap_defaults() {
     }
 
     let db = Database::open(&db_path).expect("migrate db to latest");
-    assert_eq!(db.schema_version().expect("schema version"), 10);
+    assert_eq!(db.schema_version().expect("schema version"), 11);
 
     let drawer = db
         .get_drawer("drawer_legacy_001")
@@ -626,7 +627,8 @@ fn test_insert_load_roundtrip_preserves_json_metadata_and_read_paths() {
         wing: "mempal".to_string(),
         room: Some("bootstrap".to_string()),
         source_file: Some("knowledge://project/bootstrap/typed-drawer".to_string()),
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
+        confidence: 0.5,
         added_at: "1710002000".to_string(),
         chunk_index: Some(0),
         normalize_version: 1,
@@ -693,7 +695,7 @@ fn test_read_path_rejects_non_array_or_non_string_list_payloads() {
                 "drawer_bad_json",
                 "bad payload",
                 "mempal",
-                "manual",
+                "user_explicit",
                 "1710003000",
                 "evidence",
                 "project",
@@ -738,10 +740,33 @@ async fn test_mcp_ingest_defaults_to_evidence_drawer_bootstrap_metadata() {
     assert_eq!(drawer.memory_kind, MemoryKind::Evidence);
     assert_eq!(drawer.domain, MemoryDomain::Project);
     assert_eq!(drawer.field, "general");
-    assert_eq!(drawer.provenance, Some(Provenance::Human));
+    assert_eq!(drawer.provenance, Some(Provenance::Research));
     assert_eq!(drawer.statement, None);
     assert_eq!(drawer.tier, None);
     assert_eq!(drawer.status, None);
+}
+
+#[tokio::test]
+async fn test_mcp_ingest_stores_source_confidence_params() {
+    let (_tmp, db, server) = setup_mcp_server();
+    let response = server
+        .ingest_json_for_test(json!({
+            "content": "Explicit source confidence body",
+            "wing": "mempal",
+            "room": "confidence",
+            "source_type": "user_explicit",
+            "confidence": 0.82
+        }))
+        .await
+        .expect("ingest should succeed");
+
+    let drawer = db
+        .get_drawer(&response.drawer_id)
+        .expect("load drawer")
+        .expect("drawer exists");
+
+    assert_eq!(drawer.source_type, SourceType::UserExplicit);
+    assert!((drawer.confidence - 0.82).abs() < f64::EPSILON);
 }
 
 #[tokio::test]
@@ -757,8 +782,12 @@ async fn test_mcp_ingest_default_drawer_id_matches_bootstrap_identity() {
         .await
         .expect("default ingest should succeed");
 
-    let expected =
-        expected_bootstrap_evidence_id("mempal", Some("identity"), content, &SourceType::Manual);
+    let expected = expected_bootstrap_evidence_id(
+        "mempal",
+        Some("identity"),
+        content,
+        &SourceType::AgentInference,
+    );
 
     assert_eq!(response.drawer_id, expected);
     assert_ne!(
@@ -797,6 +826,33 @@ async fn test_rest_ingest_default_evidence_drawer_id_matches_mcp() {
         body["drawer_id"],
         build_drawer_id("mempal", Some("identity"), content)
     );
+}
+
+#[cfg(feature = "rest")]
+#[tokio::test]
+async fn test_rest_ingest_stores_source_confidence_params() {
+    let (_tmp, db, _server, state) = setup_rest_mcp_server();
+    let (status, body) = post_rest_ingest(
+        state,
+        json!({
+            "content": "REST source confidence body",
+            "wing": "mempal",
+            "room": "confidence",
+            "source_type": "agent_observation",
+            "confidence": 0.73
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let drawer_id = body["drawer_id"].as_str().expect("drawer_id string");
+    let drawer = db
+        .get_drawer(drawer_id)
+        .expect("load drawer")
+        .expect("drawer exists");
+
+    assert_eq!(drawer.source_type, SourceType::AgentObservation);
+    assert!((drawer.confidence - 0.73).abs() < f64::EPSILON);
 }
 
 #[cfg(feature = "rest")]
@@ -847,8 +903,12 @@ async fn test_rest_ingest_does_not_claim_typed_field_parity() {
         }),
     )
     .await;
-    let expected =
-        expected_bootstrap_evidence_id("mempal", Some("identity"), content, &SourceType::Manual);
+    let expected = expected_bootstrap_evidence_id(
+        "mempal",
+        Some("identity"),
+        content,
+        &SourceType::AgentInference,
+    );
 
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["drawer_id"], expected);
@@ -889,8 +949,12 @@ async fn test_file_ingest_uses_bootstrap_identity_for_evidence_drawer() {
     )
     .await
     .expect("file ingest should succeed");
-    let expected =
-        expected_bootstrap_evidence_id("mempal", Some("identity"), content, &SourceType::Project);
+    let expected = expected_bootstrap_evidence_id(
+        "mempal",
+        Some("identity"),
+        content,
+        &SourceType::AgentInference,
+    );
 
     assert_eq!(stats.chunks, 1);
     assert_ne!(
@@ -953,8 +1017,12 @@ fn test_p13b_does_not_rewrite_existing_drawer_ids() {
     let db_path = db.path().to_path_buf();
     let content = "Legacy drawer id must survive P13B unchanged.";
     let old_id = build_drawer_id("mempal", Some("identity"), content);
-    let new_id =
-        expected_bootstrap_evidence_id("mempal", Some("identity"), content, &SourceType::Manual);
+    let new_id = expected_bootstrap_evidence_id(
+        "mempal",
+        Some("identity"),
+        content,
+        &SourceType::AgentInference,
+    );
     assert_ne!(old_id, new_id);
 
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
@@ -963,7 +1031,7 @@ fn test_p13b_does_not_rewrite_existing_drawer_ids() {
         wing: "mempal".to_string(),
         room: Some("identity".to_string()),
         source_file: Some("legacy://p13b".to_string()),
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
         added_at: "1710004000".to_string(),
         chunk_index: Some(0),
         importance: 0,

@@ -107,7 +107,7 @@ fn insert_drawer(db_path: &Path, seed: DrawerSeed) {
             wing: seed.wing,
             room: seed.room,
             source_file: Some(format!("{}.md", seed.id)),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: seed.added_at.to_string(),
             chunk_index: Some(0),
             importance: seed.importance,

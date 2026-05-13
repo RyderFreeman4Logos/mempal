@@ -58,7 +58,7 @@ fn make_drawer(id: &str, room: &str, importance: i32, days_ago: i64) -> Drawer {
         wing: "test".to_string(),
         room: Some(room.to_string()),
         source_file: Some(format!("tests://{id}.md")),
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
         added_at,
         importance,
         effective_importance: importance as f64,

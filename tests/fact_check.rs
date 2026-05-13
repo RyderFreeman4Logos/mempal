@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::Database;
-use mempal::core::types::Triple;
+use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType, Triple};
 use mempal::factcheck::{FactIssue, check};
 use tempfile::TempDir;
 
@@ -37,6 +37,44 @@ fn insert_triple_active(db: &Database, subject: &str, predicate: &str, object: &
         source_drawer: None,
     };
     db.insert_triple(&triple).expect("insert triple");
+}
+
+fn insert_triple_active_with_source(
+    db: &Database,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    triple_confidence: f64,
+    source_drawer: Option<&str>,
+) {
+    let id = mempal::core::utils::build_triple_id(subject, predicate, object);
+    let triple = Triple {
+        id,
+        subject: subject.to_string(),
+        predicate: predicate.to_string(),
+        object: object.to_string(),
+        valid_from: Some(NOW_SECS.saturating_sub(86_400).to_string()),
+        valid_to: None,
+        confidence: triple_confidence,
+        source_drawer: source_drawer.map(str::to_string),
+    };
+    db.insert_triple(&triple).expect("insert triple");
+}
+
+fn insert_source_drawer(db: &Database, id: &str, confidence: f64) {
+    let mut drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: "Bob is Alice's husband.".to_string(),
+        wing: "mempal".to_string(),
+        room: Some("decision".to_string()),
+        source_file: Some("test.md".to_string()),
+        source_type: SourceType::UserExplicit,
+        added_at: NOW_SECS.to_string(),
+        chunk_index: Some(0),
+        importance: 3,
+    });
+    drawer.confidence = confidence;
+    db.insert_drawer(&drawer).expect("insert source drawer");
 }
 
 fn insert_triple_expired(db: &Database, subject: &str, predicate: &str, object: &str) {
@@ -100,8 +138,16 @@ fn test_relation_contradiction_detected() {
                 subject,
                 text_claim,
                 kg_fact,
+                new_confidence,
+                existing_confidence,
+                confidence_gap,
                 ..
-            } if subject == "Bob" && text_claim == "brother_of" && kg_fact == "husband_of"
+            } if subject == "Bob"
+                && text_claim == "brother_of"
+                && kg_fact == "husband_of"
+                && *new_confidence == 0.5
+                && *existing_confidence == 1.0
+                && (*confidence_gap - 0.5).abs() < f64::EPSILON
         )
     });
     assert!(
@@ -109,6 +155,46 @@ fn test_relation_contradiction_detected() {
         "expected RelationContradiction, got: {:?}",
         report.issues
     );
+}
+
+#[test]
+fn test_relation_contradiction_prefers_source_drawer_confidence() {
+    let (_tmp, db) = new_test_db();
+    insert_source_drawer(&db, "drawer-user-source", 0.82);
+    insert_triple_active_with_source(
+        &db,
+        "Bob",
+        "husband_of",
+        "Alice",
+        0.2,
+        Some("drawer-user-source"),
+    );
+
+    let report = mempal::factcheck::check_with_confidence(
+        "Bob is Alice's brother",
+        &db,
+        NOW_SECS,
+        None,
+        0.4,
+    )
+    .expect("check");
+
+    let relation = report
+        .issues
+        .iter()
+        .find_map(|issue| match issue {
+            FactIssue::RelationContradiction {
+                existing_confidence,
+                new_confidence,
+                confidence_gap,
+                ..
+            } => Some((*existing_confidence, *new_confidence, *confidence_gap)),
+            _ => None,
+        })
+        .expect("relation contradiction");
+    assert_eq!(relation.0, 0.82);
+    assert_eq!(relation.1, 0.4);
+    assert!((relation.2 - 0.42).abs() < f64::EPSILON);
 }
 
 #[test]

@@ -638,7 +638,7 @@ async fn test_scrub_does_not_affect_storage_invariants() {
                 "test",
                 Some("privacy"),
                 chunk,
-                &SourceType::Project,
+                &SourceType::AgentInference,
             ),
             "chunk {index} must keep deterministic drawer_id"
         );

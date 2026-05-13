@@ -651,6 +651,8 @@ pub struct SearchResultDto {
     pub room: Option<String>,
     pub source_file: String,
     pub source: String,
+    pub source_type: String,
+    pub confidence: f64,
     pub similarity: f32,
     pub route: RouteDecisionDto,
     /// Other wings sharing this room (tunnel cross-references).
@@ -786,6 +788,8 @@ pub struct IngestRequest {
     pub wing: String,
     pub room: Option<String>,
     pub source: Option<String>,
+    pub source_type: Option<String>,
+    pub confidence: Option<f64>,
     pub project_id: Option<String>,
     /// Drawer ID to replace. The old drawer must be active and in the
     /// same project scope as this ingest.
@@ -935,6 +939,7 @@ pub struct StatusResponse {
     pub config_loaded_at_unix_ms: u64,
     pub diary_rollup_days: u32,
     pub scopes: Vec<ScopeCount>,
+    pub source_type_distribution: Vec<SourceTypeCount>,
     pub aaak_spec: String,
     pub memory_protocol: String,
     pub endpoint_health: EndpointHealthDto,
@@ -946,6 +951,12 @@ pub struct StatusResponse {
     pub turn_storage: TurnStorageStatusDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SourceTypeCount {
+    pub source_type: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -1347,6 +1358,8 @@ impl SearchResultDto {
             room,
             source_file,
             source,
+            source_type,
+            confidence,
             memory_kind,
             domain,
             field,
@@ -1386,6 +1399,8 @@ impl SearchResultDto {
             room,
             source_file,
             source: source.as_str().to_string(),
+            source_type: source_type.as_str().to_string(),
+            confidence,
             similarity,
             route: route.into(),
             tunnel_hints,
@@ -1791,12 +1806,13 @@ impl From<TaxonomyEntry> for TaxonomyEntryDto {
 mod tests {
     use crate::core::types::{
         AnchorKind, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, RouteDecision,
-        SearchResult,
+        SearchResult, SourceType,
     };
 
     use super::SearchResultDto;
 
     fn sample_result(content: &str) -> SearchResult {
+        let source_type = SourceType::AgentInference;
         SearchResult {
             drawer_id: "drawer-1".to_string(),
             content: content.to_string(),
@@ -1804,6 +1820,8 @@ mod tests {
             room: Some("signals".to_string()),
             source_file: "/tmp/signals.md".to_string(),
             source: crate::core::project::SearchResultSource::Project,
+            source_type,
+            confidence: crate::core::types::default_confidence(source_type),
             memory_kind: MemoryKind::Knowledge,
             domain: MemoryDomain::Project,
             field: "bootstrap".to_string(),
@@ -1841,6 +1859,8 @@ mod tests {
         assert!(!dto.content.contains('★'));
         assert_eq!(dto.drawer_id, "drawer-1");
         assert_eq!(dto.source_file, "/tmp/signals.md");
+        assert_eq!(dto.source_type, "agent_inference");
+        assert_eq!(dto.confidence, 0.5);
         assert_eq!(dto.tunnel_hints, vec!["docs".to_string()]);
         assert_eq!(dto.memory_kind, "knowledge");
         assert_eq!(dto.tier.as_deref(), Some("shu"));

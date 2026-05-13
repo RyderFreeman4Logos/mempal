@@ -13,12 +13,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::core::db::{Database, DbError};
+use crate::core::types::{SourceType, default_confidence};
 
 pub mod contradictions;
 pub mod names;
 pub mod relations;
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FactIssue {
     SimilarNameConflict {
@@ -32,6 +33,9 @@ pub enum FactIssue {
         kg_fact: String,
         triple_id: String,
         source_drawer: Option<String>,
+        new_confidence: f64,
+        existing_confidence: f64,
+        confidence_gap: f64,
     },
     StaleFact {
         subject: String,
@@ -124,6 +128,22 @@ pub fn check(
     now_unix_secs: u64,
     scope: Option<(&str, Option<&str>)>,
 ) -> Result<FactCheckReport, FactCheckError> {
+    check_with_confidence(
+        text,
+        db,
+        now_unix_secs,
+        scope,
+        default_confidence(SourceType::AgentInference),
+    )
+}
+
+pub fn check_with_confidence(
+    text: &str,
+    db: &Database,
+    now_unix_secs: u64,
+    scope: Option<(&str, Option<&str>)>,
+    new_confidence: f64,
+) -> Result<FactCheckReport, FactCheckError> {
     let scope = match scope {
         Some((wing, room)) => validate_scope(Some(wing), room)?,
         None => None,
@@ -138,6 +158,7 @@ pub fn check(
     issues.extend(contradictions::detect_relation_contradictions(
         db,
         &text_triples,
+        new_confidence,
     )?);
     issues.extend(contradictions::detect_stale_facts(
         db,

@@ -125,7 +125,7 @@ fn seed_db(db_path: &Path) {
             wing: "test".to_string(),
             room: Some("resume".to_string()),
             source_file: Some("fixtures/source.txt".to_string()),
-            source_type: SourceType::Project,
+            source_type: SourceType::AgentInference,
             added_at: format!("17130000{index:02}"),
             chunk_index: Some(index as i64),
             importance: 0,

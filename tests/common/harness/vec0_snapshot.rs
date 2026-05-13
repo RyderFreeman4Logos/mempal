@@ -96,7 +96,7 @@ mod tests {
             wing: "wing".to_string(),
             room: Some("room".to_string()),
             source_file: Some("source.txt".to_string()),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: "2026-04-21T00:00:00Z".to_string(),
             chunk_index: Some(0),
             importance: 3,

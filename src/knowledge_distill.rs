@@ -134,13 +134,15 @@ pub fn prepare_distill(db: &Database, request: DistillRequest) -> Result<Distill
         }));
     }
 
+    let source_type = SourceType::AgentInference;
     let drawer = Drawer {
         id: drawer_id.clone(),
         content: content.clone(),
         wing,
         room: Some(room),
         source_file: Some(knowledge_source_file(&domain, &field, &tier, &statement)),
-        source_type: SourceType::Manual,
+        source_type,
+        confidence: crate::core::types::default_confidence(source_type),
         added_at: current_timestamp(),
         chunk_index: Some(0),
         normalize_version: CURRENT_NORMALIZE_VERSION,

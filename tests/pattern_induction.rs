@@ -66,7 +66,7 @@ fn seed_drawer(db: &Database, id: &str, source_file: &str, content: &str, vector
         content: content.to_string(),
         wing: "test".to_string(),
         source_file: Some(source_file.to_string()),
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
         added_at: "1713000000".to_string(),
         ..Drawer::default()
     })

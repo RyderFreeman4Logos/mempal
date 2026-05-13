@@ -98,7 +98,7 @@ fn insert_drawer_with_project(db_path: &Path, seed: &DrawerSeed, project_id: Opt
             wing: seed.wing.clone(),
             room: seed.room.clone(),
             source_file: Some(format!("{}.md", seed.id)),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: seed.added_at.clone(),
             chunk_index: Some(0),
             importance: seed.importance,

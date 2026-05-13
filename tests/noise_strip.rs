@@ -275,7 +275,7 @@ fn insert_stale_drawer(db: &Database, source_file: &str) {
         wing: "mempal".to_string(),
         room: Some("noise".to_string()),
         source_file: Some(source_file.to_string()),
-        source_type: SourceType::Conversation,
+        source_type: SourceType::AgentObservation,
         added_at: "1710000000".to_string(),
         chunk_index: Some(0),
         importance: 0,

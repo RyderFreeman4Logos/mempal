@@ -30,7 +30,7 @@ async fn test_dim_mismatch_detected_before_reindex() {
         wing: "test".to_string(),
         room: Some("room".to_string()),
         source_file: Some("existing.txt".to_string()),
-        source_type: SourceType::Project,
+        source_type: SourceType::AgentInference,
         added_at: "1713000000".to_string(),
         chunk_index: Some(0),
         importance: 0,

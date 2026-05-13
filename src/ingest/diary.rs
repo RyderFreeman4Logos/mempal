@@ -116,6 +116,7 @@ pub fn commit_prepared_diary_rollup(
     prepared: PreparedDiaryRollup,
     vector: &[f32],
 ) -> Result<DiaryRollupOutcome, IngestError> {
+    let source_type = SourceType::AgentObservation;
     let drawer = Drawer {
         id: prepared.drawer_id.clone(),
         content: prepared.content,
@@ -125,7 +126,8 @@ pub fn commit_prepared_diary_rollup(
             "agent-diary://rollup/{}/{}",
             prepared.room, prepared.day
         )),
-        source_type: SourceType::Manual,
+        source_type,
+        confidence: crate::core::types::default_confidence(source_type),
         added_at: current_timestamp(),
         chunk_index: Some(0),
         normalize_version: CURRENT_NORMALIZE_VERSION,

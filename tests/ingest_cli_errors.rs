@@ -230,7 +230,16 @@ async fn test_ingest_stdin_json_creates_single_drawer() {
     let output = run_ingest_stdin_json(
         tmp.path(),
         payload,
-        &["--wing", "cli-wing", "--no-gate", "--json"],
+        &[
+            "--wing",
+            "cli-wing",
+            "--source-type",
+            "user_explicit",
+            "--confidence",
+            "0.82",
+            "--no-gate",
+            "--json",
+        ],
     );
     handle.shutdown().await;
 
@@ -258,6 +267,11 @@ async fn test_ingest_stdin_json_creates_single_drawer() {
     assert_eq!(drawer.wing, "cli-wing");
     assert_eq!(drawer.room.as_deref(), Some("json-room"));
     assert_eq!(drawer.source_file.as_deref(), Some("csa://session/99"));
+    assert_eq!(
+        drawer.source_type,
+        mempal::core::types::SourceType::UserExplicit
+    );
+    assert!((drawer.confidence - 0.82).abs() < f64::EPSILON);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

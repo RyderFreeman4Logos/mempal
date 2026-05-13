@@ -50,7 +50,7 @@ fn insert_test_drawer(db_path: &std::path::Path, id: &str, wing: &str, importanc
         content: format!("test content for {id}"),
         wing: wing.to_string(),
         source_file: Some(format!("{id}.md")),
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
         added_at: now_secs.to_string(),
         importance,
         ..Drawer::default()
@@ -177,7 +177,7 @@ fn test_fork_ext_migration_v10_sets_effective_importance_from_importance() {
         content: "migration check content".to_string(),
         wing: "test".to_string(),
         source_file: Some("check.md".to_string()),
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
         added_at: "1713000000".to_string(),
         importance: 3,
         ..Drawer::default()
@@ -385,6 +385,8 @@ fn test_search_result_dto_includes_effective_importance() {
         room: None,
         source_file: "file.md".to_string(),
         source: "bm25".to_string(),
+        source_type: "agent_inference".to_string(),
+        confidence: 0.5,
         similarity: 0.9,
         route: RouteDecisionDto {
             wing: None,

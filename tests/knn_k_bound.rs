@@ -23,7 +23,7 @@ fn make_drawer(i: usize) -> Drawer {
         wing: "test".to_string(),
         room: Some("room".to_string()),
         source_file: None,
-        source_type: SourceType::Manual,
+        source_type: SourceType::AgentInference,
         added_at: "1700000000".to_string(),
         chunk_index: None,
         importance: 0,

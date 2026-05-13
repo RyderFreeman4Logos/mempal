@@ -64,7 +64,7 @@ fn insert_drawer(
             wing: wing.to_string(),
             room: room.map(str::to_string),
             source_file: Some(format!("{id}.md")),
-            source_type: SourceType::Manual,
+            source_type: SourceType::AgentInference,
             added_at: added_at.to_string(),
             chunk_index: Some(0),
             importance: 0,
