@@ -39,6 +39,7 @@ pub struct SearchFilters {
 pub struct SearchOptions {
     pub filters: SearchFilters,
     pub with_neighbors: bool,
+    pub include_raw_turns: bool,
 }
 
 #[derive(Debug, Error)]
@@ -243,7 +244,9 @@ pub fn search_with_vector_and_scope_options(
         return Ok(Vec::new());
     }
 
-    let has_filters = !options.filters.is_empty();
+    let config = crate::core::config::ConfigHandle::current();
+    let exclude_raw_turns = config.search.exclude_raw_turns && !options.include_raw_turns;
+    let has_filters = !options.filters.is_empty() || exclude_raw_turns;
     let candidate_top_k = if has_filters {
         top_k.saturating_mul(20).max(100)
     } else {
@@ -269,13 +272,25 @@ pub fn search_with_vector_and_scope_options(
     } else {
         rrf_merge(vector_results, &fts_ids, &route, scope, db, candidate_top_k)
     };
-    if has_filters {
+    if !options.filters.is_empty() {
         results.retain(|result| matches_filters(result, &options.filters));
+        results.truncate(top_k);
+    }
+    if exclude_raw_turns {
+        results.retain(|result| {
+            !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
+        });
         results.truncate(top_k);
     }
 
     // Inject tunnel hints: for each result, check if its room exists in other wings
     inject_tunnel_hints_and_results(db, &mut results, scope);
+    if exclude_raw_turns {
+        results.retain(|result| {
+            !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
+        });
+        results.truncate(top_k);
+    }
 
     // Chunk neighbors hydration (upstream feature)
     if options.with_neighbors && top_k <= 10 {
@@ -404,10 +419,29 @@ pub fn search_bm25_only(
     scope: &ProjectSearchScope,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
+    search_bm25_only_with_options(db, query, route, scope, SearchOptions::default(), top_k)
+}
+
+/// BM25-only search path with raw-turn filtering options.
+pub fn search_bm25_only_with_options(
+    db: &Database,
+    query: &str,
+    route: RouteDecision,
+    scope: &ProjectSearchScope,
+    options: SearchOptions,
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
     if top_k == 0 {
         return Ok(Vec::new());
     }
 
+    let config = crate::core::config::ConfigHandle::current();
+    let exclude_raw_turns = config.search.exclude_raw_turns && !options.include_raw_turns;
+    let candidate_top_k = if exclude_raw_turns {
+        top_k.saturating_mul(20).max(100)
+    } else {
+        top_k
+    };
     let fts_ids = db
         .search_fts(
             query,
@@ -415,12 +449,24 @@ pub fn search_bm25_only(
             route.room.as_deref(),
             scope.mode_param(),
             scope.project_id.as_deref(),
-            top_k,
+            candidate_top_k,
         )
         .map_err(SearchError::KeywordSearch)?;
 
-    let mut results = rrf_merge(Vec::new(), &fts_ids, &route, scope, db, top_k);
+    let mut results = rrf_merge(Vec::new(), &fts_ids, &route, scope, db, candidate_top_k);
+    if exclude_raw_turns {
+        results.retain(|result| {
+            !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
+        });
+        results.truncate(top_k);
+    }
     inject_tunnel_hints_and_results(db, &mut results, scope);
+    if exclude_raw_turns {
+        results.retain(|result| {
+            !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
+        });
+        results.truncate(top_k);
+    }
     Ok(results)
 }
 
@@ -636,6 +682,7 @@ fn result_from_drawer(
         anchor_kind: drawer.anchor_kind,
         anchor_id: drawer.anchor_id,
         parent_anchor_id: drawer.parent_anchor_id,
+        importance: drawer.importance,
         similarity,
         route,
         chunk_index: drawer.chunk_index,
@@ -860,6 +907,7 @@ pub fn search_by_vector(
                     anchor_kind: AnchorKind::Global,
                     anchor_id: String::new(),
                     parent_anchor_id: None,
+                    importance: 0,
                     similarity: (1.0_f64 - distance) as f32,
                     route: route.clone(),
                     chunk_index: None,
@@ -969,6 +1017,7 @@ fn search_by_vector_scoped_exact(
                     anchor_kind: AnchorKind::Global,
                     anchor_id: String::new(),
                     parent_anchor_id: None,
+                    importance: 0,
                     similarity: (1.0_f64 - distance) as f32,
                     route: route.clone(),
                     chunk_index: None,
@@ -1242,6 +1291,7 @@ mod tests {
             anchor_kind: AnchorKind::Global,
             anchor_id: String::new(),
             parent_anchor_id: None,
+            importance: drawer.importance,
             similarity: 0.9,
             route: RouteDecision {
                 wing: None,

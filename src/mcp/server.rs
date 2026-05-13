@@ -9,6 +9,7 @@ use crate::core::{
     config::ConfigHandle,
     db::Database,
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
+    strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
         AnchorKind, BootstrapIdentityParts, Drawer, ExplicitTunnel, KnowledgeCardFilter,
         KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance, SourceType,
@@ -49,8 +50,8 @@ use crate::knowledge_lifecycle::{
     promote_knowledge,
 };
 use crate::search::{
-    SearchFilters, SearchOptions, dispatch_access_update, resolve_route, search_bm25_only,
-    search_with_vector_and_scope_options,
+    SearchFilters, SearchOptions, dispatch_access_update, resolve_route,
+    search_bm25_only_with_options, search_with_vector_and_scope_options,
 };
 use anyhow::Context;
 use rmcp::{
@@ -78,7 +79,7 @@ use super::tools::{
     RollbackResponse, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto,
     SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, StatusResponse, SystemWarning,
     TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto,
-    TunnelEndpointDto, TunnelsRequest, TunnelsResponse,
+    TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 #[derive(Clone)]
@@ -339,6 +340,7 @@ impl MempalMcpServer {
         near_target_id: &str,
         novelty: &crate::ingest::novelty::NoveltyDecision,
         audit_decision: Option<&str>,
+        importance: i32,
         inserted_drawer_ids: &mut Vec<String>,
         newly_created_drawer_ids: &mut Vec<String>,
     ) -> std::result::Result<(), ErrorData> {
@@ -389,6 +391,7 @@ impl MempalMcpServer {
                 chunk,
                 *chunk_idx,
                 &source_type,
+                importance,
             );
             db.insert_drawer_with_project(&drawer, project_id)
                 .map_err(db_error)?;
@@ -585,6 +588,7 @@ fn drawer_from_ingest_metadata(
     content: &str,
     chunk_idx: usize,
     source_type: &SourceType,
+    importance: i32,
 ) -> Drawer {
     let source_file = match metadata.memory_kind {
         MemoryKind::Knowledge => Some(knowledge_source_file(
@@ -612,7 +616,7 @@ fn drawer_from_ingest_metadata(
         added_at: iso_timestamp(),
         chunk_index: Some(chunk_idx as i64),
         normalize_version: CURRENT_NORMALIZE_VERSION,
-        importance: request.importance.unwrap_or(0),
+        importance,
         memory_kind: metadata.memory_kind.clone(),
         domain: metadata.domain.clone(),
         field: metadata.field.clone(),
@@ -629,7 +633,7 @@ fn drawer_from_ingest_metadata(
         verification_refs: metadata.verification_refs.clone(),
         scope_constraints: metadata.scope_constraints.clone(),
         trigger_hints: metadata.trigger_hints.clone(),
-        effective_importance: request.importance.unwrap_or(0) as f64,
+        effective_importance: importance as f64,
     }
 }
 
@@ -885,6 +889,7 @@ impl MempalMcpServer {
             .stale_drawer_count(CURRENT_NORMALIZE_VERSION)
             .map_err(db_error)? as u64;
         let drawer_count = db.drawer_count().map_err(db_error)?;
+        let raw_turn_count = count_raw_turn_drawers(&db, &config.turns).map_err(db_error)?;
         let null_project_backfill_pending =
             db.null_project_backfill_pending_count().map_err(db_error)?;
         let taxonomy_count = db.taxonomy_count().map_err(db_error)?;
@@ -964,6 +969,13 @@ impl MempalMcpServer {
                 model: config.llm.model.clone(),
                 max_concurrent: config.llm.max_concurrent,
             },
+            turn_storage: TurnStorageStatusDto {
+                storage_mode: config.turns.storage_mode.to_string(),
+                default_importance: config.turns.default_importance,
+                raw_turn_count,
+                raw_turn_wings: config.turns.raw_turn_wings.clone(),
+                raw_turn_rooms: config.turns.raw_turn_rooms.clone(),
+            },
             system_warnings,
         }))
     }
@@ -1006,6 +1018,7 @@ impl MempalMcpServer {
                 anchor_kind: request.anchor_kind.clone(),
             },
             with_neighbors: request.with_neighbors.unwrap_or(false),
+            include_raw_turns: request.include_raw_turns.unwrap_or(false),
         };
         let mut extra_warnings = Vec::new();
         let embedder = self.embedder_factory.build().await.map_err(|error| {
@@ -1040,7 +1053,15 @@ impl MempalMcpServer {
                     message: "vector unavailable, BM25 fallback".to_string(),
                     source: "embed".to_string(),
                 });
-                search_bm25_only(&db, &request.query, route, &scope, top_k).map_err(|bm25_error| {
+                search_bm25_only_with_options(
+                    &db,
+                    &request.query,
+                    route,
+                    &scope,
+                    search_options.clone(),
+                    top_k,
+                )
+                .map_err(|bm25_error| {
                     ErrorData::internal_error(
                         format!(
                             "search failed after vector fallback: {error}; bm25 fallback failed: {bm25_error}"
@@ -1055,7 +1076,15 @@ impl MempalMcpServer {
                     message: "vector unavailable, BM25 fallback".to_string(),
                     source: "embed".to_string(),
                 });
-                search_bm25_only(&db, &request.query, route, &scope, top_k).map_err(|error| {
+                search_bm25_only_with_options(
+                    &db,
+                    &request.query,
+                    route,
+                    &scope,
+                    search_options.clone(),
+                    top_k,
+                )
+                .map_err(|error| {
                     ErrorData::internal_error(
                         format!("search deadline fallback failed: {error}"),
                         None,
@@ -1731,6 +1760,25 @@ impl MempalMcpServer {
         let room = request.room.as_deref();
         let db = self.open_db()?;
         let dry_run = request.dry_run.unwrap_or(false);
+        let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
+        if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
+            return Ok(Json(IngestResponse {
+                drawer_id: String::new(),
+                drawer_ids: Vec::new(),
+                chunk_count: 0,
+                dropped: false,
+                gating_decision: None,
+                novelty_action: None,
+                near_drawer_id: None,
+                duplicate_warning: None,
+                lock_wait_ms: None,
+                superseded_drawer_id: None,
+                fact_check_warnings: Vec::new(),
+                system_warnings: current_system_warnings(),
+            }));
+        }
+        let drawer_importance = raw_turn_importance(&request.wing, room, &config.turns)
+            .unwrap_or_else(|| request.importance.unwrap_or(0));
         let source_type = SourceType::Manual;
         let metadata = validate_ingest_request(&request, &source_type)?;
 
@@ -1994,7 +2042,7 @@ impl MempalMcpServer {
         }
 
         let mut fact_check_warnings = Vec::new();
-        if request.wing != "hooks-raw"
+        if !raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
                 &drawer_id,
                 &candidate.content,
@@ -2147,6 +2195,7 @@ impl MempalMcpServer {
                         chunk,
                         *chunk_idx,
                         &source_type,
+                        drawer_importance,
                     );
                     if let Some(old_id) = superseded_drawer_id.as_deref() {
                         link_superseded_drawer(&mut drawer, old_id);
@@ -2220,6 +2269,7 @@ impl MempalMcpServer {
                         &target_id,
                         &novelty,
                         Some("insert_due_to_merge_cap"),
+                        drawer_importance,
                         &mut inserted_drawer_ids,
                         &mut newly_created_drawer_ids,
                     )?;
@@ -2270,6 +2320,7 @@ impl MempalMcpServer {
                                     &target_id,
                                     &novelty,
                                     Some("insert_due_to_embed_error"),
+                                    drawer_importance,
                                     &mut inserted_drawer_ids,
                                     &mut newly_created_drawer_ids,
                                 )?;
@@ -2295,6 +2346,7 @@ impl MempalMcpServer {
                                 &target_id,
                                 &novelty,
                                 Some("insert_due_to_embed_error"),
+                                drawer_importance,
                                 &mut inserted_drawer_ids,
                                 &mut newly_created_drawer_ids,
                             )?;
@@ -3992,6 +4044,7 @@ mod tests {
                 include_global: None,
                 all_projects: None,
                 disable_progressive: None,
+                include_raw_turns: None,
             }))
             .await
             .expect("search should succeed")
@@ -6568,6 +6621,7 @@ mod tests_duplicate_conflict_artifact {
                 include_global: None,
                 all_projects: None,
                 disable_progressive: None,
+                include_raw_turns: None,
             }))
             .await
             .expect("search should succeed")

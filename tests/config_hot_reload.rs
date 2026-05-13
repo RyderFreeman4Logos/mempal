@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use mempal::core::config::ConfigHandle;
-use mempal::core::db::Database;
+use mempal::core::db::{CURRENT_FORK_EXT_VERSION, Database};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::ingest::gating::{IngestCandidate, evaluate_tier1};
 use mempal::mcp::{IngestRequest, MempalMcpServer};
@@ -597,7 +597,7 @@ async fn test_status_prints_config_version_and_loaded_at() {
     assert!(
         stdout
             .lines()
-            .any(|line| line.trim() == "fork_ext_version: 13"),
+            .any(|line| line.trim() == format!("fork_ext_version: {CURRENT_FORK_EXT_VERSION}")),
         "fork_ext_version line missing from status: {stdout}"
     );
     let line = stdout

@@ -79,6 +79,9 @@ pub struct SearchRequest {
 
     /// If true and top_k <= 10, include previous/next chunks from the same source.
     pub with_neighbors: Option<bool>,
+
+    /// Include low-importance raw dialogue turns that are excluded by default.
+    pub include_raw_turns: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -930,8 +933,18 @@ pub struct StatusResponse {
     pub scrub_stats: ScrubStatsDto,
     pub chunker_stats: ChunkerStatsDto,
     pub llm_status: LlmStatusDto,
+    pub turn_storage: TurnStorageStatusDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct TurnStorageStatusDto {
+    pub storage_mode: String,
+    pub default_importance: i32,
+    pub raw_turn_count: i64,
+    pub raw_turn_wings: Vec<String>,
+    pub raw_turn_rooms: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -1333,6 +1346,7 @@ impl SearchResultDto {
             anchor_kind,
             anchor_id,
             parent_anchor_id,
+            importance: _,
             similarity,
             route,
             chunk_index: _,
@@ -1789,6 +1803,7 @@ mod tests {
             anchor_kind: AnchorKind::Repo,
             anchor_id: "repo://signals".to_string(),
             parent_anchor_id: None,
+            importance: 3,
             similarity: 0.91,
             route: RouteDecision {
                 wing: Some("mempal".to_string()),

@@ -23,6 +23,7 @@ use mempal::core::{
     },
     protocol::{DEFAULT_IDENTITY_HINT, MEMORY_PROTOCOL},
     reindex::ReindexProgressStore,
+    strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
         AnchorKind, BootstrapEvidenceArgs, Drawer, KnowledgeCard, KnowledgeCardEvent,
         KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole,
@@ -103,6 +104,7 @@ struct SearchCommandOptions<'a> {
     all_projects: bool,
     json: bool,
     with_neighbors: bool,
+    include_raw_turns: bool,
 }
 
 struct IngestCommandOptions<'a> {
@@ -221,6 +223,8 @@ enum Commands {
         json: bool,
         #[arg(long)]
         with_neighbors: bool,
+        #[arg(long)]
+        include_raw_turns: bool,
     },
     Context {
         query: String,
@@ -1220,6 +1224,7 @@ fn run() -> Result<()> {
             all_projects,
             json,
             with_neighbors,
+            include_raw_turns,
         } => block_on_result(search_command(
             &db,
             config.as_ref(),
@@ -1241,6 +1246,7 @@ fn run() -> Result<()> {
                 all_projects,
                 json,
                 with_neighbors,
+                include_raw_turns,
             },
         )),
         Commands::Context {
@@ -1872,6 +1878,17 @@ async fn ingest_stdin_command(
     let project = options.project.or(record.project.as_deref());
     let supersedes = options.supersedes.or(record.supersedes.as_deref());
     let replace_text = options.replace_text.or(record.replace_text.as_deref());
+    let raw_turn = is_raw_turn(wing, room, &config.turns);
+    let mut stats = IngestStats {
+        files: 1,
+        ..IngestStats::default()
+    };
+    if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
+        stats.skipped = 1;
+        print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
+        return Ok(());
+    }
+    let drawer_importance = raw_turn_importance(wing, room, &config.turns).unwrap_or(0);
     let (privacy_config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
     let scrubbed_replace_text = replace_text
         .map(|text| privacy_config.scrub_content_with_compiled(text, compiled_privacy.as_ref()));
@@ -1909,11 +1926,6 @@ async fn ingest_stdin_command(
         db.resolve_available_drawer_id(&preferred_id)
             .with_context(|| format!("failed to resolve drawer id for {preferred_id}"))?
     };
-    let mut stats = IngestStats {
-        files: 1,
-        ..IngestStats::default()
-    };
-
     if options.dry_run {
         stats.chunks = 1;
         stats.drawer_ids.push(drawer_id.clone());
@@ -1979,7 +1991,7 @@ async fn ingest_stdin_command(
             }
         }
 
-        if wing != "hooks-raw"
+        if !raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
                 &drawer_id,
                 &content,
@@ -2027,7 +2039,7 @@ async fn ingest_stdin_command(
         source_type,
         added_at: iso_timestamp(),
         chunk_index: Some(0),
-        importance: 0,
+        importance: drawer_importance,
     });
     let drawer = Drawer {
         normalize_version: CURRENT_NORMALIZE_VERSION,
@@ -2689,6 +2701,7 @@ async fn search_command(
         SearchOptions {
             filters: options.filters,
             with_neighbors: options.with_neighbors,
+            include_raw_turns: options.include_raw_turns,
         },
         options.top_k,
     )
@@ -5181,6 +5194,8 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
     let drawer_count = db.drawer_count().context("failed to count drawers")?;
+    let raw_turn_count =
+        count_raw_turn_drawers(db, &config.turns).context("failed to count raw turn drawers")?;
     let project_breakdown: Option<Vec<(Option<String>, i64)>> = if full {
         Some(
             db.project_breakdown()
@@ -5253,6 +5268,18 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         println!("triples: {triple_count}");
     }
     println!("db_size_bytes: {db_size_bytes}");
+    println!("Turns:");
+    println!("  storage_mode: {}", config.turns.storage_mode);
+    println!("  default_importance: {}", config.turns.default_importance);
+    println!("  raw_turn_count: {raw_turn_count}");
+    println!(
+        "  raw_turn_wings: {}",
+        display_list_or_none(&config.turns.raw_turn_wings)
+    );
+    println!(
+        "  raw_turn_rooms: {}",
+        display_list_or_none(&config.turns.raw_turn_rooms)
+    );
     println!(
         "config: version={} loaded_unix_ms={}",
         cfg_meta.version, cfg_meta.loaded_at_unix_ms
@@ -5375,6 +5402,14 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         println!("scopes: (use --full for breakdown)");
     }
     Ok(())
+}
+
+fn display_list_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(", ")
+    }
 }
 
 fn gating_command(db: &Database, config: &Config, command: GatingCommands) -> Result<()> {

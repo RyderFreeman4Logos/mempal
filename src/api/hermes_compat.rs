@@ -12,6 +12,7 @@ use super::state::ApiState;
 use crate::core::config::ConfigHandle;
 use crate::core::db::Database;
 use crate::core::project::{ProjectFilterMode, ProjectSearchScope, resolve_project_id};
+use crate::core::strata::is_excluded_raw_turn_drawer;
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -25,6 +26,7 @@ struct TimelineQuery {
     room: Option<String>,
     limit: Option<usize>,
     project_id: Option<String>,
+    include_raw_turns: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,8 +72,11 @@ async fn timeline_handler(
         )
         .map_err(hermes_internal)?;
 
+    let exclude_raw_turns =
+        config.search.exclude_raw_turns && !query.include_raw_turns.unwrap_or(false);
     let entries = drawers
         .into_iter()
+        .filter(|drawer| !exclude_raw_turns || !is_excluded_raw_turn_drawer(drawer, &config.turns))
         .map(|d| TimelineEntry {
             drawer_id: d.id,
             content: d.content,

@@ -13,6 +13,10 @@ fn mempal_bin() -> String {
 }
 
 fn setup_home() -> (TempDir, PathBuf) {
+    setup_home_with_extra_config("")
+}
+
+fn setup_home_with_extra_config(extra_config: &str) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("tempdir");
     let mempal_home = tmp.path().join(".mempal");
     fs::create_dir_all(&mempal_home).expect("create mempal home");
@@ -26,12 +30,39 @@ db_path = "{}"
 
 [hooks]
 enabled = true
+{extra_config}
 "#,
             db_path.display()
         ),
     )
     .expect("write config");
     (tmp, db_path)
+}
+
+fn run_hook(home: &TempDir, command: &str, payload: &[u8]) -> std::process::Output {
+    let mut child = Command::new(mempal_bin())
+        .args(["hook", command])
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook command");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload)
+        .expect("write payload");
+    child.wait_with_output().expect("wait output")
+}
+
+fn pending_message_count(db_path: &PathBuf) -> i64 {
+    let conn = Connection::open(db_path).expect("open sqlite");
+    conn.query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+        row.get(0)
+    })
+    .expect("query pending count")
 }
 
 #[test]
@@ -169,4 +200,54 @@ fn test_hook_envelopes_oversized_payload() {
             .expect("payload path string"),
     );
     assert!(payload_path.exists(), "oversized payload file must exist");
+}
+
+#[test]
+fn test_hook_storage_mode_off_skips_raw_turn_enqueue() {
+    let (home, db_path) = setup_home_with_extra_config(
+        r#"
+[turns]
+storage_mode = "off"
+raw_turn_wings = ["hooks-raw"]
+raw_turn_rooms = []
+"#,
+    );
+    let payload = r#"{"prompt":"do not persist raw turn"}"#;
+
+    let output = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(pending_message_count(&db_path), 0);
+}
+
+#[test]
+fn test_hook_storage_mode_off_skips_oversize_payload_file() {
+    let (home, db_path) = setup_home_with_extra_config(
+        r#"
+[turns]
+storage_mode = "off"
+raw_turn_wings = ["hooks-raw"]
+raw_turn_rooms = []
+"#,
+    );
+    let oversized = vec![b'a'; 11 * 1024 * 1024];
+
+    let output = run_hook(&home, "hook_user_prompt", &oversized);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(pending_message_count(&db_path), 0);
+    assert!(
+        !home.path().join(".mempal").join("hook-oversize").exists(),
+        "off-mode raw turn capture must not write oversize files"
+    );
 }

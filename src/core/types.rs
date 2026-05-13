@@ -464,6 +464,10 @@ pub struct SearchResult {
     pub anchor_kind: AnchorKind,
     pub anchor_id: String,
     pub parent_anchor_id: Option<String>,
+    /// Static importance ranking (0-5). Raw-turn exclusion uses this field so
+    /// access boosts cannot accidentally promote transcript storage into
+    /// durable recall.
+    pub importance: i32,
     pub similarity: f32,
     pub route: RouteDecision,
     #[serde(skip)]

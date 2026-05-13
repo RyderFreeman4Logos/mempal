@@ -82,6 +82,7 @@ def _load_config(hermes_home: str = "") -> dict:
     config = {
         "base_url": os.environ.get("MEMPAL_BASE_URL", "http://127.0.0.1:3080"),
         "user_id": os.environ.get("MEMPAL_USER_ID", "hermes-user"),
+        "turn_storage_mode": os.environ.get("MEMPAL_TURN_STORAGE_MODE", "raw_evidence"),
     }
     if hermes_home:
         config_path = os.path.join(hermes_home, "mempal.json")
@@ -131,6 +132,21 @@ class MempalMemoryProvider:
         user_id = kwargs.get("user_id") or cfg.get("user_id", "hermes-user")
         self._user_id = user_id
         self._wing = f"hermes-user/{user_id}"
+
+    def _turn_storage_mode(self) -> str:
+        try:
+            status = self._get("/api/status")
+            mode = (
+                status.get("turn_storage", {})
+                .get("storage_mode", "")
+                .strip()
+            )
+            if mode:
+                return mode
+        except Exception as exc:
+            logger.debug("mempal status lookup for turn storage failed: %s", exc)
+        cfg = _load_config(self._hermes_home)
+        return str(cfg.get("turn_storage_mode", "raw_evidence")).strip() or "raw_evidence"
 
     # -- Circuit breaker ----------------------------------------------------
 
@@ -209,7 +225,12 @@ class MempalMemoryProvider:
             try:
                 results = self._get(
                     "/api/search",
-                    {"q": query, "wing": self._wing, "top_k": 5},
+                    {
+                        "q": query,
+                        "wing": self._wing,
+                        "top_k": 5,
+                        "include_raw_turns": False,
+                    },
                 )
                 if results:
                     lines = [r.get("content", "") for r in results if r.get("content")]
@@ -230,6 +251,8 @@ class MempalMemoryProvider:
     ) -> None:
         """Ingest turn summary to mempal (non-blocking)."""
         if self._is_breaker_open():
+            return
+        if self._turn_storage_mode() != "raw_evidence":
             return
 
         content = f"User: {user_content}\nAssistant: {assistant_content}"
@@ -278,7 +301,7 @@ class MempalMemoryProvider:
                     limit = 20
                 entries = self._get(
                     "/api/timeline",
-                    {"wing": self._wing, "limit": limit},
+                    {"wing": self._wing, "limit": limit, "include_raw_turns": False},
                 )
                 self._record_success()
                 if not entries:
@@ -300,7 +323,12 @@ class MempalMemoryProvider:
             try:
                 results = self._get(
                     "/api/search",
-                    {"q": query, "wing": self._wing, "top_k": top_k},
+                    {
+                        "q": query,
+                        "wing": self._wing,
+                        "top_k": top_k,
+                        "include_raw_turns": False,
+                    },
                 )
                 self._record_success()
                 if not results:
@@ -411,6 +439,12 @@ class MempalMemoryProvider:
                 "description": "User identifier for memory scoping",
                 "default": "hermes-user",
                 "env_var": "MEMPAL_USER_ID",
+            },
+            {
+                "key": "turn_storage_mode",
+                "description": "Raw turn storage mode: off, raw_evidence, or summarized",
+                "default": "raw_evidence",
+                "env_var": "MEMPAL_TURN_STORAGE_MODE",
             },
         ]
 

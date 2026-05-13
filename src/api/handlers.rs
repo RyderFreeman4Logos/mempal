@@ -2,6 +2,7 @@ use crate::core::{
     config::ConfigHandle,
     db::Database,
     project::{ProjectSearchScope, resolve_project_id},
+    strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
         BootstrapEvidenceArgs, Drawer, RouteDecision, SearchResult, SourceType, TaxonomyEntry,
     },
@@ -12,7 +13,7 @@ use crate::core::{
 };
 use crate::ingest::gating::evaluate_fact_check_gate;
 use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
-use crate::search::{resolve_route, search_with_vector};
+use crate::search::{SearchOptions, resolve_route, search_with_vector_and_scope_options};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -73,6 +74,7 @@ struct SearchQuery {
     project_id: Option<String>,
     include_global: Option<bool>,
     all_projects: Option<bool>,
+    include_raw_turns: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +113,16 @@ struct StatusResponse {
     taxonomy_count: i64,
     db_size_bytes: u64,
     wings: Vec<ScopeCount>,
+    turn_storage: TurnStorageStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnStorageStatus {
+    storage_mode: String,
+    default_importance: i32,
+    raw_turn_count: i64,
+    raw_turn_wings: Vec<String>,
+    raw_turn_rooms: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,12 +192,16 @@ async fn search_handler(
         query.all_projects.unwrap_or(false),
         config.search.strict_project_isolation,
     );
-    let results = search_with_vector(
+    let results = search_with_vector_and_scope_options(
         &db,
         &query.q,
         &query_vector,
         route,
         &scope,
+        SearchOptions {
+            include_raw_turns: query.include_raw_turns.unwrap_or(false),
+            ..SearchOptions::default()
+        },
         query.top_k.unwrap_or(10),
     )
     .map_err(internal_error)?;
@@ -208,6 +224,22 @@ async fn ingest_handler(
     let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
         .map_err(internal_error)?;
+    let raw_turn = is_raw_turn(&request.wing, request.room.as_deref(), &config.turns);
+    if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
+        return Ok((
+            StatusCode::CREATED,
+            Json(IngestResponse {
+                drawer_id: String::new(),
+                drawer_ids: Vec::new(),
+                chunk_count: 0,
+                dropped: false,
+                superseded_drawer_id: None,
+                fact_check_warnings: Vec::new(),
+            }),
+        ));
+    }
+    let drawer_importance =
+        raw_turn_importance(&request.wing, request.room.as_deref(), &config.turns).unwrap_or(0);
 
     // Chunk the content using the token-aware chunker (issue #57).
     let chunks =
@@ -262,7 +294,7 @@ async fn ingest_handler(
         let drawer_id = db
             .resolve_available_drawer_id(&preferred_drawer_id)
             .map_err(internal_error)?;
-        if request.wing != "hooks-raw"
+        if !raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
                 &drawer_id,
                 chunk,
@@ -352,7 +384,7 @@ async fn ingest_handler(
                 source_type: SourceType::Manual,
                 added_at: iso_timestamp(),
                 chunk_index: Some(*chunk_idx as i64),
-                importance: 0,
+                importance: drawer_importance,
             });
             let drawer = Drawer {
                 normalize_version: CURRENT_NORMALIZE_VERSION,
@@ -408,6 +440,8 @@ async fn taxonomy_handler(
 async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResponse>, ApiError> {
     let db = Database::open(&state.db_path).map_err(internal_error)?;
     let drawer_count = db.drawer_count().map_err(internal_error)?;
+    let config = ConfigHandle::current();
+    let raw_turn_count = count_raw_turn_drawers(&db, &config.turns).map_err(internal_error)?;
     let taxonomy_count = db.taxonomy_count().map_err(internal_error)?;
     let db_size_bytes = db.database_size_bytes().map_err(internal_error)?;
     let wings = db
@@ -426,6 +460,13 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         taxonomy_count,
         db_size_bytes,
         wings,
+        turn_storage: TurnStorageStatus {
+            storage_mode: config.turns.storage_mode.to_string(),
+            default_importance: config.turns.default_importance,
+            raw_turn_count,
+            raw_turn_wings: config.turns.raw_turn_wings.clone(),
+            raw_turn_rooms: config.turns.raw_turn_rooms.clone(),
+        },
     }))
 }
 

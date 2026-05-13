@@ -18,6 +18,7 @@ use crate::core::{
     config::ConfigHandle,
     config::IngestGatingConfig,
     db::Database,
+    strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{BootstrapEvidenceArgs, Drawer, SourceType},
     utils::{
         build_bootstrap_evidence_drawer_id, build_drawer_id, iso_timestamp, link_superseded_drawer,
@@ -301,6 +302,17 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             route_room_from_taxonomy(&scrubbed, wing, &taxonomy)
         }
     };
+    let raw_turn = is_raw_turn(wing, Some(resolved_room.as_str()), &config.turns);
+    if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
+        return Ok(IngestStats {
+            files: 1,
+            skipped: 1,
+            noise_bytes_stripped,
+            ..IngestStats::default()
+        });
+    }
+    let drawer_importance =
+        raw_turn_importance(wing, Some(resolved_room.as_str()), &config.turns).unwrap_or(0);
     let source_display = path.to_string_lossy();
     let chunker_config = &config.chunker;
 
@@ -456,7 +468,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
                 }
             }
 
-            if wing != "hooks-raw"
+            if !raw_turn
                 && let Some(outcome) = evaluate_fact_check_gate(
                     &drawer_id,
                     chunk,
@@ -539,7 +551,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             source_type: source_type.clone(),
             added_at: iso_timestamp(),
             chunk_index: Some(chunk_index as i64),
-            importance: 0,
+            importance: drawer_importance,
         });
         let drawer = Drawer {
             normalize_version: CURRENT_NORMALIZE_VERSION,

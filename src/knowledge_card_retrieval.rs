@@ -117,6 +117,7 @@ pub fn retrieve_knowledge_cards_with_vector(
             SearchOptions {
                 filters,
                 with_neighbors: false,
+                ..SearchOptions::default()
             },
             request.evidence_top_k.max(request.top_k),
         )
