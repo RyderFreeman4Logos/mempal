@@ -27,6 +27,8 @@ const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
 const DEFAULT_SEARCH_TUNNEL_FANOUT_CAP: usize = 5;
 const DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP: usize = 8;
 const DEFAULT_SEARCH_TUNNEL_PENALTY: f32 = 0.7;
+const DEFAULT_TURN_STORAGE_MODE: TurnStorageMode = TurnStorageMode::RawEvidence;
+const DEFAULT_TURN_IMPORTANCE: i32 = 0;
 const DEFAULT_ALERT_EVERY_N_FAILURES: u64 = 100;
 const DEFAULT_DEGRADE_AFTER_N_FAILURES: u64 = 10;
 const DEFAULT_HOOK_WING: &str = "agent-diary";
@@ -79,6 +81,7 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     pub config_hot_reload: ConfigHotReloadConfig,
     pub search: SearchConfig,
+    pub turns: TurnsConfig,
     pub hotpatch: HotpatchConfig,
     #[serde(alias = "gating")]
     pub ingest_gating: IngestGatingConfig,
@@ -104,6 +107,7 @@ impl Default for Config {
             privacy: PrivacyConfig::default(),
             config_hot_reload: ConfigHotReloadConfig::default(),
             search: SearchConfig::default(),
+            turns: TurnsConfig::default(),
             hotpatch: HotpatchConfig::default(),
             ingest_gating: IngestGatingConfig::default(),
             hooks: HooksConfig::default(),
@@ -195,6 +199,11 @@ impl Config {
         if self.search.preview_chars == 0 {
             return Err(ConfigError::InvalidConfig(
                 "search.preview_chars must be greater than 0".to_string(),
+            ));
+        }
+        if !(0..=5).contains(&self.turns.default_importance) {
+            return Err(ConfigError::InvalidConfig(
+                "turns.default_importance must be between 0 and 5".to_string(),
             ));
         }
         if !self.search.tunnel_penalty.is_finite()
@@ -877,6 +886,7 @@ impl Default for ConfigHotReloadConfig {
 pub struct SearchConfig {
     pub strict_project_isolation: bool,
     pub progressive_disclosure: bool,
+    pub exclude_raw_turns: bool,
     pub preview_chars: usize,
     pub tunnel_fanout_cap: usize,
     /// Maximum wing names shown per result in `tunnel_hints`. Excess entries are
@@ -894,10 +904,56 @@ impl Default for SearchConfig {
         Self {
             strict_project_isolation: false,
             progressive_disclosure: true,
+            exclude_raw_turns: true,
             preview_chars: DEFAULT_SEARCH_PREVIEW_CHARS,
             tunnel_fanout_cap: DEFAULT_SEARCH_TUNNEL_FANOUT_CAP,
             tunnel_hints_display_cap: DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP,
             tunnel_penalty: DEFAULT_SEARCH_TUNNEL_PENALTY,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStorageMode {
+    Off,
+    RawEvidence,
+    Summarized,
+}
+
+impl Default for TurnStorageMode {
+    fn default() -> Self {
+        DEFAULT_TURN_STORAGE_MODE
+    }
+}
+
+impl std::fmt::Display for TurnStorageMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Off => "off",
+            Self::RawEvidence => "raw_evidence",
+            Self::Summarized => "summarized",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TurnsConfig {
+    pub storage_mode: TurnStorageMode,
+    pub default_importance: i32,
+    pub raw_turn_wings: Vec<String>,
+    pub raw_turn_rooms: Vec<String>,
+}
+
+impl Default for TurnsConfig {
+    fn default() -> Self {
+        Self {
+            storage_mode: TurnStorageMode::default(),
+            default_importance: DEFAULT_TURN_IMPORTANCE,
+            raw_turn_wings: vec!["hooks-raw".to_string(), "hermes-user".to_string()],
+            raw_turn_rooms: vec!["turns".to_string(), "turns/raw".to_string()],
         }
     }
 }

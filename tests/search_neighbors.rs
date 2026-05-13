@@ -143,6 +143,7 @@ async fn search_neighbors(
         SearchOptions {
             filters: SearchFilters::default(),
             with_neighbors,
+            ..SearchOptions::default()
         },
         top_k,
     )
@@ -267,6 +268,7 @@ async fn test_neighbors_limited_to_same_wing() {
         SearchOptions {
             filters: SearchFilters::default(),
             with_neighbors: true,
+            ..SearchOptions::default()
         },
         4,
     )

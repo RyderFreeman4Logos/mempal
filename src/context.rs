@@ -385,6 +385,7 @@ fn search_t2_hybrid(
             SearchOptions {
                 filters,
                 with_neighbors: false,
+                ..SearchOptions::default()
             },
             50,
         )
@@ -808,6 +809,7 @@ fn search_context_candidates(
         SearchOptions {
             filters,
             with_neighbors: false,
+            ..SearchOptions::default()
         },
         query.top_k,
     )

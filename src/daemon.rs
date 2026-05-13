@@ -11,6 +11,7 @@ use crate::core::{
     db::Database,
     project::resolve_project_id,
     queue::{ClaimedMessage, PendingMessageStore},
+    strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{BootstrapEvidenceArgs, Drawer, SourceType},
     utils::{current_timestamp, route_room_from_taxonomy, synthetic_source_file},
 };
@@ -449,10 +450,18 @@ fn build_drawer_records(
     config: &crate::core::config::Config,
     mempal_home: &Path,
 ) -> Result<Vec<DrawerRecord>> {
-    let audit_record = build_audit_drawer_record(envelope, config, mempal_home)?;
-    let mut records = vec![audit_record.clone()];
+    let mut audit_record = build_audit_drawer_record(envelope, config, mempal_home)?;
+    apply_turn_strata(&mut audit_record, config);
+    let mut records = Vec::new();
+    if should_keep_drawer_record(&audit_record, config) {
+        records.push(audit_record.clone());
+    }
     if let Some(record) = build_user_prompt_project_record(db, envelope, config, &audit_record)? {
-        records.push(record);
+        let mut record = record;
+        apply_turn_strata(&mut record, config);
+        if should_keep_drawer_record(&record, config) {
+            records.push(record);
+        }
     }
     if envelope.event == crate::hook::HookEvent::SessionEnd.display_name() {
         let session_review_payload = if config.hooks.session_end.extract_self_review {
@@ -502,7 +511,12 @@ fn build_drawer_records(
         })();
 
         match review_record {
-            Ok(Some(record)) => records.push(record),
+            Ok(Some(mut record)) => {
+                apply_turn_strata(&mut record, config);
+                if should_keep_drawer_record(&record, config) {
+                    records.push(record);
+                }
+            }
             Ok(None) => {}
             Err(error) => {
                 record_session_review_rejection(db);
@@ -518,6 +532,19 @@ fn build_drawer_records(
     }
 
     Ok(records)
+}
+
+fn apply_turn_strata(record: &mut DrawerRecord, config: &crate::core::config::Config) {
+    if let Some(importance) =
+        raw_turn_importance(&record.wing, Some(record.room.as_str()), &config.turns)
+    {
+        record.importance = importance;
+    }
+}
+
+fn should_keep_drawer_record(record: &DrawerRecord, config: &crate::core::config::Config) -> bool {
+    !is_raw_turn(&record.wing, Some(record.room.as_str()), &config.turns)
+        || should_store_raw_turns(&config.turns.storage_mode)
 }
 
 fn wing_from_cwd(cwd: &str) -> Option<String> {

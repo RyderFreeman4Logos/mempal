@@ -319,6 +319,7 @@ fn test_search_unaffected_by_tiered_context_config() {
         SearchOptions {
             filters: SearchFilters::default(),
             with_neighbors: false,
+            ..SearchOptions::default()
         },
         10,
     )
