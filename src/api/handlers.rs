@@ -205,7 +205,7 @@ async fn ingest_handler(
         .await
         .map_err(internal_error)?;
     let db = Database::open(&state.db_path).map_err(internal_error)?;
-    let config = ConfigHandle::current();
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
         .map_err(internal_error)?;
 
@@ -219,10 +219,14 @@ async fn ingest_handler(
         ));
     }
 
+    let scrubbed_replace_text = request
+        .replace_text
+        .as_deref()
+        .map(|text| config.scrub_content_with_compiled(text, compiled_privacy.as_ref()));
     let replacement_target = db
         .resolve_replacement_target(
             request.supersedes.as_deref(),
-            request.replace_text.as_deref(),
+            scrubbed_replace_text.as_deref(),
             &request.wing,
             request.room.as_deref(),
             project_id.as_deref(),
@@ -232,6 +236,7 @@ async fn ingest_handler(
         .as_ref()
         .map(|summary| summary.id.clone());
     let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
+    let mut superseded_response_id: Option<String> = None;
 
     let mut accepted_chunks: Vec<(usize, &String, String, bool)> = Vec::with_capacity(chunks.len());
     let mut fact_check_warnings = Vec::new();
@@ -283,7 +288,7 @@ async fn ingest_handler(
                 drawer_ids: Vec::new(),
                 chunk_count: 0,
                 dropped: true,
-                superseded_drawer_id,
+                superseded_drawer_id: None,
                 fact_check_warnings,
             }),
         ));
@@ -297,6 +302,7 @@ async fn ingest_handler(
         if let Some(old_id) = superseded_drawer_id.as_deref() {
             let replacement_id = drawer_ids.first().map(String::as_str).unwrap_or("existing");
             supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
+            superseded_response_id = Some(old_id.to_string());
         }
         let primary_drawer_id = drawer_ids.first().cloned().unwrap_or_default();
         return Ok((
@@ -306,7 +312,7 @@ async fn ingest_handler(
                 drawer_ids,
                 chunk_count: accepted_chunks.len(),
                 dropped: false,
-                superseded_drawer_id,
+                superseded_drawer_id: superseded_response_id,
                 fact_check_warnings,
             }),
         ));
@@ -327,7 +333,6 @@ async fn ingest_handler(
 
     // Insert each chunk as a separate drawer.
     let mut drawer_ids: Vec<String> = Vec::with_capacity(accepted_chunks.len());
-    let mut supersede_pending = superseded_drawer_id.clone();
     for ((chunk_idx, chunk, drawer_id, exact_duplicate), vector) in
         accepted_chunks.iter().zip(vectors.iter())
     {
@@ -337,9 +342,6 @@ async fn ingest_handler(
                 .map_err(internal_error)?;
 
         if !drawer_exists {
-            if let Some(old_id) = supersede_pending.take() {
-                supersede_drawer_for_ingest(&db, &old_id, drawer_id)?;
-            }
             let source_file = source_file_or_synthetic(drawer_id, request.source.as_deref());
             let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
                 id: drawer_id.clone(),
@@ -368,6 +370,13 @@ async fn ingest_handler(
         drawer_ids.push(drawer_id.clone());
     }
 
+    if let Some(old_id) = superseded_drawer_id.as_deref()
+        && let Some(replacement_id) = drawer_ids.first()
+    {
+        supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
+        superseded_response_id = Some(old_id.to_string());
+    }
+
     let primary_drawer_id = drawer_ids.first().cloned().unwrap_or_default();
     let chunk_count = drawer_ids.len();
     Ok((
@@ -377,7 +386,7 @@ async fn ingest_handler(
             drawer_ids,
             chunk_count,
             dropped: false,
-            superseded_drawer_id,
+            superseded_drawer_id: superseded_response_id,
             fact_check_warnings,
         }),
     ))

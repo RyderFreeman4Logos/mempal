@@ -1761,6 +1761,7 @@ impl MempalMcpServer {
             .as_ref()
             .map(|summary| summary.id.clone());
         let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
+        let mut superseded_response_id: Option<String> = None;
 
         let mut chunk_drawer_ids: Vec<(usize, String, bool)> = Vec::with_capacity(chunks.len());
         for (idx, chunk) in chunks.iter().enumerate() {
@@ -1823,6 +1824,7 @@ impl MempalMcpServer {
             if let Some(old_id) = superseded_drawer_id.as_deref() {
                 let replacement_id = all_ids.first().map(String::as_str).unwrap_or("existing");
                 supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
+                superseded_response_id = Some(old_id.to_string());
             }
             return Ok(Json(IngestResponse {
                 drawer_id,
@@ -1834,7 +1836,7 @@ impl MempalMcpServer {
                 near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms: None,
-                superseded_drawer_id,
+                superseded_drawer_id: superseded_response_id,
                 fact_check_warnings: Vec::new(),
                 system_warnings: current_system_warnings(),
             }));
@@ -1867,7 +1869,7 @@ impl MempalMcpServer {
                 near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms: None,
-                superseded_drawer_id: superseded_drawer_id.clone(),
+                superseded_drawer_id: None,
                 fact_check_warnings: Vec::new(),
                 system_warnings: current_system_warnings(),
             }));
@@ -1970,7 +1972,7 @@ impl MempalMcpServer {
                 near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms,
-                superseded_drawer_id: superseded_drawer_id.clone(),
+                superseded_drawer_id: None,
                 fact_check_warnings: Vec::new(),
                 system_warnings: current_system_warnings(),
             }));
@@ -2013,7 +2015,7 @@ impl MempalMcpServer {
                     near_drawer_id: None,
                     duplicate_warning: None,
                     lock_wait_ms,
-                    superseded_drawer_id: superseded_drawer_id.clone(),
+                    superseded_drawer_id: None,
                     fact_check_warnings,
                     system_warnings: current_system_warnings(),
                 }));
@@ -2098,7 +2100,6 @@ impl MempalMcpServer {
                 novelty_action = Some(NoveltyAction::Insert);
                 near_drawer_id = novelty.near_drawer_id.clone();
 
-                let mut supersede_pending = superseded_drawer_id.clone();
                 for ((chunk_idx, chunk_did, chunk_exists), (chunk, vector)) in chunk_drawer_ids
                     .iter()
                     .zip(chunks.iter().zip(vectors.iter()))
@@ -2132,9 +2133,6 @@ impl MempalMcpServer {
                         // newly_created_drawer_ids so LLM reject cannot delete it.
                         inserted_drawer_ids.push(chunk_did.clone());
                         continue;
-                    }
-                    if let Some(old_id) = supersede_pending.take() {
-                        supersede_drawer_for_ingest(&db, &old_id, chunk_did)?;
                     }
                     let mut drawer = drawer_from_ingest_metadata(
                         &request,
@@ -2302,6 +2300,13 @@ impl MempalMcpServer {
             }
         }
 
+        if let Some(old_id) = superseded_drawer_id.as_deref()
+            && let Some(replacement_id) = inserted_drawer_ids.first()
+        {
+            supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
+            superseded_response_id = Some(old_id.to_string());
+        }
+
         drop(lock_guard);
 
         // Apply session-ingest boost to previously searched drawers (P13).
@@ -2442,7 +2447,7 @@ impl MempalMcpServer {
             near_drawer_id,
             duplicate_warning,
             lock_wait_ms,
-            superseded_drawer_id,
+            superseded_drawer_id: superseded_response_id,
             fact_check_warnings,
             system_warnings: current_system_warnings(),
         }))

@@ -369,10 +369,9 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             options.project_id,
         )
         .map_err(|source| IngestError::ResolveReplacement { source })?;
-    stats.superseded_drawer_id = replacement_target
+    let replacement_target_id = replacement_target
         .as_ref()
-        .map(|summary| summary.id.clone());
-    let replacement_target_id = stats.superseded_drawer_id.as_deref();
+        .map(|summary| summary.id.as_str());
 
     let mut pending = Vec::new();
 
@@ -482,16 +481,8 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
     }
 
     if options.dry_run || pending.is_empty() {
-        if replacement_target.is_some() && !options.dry_run && pending.is_empty() {
-            supersede_target(
-                db,
-                replacement_target_id.expect("replacement target exists"),
-                stats
-                    .drawer_ids
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or("existing"),
-            )?;
+        if !options.dry_run {
+            supersede_after_successful_replacement(db, replacement_target_id, &mut stats)?;
         }
         return Ok(stats);
     }
@@ -538,12 +529,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
     }
 
     // Stage 7: Storage with all fields from both sides
-    let mut supersede_pending = replacement_target_id.map(ToOwned::to_owned);
     for ((chunk_index, chunk, drawer_id), vector) in pending.into_iter().zip(vectors) {
-        if let Some(old_id) = supersede_pending.take() {
-            supersede_target(db, &old_id, &drawer_id)?;
-        }
-
         let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
             id: drawer_id.clone(),
             content: chunk.to_string(),
@@ -624,6 +610,8 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         stats.drawer_ids.push(drawer_id);
         stats.chunks += 1;
     }
+
+    supersede_after_successful_replacement(db, replacement_target_id, &mut stats)?;
 
     Ok(stats)
 }
@@ -722,6 +710,20 @@ fn supersede_target(db: &Database, old_id: &str, new_id: &str) -> Result<()> {
             drawer_id: old_id.to_string(),
             source,
         })?;
+    Ok(())
+}
+
+fn supersede_after_successful_replacement(
+    db: &Database,
+    replacement_target_id: Option<&str>,
+    stats: &mut IngestStats,
+) -> Result<()> {
+    if let Some(target_id) = replacement_target_id
+        && let Some(replacement_id) = stats.drawer_ids.first()
+    {
+        supersede_target(db, target_id, replacement_id)?;
+        stats.superseded_drawer_id = Some(target_id.to_string());
+    }
     Ok(())
 }
 

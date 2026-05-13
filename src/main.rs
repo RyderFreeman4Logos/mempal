@@ -1872,13 +1872,22 @@ async fn ingest_stdin_command(
     let project = options.project.or(record.project.as_deref());
     let supersedes = options.supersedes.or(record.supersedes.as_deref());
     let replace_text = options.replace_text.or(record.replace_text.as_deref());
+    let (privacy_config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let scrubbed_replace_text = replace_text
+        .map(|text| privacy_config.scrub_content_with_compiled(text, compiled_privacy.as_ref()));
     let cwd = env::current_dir().ok();
     let project_id = resolve_project_id(project, config, cwd.as_deref())
         .context("failed to resolve stdin ingest project id")?;
 
     let source_type = SourceType::Manual;
     let replacement_target = db
-        .resolve_replacement_target(supersedes, replace_text, wing, room, project_id.as_deref())
+        .resolve_replacement_target(
+            supersedes,
+            scrubbed_replace_text.as_deref(),
+            wing,
+            room,
+            project_id.as_deref(),
+        )
         .context("failed to resolve replacement target")?;
     let superseded_drawer_id = replacement_target
         .as_ref()
@@ -1902,7 +1911,6 @@ async fn ingest_stdin_command(
     };
     let mut stats = IngestStats {
         files: 1,
-        superseded_drawer_id: superseded_drawer_id.clone(),
         ..IngestStats::default()
     };
 
@@ -1921,6 +1929,7 @@ async fn ingest_stdin_command(
         if let Some(old_id) = superseded_drawer_id.as_deref() {
             db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
                 .with_context(|| format!("failed to supersede drawer {old_id}"))?;
+            stats.superseded_drawer_id = Some(old_id.to_string());
         }
         append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
             .context("failed to append ingest audit log")?;
@@ -2008,10 +2017,6 @@ async fn ingest_stdin_command(
         .or(record.source.as_deref())
         .map(&scrub);
     let source_file = source_file_or_synthetic(&drawer_id, source_hint.as_deref());
-    if let Some(old_id) = superseded_drawer_id.as_deref() {
-        db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
-            .with_context(|| format!("failed to supersede drawer {old_id}"))?;
-    }
 
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: drawer_id.clone(),
@@ -2037,6 +2042,12 @@ async fn ingest_stdin_command(
         .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
     db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
         .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
+
+    if let Some(old_id) = superseded_drawer_id.as_deref() {
+        db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
+            .with_context(|| format!("failed to supersede drawer {old_id}"))?;
+        stats.superseded_drawer_id = Some(old_id.to_string());
+    }
 
     // Failure detection (P14) — synchronous, lightweight DB write.
     {
