@@ -200,6 +200,7 @@ fn load_crystallize_drawers(db: &Database, project_id: Option<&str>) -> Result<V
         WHERE deleted_at IS NULL
           AND compacted_into IS NULL
           AND memory_kind = 'evidence'
+          AND COALESCE(is_pinned, 0) = 0
           AND ((project_id IS NULL AND ?1 IS NULL) OR project_id = ?1)
         ORDER BY id
         "#,
