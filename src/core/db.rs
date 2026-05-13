@@ -38,7 +38,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 9;
+const CURRENT_SCHEMA_VERSION: u32 = 10;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -291,6 +291,16 @@ impl Database {
         drawer: &Drawer,
         project_id: Option<&str>,
     ) -> Result<(), DbError> {
+        self.insert_drawer_with_project_validity(drawer, project_id, None, None)
+    }
+
+    pub fn insert_drawer_with_project_validity(
+        &self,
+        drawer: &Drawer,
+        project_id: Option<&str>,
+        valid_from: Option<&str>,
+        valid_until: Option<&str>,
+    ) -> Result<(), DbError> {
         let content_hash = content_hash_hex(&drawer.content);
         anchor::validate_anchor_domain(&drawer.domain, &drawer.anchor_kind)
             .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
@@ -325,9 +335,11 @@ impl Database {
                 teaching_refs,
                 verification_refs,
                 scope_constraints,
-                trigger_hints
+                trigger_hints,
+                valid_from,
+                valid_until
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
             "#,
             params![
                 drawer.id.as_str(),
@@ -358,6 +370,8 @@ impl Database {
                 encode_json(&drawer.verification_refs)?,
                 drawer.scope_constraints.as_deref(),
                 encode_optional_json(drawer.trigger_hints.as_ref())?,
+                valid_from.unwrap_or(drawer.added_at.as_str()),
+                valid_until,
             ],
         )?;
 
@@ -989,7 +1003,9 @@ impl Database {
                     verification_refs = ?24,
                     scope_constraints = ?25,
                     trigger_hints = ?26,
-                    content_hash = ?27
+                    content_hash = ?27,
+                    valid_from = ?28,
+                    valid_until = NULL
                 WHERE id = ?1 AND deleted_at IS NULL
                 "#,
                 params![
@@ -1020,6 +1036,7 @@ impl Database {
                     drawer.scope_constraints.as_deref(),
                     encode_optional_json(drawer.trigger_hints.as_ref())?,
                     content_hash,
+                    drawer.added_at.as_str(),
                 ],
             )?;
 
@@ -1362,7 +1379,7 @@ impl Database {
         ))?;
         let mut rows = statement.query_map([drawer_id], |row| {
             let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-            // DRAWER_SELECT_COLUMNS now has 27 columns (indices 0-26), so
+            // DRAWER_SELECT_COLUMNS has 27 columns (indices 0-26), so
             // the extra columns appended here start at index 27.
             let updated_at = row.get::<_, Option<String>>(27)?;
             let merge_count = row.get::<_, u32>(28)?;
@@ -2056,7 +2073,7 @@ impl Database {
     pub fn supersede_drawer(&self, old_id: &str, reason: &str) -> Result<bool, DbError> {
         let timestamp = super::utils::current_timestamp();
         let affected = self.conn.execute(
-            "UPDATE drawers SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            "UPDATE drawers SET deleted_at = ?1, valid_until = ?1 WHERE id = ?2 AND deleted_at IS NULL",
             params![timestamp, old_id],
         )?;
         if affected > 0 {
@@ -3122,6 +3139,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             apply_migration_atomic(conn, &V7_ALREADY_APPLIED_MIGRATION)?;
             continue;
         }
+        if migration.version == 10 {
+            ensure_v10_drawers_schema(conn, read_user_version(conn)?)?;
+            continue;
+        }
         apply_migration_atomic(conn, migration)?;
     }
 
@@ -3178,6 +3199,33 @@ fn ensure_v5_drawers_schema(conn: &Connection, current_version: u32) -> Result<(
     // Keep the large content_hash rewrite outside the schema transaction so
     // the WAL stays bounded on legacy installs with many historical rows.
     backfill_content_hash(conn)?;
+    Ok(())
+}
+
+fn ensure_v10_drawers_schema(conn: &Connection, current_version: u32) -> Result<(), DbError> {
+    let existing_columns = drawers_column_names(conn)?;
+    let missing_columns = V10_DRAWER_COLUMN_MIGRATIONS
+        .iter()
+        .filter(|column| !existing_columns.contains(column.name))
+        .copied()
+        .collect::<Vec<_>>();
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(error) = (|| -> Result<(), DbError> {
+        for column in missing_columns {
+            conn.execute_batch(column.sql)?;
+        }
+        conn.execute_batch(V10_VALIDITY_BACKFILL_SQL)?;
+        if current_version < 10 {
+            set_user_version(conn, 10)?;
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+
     Ok(())
 }
 
@@ -3625,6 +3673,40 @@ CREATE INDEX IF NOT EXISTS idx_runtime_adoption_events_signal
     ON runtime_adoption_events(signal);
 "#;
 
+const V10_MIGRATION_SQL: &str = r#"
+ALTER TABLE drawers ADD COLUMN valid_from TEXT;
+ALTER TABLE drawers ADD COLUMN valid_until TEXT;
+
+UPDATE drawers
+SET valid_from = added_at
+WHERE valid_from IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_drawers_validity
+    ON drawers(valid_from, valid_until)
+    WHERE deleted_at IS NULL;
+"#;
+
+const V10_DRAWER_COLUMN_MIGRATIONS: &[DrawerColumnMigration] = &[
+    DrawerColumnMigration {
+        name: "valid_from",
+        sql: "ALTER TABLE drawers ADD COLUMN valid_from TEXT;",
+    },
+    DrawerColumnMigration {
+        name: "valid_until",
+        sql: "ALTER TABLE drawers ADD COLUMN valid_until TEXT;",
+    },
+];
+
+const V10_VALIDITY_BACKFILL_SQL: &str = r#"
+UPDATE drawers
+SET valid_from = added_at
+WHERE valid_from IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_drawers_validity
+    ON drawers(valid_from, valid_until)
+    WHERE deleted_at IS NULL;
+"#;
+
 fn migrations() -> &'static [Migration] {
     static MIGRATIONS: &[Migration] = &[
         Migration {
@@ -3662,6 +3744,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 9,
             sql: V9_MIGRATION_SQL,
+        },
+        Migration {
+            version: 10,
+            sql: V10_MIGRATION_SQL,
         },
     ];
     MIGRATIONS
@@ -4218,7 +4304,33 @@ mod tests {
     }
 
     #[test]
-    fn test_supersede_drawer_soft_deletes_and_writes_audit() {
+    fn test_insert_drawer_defaults_valid_from_to_added_at() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+
+        insert_test_drawer(&db, "valid-default", "valid fact", Some("project-a"));
+
+        let validity = db
+            .conn()
+            .query_row(
+                "SELECT added_at, valid_from, valid_until FROM drawers WHERE id = 'valid-default'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .expect("read validity");
+        assert_eq!(validity.1.as_deref(), Some(validity.0.as_str()));
+        assert_eq!(validity.2, None);
+    }
+
+    #[test]
+    fn test_supersede_drawer_soft_deletes_sets_valid_until_and_writes_audit() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -4230,6 +4342,15 @@ mod tests {
 
         assert!(superseded);
         assert!(!db.drawer_exists("old").expect("drawer exists"));
+        let valid_until = db
+            .conn()
+            .query_row(
+                "SELECT valid_until FROM drawers WHERE id = 'old'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .expect("read valid_until");
+        assert!(valid_until.is_some());
         let audit = fs::read_to_string(tempdir.path().join("audit.jsonl")).expect("read audit");
         assert!(audit.contains("\"command\":\"supersede\""));
         assert!(audit.contains("\"drawer_id\":\"old\""));
@@ -4301,6 +4422,57 @@ mod tests {
             !columns.iter().any(|column| column == "memory_kind"),
             "failed migration must not leave partial columns behind"
         );
+    }
+
+    #[test]
+    fn test_v10_migration_adds_validity_windows_and_backfills_valid_from() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE drawers (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                wing TEXT NOT NULL,
+                room TEXT,
+                source_file TEXT,
+                source_type TEXT NOT NULL CHECK(source_type IN ('project', 'conversation', 'manual')),
+                added_at TEXT NOT NULL,
+                chunk_index INTEGER,
+                deleted_at TEXT
+            );
+            INSERT INTO drawers (
+                id, content, wing, room, source_file, source_type, added_at, chunk_index, deleted_at
+            ) VALUES (
+                'legacy', 'legacy body', 'code', NULL, 'legacy.md', 'manual', '2026-04-29T00:00:00Z', 0, NULL
+            );
+            PRAGMA user_version = 9;
+            "#,
+        )
+        .expect("create legacy schema");
+
+        apply_migrations(&conn).expect("apply migration");
+
+        assert_eq!(
+            read_user_version(&conn).expect("user_version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        let columns = drawers_column_names(&conn).expect("drawer columns");
+        assert!(columns.contains("valid_from"));
+        assert!(columns.contains("valid_until"));
+        let validity = conn
+            .query_row(
+                "SELECT valid_from, valid_until FROM drawers WHERE id = 'legacy'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .expect("read validity");
+        assert_eq!(validity.0.as_deref(), Some("2026-04-29T00:00:00Z"));
+        assert_eq!(validity.1, None);
     }
 
     #[test]

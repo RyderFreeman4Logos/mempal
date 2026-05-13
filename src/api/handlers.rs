@@ -75,6 +75,7 @@ struct SearchQuery {
     include_global: Option<bool>,
     all_projects: Option<bool>,
     include_raw_turns: Option<bool>,
+    include_expired: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +87,8 @@ struct IngestRequest {
     project_id: Option<String>,
     supersedes: Option<String>,
     replace_text: Option<String>,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,11 +110,24 @@ fn is_zero(v: &usize) -> bool {
     *v == 0
 }
 
+fn validate_temporal_param(name: &str, value: Option<&str>) -> Result<(), ApiError> {
+    if let Some(raw) = value
+        && crate::core::decay::parse_temporal_timestamp_secs(raw).is_none()
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{name} must be a Unix timestamp or RFC3339 timestamp"),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     drawer_count: i64,
     taxonomy_count: i64,
     db_size_bytes: u64,
+    search_decay_mode: String,
     wings: Vec<ScopeCount>,
     turn_storage: TurnStorageStatus,
 }
@@ -200,6 +216,7 @@ async fn search_handler(
         &scope,
         SearchOptions {
             include_raw_turns: query.include_raw_turns.unwrap_or(false),
+            include_expired: query.include_expired.unwrap_or(false),
             ..SearchOptions::default()
         },
         query.top_k.unwrap_or(10),
@@ -222,6 +239,8 @@ async fn ingest_handler(
         .map_err(internal_error)?;
     let db = Database::open(&state.db_path).map_err(internal_error)?;
     let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    validate_temporal_param("valid_from", request.valid_from.as_deref())?;
+    validate_temporal_param("valid_until", request.valid_until.as_deref())?;
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
         .map_err(internal_error)?;
     let raw_turn = is_raw_turn(&request.wing, request.room.as_deref(), &config.turns);
@@ -394,8 +413,13 @@ async fn ingest_handler(
             if let Some(old_id) = superseded_drawer_id.as_deref() {
                 link_superseded_drawer(&mut drawer, old_id);
             }
-            db.insert_drawer_with_project(&drawer, project_id.as_deref())
-                .map_err(internal_error)?;
+            db.insert_drawer_with_project_validity(
+                &drawer,
+                project_id.as_deref(),
+                request.valid_from.as_deref(),
+                request.valid_until.as_deref(),
+            )
+            .map_err(internal_error)?;
             db.insert_vector_with_project(drawer_id, vector, project_id.as_deref())
                 .map_err(internal_error)?;
         }
@@ -459,6 +483,7 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         drawer_count,
         taxonomy_count,
         db_size_bytes,
+        search_decay_mode: config.search.decay.mode.to_string(),
         wings,
         turn_storage: TurnStorageStatus {
             storage_mode: config.turns.storage_mode.to_string(),

@@ -557,7 +557,7 @@ fn test_migration_backfills_legacy_drawers_with_bootstrap_defaults() {
     }
 
     let db = Database::open(&db_path).expect("migrate db to latest");
-    assert_eq!(db.schema_version().expect("schema version"), 9);
+    assert_eq!(db.schema_version().expect("schema version"), 10);
 
     let drawer = db
         .get_drawer("drawer_legacy_001")
@@ -2113,7 +2113,7 @@ async fn test_search_filters_by_domain_field_status_and_anchor_kind() {
             "wing": "mempal",
             "room": "bootstrap",
             "anchor_kind": "repo",
-            "top_k": 5
+            "top_k": 10
         }))
         .await
         .expect("anchor-filtered search should succeed");
