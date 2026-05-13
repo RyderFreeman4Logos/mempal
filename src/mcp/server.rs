@@ -16,7 +16,8 @@ use crate::core::{
     },
     utils::{
         build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp, iso_timestamp,
-        knowledge_source_file, normalize_rfc3339_timestamp, source_file_or_synthetic,
+        knowledge_source_file, link_superseded_drawer, normalize_rfc3339_timestamp,
+        source_file_or_synthetic,
     },
 };
 use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
@@ -1742,15 +1743,56 @@ impl MempalMcpServer {
         })?;
         let chunks =
             crate::ingest::prepare_chunks(&scrubbed_content, &config.chunker, embedder.as_ref());
+        if chunks.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "content produced no chunks",
+                None,
+            ));
+        }
+
+        let scrubbed_replace_text = request
+            .replace_text
+            .as_deref()
+            .map(|text| config.scrub_content_with_compiled(text, compiled_privacy.as_ref()));
+        let replacement_target = db
+            .resolve_replacement_target(
+                request.supersedes.as_deref(),
+                scrubbed_replace_text.as_deref(),
+                &request.wing,
+                room,
+                project_id.as_deref(),
+            )
+            .map_err(replacement_db_error)?;
+        let superseded_drawer_id = replacement_target
+            .as_ref()
+            .map(|summary| summary.id.clone());
+        let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
+        let mut superseded_response_id: Option<String> = None;
 
         let mut chunk_drawer_ids: Vec<(usize, String, bool)> = Vec::with_capacity(chunks.len());
         for (idx, chunk) in chunks.iter().enumerate() {
-            let did = build_bootstrap_drawer_id_from_parts(
+            if let Some(existing_id) = exact_duplicate_drawer_id(
+                &db,
+                chunk,
+                &request.wing,
+                room,
+                project_id.as_deref(),
+                superseded_drawer_id_ref,
+                &metadata,
+            )? {
+                chunk_drawer_ids.push((idx, existing_id, true));
+                continue;
+            }
+
+            let preferred_id = build_bootstrap_drawer_id_from_parts(
                 &request.wing,
                 room,
                 chunk,
                 metadata.identity_parts(),
             );
+            let did = db
+                .resolve_available_drawer_id(&preferred_id)
+                .map_err(db_error)?;
             let exists = db.drawer_exists(&did).map_err(db_error)?;
             chunk_drawer_ids.push((idx, did, exists));
         }
@@ -1774,6 +1816,33 @@ impl MempalMcpServer {
                 near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms: None,
+                superseded_drawer_id,
+                fact_check_warnings: Vec::new(),
+                system_warnings: current_system_warnings(),
+            }));
+        }
+
+        if chunk_drawer_ids.iter().all(|(_, _, exists)| *exists) {
+            let all_ids = chunk_drawer_ids
+                .iter()
+                .map(|(_, id, _)| id.clone())
+                .collect::<Vec<_>>();
+            if let Some(old_id) = superseded_drawer_id.as_deref() {
+                let replacement_id = all_ids.first().map(String::as_str).unwrap_or("existing");
+                supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
+                superseded_response_id = Some(old_id.to_string());
+            }
+            return Ok(Json(IngestResponse {
+                drawer_id,
+                drawer_ids: all_ids,
+                chunk_count: chunks.len(),
+                dropped: false,
+                gating_decision: None,
+                novelty_action: None,
+                near_drawer_id: None,
+                duplicate_warning: None,
+                lock_wait_ms: None,
+                superseded_drawer_id: superseded_response_id,
                 fact_check_warnings: Vec::new(),
                 system_warnings: current_system_warnings(),
             }));
@@ -1806,6 +1875,7 @@ impl MempalMcpServer {
                 near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms: None,
+                superseded_drawer_id: None,
                 fact_check_warnings: Vec::new(),
                 system_warnings: current_system_warnings(),
             }));
@@ -1852,7 +1922,8 @@ impl MempalMcpServer {
                 first_vector = tier2.vector;
                 // Tier 3: intercept uncertain Tier 2 results ("prototype_below_threshold")
                 // and route to LLM judge when enabled (fail-open: store now, judge async).
-                let llm_judge_active = config.llm.enabled
+                let llm_judge_active = superseded_drawer_id.is_none()
+                    && config.llm.enabled
                     && config.llm.enabled_for.contains(&"gating".to_string())
                     && config
                         .ingest_gating
@@ -1907,6 +1978,7 @@ impl MempalMcpServer {
                 near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms,
+                superseded_drawer_id: None,
                 fact_check_warnings: Vec::new(),
                 system_warnings: current_system_warnings(),
             }));
@@ -1949,6 +2021,7 @@ impl MempalMcpServer {
                     near_drawer_id: None,
                     duplicate_warning: None,
                     lock_wait_ms,
+                    superseded_drawer_id: None,
                     fact_check_warnings,
                     system_warnings: current_system_warnings(),
                 }));
@@ -1996,12 +2069,19 @@ impl MempalMcpServer {
             room: request.room.clone(),
             project_id: project_id.clone(),
         };
-        let novelty = evaluate_novelty(
-            &db,
-            &novelty_candidate,
-            first_vector_ref,
-            &config.ingest_gating.novelty,
-        );
+        let novelty = if superseded_drawer_id.is_some() {
+            crate::ingest::novelty::NoveltyDecision {
+                should_audit: false,
+                ..crate::ingest::novelty::NoveltyDecision::insert()
+            }
+        } else {
+            evaluate_novelty(
+                &db,
+                &novelty_candidate,
+                first_vector_ref,
+                &config.ingest_gating.novelty,
+            )
+        };
         let mut response_drawer_id = drawer_id.clone();
         let (novelty_action, near_drawer_id);
 
@@ -2060,7 +2140,7 @@ impl MempalMcpServer {
                         inserted_drawer_ids.push(chunk_did.clone());
                         continue;
                     }
-                    let drawer = drawer_from_ingest_metadata(
+                    let mut drawer = drawer_from_ingest_metadata(
                         &request,
                         &metadata,
                         chunk_did,
@@ -2068,6 +2148,9 @@ impl MempalMcpServer {
                         *chunk_idx,
                         &source_type,
                     );
+                    if let Some(old_id) = superseded_drawer_id.as_deref() {
+                        link_superseded_drawer(&mut drawer, old_id);
+                    }
                     db.insert_drawer_with_project(&drawer, project_id.as_deref())
                         .map_err(db_error)?;
                     db.insert_vector_with_project(chunk_did, vector, project_id.as_deref())
@@ -2223,6 +2306,13 @@ impl MempalMcpServer {
             }
         }
 
+        if let Some(old_id) = superseded_drawer_id.as_deref()
+            && let Some(replacement_id) = inserted_drawer_ids.first()
+        {
+            supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
+            superseded_response_id = Some(old_id.to_string());
+        }
+
         drop(lock_guard);
 
         // Apply session-ingest boost to previously searched drawers (P13).
@@ -2363,6 +2453,7 @@ impl MempalMcpServer {
             near_drawer_id,
             duplicate_warning,
             lock_wait_ms,
+            superseded_drawer_id: superseded_response_id,
             fact_check_warnings,
             system_warnings: current_system_warnings(),
         }))
@@ -3225,6 +3316,103 @@ impl ServerHandler for MempalMcpServer {
 
 pub(super) fn db_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(format!("{error}"), None)
+}
+
+fn replacement_db_error(error: crate::core::db::DbError) -> ErrorData {
+    match error {
+        crate::core::db::DbError::ReplacementTargetConflict
+        | crate::core::db::DbError::SupersededDrawerNotFound { .. }
+        | crate::core::db::DbError::SupersededDrawerProjectMismatch { .. }
+        | crate::core::db::DbError::ReplacementTextNotFound
+        | crate::core::db::DbError::ReplacementTextAmbiguous { .. } => {
+            ErrorData::invalid_params(error.to_string(), None)
+        }
+        _ => db_error(error),
+    }
+}
+
+fn exact_duplicate_drawer_id(
+    db: &Database,
+    content: &str,
+    wing: &str,
+    room: Option<&str>,
+    project_id: Option<&str>,
+    excluded_drawer_id: Option<&str>,
+    metadata: &ValidatedIngestMetadata,
+) -> std::result::Result<Option<String>, ErrorData> {
+    let candidates = db
+        .find_active_drawers_by_content(content, wing, room, project_id)
+        .map_err(db_error)?
+        .into_iter()
+        .filter(|summary| Some(summary.id.as_str()) != excluded_drawer_id)
+        .collect::<Vec<_>>();
+
+    for candidate in candidates {
+        let Some(drawer) = db.get_drawer(&candidate.id).map_err(db_error)? else {
+            continue;
+        };
+        if drawer_matches_ingest_metadata(&drawer, metadata) {
+            return Ok(Some(candidate.id));
+        }
+    }
+
+    Ok(None)
+}
+
+fn supersede_drawer_for_ingest(
+    db: &Database,
+    old_id: &str,
+    new_id: &str,
+) -> std::result::Result<(), ErrorData> {
+    db.supersede_drawer(old_id, &format!("replaced by {new_id}"))
+        .map_err(db_error)?;
+    Ok(())
+}
+
+fn drawer_matches_ingest_metadata(drawer: &Drawer, metadata: &ValidatedIngestMetadata) -> bool {
+    drawer.memory_kind == metadata.memory_kind
+        && drawer.domain == metadata.domain
+        && drawer.field == metadata.field
+        && drawer.anchor_kind == metadata.anchor_kind
+        && drawer.anchor_id == metadata.anchor_id
+        && drawer.parent_anchor_id == metadata.parent_anchor_id
+        && drawer.provenance == metadata.provenance
+        && drawer.statement == metadata.statement
+        && drawer.tier == metadata.tier
+        && drawer.status == metadata.status
+        && normalized_string_sets_match(&drawer.supporting_refs, &metadata.supporting_refs)
+        && normalized_string_sets_match(&drawer.counterexample_refs, &metadata.counterexample_refs)
+        && normalized_string_sets_match(&drawer.teaching_refs, &metadata.teaching_refs)
+        && normalized_string_sets_match(&drawer.verification_refs, &metadata.verification_refs)
+        && drawer.scope_constraints == metadata.scope_constraints
+        && trigger_hints_match(&drawer.trigger_hints, &metadata.trigger_hints)
+}
+
+fn normalized_string_sets_match(left: &[String], right: &[String]) -> bool {
+    fn normalize(values: &[String]) -> Vec<String> {
+        let mut normalized = values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized
+    }
+
+    normalize(left) == normalize(right)
+}
+
+fn trigger_hints_match(left: &Option<TriggerHints>, right: &Option<TriggerHints>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            normalized_string_sets_match(&left.intent_tags, &right.intent_tags)
+                && normalized_string_sets_match(&left.workflow_bias, &right.workflow_bias)
+                && normalized_string_sets_match(&left.tool_needs, &right.tool_needs)
+        }
+        _ => false,
+    }
 }
 
 #[allow(dead_code)]
@@ -5528,6 +5716,254 @@ mod tests {
         );
     }
 
+    async fn ingest_manual(
+        server: &MempalMcpServer,
+        content: &str,
+        project_id: Option<&str>,
+        supersedes: Option<&str>,
+        replace_text: Option<&str>,
+    ) -> IngestResponse {
+        server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: content.to_string(),
+                wing: "mempal".to_string(),
+                room: Some("replace".to_string()),
+                project_id: project_id.map(ToOwned::to_owned),
+                supersedes: supersedes.map(ToOwned::to_owned),
+                replace_text: replace_text.map(ToOwned::to_owned),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("ingest should succeed")
+            .0
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_idempotent_exact_duplicate_returns_existing_id() {
+        let (_tempdir, db_path, server) = setup_server();
+
+        let first = ingest_manual(&server, "idempotent exact fact", None, None, None).await;
+        let second = ingest_manual(&server, "idempotent exact fact", None, None, None).await;
+
+        assert_eq!(second.drawer_id, first.drawer_id);
+        assert_eq!(second.drawer_ids, vec![first.drawer_id.clone()]);
+        let db = Database::open(&db_path).expect("open db");
+        assert_eq!(db.drawer_count().expect("drawer count"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_supersedes_soft_deletes_old_and_links_new() {
+        let (_tempdir, db_path, server) = setup_server();
+        let old = ingest_manual(&server, "stale explicit fact", None, None, None).await;
+
+        let new = ingest_manual(
+            &server,
+            "corrected explicit fact",
+            None,
+            Some(&old.drawer_id),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            new.superseded_drawer_id.as_deref(),
+            Some(old.drawer_id.as_str())
+        );
+        let db = Database::open(&db_path).expect("open db");
+        assert!(db.get_drawer(&old.drawer_id).expect("old lookup").is_none());
+        let new_drawer = db
+            .get_drawer(&new.drawer_id)
+            .expect("new lookup")
+            .expect("new drawer exists");
+        assert!(
+            new_drawer
+                .scope_constraints
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&format!("supersedes:{}", old.drawer_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_supersedes_empty_chunks_errors_without_retiring_old() {
+        let (_tempdir, db_path, server) = setup_server();
+        let old = ingest_manual(&server, "empty replacement old fact", None, None, None).await;
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "   \n\t  ".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("replace".to_string()),
+                supersedes: Some(old.drawer_id.clone()),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(_) => panic!("empty replacement should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("content produced no chunks"));
+        let db = Database::open(&db_path).expect("open db");
+        assert!(db.get_drawer(&old.drawer_id).expect("old lookup").is_some());
+        assert_eq!(db.drawer_count().expect("drawer count"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_replace_text_single_match_supersedes() {
+        let (_tempdir, db_path, server) = setup_server();
+        let old = ingest_manual(&server, "replace text old fact", None, None, None).await;
+
+        let new = ingest_manual(
+            &server,
+            "replace text new fact",
+            None,
+            None,
+            Some("replace text old fact"),
+        )
+        .await;
+
+        assert_eq!(
+            new.superseded_drawer_id.as_deref(),
+            Some(old.drawer_id.as_str())
+        );
+        let db = Database::open(&db_path).expect("open db");
+        assert!(db.get_drawer(&old.drawer_id).expect("old lookup").is_none());
+        assert!(db.get_drawer(&new.drawer_id).expect("new lookup").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_replace_text_zero_matches_errors() {
+        let (_tempdir, _db_path, server) = setup_server();
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "new fact without old".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("replace".to_string()),
+                replace_text: Some("missing old fact".to_string()),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(_) => panic!("missing replace_text target should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("no matching active fact found"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_replace_text_multiple_matches_errors_with_candidates() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "replace_candidate_a",
+            "ambiguous old fact",
+            "mempal",
+            Some("replace"),
+            "a.md",
+            0,
+        );
+        insert_drawer(
+            &db_path,
+            "replace_candidate_b",
+            "ambiguous old fact",
+            "mempal",
+            Some("replace"),
+            "b.md",
+            0,
+        );
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "new ambiguous replacement".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("replace".to_string()),
+                replace_text: Some("ambiguous old fact".to_string()),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(_) => panic!("ambiguous replace_text target should fail"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("multiple matching active facts"));
+        assert!(message.contains("replace_candidate_a"));
+        assert!(message.contains("replace_candidate_b"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_superseded_drawer_excluded_from_search() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let old = ingest_manual(&server, "retired-search-token old fact", None, None, None).await;
+        let new = ingest_manual(
+            &server,
+            "replacement visible fact",
+            None,
+            Some(&old.drawer_id),
+            None,
+        )
+        .await;
+
+        let results = server
+            .mempal_search(Parameters(SearchRequest {
+                query: "retired-search-token".to_string(),
+                wing: Some("mempal".to_string()),
+                room: Some("replace".to_string()),
+                top_k: Some(10),
+                ..SearchRequest::default()
+            }))
+            .await
+            .expect("search should succeed")
+            .0
+            .results;
+
+        assert!(
+            !results
+                .iter()
+                .any(|result| result.drawer_id == old.drawer_id)
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.drawer_id != old.drawer_id)
+        );
+        assert_ne!(new.drawer_id, old.drawer_id);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_cannot_supersede_different_project_scope() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let old = ingest_manual(
+            &server,
+            "project scoped old fact",
+            Some("project-a"),
+            None,
+            None,
+        )
+        .await;
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "project scoped new fact".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("replace".to_string()),
+                project_id: Some("project-b".to_string()),
+                supersedes: Some(old.drawer_id),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(_) => panic!("project mismatch should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("expected Some(\"project-b\")"));
+    }
+
     #[tokio::test]
     async fn test_mcp_ingest_response_exposes_lock_wait() {
         let (_tempdir, _db_path, server) = setup_server();
@@ -5541,6 +5977,8 @@ mod tests {
                 importance: None,
                 dry_run: None,
                 diary_rollup: None,
+                supersedes: None,
+                replace_text: None,
                 memory_kind: None,
                 domain: None,
                 field: None,

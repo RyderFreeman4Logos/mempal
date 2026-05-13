@@ -405,6 +405,138 @@ async fn test_ingest_stdin_scrubs_source_fields_in_audit_and_drawer() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_stdin_replace_text_uses_scrubbed_text_for_lookup() {
+    let tmp = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_embed_config_with_privacy(tmp.path(), &format!("http://{addr}/v1"), true);
+
+    let raw_old = "old <private>hidden</private> fact";
+    let old_payload = serde_json::json!({
+        "content": raw_old,
+        "wing": "privacy-wing",
+        "room": "privacy-room",
+        "project": "privacy-project"
+    })
+    .to_string();
+    let old_output = run_ingest_stdin_json(tmp.path(), &old_payload, &["--no-gate", "--json"]);
+    assert!(
+        old_output.status.success(),
+        "old ingest must succeed, stdout={}, stderr={}",
+        String::from_utf8_lossy(&old_output.stdout),
+        String::from_utf8_lossy(&old_output.stderr)
+    );
+    let old_json: Value =
+        serde_json::from_slice(&old_output.stdout).expect("parse old ingest JSON");
+    let old_id = old_json["drawer_ids"][0]
+        .as_str()
+        .expect("old drawer id")
+        .to_string();
+
+    let replacement_payload = serde_json::json!({
+        "content": "new scrubbed replacement fact",
+        "wing": "privacy-wing",
+        "room": "privacy-room",
+        "project": "privacy-project"
+    })
+    .to_string();
+    let replacement_output = run_ingest_stdin_json(
+        tmp.path(),
+        &replacement_payload,
+        &["--no-gate", "--json", "--replace-text", raw_old],
+    );
+    handle.shutdown().await;
+
+    assert!(
+        replacement_output.status.success(),
+        "replacement ingest must match scrubbed replace_text, stdout={}, stderr={}",
+        String::from_utf8_lossy(&replacement_output.stdout),
+        String::from_utf8_lossy(&replacement_output.stderr)
+    );
+    let replacement_json: Value =
+        serde_json::from_slice(&replacement_output.stdout).expect("parse replacement JSON");
+    assert_eq!(
+        replacement_json["stats"]["superseded_drawer_id"],
+        Value::String(old_id.clone())
+    );
+
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    assert!(db.get_drawer(&old_id).expect("old lookup").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_stdin_replacement_insert_failure_preserves_old_drawer() {
+    let tmp = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_embed_config(tmp.path(), &format!("http://{addr}/v1"));
+
+    let old_payload = serde_json::json!({
+        "content": "old durable replacement fact",
+        "wing": "replace-wing",
+        "room": "replace-room",
+        "project": "replace-project"
+    })
+    .to_string();
+    let old_output = run_ingest_stdin_json(tmp.path(), &old_payload, &["--no-gate", "--json"]);
+    assert!(
+        old_output.status.success(),
+        "old ingest must succeed, stdout={}, stderr={}",
+        String::from_utf8_lossy(&old_output.stdout),
+        String::from_utf8_lossy(&old_output.stderr)
+    );
+    let old_json: Value =
+        serde_json::from_slice(&old_output.stdout).expect("parse old ingest JSON");
+    let old_id = old_json["drawer_ids"][0]
+        .as_str()
+        .expect("old drawer id")
+        .to_string();
+
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    db.conn()
+        .execute_batch(
+            r#"
+            CREATE TRIGGER fail_replacement_drawer_insert
+            BEFORE INSERT ON drawers
+            BEGIN
+                SELECT RAISE(FAIL, 'forced replacement drawer insert failure');
+            END;
+            "#,
+        )
+        .expect("install failure trigger");
+
+    let replacement_payload = serde_json::json!({
+        "content": "new replacement fact that cannot be stored",
+        "wing": "replace-wing",
+        "room": "replace-room",
+        "project": "replace-project"
+    })
+    .to_string();
+    let replacement_output = run_ingest_stdin_json(
+        tmp.path(),
+        &replacement_payload,
+        &["--no-gate", "--json", "--supersedes", &old_id],
+    );
+    handle.shutdown().await;
+
+    assert!(
+        !replacement_output.status.success(),
+        "replacement ingest must fail, stdout={}, stderr={}",
+        String::from_utf8_lossy(&replacement_output.stdout),
+        String::from_utf8_lossy(&replacement_output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&replacement_output.stderr);
+    assert!(
+        stderr.contains("forced replacement drawer insert failure"),
+        "stderr must include forced failure, got: {stderr}"
+    );
+    assert!(
+        db.get_drawer(&old_id).expect("old lookup").is_some(),
+        "old drawer must remain active when replacement storage fails"
+    );
+}
+
 #[test]
 fn test_ingest_stdin_rejects_invalid_json() {
     let tmp = setup_home();

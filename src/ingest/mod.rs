@@ -20,7 +20,7 @@ use crate::core::{
     db::Database,
     types::{BootstrapEvidenceArgs, Drawer, SourceType},
     utils::{
-        build_bootstrap_evidence_drawer_id, build_drawer_id, iso_timestamp,
+        build_bootstrap_evidence_drawer_id, build_drawer_id, iso_timestamp, link_superseded_drawer,
         route_room_from_taxonomy,
     },
 };
@@ -59,6 +59,7 @@ pub struct IngestStats {
     pub drawer_ids: Vec<String>,
     pub fact_check_warnings: Vec<String>,
     pub noise_bytes_stripped: Option<u64>,
+    pub superseded_drawer_id: Option<String>,
     /// Time waited acquiring the per-source ingest lock (P9-B). `None`
     /// when the lock was bypassed (e.g. dry-run) or when no wait was
     /// needed and the path took the fast exit before lock acquisition.
@@ -78,6 +79,8 @@ pub struct IngestOptions<'a> {
     pub no_strip_noise: bool,
     pub diary_rollup: bool,
     pub diary_rollup_day: Option<&'a str>,
+    pub supersedes: Option<&'a str>,
+    pub replace_text: Option<&'a str>,
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -123,6 +126,17 @@ pub enum IngestError {
     #[error("failed to replace source drawers for {source_file}")]
     ReplaceSource {
         source_file: String,
+        #[source]
+        source: crate::core::db::DbError,
+    },
+    #[error("failed to resolve replacement target")]
+    ResolveReplacement {
+        #[source]
+        source: crate::core::db::DbError,
+    },
+    #[error("failed to supersede drawer {drawer_id}")]
+    SupersedeDrawer {
+        drawer_id: String,
         #[source]
         source: crate::core::db::DbError,
     },
@@ -207,6 +221,8 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             no_strip_noise: false,
             diary_rollup: false,
             diary_rollup_day: None,
+            supersedes: None,
+            replace_text: None,
         },
     )
     .await
@@ -341,15 +357,56 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             })?;
     }
 
+    let scrubbed_replace_text = options
+        .replace_text
+        .map(|text| config.scrub_content_with_compiled(text, compiled_privacy.as_ref()));
+    let replacement_target = db
+        .resolve_replacement_target(
+            options.supersedes,
+            scrubbed_replace_text.as_deref(),
+            wing,
+            Some(resolved_room.as_str()),
+            options.project_id,
+        )
+        .map_err(|source| IngestError::ResolveReplacement { source })?;
+    let replacement_target_id = replacement_target
+        .as_ref()
+        .map(|summary| summary.id.as_str());
+
     let mut pending = Vec::new();
 
     for (chunk_index, chunk) in chunks.iter().enumerate() {
-        let drawer_id = build_bootstrap_evidence_drawer_id(
+        let exact_duplicate = db
+            .find_active_drawers_by_content(
+                chunk,
+                wing,
+                Some(resolved_room.as_str()),
+                options.project_id,
+            )
+            .map_err(|source| IngestError::CheckDrawer {
+                drawer_id: build_drawer_id(wing, Some(resolved_room.as_str()), chunk),
+                source,
+            })?
+            .into_iter()
+            .find(|summary| Some(summary.id.as_str()) != replacement_target_id);
+        if let Some(existing) = exact_duplicate {
+            stats.skipped += 1;
+            stats.drawer_ids.push(existing.id);
+            continue;
+        }
+
+        let preferred_drawer_id = build_bootstrap_evidence_drawer_id(
             wing,
             Some(resolved_room.as_str()),
             chunk,
             &source_type,
         );
+        let drawer_id = db
+            .resolve_available_drawer_id(&preferred_drawer_id)
+            .map_err(|source| IngestError::CheckDrawer {
+                drawer_id: preferred_drawer_id.clone(),
+                source,
+            })?;
         let exists = db
             .drawer_exists(&drawer_id)
             .map_err(|source| IngestError::CheckDrawer {
@@ -424,6 +481,9 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
     }
 
     if options.dry_run || pending.is_empty() {
+        if !options.dry_run {
+            supersede_after_successful_replacement(db, replacement_target_id, &mut stats)?;
+        }
         return Ok(stats);
     }
 
@@ -485,6 +545,10 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             normalize_version: CURRENT_NORMALIZE_VERSION,
             ..drawer
         };
+        let mut drawer = drawer;
+        if let Some(old_id) = replacement_target_id {
+            link_superseded_drawer(&mut drawer, old_id);
+        }
 
         db.insert_drawer_with_project(&drawer, options.project_id)
             .map_err(|source| IngestError::InsertDrawer {
@@ -547,6 +611,8 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         stats.chunks += 1;
     }
 
+    supersede_after_successful_replacement(db, replacement_target_id, &mut stats)?;
+
     Ok(stats)
 }
 
@@ -574,6 +640,8 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             no_strip_noise: false,
             diary_rollup: false,
             diary_rollup_day: None,
+            supersedes: None,
+            replace_text: None,
         },
     )
     .await
@@ -618,6 +686,9 @@ pub async fn ingest_dir_with_options<E: Embedder + ?Sized>(
                 stats.drawer_ids.extend(file_stats.drawer_ids);
                 stats.noise_bytes_stripped =
                     merge_optional_sum(stats.noise_bytes_stripped, file_stats.noise_bytes_stripped);
+                if stats.superseded_drawer_id.is_none() {
+                    stats.superseded_drawer_id = file_stats.superseded_drawer_id;
+                }
             }
         }
     }
@@ -631,6 +702,29 @@ fn merge_optional_sum(left: Option<u64>, right: Option<u64>) -> Option<u64> {
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
     }
+}
+
+fn supersede_target(db: &Database, old_id: &str, new_id: &str) -> Result<()> {
+    db.supersede_drawer(old_id, &format!("replaced by {new_id}"))
+        .map_err(|source| IngestError::SupersedeDrawer {
+            drawer_id: old_id.to_string(),
+            source,
+        })?;
+    Ok(())
+}
+
+fn supersede_after_successful_replacement(
+    db: &Database,
+    replacement_target_id: Option<&str>,
+    stats: &mut IngestStats,
+) -> Result<()> {
+    if let Some(target_id) = replacement_target_id
+        && let Some(replacement_id) = stats.drawer_ids.first()
+    {
+        supersede_target(db, target_id, replacement_id)?;
+        stats.superseded_drawer_id = Some(target_id.to_string());
+    }
+    Ok(())
 }
 
 fn source_type_for(format: Format) -> SourceType {

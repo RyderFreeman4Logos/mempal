@@ -7,7 +7,8 @@ pub use db_fork_ext::{
     read_fork_ext_version, set_fork_ext_version,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,12 +23,12 @@ use thiserror::Error;
 use super::anchor;
 use super::{
     types::{
-        AnchorKind, ChunkNeighbors, Drawer, DrawerDetails, ExplicitTunnel, KnowledgeCard,
-        KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink,
-        KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
-        NeighborChunk, Provenance, ReindexSource, RuntimeAdoptionEvent, RuntimeAdoptionFilter,
-        RuntimeAdoptionSignal, RuntimeAdoptionTrack, SourceType, TaxonomyEntry, Triple,
-        TripleStats, TunnelDrawer, TunnelEndpoint, TunnelFollowResult,
+        AnchorKind, ChunkNeighbors, Drawer, DrawerDetails, DrawerSummary, ExplicitTunnel,
+        KnowledgeCard, KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType,
+        KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain,
+        MemoryKind, NeighborChunk, Provenance, ReindexSource, RuntimeAdoptionEvent,
+        RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack, SourceType,
+        TaxonomyEntry, Triple, TripleStats, TunnelDrawer, TunnelEndpoint, TunnelFollowResult,
     },
     utils::{
         build_drawer_id, build_scoped_drawer_id, build_tunnel_id, current_timestamp,
@@ -145,6 +146,18 @@ pub enum DbError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to open audit log {path}")]
+    AuditOpen {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write audit log {path}")]
+    AuditWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error("failed to parse taxonomy keywords JSON")]
@@ -161,6 +174,22 @@ pub enum DbError {
     RegisterVec(String),
     #[error("database schema version {current} is newer than supported version {supported}")]
     UnsupportedSchemaVersion { current: u32, supported: u32 },
+    #[error("supersedes and replace_text are mutually exclusive")]
+    ReplacementTargetConflict,
+    #[error("superseded drawer {drawer_id} was not found or is already deleted")]
+    SupersededDrawerNotFound { drawer_id: String },
+    #[error(
+        "superseded drawer {drawer_id} belongs to project scope {actual:?}, expected {expected:?}"
+    )]
+    SupersededDrawerProjectMismatch {
+        drawer_id: String,
+        expected: Option<String>,
+        actual: Option<String>,
+    },
+    #[error("no matching active fact found for replace_text")]
+    ReplacementTextNotFound,
+    #[error("multiple matching active facts found for replace_text; candidates: {candidate_ids:?}")]
+    ReplacementTextAmbiguous { candidate_ids: Vec<String> },
 }
 
 pub struct Database {
@@ -745,6 +774,97 @@ impl Database {
             |row| row.get::<_, i64>(0),
         )?;
         Ok(exists == 1)
+    }
+
+    pub fn drawer_exists_exact(
+        &self,
+        content: &str,
+        wing: &str,
+        room: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<bool, DbError> {
+        Ok(!self
+            .find_active_drawers_by_content(content, wing, room, project_id)?
+            .is_empty())
+    }
+
+    pub fn find_active_drawers_by_content(
+        &self,
+        text: &str,
+        wing: &str,
+        room: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Vec<DrawerSummary>, DbError> {
+        let content_hash = content_hash_hex(text);
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id, wing, room, source_file, project_id, added_at
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND content_hash = ?1
+              AND content = ?2
+              AND wing = ?3
+              AND ((room IS NULL AND ?4 IS NULL) OR room = ?4)
+              AND ((project_id IS NULL AND ?5 IS NULL) OR project_id = ?5)
+            ORDER BY added_at DESC, id
+            "#,
+        )?;
+        let rows =
+            statement.query_map(params![content_hash, text, wing, room, project_id], |row| {
+                Ok(DrawerSummary {
+                    id: row.get(0)?,
+                    wing: row.get(1)?,
+                    room: row.get(2)?,
+                    source_file: row.get(3)?,
+                    project_id: row.get(4)?,
+                    added_at: row.get(5)?,
+                })
+            })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
+    pub fn resolve_replacement_target(
+        &self,
+        supersedes: Option<&str>,
+        replace_text: Option<&str>,
+        wing: &str,
+        room: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Option<DrawerSummary>, DbError> {
+        match (supersedes, replace_text) {
+            (Some(_), Some(_)) => Err(DbError::ReplacementTargetConflict),
+            (Some(drawer_id), None) => {
+                let details = self.get_drawer_details(drawer_id)?.ok_or_else(|| {
+                    DbError::SupersededDrawerNotFound {
+                        drawer_id: drawer_id.to_string(),
+                    }
+                })?;
+                if details.project_id.as_deref() != project_id {
+                    return Err(DbError::SupersededDrawerProjectMismatch {
+                        drawer_id: drawer_id.to_string(),
+                        expected: project_id.map(ToOwned::to_owned),
+                        actual: details.project_id,
+                    });
+                }
+                Ok(Some(drawer_summary_from_details(details)))
+            }
+            (None, Some(text)) => {
+                let matches = self.find_active_drawers_by_content(text, wing, room, project_id)?;
+                match matches.len() {
+                    0 => Err(DbError::ReplacementTextNotFound),
+                    1 => Ok(matches.into_iter().next()),
+                    _ => Err(DbError::ReplacementTextAmbiguous {
+                        candidate_ids: matches.into_iter().map(|summary| summary.id).collect(),
+                    }),
+                }
+            }
+            (None, None) => Ok(None),
+        }
     }
 
     pub fn resolve_ingest_drawer_id(
@@ -1346,6 +1466,21 @@ impl Database {
         Ok(exists == 1)
     }
 
+    pub fn resolve_available_drawer_id(&self, preferred_id: &str) -> Result<String, DbError> {
+        if !self.drawer_id_in_use(preferred_id)? {
+            return Ok(preferred_id.to_string());
+        }
+
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{preferred_id}_{suffix}");
+            if !self.drawer_id_in_use(&candidate)? {
+                return Ok(candidate);
+            }
+            suffix += 1;
+        }
+    }
+
     fn find_active_drawer_id_by_identity(
         &self,
         wing: &str,
@@ -1916,6 +2051,50 @@ impl Database {
             params![timestamp, drawer_id],
         )?;
         Ok(affected > 0)
+    }
+
+    pub fn supersede_drawer(&self, old_id: &str, reason: &str) -> Result<bool, DbError> {
+        let timestamp = super::utils::current_timestamp();
+        let affected = self.conn.execute(
+            "UPDATE drawers SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            params![timestamp, old_id],
+        )?;
+        if affected > 0 {
+            self.append_supersede_audit_entry(old_id, reason, &timestamp)?;
+        }
+        Ok(affected > 0)
+    }
+
+    fn append_supersede_audit_entry(
+        &self,
+        old_id: &str,
+        reason: &str,
+        timestamp: &str,
+    ) -> Result<(), DbError> {
+        let audit_path = self
+            .path
+            .parent()
+            .map(|parent| parent.join("audit.jsonl"))
+            .unwrap_or_else(|| PathBuf::from("audit.jsonl"));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&audit_path)
+            .map_err(|source| DbError::AuditOpen {
+                path: audit_path.clone(),
+                source,
+            })?;
+        let entry = serde_json::json!({
+            "timestamp": timestamp,
+            "command": "supersede",
+            "drawer_id": old_id,
+            "reason": reason,
+        });
+        writeln!(file, "{entry}").map_err(|source| DbError::AuditWrite {
+            path: audit_path,
+            source,
+        })?;
+        Ok(())
     }
 
     pub fn soft_delete_drawers_since(
@@ -3940,6 +4119,17 @@ fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
     })
 }
 
+fn drawer_summary_from_details(details: DrawerDetails) -> DrawerSummary {
+    DrawerSummary {
+        id: details.drawer.id,
+        wing: details.drawer.wing,
+        room: details.drawer.room,
+        source_file: details.drawer.source_file,
+        project_id: details.project_id,
+        added_at: details.drawer.added_at,
+    }
+}
+
 fn parse_keywords(raw: Option<&str>) -> Result<Vec<String>, DbError> {
     let Some(raw) = raw else {
         return Ok(Vec::new());
@@ -3975,6 +4165,99 @@ fn build_fts_match_query(query: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_drawer(id: &str, content: &str) -> Drawer {
+        Drawer::new_bootstrap_evidence(super::super::types::BootstrapEvidenceArgs {
+            id: id.to_string(),
+            content: content.to_string(),
+            wing: "test-wing".to_string(),
+            room: Some("test-room".to_string()),
+            source_file: Some(format!("{id}.md")),
+            source_type: SourceType::Manual,
+            added_at: "2026-05-13T00:00:00Z".to_string(),
+            chunk_index: Some(0),
+            importance: 0,
+        })
+    }
+
+    fn insert_test_drawer(db: &Database, id: &str, content: &str, project_id: Option<&str>) {
+        db.insert_drawer_with_project(&test_drawer(id, content), project_id)
+            .expect("insert drawer");
+    }
+
+    #[test]
+    fn test_find_active_drawers_by_content_respects_scope_and_soft_delete() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        insert_test_drawer(&db, "same-project", "same fact", Some("project-a"));
+        insert_test_drawer(&db, "other-project", "same fact", Some("project-b"));
+        insert_test_drawer(&db, "deleted", "same fact", Some("project-a"));
+        db.soft_delete_drawer("deleted").expect("soft delete");
+
+        let matches = db
+            .find_active_drawers_by_content(
+                "same fact",
+                "test-wing",
+                Some("test-room"),
+                Some("project-a"),
+            )
+            .expect("find matches");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, "same-project");
+        assert!(
+            db.drawer_exists_exact(
+                "same fact",
+                "test-wing",
+                Some("test-room"),
+                Some("project-a")
+            )
+            .expect("exists exact")
+        );
+    }
+
+    #[test]
+    fn test_supersede_drawer_soft_deletes_and_writes_audit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        insert_test_drawer(&db, "old", "old fact", Some("project-a"));
+
+        let superseded = db
+            .supersede_drawer("old", "replaced by new")
+            .expect("supersede");
+
+        assert!(superseded);
+        assert!(!db.drawer_exists("old").expect("drawer exists"));
+        let audit = fs::read_to_string(tempdir.path().join("audit.jsonl")).expect("read audit");
+        assert!(audit.contains("\"command\":\"supersede\""));
+        assert!(audit.contains("\"drawer_id\":\"old\""));
+        assert!(audit.contains("\"reason\":\"replaced by new\""));
+    }
+
+    #[test]
+    fn test_resolve_replacement_target_rejects_project_mismatch() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        insert_test_drawer(&db, "old", "old fact", Some("project-a"));
+
+        let error = db
+            .resolve_replacement_target(
+                Some("old"),
+                None,
+                "test-wing",
+                Some("test-room"),
+                Some("project-b"),
+            )
+            .expect_err("project mismatch");
+
+        assert!(matches!(
+            error,
+            DbError::SupersededDrawerProjectMismatch { .. }
+        ));
+    }
 
     #[test]
     fn test_atomic_migration_rolls_back_partial_schema_changes() {

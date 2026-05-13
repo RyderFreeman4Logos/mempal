@@ -218,6 +218,119 @@ async fn test_fact_check_engine_error_fails_open_with_warning() {
 }
 
 #[tokio::test]
+async fn test_rejected_replacement_does_not_supersede_old_drawer() {
+    let (tmp, db) = new_test_db();
+    let old_path = write_input(tmp.path(), "old fact remains active");
+    let old = ingest_file_with_options(
+        &db,
+        &StubEmbedder,
+        &old_path,
+        "mempal",
+        IngestOptions {
+            room: Some("decision"),
+            project_id: Some("test-project"),
+            ..IngestOptions::default()
+        },
+    )
+    .await
+    .expect("ingest old drawer");
+    let old_id = old.drawer_ids.first().expect("old drawer id").clone();
+
+    insert_triple(&db, "Bob", "husband_of", "Alice");
+    let replacement_path = write_input(tmp.path(), "Bob is Alice's brother.");
+    let gating = gating(enabled_fact_check(true));
+
+    let stats = ingest_file_with_options(
+        &db,
+        &StubEmbedder,
+        &replacement_path,
+        "mempal",
+        IngestOptions {
+            room: Some("decision"),
+            gating: Some(&gating),
+            project_id: Some("test-project"),
+            supersedes: Some(&old_id),
+            ..IngestOptions::default()
+        },
+    )
+    .await
+    .expect("ingest rejected replacement");
+
+    assert_eq!(stats.dropped_by_gate, 1);
+    assert!(stats.drawer_ids.is_empty());
+    assert!(stats.superseded_drawer_id.is_none());
+    assert!(
+        db.get_drawer(&old_id).expect("old lookup").is_some(),
+        "old drawer must remain active when every replacement chunk is rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_duplicate_replacement_supersedes_old_drawer() {
+    let (tmp, db) = new_test_db();
+    let old_path = write_input(tmp.path(), "stale duplicate replacement source");
+    let old = ingest_file_with_options(
+        &db,
+        &StubEmbedder,
+        &old_path,
+        "mempal",
+        IngestOptions {
+            room: Some("decision"),
+            project_id: Some("test-project"),
+            ..IngestOptions::default()
+        },
+    )
+    .await
+    .expect("ingest old drawer");
+    let old_id = old.drawer_ids.first().expect("old drawer id").clone();
+
+    let canonical_path = write_input(tmp.path(), "canonical replacement fact");
+    let canonical = ingest_file_with_options(
+        &db,
+        &StubEmbedder,
+        &canonical_path,
+        "mempal",
+        IngestOptions {
+            room: Some("decision"),
+            project_id: Some("test-project"),
+            ..IngestOptions::default()
+        },
+    )
+    .await
+    .expect("ingest canonical drawer");
+    let canonical_id = canonical
+        .drawer_ids
+        .first()
+        .expect("canonical drawer id")
+        .clone();
+
+    let replacement_path = write_input(tmp.path(), "canonical replacement fact");
+    let stats = ingest_file_with_options(
+        &db,
+        &StubEmbedder,
+        &replacement_path,
+        "mempal",
+        IngestOptions {
+            room: Some("decision"),
+            project_id: Some("test-project"),
+            supersedes: Some(&old_id),
+            ..IngestOptions::default()
+        },
+    )
+    .await
+    .expect("ingest duplicate replacement");
+
+    assert_eq!(stats.drawer_ids, vec![canonical_id.clone()]);
+    assert_eq!(stats.superseded_drawer_id.as_deref(), Some(old_id.as_str()));
+    assert!(db.get_drawer(&old_id).expect("old lookup").is_none());
+    assert!(
+        db.get_drawer(&canonical_id)
+            .expect("canonical lookup")
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn test_fact_check_config_disabled_skips_gate_entirely() {
     let (tmp, db) = new_test_db();
     insert_triple(&db, "Bob", "husband_of", "Alice");

@@ -5,7 +5,10 @@ use crate::core::{
     types::{
         BootstrapEvidenceArgs, Drawer, RouteDecision, SearchResult, SourceType, TaxonomyEntry,
     },
-    utils::{build_bootstrap_evidence_drawer_id, iso_timestamp, source_file_or_synthetic},
+    utils::{
+        build_bootstrap_evidence_drawer_id, iso_timestamp, link_superseded_drawer,
+        source_file_or_synthetic,
+    },
 };
 use crate::ingest::gating::evaluate_fact_check_gate;
 use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
@@ -79,6 +82,8 @@ struct IngestRequest {
     room: Option<String>,
     source: Option<String>,
     project_id: Option<String>,
+    supersedes: Option<String>,
+    replace_text: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +95,8 @@ struct IngestResponse {
     chunk_count: usize,
     #[serde(default)]
     dropped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_drawer_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fact_check_warnings: Vec<String>,
 }
@@ -198,7 +205,7 @@ async fn ingest_handler(
         .await
         .map_err(internal_error)?;
     let db = Database::open(&state.db_path).map_err(internal_error)?;
-    let config = ConfigHandle::current();
+    let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
         .map_err(internal_error)?;
 
@@ -212,15 +219,49 @@ async fn ingest_handler(
         ));
     }
 
-    let mut accepted_chunks: Vec<(usize, &String, String)> = Vec::with_capacity(chunks.len());
+    let scrubbed_replace_text = request
+        .replace_text
+        .as_deref()
+        .map(|text| config.scrub_content_with_compiled(text, compiled_privacy.as_ref()));
+    let replacement_target = db
+        .resolve_replacement_target(
+            request.supersedes.as_deref(),
+            scrubbed_replace_text.as_deref(),
+            &request.wing,
+            request.room.as_deref(),
+            project_id.as_deref(),
+        )
+        .map_err(replacement_error)?;
+    let superseded_drawer_id = replacement_target
+        .as_ref()
+        .map(|summary| summary.id.clone());
+    let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
+    let mut superseded_response_id: Option<String> = None;
+
+    let mut accepted_chunks: Vec<(usize, &String, String, bool)> = Vec::with_capacity(chunks.len());
     let mut fact_check_warnings = Vec::new();
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
-        let drawer_id = build_bootstrap_evidence_drawer_id(
+        if let Some(existing_id) = exact_duplicate_drawer_id(
+            &db,
+            chunk,
+            &request.wing,
+            request.room.as_deref(),
+            project_id.as_deref(),
+            superseded_drawer_id_ref,
+        )? {
+            accepted_chunks.push((chunk_idx, chunk, existing_id, true));
+            continue;
+        }
+
+        let preferred_drawer_id = build_bootstrap_evidence_drawer_id(
             &request.wing,
             request.room.as_deref(),
             chunk,
             &SourceType::Manual,
         );
+        let drawer_id = db
+            .resolve_available_drawer_id(&preferred_drawer_id)
+            .map_err(internal_error)?;
         if request.wing != "hooks-raw"
             && let Some(outcome) = evaluate_fact_check_gate(
                 &drawer_id,
@@ -236,7 +277,7 @@ async fn ingest_handler(
                 continue;
             }
         }
-        accepted_chunks.push((chunk_idx, chunk, drawer_id));
+        accepted_chunks.push((chunk_idx, chunk, drawer_id, false));
     }
 
     if accepted_chunks.is_empty() {
@@ -247,6 +288,31 @@ async fn ingest_handler(
                 drawer_ids: Vec::new(),
                 chunk_count: 0,
                 dropped: true,
+                superseded_drawer_id: None,
+                fact_check_warnings,
+            }),
+        ));
+    }
+
+    if accepted_chunks.iter().all(|(_, _, _, exists)| *exists) {
+        let drawer_ids = accepted_chunks
+            .iter()
+            .map(|(_, _, drawer_id, _)| drawer_id.clone())
+            .collect::<Vec<_>>();
+        if let Some(old_id) = superseded_drawer_id.as_deref() {
+            let replacement_id = drawer_ids.first().map(String::as_str).unwrap_or("existing");
+            supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
+            superseded_response_id = Some(old_id.to_string());
+        }
+        let primary_drawer_id = drawer_ids.first().cloned().unwrap_or_default();
+        return Ok((
+            StatusCode::CREATED,
+            Json(IngestResponse {
+                drawer_id: primary_drawer_id,
+                drawer_ids,
+                chunk_count: accepted_chunks.len(),
+                dropped: false,
+                superseded_drawer_id: superseded_response_id,
                 fact_check_warnings,
             }),
         ));
@@ -255,7 +321,7 @@ async fn ingest_handler(
     // Embed all accepted chunks in one batch call.
     let chunk_refs: Vec<&str> = accepted_chunks
         .iter()
-        .map(|(_, chunk, _)| chunk.as_str())
+        .map(|(_, chunk, _, _)| chunk.as_str())
         .collect();
     let vectors = embedder.embed(&chunk_refs).await.map_err(internal_error)?;
     if vectors.len() != accepted_chunks.len() {
@@ -267,10 +333,13 @@ async fn ingest_handler(
 
     // Insert each chunk as a separate drawer.
     let mut drawer_ids: Vec<String> = Vec::with_capacity(accepted_chunks.len());
-    for ((chunk_idx, chunk, drawer_id), vector) in accepted_chunks.iter().zip(vectors.iter()) {
-        let drawer_exists = db
-            .drawer_exists(drawer_id.as_str())
-            .map_err(internal_error)?;
+    for ((chunk_idx, chunk, drawer_id, exact_duplicate), vector) in
+        accepted_chunks.iter().zip(vectors.iter())
+    {
+        let drawer_exists = *exact_duplicate
+            || db
+                .drawer_exists(drawer_id.as_str())
+                .map_err(internal_error)?;
 
         if !drawer_exists {
             let source_file = source_file_or_synthetic(drawer_id, request.source.as_deref());
@@ -289,12 +358,23 @@ async fn ingest_handler(
                 normalize_version: CURRENT_NORMALIZE_VERSION,
                 ..drawer
             };
+            let mut drawer = drawer;
+            if let Some(old_id) = superseded_drawer_id.as_deref() {
+                link_superseded_drawer(&mut drawer, old_id);
+            }
             db.insert_drawer_with_project(&drawer, project_id.as_deref())
                 .map_err(internal_error)?;
             db.insert_vector_with_project(drawer_id, vector, project_id.as_deref())
                 .map_err(internal_error)?;
         }
         drawer_ids.push(drawer_id.clone());
+    }
+
+    if let Some(old_id) = superseded_drawer_id.as_deref()
+        && let Some(replacement_id) = drawer_ids.first()
+    {
+        supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
+        superseded_response_id = Some(old_id.to_string());
     }
 
     let primary_drawer_id = drawer_ids.first().cloned().unwrap_or_default();
@@ -306,6 +386,7 @@ async fn ingest_handler(
             drawer_ids,
             chunk_count,
             dropped: false,
+            superseded_drawer_id: superseded_response_id,
             fact_check_warnings,
         }),
     ))
@@ -377,6 +458,41 @@ impl IntoResponse for ApiError {
 
 fn internal_error(error: impl std::fmt::Display) -> ApiError {
     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+fn replacement_error(error: crate::core::db::DbError) -> ApiError {
+    match error {
+        crate::core::db::DbError::ReplacementTargetConflict
+        | crate::core::db::DbError::SupersededDrawerNotFound { .. }
+        | crate::core::db::DbError::SupersededDrawerProjectMismatch { .. }
+        | crate::core::db::DbError::ReplacementTextNotFound
+        | crate::core::db::DbError::ReplacementTextAmbiguous { .. } => {
+            ApiError::new(StatusCode::BAD_REQUEST, error.to_string())
+        }
+        _ => internal_error(error),
+    }
+}
+
+fn exact_duplicate_drawer_id(
+    db: &Database,
+    content: &str,
+    wing: &str,
+    room: Option<&str>,
+    project_id: Option<&str>,
+    excluded_drawer_id: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    Ok(db
+        .find_active_drawers_by_content(content, wing, room, project_id)
+        .map_err(internal_error)?
+        .into_iter()
+        .find(|summary| Some(summary.id.as_str()) != excluded_drawer_id)
+        .map(|summary| summary.id))
+}
+
+fn supersede_drawer_for_ingest(db: &Database, old_id: &str, new_id: &str) -> Result<(), ApiError> {
+    db.supersede_drawer(old_id, &format!("replaced by {new_id}"))
+        .map_err(internal_error)?;
+    Ok(())
 }
 
 impl From<SearchResult> for SearchResultDto {

@@ -379,6 +379,16 @@ pub struct DrawerDetails {
     pub project_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawerSummary {
+    pub id: String,
+    pub wing: String,
+    pub room: Option<String>,
+    pub source_file: Option<String>,
+    pub project_id: Option<String>,
+    pub added_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunnelDrawer {
     pub drawer: Drawer,

@@ -32,8 +32,9 @@ use mempal::core::{
     },
     utils::{
         build_bootstrap_evidence_drawer_id, build_triple_id, current_timestamp,
-        format_tunnel_endpoint, iso_timestamp, normalize_added_at as normalize_added_at_value,
-        normalize_rfc3339_timestamp, source_file_or_synthetic,
+        format_tunnel_endpoint, iso_timestamp, link_superseded_drawer,
+        normalize_added_at as normalize_added_at_value, normalize_rfc3339_timestamp,
+        source_file_or_synthetic,
     },
 };
 use mempal::embed::build_backend_from_name;
@@ -116,6 +117,8 @@ struct IngestCommandOptions<'a> {
     json: bool,
     no_strip_noise: bool,
     diary_rollup: bool,
+    supersedes: Option<&'a str>,
+    replace_text: Option<&'a str>,
 }
 
 struct RollbackCommandOptions<'a> {
@@ -183,6 +186,10 @@ enum Commands {
         no_strip_noise: bool,
         #[arg(long)]
         diary_rollup: bool,
+        #[arg(long)]
+        supersedes: Option<String>,
+        #[arg(long)]
+        replace_text: Option<String>,
     },
     Search {
         query: String,
@@ -1176,6 +1183,8 @@ fn run() -> Result<()> {
             json,
             no_strip_noise,
             diary_rollup,
+            supersedes,
+            replace_text,
         } => block_on_result(ingest_command(
             &db,
             config.as_ref(),
@@ -1191,6 +1200,8 @@ fn run() -> Result<()> {
                 json,
                 no_strip_noise,
                 diary_rollup,
+                supersedes: supersedes.as_deref(),
+                replace_text: replace_text.as_deref(),
             },
         )),
         Commands::Search {
@@ -1640,6 +1651,9 @@ async fn ingest_command(
         }
         (false, Some(_)) => {}
     }
+    if options.supersedes.is_some() || options.replace_text.is_some() {
+        bail!("--supersedes and --replace-text are only supported with --stdin ingest");
+    }
 
     let path = options
         .dir
@@ -1682,6 +1696,8 @@ async fn ingest_command(
         no_strip_noise: options.no_strip_noise,
         diary_rollup: options.diary_rollup,
         diary_rollup_day: None,
+        supersedes: options.supersedes,
+        replace_text: options.replace_text,
     };
 
     let stats = if options.dry_run {
@@ -1712,6 +1728,8 @@ async fn ingest_command(
             no_strip_noise: options.no_strip_noise,
             diary_rollup: options.diary_rollup,
             diary_rollup_day: None,
+            supersedes: options.supersedes,
+            replace_text: options.replace_text,
         };
         ingest_path_with_options(db, &*embedder, path, wing, live_options).await?
     };
@@ -1735,6 +1753,7 @@ async fn ingest_command(
             skipped: stats.skipped,
             dropped_by_gate: stats.dropped_by_gate,
             drawer_ids: &stats.drawer_ids,
+            superseded_drawer_id: stats.superseded_drawer_id.clone(),
             fact_check_warnings: stats.fact_check_warnings.clone(),
         };
         println!(
@@ -1746,14 +1765,15 @@ async fn ingest_command(
     }
 
     println!(
-        "dry_run={} files={} chunks={} skipped={} dropped_by_gate={} noise_bytes_stripped={} lock_wait_ms={}",
+        "dry_run={} files={} chunks={} skipped={} dropped_by_gate={} noise_bytes_stripped={} lock_wait_ms={} superseded_drawer_id={}",
         options.dry_run,
         stats.files,
         stats.chunks,
         stats.skipped,
         stats.dropped_by_gate,
         stats.noise_bytes_stripped.unwrap_or(0),
-        stats.lock_wait_ms.unwrap_or(0)
+        stats.lock_wait_ms.unwrap_or(0),
+        stats.superseded_drawer_id.as_deref().unwrap_or("")
     );
     Ok(())
 }
@@ -1766,6 +1786,8 @@ struct StdinIngestRecord {
     project: Option<String>,
     source: Option<String>,
     source_file: Option<String>,
+    supersedes: Option<String>,
+    replace_text: Option<String>,
     metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -1786,6 +1808,23 @@ struct StdinIngestStatsJson {
     dropped_by_gate: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fact_check_warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_drawer_id: Option<String>,
+}
+
+fn exact_duplicate_drawer_id(
+    db: &Database,
+    content: &str,
+    wing: &str,
+    room: Option<&str>,
+    project_id: Option<&str>,
+    excluded_drawer_id: Option<&str>,
+) -> Result<Option<String>> {
+    Ok(db
+        .find_active_drawers_by_content(content, wing, room, project_id)?
+        .into_iter()
+        .find(|summary| Some(summary.id.as_str()) != excluded_drawer_id)
+        .map(|summary| summary.id))
 }
 
 async fn ingest_stdin_command(
@@ -1831,12 +1870,45 @@ async fn ingest_stdin_command(
         .context("stdin ingest requires --wing or JSON `wing`")?;
     let room = options.room.or(record.room.as_deref());
     let project = options.project.or(record.project.as_deref());
+    let supersedes = options.supersedes.or(record.supersedes.as_deref());
+    let replace_text = options.replace_text.or(record.replace_text.as_deref());
+    let (privacy_config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+    let scrubbed_replace_text = replace_text
+        .map(|text| privacy_config.scrub_content_with_compiled(text, compiled_privacy.as_ref()));
     let cwd = env::current_dir().ok();
     let project_id = resolve_project_id(project, config, cwd.as_deref())
         .context("failed to resolve stdin ingest project id")?;
 
     let source_type = SourceType::Manual;
-    let drawer_id = build_bootstrap_evidence_drawer_id(wing, room, &content, &source_type);
+    let replacement_target = db
+        .resolve_replacement_target(
+            supersedes,
+            scrubbed_replace_text.as_deref(),
+            wing,
+            room,
+            project_id.as_deref(),
+        )
+        .context("failed to resolve replacement target")?;
+    let superseded_drawer_id = replacement_target
+        .as_ref()
+        .map(|summary| summary.id.clone());
+    let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
+    let exact_duplicate = exact_duplicate_drawer_id(
+        db,
+        &content,
+        wing,
+        room,
+        project_id.as_deref(),
+        superseded_drawer_id_ref,
+    )
+    .context("failed to check exact duplicate")?;
+    let drawer_id = if let Some(existing_id) = exact_duplicate.as_ref() {
+        existing_id.clone()
+    } else {
+        let preferred_id = build_bootstrap_evidence_drawer_id(wing, room, &content, &source_type);
+        db.resolve_available_drawer_id(&preferred_id)
+            .with_context(|| format!("failed to resolve drawer id for {preferred_id}"))?
+    };
     let mut stats = IngestStats {
         files: 1,
         ..IngestStats::default()
@@ -1845,6 +1917,20 @@ async fn ingest_stdin_command(
     if options.dry_run {
         stats.chunks = 1;
         stats.drawer_ids.push(drawer_id.clone());
+        append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
+            .context("failed to append ingest audit log")?;
+        print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
+        return Ok(());
+    }
+
+    if exact_duplicate.is_some() {
+        stats.skipped = 1;
+        stats.drawer_ids.push(drawer_id.clone());
+        if let Some(old_id) = superseded_drawer_id.as_deref() {
+            db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
+                .with_context(|| format!("failed to supersede drawer {old_id}"))?;
+            stats.superseded_drawer_id = Some(old_id.to_string());
+        }
         append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
             .context("failed to append ingest audit log")?;
         print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
@@ -1931,6 +2017,7 @@ async fn ingest_stdin_command(
         .or(record.source.as_deref())
         .map(&scrub);
     let source_file = source_file_or_synthetic(&drawer_id, source_hint.as_deref());
+
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: drawer_id.clone(),
         content,
@@ -1946,11 +2033,21 @@ async fn ingest_stdin_command(
         normalize_version: CURRENT_NORMALIZE_VERSION,
         ..drawer
     };
+    let mut drawer = drawer;
+    if let Some(old_id) = superseded_drawer_id.as_deref() {
+        link_superseded_drawer(&mut drawer, old_id);
+    }
 
     db.insert_drawer_with_project(&drawer, project_id.as_deref())
         .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
     db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
         .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
+
+    if let Some(old_id) = superseded_drawer_id.as_deref() {
+        db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
+            .with_context(|| format!("failed to supersede drawer {old_id}"))?;
+        stats.superseded_drawer_id = Some(old_id.to_string());
+    }
 
     // Failure detection (P14) — synchronous, lightweight DB write.
     {
@@ -2007,6 +2104,7 @@ fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> 
                 skipped: stats.skipped,
                 dropped_by_gate: stats.dropped_by_gate,
                 fact_check_warnings: stats.fact_check_warnings.clone(),
+                superseded_drawer_id: stats.superseded_drawer_id.clone(),
             },
         };
         println!(
@@ -2018,8 +2116,13 @@ fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> 
     }
 
     println!(
-        "dry_run={} files={} chunks={} skipped={} dropped_by_gate={}",
-        dry_run, stats.files, stats.chunks, stats.skipped, stats.dropped_by_gate
+        "dry_run={} files={} chunks={} skipped={} dropped_by_gate={} superseded_drawer_id={}",
+        dry_run,
+        stats.files,
+        stats.chunks,
+        stats.skipped,
+        stats.dropped_by_gate,
+        stats.superseded_drawer_id.as_deref().unwrap_or("")
     );
     Ok(())
 }
@@ -2323,6 +2426,8 @@ struct IngestJsonOutput<'a> {
     skipped: usize,
     dropped_by_gate: usize,
     drawer_ids: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_drawer_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fact_check_warnings: Vec<String>,
 }
@@ -2364,7 +2469,7 @@ fn append_ingest_audit_log(
         .append(true)
         .open(&audit_path)
         .with_context(|| format!("failed to open audit log {}", audit_path.display()))?;
-    let entry = serde_json::json!({ "timestamp": current_timestamp(), "command": "ingest", "wing": wing, "dir": dir.to_string_lossy(), "format": format, "dry_run": dry_run, "files": stats.files, "chunks": stats.chunks, "skipped": stats.skipped, "dropped_by_gate": stats.dropped_by_gate });
+    let entry = serde_json::json!({ "timestamp": current_timestamp(), "command": "ingest", "wing": wing, "dir": dir.to_string_lossy(), "format": format, "dry_run": dry_run, "files": stats.files, "chunks": stats.chunks, "skipped": stats.skipped, "dropped_by_gate": stats.dropped_by_gate, "superseded_drawer_id": stats.superseded_drawer_id.as_deref() });
     writeln!(file, "{entry}")
         .with_context(|| format!("failed to write audit log {}", audit_path.display()))?;
     Ok(())
@@ -2399,12 +2504,15 @@ fn append_ingest_stdin_audit_log(
         "wing": wing,
         "source": source,
         "source_file": source_file,
+        "supersedes": record.supersedes.as_deref().map(&scrub),
+        "replace_text": record.replace_text.as_deref().map(&scrub),
         "metadata": metadata.as_ref(),
         "dry_run": dry_run,
         "files": stats.files,
         "chunks": stats.chunks,
         "skipped": stats.skipped,
         "dropped_by_gate": stats.dropped_by_gate,
+        "superseded_drawer_id": stats.superseded_drawer_id.as_deref(),
     });
     writeln!(file, "{entry}")
         .with_context(|| format!("failed to write audit log {}", audit_path.display()))?;
