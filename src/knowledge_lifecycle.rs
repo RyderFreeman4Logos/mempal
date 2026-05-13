@@ -277,6 +277,8 @@ fn append_audit_entry(db: &Database, command: &str, details: &serde_json::Value)
 
 fn knowledge_status_slug(value: &KnowledgeStatus) -> &'static str {
     match value {
+        KnowledgeStatus::Active => "active",
+        KnowledgeStatus::Superseded => "superseded",
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",

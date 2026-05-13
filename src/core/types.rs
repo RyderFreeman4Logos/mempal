@@ -104,19 +104,21 @@ pub fn default_confidence(source_type: SourceType) -> f64 {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {
     #[default]
     Evidence,
     Knowledge,
+    ProfileFact,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryDomain {
     #[default]
     Project,
+    User,
     Agent,
     Skill,
     Global,
@@ -131,7 +133,7 @@ pub enum AnchorKind {
     Worktree,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
     Runtime,
@@ -151,6 +153,8 @@ pub enum KnowledgeTier {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeStatus {
+    Active,
+    Superseded,
     Candidate,
     Promoted,
     Canonical,
@@ -435,6 +439,10 @@ pub struct Drawer {
     pub verification_refs: Vec<String>,
     pub scope_constraints: Option<String>,
     pub trigger_hints: Option<TriggerHints>,
+    #[serde(default)]
+    pub is_pinned: bool,
+    pub pin_order: Option<i64>,
+    pub supersedes: Option<String>,
     /// Dynamic importance after time-decay + retrieval boost (P13).
     /// Defaults to `importance as f64` when the column doesn't exist (pre-v10 DBs).
     #[serde(default)]
@@ -488,6 +496,9 @@ impl Drawer {
             verification_refs: Vec::new(),
             scope_constraints: None,
             trigger_hints: None,
+            is_pinned: false,
+            pin_order: None,
+            supersedes: None,
             effective_importance: args.importance as f64,
             compacted_into: None,
         }
@@ -526,6 +537,9 @@ impl Default for Drawer {
             verification_refs: Vec::new(),
             scope_constraints: None,
             trigger_hints: None,
+            is_pinned: false,
+            pin_order: None,
+            supersedes: None,
             effective_importance: 0.0,
             compacted_into: None,
         }
@@ -631,6 +645,7 @@ pub struct SearchResult {
     pub anchor_kind: AnchorKind,
     pub anchor_id: String,
     pub parent_anchor_id: Option<String>,
+    pub is_pinned: bool,
     /// Static importance ranking (0-5). Raw-turn exclusion uses this field so
     /// access boosts cannot accidentally promote transcript storage into
     /// durable recall.

@@ -75,7 +75,8 @@ use super::tools::{
     KnowledgePromoteRequest, KnowledgePromoteResponse, KnowledgePublishAnchorRequest,
     KnowledgePublishAnchorResponse, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT,
     MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse,
-    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
+    PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse, QueueStatsDto,
+    ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
     RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, ScopeCount, ScrubStatsDto,
     SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
     SkillSummaryDto, SourceTypeCount, StatusResponse, SystemWarning, TaxonomyEntryDto,
@@ -296,6 +297,17 @@ impl MempalMcpServer {
         self.mempal_status().await.map(|response| response.0)
     }
 
+    pub async fn pinned_facts_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<PinnedFactsResponse, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_pinned_facts(Parameters(request))
+            .await
+            .map(|response| response.0)
+    }
+
     pub async fn knowledge_policy_json_for_test(
         &self,
     ) -> std::result::Result<KnowledgePolicyResponse, ErrorData> {
@@ -383,6 +395,9 @@ impl MempalMcpServer {
             if exists {
                 // Dedup-resolved: drawer pre-existed; include in response list but NOT
                 // in newly_created_drawer_ids so LLM reject cannot soft-delete it.
+                if metadata.is_pinned {
+                    db.pin_drawer(chunk_did, None).map_err(db_error)?;
+                }
                 inserted_drawer_ids.push(chunk_did.clone());
                 continue;
             }
@@ -427,6 +442,7 @@ struct ValidatedIngestMetadata {
     memory_kind: MemoryKind,
     domain: MemoryDomain,
     field: String,
+    is_pinned: bool,
     anchor_kind: AnchorKind,
     anchor_id: String,
     parent_anchor_id: Option<String>,
@@ -494,10 +510,9 @@ fn validate_ingest_request(
     let derived_anchor = validate_anchor_metadata(request, &domain, source_type)?;
 
     match memory_kind {
-        MemoryKind::Evidence => {
+        MemoryKind::Evidence | MemoryKind::ProfileFact => {
             if statement.is_some()
                 || tier.is_some()
-                || status.is_some()
                 || !supporting_refs.is_empty()
                 || !counterexample_refs.is_empty()
                 || !teaching_refs.is_empty()
@@ -510,11 +525,20 @@ fn validate_ingest_request(
                     None,
                 ));
             }
+            if status.as_ref().is_some_and(|value| {
+                !matches!(value, KnowledgeStatus::Active | KnowledgeStatus::Canonical)
+            }) {
+                return Err(ErrorData::invalid_params(
+                    "evidence/profile_fact status must be active or canonical",
+                    None,
+                ));
+            }
 
             Ok(ValidatedIngestMetadata {
                 memory_kind,
                 domain,
                 field,
+                is_pinned: request.is_pinned.unwrap_or(false),
                 anchor_kind: derived_anchor.anchor_kind,
                 anchor_id: derived_anchor.anchor_id,
                 parent_anchor_id: derived_anchor.parent_anchor_id,
@@ -523,7 +547,7 @@ fn validate_ingest_request(
                 ),
                 statement: None,
                 tier: None,
-                status: None,
+                status,
                 supporting_refs: Vec::new(),
                 counterexample_refs: Vec::new(),
                 teaching_refs: Vec::new(),
@@ -576,6 +600,7 @@ fn validate_ingest_request(
                 memory_kind,
                 domain,
                 field,
+                is_pinned: request.is_pinned.unwrap_or(false),
                 anchor_kind: derived_anchor.anchor_kind,
                 anchor_id: derived_anchor.anchor_id,
                 parent_anchor_id: derived_anchor.parent_anchor_id,
@@ -640,6 +665,33 @@ struct SourceConfidence {
     confidence: f64,
 }
 
+fn format_pinned_facts_text(drawers: &[Drawer]) -> String {
+    if drawers.is_empty() {
+        return "Pinned facts: none".to_string();
+    }
+
+    let mut lines = vec!["Pinned facts:".to_string()];
+    for drawer in drawers {
+        let source = drawer.source_file.as_deref().unwrap_or(drawer.id.as_str());
+        let field = drawer.field.as_str();
+        lines.push(format!(
+            "- [{}] {}/{field} source={} importance={}: {}",
+            drawer.id,
+            match &drawer.domain {
+                MemoryDomain::Project => "project",
+                MemoryDomain::User => "user",
+                MemoryDomain::Agent => "agent",
+                MemoryDomain::Skill => "skill",
+                MemoryDomain::Global => "global",
+            },
+            source,
+            drawer.importance,
+            drawer.content
+        ));
+    }
+    lines.join("\n")
+}
+
 fn drawer_from_ingest_metadata(
     request: &IngestRequest,
     metadata: &ValidatedIngestMetadata,
@@ -659,7 +711,7 @@ fn drawer_from_ingest_metadata(
                 .as_deref()
                 .expect("validated knowledge statement"),
         )),
-        MemoryKind::Evidence => Some(source_file_or_synthetic(
+        MemoryKind::Evidence | MemoryKind::ProfileFact => Some(source_file_or_synthetic(
             drawer_id,
             request.source.as_deref(),
         )),
@@ -677,13 +729,13 @@ fn drawer_from_ingest_metadata(
         chunk_index: Some(chunk_idx as i64),
         normalize_version: CURRENT_NORMALIZE_VERSION,
         importance,
-        memory_kind: metadata.memory_kind.clone(),
-        domain: metadata.domain.clone(),
+        memory_kind: metadata.memory_kind,
+        domain: metadata.domain,
         field: metadata.field.clone(),
         anchor_kind: metadata.anchor_kind.clone(),
         anchor_id: metadata.anchor_id.clone(),
         parent_anchor_id: metadata.parent_anchor_id.clone(),
-        provenance: metadata.provenance.clone(),
+        provenance: metadata.provenance,
         statement: metadata.statement.clone(),
         tier: metadata.tier.clone(),
         status: metadata.status.clone(),
@@ -693,6 +745,9 @@ fn drawer_from_ingest_metadata(
         verification_refs: metadata.verification_refs.clone(),
         scope_constraints: metadata.scope_constraints.clone(),
         trigger_hints: metadata.trigger_hints.clone(),
+        is_pinned: metadata.is_pinned,
+        pin_order: None,
+        supersedes: None,
         effective_importance: importance as f64,
         compacted_into: None,
     }
@@ -786,6 +841,7 @@ fn parse_memory_kind(value: Option<&str>) -> std::result::Result<Option<MemoryKi
     parse_enum(value, "memory_kind", |normalized| match normalized {
         "evidence" => Some(MemoryKind::Evidence),
         "knowledge" => Some(MemoryKind::Knowledge),
+        "profile_fact" => Some(MemoryKind::ProfileFact),
         _ => None,
     })
 }
@@ -793,6 +849,7 @@ fn parse_memory_kind(value: Option<&str>) -> std::result::Result<Option<MemoryKi
 fn parse_domain(value: Option<&str>) -> std::result::Result<Option<MemoryDomain>, ErrorData> {
     parse_enum(value, "domain", |normalized| match normalized {
         "project" => Some(MemoryDomain::Project),
+        "user" => Some(MemoryDomain::User),
         "agent" => Some(MemoryDomain::Agent),
         "skill" => Some(MemoryDomain::Skill),
         "global" => Some(MemoryDomain::Global),
@@ -834,6 +891,8 @@ fn parse_tier(value: Option<&str>) -> std::result::Result<Option<KnowledgeTier>,
 #[allow(dead_code)]
 fn parse_status(value: Option<&str>) -> std::result::Result<Option<KnowledgeStatus>, ErrorData> {
     parse_enum(value, "status", |normalized| match normalized {
+        "active" => Some(KnowledgeStatus::Active),
+        "superseded" => Some(KnowledgeStatus::Superseded),
         "candidate" => Some(KnowledgeStatus::Candidate),
         "promoted" => Some(KnowledgeStatus::Promoted),
         "canonical" => Some(KnowledgeStatus::Canonical),
@@ -977,6 +1036,12 @@ impl MempalMcpServer {
                 count,
             })
             .collect();
+        let pinned_fact_counts = db
+            .pinned_fact_counts_by_project()
+            .map_err(db_error)?
+            .into_iter()
+            .map(|(project_id, count)| PinnedFactProjectCount { project_id, count })
+            .collect();
         let mut system_warnings = current_system_warnings();
         if null_project_backfill_pending > 0 {
             system_warnings.push(SystemWarning {
@@ -1004,6 +1069,7 @@ impl MempalMcpServer {
             config_loaded_at_unix_ms: cfg_meta.loaded_at_unix_ms,
             scopes,
             source_type_distribution,
+            pinned_fact_counts,
             aaak_spec: crate::aaak::generate_spec(),
             memory_protocol: crate::core::protocol::MEMORY_PROTOCOL.to_string(),
             endpoint_health: EndpointHealthDto {
@@ -1065,6 +1131,40 @@ impl MempalMcpServer {
     }
 
     #[tool(
+        name = "mempal_pinned_facts",
+        description = "Return canonical pinned facts for prompt injection without running embedding search. Use this at session start for always-on context. Results are pure SQL, scoped by project_id when provided, and capped by budget_chars."
+    )]
+    pub async fn mempal_pinned_facts(
+        &self,
+        Parameters(request): Parameters<PinnedFactsRequest>,
+    ) -> std::result::Result<Json<PinnedFactsResponse>, ErrorData> {
+        let config = ConfigHandle::current();
+        let project_id = self
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await?;
+        let budget_chars = request.budget_chars.unwrap_or(4_000);
+        let db = self.open_db()?;
+        let drawers = db
+            .get_pinned_facts(project_id.as_deref(), budget_chars)
+            .map_err(db_error)?;
+        let used_chars = drawers
+            .iter()
+            .map(|drawer| drawer.content.chars().count())
+            .sum();
+        let text = format_pinned_facts_text(&drawers);
+        let facts = drawers.into_iter().map(PinnedFactDto::from).collect();
+
+        Ok(Json(PinnedFactsResponse {
+            project_id,
+            budget_chars,
+            used_chars,
+            text,
+            facts,
+            system_warnings: current_system_warnings(),
+        }))
+    }
+
+    #[tool(
         name = "mempal_search",
         description = "Search persistent project memory via vector embedding with optional wing/room filters. PREFER THIS over grepping files or guessing from general knowledge when answering ANY project-specific question — past decisions, design rationale, implementation details, bug history, how a component works, why something was built a certain way, or any other project knowledge. Every result includes drawer_id and source_file for citation, plus structured AAAK-derived signals (`entities`, `topics`, `flags`, `emotions`, `importance_stars`) for filtering and ranking."
     )]
@@ -1095,7 +1195,7 @@ impl MempalMcpServer {
         let search_options = SearchOptions {
             filters: SearchFilters {
                 memory_kind: request.memory_kind.clone(),
-                domain: request.domain.clone(),
+                domain: request.domain,
                 field: request.field.clone(),
                 tier: request.tier.clone(),
                 status: request.status.clone(),
@@ -1961,6 +2061,11 @@ impl MempalMcpServer {
                 .iter()
                 .map(|(_, id, _)| id.clone())
                 .collect::<Vec<_>>();
+            if metadata.is_pinned {
+                for id in &all_ids {
+                    db.pin_drawer(id, None).map_err(db_error)?;
+                }
+            }
             if let Some(old_id) = superseded_drawer_id.as_deref() {
                 let replacement_id = all_ids.first().map(String::as_str).unwrap_or("existing");
                 supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
@@ -2248,6 +2353,9 @@ impl MempalMcpServer {
                     if *chunk_exists {
                         // Dedup-resolved pre-lock: include in response but NOT in
                         // newly_created_drawer_ids so LLM reject cannot delete it.
+                        if metadata.is_pinned {
+                            db.pin_drawer(chunk_did, None).map_err(db_error)?;
+                        }
                         inserted_drawer_ids.push(chunk_did.clone());
                         continue;
                     }
@@ -2272,6 +2380,9 @@ impl MempalMcpServer {
                     if exists_after_lock {
                         // Dedup-resolved post-lock: include in response but NOT in
                         // newly_created_drawer_ids so LLM reject cannot delete it.
+                        if metadata.is_pinned {
+                            db.pin_drawer(chunk_did, None).map_err(db_error)?;
+                        }
                         inserted_drawer_ids.push(chunk_did.clone());
                         continue;
                     }
@@ -3529,6 +3640,7 @@ fn drawer_matches_ingest_metadata(drawer: &Drawer, metadata: &ValidatedIngestMet
         && drawer.anchor_kind == metadata.anchor_kind
         && drawer.anchor_id == metadata.anchor_id
         && drawer.parent_anchor_id == metadata.parent_anchor_id
+        && drawer.is_pinned == metadata.is_pinned
         && drawer.provenance == metadata.provenance
         && drawer.statement == metadata.statement
         && drawer.tier == metadata.tier
@@ -4035,6 +4147,9 @@ mod tests {
             verification_refs: refs.verification,
             scope_constraints: None,
             trigger_hints: None,
+            is_pinned: false,
+            pin_order: None,
+            supersedes: None,
             compacted_into: None,
         };
         db.insert_drawer(&drawer).expect("insert knowledge drawer");
@@ -4079,6 +4194,9 @@ mod tests {
             verification_refs: Vec::new(),
             scope_constraints: None,
             trigger_hints: None,
+            is_pinned: false,
+            pin_order: None,
+            supersedes: None,
             compacted_into: None,
         };
         db.insert_drawer(&drawer)
@@ -6216,6 +6334,7 @@ mod tests {
                 memory_kind: None,
                 domain: None,
                 field: None,
+                is_pinned: None,
                 provenance: None,
                 statement: None,
                 tier: None,

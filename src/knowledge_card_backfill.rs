@@ -232,7 +232,7 @@ fn create_card_and_event(db: &Database, drawer: &Drawer, card_id: &str) -> Resul
             .status
             .clone()
             .expect("ready candidate must have status"),
-        domain: drawer.domain.clone(),
+        domain: drawer.domain,
         field: drawer.field.clone(),
         anchor_kind: drawer.anchor_kind.clone(),
         anchor_id: drawer.anchor_id.clone(),
@@ -353,6 +353,7 @@ fn evidence_role_slug(value: &KnowledgeEvidenceRole) -> &'static str {
 fn memory_domain_slug(value: &crate::core::types::MemoryDomain) -> &'static str {
     match value {
         crate::core::types::MemoryDomain::Project => "project",
+        crate::core::types::MemoryDomain::User => "user",
         crate::core::types::MemoryDomain::Agent => "agent",
         crate::core::types::MemoryDomain::Skill => "skill",
         crate::core::types::MemoryDomain::Global => "global",
@@ -370,6 +371,8 @@ fn knowledge_tier_slug(value: &crate::core::types::KnowledgeTier) -> &'static st
 
 fn knowledge_status_slug(value: &crate::core::types::KnowledgeStatus) -> &'static str {
     match value {
+        crate::core::types::KnowledgeStatus::Active => "active",
+        crate::core::types::KnowledgeStatus::Superseded => "superseded",
         crate::core::types::KnowledgeStatus::Candidate => "candidate",
         crate::core::types::KnowledgeStatus::Promoted => "promoted",
         crate::core::types::KnowledgeStatus::Canonical => "canonical",

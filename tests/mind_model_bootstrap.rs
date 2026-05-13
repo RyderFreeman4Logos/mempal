@@ -417,7 +417,7 @@ fn bootstrap_drawer(
         wing: "mempal".to_string(),
         room: Some("bootstrap".to_string()),
         source_file: Some(match memory_kind {
-            MemoryKind::Evidence => format!("tests://{id}"),
+            MemoryKind::Evidence | MemoryKind::ProfileFact => format!("tests://{id}"),
             MemoryKind::Knowledge => format!("knowledge://project/bootstrap/{id}"),
         }),
         source_type: SourceType::AgentInference,
@@ -426,14 +426,14 @@ fn bootstrap_drawer(
         chunk_index: Some(0),
         normalize_version: 1,
         importance: 2,
-        memory_kind: memory_kind.clone(),
+        memory_kind,
         domain: MemoryDomain::Project,
         field: anchor::DEFAULT_FIELD.to_string(),
         anchor_kind: AnchorKind::Repo,
         anchor_id: format!("repo://{id}"),
         parent_anchor_id: None,
         provenance: match memory_kind {
-            MemoryKind::Evidence => Some(Provenance::Human),
+            MemoryKind::Evidence | MemoryKind::ProfileFact => Some(Provenance::Human),
             MemoryKind::Knowledge => None,
         },
         statement: statement.map(ToOwned::to_owned),
@@ -449,6 +449,9 @@ fn bootstrap_drawer(
         verification_refs: Vec::new(),
         scope_constraints: None,
         trigger_hints: None,
+        is_pinned: false,
+        pin_order: None,
+        supersedes: None,
         effective_importance: 2.0,
         compacted_into: None,
     }
@@ -559,7 +562,7 @@ fn test_migration_backfills_legacy_drawers_with_bootstrap_defaults() {
     }
 
     let db = Database::open(&db_path).expect("migrate db to latest");
-    assert_eq!(db.schema_version().expect("schema version"), 12);
+    assert_eq!(db.schema_version().expect("schema version"), 13);
 
     let drawer = db
         .get_drawer("drawer_legacy_001")
@@ -654,6 +657,9 @@ fn test_insert_load_roundtrip_preserves_json_metadata_and_read_paths() {
             workflow_bias: vec!["tdd".to_string()],
             tool_needs: vec!["cargo-check".to_string()],
         }),
+        is_pinned: false,
+        pin_order: None,
+        supersedes: None,
         effective_importance: 3.0,
         compacted_into: None,
     };

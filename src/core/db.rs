@@ -39,7 +39,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 12;
+const CURRENT_SCHEMA_VERSION: u32 = 13;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -58,6 +58,10 @@ fn truncate_preview(content: &str, max_chars: usize) -> String {
     preview
 }
 
+fn truncate_to_char_budget(content: &str, max_chars: usize) -> String {
+    content.chars().take(max_chars).collect()
+}
+
 const DRAWER_SELECT_COLUMNS: &str = r#"
     id,
     content,
@@ -72,7 +76,7 @@ const DRAWER_SELECT_COLUMNS: &str = r#"
     COALESCE(importance, 0) as importance,
     memory_kind,
     domain,
-    field,
+    COALESCE(field, 'general') as field,
     anchor_kind,
     anchor_id,
     parent_anchor_id,
@@ -86,6 +90,9 @@ const DRAWER_SELECT_COLUMNS: &str = r#"
     verification_refs,
     scope_constraints,
     trigger_hints,
+    COALESCE(is_pinned, 0) as is_pinned,
+    pin_order,
+    supersedes,
     COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) as effective_importance,
     compacted_into
 "#;
@@ -347,10 +354,13 @@ impl Database {
                 verification_refs,
                 scope_constraints,
                 trigger_hints,
+                is_pinned,
+                pin_order,
+                supersedes,
                 valid_from,
                 valid_until
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
             "#,
             params![
                 drawer.id.as_str(),
@@ -382,6 +392,9 @@ impl Database {
                 encode_json(&drawer.verification_refs)?,
                 drawer.scope_constraints.as_deref(),
                 encode_optional_json(drawer.trigger_hints.as_ref())?,
+                drawer.is_pinned,
+                drawer.pin_order,
+                drawer.supersedes.as_deref(),
                 valid_from.unwrap_or(drawer.added_at.as_str()),
                 valid_until,
             ],
@@ -1016,8 +1029,11 @@ impl Database {
                     verification_refs = ?25,
                     scope_constraints = ?26,
                     trigger_hints = ?27,
-                    content_hash = ?28,
-                    valid_from = ?29,
+                    is_pinned = ?28,
+                    pin_order = ?29,
+                    supersedes = ?30,
+                    content_hash = ?31,
+                    valid_from = ?32,
                     valid_until = NULL
                 WHERE id = ?1 AND deleted_at IS NULL
                 "#,
@@ -1049,6 +1065,9 @@ impl Database {
                     encode_json(&drawer.verification_refs)?,
                     drawer.scope_constraints.as_deref(),
                     encode_optional_json(drawer.trigger_hints.as_ref())?,
+                    drawer.is_pinned,
+                    drawer.pin_order,
+                    drawer.supersedes.as_deref(),
                     content_hash,
                     drawer.added_at.as_str(),
                 ],
@@ -1223,6 +1242,157 @@ impl Database {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn pinned_fact_counts_by_project(&self) -> Result<Vec<(Option<String>, i64)>, DbError> {
+        if !drawers_column_exists(&self.conn, "project_id")? {
+            let count = self.conn.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM drawers
+                WHERE deleted_at IS NULL
+                  AND is_pinned = 1
+                  AND COALESCE(status, 'active') IN ('active', 'canonical')
+                "#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            return Ok(vec![(None, count)]);
+        }
+
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT project_id, COUNT(*)
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND is_pinned = 1
+              AND COALESCE(status, 'active') IN ('active', 'canonical')
+            GROUP BY project_id
+            ORDER BY project_id IS NOT NULL DESC, project_id
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn pin_drawer(&self, drawer_id: &str, pin_order: Option<i64>) -> Result<bool, DbError> {
+        let resolved_order = match pin_order {
+            Some(order) => Some(order),
+            None => self.conn.query_row(
+                "SELECT COALESCE(MAX(pin_order), -1) + 1 FROM drawers WHERE is_pinned = 1",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )?,
+        };
+        let affected = self.conn.execute(
+            "UPDATE drawers SET is_pinned = 1, pin_order = COALESCE(?2, pin_order) WHERE id = ?1 AND deleted_at IS NULL",
+            params![drawer_id, resolved_order],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn unpin_drawer(&self, drawer_id: &str) -> Result<bool, DbError> {
+        let affected = self.conn.execute(
+            "UPDATE drawers SET is_pinned = 0, pin_order = NULL WHERE id = ?1 AND deleted_at IS NULL",
+            [drawer_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn reorder_pinned_facts(&self, drawer_ids: &[String]) -> Result<(), DbError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<(), DbError> {
+            for (index, drawer_id) in drawer_ids.iter().enumerate() {
+                self.conn.execute(
+                    "UPDATE drawers SET is_pinned = 1, pin_order = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+                    params![drawer_id, i64::try_from(index).map_err(|_| {
+                        DbError::InvalidEnumValue {
+                            kind: "pin_order",
+                            value: index.to_string(),
+                        }
+                    })?],
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn get_pinned_facts(
+        &self,
+        project_id: Option<&str>,
+        budget_chars: usize,
+    ) -> Result<Vec<Drawer>, DbError> {
+        if budget_chars == 0 {
+            return Ok(Vec::new());
+        }
+
+        let has_project_id = drawers_column_exists(&self.conn, "project_id")?;
+        let updated_order = if drawers_column_exists(&self.conn, "updated_at")? {
+            "COALESCE(updated_at, added_at)"
+        } else {
+            "added_at"
+        };
+        let mut values = Vec::new();
+        let mut project_filter = String::new();
+        if has_project_id && let Some(project_id) = project_id {
+            values.push(SqlValue::Text(project_id.to_string()));
+            project_filter = " AND project_id = ?1".to_string();
+        }
+
+        let sql = format!(
+            r#"
+            SELECT {DRAWER_SELECT_COLUMNS}
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND is_pinned = 1
+              AND COALESCE(status, 'active') IN ('active', 'canonical')
+              {project_filter}
+            ORDER BY pin_order IS NULL ASC,
+                     pin_order ASC,
+                     importance DESC,
+                     {updated_order} DESC,
+                     id ASC
+            "#
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(values), |row| {
+                drawer_from_row(row).map_err(row_decode_error)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut used_chars = 0usize;
+        let mut facts = Vec::new();
+        for mut drawer in rows {
+            if used_chars >= budget_chars {
+                break;
+            }
+            let remaining = budget_chars - used_chars;
+            let content_chars = drawer.content.chars().count();
+            if content_chars <= remaining {
+                used_chars += content_chars;
+                facts.push(drawer);
+            } else if remaining > 0 {
+                drawer.content = truncate_to_char_budget(&drawer.content, remaining);
+                facts.push(drawer);
+                break;
+            }
+        }
+        Ok(facts)
     }
 
     pub fn diary_rollup_days(&self) -> Result<u32, DbError> {
@@ -1408,11 +1578,11 @@ impl Database {
         ))?;
         let mut rows = statement.query_map([drawer_id], |row| {
             let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-            // DRAWER_SELECT_COLUMNS has 29 columns (indices 0-28), so
-            // the extra columns appended here start at index 29.
-            let updated_at = row.get::<_, Option<String>>(29)?;
-            let merge_count = row.get::<_, u32>(30)?;
-            let project_id = row.get::<_, Option<String>>(31)?;
+            // DRAWER_SELECT_COLUMNS has 32 columns (indices 0-31), so
+            // the extra columns appended here start at index 32.
+            let updated_at = row.get::<_, Option<String>>(32)?;
+            let merge_count = row.get::<_, u32>(33)?;
+            let project_id = row.get::<_, Option<String>>(34)?;
             Ok(DrawerDetails {
                 drawer,
                 updated_at,
@@ -1464,10 +1634,10 @@ impl Database {
             let mut statement = self.conn.prepare(&sql)?;
             let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
                 let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-                // DRAWER_SELECT_COLUMNS is 29 columns (0-28); extra columns start at 29.
-                let updated_at = row.get::<_, Option<String>>(29)?;
-                let merge_count = row.get::<_, u32>(30)?;
-                let project_id = row.get::<_, Option<String>>(31)?;
+                // DRAWER_SELECT_COLUMNS is 32 columns (0-31); extra columns start at 32.
+                let updated_at = row.get::<_, Option<String>>(32)?;
+                let merge_count = row.get::<_, u32>(33)?;
+                let project_id = row.get::<_, Option<String>>(34)?;
                 Ok((
                     drawer.id.clone(),
                     DrawerDetails {
@@ -2257,7 +2427,7 @@ impl Database {
     pub fn supersede_drawer(&self, old_id: &str, reason: &str) -> Result<bool, DbError> {
         let timestamp = super::utils::current_timestamp();
         let affected = self.conn.execute(
-            "UPDATE drawers SET deleted_at = ?1, valid_until = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            "UPDATE drawers SET status = 'superseded', deleted_at = ?1, valid_until = ?1 WHERE id = ?2 AND deleted_at IS NULL",
             params![timestamp, old_id],
         )?;
         if affected > 0 {
@@ -2551,8 +2721,8 @@ impl Database {
                 rusqlite::params![room, exclude_drawer_id, current_project_id, sql_limit],
                 |row| {
                     let drawer = drawer_from_row(row).map_err(row_decode_error)?;
-                    // DRAWER_SELECT_COLUMNS is 29 columns (0-28); project_id appended at 29.
-                    let project_id = row.get::<_, Option<String>>(29)?;
+                    // DRAWER_SELECT_COLUMNS is 32 columns (0-31); project_id appended at 32.
+                    let project_id = row.get::<_, Option<String>>(32)?;
                     Ok(TunnelDrawer {
                         drawer,
                         target_project_id: project_id,
@@ -3546,6 +3716,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             ensure_v12_compaction_schema(conn, read_user_version(conn)?)?;
             continue;
         }
+        if migration.version == 13 {
+            ensure_v13_typed_pinned_schema(conn, read_user_version(conn)?)?;
+            continue;
+        }
         apply_migration_atomic(conn, migration)?;
     }
 
@@ -3557,6 +3731,9 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     }
     if read_user_version(conn)? >= 12 {
         ensure_v12_compaction_schema(conn, read_user_version(conn)?)?;
+    }
+    if read_user_version(conn)? >= 13 {
+        ensure_v13_typed_pinned_schema(conn, read_user_version(conn)?)?;
     }
 
     Ok(())
@@ -3700,6 +3877,45 @@ fn ensure_v12_compaction_schema(conn: &Connection, current_version: u32) -> Resu
     Ok(())
 }
 
+fn ensure_v13_typed_pinned_schema(conn: &Connection, current_version: u32) -> Result<(), DbError> {
+    let existing_columns = drawers_column_names(conn)?;
+    let missing_is_pinned = !existing_columns.contains("is_pinned");
+    let missing_pin_order = !existing_columns.contains("pin_order");
+    let missing_supersedes = !existing_columns.contains("supersedes");
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(error) = (|| -> Result<(), DbError> {
+        if missing_is_pinned {
+            conn.execute_batch(
+                "ALTER TABLE drawers ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0 CHECK(is_pinned IN (0, 1));",
+            )?;
+        }
+        if missing_pin_order {
+            conn.execute_batch("ALTER TABLE drawers ADD COLUMN pin_order INTEGER;")?;
+        }
+        if missing_supersedes {
+            conn.execute_batch(
+                "ALTER TABLE drawers ADD COLUMN supersedes TEXT REFERENCES drawers(id);",
+            )?;
+        }
+        let rewrote_checks = rewrite_drawers_typed_ingest_checks(conn)?;
+        conn.execute_batch(V13_TYPED_PINNED_SCHEMA_SQL)?;
+        if rewrote_checks {
+            bump_sqlite_schema_version(conn)?;
+        }
+        if current_version < 13 {
+            set_user_version(conn, 13)?;
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+
+    Ok(())
+}
+
 fn rewrite_drawers_source_type_check(conn: &Connection) -> Result<bool, DbError> {
     let table_sql = conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drawers'",
@@ -3740,6 +3956,59 @@ fn rewrite_drawers_source_type_check(conn: &Connection) -> Result<bool, DbError>
     conn.execute_batch("PRAGMA writable_schema = OFF;")?;
     update_result?;
     bump_sqlite_schema_version(conn)?;
+    Ok(true)
+}
+
+fn rewrite_drawers_typed_ingest_checks(conn: &Connection) -> Result<bool, DbError> {
+    let table_sql = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drawers'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+
+    let replacements = [
+        (
+            "memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge')) DEFAULT 'evidence'",
+            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'profile_fact'))",
+        ),
+        (
+            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge'))",
+            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'profile_fact'))",
+        ),
+        (
+            "domain TEXT NOT NULL CHECK(domain IN ('project', 'agent', 'skill', 'global')) DEFAULT 'project'",
+            "domain TEXT NOT NULL DEFAULT 'project' CHECK(domain IN ('user', 'agent', 'project', 'skill', 'global'))",
+        ),
+        (
+            "domain TEXT NOT NULL DEFAULT 'project' CHECK(domain IN ('project', 'agent', 'skill', 'global'))",
+            "domain TEXT NOT NULL DEFAULT 'project' CHECK(domain IN ('user', 'agent', 'project', 'skill', 'global'))",
+        ),
+        ("field TEXT NOT NULL DEFAULT 'general'", "field TEXT"),
+        (
+            "status TEXT CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+            "status TEXT DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        ),
+        (
+            "status TEXT DEFAULT 'active' CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+            "status TEXT DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        ),
+    ];
+
+    let mut new_sql = table_sql.clone();
+    for (old, new) in replacements {
+        new_sql = new_sql.replace(old, new);
+    }
+    if new_sql == table_sql {
+        return Ok(false);
+    }
+
+    conn.execute_batch("PRAGMA writable_schema = ON;")?;
+    let update_result = conn.execute(
+        "UPDATE sqlite_master SET sql = ?1 WHERE type = 'table' AND name = 'drawers'",
+        [new_sql],
+    );
+    conn.execute_batch("PRAGMA writable_schema = OFF;")?;
+    update_result?;
     Ok(true)
 }
 
@@ -4279,6 +4548,7 @@ SET source_type = CASE
 
 const V11_MIGRATION_SQL: &str = "";
 const V12_MIGRATION_SQL: &str = "";
+const V13_MIGRATION_SQL: &str = "";
 const V12_COMPACTION_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
     ON drawers(compacted_into)
@@ -4302,6 +4572,16 @@ CREATE INDEX IF NOT EXISTS idx_consolidation_log_created_at
 
 CREATE INDEX IF NOT EXISTS idx_consolidation_log_scope
     ON consolidation_log(wing, room, project_id);
+"#;
+
+const V13_TYPED_PINNED_SCHEMA_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_drawers_pinned
+    ON drawers(is_pinned, pin_order)
+    WHERE is_pinned = 1 AND deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_drawers_supersedes
+    ON drawers(supersedes)
+    WHERE supersedes IS NOT NULL;
 "#;
 
 fn migrations() -> &'static [Migration] {
@@ -4354,6 +4634,10 @@ fn migrations() -> &'static [Migration] {
             version: 12,
             sql: V12_MIGRATION_SQL,
         },
+        Migration {
+            version: 13,
+            sql: V13_MIGRATION_SQL,
+        },
     ];
     MIGRATIONS
 }
@@ -4400,6 +4684,7 @@ fn memory_kind_as_str(memory_kind: &MemoryKind) -> &'static str {
     match memory_kind {
         MemoryKind::Evidence => "evidence",
         MemoryKind::Knowledge => "knowledge",
+        MemoryKind::ProfileFact => "profile_fact",
     }
 }
 
@@ -4407,6 +4692,7 @@ fn memory_kind_from_str(memory_kind: &str) -> Result<MemoryKind, DbError> {
     match memory_kind {
         "evidence" => Ok(MemoryKind::Evidence),
         "knowledge" => Ok(MemoryKind::Knowledge),
+        "profile_fact" => Ok(MemoryKind::ProfileFact),
         other => Err(DbError::InvalidEnumValue {
             kind: "memory_kind",
             value: other.to_string(),
@@ -4417,6 +4703,7 @@ fn memory_kind_from_str(memory_kind: &str) -> Result<MemoryKind, DbError> {
 fn memory_domain_as_str(domain: &MemoryDomain) -> &'static str {
     match domain {
         MemoryDomain::Project => "project",
+        MemoryDomain::User => "user",
         MemoryDomain::Agent => "agent",
         MemoryDomain::Skill => "skill",
         MemoryDomain::Global => "global",
@@ -4426,6 +4713,7 @@ fn memory_domain_as_str(domain: &MemoryDomain) -> &'static str {
 fn memory_domain_from_str(domain: &str) -> Result<MemoryDomain, DbError> {
     match domain {
         "project" => Ok(MemoryDomain::Project),
+        "user" => Ok(MemoryDomain::User),
         "agent" => Ok(MemoryDomain::Agent),
         "skill" => Ok(MemoryDomain::Skill),
         "global" => Ok(MemoryDomain::Global),
@@ -4500,6 +4788,8 @@ fn knowledge_tier_from_str(tier: &str) -> Result<KnowledgeTier, DbError> {
 
 fn knowledge_status_as_str(status: &KnowledgeStatus) -> &'static str {
     match status {
+        KnowledgeStatus::Active => "active",
+        KnowledgeStatus::Superseded => "superseded",
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
@@ -4510,6 +4800,8 @@ fn knowledge_status_as_str(status: &KnowledgeStatus) -> &'static str {
 
 fn knowledge_status_from_str(status: &str) -> Result<KnowledgeStatus, DbError> {
     match status {
+        "active" => Ok(KnowledgeStatus::Active),
+        "superseded" => Ok(KnowledgeStatus::Superseded),
         "candidate" => Ok(KnowledgeStatus::Candidate),
         "promoted" => Ok(KnowledgeStatus::Promoted),
         "canonical" => Ok(KnowledgeStatus::Canonical),
@@ -4768,8 +5060,11 @@ fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
     let verification_refs = parse_string_list(row.get::<_, Option<String>>(24)?.as_deref())?;
     let scope_constraints = row.get::<_, Option<String>>(25)?;
     let trigger_hints = parse_optional_json(row.get::<_, Option<String>>(26)?.as_deref())?;
-    let effective_importance = row.get::<_, f64>(27)?;
-    let compacted_into = row.get::<_, Option<String>>(28)?;
+    let is_pinned = row.get::<_, bool>(27)?;
+    let pin_order = row.get::<_, Option<i64>>(28)?;
+    let supersedes = row.get::<_, Option<String>>(29)?;
+    let effective_importance = row.get::<_, f64>(30)?;
+    let compacted_into = row.get::<_, Option<String>>(31)?;
 
     anchor::validate_anchor_domain(&domain, &anchor_kind)
         .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
@@ -4802,6 +5097,9 @@ fn drawer_from_row(row: &Row<'_>) -> Result<Drawer, DbError> {
         verification_refs,
         scope_constraints,
         trigger_hints,
+        is_pinned,
+        pin_order,
+        supersedes,
         effective_importance,
         compacted_into,
     })

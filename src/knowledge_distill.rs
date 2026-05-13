@@ -163,6 +163,9 @@ pub fn prepare_distill(db: &Database, request: DistillRequest) -> Result<Distill
         verification_refs: Vec::new(),
         scope_constraints,
         trigger_hints,
+        is_pinned: false,
+        pin_order: None,
+        supersedes: None,
         effective_importance: request.importance as f64,
         compacted_into: None,
     };
@@ -243,6 +246,7 @@ fn normalize_trigger_hints(hints: TriggerHints) -> Option<TriggerHints> {
 fn parse_domain(value: &str) -> Result<MemoryDomain> {
     match value.trim() {
         "project" => Ok(MemoryDomain::Project),
+        "user" => Ok(MemoryDomain::User),
         "agent" => Ok(MemoryDomain::Agent),
         "skill" => Ok(MemoryDomain::Skill),
         "global" => Ok(MemoryDomain::Global),
@@ -330,6 +334,8 @@ fn tier_slug(value: &KnowledgeTier) -> &'static str {
 fn status_slug(value: &KnowledgeStatus) -> &'static str {
     match value {
         KnowledgeStatus::Candidate => "candidate",
+        KnowledgeStatus::Active => "active",
+        KnowledgeStatus::Superseded => "superseded",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
         KnowledgeStatus::Demoted => "demoted",

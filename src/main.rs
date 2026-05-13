@@ -122,6 +122,10 @@ struct IngestCommandOptions<'a> {
     no_strip_noise: bool,
     diary_rollup: bool,
     source_type: Option<&'a str>,
+    memory_kind: Option<&'a str>,
+    domain: Option<&'a str>,
+    field: Option<&'a str>,
+    is_pinned: bool,
     confidence: Option<f64>,
     supersedes: Option<&'a str>,
     replace_text: Option<&'a str>,
@@ -206,6 +210,14 @@ enum Commands {
         diary_rollup: bool,
         #[arg(long = "source-type")]
         source_type: Option<String>,
+        #[arg(long = "memory-kind")]
+        memory_kind: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        field: Option<String>,
+        #[arg(long = "is-pinned", alias = "pinned", default_value_t = false)]
+        is_pinned: bool,
         #[arg(long)]
         confidence: Option<f64>,
         #[arg(long)]
@@ -300,6 +312,20 @@ enum Commands {
     },
     Delete {
         drawer_id: String,
+    },
+    Pin {
+        drawer_id: String,
+    },
+    Unpin {
+        drawer_id: String,
+    },
+    Pinned {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, num_args = 1..)]
+        reorder: Vec<String>,
+        #[arg(long)]
+        json: bool,
     },
     Rollback {
         #[arg(long)]
@@ -1245,6 +1271,10 @@ fn run() -> Result<()> {
             no_strip_noise,
             diary_rollup,
             source_type,
+            memory_kind,
+            domain,
+            field,
+            is_pinned,
             confidence,
             supersedes,
             replace_text,
@@ -1266,6 +1296,10 @@ fn run() -> Result<()> {
                 no_strip_noise,
                 diary_rollup,
                 source_type: source_type.as_deref(),
+                memory_kind: memory_kind.as_deref(),
+                domain: domain.as_deref(),
+                field: field.as_deref(),
+                is_pinned,
                 confidence,
                 supersedes: supersedes.as_deref(),
                 replace_text: replace_text.as_deref(),
@@ -1346,6 +1380,13 @@ fn run() -> Result<()> {
         Commands::Project { command } => project_command(&db, command),
         Commands::Config { .. } => unreachable!(),
         Commands::Delete { drawer_id } => delete_command(&db, &drawer_id),
+        Commands::Pin { drawer_id } => pin_command(&db, &drawer_id),
+        Commands::Unpin { drawer_id } => unpin_command(&db, &drawer_id),
+        Commands::Pinned {
+            project,
+            reorder,
+            json,
+        } => pinned_command(&db, config.as_ref(), project.as_deref(), &reorder, json),
         Commands::Rollback {
             since,
             wing,
@@ -1779,6 +1820,12 @@ async fn ingest_command(
     let valid_until = validate_temporal_bound("--valid-until", options.valid_until)?;
     let source_type = parse_source_type_bound("--source-type", options.source_type)?
         .unwrap_or(SourceType::AgentInference);
+    let memory_kind = parse_memory_kind_bound("--memory-kind", options.memory_kind)?;
+    let domain = options
+        .domain
+        .map(parse_domain)
+        .transpose()
+        .context("failed to parse --domain")?;
     let confidence = resolve_confidence_bound("--confidence", source_type, options.confidence)?;
     let base_options = IngestOptions {
         room: options.room,
@@ -1793,6 +1840,10 @@ async fn ingest_command(
         prototype_classifier: None,
         source_file_override: None,
         source_type: Some(source_type),
+        memory_kind,
+        domain,
+        field: options.field,
+        is_pinned: options.is_pinned,
         confidence: Some(confidence),
         replace_existing_source: false,
         no_strip_noise: options.no_strip_noise,
@@ -1829,6 +1880,10 @@ async fn ingest_command(
             prototype_classifier: prototype_classifier.as_ref(),
             source_file_override: None,
             source_type: Some(source_type),
+            memory_kind,
+            domain,
+            field: options.field,
+            is_pinned: options.is_pinned,
             confidence: Some(confidence),
             replace_existing_source: false,
             no_strip_noise: options.no_strip_noise,
@@ -1895,6 +1950,10 @@ struct StdinIngestRecord {
     source: Option<String>,
     source_file: Option<String>,
     source_type: Option<String>,
+    memory_kind: Option<String>,
+    domain: Option<String>,
+    field: Option<String>,
+    is_pinned: Option<bool>,
     confidence: Option<f64>,
     supersedes: Option<String>,
     replace_text: Option<String>,
@@ -1953,6 +2012,17 @@ fn parse_source_type_bound(field: &str, value: Option<&str>) -> Result<Option<So
         .map(|raw| {
             raw.parse::<SourceType>()
                 .with_context(|| format!("{field} must be one of user_explicit, agent_observation, agent_inference, system_generated"))
+        })
+        .transpose()
+}
+
+fn parse_memory_kind_bound(field: &str, value: Option<&str>) -> Result<Option<MemoryKind>> {
+    value
+        .map(|raw| match raw {
+            "evidence" => Ok(MemoryKind::Evidence),
+            "knowledge" => Ok(MemoryKind::Knowledge),
+            "profile_fact" => Ok(MemoryKind::ProfileFact),
+            other => bail!("{field} must be one of evidence, knowledge, profile_fact; got {other}"),
         })
         .transpose()
 }
@@ -2023,6 +2093,23 @@ async fn ingest_stdin_command(
         options.source_type.or(record.source_type.as_deref()),
     )?
     .unwrap_or(SourceType::AgentInference);
+    let memory_kind = parse_memory_kind_bound(
+        "memory_kind",
+        options.memory_kind.or(record.memory_kind.as_deref()),
+    )?
+    .unwrap_or(MemoryKind::Evidence);
+    let domain = options
+        .domain
+        .or(record.domain.as_deref())
+        .map(parse_domain)
+        .transpose()
+        .context("failed to parse stdin ingest domain")?
+        .unwrap_or(MemoryDomain::Project);
+    let field = options
+        .field
+        .or(record.field.as_deref())
+        .unwrap_or("general");
+    let is_pinned = options.is_pinned || record.is_pinned.unwrap_or(false);
     let confidence = resolve_confidence_bound(
         "confidence",
         source_type,
@@ -2093,6 +2180,10 @@ async fn ingest_stdin_command(
     }
 
     if exact_duplicate.is_some() {
+        if is_pinned {
+            db.pin_drawer(&drawer_id, None)
+                .with_context(|| format!("failed to pin duplicate drawer {drawer_id}"))?;
+        }
         stats.skipped = 1;
         stats.drawer_ids.push(drawer_id.clone());
         if let Some(old_id) = superseded_drawer_id.as_deref() {
@@ -2205,6 +2296,10 @@ async fn ingest_stdin_command(
         ..drawer
     };
     let mut drawer = drawer;
+    drawer.memory_kind = memory_kind;
+    drawer.domain = domain;
+    drawer.field = field.to_string();
+    drawer.is_pinned = is_pinned;
     if let Some(old_id) = superseded_drawer_id.as_deref() {
         link_superseded_drawer(&mut drawer, old_id);
     }
@@ -2781,6 +2876,7 @@ async fn context_command(db: &Database, config: &Config, args: ContextCommandArg
 fn parse_domain(value: &str) -> Result<MemoryDomain> {
     match value {
         "project" => Ok(MemoryDomain::Project),
+        "user" => Ok(MemoryDomain::User),
         "agent" => Ok(MemoryDomain::Agent),
         "skill" => Ok(MemoryDomain::Skill),
         "global" => Ok(MemoryDomain::Global),
@@ -2939,6 +3035,7 @@ struct CliSearchResult {
     memory_kind: String,
     domain: String,
     field: String,
+    is_pinned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     statement: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2965,6 +3062,7 @@ fn build_cli_search_result(result: mempal::core::types::SearchResult) -> CliSear
         memory_kind: memory_kind_slug(&result.memory_kind).to_string(),
         domain: domain_slug(&result.domain).to_string(),
         field: result.field,
+        is_pinned: result.is_pinned,
         statement: result.statement,
         tier: result
             .tier
@@ -2986,11 +3084,13 @@ fn memory_kind_slug(v: &MemoryKind) -> &'static str {
     match v {
         MemoryKind::Evidence => "evidence",
         MemoryKind::Knowledge => "knowledge",
+        MemoryKind::ProfileFact => "profile_fact",
     }
 }
 fn domain_slug(v: &MemoryDomain) -> &'static str {
     match v {
         MemoryDomain::Project => "project",
+        MemoryDomain::User => "user",
         MemoryDomain::Agent => "agent",
         MemoryDomain::Skill => "skill",
         MemoryDomain::Global => "global",
@@ -3015,6 +3115,8 @@ fn parse_knowledge_tier(v: &str) -> Result<KnowledgeTier> {
 }
 fn knowledge_status_slug(v: &KnowledgeStatus) -> &'static str {
     match v {
+        KnowledgeStatus::Active => "active",
+        KnowledgeStatus::Superseded => "superseded",
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
@@ -3024,6 +3126,8 @@ fn knowledge_status_slug(v: &KnowledgeStatus) -> &'static str {
 }
 fn parse_knowledge_status(v: &str) -> Result<KnowledgeStatus> {
     match v {
+        "active" => Ok(KnowledgeStatus::Active),
+        "superseded" => Ok(KnowledgeStatus::Superseded),
         "candidate" => Ok(KnowledgeStatus::Candidate),
         "promoted" => Ok(KnowledgeStatus::Promoted),
         "canonical" => Ok(KnowledgeStatus::Canonical),
@@ -3154,7 +3258,7 @@ fn effective_wake_up_text(drawer: &mempal::core::types::Drawer) -> &str {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .unwrap_or(drawer.content.as_str()),
-        MemoryKind::Evidence => drawer.content.as_str(),
+        MemoryKind::Evidence | MemoryKind::ProfileFact => drawer.content.as_str(),
     }
 }
 
@@ -4981,6 +5085,114 @@ fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn pin_command(db: &Database, drawer_id: &str) -> Result<()> {
+    if !db
+        .pin_drawer(drawer_id, None)
+        .context("failed to pin drawer")?
+    {
+        bail!("drawer not found: {drawer_id}");
+    }
+    append_audit_entry(db, "pin", &serde_json::json!({ "drawer_id": drawer_id }))
+        .context("failed to append audit log")?;
+    println!("pinned {drawer_id}");
+    Ok(())
+}
+
+fn unpin_command(db: &Database, drawer_id: &str) -> Result<()> {
+    if !db
+        .unpin_drawer(drawer_id)
+        .context("failed to unpin drawer")?
+    {
+        bail!("drawer not found: {drawer_id}");
+    }
+    append_audit_entry(db, "unpin", &serde_json::json!({ "drawer_id": drawer_id }))
+        .context("failed to append audit log")?;
+    println!("unpinned {drawer_id}");
+    Ok(())
+}
+
+fn pinned_command(
+    db: &Database,
+    config: &Config,
+    project: Option<&str>,
+    reorder: &[String],
+    json: bool,
+) -> Result<()> {
+    if !reorder.is_empty() {
+        for drawer_id in reorder {
+            if db
+                .get_drawer(drawer_id)
+                .context("failed to look up pinned reorder drawer")?
+                .is_none()
+            {
+                bail!("drawer not found: {drawer_id}");
+            }
+        }
+        db.reorder_pinned_facts(reorder)
+            .context("failed to reorder pinned facts")?;
+        append_audit_entry(
+            db,
+            "pinned_reorder",
+            &serde_json::json!({ "drawer_ids": reorder }),
+        )
+        .context("failed to append audit log")?;
+    }
+
+    let cwd = env::current_dir().ok();
+    let project_id = match project {
+        Some(project) => resolve_project_id(Some(project), config, cwd.as_deref())
+            .context("failed to resolve pinned project id")?,
+        None => None,
+    };
+    let facts = db
+        .get_pinned_facts(project_id.as_deref(), 1_000_000)
+        .context("failed to load pinned facts")?;
+
+    if json {
+        let output = facts
+            .iter()
+            .map(|drawer| {
+                serde_json::json!({
+                    "drawer_id": &drawer.id,
+                    "pin_order": drawer.pin_order,
+                    "memory_kind": memory_kind_slug(&drawer.memory_kind),
+                    "domain": domain_slug(&drawer.domain),
+                    "field": &drawer.field,
+                    "status": drawer.status.as_ref().map(knowledge_status_slug),
+                    "importance": drawer.importance,
+                    "source_file": &drawer.source_file,
+                    "content": &drawer.content,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "facts": output }))
+                .context("failed to serialize pinned facts JSON")?
+        );
+        return Ok(());
+    }
+
+    if facts.is_empty() {
+        println!("no pinned facts");
+        return Ok(());
+    }
+    for drawer in facts {
+        let order = drawer
+            .pin_order
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{order}\t{}\t{}/{}\t{}",
+            drawer.id,
+            domain_slug(&drawer.domain),
+            drawer.field,
+            truncate_for_summary(&drawer.content, 120)
+        );
+    }
+    Ok(())
+}
+
 fn rollback_command(
     db: &Database,
     config: &Config,
@@ -5510,6 +5722,9 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     let source_type_counts = db
         .source_type_counts()
         .context("failed to count drawers per source type")?;
+    let pinned_fact_counts = db
+        .pinned_fact_counts_by_project()
+        .context("failed to count pinned facts per project")?;
     let raw_turn_count =
         count_raw_turn_drawers(db, &config.turns).context("failed to count raw turn drawers")?;
     let project_breakdown: Option<Vec<(Option<String>, i64)>> = if full {
@@ -5607,6 +5822,19 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     } else {
         for (source_type, count) in source_type_counts {
             println!("  {source_type}: {count}");
+        }
+    }
+    println!("Pinned Facts:");
+    if pinned_fact_counts.is_empty() {
+        println!("  none");
+    } else {
+        for (project_id, count) in pinned_fact_counts {
+            match project_id {
+                Some(project_id) => {
+                    println!("  {}: {count}", escape_project_id_for_display(&project_id))
+                }
+                None => println!("  NULL: {count}"),
+            }
         }
     }
     println!("Turns:");

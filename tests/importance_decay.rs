@@ -405,6 +405,7 @@ fn test_search_result_dto_includes_effective_importance() {
         memory_kind: "evidence".to_string(),
         domain: "project".to_string(),
         field: "default".to_string(),
+        is_pinned: false,
         statement: None,
         tier: None,
         status: None,

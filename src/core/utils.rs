@@ -163,6 +163,7 @@ pub fn build_bootstrap_evidence_drawer_id(
 }
 
 pub fn link_superseded_drawer(drawer: &mut Drawer, old_id: &str) {
+    drawer.supersedes = Some(old_id.to_string());
     let marker = format!("supersedes:{old_id}");
     match drawer.scope_constraints.as_mut() {
         Some(existing) if !existing.trim().is_empty() => {
@@ -391,12 +392,14 @@ fn memory_kind_as_str(kind: &MemoryKind) -> &'static str {
     match kind {
         MemoryKind::Evidence => "evidence",
         MemoryKind::Knowledge => "knowledge",
+        MemoryKind::ProfileFact => "profile_fact",
     }
 }
 
 fn memory_domain_as_str(domain: &MemoryDomain) -> &'static str {
     match domain {
         MemoryDomain::Project => "project",
+        MemoryDomain::User => "user",
         MemoryDomain::Agent => "agent",
         MemoryDomain::Skill => "skill",
         MemoryDomain::Global => "global",
@@ -430,6 +433,8 @@ fn knowledge_tier_as_str(tier: &KnowledgeTier) -> &'static str {
 
 fn knowledge_status_as_str(status: &KnowledgeStatus) -> &'static str {
     match status {
+        KnowledgeStatus::Active => "active",
+        KnowledgeStatus::Superseded => "superseded",
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",

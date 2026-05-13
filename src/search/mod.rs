@@ -815,6 +815,7 @@ fn result_from_drawer(
         anchor_kind: drawer.anchor_kind,
         anchor_id: drawer.anchor_id,
         parent_anchor_id: drawer.parent_anchor_id,
+        is_pinned: drawer.is_pinned,
         importance: drawer.importance,
         similarity,
         route,
@@ -1042,6 +1043,7 @@ pub fn search_by_vector(
                     anchor_kind: AnchorKind::Global,
                     anchor_id: String::new(),
                     parent_anchor_id: None,
+                    is_pinned: false,
                     importance: 0,
                     similarity: (1.0_f64 - distance) as f32,
                     route: route.clone(),
@@ -1154,6 +1156,7 @@ fn search_by_vector_scoped_exact(
                     anchor_kind: AnchorKind::Global,
                     anchor_id: String::new(),
                     parent_anchor_id: None,
+                    is_pinned: false,
                     importance: 0,
                     similarity: (1.0_f64 - distance) as f32,
                     route: route.clone(),
@@ -1276,6 +1279,7 @@ fn memory_kind_from_str(value: &str) -> rusqlite::Result<MemoryKind> {
     match value {
         "evidence" => Ok(MemoryKind::Evidence),
         "knowledge" => Ok(MemoryKind::Knowledge),
+        "profile_fact" => Ok(MemoryKind::ProfileFact),
         _ => Err(invalid_enum_value("memory_kind", value.to_string())),
     }
 }
@@ -1284,6 +1288,7 @@ fn memory_kind_slug(value: &MemoryKind) -> &'static str {
     match value {
         MemoryKind::Evidence => "evidence",
         MemoryKind::Knowledge => "knowledge",
+        MemoryKind::ProfileFact => "profile_fact",
     }
 }
 
@@ -1291,6 +1296,7 @@ fn memory_kind_slug(value: &MemoryKind) -> &'static str {
 fn memory_domain_from_str(value: &str) -> rusqlite::Result<MemoryDomain> {
     match value {
         "project" => Ok(MemoryDomain::Project),
+        "user" => Ok(MemoryDomain::User),
         "agent" => Ok(MemoryDomain::Agent),
         "skill" => Ok(MemoryDomain::Skill),
         "global" => Ok(MemoryDomain::Global),
@@ -1301,6 +1307,7 @@ fn memory_domain_from_str(value: &str) -> rusqlite::Result<MemoryDomain> {
 fn domain_slug(value: &MemoryDomain) -> &'static str {
     match value {
         MemoryDomain::Project => "project",
+        MemoryDomain::User => "user",
         MemoryDomain::Agent => "agent",
         MemoryDomain::Skill => "skill",
         MemoryDomain::Global => "global",
@@ -1331,6 +1338,8 @@ fn tier_slug(value: &KnowledgeTier) -> &'static str {
 fn knowledge_status_from_str(value: &str) -> rusqlite::Result<KnowledgeStatus> {
     match value {
         "candidate" => Ok(KnowledgeStatus::Candidate),
+        "active" => Ok(KnowledgeStatus::Active),
+        "superseded" => Ok(KnowledgeStatus::Superseded),
         "promoted" => Ok(KnowledgeStatus::Promoted),
         "canonical" => Ok(KnowledgeStatus::Canonical),
         "demoted" => Ok(KnowledgeStatus::Demoted),
@@ -1342,6 +1351,8 @@ fn knowledge_status_from_str(value: &str) -> rusqlite::Result<KnowledgeStatus> {
 fn status_slug(value: &KnowledgeStatus) -> &'static str {
     match value {
         KnowledgeStatus::Candidate => "candidate",
+        KnowledgeStatus::Active => "active",
+        KnowledgeStatus::Superseded => "superseded",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
         KnowledgeStatus::Demoted => "demoted",
@@ -1430,6 +1441,7 @@ mod tests {
             anchor_kind: AnchorKind::Global,
             anchor_id: String::new(),
             parent_anchor_id: None,
+            is_pinned: false,
             importance: drawer.importance,
             similarity: 0.9,
             route: RouteDecision {

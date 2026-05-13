@@ -19,7 +19,9 @@ use crate::core::{
     config::IngestGatingConfig,
     db::Database,
     strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
-    types::{BootstrapEvidenceArgs, Drawer, SourceType, default_confidence},
+    types::{
+        BootstrapEvidenceArgs, Drawer, MemoryDomain, MemoryKind, SourceType, default_confidence,
+    },
     utils::{
         build_bootstrap_evidence_drawer_id, build_drawer_id, iso_timestamp, link_superseded_drawer,
         route_room_from_taxonomy,
@@ -77,6 +79,10 @@ pub struct IngestOptions<'a> {
     pub prototype_classifier: Option<&'a PrototypeClassifier>,
     pub source_file_override: Option<&'a str>,
     pub source_type: Option<SourceType>,
+    pub memory_kind: Option<MemoryKind>,
+    pub domain: Option<MemoryDomain>,
+    pub field: Option<&'a str>,
+    pub is_pinned: bool,
     pub confidence: Option<f64>,
     pub replace_existing_source: bool,
     pub no_strip_noise: bool,
@@ -223,6 +229,10 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             prototype_classifier: None,
             source_file_override: None,
             source_type: None,
+            memory_kind: None,
+            domain: None,
+            field: None,
+            is_pinned: false,
             confidence: None,
             replace_existing_source: false,
             no_strip_noise: false,
@@ -413,6 +423,13 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             .into_iter()
             .find(|summary| Some(summary.id.as_str()) != replacement_target_id);
         if let Some(existing) = exact_duplicate {
+            if options.is_pinned {
+                db.pin_drawer(&existing.id, None)
+                    .map_err(|source| IngestError::InsertDrawer {
+                        drawer_id: existing.id.clone(),
+                        source,
+                    })?;
+            }
             stats.skipped += 1;
             stats.drawer_ids.push(existing.id);
             continue;
@@ -571,6 +588,16 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             ..drawer
         };
         let mut drawer = drawer;
+        if let Some(memory_kind) = options.memory_kind {
+            drawer.memory_kind = memory_kind;
+        }
+        if let Some(domain) = options.domain {
+            drawer.domain = domain;
+        }
+        if let Some(field) = options.field {
+            drawer.field = field.to_string();
+        }
+        drawer.is_pinned = options.is_pinned;
         if let Some(old_id) = replacement_target_id {
             link_superseded_drawer(&mut drawer, old_id);
         }
@@ -667,6 +694,10 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             prototype_classifier: None,
             source_file_override: None,
             source_type: None,
+            memory_kind: None,
+            domain: None,
+            field: None,
+            is_pinned: false,
             confidence: None,
             replace_existing_source: false,
             no_strip_noise: false,
