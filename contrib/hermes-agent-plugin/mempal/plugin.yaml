@@ -1,0 +1,3 @@
+name: mempal
+description: Local memory backend via mempal (BM25 + vector hybrid search, zero cloud dependency)
+dependencies: []

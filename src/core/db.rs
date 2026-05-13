@@ -1962,6 +1962,50 @@ impl Database {
             .query_row(&sql, params_from_iter(values), |row| row.get(0))?)
     }
 
+    pub fn timeline_drawers(
+        &self,
+        wing: Option<&str>,
+        room: Option<&str>,
+        project_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Drawer>, DbError> {
+        let sql_limit =
+            i64::try_from(limit).map_err(|_| DbError::InvalidSourceType("limit".to_string()))?;
+        let mut sql = format!(
+            r#"
+            SELECT {DRAWER_SELECT_COLUMNS}
+            FROM drawers
+            WHERE deleted_at IS NULL
+            "#
+        );
+        let mut values: Vec<SqlValue> = Vec::new();
+        if let Some(w) = wing {
+            values.push(SqlValue::Text(w.to_string()));
+            sql.push_str(&format!("AND wing = ?{} ", values.len()));
+        }
+        if let Some(r) = room {
+            values.push(SqlValue::Text(r.to_string()));
+            sql.push_str(&format!("AND room = ?{} ", values.len()));
+        }
+        if let Some(p) = project_id {
+            values.push(SqlValue::Text(p.to_string()));
+            sql.push_str(&format!("AND project_id = ?{} ", values.len()));
+        }
+        values.push(SqlValue::Integer(sql_limit));
+        sql.push_str(&format!(
+            "ORDER BY CAST(added_at AS INTEGER) DESC, id DESC LIMIT ?{}",
+            values.len()
+        ));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(values), |row| {
+                drawer_from_row(row).map_err(row_decode_error)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn purge_deleted(&self, before: Option<&str>) -> Result<u64, DbError> {
         // First collect IDs to purge, then delete from both tables
         let ids: Vec<String> = if let Some(before) = before {

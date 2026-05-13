@@ -34,6 +34,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/ingest", post(ingest_handler))
         .route("/api/taxonomy", get(taxonomy_handler))
         .route("/api/status", get(status_handler))
+        .merge(super::hermes_compat::routes())
         .with_state(state)
         .layer(cors_layer())
 }

@@ -3,6 +3,8 @@
 #[cfg(feature = "rest")]
 mod handlers;
 #[cfg(feature = "rest")]
+mod hermes_compat;
+#[cfg(feature = "rest")]
 mod state;
 
 #[cfg(feature = "rest")]
