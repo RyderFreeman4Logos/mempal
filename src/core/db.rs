@@ -28,7 +28,7 @@ use super::{
         KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus,
         KnowledgeTier, MemoryDomain, MemoryKind, NeighborChunk, Provenance, ReindexSource,
         RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack,
-        SourceType, TaxonomyEntry, Triple, TripleStats, TunnelDrawer, TunnelEndpoint,
+        SleepStats, SourceType, TaxonomyEntry, Triple, TripleStats, TunnelDrawer, TunnelEndpoint,
         TunnelFollowResult,
     },
     utils::{
@@ -39,7 +39,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 13;
+const CURRENT_SCHEMA_VERSION: u32 = 14;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -2622,11 +2622,46 @@ impl Database {
                 ))
             },
         )?;
+        let sleep_stats = self.sleep_stats()?;
         Ok(ConsolidationStats {
             total_compacted_drawers,
             consolidation_runs,
             last_consolidation_at,
+            last_sleep_at: sleep_stats.last_sleep_at,
+            sleep_items_pruned: sleep_stats.items_pruned,
+            sleep_items_compacted: sleep_stats.items_compacted,
+            sleep_conflicts_resolved: sleep_stats.conflicts_resolved,
         })
+    }
+
+    pub fn sleep_stats(&self) -> Result<SleepStats, DbError> {
+        if !self.table_exists("sleep_log")? {
+            return Ok(SleepStats::default());
+        }
+
+        let stats = self
+            .conn
+            .query_row(
+                r#"
+                SELECT created_at, pruned_count, compacted_count, conflicts_resolved_count
+                FROM sleep_log
+                WHERE dry_run = 0
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                "#,
+                [],
+                |row| {
+                    Ok(SleepStats {
+                        last_sleep_at: row.get::<_, Option<String>>(0)?,
+                        items_pruned: row.get::<_, i64>(1)? as u64,
+                        items_compacted: row.get::<_, i64>(2)? as u64,
+                        conflicts_resolved: row.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(stats)
     }
 
     // --- FTS5 BM25 search ---
@@ -3720,6 +3755,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             ensure_v13_typed_pinned_schema(conn, read_user_version(conn)?)?;
             continue;
         }
+        if migration.version == 14 {
+            ensure_v14_sleep_schema(conn, read_user_version(conn)?)?;
+            continue;
+        }
         apply_migration_atomic(conn, migration)?;
     }
 
@@ -3734,6 +3773,9 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     }
     if read_user_version(conn)? >= 13 {
         ensure_v13_typed_pinned_schema(conn, read_user_version(conn)?)?;
+    }
+    if read_user_version(conn)? >= 14 {
+        ensure_v14_sleep_schema(conn, read_user_version(conn)?)?;
     }
 
     Ok(())
@@ -3905,6 +3947,33 @@ fn ensure_v13_typed_pinned_schema(conn: &Connection, current_version: u32) -> Re
         }
         if current_version < 13 {
             set_user_version(conn, 13)?;
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn ensure_v14_sleep_schema(conn: &Connection, current_version: u32) -> Result<(), DbError> {
+    let existing_columns = drawers_column_names(conn)?;
+    let missing_priority = !existing_columns.contains("consolidation_priority");
+    let missing_last_sleep_at = !existing_columns.contains("last_sleep_at");
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(error) = (|| -> Result<(), DbError> {
+        if missing_priority {
+            conn.execute_batch("ALTER TABLE drawers ADD COLUMN consolidation_priority REAL;")?;
+        }
+        if missing_last_sleep_at {
+            conn.execute_batch("ALTER TABLE drawers ADD COLUMN last_sleep_at TEXT;")?;
+        }
+        conn.execute_batch(V14_SLEEP_SCHEMA_SQL)?;
+        if current_version < 14 {
+            set_user_version(conn, 14)?;
         }
         conn.execute_batch("COMMIT;")?;
         Ok(())
@@ -4549,6 +4618,7 @@ SET source_type = CASE
 const V11_MIGRATION_SQL: &str = "";
 const V12_MIGRATION_SQL: &str = "";
 const V13_MIGRATION_SQL: &str = "";
+const V14_MIGRATION_SQL: &str = "";
 const V12_COMPACTION_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
     ON drawers(compacted_into)
@@ -4582,6 +4652,47 @@ CREATE INDEX IF NOT EXISTS idx_drawers_pinned
 CREATE INDEX IF NOT EXISTS idx_drawers_supersedes
     ON drawers(supersedes)
     WHERE supersedes IS NOT NULL;
+"#;
+
+const V14_SLEEP_SCHEMA_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_drawers_consolidation_priority
+    ON drawers(consolidation_priority DESC)
+    WHERE deleted_at IS NULL AND compacted_into IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_drawers_last_sleep_at
+    ON drawers(last_sleep_at)
+    WHERE last_sleep_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS sleep_log (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('full', 'nrem', 'rem', 'salience', 'selected')),
+    processed_count INTEGER NOT NULL DEFAULT 0,
+    pruned_count INTEGER NOT NULL DEFAULT 0,
+    compacted_count INTEGER NOT NULL DEFAULT 0,
+    conflicts_resolved_count INTEGER NOT NULL DEFAULT 0,
+    salience_scored_count INTEGER NOT NULL DEFAULT 0,
+    dry_run INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_sleep_log_created_at
+    ON sleep_log(created_at);
+
+CREATE TABLE IF NOT EXISTS sleep_resolution_log (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    wing TEXT NOT NULL,
+    drawer_id TEXT NOT NULL REFERENCES drawers(id),
+    contradicted_triple_id TEXT NOT NULL REFERENCES triples(id),
+    contradicted_source_drawer TEXT REFERENCES drawers(id),
+    new_confidence REAL NOT NULL,
+    existing_confidence REAL NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('invalidated')),
+    dry_run INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_sleep_resolution_log_created_at
+    ON sleep_resolution_log(created_at);
 "#;
 
 fn migrations() -> &'static [Migration] {
@@ -4637,6 +4748,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 13,
             sql: V13_MIGRATION_SQL,
+        },
+        Migration {
+            version: 14,
+            sql: V14_MIGRATION_SQL,
         },
     ];
     MIGRATIONS

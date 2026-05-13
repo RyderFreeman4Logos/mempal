@@ -79,6 +79,11 @@ const DEFAULT_CONSOLIDATION_SIMILARITY_THRESHOLD: f64 = 0.85;
 const DEFAULT_CONSOLIDATION_MIN_CLUSTER_SIZE: usize = 3;
 const DEFAULT_CONSOLIDATION_MAX_CLUSTERS_PER_RUN: usize = 100;
 const DEFAULT_CONSOLIDATION_STRATEGY: &str = "richest_content";
+const DEFAULT_SLEEP_NREM_PRUNE_MIN_AGE_DAYS: u64 = 30;
+const DEFAULT_SLEEP_NREM_PRUNE_MAX_IMPORTANCE: i32 = 1;
+const DEFAULT_SLEEP_NREM_COMPACTION_THRESHOLD: f64 = 0.85;
+const DEFAULT_SLEEP_SALIENCE_IDLE_MINUTES: u64 = 30;
+const DEFAULT_SLEEP_SCHEDULE: &str = "0 3 * * *";
 static DEFAULT_SENSITIVE_SCRUBBER: OnceLock<Option<CompiledPrivacyConfig>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -108,6 +113,7 @@ pub struct Config {
     pub repair: RepairConfig,
     pub skills: SkillsConfig,
     pub consolidation: ConsolidationConfig,
+    pub sleep: SleepConfig,
 }
 
 impl Default for Config {
@@ -135,6 +141,7 @@ impl Default for Config {
             repair: RepairConfig::default(),
             skills: SkillsConfig::default(),
             consolidation: ConsolidationConfig::default(),
+            sleep: SleepConfig::default(),
         }
     }
 }
@@ -314,6 +321,28 @@ impl Config {
                     "unsupported consolidation.strategy: {other}"
                 )));
             }
+        }
+        if self.sleep.nrem_prune_min_age_days == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "sleep.nrem_prune_min_age_days must be greater than 0".to_string(),
+            ));
+        }
+        if !(0..=5).contains(&self.sleep.nrem_prune_max_importance) {
+            return Err(ConfigError::InvalidConfig(
+                "sleep.nrem_prune_max_importance must be between 0 and 5".to_string(),
+            ));
+        }
+        if !self.sleep.nrem_compaction_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.sleep.nrem_compaction_threshold)
+        {
+            return Err(ConfigError::InvalidConfig(
+                "sleep.nrem_compaction_threshold must be a finite value in 0.0..=1.0".to_string(),
+            ));
+        }
+        if self.sleep.salience_idle_minutes == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "sleep.salience_idle_minutes must be greater than 0".to_string(),
+            ));
         }
         if let Some(path) = self
             .embed
@@ -1735,6 +1764,32 @@ impl Default for ConsolidationConfig {
             min_cluster_size: DEFAULT_CONSOLIDATION_MIN_CLUSTER_SIZE,
             max_clusters_per_run: DEFAULT_CONSOLIDATION_MAX_CLUSTERS_PER_RUN,
             strategy: DEFAULT_CONSOLIDATION_STRATEGY.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SleepConfig {
+    pub enabled: bool,
+    pub nrem_prune_min_age_days: u64,
+    pub nrem_prune_max_importance: i32,
+    pub nrem_compaction_threshold: f64,
+    pub rem_auto_resolve: bool,
+    pub salience_idle_minutes: u64,
+    pub schedule: String,
+}
+
+impl Default for SleepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            nrem_prune_min_age_days: DEFAULT_SLEEP_NREM_PRUNE_MIN_AGE_DAYS,
+            nrem_prune_max_importance: DEFAULT_SLEEP_NREM_PRUNE_MAX_IMPORTANCE,
+            nrem_compaction_threshold: DEFAULT_SLEEP_NREM_COMPACTION_THRESHOLD,
+            rem_auto_resolve: true,
+            salience_idle_minutes: DEFAULT_SLEEP_SALIENCE_IDLE_MINUTES,
+            schedule: DEFAULT_SLEEP_SCHEDULE.to_string(),
         }
     }
 }

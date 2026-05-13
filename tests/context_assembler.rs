@@ -996,10 +996,10 @@ async fn test_context_assembler_returns_typed_pack() {
 #[test]
 fn test_context_assembler_does_not_bump_schema() {
     let (tmp, db) = setup_cli_home();
-    assert_eq!(db.schema_version().expect("schema"), 13);
+    assert_eq!(db.schema_version().expect("schema"), 14);
     let before_tables = table_names(&db);
     let _ = run_context_plain(tmp.path(), "debug", &[]);
-    assert_eq!(db.schema_version().expect("schema"), 13);
+    assert_eq!(db.schema_version().expect("schema"), 14);
     assert_eq!(table_names(&db), before_tables);
 }
 

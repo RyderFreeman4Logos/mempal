@@ -73,6 +73,10 @@ use mempal::knowledge_lifecycle::{
 use mempal::mcp::MempalMcpServer;
 use mempal::observability;
 use mempal::search::{SearchFilters, SearchOptions, search_with_all_options};
+use mempal::sleep::{
+    NremSummary, RemSummary, SalienceSummary, SleepCycleSummary, SleepPhaseSelection,
+    SleepRunOptions, run_sleep_cycle,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -150,6 +154,13 @@ struct ConsolidateCommandOptions<'a> {
     dry_run: bool,
     strategy: Option<&'a str>,
     limit: Option<usize>,
+}
+
+struct SleepCommandOptions {
+    nrem: bool,
+    rem: bool,
+    salience: bool,
+    dry_run: bool,
 }
 
 struct ContextCommandArgs {
@@ -387,6 +398,16 @@ enum Commands {
         strategy: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+    },
+    Sleep {
+        #[arg(long)]
+        nrem: bool,
+        #[arg(long)]
+        rem: bool,
+        #[arg(long)]
+        salience: bool,
+        #[arg(long)]
+        dry_run: bool,
     },
     Kg {
         #[command(subcommand)]
@@ -1476,6 +1497,21 @@ fn run() -> Result<()> {
                 dry_run,
                 strategy: strategy.as_deref(),
                 limit,
+            },
+        ),
+        Commands::Sleep {
+            nrem,
+            rem,
+            salience,
+            dry_run,
+        } => sleep_command(
+            &db,
+            config.as_ref(),
+            SleepCommandOptions {
+                nrem,
+                rem,
+                salience,
+                dry_run,
             },
         ),
         Commands::Kg { command } => kg_command(&db, command),
@@ -3483,6 +3519,83 @@ fn consolidate_command(
         drawers_merged
     );
     Ok(())
+}
+
+fn sleep_command(db: &Database, config: &Config, options: SleepCommandOptions) -> Result<()> {
+    let current_dir = env::current_dir().ok();
+    let project_id = resolve_project_id(None, config, current_dir.as_deref())
+        .context("failed to resolve project id for sleep cycle")?;
+    let summary = run_sleep_cycle(
+        db,
+        config,
+        SleepRunOptions {
+            phases: SleepPhaseSelection {
+                nrem: options.nrem,
+                rem: options.rem,
+                salience: options.salience,
+            },
+            dry_run: options.dry_run,
+            project_id,
+        },
+    )
+    .context("sleep cycle failed")?;
+    print_sleep_summary(&summary);
+    Ok(())
+}
+
+fn print_sleep_summary(summary: &SleepCycleSummary) {
+    println!(
+        "sleep: phases={} dry_run={}",
+        summary
+            .phases
+            .iter()
+            .map(|phase| phase.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        summary.dry_run
+    );
+    if let Some(nrem) = &summary.nrem {
+        print_nrem_summary(nrem);
+    }
+    if let Some(rem) = &summary.rem {
+        print_rem_summary(rem);
+    }
+    if let Some(salience) = &summary.salience {
+        print_salience_summary(salience);
+    }
+    println!(
+        "summary: processed={} pruned={} compacted={} conflicts_resolved={} salience_scored={}",
+        summary.processed_count(),
+        summary.pruned_count(),
+        summary.compacted_count(),
+        summary.conflicts_resolved_count(),
+        summary.salience_scored_count()
+    );
+}
+
+fn print_nrem_summary(summary: &NremSummary) {
+    println!(
+        "nrem: processed={} pruned={} clusters_found={} clusters_compacted={} compacted_drawers={}",
+        summary.processed_drawers,
+        summary.pruned_drawers,
+        summary.clusters_found,
+        summary.clusters_compacted,
+        summary.compacted_drawers
+    );
+}
+
+fn print_rem_summary(summary: &RemSummary) {
+    println!(
+        "rem: processed={} conflicts_detected={} conflicts_resolved={}",
+        summary.processed_drawers, summary.conflicts_detected, summary.conflicts_resolved
+    );
+}
+
+fn print_salience_summary(summary: &SalienceSummary) {
+    println!(
+        "salience: processed={} scored={}",
+        summary.processed_drawers, summary.scored_drawers
+    );
 }
 
 fn average_cluster_similarity(cluster: &[(String, f64)]) -> f64 {
@@ -5810,6 +5923,20 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         Some(last) => println!("  last_consolidation_at: {last}"),
         None => println!("  last_consolidation_at: none"),
     }
+    println!("Sleep:");
+    match consolidation_stats.last_sleep_at.as_deref() {
+        Some(last) => println!("  last_sleep_at: {last}"),
+        None => println!("  last_sleep_at: none"),
+    }
+    println!("  items_pruned: {}", consolidation_stats.sleep_items_pruned);
+    println!(
+        "  items_compacted: {}",
+        consolidation_stats.sleep_items_compacted
+    );
+    println!(
+        "  conflicts_resolved: {}",
+        consolidation_stats.sleep_conflicts_resolved
+    );
     let triple_count = db.triple_count().context("failed to count triples")?;
     println!("taxonomy_entries: {taxonomy_count}");
     if triple_count > 0 {
