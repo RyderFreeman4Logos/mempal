@@ -54,11 +54,18 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
 
 ## Memory routing
 
-All memories are stored under `wing="hermes-user/{user_id}"`:
-- Turns → `room="turns"`
-- Explicit facts → `room="facts"`
-- Session summaries → `room="sessions"`
-- Built-in memory mirrors → `room="memory-mirror"`
+All memories are profile-scoped under `wing="hermes-user/{user_id}/{profile}"`.
+The default profile is `default`, and Hermes may pass it as `agent_identity`
+or `profile`.
+
+- Turns → `room="turns"` or `room="turns/{platform}/{chat_id}[/{thread_id}]"`
+- Explicit facts → `room="facts"` shared across chats for the same profile
+- Session summaries → `room="sessions/{session_id}"`
+- Built-in memory mirrors → `room="facts"`, scoped turns/session rooms, or `room="memory-mirror/{target}"`
+
+When Hermes provides `project_id` (or `cwd` as a fallback), the plugin forwards
+it to `/api/search`, `/api/timeline`, and `/api/ingest` for mempal project
+isolation.
 
 ## Circuit breaker
 
