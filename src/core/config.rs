@@ -27,6 +27,9 @@ const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
 const DEFAULT_SEARCH_TUNNEL_FANOUT_CAP: usize = 5;
 const DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP: usize = 8;
 const DEFAULT_SEARCH_TUNNEL_PENALTY: f32 = 0.7;
+const DEFAULT_SEARCH_DECAY_HALF_LIFE_DAYS: u64 = 90;
+const DEFAULT_SEARCH_DECAY_STEP_FULL_DAYS: u64 = 30;
+const DEFAULT_SEARCH_DECAY_STEP_REDUCED_WEIGHT: f64 = 0.5;
 const DEFAULT_TURN_STORAGE_MODE: TurnStorageMode = TurnStorageMode::RawEvidence;
 const DEFAULT_TURN_IMPORTANCE: i32 = 0;
 const DEFAULT_ALERT_EVERY_N_FAILURES: u64 = 100;
@@ -211,6 +214,18 @@ impl Config {
         {
             return Err(ConfigError::InvalidConfig(
                 "search.tunnel_penalty must be a finite value in 0.0..=1.0".to_string(),
+            ));
+        }
+        if self.search.decay.half_life_days == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "search.decay.half_life_days must be greater than 0".to_string(),
+            ));
+        }
+        if !self.search.decay.step_reduced_weight.is_finite()
+            || !(0.0..=1.0).contains(&self.search.decay.step_reduced_weight)
+        {
+            return Err(ConfigError::InvalidConfig(
+                "search.decay.step_reduced_weight must be a finite value in 0.0..=1.0".to_string(),
             ));
         }
         if !(0..=5).contains(&self.hotpatch.min_importance_stars) {
@@ -897,6 +912,7 @@ pub struct SearchConfig {
     /// `1.0` disables the penalty. Default `0.7` deprioritizes cross-project rows
     /// when their raw embedding score clusters near direct in-project matches.
     pub tunnel_penalty: f32,
+    pub decay: DecayConfig,
 }
 
 impl Default for SearchConfig {
@@ -909,7 +925,50 @@ impl Default for SearchConfig {
             tunnel_fanout_cap: DEFAULT_SEARCH_TUNNEL_FANOUT_CAP,
             tunnel_hints_display_cap: DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP,
             tunnel_penalty: DEFAULT_SEARCH_TUNNEL_PENALTY,
+            decay: DecayConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DecayConfig {
+    pub mode: DecayMode,
+    pub half_life_days: u64,
+    pub step_full_days: u64,
+    pub step_reduced_weight: f64,
+}
+
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self {
+            mode: DecayMode::None,
+            half_life_days: DEFAULT_SEARCH_DECAY_HALF_LIFE_DAYS,
+            step_full_days: DEFAULT_SEARCH_DECAY_STEP_FULL_DAYS,
+            step_reduced_weight: DEFAULT_SEARCH_DECAY_STEP_REDUCED_WEIGHT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecayMode {
+    #[default]
+    None,
+    Exponential,
+    Linear,
+    Step,
+}
+
+impl std::fmt::Display for DecayMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::None => "none",
+            Self::Exponential => "exponential",
+            Self::Linear => "linear",
+            Self::Step => "step",
+        };
+        f.write_str(value)
     }
 }
 
@@ -1470,5 +1529,65 @@ impl Default for SkillsConfig {
             skill_min_sessions: DEFAULT_SKILLS_MIN_SESSIONS,
             skill_surfacing_threshold: DEFAULT_SKILLS_SURFACING_THRESHOLD,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, DecayMode};
+
+    #[test]
+    fn search_decay_defaults_to_none() {
+        let config = Config::parse("").expect("empty config should parse");
+        assert_eq!(config.search.decay.mode, DecayMode::None);
+        assert_eq!(config.search.decay.half_life_days, 90);
+        assert_eq!(config.search.decay.step_full_days, 30);
+        assert_eq!(config.search.decay.step_reduced_weight, 0.5);
+    }
+
+    #[test]
+    fn search_decay_config_parses_nested_section() {
+        let config = Config::parse(
+            r#"
+            [search.decay]
+            mode = "exponential"
+            half_life_days = 45
+            step_full_days = 10
+            step_reduced_weight = 0.25
+            "#,
+        )
+        .expect("decay config should parse");
+
+        assert_eq!(config.search.decay.mode, DecayMode::Exponential);
+        assert_eq!(config.search.decay.half_life_days, 45);
+        assert_eq!(config.search.decay.step_full_days, 10);
+        assert_eq!(config.search.decay.step_reduced_weight, 0.25);
+    }
+
+    #[test]
+    fn search_decay_config_rejects_invalid_values() {
+        let err = Config::parse(
+            r#"
+            [search.decay]
+            half_life_days = 0
+            "#,
+        )
+        .expect_err("zero half-life must be rejected");
+        assert!(
+            err.to_string().contains("search.decay.half_life_days"),
+            "unexpected error: {err}"
+        );
+
+        let err = Config::parse(
+            r#"
+            [search.decay]
+            step_reduced_weight = 1.5
+            "#,
+        )
+        .expect_err("step weight above one must be rejected");
+        assert!(
+            err.to_string().contains("search.decay.step_reduced_weight"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -1,9 +1,12 @@
-//! Pure importance-decay and retrieval-boost functions (P13, LLM-free).
+//! Pure importance-decay, retrieval-boost, and search temporal scoring functions.
 //!
 //! Implements heuristic effective_importance = base * decay(days) + capped_boost.
 //! All parameters come from `ImportanceConfig` which is hot-reload whitelisted.
 
-use crate::core::config::ImportanceConfig;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::core::config::{DecayConfig, DecayMode, ImportanceConfig};
+use crate::cowork::peek::parse_rfc3339;
 
 /// Compute `effective_importance` from components.
 ///
@@ -40,10 +43,76 @@ pub fn elapsed_days(now_ms: i64, reference_ms: i64) -> f64 {
     diff_ms / 86_400_000.0
 }
 
+/// Parse mempal temporal fields as Unix seconds or RFC3339 timestamps.
+pub fn parse_temporal_timestamp_secs(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<i64>().ok().or_else(|| parse_rfc3339(value))
+}
+
+/// Compute the search relevance decay factor for a drawer timestamp.
+///
+/// Invalid timestamps fail open with factor `1.0` so search recall is not lost
+/// because of legacy or externally supplied metadata.
+pub fn search_decay_factor(added_at: &str, config: &DecayConfig) -> f64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    search_decay_factor_at(added_at, config, now)
+}
+
+/// Deterministic variant of [`search_decay_factor`] for tests and callers that
+/// already captured a request-level clock.
+pub fn search_decay_factor_at(added_at: &str, config: &DecayConfig, now_secs: i64) -> f64 {
+    let Some(added_at_secs) = parse_temporal_timestamp_secs(added_at) else {
+        return 1.0;
+    };
+    let age_days = ((now_secs - added_at_secs).max(0) as f64) / 86_400.0;
+    match config.mode {
+        DecayMode::None => 1.0,
+        DecayMode::Exponential => (-0.693 * age_days / config.half_life_days as f64).exp(),
+        DecayMode::Linear => (1.0 - age_days / config.half_life_days as f64).max(0.0),
+        DecayMode::Step => {
+            if age_days <= config.step_full_days as f64 {
+                1.0
+            } else {
+                config.step_reduced_weight
+            }
+        }
+    }
+}
+
+/// Return whether a validity window contains `now_secs`.
+///
+/// Unset or unparseable bounds are treated as open so malformed legacy
+/// metadata does not silently hide otherwise searchable memories.
+pub fn validity_window_contains_at(
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
+    now_secs: i64,
+) -> bool {
+    if valid_from
+        .and_then(parse_temporal_timestamp_secs)
+        .is_some_and(|from| from > now_secs)
+    {
+        return false;
+    }
+    if valid_until
+        .and_then(parse_temporal_timestamp_secs)
+        .is_some_and(|until| until < now_secs)
+    {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::ImportanceConfig;
+    use crate::core::config::{DecayConfig, DecayMode, ImportanceConfig};
 
     fn default_cfg() -> ImportanceConfig {
         ImportanceConfig::default()
@@ -136,5 +205,88 @@ mod tests {
     fn test_elapsed_days_clamps_negative_to_zero() {
         // reference > now → should clamp to 0 days
         assert!((elapsed_days(0, 1_000_000)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_search_decay_none_is_noop() {
+        let cfg = DecayConfig::default();
+        let factor = search_decay_factor_at("1710000000", &cfg, 1710000000 + 365 * 86_400);
+        assert_eq!(factor, 1.0);
+    }
+
+    #[test]
+    fn test_search_decay_exponential_halves_at_half_life() {
+        let cfg = DecayConfig {
+            mode: DecayMode::Exponential,
+            half_life_days: 90,
+            ..DecayConfig::default()
+        };
+        let factor = search_decay_factor_at("1710000000", &cfg, 1710000000 + 90 * 86_400);
+        assert!((factor - 0.500_073_6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_search_decay_linear_reaches_zero_at_half_life() {
+        let cfg = DecayConfig {
+            mode: DecayMode::Linear,
+            half_life_days: 90,
+            ..DecayConfig::default()
+        };
+        let factor = search_decay_factor_at("1710000000", &cfg, 1710000000 + 45 * 86_400);
+        assert!((factor - 0.5).abs() < 1e-9);
+
+        let zero = search_decay_factor_at("1710000000", &cfg, 1710000000 + 91 * 86_400);
+        assert_eq!(zero, 0.0);
+    }
+
+    #[test]
+    fn test_search_decay_step_uses_reduced_weight_after_full_window() {
+        let cfg = DecayConfig {
+            mode: DecayMode::Step,
+            step_full_days: 30,
+            step_reduced_weight: 0.25,
+            ..DecayConfig::default()
+        };
+        assert_eq!(
+            search_decay_factor_at("1710000000", &cfg, 1710000000 + 30 * 86_400),
+            1.0
+        );
+        assert_eq!(
+            search_decay_factor_at("1710000000", &cfg, 1710000000 + 31 * 86_400),
+            0.25
+        );
+    }
+
+    #[test]
+    fn test_search_decay_accepts_rfc3339_and_fails_open() {
+        let cfg = DecayConfig {
+            mode: DecayMode::Linear,
+            half_life_days: 10,
+            ..DecayConfig::default()
+        };
+        let factor = search_decay_factor_at("2026-05-01T00:00:00Z", &cfg, 1_777_852_800);
+        assert!((factor - 0.7).abs() < 1e-9);
+        assert_eq!(
+            search_decay_factor_at("not-a-time", &cfg, 1_777_930_400),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_validity_window_excludes_future_and_expired() {
+        let now = 1_710_000_000;
+        assert!(validity_window_contains_at(None, None, now));
+        assert!(validity_window_contains_at(
+            Some("1709999900"),
+            Some("1710000100"),
+            now
+        ));
+        assert!(!validity_window_contains_at(Some("1710000100"), None, now));
+        assert!(!validity_window_contains_at(None, Some("1709999900"), now));
+        assert!(validity_window_contains_at(
+            Some("not-a-time"),
+            Some("also-not-a-time"),
+            now
+        ));
     }
 }
