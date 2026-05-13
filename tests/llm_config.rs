@@ -99,6 +99,49 @@ extra_body = { chat_template_kwargs = { enable_thinking = false } }
 }
 
 #[test]
+fn test_cloud_llm_memory_intelligence_mode_is_rejected() {
+    let err = Config::parse(
+        r#"
+[memory_intelligence]
+mode = "cloud_llm"
+"#,
+    )
+    .expect_err("cloud_llm mode must not parse");
+
+    match err {
+        ConfigError::Parse(source) => {
+            assert!(source.to_string().contains("cloud_llm"), "{source}");
+        }
+        other => panic!("expected ConfigError::Parse, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_external_llm_base_url_warns_but_does_not_block_config() {
+    let config = Config::parse(
+        r#"
+[memory_intelligence]
+mode = "local_llm"
+
+[memory_intelligence.llm]
+base_url = "https://api.example.com/v1"
+model = "operator-owned-model"
+"#,
+    )
+    .expect("external LLM endpoint warning must not block config parsing");
+
+    let warnings = config.collect_runtime_warnings();
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.source == "llm"
+                && warning.message.contains("memory_intelligence.llm.base_url")
+                && warning.message.contains("api.example.com")
+        }),
+        "{warnings:?}"
+    );
+}
+
+#[test]
 fn test_llm_config_missing_base_url_when_enabled() {
     let err = Config::parse(
         r#"

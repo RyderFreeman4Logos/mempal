@@ -40,7 +40,6 @@ fn test_intelligence_mode_config_parsing() {
     for (raw, expected) in [
         ("deterministic", IntelligenceMode::Deterministic),
         ("local_llm", IntelligenceMode::LocalLlm),
-        ("cloud_llm", IntelligenceMode::CloudLlm),
         ("auto", IntelligenceMode::Auto),
     ] {
         let config = Config::parse(&format!(

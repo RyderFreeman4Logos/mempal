@@ -12,7 +12,6 @@ pub enum IntelligenceMode {
     #[default]
     Deterministic,
     LocalLlm,
-    CloudLlm,
     Auto,
 }
 
@@ -21,7 +20,6 @@ impl IntelligenceMode {
         match self {
             Self::Deterministic => "deterministic",
             Self::LocalLlm => "local_llm",
-            Self::CloudLlm => "cloud_llm",
             Self::Auto => "auto",
         }
     }

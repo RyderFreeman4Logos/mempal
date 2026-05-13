@@ -1,10 +1,12 @@
 use std::env;
 use std::fs;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use regex::Regex;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -214,6 +216,9 @@ impl Config {
             return Err(ConfigError::InvalidConfig(
                 "memory_intelligence.llm.timeout_secs must be greater than 0".to_string(),
             ));
+        }
+        for warning in self.llm_base_url_locality_warnings() {
+            tracing::warn!(source = warning.source, "{}", warning.message);
         }
         if self.search.preview_chars == 0 {
             return Err(ConfigError::InvalidConfig(
@@ -516,8 +521,61 @@ impl Config {
                 message: "hooks capture is enabled while tier-2 gating is fail-open on embedder errors; review warnings before trusting passive captures.".to_string(),
             });
         }
+        warnings.extend(self.llm_base_url_locality_warnings());
         warnings
     }
+
+    fn llm_base_url_locality_warnings(&self) -> Vec<RuntimeWarning> {
+        [
+            ("llm.base_url", self.llm.base_url.as_deref()),
+            (
+                "memory_intelligence.llm.base_url",
+                self.memory_intelligence.llm.base_url.as_deref(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(setting, base_url)| {
+            let base_url = base_url?.trim();
+            if base_url.is_empty() || llm_base_url_is_local_or_lan(base_url) {
+                return None;
+            }
+            let host = llm_base_url_host(base_url)
+                .map(|host| format!(" host `{host}`"))
+                .unwrap_or_default();
+            Some(RuntimeWarning {
+                level: "warn",
+                source: "llm",
+                message: format!(
+                    "{setting}{host} appears outside localhost/LAN; mempal assumes user-configured LLM endpoints are local or private network and does not block operation"
+                ),
+            })
+        })
+        .collect()
+    }
+}
+
+fn llm_base_url_is_local_or_lan(base_url: &str) -> bool {
+    let Some(host) = llm_base_url_host(base_url) else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") || !host.contains('.') {
+        return true;
+    }
+    if let Ok(addr) = host.parse::<Ipv4Addr>() {
+        let octets = addr.octets();
+        return octets[0] == 10
+            || octets[0] == 127
+            || (octets[0] == 192 && octets[1] == 168)
+            || (octets[0] == 172 && (16..=31).contains(&octets[1]));
+    }
+    host.parse::<Ipv6Addr>()
+        .is_ok_and(|addr| addr.is_loopback() || addr.is_unique_local())
+}
+
+fn llm_base_url_host(base_url: &str) -> Option<String> {
+    Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
 }
 
 pub(crate) fn scrub_sensitive_text(input: &str) -> String {
