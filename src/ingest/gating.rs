@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use crate::core::config::{
-    Config, EmbeddingClassifierConfig, GatingRuleConfig, IngestGatingConfig,
+    AutoFactCheckConfig, Config, EmbeddingClassifierConfig, GatingRuleConfig, IngestGatingConfig,
 };
+use crate::core::db::{Database, DbError};
 use crate::embed::{EmbedError, Embedder, EmbedderFactory, build_backend_from_name};
+use crate::factcheck::{self, FactIssue};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -86,6 +88,12 @@ impl GatingDecision {
 pub struct Tier2Outcome {
     pub decision: GatingDecision,
     pub vector: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactCheckGateOutcome {
+    pub decision: GatingDecision,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +375,149 @@ pub async fn evaluate_tier2<E: Embedder + ?Sized>(
                 vector: None,
             }
         }
+    }
+}
+
+pub fn evaluate_fact_check_gate(
+    candidate_hash: &str,
+    chunk_text: &str,
+    db: &Database,
+    project_id: Option<&str>,
+    config: &AutoFactCheckConfig,
+) -> Result<Option<FactCheckGateOutcome>, DbError> {
+    if !config.enabled {
+        return Ok(None);
+    }
+
+    let now = match factcheck::resolve_now(None) {
+        Ok(now) => now,
+        Err(error) => {
+            let outcome = fact_check_fail_open_outcome(error.to_string());
+            db.record_gating_audit(
+                candidate_hash,
+                &outcome.decision,
+                project_id,
+                Some(chunk_text),
+            )?;
+            return Ok(Some(outcome));
+        }
+    };
+
+    let report = match factcheck::check(chunk_text, db, now, None) {
+        Ok(report) => report,
+        Err(error) => {
+            let outcome = fact_check_fail_open_outcome(error.to_string());
+            db.record_gating_audit(
+                candidate_hash,
+                &outcome.decision,
+                project_id,
+                Some(chunk_text),
+            )?;
+            return Ok(Some(outcome));
+        }
+    };
+
+    let warnings = report
+        .issues
+        .iter()
+        .map(format_fact_issue_warning)
+        .collect::<Vec<_>>();
+    let decision = fact_check_decision(&report.issues, config);
+    db.record_gating_audit(candidate_hash, &decision, project_id, Some(chunk_text))?;
+    Ok(Some(FactCheckGateOutcome { decision, warnings }))
+}
+
+fn fact_check_decision(issues: &[FactIssue], config: &AutoFactCheckConfig) -> GatingDecision {
+    let rejecting_issue = issues
+        .iter()
+        .find(|issue| fact_issue_rejects(issue, config));
+    if let Some(issue) = rejecting_issue {
+        let label = fact_issue_label(issue).to_string();
+        return GatingDecision {
+            decision: "rejected".to_string(),
+            tier: 3,
+            gating_reason: Some(label.clone()),
+            label: Some(label),
+            score: None,
+            matched_pattern: None,
+        };
+    }
+
+    let label = issues
+        .first()
+        .map(fact_issue_label)
+        .unwrap_or("fact_check.clean")
+        .to_string();
+    GatingDecision {
+        decision: "accepted".to_string(),
+        tier: 3,
+        gating_reason: None,
+        label: Some(label),
+        score: None,
+        matched_pattern: None,
+    }
+}
+
+fn fact_check_fail_open_outcome(error: String) -> FactCheckGateOutcome {
+    FactCheckGateOutcome {
+        decision: GatingDecision {
+            decision: "accepted".to_string(),
+            tier: 3,
+            gating_reason: Some("fact_check.error".to_string()),
+            label: Some("fact_check.error".to_string()),
+            score: None,
+            matched_pattern: None,
+        },
+        warnings: vec![format!("fact_check.error: {error}")],
+    }
+}
+
+fn fact_issue_rejects(issue: &FactIssue, config: &AutoFactCheckConfig) -> bool {
+    match issue {
+        FactIssue::RelationContradiction { .. } => config.reject_on_contradiction,
+        FactIssue::StaleFact { .. } => config.reject_on_stale,
+        FactIssue::SimilarNameConflict { .. } => config.reject_on_similar_name,
+    }
+}
+
+fn fact_issue_label(issue: &FactIssue) -> &'static str {
+    match issue {
+        FactIssue::RelationContradiction { .. } => "fact_check.relation_contradiction",
+        FactIssue::StaleFact { .. } => "fact_check.stale_fact",
+        FactIssue::SimilarNameConflict { .. } => "fact_check.similar_name",
+    }
+}
+
+fn format_fact_issue_warning(issue: &FactIssue) -> String {
+    match issue {
+        FactIssue::SimilarNameConflict {
+            mentioned,
+            known_entity,
+            edit_distance,
+        } => format!(
+            "fact_check.similar_name: mentioned={mentioned} known_entity={known_entity} edit_distance={edit_distance}"
+        ),
+        FactIssue::RelationContradiction {
+            subject,
+            text_claim,
+            kg_fact,
+            triple_id,
+            source_drawer,
+        } => format!(
+            "fact_check.relation_contradiction: subject={subject} text_claim={text_claim} kg_fact={kg_fact} triple_id={triple_id} source_drawer={}",
+            source_drawer.as_deref().unwrap_or("")
+        ),
+        FactIssue::StaleFact {
+            subject,
+            predicate,
+            object,
+            valid_to,
+            triple_id,
+            source_drawer,
+        } => format!(
+            "fact_check.stale_fact: subject={subject} predicate={predicate} object={object} valid_to={valid_to} triple_id={triple_id} source_drawer={}",
+            source_drawer.as_deref().unwrap_or("")
+        ),
     }
 }
 

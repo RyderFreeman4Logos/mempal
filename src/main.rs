@@ -43,7 +43,7 @@ use mempal::ingest::gating::compile_classifier_from_config;
 use mempal::ingest::{
     IngestOptions, IngestStats,
     detect::detect_format,
-    gating::{IngestCandidate, evaluate_tier1, evaluate_tier2},
+    gating::{IngestCandidate, evaluate_fact_check_gate, evaluate_tier1, evaluate_tier2},
     ingest_dir_with_options, ingest_file_with_options,
     normalize::{CURRENT_NORMALIZE_VERSION, NormalizeOptions, normalize_content_with_options},
     reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
@@ -1726,6 +1726,7 @@ async fn ingest_command(
     )
     .context("failed to append ingest audit log")?;
 
+    print_fact_check_warnings(&stats.fact_check_warnings);
     if options.json {
         let output = IngestJsonOutput {
             dry_run: options.dry_run,
@@ -1734,6 +1735,7 @@ async fn ingest_command(
             skipped: stats.skipped,
             dropped_by_gate: stats.dropped_by_gate,
             drawer_ids: &stats.drawer_ids,
+            fact_check_warnings: stats.fact_check_warnings.clone(),
         };
         println!(
             "{}",
@@ -1782,6 +1784,8 @@ struct StdinIngestStatsJson {
     chunks: usize,
     skipped: usize,
     dropped_by_gate: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fact_check_warnings: Vec<String>,
 }
 
 async fn ingest_stdin_command(
@@ -1888,6 +1892,26 @@ async fn ingest_stdin_command(
                 return Ok(());
             }
         }
+
+        if wing != "hooks-raw"
+            && let Some(outcome) = evaluate_fact_check_gate(
+                &drawer_id,
+                &content,
+                db,
+                project_id.as_deref(),
+                &config.ingest_gating.fact_check,
+            )
+            .with_context(|| format!("failed to record fact-check gate audit for {drawer_id}"))?
+        {
+            stats.fact_check_warnings.extend(outcome.warnings);
+            if outcome.decision.is_rejected() {
+                stats.dropped_by_gate = 1;
+                append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
+                    .context("failed to append ingest audit log")?;
+                print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
+                return Ok(());
+            }
+        }
     }
 
     let texts = [content.as_str()];
@@ -1972,6 +1996,7 @@ fn normalize_stdin_content(content: &str, no_strip_noise: bool) -> Result<String
 }
 
 fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> Result<()> {
+    print_fact_check_warnings(&stats.fact_check_warnings);
     if json {
         let output = StdinIngestJsonOutput {
             drawer_ids: &stats.drawer_ids,
@@ -1981,6 +2006,7 @@ fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> 
                 chunks: stats.chunks,
                 skipped: stats.skipped,
                 dropped_by_gate: stats.dropped_by_gate,
+                fact_check_warnings: stats.fact_check_warnings.clone(),
             },
         };
         println!(
@@ -1996,6 +2022,12 @@ fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> 
         dry_run, stats.files, stats.chunks, stats.skipped, stats.dropped_by_gate
     );
     Ok(())
+}
+
+fn print_fact_check_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("{warning}");
+    }
 }
 
 async fn checkpoint_command(
@@ -2291,6 +2323,8 @@ struct IngestJsonOutput<'a> {
     skipped: usize,
     dropped_by_gate: usize,
     drawer_ids: &'a [String],
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fact_check_warnings: Vec<String>,
 }
 
 #[derive(Default)]

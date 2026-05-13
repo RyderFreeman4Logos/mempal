@@ -24,7 +24,10 @@ use crate::embed::{EmbedderFactory, global_embed_status};
 use crate::field_taxonomy::field_taxonomy;
 use crate::ingest::{
     IngestError,
-    gating::{GatingDecision, GatingRuntime, IngestCandidate, evaluate_tier1, evaluate_tier2},
+    gating::{
+        GatingDecision, GatingRuntime, IngestCandidate, evaluate_fact_check_gate, evaluate_tier1,
+        evaluate_tier2,
+    },
     normalize::CURRENT_NORMALIZE_VERSION,
     novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty},
 };
@@ -1771,6 +1774,7 @@ impl MempalMcpServer {
                 near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms: None,
+                fact_check_warnings: Vec::new(),
                 system_warnings: current_system_warnings(),
             }));
         }
@@ -1802,6 +1806,7 @@ impl MempalMcpServer {
                 near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms: None,
+                fact_check_warnings: Vec::new(),
                 system_warnings: current_system_warnings(),
             }));
         }
@@ -1902,6 +1907,7 @@ impl MempalMcpServer {
                 near_drawer_id: None,
                 duplicate_warning: None,
                 lock_wait_ms,
+                fact_check_warnings: Vec::new(),
                 system_warnings: current_system_warnings(),
             }));
         }
@@ -1913,6 +1919,40 @@ impl MempalMcpServer {
                 Some(&candidate.content),
             )
             .map_err(db_error)?;
+        }
+
+        let mut fact_check_warnings = Vec::new();
+        if request.wing != "hooks-raw"
+            && let Some(outcome) = evaluate_fact_check_gate(
+                &drawer_id,
+                &candidate.content,
+                &db,
+                project_id.as_deref(),
+                &config.ingest_gating.fact_check,
+            )
+            .map_err(db_error)?
+        {
+            fact_check_warnings = outcome.warnings;
+            gating_decision = Some(outcome.decision);
+            if gating_decision
+                .as_ref()
+                .is_some_and(GatingDecision::is_rejected)
+            {
+                drop(lock_guard);
+                return Ok(Json(IngestResponse {
+                    drawer_id,
+                    drawer_ids: Vec::new(),
+                    chunk_count: 0,
+                    dropped: true,
+                    gating_decision,
+                    novelty_action: None,
+                    near_drawer_id: None,
+                    duplicate_warning: None,
+                    lock_wait_ms,
+                    fact_check_warnings,
+                    system_warnings: current_system_warnings(),
+                }));
+            }
         }
 
         let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();
@@ -2323,6 +2363,7 @@ impl MempalMcpServer {
             near_drawer_id,
             duplicate_warning,
             lock_wait_ms,
+            fact_check_warnings,
             system_warnings: current_system_warnings(),
         }))
     }

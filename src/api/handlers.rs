@@ -7,6 +7,7 @@ use crate::core::{
     },
     utils::{build_bootstrap_evidence_drawer_id, iso_timestamp, source_file_or_synthetic},
 };
+use crate::ingest::gating::evaluate_fact_check_gate;
 use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use crate::search::{resolve_route, search_with_vector};
 use axum::{
@@ -87,6 +88,10 @@ struct IngestResponse {
     drawer_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     chunk_count: usize,
+    #[serde(default)]
+    dropped: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fact_check_warnings: Vec<String>,
 }
 
 fn is_zero(v: &usize) -> bool {
@@ -207,10 +212,53 @@ async fn ingest_handler(
         ));
     }
 
-    // Embed all chunks in one batch call.
-    let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();
+    let mut accepted_chunks: Vec<(usize, &String, String)> = Vec::with_capacity(chunks.len());
+    let mut fact_check_warnings = Vec::new();
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        let drawer_id = build_bootstrap_evidence_drawer_id(
+            &request.wing,
+            request.room.as_deref(),
+            chunk,
+            &SourceType::Manual,
+        );
+        if request.wing != "hooks-raw"
+            && let Some(outcome) = evaluate_fact_check_gate(
+                &drawer_id,
+                chunk,
+                &db,
+                project_id.as_deref(),
+                &config.ingest_gating.fact_check,
+            )
+            .map_err(internal_error)?
+        {
+            fact_check_warnings.extend(outcome.warnings);
+            if outcome.decision.is_rejected() {
+                continue;
+            }
+        }
+        accepted_chunks.push((chunk_idx, chunk, drawer_id));
+    }
+
+    if accepted_chunks.is_empty() {
+        return Ok((
+            StatusCode::CREATED,
+            Json(IngestResponse {
+                drawer_id: String::new(),
+                drawer_ids: Vec::new(),
+                chunk_count: 0,
+                dropped: true,
+                fact_check_warnings,
+            }),
+        ));
+    }
+
+    // Embed all accepted chunks in one batch call.
+    let chunk_refs: Vec<&str> = accepted_chunks
+        .iter()
+        .map(|(_, chunk, _)| chunk.as_str())
+        .collect();
     let vectors = embedder.embed(&chunk_refs).await.map_err(internal_error)?;
-    if vectors.len() != chunks.len() {
+    if vectors.len() != accepted_chunks.len() {
         return Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "embedder returned wrong number of vectors",
@@ -218,27 +266,23 @@ async fn ingest_handler(
     }
 
     // Insert each chunk as a separate drawer.
-    let mut drawer_ids: Vec<String> = Vec::with_capacity(chunks.len());
-    for (chunk_idx, (chunk, vector)) in chunks.iter().zip(vectors.iter()).enumerate() {
-        let drawer_id = build_bootstrap_evidence_drawer_id(
-            &request.wing,
-            request.room.as_deref(),
-            chunk,
-            &SourceType::Manual,
-        );
-        let drawer_exists = db.drawer_exists(&drawer_id).map_err(internal_error)?;
+    let mut drawer_ids: Vec<String> = Vec::with_capacity(accepted_chunks.len());
+    for ((chunk_idx, chunk, drawer_id), vector) in accepted_chunks.iter().zip(vectors.iter()) {
+        let drawer_exists = db
+            .drawer_exists(drawer_id.as_str())
+            .map_err(internal_error)?;
 
         if !drawer_exists {
-            let source_file = source_file_or_synthetic(&drawer_id, request.source.as_deref());
+            let source_file = source_file_or_synthetic(drawer_id, request.source.as_deref());
             let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
                 id: drawer_id.clone(),
-                content: chunk.clone(),
+                content: chunk.to_string(),
                 wing: request.wing.clone(),
                 room: request.room.clone(),
                 source_file: Some(source_file),
                 source_type: SourceType::Manual,
                 added_at: iso_timestamp(),
-                chunk_index: Some(chunk_idx as i64),
+                chunk_index: Some(*chunk_idx as i64),
                 importance: 0,
             });
             let drawer = Drawer {
@@ -247,20 +291,22 @@ async fn ingest_handler(
             };
             db.insert_drawer_with_project(&drawer, project_id.as_deref())
                 .map_err(internal_error)?;
-            db.insert_vector_with_project(&drawer_id, vector, project_id.as_deref())
+            db.insert_vector_with_project(drawer_id, vector, project_id.as_deref())
                 .map_err(internal_error)?;
         }
-        drawer_ids.push(drawer_id);
+        drawer_ids.push(drawer_id.clone());
     }
 
     let primary_drawer_id = drawer_ids.first().cloned().unwrap_or_default();
-    let chunk_count = chunks.len();
+    let chunk_count = drawer_ids.len();
     Ok((
         StatusCode::CREATED,
         Json(IngestResponse {
             drawer_id: primary_drawer_id,
             drawer_ids,
             chunk_count,
+            dropped: false,
+            fact_check_warnings,
         }),
     ))
 }
