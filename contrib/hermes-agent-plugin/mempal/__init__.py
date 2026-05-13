@@ -100,15 +100,27 @@ class MempalMemoryProvider:
 
     def __init__(self):
         self._base_url = "http://127.0.0.1:3080"
+        self._session_id = ""
+        self._hermes_home = ""
         self._user_id = "hermes-user"
-        self._wing = "hermes-user/hermes-user"
+        self._profile = "default"
+        self._platform = "cli"
+        self._chat_id = ""
+        self._thread_id = ""
+        self._wing = "hermes-user/hermes-user/default"
+        self._turns_room = "turns"
+        self._facts_room = "facts"
+        self._project_id: Optional[str] = None
         self._prefetch_result = ""
+        self._prefetch_results: Dict[str, str] = {}
+        self._prefetch_generation = 0
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
+        self._session_end_thread: Optional[threading.Thread] = None
+        self._mirror_thread: Optional[threading.Thread] = None
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
-        self._hermes_home = ""
 
     @property
     def name(self) -> str:
@@ -126,12 +138,92 @@ class MempalMemoryProvider:
             return False
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        self._hermes_home = kwargs.get("hermes_home", "")
+        self._configure_scope(session_id, kwargs, preserve_existing=False)
+
+    def _configure_scope(
+        self,
+        session_id: str,
+        context: Dict[str, Any],
+        *,
+        preserve_existing: bool,
+    ) -> None:
+        self._session_id = session_id
+        if "hermes_home" in context or not preserve_existing:
+            self._hermes_home = str(context.get("hermes_home", ""))
+
         cfg = _load_config(self._hermes_home)
         self._base_url = cfg["base_url"].rstrip("/")
-        user_id = kwargs.get("user_id") or cfg.get("user_id", "hermes-user")
+
+        user_id = context.get("user_id") or (
+            self._user_id if preserve_existing else cfg.get("user_id", "hermes-user")
+        )
+        profile = (
+            context.get("agent_identity")
+            or context.get("profile")
+            or (self._profile if preserve_existing else "default")
+        )
+        platform = context.get("platform") or (self._platform if preserve_existing else "cli")
+
+        if "chat_id" in context:
+            chat_id = str(context.get("chat_id") or "")
+        else:
+            chat_id = self._chat_id if preserve_existing else ""
+        if "thread_id" in context:
+            thread_id = str(context.get("thread_id") or "")
+        else:
+            thread_id = self._thread_id if preserve_existing else ""
+
+        if "project_id" in context or "cwd" in context:
+            project_id = context.get("project_id") or ""
+            if not project_id:
+                cwd = str(context.get("cwd") or "")
+                project_id = os.path.basename(cwd.rstrip("/")) if cwd else ""
+        else:
+            project_id = self._project_id if preserve_existing else ""
+
         self._user_id = user_id
-        self._wing = f"hermes-user/{user_id}"
+        self._profile = str(profile)
+        self._platform = str(platform)
+        self._chat_id = chat_id
+        self._thread_id = thread_id
+        self._wing = f"hermes-user/{user_id}/{self._profile}"
+        self._turns_room = self._derive_turns_room(self._platform, chat_id, thread_id)
+        self._facts_room = "facts"
+        self._project_id = str(project_id) if project_id else None
+
+    @staticmethod
+    def _derive_turns_room(platform: str, chat_id: str, thread_id: str) -> str:
+        if not chat_id:
+            return "turns"
+        if thread_id:
+            return f"turns/{platform}/{chat_id}/{thread_id}"
+        return f"turns/{platform}/{chat_id}"
+
+    def _session_key(self, session_id: str = "") -> str:
+        return session_id or self._session_id
+
+    def _with_project_id(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        scoped = dict(payload)
+        if self._project_id:
+            scoped["project_id"] = self._project_id
+        return scoped
+
+    def _session_room(self) -> str:
+        if self._session_id:
+            return f"sessions/{self._session_id}"
+        return "sessions"
+
+    def _memory_room_for_target(self, target: str) -> str:
+        normalized = (target or "").strip().lower()
+        if normalized in {"fact", "facts", "profile", "user", "global"}:
+            return self._facts_room
+        if normalized in {"turn", "turns", "conversation"}:
+            return self._turns_room
+        if normalized in {"session", "sessions"}:
+            return self._session_room()
+        if normalized:
+            return f"memory-mirror/{normalized.replace('/', '_')}"
+        return "memory-mirror"
 
     def _turn_storage_mode(self) -> str:
         try:
@@ -202,7 +294,8 @@ class MempalMemoryProvider:
     def system_prompt_block(self) -> str:
         return (
             "# Mempal Memory\n"
-            f"Active. User: {self._user_id}. Local BM25+vector backend, zero cloud.\n"
+            f"Active. User: {self._user_id}. Profile: {self._profile}. "
+            "Local BM25+vector backend, zero cloud.\n"
             "Use mempal_search to recall facts, mempal_conclude to store, "
             "mempal_profile for recent overview."
         )
@@ -210,8 +303,11 @@ class MempalMemoryProvider:
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
+        key = self._session_key(session_id)
         with self._prefetch_lock:
-            result = self._prefetch_result
+            result = self._prefetch_results.pop(key, "")
+            if not result and key == self._session_id:
+                result = self._prefetch_result
             self._prefetch_result = ""
         if not result:
             return ""
@@ -220,22 +316,27 @@ class MempalMemoryProvider:
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._is_breaker_open():
             return
+        key = self._session_key(session_id)
+        wing = self._wing
+        generation = self._prefetch_generation
+        params = self._with_project_id({
+            "q": query,
+            "wing": wing,
+            "top_k": 5,
+            "include_raw_turns": False,
+        })
 
         def _run():
             try:
-                results = self._get(
-                    "/api/search",
-                    {
-                        "q": query,
-                        "wing": self._wing,
-                        "top_k": 5,
-                        "include_raw_turns": False,
-                    },
-                )
+                results = self._get("/api/search", params)
                 if results:
                     lines = [r.get("content", "") for r in results if r.get("content")]
                     with self._prefetch_lock:
-                        self._prefetch_result = "\n".join(f"- {l}" for l in lines)
+                        if generation == self._prefetch_generation:
+                            result = "\n".join(f"- {l}" for l in lines)
+                            self._prefetch_results[key] = result
+                            if key == self._session_id:
+                                self._prefetch_result = result
                 self._record_success()
             except Exception as exc:
                 self._record_failure()
@@ -256,17 +357,15 @@ class MempalMemoryProvider:
             return
 
         content = f"User: {user_content}\nAssistant: {assistant_content}"
+        body = self._with_project_id({
+            "content": content,
+            "wing": self._wing,
+            "room": self._turns_room,
+        })
 
         def _sync():
             try:
-                self._post(
-                    "/api/ingest",
-                    {
-                        "content": content,
-                        "wing": self._wing,
-                        "room": "turns",
-                    },
-                )
+                self._post("/api/ingest", body)
                 self._record_success()
             except Exception as exc:
                 self._record_failure()
@@ -301,7 +400,11 @@ class MempalMemoryProvider:
                     limit = 20
                 entries = self._get(
                     "/api/timeline",
-                    {"wing": self._wing, "limit": limit, "include_raw_turns": False},
+                    self._with_project_id({
+                        "wing": self._wing,
+                        "limit": limit,
+                        "include_raw_turns": False,
+                    }),
                 )
                 self._record_success()
                 if not entries:
@@ -323,12 +426,12 @@ class MempalMemoryProvider:
             try:
                 results = self._get(
                     "/api/search",
-                    {
+                    self._with_project_id({
                         "q": query,
                         "wing": self._wing,
                         "top_k": top_k,
                         "include_raw_turns": False,
-                    },
+                    }),
                 )
                 self._record_success()
                 if not results:
@@ -349,11 +452,11 @@ class MempalMemoryProvider:
             try:
                 self._post(
                     "/api/ingest",
-                    {
+                    self._with_project_id({
                         "content": conclusion,
                         "wing": self._wing,
-                        "room": "facts",
-                    },
+                        "room": self._facts_room,
+                    }),
                 )
                 self._record_success()
                 return json.dumps({"result": "Fact stored."})
@@ -375,23 +478,24 @@ class MempalMemoryProvider:
         if not assistant_msgs:
             return
         summary = assistant_msgs[-1][:2000]
+        body = self._with_project_id({
+            "content": f"[Session summary] {summary}",
+            "wing": self._wing,
+            "room": self._session_room(),
+        })
 
         def _ingest():
             try:
-                self._post(
-                    "/api/ingest",
-                    {
-                        "content": f"[Session summary] {summary}",
-                        "wing": self._wing,
-                        "room": "sessions",
-                    },
-                )
+                self._post("/api/ingest", body)
                 self._record_success()
             except Exception as exc:
                 self._record_failure()
                 logger.warning("mempal on_session_end failed: %s", exc)
 
-        threading.Thread(target=_ingest, daemon=True, name="mempal-session-end").start()
+        self._session_end_thread = threading.Thread(
+            target=_ingest, daemon=True, name="mempal-session-end"
+        )
+        self._session_end_thread.start()
 
     def on_memory_write(
         self,
@@ -403,26 +507,46 @@ class MempalMemoryProvider:
         """Mirror built-in memory writes to mempal."""
         if self._is_breaker_open() or action == "remove":
             return
+        body = self._with_project_id({
+            "content": content,
+            "wing": self._wing,
+            "room": self._memory_room_for_target(target),
+        })
 
         def _mirror():
             try:
-                self._post(
-                    "/api/ingest",
-                    {
-                        "content": content,
-                        "wing": self._wing,
-                        "room": "memory-mirror",
-                    },
-                )
+                self._post("/api/ingest", body)
                 self._record_success()
             except Exception as exc:
                 self._record_failure()
                 logger.debug("mempal on_memory_write failed: %s", exc)
 
-        threading.Thread(target=_mirror, daemon=True, name="mempal-mirror").start()
+        self._mirror_thread = threading.Thread(
+            target=_mirror, daemon=True, name="mempal-mirror"
+        )
+        self._mirror_thread.start()
+
+    def on_session_switch(self, new_session_id: str, reason: str = "", **kwargs) -> None:
+        """Handle reset/new/resume/branch/compression continuation events."""
+        del reason
+        with self._prefetch_lock:
+            self._prefetch_result = ""
+            self._prefetch_results.clear()
+            self._prefetch_generation += 1
+
+        for thread in (self._sync_thread, self._session_end_thread, self._mirror_thread):
+            if thread and thread.is_alive():
+                thread.join(timeout=5.0)
+
+        self._configure_scope(new_session_id, kwargs, preserve_existing=True)
 
     def shutdown(self) -> None:
-        for t in (self._prefetch_thread, self._sync_thread):
+        for t in (
+            self._prefetch_thread,
+            self._sync_thread,
+            self._session_end_thread,
+            self._mirror_thread,
+        ):
             if t and t.is_alive():
                 t.join(timeout=5.0)
 
