@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::state::ApiState;
+use crate::core::config::ConfigHandle;
 use crate::core::db::Database;
+use crate::core::project::resolve_project_id;
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -39,6 +41,7 @@ struct TimelineEntry {
 #[derive(Debug, Deserialize)]
 struct DeleteRequest {
     drawer_id: String,
+    project_id: Option<String>,
 }
 
 async fn timeline_handler(
@@ -46,12 +49,15 @@ async fn timeline_handler(
     Query(query): Query<TimelineQuery>,
 ) -> Result<Json<Vec<TimelineEntry>>, HermesError> {
     let db = Database::open(&state.db_path).map_err(hermes_internal)?;
+    let config = ConfigHandle::current();
+    let project_id = resolve_project_id(query.project_id.as_deref(), config.as_ref(), None)
+        .map_err(hermes_internal)?;
     let limit = query.limit.unwrap_or(50).min(500);
     let drawers = db
         .timeline_drawers(
             query.wing.as_deref(),
             query.room.as_deref(),
-            query.project_id.as_deref(),
+            project_id.as_deref(),
             limit,
         )
         .map_err(hermes_internal)?;
@@ -76,6 +82,20 @@ async fn delete_handler(
     Json(request): Json<DeleteRequest>,
 ) -> Result<impl IntoResponse, HermesError> {
     let db = Database::open(&state.db_path).map_err(hermes_internal)?;
+    let config = ConfigHandle::current();
+    let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
+        .map_err(hermes_internal)?;
+    if let Some(ref pid) = project_id {
+        let drawer_project = db
+            .drawer_project_id(&request.drawer_id)
+            .map_err(hermes_internal)?;
+        if drawer_project.as_deref() != Some(pid.as_str()) {
+            return Err(HermesError {
+                status: StatusCode::FORBIDDEN,
+                message: format!("drawer '{}' belongs to another project", request.drawer_id),
+            });
+        }
+    }
     let deleted = db
         .soft_delete_drawer(&request.drawer_id)
         .map_err(hermes_internal)?;
