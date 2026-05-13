@@ -79,6 +79,9 @@ const DEFAULT_CONSOLIDATION_SIMILARITY_THRESHOLD: f64 = 0.85;
 const DEFAULT_CONSOLIDATION_MIN_CLUSTER_SIZE: usize = 3;
 const DEFAULT_CONSOLIDATION_MAX_CLUSTERS_PER_RUN: usize = 100;
 const DEFAULT_CONSOLIDATION_STRATEGY: &str = "richest_content";
+const DEFAULT_CRYSTALLIZE_MIN_CLUSTER_SIZE: usize = 5;
+const DEFAULT_CRYSTALLIZE_READINESS_THRESHOLD: f64 = 5.0;
+const DEFAULT_CRYSTALLIZE_MAX_CANDIDATES_PER_RUN: usize = 20;
 const DEFAULT_SLEEP_NREM_PRUNE_MIN_AGE_DAYS: u64 = 30;
 const DEFAULT_SLEEP_NREM_PRUNE_MAX_IMPORTANCE: i32 = 1;
 const DEFAULT_SLEEP_NREM_COMPACTION_THRESHOLD: f64 = 0.85;
@@ -113,6 +116,7 @@ pub struct Config {
     pub repair: RepairConfig,
     pub skills: SkillsConfig,
     pub consolidation: ConsolidationConfig,
+    pub crystallize: CrystallizeConfig,
     pub sleep: SleepConfig,
 }
 
@@ -141,6 +145,7 @@ impl Default for Config {
             repair: RepairConfig::default(),
             skills: SkillsConfig::default(),
             consolidation: ConsolidationConfig::default(),
+            crystallize: CrystallizeConfig::default(),
             sleep: SleepConfig::default(),
         }
     }
@@ -321,6 +326,23 @@ impl Config {
                     "unsupported consolidation.strategy: {other}"
                 )));
             }
+        }
+        if self.crystallize.min_cluster_size < 2 {
+            return Err(ConfigError::InvalidConfig(
+                "crystallize.min_cluster_size must be at least 2".to_string(),
+            ));
+        }
+        if !self.crystallize.readiness_threshold.is_finite()
+            || self.crystallize.readiness_threshold < 0.0
+        {
+            return Err(ConfigError::InvalidConfig(
+                "crystallize.readiness_threshold must be a finite value >= 0.0".to_string(),
+            ));
+        }
+        if self.crystallize.max_candidates_per_run == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "crystallize.max_candidates_per_run must be greater than 0".to_string(),
+            ));
         }
         if self.sleep.nrem_prune_min_age_days == 0 {
             return Err(ConfigError::InvalidConfig(
@@ -1764,6 +1786,28 @@ impl Default for ConsolidationConfig {
             min_cluster_size: DEFAULT_CONSOLIDATION_MIN_CLUSTER_SIZE,
             max_clusters_per_run: DEFAULT_CONSOLIDATION_MAX_CLUSTERS_PER_RUN,
             strategy: DEFAULT_CONSOLIDATION_STRATEGY.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CrystallizeConfig {
+    pub enabled: bool,
+    pub min_cluster_size: usize,
+    pub readiness_threshold: f64,
+    pub auto_approve: bool,
+    pub max_candidates_per_run: usize,
+}
+
+impl Default for CrystallizeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_cluster_size: DEFAULT_CRYSTALLIZE_MIN_CLUSTER_SIZE,
+            readiness_threshold: DEFAULT_CRYSTALLIZE_READINESS_THRESHOLD,
+            auto_approve: false,
+            max_candidates_per_run: DEFAULT_CRYSTALLIZE_MAX_CANDIDATES_PER_RUN,
         }
     }
 }

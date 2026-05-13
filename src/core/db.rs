@@ -39,7 +39,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 14;
+const CURRENT_SCHEMA_VERSION: u32 = 15;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -1958,10 +1958,13 @@ impl Database {
                 parent_anchor_id,
                 scope_constraints,
                 trigger_hints,
+                auto_generated,
+                crystallization_score,
+                source_drawer_ids,
                 created_at,
                 updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             "#,
             params![
                 card.id.as_str(),
@@ -1976,6 +1979,9 @@ impl Database {
                 card.parent_anchor_id.as_deref(),
                 card.scope_constraints.as_deref(),
                 encode_optional_json(card.trigger_hints.as_ref())?,
+                card.auto_generated,
+                card.crystallization_score,
+                serde_json::to_string(&card.source_drawer_ids)?,
                 card.created_at.as_str(),
                 card.updated_at.as_str(),
             ],
@@ -1999,6 +2005,9 @@ impl Database {
                 parent_anchor_id,
                 scope_constraints,
                 trigger_hints,
+                auto_generated,
+                crystallization_score,
+                source_drawer_ids,
                 created_at,
                 updated_at
             FROM knowledge_cards
@@ -2023,6 +2032,12 @@ impl Database {
         let status = filter.status.as_ref().map(knowledge_status_as_str);
         let domain = filter.domain.as_ref().map(memory_domain_as_str);
         let anchor_kind = filter.anchor_kind.as_ref().map(anchor_kind_as_str);
+        let auto_generated = filter
+            .auto_generated
+            .map(|value| if value { 1_i64 } else { 0_i64 });
+        let pending_review = filter
+            .pending_review
+            .map(|value| if value { 1_i64 } else { 0_i64 });
 
         let mut statement = self.conn.prepare(
             r#"
@@ -2039,6 +2054,9 @@ impl Database {
                 parent_anchor_id,
                 scope_constraints,
                 trigger_hints,
+                auto_generated,
+                crystallization_score,
+                source_drawer_ids,
                 created_at,
                 updated_at
             FROM knowledge_cards
@@ -2048,6 +2066,8 @@ impl Database {
               AND (?4 IS NULL OR field = ?4)
               AND (?5 IS NULL OR anchor_kind = ?5)
               AND (?6 IS NULL OR anchor_id = ?6)
+              AND (?7 IS NULL OR auto_generated = ?7)
+              AND (?8 IS NULL OR (?8 = 1 AND status = 'pending_review') OR (?8 = 0 AND status != 'pending_review'))
             ORDER BY tier, status, id
             "#,
         )?;
@@ -2060,6 +2080,8 @@ impl Database {
                     filter.field.as_deref(),
                     anchor_kind,
                     filter.anchor_id.as_deref(),
+                    auto_generated,
+                    pending_review,
                 ],
                 |row| knowledge_card_from_row(row).map_err(row_decode_error),
             )?
@@ -2070,6 +2092,26 @@ impl Database {
     pub fn knowledge_card_count(&self) -> Result<i64, DbError> {
         self.conn
             .query_row("SELECT COUNT(*) FROM knowledge_cards", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    pub fn pending_auto_generated_knowledge_card_count(&self) -> Result<i64, DbError> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_cards WHERE auto_generated = 1 AND status = 'pending_review'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn last_crystallization_at(&self) -> Result<Option<String>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT MAX(created_at) FROM knowledge_cards WHERE auto_generated = 1",
+                [],
+                |row| row.get(0),
+            )
             .map_err(Into::into)
     }
 
@@ -2209,7 +2251,10 @@ impl Database {
                 parent_anchor_id = ?10,
                 scope_constraints = ?11,
                 trigger_hints = ?12,
-                updated_at = ?13
+                auto_generated = ?13,
+                crystallization_score = ?14,
+                source_drawer_ids = ?15,
+                updated_at = ?16
             WHERE id = ?1
             "#,
             params![
@@ -2225,6 +2270,9 @@ impl Database {
                 card.parent_anchor_id.as_deref(),
                 card.scope_constraints.as_deref(),
                 encode_optional_json(card.trigger_hints.as_ref())?,
+                card.auto_generated,
+                card.crystallization_score,
+                serde_json::to_string(&card.source_drawer_ids)?,
                 card.updated_at.as_str(),
             ],
         )?;
@@ -3759,6 +3807,10 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             ensure_v14_sleep_schema(conn, read_user_version(conn)?)?;
             continue;
         }
+        if migration.version == 15 {
+            ensure_v15_crystallize_schema(conn, read_user_version(conn)?)?;
+            continue;
+        }
         apply_migration_atomic(conn, migration)?;
     }
 
@@ -3776,6 +3828,9 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     }
     if read_user_version(conn)? >= 14 {
         ensure_v14_sleep_schema(conn, read_user_version(conn)?)?;
+    }
+    if read_user_version(conn)? >= 15 {
+        ensure_v15_crystallize_schema(conn, read_user_version(conn)?)?;
     }
 
     Ok(())
@@ -3985,6 +4040,54 @@ fn ensure_v14_sleep_schema(conn: &Connection, current_version: u32) -> Result<()
     Ok(())
 }
 
+fn ensure_v15_crystallize_schema(conn: &Connection, current_version: u32) -> Result<(), DbError> {
+    if !table_exists_conn(conn, "knowledge_cards")? {
+        if current_version < 15 {
+            set_user_version(conn, 15)?;
+        }
+        return Ok(());
+    }
+
+    let existing_columns = table_column_names(conn, "knowledge_cards")?;
+    let missing_auto_generated = !existing_columns.contains("auto_generated");
+    let missing_crystallization_score = !existing_columns.contains("crystallization_score");
+    let missing_source_drawer_ids = !existing_columns.contains("source_drawer_ids");
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(error) = (|| -> Result<(), DbError> {
+        if missing_auto_generated {
+            conn.execute_batch(
+                "ALTER TABLE knowledge_cards ADD COLUMN auto_generated INTEGER NOT NULL DEFAULT 0 CHECK(auto_generated IN (0, 1));",
+            )?;
+        }
+        if missing_crystallization_score {
+            conn.execute_batch(
+                "ALTER TABLE knowledge_cards ADD COLUMN crystallization_score REAL;",
+            )?;
+        }
+        if missing_source_drawer_ids {
+            conn.execute_batch(
+                "ALTER TABLE knowledge_cards ADD COLUMN source_drawer_ids TEXT NOT NULL DEFAULT '[]';",
+            )?;
+        }
+        let rewrote_status_check = rewrite_knowledge_cards_status_check(conn)?;
+        conn.execute_batch(V15_CRYSTALLIZE_SCHEMA_SQL)?;
+        if rewrote_status_check {
+            bump_sqlite_schema_version(conn)?;
+        }
+        if current_version < 15 {
+            set_user_version(conn, 15)?;
+        }
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
+    })() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+
+    Ok(())
+}
+
 fn rewrite_drawers_source_type_check(conn: &Connection) -> Result<bool, DbError> {
     let table_sql = conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drawers'",
@@ -4081,6 +4184,44 @@ fn rewrite_drawers_typed_ingest_checks(conn: &Connection) -> Result<bool, DbErro
     Ok(true)
 }
 
+fn rewrite_knowledge_cards_status_check(conn: &Connection) -> Result<bool, DbError> {
+    let table_sql = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_cards'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    if table_sql.contains("pending_review") {
+        return Ok(false);
+    }
+
+    let replacements = [
+        (
+            "status TEXT NOT NULL CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+            "status TEXT NOT NULL CHECK(status IN ('pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        ),
+        (
+            "status TEXT NOT NULL CHECK(status IN ('candidate','promoted','canonical','demoted','retired'))",
+            "status TEXT NOT NULL CHECK(status IN ('pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        ),
+    ];
+    let mut new_sql = table_sql.clone();
+    for (old, new) in replacements {
+        new_sql = new_sql.replace(old, new);
+    }
+    if new_sql == table_sql {
+        return Ok(false);
+    }
+
+    conn.execute_batch("PRAGMA writable_schema = ON;")?;
+    let update_result = conn.execute(
+        "UPDATE sqlite_master SET sql = ?1 WHERE type = 'table' AND name = 'knowledge_cards'",
+        [new_sql],
+    );
+    conn.execute_batch("PRAGMA writable_schema = OFF;")?;
+    update_result?;
+    Ok(true)
+}
+
 fn bump_sqlite_schema_version(conn: &Connection) -> Result<(), DbError> {
     let schema_version = conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, u32>(0))?;
     conn.execute_batch(&format!(
@@ -4100,7 +4241,11 @@ fn drawers_column_exists(conn: &Connection, column: &str) -> Result<bool, DbErro
 }
 
 fn drawers_column_names(conn: &Connection) -> Result<HashSet<String>, DbError> {
-    let mut stmt = conn.prepare("PRAGMA table_info(drawers)")?;
+    table_column_names(conn, "drawers")
+}
+
+fn table_column_names(conn: &Connection, table_name: &str) -> Result<HashSet<String>, DbError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
     let columns = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<HashSet<_>, _>>()?;
@@ -4619,6 +4764,7 @@ const V11_MIGRATION_SQL: &str = "";
 const V12_MIGRATION_SQL: &str = "";
 const V13_MIGRATION_SQL: &str = "";
 const V14_MIGRATION_SQL: &str = "";
+const V15_MIGRATION_SQL: &str = "";
 const V12_COMPACTION_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
     ON drawers(compacted_into)
@@ -4695,6 +4841,11 @@ CREATE INDEX IF NOT EXISTS idx_sleep_resolution_log_created_at
     ON sleep_resolution_log(created_at);
 "#;
 
+const V15_CRYSTALLIZE_SCHEMA_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_knowledge_cards_auto_pending
+    ON knowledge_cards(auto_generated, status, created_at);
+"#;
+
 fn migrations() -> &'static [Migration] {
     static MIGRATIONS: &[Migration] = &[
         Migration {
@@ -4752,6 +4903,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 14,
             sql: V14_MIGRATION_SQL,
+        },
+        Migration {
+            version: 15,
+            sql: V15_MIGRATION_SQL,
         },
     ];
     MIGRATIONS
@@ -4905,6 +5060,7 @@ fn knowledge_status_as_str(status: &KnowledgeStatus) -> &'static str {
     match status {
         KnowledgeStatus::Active => "active",
         KnowledgeStatus::Superseded => "superseded",
+        KnowledgeStatus::PendingReview => "pending_review",
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
@@ -4917,6 +5073,7 @@ fn knowledge_status_from_str(status: &str) -> Result<KnowledgeStatus, DbError> {
     match status {
         "active" => Ok(KnowledgeStatus::Active),
         "superseded" => Ok(KnowledgeStatus::Superseded),
+        "pending_review" => Ok(KnowledgeStatus::PendingReview),
         "candidate" => Ok(KnowledgeStatus::Candidate),
         "promoted" => Ok(KnowledgeStatus::Promoted),
         "canonical" => Ok(KnowledgeStatus::Canonical),
@@ -5067,6 +5224,8 @@ fn knowledge_card_from_row(row: &Row<'_>) -> Result<KnowledgeCard, DbError> {
     let domain = memory_domain_from_str(&row.get::<_, String>(5)?)?;
     let anchor_kind = anchor_kind_from_str(&row.get::<_, String>(7)?)?;
     let trigger_hints = parse_optional_json(row.get::<_, Option<String>>(11)?.as_deref())?;
+    let source_drawer_ids =
+        serde_json::from_str::<Vec<String>>(row.get::<_, String>(14)?.as_str())?;
 
     anchor::validate_anchor_domain(&domain, &anchor_kind)
         .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
@@ -5084,8 +5243,11 @@ fn knowledge_card_from_row(row: &Row<'_>) -> Result<KnowledgeCard, DbError> {
         parent_anchor_id: row.get(9)?,
         scope_constraints: row.get(10)?,
         trigger_hints,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        auto_generated: row.get::<_, i64>(12)? != 0,
+        crystallization_score: row.get(13)?,
+        source_drawer_ids,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
 }
 

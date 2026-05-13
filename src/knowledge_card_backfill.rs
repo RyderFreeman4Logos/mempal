@@ -239,6 +239,9 @@ fn create_card_and_event(db: &Database, drawer: &Drawer, card_id: &str) -> Resul
         parent_anchor_id: drawer.parent_anchor_id.clone(),
         scope_constraints: drawer.scope_constraints.clone(),
         trigger_hints: drawer.trigger_hints.clone(),
+        auto_generated: false,
+        crystallization_score: None,
+        source_drawer_ids: Vec::new(),
         created_at: now.clone(),
         updated_at: now.clone(),
     };
@@ -373,6 +376,7 @@ fn knowledge_status_slug(value: &crate::core::types::KnowledgeStatus) -> &'stati
     match value {
         crate::core::types::KnowledgeStatus::Active => "active",
         crate::core::types::KnowledgeStatus::Superseded => "superseded",
+        crate::core::types::KnowledgeStatus::PendingReview => "pending_review",
         crate::core::types::KnowledgeStatus::Candidate => "candidate",
         crate::core::types::KnowledgeStatus::Promoted => "promoted",
         crate::core::types::KnowledgeStatus::Canonical => "canonical",

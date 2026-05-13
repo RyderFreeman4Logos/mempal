@@ -7,6 +7,7 @@ pub mod bootstrap_events;
 pub mod context;
 pub mod core;
 pub mod cowork;
+pub mod crystallize;
 pub mod daemon;
 pub mod daemon_bootstrap;
 pub mod embed;

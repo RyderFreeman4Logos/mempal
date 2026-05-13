@@ -155,6 +155,7 @@ pub enum KnowledgeTier {
 pub enum KnowledgeStatus {
     Active,
     Superseded,
+    PendingReview,
     Candidate,
     Promoted,
     Canonical,
@@ -312,7 +313,7 @@ pub struct RuntimeAdoptionFilter {
     pub feature: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeCard {
     pub id: String,
     pub statement: String,
@@ -326,6 +327,9 @@ pub struct KnowledgeCard {
     pub parent_anchor_id: Option<String>,
     pub scope_constraints: Option<String>,
     pub trigger_hints: Option<TriggerHints>,
+    pub auto_generated: bool,
+    pub crystallization_score: Option<f64>,
+    pub source_drawer_ids: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -338,6 +342,8 @@ pub struct KnowledgeCardFilter {
     pub field: Option<String>,
     pub anchor_kind: Option<AnchorKind>,
     pub anchor_id: Option<String>,
+    pub auto_generated: Option<bool>,
+    pub pending_review: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

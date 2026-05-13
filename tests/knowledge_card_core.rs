@@ -32,6 +32,9 @@ fn card(id: &str) -> KnowledgeCard {
             workflow_bias: vec!["test-first".to_string()],
             tool_needs: vec!["cargo".to_string()],
         }),
+        auto_generated: false,
+        crystallization_score: None,
+        source_drawer_ids: Vec::new(),
         created_at: "1710000000".to_string(),
         updated_at: "1710000000".to_string(),
     }
@@ -143,10 +146,18 @@ fn test_knowledge_card_list_filters() {
     global_card.anchor_kind = AnchorKind::Global;
     global_card.anchor_id = "global://all".to_string();
 
+    let mut auto_card = card("card_auto_pending");
+    auto_card.status = KnowledgeStatus::PendingReview;
+    auto_card.auto_generated = true;
+    auto_card.crystallization_score = Some(6.25);
+    auto_card.source_drawer_ids = vec!["drawer_auto_1".to_string()];
+
     db.insert_knowledge_card(&rust_card)
         .expect("insert rust card");
     db.insert_knowledge_card(&global_card)
         .expect("insert global card");
+    db.insert_knowledge_card(&auto_card)
+        .expect("insert auto card");
 
     let by_tier = db
         .list_knowledge_cards(&KnowledgeCardFilter {
@@ -166,6 +177,26 @@ fn test_knowledge_card_list_filters() {
         })
         .expect("list by field");
     assert_eq!(by_field, vec![rust_card]);
+
+    let pending_auto = db
+        .list_knowledge_cards(&KnowledgeCardFilter {
+            auto_generated: Some(true),
+            pending_review: Some(true),
+            ..KnowledgeCardFilter::default()
+        })
+        .expect("list pending auto cards");
+    assert_eq!(pending_auto, vec![auto_card]);
+    assert_eq!(
+        db.pending_auto_generated_knowledge_card_count()
+            .expect("pending count"),
+        1
+    );
+    assert_eq!(
+        db.last_crystallization_at()
+            .expect("last crystallization")
+            .as_deref(),
+        Some("1710000000")
+    );
 }
 
 #[test]

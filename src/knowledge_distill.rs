@@ -336,6 +336,7 @@ fn status_slug(value: &KnowledgeStatus) -> &'static str {
         KnowledgeStatus::Candidate => "candidate",
         KnowledgeStatus::Active => "active",
         KnowledgeStatus::Superseded => "superseded",
+        KnowledgeStatus::PendingReview => "pending_review",
         KnowledgeStatus::Promoted => "promoted",
         KnowledgeStatus::Canonical => "canonical",
         KnowledgeStatus::Demoted => "demoted",

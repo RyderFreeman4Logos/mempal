@@ -805,17 +805,20 @@ fn validate_tier_status(
     let allowed = match tier {
         KnowledgeTier::DaoTian => &[KnowledgeStatus::Canonical, KnowledgeStatus::Demoted][..],
         KnowledgeTier::DaoRen => &[
+            KnowledgeStatus::PendingReview,
             KnowledgeStatus::Candidate,
             KnowledgeStatus::Promoted,
             KnowledgeStatus::Demoted,
             KnowledgeStatus::Retired,
         ][..],
         KnowledgeTier::Shu => &[
+            KnowledgeStatus::PendingReview,
             KnowledgeStatus::Promoted,
             KnowledgeStatus::Demoted,
             KnowledgeStatus::Retired,
         ][..],
         KnowledgeTier::Qi => &[
+            KnowledgeStatus::PendingReview,
             KnowledgeStatus::Candidate,
             KnowledgeStatus::Promoted,
             KnowledgeStatus::Demoted,
@@ -893,6 +896,7 @@ fn parse_status(value: Option<&str>) -> std::result::Result<Option<KnowledgeStat
     parse_enum(value, "status", |normalized| match normalized {
         "active" => Some(KnowledgeStatus::Active),
         "superseded" => Some(KnowledgeStatus::Superseded),
+        "pending_review" => Some(KnowledgeStatus::PendingReview),
         "candidate" => Some(KnowledgeStatus::Candidate),
         "promoted" => Some(KnowledgeStatus::Promoted),
         "canonical" => Some(KnowledgeStatus::Canonical),
@@ -1011,6 +1015,10 @@ impl MempalMcpServer {
             .map_err(db_error)? as u64;
         let drawer_count = db.drawer_count().map_err(db_error)?;
         let consolidation_stats = db.consolidation_stats().map_err(db_error)?;
+        let pending_card_count = db
+            .pending_auto_generated_knowledge_card_count()
+            .map_err(db_error)?;
+        let last_crystallization_at = db.last_crystallization_at().map_err(db_error)?;
         let raw_turn_count = count_raw_turn_drawers(&db, &config.turns).map_err(db_error)?;
         let null_project_backfill_pending =
             db.null_project_backfill_pending_count().map_err(db_error)?;
@@ -1066,6 +1074,8 @@ impl MempalMcpServer {
             sleep_items_pruned: consolidation_stats.sleep_items_pruned,
             sleep_items_compacted: consolidation_stats.sleep_items_compacted,
             sleep_conflicts_resolved: consolidation_stats.sleep_conflicts_resolved,
+            pending_card_count,
+            last_crystallization_at,
             taxonomy_count,
             db_size_bytes,
             diary_rollup_days,
@@ -1625,7 +1635,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_knowledge_cards",
-        description = "Phase-2 knowledge card inspection, linked-evidence retrieval, and governed lifecycle. Actions: list/get/retrieve/events/gate/promote/demote. Retrieve searches linked evidence and returns active cards with citations; promote/demote require evidence refs and append knowledge_events transactionally."
+        description = "Phase-2 knowledge card inspection, linked-evidence retrieval, and governed lifecycle. Actions: list/get/retrieve/events/gate/promote/demote. List supports auto_generated and pending_review filters. Retrieve searches linked evidence and returns active cards with citations; promote/demote require evidence refs and append knowledge_events transactionally."
     )]
     async fn mempal_knowledge_cards(
         &self,
@@ -1644,6 +1654,8 @@ impl MempalMcpServer {
                     field: trim_to_owned(request.field.as_deref()),
                     anchor_kind: parse_anchor_kind(request.anchor_kind.as_deref())?,
                     anchor_id: trim_to_owned(request.anchor_id.as_deref()),
+                    auto_generated: request.auto_generated,
+                    pending_review: request.pending_review,
                 };
                 let cards = db.list_knowledge_cards(&filter).map_err(|error| {
                     ErrorData::internal_error(
@@ -6658,6 +6670,9 @@ mod tests_duplicate_conflict_artifact {
                 workflow_bias: vec!["inspect-first".to_string()],
                 tool_needs: vec!["mcp".to_string()],
             }),
+            auto_generated: false,
+            crystallization_score: None,
+            source_drawer_ids: Vec::new(),
             created_at: "1713000000".to_string(),
             updated_at: "1713000000".to_string(),
         }
@@ -7479,6 +7494,17 @@ mod tests_duplicate_conflict_artifact {
                 "docs",
             ),
         );
+        let mut auto_card = knowledge_card(
+            "card_auto_pending",
+            KnowledgeTier::Shu,
+            KnowledgeStatus::PendingReview,
+            "rust",
+        );
+        auto_card.auto_generated = true;
+        auto_card.crystallization_score = Some(6.5);
+        auto_card.source_drawer_ids =
+            vec!["drawer_auto_1".to_string(), "drawer_auto_2".to_string()];
+        insert_knowledge_card(&db_path, auto_card);
 
         let response = server
             .knowledge_cards_json_for_test(serde_json::json!({
@@ -7493,6 +7519,44 @@ mod tests_duplicate_conflict_artifact {
         assert_eq!(response.cards.len(), 1);
         assert_eq!(response.cards[0].id, "card_match");
         assert!(response.events.is_empty());
+
+        let response = server
+            .knowledge_cards_json_for_test(serde_json::json!({
+                "action": "list",
+                "auto_generated": true,
+                "pending_review": true
+            }))
+            .await
+            .expect("list pending auto cards");
+
+        assert_eq!(response.cards.len(), 1);
+        assert_eq!(response.cards[0].id, "card_auto_pending");
+        assert!(response.cards[0].auto_generated);
+        assert_eq!(response.cards[0].crystallization_score, Some(6.5));
+        assert_eq!(response.cards[0].source_drawer_ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_status_reports_pending_auto_cards() {
+        let (_tempdir, db_path, server) = setup_server();
+        let mut auto_card = knowledge_card(
+            "card_auto_status",
+            KnowledgeTier::Shu,
+            KnowledgeStatus::PendingReview,
+            "rust",
+        );
+        auto_card.auto_generated = true;
+        auto_card.crystallization_score = Some(7.25);
+        auto_card.source_drawer_ids = vec!["drawer_auto_status".to_string()];
+        insert_knowledge_card(&db_path, auto_card);
+
+        let response = server.status_json_for_test().await.expect("status");
+
+        assert_eq!(response.pending_card_count, 1);
+        assert_eq!(
+            response.last_crystallization_at.as_deref(),
+            Some("1713000000")
+        );
     }
 
     #[tokio::test]
