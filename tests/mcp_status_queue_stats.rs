@@ -2,7 +2,7 @@
 mod common;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "integration")]
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
@@ -13,6 +13,7 @@ use common::harness::McpStdio;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
 use mempal::core::queue::{PendingMessageStore, QueueConfig};
+use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use mempal::mcp::MempalMcpServer;
 #[cfg(feature = "integration")]
 use serde_json::{Value, json};
@@ -48,6 +49,22 @@ db_path = "{}"
         ..Config::default()
     };
     (tmp, db_path, config)
+}
+
+fn insert_drawer_with_source_type(db_path: &Path, id: &str, source_type: SourceType) {
+    let db = Database::open(db_path).expect("open db for drawer insert");
+    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: format!("status source type fixture {id}"),
+        wing: "mempal".to_string(),
+        room: Some("status".to_string()),
+        source_file: Some(format!("{id}.md")),
+        source_type,
+        added_at: "1700000000".to_string(),
+        chunk_index: Some(0),
+        importance: 1,
+    });
+    db.insert_drawer(&drawer).expect("insert drawer");
 }
 
 #[cfg(feature = "integration")]
@@ -124,6 +141,29 @@ async fn test_mcp_status_surfaces_queue_stats() {
     assert!(response.queue_stats.avg_processing_ms.is_some());
     assert_eq!(response.queue_stats.eta_secs, Some(600));
     assert!(response.queue_stats.oldest_pending_age_secs.is_some());
+}
+
+#[tokio::test]
+async fn test_mcp_status_surfaces_source_type_distribution() {
+    let (_tmp, db_path, config) = setup_env();
+    insert_drawer_with_source_type(&db_path, "drawer-user", SourceType::UserExplicit);
+    insert_drawer_with_source_type(&db_path, "drawer-hook", SourceType::SystemGenerated);
+
+    let server = MempalMcpServer::new(db_path, config);
+    let response = server.mempal_status().await.expect("status").0;
+
+    let user_count = response
+        .source_type_distribution
+        .iter()
+        .find(|entry| entry.source_type == "user_explicit")
+        .map(|entry| entry.count);
+    let system_count = response
+        .source_type_distribution
+        .iter()
+        .find(|entry| entry.source_type == "system_generated")
+        .map(|entry| entry.count);
+    assert_eq!(user_count, Some(1));
+    assert_eq!(system_count, Some(1));
 }
 
 #[cfg(feature = "integration")]

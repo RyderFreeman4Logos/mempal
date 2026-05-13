@@ -5290,6 +5290,9 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
     let drawer_count = db.drawer_count().context("failed to count drawers")?;
+    let source_type_counts = db
+        .source_type_counts()
+        .context("failed to count drawers per source type")?;
     let raw_turn_count =
         count_raw_turn_drawers(db, &config.turns).context("failed to count raw turn drawers")?;
     let project_breakdown: Option<Vec<(Option<String>, i64)>> = if full {
@@ -5365,6 +5368,14 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         println!("triples: {triple_count}");
     }
     println!("db_size_bytes: {db_size_bytes}");
+    println!("Source Types:");
+    if source_type_counts.is_empty() {
+        println!("  none");
+    } else {
+        for (source_type, count) in source_type_counts {
+            println!("  {source_type}: {count}");
+        }
+    }
     println!("Turns:");
     println!("  storage_mode: {}", config.turns.storage_mode);
     println!("  default_importance: {}", config.turns.default_importance);

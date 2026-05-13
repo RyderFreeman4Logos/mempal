@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(feature = "integration")]
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(feature = "integration")]
 use std::thread;
@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::{Database, apply_fork_ext_migrations_to};
 use mempal::core::queue::{PendingMessageStore, QueueConfig};
+use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
@@ -50,6 +51,22 @@ db_path = "{}"
     )
     .expect("write config");
     (tmp, db_path)
+}
+
+fn insert_status_drawer(db_path: &Path, id: &str, source_type: SourceType) {
+    let db = Database::open(db_path).expect("open db for status drawer");
+    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: format!("status fixture {id}"),
+        wing: "mempal".to_string(),
+        room: Some("status".to_string()),
+        source_file: Some(format!("{id}.md")),
+        source_type,
+        added_at: "1700000000".to_string(),
+        chunk_index: Some(0),
+        importance: 1,
+    });
+    db.insert_drawer(&drawer).expect("insert status drawer");
 }
 
 #[cfg(feature = "integration")]
@@ -246,6 +263,7 @@ fn test_oldest_pending_age_none_when_empty() {
 #[test]
 fn test_status_command_shows_queue_stats() {
     let (home, db_path) = setup_home();
+    insert_status_drawer(&db_path, "drawer-status-user", SourceType::UserExplicit);
     let store = PendingMessageStore::with_config(
         &db_path,
         QueueConfig {
@@ -303,6 +321,8 @@ fn test_status_command_shows_queue_stats() {
     assert!(stdout.contains("avg_processing_ms:"), "{stdout}");
     assert!(stdout.contains("eta_secs: 600"), "{stdout}");
     assert!(stdout.contains("oldest_pending_age_secs:"), "{stdout}");
+    assert!(stdout.contains("Source Types:"), "{stdout}");
+    assert!(stdout.contains("user_explicit: 1"), "{stdout}");
 }
 
 #[test]

@@ -4637,6 +4637,76 @@ mod tests {
     }
 
     #[test]
+    fn test_v11_migration_backfills_source_type_and_confidence() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE drawers (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                wing TEXT NOT NULL,
+                room TEXT,
+                source_file TEXT,
+                source_type TEXT NOT NULL CHECK(source_type IN ('project', 'conversation', 'manual')),
+                added_at TEXT NOT NULL,
+                chunk_index INTEGER,
+                deleted_at TEXT,
+                importance INTEGER DEFAULT 0,
+                normalize_version INTEGER NOT NULL DEFAULT 1,
+                valid_from TEXT,
+                valid_until TEXT
+            );
+            INSERT INTO drawers (id, content, wing, room, source_file, source_type, added_at, chunk_index, deleted_at, importance, normalize_version, valid_from, valid_until)
+            VALUES
+                ('hook-source', 'hook source', 'mempal', NULL, '/tmp/hook/capture.json', 'manual', '2026-05-13T00:00:00Z', 0, NULL, 0, 1, '2026-05-13T00:00:00Z', NULL),
+                ('hook-wing', 'hook wing', 'hooks-raw', NULL, 'raw.json', 'manual', '2026-05-13T00:00:00Z', 0, NULL, 0, 1, '2026-05-13T00:00:00Z', NULL),
+                ('diary', 'diary body', 'agent-diary', 'codex', 'agent-diary://rollup/2026-05-13', 'manual', '2026-05-13T00:00:00Z', 0, NULL, 0, 1, '2026-05-13T00:00:00Z', NULL),
+                ('normal', 'normal body', 'mempal', 'decision', 'normal.md', 'manual', '2026-05-13T00:00:00Z', 0, NULL, 0, 1, '2026-05-13T00:00:00Z', NULL);
+            PRAGMA user_version = 10;
+            "#,
+        )
+        .expect("create v10 schema");
+
+        apply_migrations(&conn).expect("apply v11 migration");
+
+        assert_eq!(
+            read_user_version(&conn).expect("user_version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        let rows = conn
+            .prepare("SELECT id, source_type, confidence FROM drawers ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![
+                ("diary".to_string(), "agent_observation".to_string(), 0.7),
+                (
+                    "hook-source".to_string(),
+                    "system_generated".to_string(),
+                    0.3
+                ),
+                ("hook-wing".to_string(), "system_generated".to_string(), 0.3),
+                ("normal".to_string(), "agent_inference".to_string(), 0.5),
+            ]
+        );
+        conn.execute(
+            "INSERT INTO drawers (id, content, wing, source_type, confidence, added_at) VALUES ('new-user', 'new body', 'mempal', 'user_explicit', 0.9, '2026-05-13T00:00:00Z')",
+            [],
+        )
+        .expect("new source_type check accepts user_explicit");
+    }
+
+    #[test]
     fn test_v5_repair_runs_when_user_version_is_already_past_v5() {
         let conn = Connection::open_in_memory().expect("open in-memory");
         conn.execute_batch(

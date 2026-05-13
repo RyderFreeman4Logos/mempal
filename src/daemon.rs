@@ -1466,15 +1466,17 @@ mod tests {
         .await
         .expect("process hook envelope");
 
-        let added_at: String = db
+        let (added_at, source_type, confidence): (String, String, f64) = db
             .conn()
             .query_row(
-                "SELECT added_at FROM drawers WHERE room = 'Bash' AND deleted_at IS NULL",
+                "SELECT added_at, source_type, confidence FROM drawers WHERE room = 'Bash' AND deleted_at IS NULL",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .expect("query drawer added_at");
+            .expect("query drawer metadata");
         assert_eq!(added_at, captured_at);
+        assert_eq!(source_type, "system_generated");
+        assert!((confidence - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]

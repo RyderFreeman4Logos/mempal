@@ -77,9 +77,9 @@ use super::tools::{
     PeekPartnerRequest, PeekPartnerResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
     ReadDrawersRequest, ReadDrawersResponse, RetrievedKnowledgeCardDto, RollbackRequest,
     RollbackResponse, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto,
-    SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, StatusResponse, SystemWarning,
-    TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto,
-    TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, StatusResponse,
+    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
+    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 #[derive(Clone)]
@@ -964,6 +964,15 @@ impl MempalMcpServer {
                 drawer_count,
             })
             .collect();
+        let source_type_distribution = db
+            .source_type_counts()
+            .map_err(db_error)?
+            .into_iter()
+            .map(|(source_type, count)| SourceTypeCount {
+                source_type: source_type.to_string(),
+                count,
+            })
+            .collect();
         let mut system_warnings = current_system_warnings();
         if null_project_backfill_pending > 0 {
             system_warnings.push(SystemWarning {
@@ -987,6 +996,7 @@ impl MempalMcpServer {
             config_version: cfg_meta.version,
             config_loaded_at_unix_ms: cfg_meta.loaded_at_unix_ms,
             scopes,
+            source_type_distribution,
             aaak_spec: crate::aaak::generate_spec(),
             memory_protocol: crate::core::protocol::MEMORY_PROTOCOL.to_string(),
             endpoint_health: EndpointHealthDto {

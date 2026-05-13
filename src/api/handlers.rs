@@ -157,7 +157,14 @@ struct StatusResponse {
     db_size_bytes: u64,
     search_decay_mode: String,
     wings: Vec<ScopeCount>,
+    source_type_distribution: Vec<SourceTypeCount>,
     turn_storage: TurnStorageStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceTypeCount {
+    source_type: String,
+    count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -512,6 +519,15 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
             drawer_count,
         })
         .collect();
+    let source_type_distribution = db
+        .source_type_counts()
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|(source_type, count)| SourceTypeCount {
+            source_type: source_type.to_string(),
+            count,
+        })
+        .collect();
 
     Ok(Json(StatusResponse {
         drawer_count,
@@ -519,6 +535,7 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         db_size_bytes,
         search_decay_mode: config.search.decay.mode.to_string(),
         wings,
+        source_type_distribution,
         turn_storage: TurnStorageStatus {
             storage_mode: config.turns.storage_mode.to_string(),
             default_importance: config.turns.default_importance,

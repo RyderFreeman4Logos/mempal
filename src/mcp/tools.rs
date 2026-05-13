@@ -939,6 +939,7 @@ pub struct StatusResponse {
     pub config_loaded_at_unix_ms: u64,
     pub diary_rollup_days: u32,
     pub scopes: Vec<ScopeCount>,
+    pub source_type_distribution: Vec<SourceTypeCount>,
     pub aaak_spec: String,
     pub memory_protocol: String,
     pub endpoint_health: EndpointHealthDto,
@@ -950,6 +951,12 @@ pub struct StatusResponse {
     pub turn_storage: TurnStorageStatusDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SourceTypeCount {
+    pub source_type: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -1852,6 +1859,8 @@ mod tests {
         assert!(!dto.content.contains('★'));
         assert_eq!(dto.drawer_id, "drawer-1");
         assert_eq!(dto.source_file, "/tmp/signals.md");
+        assert_eq!(dto.source_type, "agent_inference");
+        assert_eq!(dto.confidence, 0.5);
         assert_eq!(dto.tunnel_hints, vec!["docs".to_string()]);
         assert_eq!(dto.memory_kind, "knowledge");
         assert_eq!(dto.tier.as_deref(), Some("shu"));
