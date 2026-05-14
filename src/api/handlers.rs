@@ -9,13 +9,14 @@ use std::{
 };
 
 use crate::core::{
+    anchor,
     config::ConfigHandle,
     db::Database,
     project::{ProjectSearchScope, resolve_project_id},
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
-        BootstrapEvidenceArgs, Drawer, RouteDecision, SearchResult, SourceType, TaxonomyEntry,
-        default_confidence,
+        BootstrapEvidenceArgs, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
+        RouteDecision, SearchResult, SourceType, TaxonomyEntry, default_confidence,
     },
     utils::{
         build_bootstrap_evidence_drawer_id, iso_timestamp, link_superseded_drawer,
@@ -97,6 +98,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/ingest", post(ingest_handler))
         .route("/api/taxonomy", get(taxonomy_handler))
         .route("/api/status", get(status_handler))
+        .route("/api/pinned_facts", get(pinned_facts_handler))
         .merge(super::hermes_compat::routes())
         .with_state(state)
         .layer(cors_layer())
@@ -149,6 +151,19 @@ struct IngestRequest {
     replace_text: Option<String>,
     valid_from: Option<String>,
     valid_until: Option<String>,
+    // Typed memory fields (parity with MCP mempal_ingest)
+    memory_kind: Option<String>,
+    domain: Option<String>,
+    field: Option<String>,
+    importance: Option<i32>,
+    status: Option<String>,
+    tier: Option<String>,
+    is_pinned: Option<bool>,
+    statement: Option<String>,
+    supporting_refs: Option<Vec<String>>,
+    counterexample_refs: Option<Vec<String>>,
+    teaching_refs: Option<Vec<String>>,
+    verification_refs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -205,6 +220,117 @@ fn resolve_confidence_param(source_type: SourceType, value: Option<f64>) -> Resu
         )),
         None => Ok(default_confidence(source_type)),
     }
+}
+
+fn parse_memory_kind(value: &str) -> Result<MemoryKind, ApiError> {
+    match value.trim() {
+        "evidence" => Ok(MemoryKind::Evidence),
+        "knowledge" => Ok(MemoryKind::Knowledge),
+        "profile_fact" => Ok(MemoryKind::ProfileFact),
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("invalid memory_kind: {other}; expected evidence, knowledge, or profile_fact"),
+        )),
+    }
+}
+
+fn parse_domain(value: &str) -> Result<MemoryDomain, ApiError> {
+    match value.trim() {
+        "project" => Ok(MemoryDomain::Project),
+        "user" => Ok(MemoryDomain::User),
+        "agent" => Ok(MemoryDomain::Agent),
+        "skill" => Ok(MemoryDomain::Skill),
+        "global" => Ok(MemoryDomain::Global),
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("invalid domain: {other}; expected project, user, agent, skill, or global"),
+        )),
+    }
+}
+
+fn parse_status_opt(value: &str) -> Result<KnowledgeStatus, ApiError> {
+    match value.trim() {
+        "active" => Ok(KnowledgeStatus::Active),
+        "superseded" => Ok(KnowledgeStatus::Superseded),
+        "pending_review" => Ok(KnowledgeStatus::PendingReview),
+        "candidate" => Ok(KnowledgeStatus::Candidate),
+        "promoted" => Ok(KnowledgeStatus::Promoted),
+        "canonical" => Ok(KnowledgeStatus::Canonical),
+        "demoted" => Ok(KnowledgeStatus::Demoted),
+        "retired" => Ok(KnowledgeStatus::Retired),
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("invalid status: {other}"),
+        )),
+    }
+}
+
+fn parse_tier_opt(value: &str) -> Result<KnowledgeTier, ApiError> {
+    match value.trim() {
+        "qi" => Ok(KnowledgeTier::Qi),
+        "shu" => Ok(KnowledgeTier::Shu),
+        "dao_ren" => Ok(KnowledgeTier::DaoRen),
+        "dao_tian" => Ok(KnowledgeTier::DaoTian),
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("invalid tier: {other}; expected qi, shu, dao_ren, or dao_tian"),
+        )),
+    }
+}
+
+fn memory_kind_slug(kind: MemoryKind) -> &'static str {
+    match kind {
+        MemoryKind::Evidence => "evidence",
+        MemoryKind::Knowledge => "knowledge",
+        MemoryKind::ProfileFact => "profile_fact",
+    }
+}
+
+fn domain_slug(domain: MemoryDomain) -> &'static str {
+    match domain {
+        MemoryDomain::Project => "project",
+        MemoryDomain::User => "user",
+        MemoryDomain::Agent => "agent",
+        MemoryDomain::Skill => "skill",
+        MemoryDomain::Global => "global",
+    }
+}
+
+fn knowledge_status_slug(status: &KnowledgeStatus) -> &'static str {
+    match status {
+        KnowledgeStatus::Active => "active",
+        KnowledgeStatus::Superseded => "superseded",
+        KnowledgeStatus::PendingReview => "pending_review",
+        KnowledgeStatus::Candidate => "candidate",
+        KnowledgeStatus::Promoted => "promoted",
+        KnowledgeStatus::Canonical => "canonical",
+        KnowledgeStatus::Demoted => "demoted",
+        KnowledgeStatus::Retired => "retired",
+    }
+}
+
+fn knowledge_tier_slug(tier: &KnowledgeTier) -> &'static str {
+    match tier {
+        KnowledgeTier::Qi => "qi",
+        KnowledgeTier::Shu => "shu",
+        KnowledgeTier::DaoRen => "dao_ren",
+        KnowledgeTier::DaoTian => "dao_tian",
+    }
+}
+
+fn normalize_refs(values: Option<&[String]>) -> Vec<String> {
+    values
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|v| {
+            let t = v.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -268,6 +394,18 @@ struct SearchResultDto {
     similarity: f32,
     route: RouteDecisionDto,
     search_mode: String,
+    // Typed metadata fields
+    memory_kind: String,
+    domain: String,
+    field: String,
+    importance: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier: Option<String>,
+    is_pinned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statement: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
 }
@@ -278,6 +416,33 @@ struct RouteDecisionDto {
     room: Option<String>,
     confidence: f32,
     reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PinnedFactsQuery {
+    wing: Option<String>,
+    room: Option<String>,
+    domain: Option<String>,
+    project_id: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct PinnedFactDto {
+    drawer_id: String,
+    content: String,
+    wing: String,
+    room: Option<String>,
+    source_file: String,
+    memory_kind: String,
+    domain: String,
+    field: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    importance: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pin_order: Option<i64>,
+    added_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -458,7 +623,38 @@ async fn process_ingest_request(
         });
     }
     let drawer_importance =
-        raw_turn_importance(&request.wing, request.room.as_deref(), &config.turns).unwrap_or(0);
+        raw_turn_importance(&request.wing, request.room.as_deref(), &config.turns)
+            .unwrap_or_else(|| request.importance.unwrap_or(0));
+
+    // Parse typed memory fields.
+    let typed_memory_kind = request
+        .memory_kind
+        .as_deref()
+        .map(parse_memory_kind)
+        .transpose()?;
+    let typed_domain = request.domain.as_deref().map(parse_domain).transpose()?;
+    let typed_field = request
+        .field
+        .as_deref()
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty());
+    let typed_status = request
+        .status
+        .as_deref()
+        .map(parse_status_opt)
+        .transpose()?;
+    let typed_tier = request.tier.as_deref().map(parse_tier_opt).transpose()?;
+    let typed_is_pinned = request.is_pinned.unwrap_or(false);
+    let typed_statement = request
+        .statement
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let typed_supporting_refs = normalize_refs(request.supporting_refs.as_deref());
+    let typed_counterexample_refs = normalize_refs(request.counterexample_refs.as_deref());
+    let typed_teaching_refs = normalize_refs(request.teaching_refs.as_deref());
+    let typed_verification_refs = normalize_refs(request.verification_refs.as_deref());
 
     // Chunk the content using the token-aware chunker (issue #57).
     let chunks =
@@ -589,7 +785,7 @@ async fn process_ingest_request(
 
         if !drawer_exists {
             let source_file = source_file_or_synthetic(drawer_id, request.source.as_deref());
-            let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            let base = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
                 id: drawer_id.clone(),
                 content: chunk.to_string(),
                 wing: request.wing.clone(),
@@ -603,7 +799,36 @@ async fn process_ingest_request(
             let drawer = Drawer {
                 confidence,
                 normalize_version: CURRENT_NORMALIZE_VERSION,
-                ..drawer
+                memory_kind: typed_memory_kind.unwrap_or(base.memory_kind),
+                domain: typed_domain.unwrap_or(base.domain),
+                field: typed_field
+                    .clone()
+                    .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
+                status: typed_status.clone().or(base.status),
+                tier: typed_tier.clone().or(base.tier),
+                is_pinned: typed_is_pinned,
+                statement: typed_statement.clone().or(base.statement),
+                supporting_refs: if typed_supporting_refs.is_empty() {
+                    base.supporting_refs
+                } else {
+                    typed_supporting_refs.clone()
+                },
+                counterexample_refs: if typed_counterexample_refs.is_empty() {
+                    base.counterexample_refs
+                } else {
+                    typed_counterexample_refs.clone()
+                },
+                teaching_refs: if typed_teaching_refs.is_empty() {
+                    base.teaching_refs
+                } else {
+                    typed_teaching_refs.clone()
+                },
+                verification_refs: if typed_verification_refs.is_empty() {
+                    base.verification_refs
+                } else {
+                    typed_verification_refs.clone()
+                },
+                ..base
             };
             let mut drawer = drawer;
             if let Some(old_id) = superseded_drawer_id.as_deref() {
@@ -639,6 +864,58 @@ async fn process_ingest_request(
         superseded_drawer_id: superseded_response_id,
         fact_check_warnings,
     })
+}
+
+async fn pinned_facts_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<PinnedFactsQuery>,
+) -> Result<Json<Vec<PinnedFactDto>>, ApiError> {
+    let config = ConfigHandle::current();
+    let project_id = resolve_project_id(query.project_id.as_deref(), config.as_ref(), None)
+        .map_err(internal_error)?;
+    let domain_filter = if let Some(d) = query.domain.as_deref() {
+        Some(parse_domain(d)?)
+    } else {
+        None
+    };
+    let limit = query.limit.unwrap_or(50).min(500);
+    let budget_chars = limit * 2000;
+    let db = Database::open(&state.db_path).map_err(internal_error)?;
+    let drawers = db
+        .get_pinned_facts(project_id.as_deref(), budget_chars)
+        .map_err(internal_error)?;
+    let facts = drawers
+        .into_iter()
+        .filter(|d| {
+            let wing_ok = query.wing.as_deref().is_none_or(|w| d.wing == w);
+            let room_ok = query
+                .room
+                .as_deref()
+                .is_none_or(|r| d.room.as_deref() == Some(r));
+            let domain_ok = domain_filter.is_none_or(|dom| d.domain == dom);
+            wing_ok && room_ok && domain_ok
+        })
+        .take(limit)
+        .map(|d| PinnedFactDto {
+            drawer_id: d.id.clone(),
+            content: d.content,
+            wing: d.wing,
+            room: d.room,
+            source_file: d.source_file.unwrap_or(d.id),
+            memory_kind: memory_kind_slug(d.memory_kind).to_string(),
+            domain: domain_slug(d.domain).to_string(),
+            field: d.field,
+            status: d
+                .status
+                .as_ref()
+                .map(knowledge_status_slug)
+                .map(str::to_string),
+            importance: d.importance,
+            pin_order: d.pin_order,
+            added_at: d.added_at,
+        })
+        .collect();
+    Ok(Json(facts))
 }
 
 async fn taxonomy_handler(
@@ -967,6 +1244,22 @@ impl SearchResultDto {
             similarity: value.similarity,
             route: value.route.into(),
             search_mode: search_mode.as_str().to_string(),
+            memory_kind: memory_kind_slug(value.memory_kind).to_string(),
+            domain: domain_slug(value.domain).to_string(),
+            field: value.field,
+            importance: value.importance,
+            status: value
+                .status
+                .as_ref()
+                .map(knowledge_status_slug)
+                .map(str::to_string),
+            tier: value
+                .tier
+                .as_ref()
+                .map(knowledge_tier_slug)
+                .map(str::to_string),
+            is_pinned: value.is_pinned,
+            statement: value.statement,
             warnings: warnings.to_vec(),
         }
     }
