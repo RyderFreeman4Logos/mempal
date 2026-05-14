@@ -560,5 +560,162 @@ class FactExtractionValidationTests(unittest.TestCase):
             self.assertLessEqual(len(result), 10)
 
 
+class ReadinessActivationTests(unittest.TestCase):
+    """Provider activation: config loading, availability, REST-down behavior."""
+
+    def test_no_base_url_makes_unavailable(self) -> None:
+        provider = RecordingProvider()
+        provider._hermes_home = ""
+        old = os.environ.get("MEMPAL_BASE_URL")
+        try:
+            os.environ["MEMPAL_BASE_URL"] = ""
+            self.assertFalse(provider.is_available())
+        finally:
+            if old is not None:
+                os.environ["MEMPAL_BASE_URL"] = old
+            else:
+                os.environ.pop("MEMPAL_BASE_URL", None)
+
+    def test_provider_name_is_mempal(self) -> None:
+        provider = RecordingProvider()
+        self.assertEqual(provider.name, "mempal")
+
+    def test_tool_schemas_registered(self) -> None:
+        provider = RecordingProvider()
+        schemas = provider.get_tool_schemas()
+        names = {s["name"] for s in schemas}
+        self.assertEqual(names, {"mempal_profile", "mempal_search", "mempal_conclude"})
+
+    def test_breaker_open_blocks_tool_calls(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._consecutive_failures = 10
+        provider._breaker_open_until = time.monotonic() + 999
+
+        result = json.loads(provider.handle_tool_call("mempal_search", {"query": "test"}))
+        self.assertIn("error", result)
+        self.assertIn("unavailable", result["error"])
+
+    def test_breaker_resets_after_cooldown(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._consecutive_failures = 10
+        provider._breaker_open_until = time.monotonic() - 1
+
+        provider.responses["/api/search"] = [{"content": "found"}]
+        result = json.loads(provider.handle_tool_call("mempal_search", {"query": "test"}))
+        self.assertIn("results", result)
+
+    def test_health_cache_prevents_probe(self) -> None:
+        provider = RecordingProvider()
+        provider._is_healthy = False
+        provider._last_health_at = time.monotonic()
+        self.assertFalse(provider.is_available())
+
+
+class ReadinessDurableMemoryTests(unittest.TestCase):
+    """Durable memory semantics: add/replace/remove correctness."""
+
+    def test_add_creates_one_ingest(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.on_memory_write("add", "profile", "single fact")
+        provider._drain_writes()
+        ingests = [b for p, b in provider.posts if p == "/api/ingest"]
+        self.assertEqual(len(ingests), 1)
+        self.assertEqual(ingests[0]["content"], "single fact")
+
+    def test_replace_supersedes_and_creates_new(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.on_memory_write("add", "profile", "v1")
+        provider._drain_writes()
+        provider.on_memory_write("replace", "profile", "v2")
+        provider._drain_writes()
+        ingests = [b for p, b in provider.posts if p == "/api/ingest"]
+        self.assertEqual(len(ingests), 2)
+        self.assertIn("supersedes", ingests[1])
+        self.assertEqual(ingests[1]["content"], "v2")
+
+    def test_remove_deletes_tracked(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.on_memory_write("add", "profile", "ephemeral")
+        provider._drain_writes()
+        provider.on_memory_write("remove", "profile", "")
+        provider._drain_writes()
+        deletes = [b for p, b in provider.posts if p == "/api/delete"]
+        self.assertEqual(len(deletes), 1)
+
+    def test_remove_without_prior_is_noop(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.on_memory_write("remove", "profile", "")
+        self.assertEqual(len(provider.posts), 0)
+
+    def test_conclude_stores_verbatim(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        result = json.loads(provider.handle_tool_call("mempal_conclude", {"conclusion": "exact text"}))
+        self.assertEqual(provider.posts[-1][1]["content"], "exact text")
+        self.assertIn("drawer_id", result)
+
+
+class ReadinessReliabilityTests(unittest.TestCase):
+    """Reliability: degradation, rapid writes, session switch draining."""
+
+    def test_rapid_writes_then_shutdown_drains_all(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        for i in range(20):
+            provider.on_memory_write("add", "profile", f"fact {i}")
+        provider.shutdown()
+        ingests = [b for p, b in provider.posts if p == "/api/ingest"]
+        self.assertEqual(len(ingests), 20)
+
+    def test_session_switch_clears_stale_state(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        with provider._prefetch_lock:
+            provider._prefetch_result = "old data"
+        with provider._pinned_facts_lock:
+            provider._pinned_facts_cache = [{"content": "stale"}]
+            provider._pinned_facts_fetched_at = time.monotonic()
+
+        provider.on_session_switch("session-b", reason="reset")
+
+        self.assertEqual(provider.prefetch("x", session_id="session-a"), "")
+        self.assertEqual(provider._pinned_facts_fetched_at, 0.0)
+
+    def test_consecutive_failures_trip_breaker(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        for _ in range(5):
+            provider._record_failure()
+        self.assertTrue(provider._is_breaker_open())
+
+    def test_success_resets_failure_count(self) -> None:
+        provider = RecordingProvider()
+        provider._consecutive_failures = 4
+        provider._record_success()
+        self.assertEqual(provider._consecutive_failures, 0)
+
+    def test_empty_search_returns_no_results_message(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.responses["/api/search"] = []
+        result = json.loads(provider.handle_tool_call("mempal_search", {"query": "nothing"}))
+        self.assertIn("result", result)
+        self.assertIn("No relevant", result["result"])
+
+    def test_empty_profile_returns_no_memories_message(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.responses["/api/timeline"] = []
+        result = json.loads(provider.handle_tool_call("mempal_profile", {}))
+        self.assertIn("result", result)
+        self.assertIn("No memories", result["result"])
+
+
 if __name__ == "__main__":
     unittest.main()
