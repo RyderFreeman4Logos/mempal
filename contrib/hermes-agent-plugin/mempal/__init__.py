@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -30,6 +31,19 @@ _WRITE_RETRY_MAX = 3
 _WRITE_RETRY_DELAY = 2.0
 _HEALTH_CHECK_INTERVAL = 60.0
 _PINNED_FACTS_TTL = 300.0
+_LLM_DEFAULT_TIMEOUT = 30
+_LLM_BREAKER_THRESHOLD = 3
+_LLM_BREAKER_COOLDOWN = 300.0
+
+_VALID_MODES = {"deterministic", "local_llm", "cloud_llm", "auto"}
+_VALID_MEMORY_KINDS = {
+    "fact", "preference", "decision", "correction", "rule",
+    "observation", "summary", "context", "goal", "constraint",
+}
+_VALID_DOMAINS = {
+    "coding", "communication", "workflow", "architecture",
+    "debugging", "testing", "deployment", "personal", "project",
+}
 
 PROFILE_SCHEMA = {
     "name": "mempal_profile",
@@ -104,6 +118,200 @@ def _strip_none(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
+class _LLMClient:
+    """OpenAI-compatible chat completion client using stdlib only."""
+
+    def __init__(self, cfg: Dict[str, Any]) -> None:
+        self._base_url = (cfg.get("base_url") or "").rstrip("/")
+        self._model = cfg.get("model") or ""
+        self._api_key = cfg.get("api_key") or ""
+        self._timeout = int(cfg.get("timeout_secs") or _LLM_DEFAULT_TIMEOUT)
+        self._extra_body = cfg.get("extra_body") or {}
+        self._consecutive_failures = 0
+        self._breaker_open_until = 0.0
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._base_url and self._model)
+
+    def _is_breaker_open(self) -> bool:
+        if self._consecutive_failures < _LLM_BREAKER_THRESHOLD:
+            return False
+        if time.monotonic() >= self._breaker_open_until:
+            self._consecutive_failures = 0
+            return False
+        return True
+
+    def chat(self, system: str, user: str, *, temperature: float = 0.1) -> Optional[str]:
+        if not self.is_configured or self._is_breaker_open():
+            return None
+        import urllib.request
+        body: Dict[str, Any] = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "max_tokens": 1024,
+        }
+        body.update(self._extra_body)
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        url = self._base_url + "/chat/completions"
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                result = json.loads(resp.read().decode())
+            content = result.get("choices", [{}])[0].get("message", {}).get("content")
+            if content:
+                self._consecutive_failures = 0
+            return content or None
+        except Exception as exc:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= _LLM_BREAKER_THRESHOLD:
+                self._breaker_open_until = time.monotonic() + _LLM_BREAKER_COOLDOWN
+                logger.warning("mempal LLM breaker tripped after %d failures, pausing %ds", self._consecutive_failures, _LLM_BREAKER_COOLDOWN)
+            else:
+                logger.debug("mempal LLM call failed: %s", exc)
+            return None
+
+    @property
+    def status(self) -> str:
+        if not self.is_configured:
+            return "not_configured"
+        if self._is_breaker_open():
+            return "breaker_open"
+        return "available"
+
+
+class _IntelligenceEnhancer:
+    """Enhancement pipeline: LLM-powered metadata extraction with deterministic gates."""
+
+    _METADATA_SYSTEM = (
+        "You classify memory entries. Return ONLY a JSON object with these fields:\n"
+        '  "memory_kind": one of: fact, preference, decision, correction, rule, '
+        "observation, summary, context, goal, constraint\n"
+        '  "domain": one of: coding, communication, workflow, architecture, '
+        "debugging, testing, deployment, personal, project\n"
+        '  "importance": integer 1-5 (1=trivial, 5=critical)\n'
+        '  "tags": list of 1-3 short keyword tags\n'
+        "Return ONLY valid JSON, no explanation."
+    )
+
+    _FACTS_SYSTEM = (
+        "Extract durable facts from this conversation turn. Return a JSON array of objects, "
+        "each with:\n"
+        '  "fact": the extracted fact as a concise statement\n'
+        '  "memory_kind": one of: fact, preference, decision, correction, rule, '
+        "observation, context, goal, constraint\n"
+        '  "importance": integer 1-5\n'
+        "Only extract facts worth remembering long-term. If nothing is worth extracting, "
+        "return an empty array []. Return ONLY valid JSON."
+    )
+
+    _SUMMARY_SYSTEM = (
+        "Summarize this conversation for long-term memory. Focus on:\n"
+        "- Key decisions made\n"
+        "- User preferences discovered\n"
+        "- Important context established\n"
+        "Keep it concise (under 500 characters). Return ONLY the summary text, no JSON."
+    )
+
+    def __init__(self, llm: _LLMClient) -> None:
+        self._llm = llm
+
+    def extract_metadata(self, content: str) -> Optional[Dict[str, Any]]:
+        raw = self._llm.chat(self._METADATA_SYSTEM, content)
+        if not raw:
+            return None
+        return self._validate_metadata(raw)
+
+    def extract_facts(self, turn_content: str) -> Optional[List[Dict[str, Any]]]:
+        if len(turn_content) < 50:
+            return None
+        raw = self._llm.chat(self._FACTS_SYSTEM, turn_content)
+        if not raw:
+            return None
+        return self._validate_facts(raw, turn_content)
+
+    def enhance_summary(self, messages_text: str) -> Optional[str]:
+        raw = self._llm.chat(self._SUMMARY_SYSTEM, messages_text)
+        if not raw or len(raw) < 10:
+            return None
+        if len(raw) > 2000:
+            return raw[:2000]
+        return raw
+
+    @staticmethod
+    def _validate_metadata(raw: str) -> Optional[Dict[str, Any]]:
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        result: Dict[str, Any] = {}
+        kind = str(parsed.get("memory_kind", "")).strip().lower()
+        if kind in _VALID_MEMORY_KINDS:
+            result["memory_kind"] = kind
+        domain = str(parsed.get("domain", "")).strip().lower()
+        if domain in _VALID_DOMAINS:
+            result["domain"] = domain
+        try:
+            importance = int(parsed.get("importance", 0))
+            if 1 <= importance <= 5:
+                result["importance"] = importance
+        except (ValueError, TypeError):
+            pass
+        tags = parsed.get("tags")
+        if isinstance(tags, list):
+            clean = [str(t).strip()[:30] for t in tags[:5] if isinstance(t, str) and t.strip()]
+            if clean:
+                result["tags"] = clean
+        return result if result else None
+
+    @staticmethod
+    def _validate_facts(raw: str, source_content: str) -> Optional[List[Dict[str, Any]]]:
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(parsed, list):
+            return None
+        source_lower = source_content.lower()
+        validated: List[Dict[str, Any]] = []
+        for item in parsed[:10]:
+            if not isinstance(item, dict):
+                continue
+            fact = str(item.get("fact", "")).strip()
+            if not fact or len(fact) < 5:
+                continue
+            words = fact.lower().split()
+            grounded = sum(1 for w in words if len(w) > 3 and w in source_lower)
+            if grounded < min(2, len(words) // 3):
+                continue
+            entry: Dict[str, Any] = {"fact": fact}
+            kind = str(item.get("memory_kind", "fact")).strip().lower()
+            entry["memory_kind"] = kind if kind in _VALID_MEMORY_KINDS else "fact"
+            try:
+                imp = int(item.get("importance", 2))
+                entry["importance"] = max(1, min(5, imp))
+            except (ValueError, TypeError):
+                entry["importance"] = 2
+            validated.append(entry)
+        return validated if validated else None
+
+
 class MempalMemoryProvider:
     def __init__(self):
         self._base_url = "http://127.0.0.1:3080"
@@ -135,6 +343,39 @@ class MempalMemoryProvider:
         self._pinned_facts_lock = threading.Lock()
         self._is_healthy = True
         self._last_health_at: float = 0.0
+        self._intelligence_mode = "deterministic"
+        self._llm = _LLMClient({})
+        self._enhancer: Optional[_IntelligenceEnhancer] = None
+
+    def _configure_intelligence(self, cfg: dict) -> None:
+        mi = cfg.get("memory_intelligence") or {}
+        mode = str(mi.get("mode", "deterministic")).strip().lower()
+        if mode not in _VALID_MODES:
+            mode = "deterministic"
+        self._intelligence_mode = mode
+        if mode == "deterministic":
+            self._llm = _LLMClient({})
+            self._enhancer = None
+            return
+        llm_cfg = mi.get("llm") or {}
+        self._llm = _LLMClient(llm_cfg)
+        if mode == "auto" and not self._llm.is_configured:
+            self._intelligence_mode = "deterministic"
+            self._enhancer = None
+            return
+        if self._llm.is_configured:
+            self._enhancer = _IntelligenceEnhancer(self._llm)
+        else:
+            self._enhancer = None
+
+    def _should_enhance(self) -> bool:
+        if self._intelligence_mode == "deterministic":
+            return False
+        if self._enhancer is None:
+            return False
+        if self._llm._is_breaker_open():
+            return False
+        return True
 
     def _start_write_worker(self) -> None:
         if self._write_worker and self._write_worker.is_alive():
@@ -161,6 +402,15 @@ class MempalMemoryProvider:
 
     def _process_write(self, item: Dict[str, Any]) -> None:
         op = item.get("op")
+        if op == "ingest" and self._should_enhance() and self._enhancer:
+            body = item["body"]
+            content = body.get("content", "")
+            if content and not item.get("skip_enhance"):
+                metadata = self._enhancer.extract_metadata(content)
+                if metadata:
+                    for k, v in metadata.items():
+                        if k not in body and v is not None:
+                            body[k] = v
         for attempt in range(_WRITE_RETRY_MAX):
             try:
                 if op == "ingest":
@@ -245,6 +495,7 @@ class MempalMemoryProvider:
         self._turns_room = self._derive_turns_room(self._platform, chat_id, thread_id)
         self._facts_room = "facts"
         self._project_id = str(project_id) if project_id else None
+        self._configure_intelligence(cfg)
 
     @staticmethod
     def _derive_turns_room(platform, chat_id, thread_id):
@@ -351,9 +602,13 @@ class MempalMemoryProvider:
         return "## Pinned Facts (always active)\n" + "\n".join(lines)
 
     def system_prompt_block(self):
+        mode_label = self._intelligence_mode
+        if mode_label != "deterministic" and self._llm.is_configured:
+            mode_label = f"{mode_label} (llm: {self._llm.status})"
         base = (
             "# Mempal Memory\n"
             f"Active. User: {self._user_id}. Profile: {self._profile}. "
+            f"Mode: {mode_label}. "
             "Local BM25+vector backend, zero cloud.\n"
             "Use mempal_search to recall facts, mempal_conclude to store, "
             "mempal_profile for recent overview."
@@ -409,7 +664,20 @@ class MempalMemoryProvider:
             return
         content = f"User: {user_content}\nAssistant: {assistant_content}"
         body = self._with_project_id({"content": content, "wing": self._wing, "room": self._turns_room})
-        self._enqueue_write({"op": "ingest", "body": body})
+        self._enqueue_write({"op": "ingest", "body": body, "skip_enhance": True})
+        if self._should_enhance() and self._enhancer:
+            facts = self._enhancer.extract_facts(content)
+            if facts:
+                for fact_entry in facts:
+                    fact_body = self._with_project_id({
+                        "content": fact_entry["fact"],
+                        "wing": self._wing,
+                        "room": self._facts_room,
+                        "memory_kind": fact_entry.get("memory_kind", "fact"),
+                        "importance": fact_entry.get("importance", 2),
+                        "source_type": "llm_extracted",
+                    })
+                    self._enqueue_write({"op": "ingest", "body": fact_body, "skip_enhance": True})
 
     def get_tool_schemas(self):
         return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
@@ -474,8 +742,13 @@ class MempalMemoryProvider:
         if not assistant_msgs:
             return
         summary = assistant_msgs[-1][:2000]
+        if self._should_enhance() and self._enhancer:
+            all_text = "\n".join(f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages[-10:] if m.get("content"))
+            enhanced = self._enhancer.enhance_summary(all_text)
+            if enhanced:
+                summary = enhanced
         body = self._with_project_id({"content": f"[Session summary] {summary}", "wing": self._wing, "room": self._session_room()})
-        self._enqueue_write({"op": "ingest", "body": body})
+        self._enqueue_write({"op": "ingest", "body": body, "skip_enhance": True})
 
     def on_memory_write(self, action, target, content, metadata=None):
         if self._is_breaker_open():
@@ -526,7 +799,16 @@ class MempalMemoryProvider:
                 logger.warning("mempal write worker did not drain in time")
 
     def get_config_schema(self):
-        return [{"key": "base_url", "description": "mempal REST endpoint", "default": "http://127.0.0.1:3080", "env_var": "MEMPAL_BASE_URL"}, {"key": "user_id", "description": "User identifier for memory scoping", "default": "hermes-user", "env_var": "MEMPAL_USER_ID"}, {"key": "turn_storage_mode", "description": "Raw turn storage mode: off, raw_evidence, or summarized", "default": "raw_evidence", "env_var": "MEMPAL_TURN_STORAGE_MODE"}]
+        return [
+            {"key": "base_url", "description": "mempal REST endpoint", "default": "http://127.0.0.1:3080", "env_var": "MEMPAL_BASE_URL"},
+            {"key": "user_id", "description": "User identifier for memory scoping", "default": "hermes-user", "env_var": "MEMPAL_USER_ID"},
+            {"key": "turn_storage_mode", "description": "Raw turn storage mode: off, raw_evidence, or summarized", "default": "raw_evidence", "env_var": "MEMPAL_TURN_STORAGE_MODE"},
+            {"key": "memory_intelligence.mode", "description": "Intelligence mode: deterministic, local_llm, cloud_llm, or auto", "default": "deterministic"},
+            {"key": "memory_intelligence.llm.base_url", "description": "OpenAI-compatible LLM endpoint for enhancement", "default": ""},
+            {"key": "memory_intelligence.llm.model", "description": "Model name for LLM enhancement", "default": ""},
+            {"key": "memory_intelligence.llm.api_key", "description": "API key for LLM endpoint (optional for local)", "default": ""},
+            {"key": "memory_intelligence.llm.timeout_secs", "description": "LLM request timeout in seconds", "default": "30"},
+        ]
 
     def save_config(self, values, hermes_home):
         config_path = os.path.join(hermes_home, "mempal.json")

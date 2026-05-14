@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -9,7 +10,7 @@ PLUGIN_DIR = os.path.dirname(__file__)
 if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
-from mempal import MempalMemoryProvider  # noqa: E402
+from mempal import MempalMemoryProvider, _LLMClient, _IntelligenceEnhancer  # noqa: E402
 
 
 class RecordingProvider(MempalMemoryProvider):
@@ -373,6 +374,190 @@ class PinnedFactsTests(unittest.TestCase):
         provider.system_prompt_block()
 
         self.assertGreater(len(provider.gets), call_count_before)
+
+
+class IntelligenceModeTests(unittest.TestCase):
+    def test_default_mode_is_deterministic(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        self.assertEqual(provider._intelligence_mode, "deterministic")
+        self.assertFalse(provider._should_enhance())
+
+    def test_deterministic_mode_no_llm_calls(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.sync_turn("hello there friend", "hi back to you friend")
+        provider._drain_writes()
+        self.assertEqual(len(provider.posts), 1)
+        self.assertNotIn("source_type", provider.posts[0][1])
+
+    def test_system_prompt_shows_mode(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.responses["/api/pinned_facts"] = []
+        block = provider.system_prompt_block()
+        self.assertIn("Mode: deterministic", block)
+
+    def test_invalid_mode_falls_back_to_deterministic(self) -> None:
+        provider = RecordingProvider()
+        provider._hermes_home = ""
+        provider._configure_intelligence({"memory_intelligence": {"mode": "invalid_mode"}})
+        self.assertEqual(provider._intelligence_mode, "deterministic")
+
+    def test_auto_without_llm_config_is_deterministic(self) -> None:
+        provider = RecordingProvider()
+        provider._configure_intelligence({"memory_intelligence": {"mode": "auto"}})
+        self.assertEqual(provider._intelligence_mode, "deterministic")
+        self.assertFalse(provider._should_enhance())
+
+    def test_auto_with_llm_config_enables_enhancement(self) -> None:
+        provider = RecordingProvider()
+        provider._configure_intelligence({
+            "memory_intelligence": {
+                "mode": "auto",
+                "llm": {"base_url": "http://localhost:18009/v1", "model": "test-model"},
+            },
+        })
+        self.assertEqual(provider._intelligence_mode, "auto")
+        self.assertTrue(provider._should_enhance())
+        self.assertIsNotNone(provider._enhancer)
+
+    def test_local_llm_mode_configures_enhancer(self) -> None:
+        provider = RecordingProvider()
+        provider._configure_intelligence({
+            "memory_intelligence": {
+                "mode": "local_llm",
+                "llm": {"base_url": "http://localhost:18009/v1", "model": "qwen3.6-27b"},
+            },
+        })
+        self.assertEqual(provider._intelligence_mode, "local_llm")
+        self.assertIsNotNone(provider._enhancer)
+        self.assertEqual(provider._llm._model, "qwen3.6-27b")
+
+    def test_llm_breaker_disables_enhancement(self) -> None:
+        provider = RecordingProvider()
+        provider._configure_intelligence({
+            "memory_intelligence": {
+                "mode": "local_llm",
+                "llm": {"base_url": "http://localhost:18009/v1", "model": "test"},
+            },
+        })
+        self.assertTrue(provider._should_enhance())
+        provider._llm._consecutive_failures = 10
+        provider._llm._breaker_open_until = time.monotonic() + 999
+        self.assertFalse(provider._should_enhance())
+
+    def test_config_schema_includes_intelligence_fields(self) -> None:
+        provider = RecordingProvider()
+        schema = provider.get_config_schema()
+        keys = [s["key"] for s in schema]
+        self.assertIn("memory_intelligence.mode", keys)
+        self.assertIn("memory_intelligence.llm.base_url", keys)
+        self.assertIn("memory_intelligence.llm.model", keys)
+
+
+class LLMClientTests(unittest.TestCase):
+    def test_unconfigured_returns_none(self) -> None:
+        client = _LLMClient({})
+        self.assertFalse(client.is_configured)
+        self.assertIsNone(client.chat("system", "user"))
+        self.assertEqual(client.status, "not_configured")
+
+    def test_configured_status(self) -> None:
+        client = _LLMClient({"base_url": "http://localhost:18009/v1", "model": "test"})
+        self.assertTrue(client.is_configured)
+        self.assertEqual(client.status, "available")
+
+    def test_breaker_open_status(self) -> None:
+        client = _LLMClient({"base_url": "http://localhost:18009/v1", "model": "test"})
+        client._consecutive_failures = 5
+        client._breaker_open_until = time.monotonic() + 999
+        self.assertEqual(client.status, "breaker_open")
+        self.assertIsNone(client.chat("system", "user"))
+
+    def test_extra_body_preserved(self) -> None:
+        client = _LLMClient({
+            "base_url": "http://localhost:18009/v1",
+            "model": "qwen3",
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        })
+        self.assertEqual(client._extra_body, {"chat_template_kwargs": {"enable_thinking": False}})
+
+
+class MetadataValidationTests(unittest.TestCase):
+    def test_valid_metadata_json(self) -> None:
+        result = _IntelligenceEnhancer._validate_metadata(
+            '{"memory_kind": "preference", "domain": "coding", "importance": 4, "tags": ["vim", "editor"]}'
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["memory_kind"], "preference")
+        self.assertEqual(result["domain"], "coding")
+        self.assertEqual(result["importance"], 4)
+        self.assertEqual(result["tags"], ["vim", "editor"])
+
+    def test_metadata_strips_code_fence(self) -> None:
+        result = _IntelligenceEnhancer._validate_metadata(
+            '```json\n{"memory_kind": "fact", "importance": 3}\n```'
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["memory_kind"], "fact")
+
+    def test_invalid_json_returns_none(self) -> None:
+        result = _IntelligenceEnhancer._validate_metadata("not json at all")
+        self.assertIsNone(result)
+
+    def test_invalid_memory_kind_excluded(self) -> None:
+        result = _IntelligenceEnhancer._validate_metadata(
+            '{"memory_kind": "hallucination", "importance": 3}'
+        )
+        self.assertIsNotNone(result)
+        self.assertNotIn("memory_kind", result)
+        self.assertEqual(result["importance"], 3)
+
+    def test_importance_clamped(self) -> None:
+        result = _IntelligenceEnhancer._validate_metadata('{"importance": 99}')
+        self.assertIsNone(result)
+
+    def test_empty_result_returns_none(self) -> None:
+        result = _IntelligenceEnhancer._validate_metadata('{"memory_kind": "invalid"}')
+        self.assertIsNone(result)
+
+
+class FactExtractionValidationTests(unittest.TestCase):
+    def test_valid_facts_extracted(self) -> None:
+        source = "User: I always prefer dark mode in my editor and terminal applications"
+        raw = json.dumps([
+            {"fact": "User prefers dark mode in editor and terminal", "memory_kind": "preference", "importance": 3},
+        ])
+        result = _IntelligenceEnhancer._validate_facts(raw, source)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["memory_kind"], "preference")
+
+    def test_hallucinated_facts_rejected(self) -> None:
+        source = "User: I like Python"
+        raw = json.dumps([
+            {"fact": "User has extensive experience with quantum computing frameworks", "importance": 4},
+        ])
+        result = _IntelligenceEnhancer._validate_facts(raw, source)
+        self.assertIsNone(result)
+
+    def test_empty_array_returns_none(self) -> None:
+        result = _IntelligenceEnhancer._validate_facts("[]", "some source")
+        self.assertIsNone(result)
+
+    def test_code_fence_stripped(self) -> None:
+        source = "User: I prefer using vim for all code editing tasks"
+        raw = '```json\n[{"fact": "prefers vim for code editing", "importance": 2}]\n```'
+        result = _IntelligenceEnhancer._validate_facts(raw, source)
+        self.assertIsNotNone(result)
+
+    def test_max_facts_capped(self) -> None:
+        source = "word " * 100
+        facts = [{"fact": f"word word word word fact {i}", "importance": 1} for i in range(15)]
+        result = _IntelligenceEnhancer._validate_facts(json.dumps(facts), source)
+        if result:
+            self.assertLessEqual(len(result), 10)
 
 
 if __name__ == "__main__":

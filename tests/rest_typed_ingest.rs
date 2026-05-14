@@ -547,3 +547,62 @@ async fn test_search_response_includes_typed_fields() {
     assert_eq!(result["importance"].as_i64(), Some(3));
     assert_eq!(result["is_pinned"].as_bool(), Some(true));
 }
+
+#[tokio::test]
+async fn test_delete_soft_deletes_drawer() {
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (ingest_status, ingest_body) = post_json(
+        state.clone(),
+        "/api/ingest",
+        json!({
+            "content": "Drawer to be deleted via REST.",
+            "wing": "test",
+            "room": "delete-test",
+        }),
+    )
+    .await;
+    assert_eq!(
+        ingest_status,
+        StatusCode::CREATED,
+        "ingest body={ingest_body}"
+    );
+    let drawer_id = ingest_body["drawer_id"]
+        .as_str()
+        .expect("drawer_id in ingest response")
+        .to_string();
+
+    let (del_status, del_body) =
+        post_json(state, "/api/delete", json!({ "drawer_id": drawer_id })).await;
+    assert_eq!(del_status, StatusCode::OK, "delete body={del_body}");
+    assert_eq!(del_body["deleted"].as_bool(), Some(true));
+
+    let db = env.db();
+    let deleted_at: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT deleted_at FROM drawers WHERE id = ?1",
+            [&drawer_id],
+            |row| row.get(0),
+        )
+        .expect("query drawer");
+    assert!(
+        deleted_at.is_some(),
+        "drawer should have deleted_at set after soft-delete"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_not_found_returns_404() {
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (status, body) = post_json(
+        state,
+        "/api/delete",
+        json!({ "drawer_id": "drawer_does_not_exist_xyz" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
+}
