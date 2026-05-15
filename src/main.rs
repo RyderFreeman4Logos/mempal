@@ -14,9 +14,24 @@ use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::api::{ApiState, DEFAULT_REST_ADDR, serve as serve_rest_api};
 use mempal::context::{ContextPack, ContextRequest, assemble_context};
 use mempal::core::{
+    anchor,
     compaction::merge_cluster,
     config::{CompiledPrivacyConfig, Config, ConfigHandle, default_config_path},
     db::{Database, find_similar_clusters},
+    phase3::{
+        CardContextDefaultProposalReport, CardContextRollbackControlReport, EvaluatorAdviceInput,
+        EvaluatorAdviceReport, Phase3ReadinessReport, ResearchIngestPlanReport,
+        RuntimeAdoptionCaptureInput, RuntimeAdoptionCaptureReport,
+        RuntimeAdoptionCheckedRecordReport, RuntimeAdoptionGuidance, RuntimeAdoptionRecordPlan,
+        RuntimeAdoptionRecordPlanInput, RuntimeAdoptionRecordQualityReport,
+        RuntimeAdoptionReviewFilters, RuntimeAdoptionReviewReport,
+        build_research_ingest_plan_from_value, capture_runtime_adoption_record_input,
+        card_context_default_proposal, card_context_default_readiness,
+        card_context_rollback_control, check_runtime_adoption_record, evaluator_advice,
+        prepare_runtime_adoption_capture, prepare_runtime_adoption_record,
+        review_runtime_adoption_events, runtime_adoption_guidance,
+        runtime_adoption_instrumentation_policy, should_write_checked_record,
+    },
     priming::PrimingRequest,
     project::{
         ProjectMigrationEvent, ProjectSearchScope, escape_project_id_for_display,
@@ -29,8 +44,9 @@ use mempal::core::{
         AnchorKind, BootstrapEvidenceArgs, CompactionStrategy, Drawer, KnowledgeCard,
         KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink,
         KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
-        RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack,
-        SourceType, TaxonomyEntry, TriggerHints, TunnelEndpoint, default_confidence,
+        Provenance, RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal,
+        RuntimeAdoptionTrack, SourceType, TaxonomyEntry, TriggerHints, TunnelEndpoint,
+        default_confidence,
     },
     utils::{
         build_bootstrap_evidence_drawer_id, build_triple_id, current_timestamp,
@@ -303,6 +319,8 @@ enum Commands {
         include_evidence: bool,
         #[arg(long)]
         include_cards: bool,
+        #[arg(long = "no-include-cards")]
+        no_include_cards: bool,
         #[arg(long, default_value_t = 12)]
         max_items: usize,
         #[arg(long = "dao-tian-limit", default_value_t = 1)]
@@ -1065,7 +1083,41 @@ enum Phase3Commands {
         #[command(subcommand)]
         command: Phase3AdoptionCommands,
     },
+    Evaluator {
+        #[command(subcommand)]
+        command: Phase3EvaluatorCommands,
+    },
+    DefaultProposal {
+        candidate: String,
+        #[arg(long = "rollback-criterion")]
+        rollback_criteria: Vec<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    DefaultControl {
+        candidate: String,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        #[arg(long = "rollback-criterion")]
+        rollback_criteria: Vec<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    RollbackControl {
+        candidate: String,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
     Gate {
+        candidate: String,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    Readiness {
         candidate: String,
         #[arg(long, default_value = "plain")]
         format: String,
@@ -1075,11 +1127,170 @@ enum Phase3Commands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    ResearchIngestPlan {
+        path: PathBuf,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum Phase3EvaluatorCommands {
+    Advise {
+        #[arg(long = "evaluator-id")]
+        evaluator_id: Option<String>,
+        #[arg(long = "subject-kind")]
+        subject_kind: String,
+        #[arg(long = "subject-id")]
+        subject_id: String,
+        #[arg(long = "proposed-action")]
+        proposed_action: String,
+        #[arg(long = "evidence-ref")]
+        evidence_refs: Vec<String>,
+        #[arg(long = "counterexample-ref")]
+        counterexample_refs: Vec<String>,
+        #[arg(long = "risk-note")]
+        risk_notes: Vec<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // `record` intentionally carries the full event payload.
 enum Phase3AdoptionCommands {
+    Guidance {
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    InstrumentationPolicy {
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    PrepareRecord {
+        #[arg(long)]
+        track: String,
+        #[arg(long)]
+        signal: String,
+        #[arg(long)]
+        feature: String,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long = "context-hash")]
+        context_hash: Option<String>,
+        #[arg(long = "card-id")]
+        card_id: Option<String>,
+        #[arg(long = "evaluator-id")]
+        evaluator_id: Option<String>,
+        #[arg(long = "research-report-id")]
+        research_report_id: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long = "metadata-json")]
+        metadata_json: Option<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    Capture {
+        #[arg(long)]
+        surface: String,
+        #[arg(long)]
+        outcome: String,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long = "context-hash")]
+        context_hash: Option<String>,
+        #[arg(long = "card-id")]
+        card_id: Option<String>,
+        #[arg(long = "evaluator-id")]
+        evaluator_id: Option<String>,
+        #[arg(long = "research-report-id")]
+        research_report_id: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long = "metadata-json")]
+        metadata_json: Option<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long = "allow-warnings")]
+        allow_warnings: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    CheckRecord {
+        #[arg(long)]
+        track: String,
+        #[arg(long)]
+        signal: String,
+        #[arg(long)]
+        feature: String,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long = "context-hash")]
+        context_hash: Option<String>,
+        #[arg(long = "card-id")]
+        card_id: Option<String>,
+        #[arg(long = "evaluator-id")]
+        evaluator_id: Option<String>,
+        #[arg(long = "research-report-id")]
+        research_report_id: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long = "metadata-json")]
+        metadata_json: Option<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    RecordChecked {
+        #[arg(long)]
+        track: String,
+        #[arg(long)]
+        signal: String,
+        #[arg(long)]
+        feature: String,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long = "context-hash")]
+        context_hash: Option<String>,
+        #[arg(long = "card-id")]
+        card_id: Option<String>,
+        #[arg(long = "evaluator-id")]
+        evaluator_id: Option<String>,
+        #[arg(long = "research-report-id")]
+        research_report_id: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long = "metadata-json")]
+        metadata_json: Option<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long = "allow-warnings")]
+        allow_warnings: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    Review {
+        #[arg(long)]
+        track: Option<String>,
+        #[arg(long)]
+        feature: Option<String>,
+        #[arg(long)]
+        signal: Option<String>,
+        #[arg(long, default_value_t = 10_000)]
+        limit: usize,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
     Record {
         #[arg(long)]
         track: String,
@@ -1411,25 +1622,35 @@ fn run() -> Result<()> {
             format,
             include_evidence,
             include_cards,
+            no_include_cards,
             max_items,
             dao_tian_limit,
             trigger,
-        } => block_on_result(context_command(
-            &db,
-            config.as_ref(),
-            ContextCommandArgs {
-                query,
-                field,
-                domain,
-                cwd,
-                format,
-                include_evidence,
-                include_cards,
-                max_items,
-                dao_tian_limit,
-                trigger,
-            },
-        )),
+        } => {
+            let effective_include_cards = if no_include_cards {
+                false
+            } else if include_cards {
+                true
+            } else {
+                config.context.include_cards_default
+            };
+            block_on_result(context_command(
+                &db,
+                config.as_ref(),
+                ContextCommandArgs {
+                    query,
+                    field,
+                    domain,
+                    cwd,
+                    format,
+                    include_evidence,
+                    include_cards: effective_include_cards,
+                    max_items,
+                    dao_tian_limit,
+                    trigger,
+                },
+            ))
+        }
         Commands::Project { command } => project_command(&db, command),
         Commands::Config { .. } => unreachable!(),
         Commands::Delete { drawer_id } => delete_command(&db, &drawer_id),
@@ -1580,7 +1801,9 @@ fn run() -> Result<()> {
                 format,
             },
         ),
-        Commands::Phase3 { command } => phase3_command(&db, command),
+        Commands::Phase3 { command } => {
+            block_on_result(phase3_command(&db, config.as_ref(), command))
+        }
         Commands::Tunnels { command } => tunnels_command(&db, command),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
         Commands::FieldTaxonomy { format } => field_taxonomy_command(&format),
@@ -4643,22 +4866,780 @@ async fn knowledge_card_command(
     Ok(())
 }
 
-fn phase3_command(db: &Database, command: Phase3Commands) -> Result<()> {
+async fn phase3_command(db: &Database, config: &Config, command: Phase3Commands) -> Result<()> {
     match command {
         Phase3Commands::Adoption { command } => phase3_adoption_command(db, command),
+        Phase3Commands::Evaluator { command } => phase3_evaluator_command(command),
+        Phase3Commands::DefaultProposal {
+            candidate,
+            rollback_criteria,
+            format,
+        } => {
+            let report = phase3_default_proposal(db, &candidate, rollback_criteria)?;
+            print_card_context_default_proposal(&report, &format)
+        }
+        Phase3Commands::DefaultControl {
+            candidate,
+            enable,
+            disable,
+            rollback_criteria,
+            format,
+        } => {
+            let report =
+                phase3_default_control(db, &candidate, enable, disable, rollback_criteria)?;
+            print_phase3_default_control(&report, &format)
+        }
+        Phase3Commands::RollbackControl {
+            candidate,
+            execute,
+            format,
+        } => {
+            let report = phase3_rollback_control(db, &candidate, execute)?;
+            print_phase3_rollback_control(&report, &format)
+        }
         Phase3Commands::Gate { candidate, format } => {
             let report = phase3_gate_report(db, &candidate)?;
             print_phase3_gate_report(&report, &format)
+        }
+        Phase3Commands::Readiness { candidate, format } => {
+            let report = phase3_readiness_report(db, &candidate)?;
+            print_phase3_readiness_report(&report, &format)
         }
         Phase3Commands::ResearchValidatePlan { path, format } => {
             let report = validate_research_adapter_plan(&path)?;
             print_research_adapter_plan(&report, &format)
         }
+        Phase3Commands::ResearchIngestPlan {
+            path,
+            execute,
+            format,
+        } => research_ingest_plan_command(db, config, &path, execute, &format).await,
     }
+}
+
+fn phase3_default_proposal(
+    db: &Database,
+    candidate: &str,
+    rollback_criteria: Vec<String>,
+) -> Result<CardContextDefaultProposalReport> {
+    match candidate {
+        "card-context" => {
+            let events = db
+                .list_runtime_adoption_events(
+                    &RuntimeAdoptionFilter {
+                        track: Some(RuntimeAdoptionTrack::CardContext),
+                        feature: Some("include_cards".to_string()),
+                    },
+                    10_000,
+                )
+                .context("failed to list runtime adoption events")?;
+            Ok(card_context_default_proposal(&events, rollback_criteria))
+        }
+        other => bail!("unsupported phase3 default proposal candidate: {other}"),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct Phase3DefaultControlReport {
+    writes: bool,
+    candidate: String,
+    requested: String,
+    applied: bool,
+    include_cards_default: bool,
+    proposal: Option<CardContextDefaultProposalReport>,
+    reasons: Vec<String>,
+}
+
+fn phase3_default_control(
+    db: &Database,
+    candidate: &str,
+    enable: bool,
+    disable: bool,
+    rollback_criteria: Vec<String>,
+) -> Result<Phase3DefaultControlReport> {
+    if enable == disable {
+        bail!("exactly one of --enable or --disable is required");
+    }
+    match candidate {
+        "card-context" => {
+            let mut config = Config::load().context("failed to load config")?;
+            if disable {
+                config.context.include_cards_default = false;
+                config.save_default().context("failed to save config")?;
+                return Ok(Phase3DefaultControlReport {
+                    writes: true,
+                    candidate: candidate.to_string(),
+                    requested: "disable".to_string(),
+                    applied: true,
+                    include_cards_default: false,
+                    proposal: None,
+                    reasons: vec!["card context default disabled".to_string()],
+                });
+            }
+
+            let proposal = phase3_default_proposal(db, candidate, rollback_criteria)?;
+            if !proposal.proposal_ready {
+                return Ok(Phase3DefaultControlReport {
+                    writes: false,
+                    candidate: candidate.to_string(),
+                    requested: "enable".to_string(),
+                    applied: false,
+                    include_cards_default: config.context.include_cards_default,
+                    proposal: Some(proposal),
+                    reasons: vec!["default-on proposal is not ready".to_string()],
+                });
+            }
+
+            config.context.include_cards_default = true;
+            config.save_default().context("failed to save config")?;
+            Ok(Phase3DefaultControlReport {
+                writes: true,
+                candidate: candidate.to_string(),
+                requested: "enable".to_string(),
+                applied: true,
+                include_cards_default: true,
+                proposal: Some(proposal),
+                reasons: vec!["card context default enabled".to_string()],
+            })
+        }
+        other => bail!("unsupported phase3 default-control candidate: {other}"),
+    }
+}
+
+fn phase3_rollback_control(
+    db: &Database,
+    candidate: &str,
+    execute: bool,
+) -> Result<CardContextRollbackControlReport> {
+    match candidate {
+        "card-context" => {
+            let mut config = Config::load().context("failed to load config")?;
+            let events = db
+                .list_runtime_adoption_events(
+                    &RuntimeAdoptionFilter {
+                        track: Some(RuntimeAdoptionTrack::CardContext),
+                        feature: Some("include_cards".to_string()),
+                    },
+                    10_000,
+                )
+                .context("failed to list runtime adoption events")?;
+            let report = card_context_rollback_control(
+                &events,
+                config.context.include_cards_default,
+                execute,
+            );
+            if report.applied {
+                config.context.include_cards_default = false;
+                config.save_default().context("failed to save config")?;
+            }
+            Ok(report)
+        }
+        other => bail!("unsupported phase3 rollback-control candidate: {other}"),
+    }
+}
+
+fn phase3_evaluator_command(command: Phase3EvaluatorCommands) -> Result<()> {
+    match command {
+        Phase3EvaluatorCommands::Advise {
+            evaluator_id,
+            subject_kind,
+            subject_id,
+            proposed_action,
+            evidence_refs,
+            counterexample_refs,
+            risk_notes,
+            note,
+            format,
+        } => {
+            let report = evaluator_advice(EvaluatorAdviceInput {
+                evaluator_id: evaluator_id.unwrap_or_default(),
+                subject_kind,
+                subject_id,
+                proposed_action,
+                evidence_refs,
+                counterexample_refs,
+                risk_notes,
+                note,
+            })
+            .map_err(anyhow::Error::msg)?;
+            print_evaluator_advice(&report, &format)
+        }
+    }
+}
+
+fn phase3_readiness_report(db: &Database, candidate: &str) -> Result<Phase3ReadinessReport> {
+    match candidate {
+        "card-context-default" => {
+            let events = db
+                .list_runtime_adoption_events(
+                    &RuntimeAdoptionFilter {
+                        track: Some(RuntimeAdoptionTrack::CardContext),
+                        feature: Some("include_cards".to_string()),
+                    },
+                    10_000,
+                )
+                .context("failed to list runtime adoption events")?;
+            Ok(card_context_default_readiness(&events))
+        }
+        other => bail!("unsupported phase3 readiness candidate: {other}"),
+    }
+}
+
+fn print_card_context_default_proposal(
+    report: &CardContextDefaultProposalReport,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("writes={}", report.writes);
+            println!("candidate={}", report.candidate);
+            println!("proposal_ready={}", report.proposal_ready);
+            println!("decision={}", report.decision);
+            println!("readiness_ready={}", report.readiness.ready);
+            for criterion in &report.rollback_criteria {
+                println!("rollback_criterion={criterion}");
+            }
+            for reason in &report.reasons {
+                println!("reason={reason}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize card context default proposal")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 default proposal format: {other}"),
+    }
+}
+
+fn print_phase3_default_control(report: &Phase3DefaultControlReport, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("writes={}", report.writes);
+            println!("candidate={}", report.candidate);
+            println!("requested={}", report.requested);
+            println!("applied={}", report.applied);
+            println!("include_cards_default={}", report.include_cards_default);
+            for reason in &report.reasons {
+                println!("reason={reason}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize phase3 default control report")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 default control format: {other}"),
+    }
+}
+
+fn print_phase3_rollback_control(
+    report: &CardContextRollbackControlReport,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("writes={}", report.writes);
+            println!("candidate={}", report.candidate);
+            println!("execute={}", report.execute);
+            println!("rollback_required={}", report.rollback_required);
+            println!("applied={}", report.applied);
+            println!(
+                "include_cards_default_before={}",
+                report.include_cards_default_before
+            );
+            println!(
+                "include_cards_default_after={}",
+                report.include_cards_default_after
+            );
+            println!("rollback_events={}", report.review.stats.rollbacks);
+            for reason in &report.reasons {
+                println!("reason={reason}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize phase3 rollback control report")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 rollback-control format: {other}"),
+    }
+}
+
+fn print_phase3_readiness_report(report: &Phase3ReadinessReport, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("writes={}", report.writes);
+            println!("candidate={}", report.candidate);
+            println!("ready={}", report.ready);
+            println!("decision={}", report.decision);
+            println!("required_track={}", report.required_track);
+            println!("required_feature={}", report.required_feature);
+            println!("accepted={}", report.review.stats.accepted);
+            println!("rejected={}", report.review.stats.rejected);
+            println!("misses={}", report.review.stats.misses);
+            println!("rollbacks={}", report.review.stats.rollbacks);
+            println!("contradictions={}", report.review.stats.contradictions);
+            for reason in &report.reasons {
+                println!("reason={reason}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize phase3 readiness report")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 readiness format: {other}"),
+    }
+}
+
+fn print_evaluator_advice(report: &EvaluatorAdviceReport, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("writes={}", report.writes);
+            println!("evaluator_id={}", report.evaluator_id);
+            println!("subject_kind={}", report.subject_kind);
+            println!("subject_id={}", report.subject_id);
+            println!("proposed_action={}", report.proposed_action);
+            println!("recommendation={}", report.recommendation);
+            println!("lifecycle_authority={}", report.lifecycle_authority);
+            println!(
+                "deterministic_gate_required={}",
+                report.deterministic_gate_required
+            );
+            println!("requires_human_review={}", report.requires_human_review);
+            for reason in &report.reasons {
+                println!("reason={reason}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize evaluator advice")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 evaluator format: {other}"),
+    }
+}
+
+fn build_research_ingest_plan(path: &Path) -> Result<ResearchIngestPlanReport> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read research report {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse research report {}", path.display()))?;
+    Ok(build_research_ingest_plan_from_value(&value))
+}
+
+fn research_evidence_drawer(
+    drawer_id: String,
+    content: String,
+    source_file: String,
+    report_id: &str,
+    finding_index: usize,
+) -> Drawer {
+    Drawer {
+        id: drawer_id,
+        content,
+        wing: "mempal".to_string(),
+        room: Some("research".to_string()),
+        source_file: Some(source_file),
+        source_type: SourceType::SystemGenerated,
+        confidence: default_confidence(SourceType::SystemGenerated),
+        added_at: current_timestamp(),
+        chunk_index: Some(finding_index as i64),
+        normalize_version: CURRENT_NORMALIZE_VERSION,
+        importance: 3,
+        memory_kind: MemoryKind::Evidence,
+        domain: MemoryDomain::Project,
+        field: "research".to_string(),
+        anchor_kind: AnchorKind::Repo,
+        anchor_id: anchor::LEGACY_REPO_ANCHOR_ID.to_string(),
+        parent_anchor_id: None,
+        provenance: Some(Provenance::Research),
+        statement: Some(format!(
+            "Research finding from {report_id} #{finding_index}"
+        )),
+        tier: None,
+        status: None,
+        supporting_refs: Vec::new(),
+        counterexample_refs: Vec::new(),
+        teaching_refs: Vec::new(),
+        verification_refs: Vec::new(),
+        scope_constraints: None,
+        trigger_hints: None,
+        is_pinned: false,
+        pin_order: None,
+        supersedes: None,
+        effective_importance: 3.0,
+        compacted_into: None,
+    }
+}
+
+fn print_research_ingest_plan(report: &ResearchIngestPlanReport, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("valid={}", report.valid);
+            println!("writes={}", report.writes);
+            println!("report_id={}", report.report_id);
+            println!("title={}", report.title);
+            println!("planned_evidence_count={}", report.planned_evidence_count);
+            println!("created_count={}", report.created_count);
+            println!("skipped_count={}", report.skipped_count);
+            println!("candidate_insight_count={}", report.candidate_insight_count);
+            for error in &report.errors {
+                println!("error={error}");
+            }
+            for drawer in &report.evidence_drawers {
+                println!(
+                    "drawer={} finding_index={} created={} skipped={}",
+                    drawer.drawer_id, drawer.finding_index, drawer.created, drawer.skipped
+                );
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize research ingest plan")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 research ingest format: {other}"),
+    }
+}
+
+async fn research_ingest_plan_command(
+    db: &Database,
+    config: &Config,
+    path: &Path,
+    execute: bool,
+    format: &str,
+) -> Result<()> {
+    let mut report = build_research_ingest_plan(path)?;
+    if report.valid && execute {
+        let existing = report
+            .evidence_drawers
+            .iter()
+            .filter_map(|plan| {
+                db.get_drawer(&plan.drawer_id)
+                    .ok()
+                    .flatten()
+                    .map(|_| plan.drawer_id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let pending = report
+            .evidence_drawers
+            .iter()
+            .enumerate()
+            .filter(|(_, plan)| !existing.contains(&plan.drawer_id))
+            .map(|(index, plan)| (index, plan.drawer_id.clone(), plan.content.clone()))
+            .collect::<Vec<_>>();
+
+        let mut created_indices = BTreeSet::new();
+        if !pending.is_empty() {
+            let embedder = build_embedder(config).await?;
+            let content_refs = pending
+                .iter()
+                .map(|(_, _, content)| content.as_str())
+                .collect::<Vec<_>>();
+            let vectors = embedder
+                .embed(&content_refs)
+                .await
+                .context("failed to embed research evidence drawers")?;
+
+            for ((index, drawer_id, content), vector) in pending.into_iter().zip(vectors) {
+                let source_file = report.evidence_drawers[index].source_file.clone();
+                let drawer = research_evidence_drawer(
+                    drawer_id.clone(),
+                    content,
+                    source_file,
+                    report.report_id.as_str(),
+                    index,
+                );
+                db.insert_drawer(&drawer).with_context(|| {
+                    format!("failed to insert research evidence drawer {drawer_id}")
+                })?;
+                db.insert_vector(&drawer_id, &vector)
+                    .with_context(|| format!("failed to insert vector for {drawer_id}"))?;
+                created_indices.insert(index);
+            }
+        }
+
+        for (index, plan) in report.evidence_drawers.iter_mut().enumerate() {
+            plan.created = created_indices.contains(&index);
+            plan.skipped = existing.contains(&plan.drawer_id);
+        }
+        report.created_count = report
+            .evidence_drawers
+            .iter()
+            .filter(|plan| plan.created)
+            .count();
+        report.skipped_count = report
+            .evidence_drawers
+            .iter()
+            .filter(|plan| plan.skipped)
+            .count();
+        report.writes = report.created_count > 0;
+    }
+    print_research_ingest_plan(&report, format)
 }
 
 fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Result<()> {
     match command {
+        Phase3AdoptionCommands::Guidance { format } => {
+            print_runtime_adoption_guidance(&runtime_adoption_guidance(), &format)
+        }
+        Phase3AdoptionCommands::InstrumentationPolicy { format } => {
+            print_runtime_adoption_instrumentation_policy(
+                &runtime_adoption_instrumentation_policy(),
+                &format,
+            )
+        }
+        Phase3AdoptionCommands::PrepareRecord {
+            track,
+            signal,
+            feature,
+            query,
+            context_hash,
+            card_id,
+            evaluator_id,
+            research_report_id,
+            note,
+            metadata_json,
+            id,
+            format,
+        } => {
+            let track = parse_runtime_adoption_track(&track)?;
+            let signal = parse_runtime_adoption_signal(&signal)?;
+            let metadata = metadata_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .context("failed to parse --metadata-json")?;
+            let plan = prepare_runtime_adoption_record(RuntimeAdoptionRecordPlanInput {
+                id,
+                track: runtime_adoption_track_slug(&track).to_string(),
+                signal: runtime_adoption_signal_slug(&signal).to_string(),
+                feature,
+                query,
+                context_hash,
+                card_id,
+                evaluator_id,
+                research_report_id,
+                note,
+                metadata,
+            });
+            print_runtime_adoption_record_plan(&plan, &format)
+        }
+        Phase3AdoptionCommands::Capture {
+            surface,
+            outcome,
+            query,
+            context_hash,
+            card_id,
+            evaluator_id,
+            research_report_id,
+            note,
+            metadata_json,
+            id,
+            execute,
+            allow_warnings,
+            format,
+        } => {
+            let metadata = metadata_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .context("failed to parse --metadata-json")?;
+            let record_input = capture_runtime_adoption_record_input(RuntimeAdoptionCaptureInput {
+                id,
+                surface: surface.clone(),
+                outcome: outcome.clone(),
+                query,
+                context_hash,
+                card_id,
+                evaluator_id,
+                research_report_id,
+                note,
+                metadata,
+            })
+            .map_err(anyhow::Error::msg)?;
+            let mut report =
+                prepare_runtime_adoption_capture(surface, outcome, execute, record_input.clone());
+            if execute {
+                let track = parse_runtime_adoption_track(&record_input.track)?;
+                let signal = parse_runtime_adoption_signal(&record_input.signal)?;
+                let should_write =
+                    should_write_checked_record(&report.record_quality, allow_warnings);
+                let event = if should_write {
+                    let event = runtime_adoption_event_from_input(record_input, track, signal);
+                    db.insert_runtime_adoption_event(&event)
+                        .context("failed to insert runtime adoption event")?;
+                    Some(event)
+                } else {
+                    None
+                };
+                report.writes = event.is_some();
+                report.record_checked = Some(RuntimeAdoptionCheckedRecordReport {
+                    writes: event.is_some(),
+                    blocked: event.is_none(),
+                    record_quality: report.record_quality.clone(),
+                    event,
+                });
+            }
+            print_runtime_adoption_capture(&report, &format)
+        }
+        Phase3AdoptionCommands::CheckRecord {
+            track,
+            signal,
+            feature,
+            query,
+            context_hash,
+            card_id,
+            evaluator_id,
+            research_report_id,
+            note,
+            metadata_json,
+            id,
+            format,
+        } => {
+            let track = parse_runtime_adoption_track(&track)?;
+            let signal = parse_runtime_adoption_signal(&signal)?;
+            let metadata = metadata_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .context("failed to parse --metadata-json")?;
+            let input = RuntimeAdoptionRecordPlanInput {
+                id,
+                track: runtime_adoption_track_slug(&track).to_string(),
+                signal: runtime_adoption_signal_slug(&signal).to_string(),
+                feature,
+                query,
+                context_hash,
+                card_id,
+                evaluator_id,
+                research_report_id,
+                note,
+                metadata,
+            };
+            let report = check_runtime_adoption_record(&input);
+            print_runtime_adoption_record_quality(&report, &format)
+        }
+        Phase3AdoptionCommands::RecordChecked {
+            track,
+            signal,
+            feature,
+            query,
+            context_hash,
+            card_id,
+            evaluator_id,
+            research_report_id,
+            note,
+            metadata_json,
+            id,
+            allow_warnings,
+            format,
+        } => {
+            let track = parse_runtime_adoption_track(&track)?;
+            let signal = parse_runtime_adoption_signal(&signal)?;
+            let metadata = metadata_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .context("failed to parse --metadata-json")?;
+            let input = RuntimeAdoptionRecordPlanInput {
+                id,
+                track: runtime_adoption_track_slug(&track).to_string(),
+                signal: runtime_adoption_signal_slug(&signal).to_string(),
+                feature,
+                query,
+                context_hash,
+                card_id,
+                evaluator_id,
+                research_report_id,
+                note,
+                metadata,
+            };
+            let quality = check_runtime_adoption_record(&input);
+            let should_write = should_write_checked_record(&quality, allow_warnings);
+            let event = if should_write {
+                let event = runtime_adoption_event_from_input(input, track, signal);
+                db.insert_runtime_adoption_event(&event)
+                    .context("failed to insert runtime adoption event")?;
+                Some(event)
+            } else {
+                None
+            };
+            let report = RuntimeAdoptionCheckedRecordReport {
+                writes: event.is_some(),
+                blocked: event.is_none(),
+                record_quality: quality,
+                event,
+            };
+            print_runtime_adoption_checked_record(&report, &format)
+        }
+        Phase3AdoptionCommands::Review {
+            track,
+            feature,
+            signal,
+            limit,
+            format,
+        } => {
+            let track = track
+                .as_deref()
+                .map(parse_runtime_adoption_track)
+                .transpose()?;
+            let signal = signal
+                .as_deref()
+                .map(parse_runtime_adoption_signal)
+                .transpose()?;
+            let events = db
+                .list_runtime_adoption_events(
+                    &RuntimeAdoptionFilter {
+                        track: track.clone(),
+                        feature: feature.clone(),
+                    },
+                    limit,
+                )
+                .context("failed to list runtime adoption events")?;
+            let report = review_runtime_adoption_events(
+                &events,
+                RuntimeAdoptionReviewFilters {
+                    track: track
+                        .as_ref()
+                        .map(runtime_adoption_track_slug)
+                        .map(str::to_string),
+                    feature,
+                    signal: signal
+                        .as_ref()
+                        .map(runtime_adoption_signal_slug)
+                        .map(str::to_string),
+                    limit,
+                },
+            );
+            print_runtime_adoption_review(&report, &format)
+        }
         Phase3AdoptionCommands::Record {
             track,
             signal,
@@ -4680,42 +5661,24 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
                 .map(serde_json::from_str)
                 .transpose()
                 .context("failed to parse --metadata-json")?;
-            let created_at = current_timestamp();
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos().to_string())
-                .unwrap_or_else(|_| "0".to_string());
-            let id = id.unwrap_or_else(|| {
-                stable_cli_id(
-                    "adoption",
-                    &[
-                        runtime_adoption_track_slug(&track),
-                        runtime_adoption_signal_slug(&signal),
-                        feature.as_str(),
-                        query.as_deref().unwrap_or(""),
-                        context_hash.as_deref().unwrap_or(""),
-                        card_id.as_deref().unwrap_or(""),
-                        evaluator_id.as_deref().unwrap_or(""),
-                        research_report_id.as_deref().unwrap_or(""),
-                        created_at.as_str(),
-                        nonce.as_str(),
-                    ],
-                )
-            });
-            let event = RuntimeAdoptionEvent {
-                id: id.clone(),
+            let event = runtime_adoption_event_from_input(
+                RuntimeAdoptionRecordPlanInput {
+                    id,
+                    track: runtime_adoption_track_slug(&track).to_string(),
+                    signal: runtime_adoption_signal_slug(&signal).to_string(),
+                    feature,
+                    query,
+                    context_hash,
+                    card_id,
+                    evaluator_id,
+                    research_report_id,
+                    note,
+                    metadata,
+                },
                 track,
                 signal,
-                feature,
-                query,
-                context_hash,
-                card_id,
-                evaluator_id,
-                research_report_id,
-                note,
-                metadata,
-                created_at,
-            };
+            );
+            let id = event.id.clone();
             db.insert_runtime_adoption_event(&event)
                 .context("failed to insert runtime adoption event")?;
             match format.as_str() {
@@ -4769,6 +5732,276 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
             let stats = RuntimeAdoptionStats::from_events(&events);
             print_runtime_adoption_stats(&stats, &format)
         }
+    }
+}
+
+fn runtime_adoption_event_from_input(
+    input: RuntimeAdoptionRecordPlanInput,
+    track: RuntimeAdoptionTrack,
+    signal: RuntimeAdoptionSignal,
+) -> RuntimeAdoptionEvent {
+    let created_at = current_timestamp();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+    let id = input.id.unwrap_or_else(|| {
+        stable_cli_id(
+            "adoption",
+            &[
+                runtime_adoption_track_slug(&track),
+                runtime_adoption_signal_slug(&signal),
+                input.feature.as_str(),
+                input.query.as_deref().unwrap_or(""),
+                input.context_hash.as_deref().unwrap_or(""),
+                input.card_id.as_deref().unwrap_or(""),
+                input.evaluator_id.as_deref().unwrap_or(""),
+                input.research_report_id.as_deref().unwrap_or(""),
+                created_at.as_str(),
+                nonce.as_str(),
+            ],
+        )
+    });
+    RuntimeAdoptionEvent {
+        id,
+        track,
+        signal,
+        feature: input.feature,
+        query: input.query,
+        context_hash: input.context_hash,
+        card_id: input.card_id,
+        evaluator_id: input.evaluator_id,
+        research_report_id: input.research_report_id,
+        note: input.note,
+        metadata: input.metadata,
+        created_at,
+    }
+}
+
+fn print_runtime_adoption_checked_record(
+    report: &RuntimeAdoptionCheckedRecordReport,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("writes={}", report.writes);
+            println!("blocked={}", report.blocked);
+            println!("quality={}", report.record_quality.quality);
+            if let Some(event) = report.event.as_ref() {
+                println!("event_id={}", event.id);
+            }
+            for error in &report.record_quality.errors {
+                println!("error={error}");
+            }
+            for warning in &report.record_quality.warnings {
+                println!("warning={warning}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize runtime adoption checked record report")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 adoption format: {other}"),
+    }
+}
+
+fn print_runtime_adoption_capture(
+    report: &RuntimeAdoptionCaptureReport,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("writes={}", report.writes);
+            println!("execute={}", report.execute);
+            println!("surface={}", report.surface);
+            println!("outcome={}", report.outcome);
+            println!("quality={}", report.record_quality.quality);
+            if let Some(checked) = report.record_checked.as_ref() {
+                println!("blocked={}", checked.blocked);
+                if let Some(event) = checked.event.as_ref() {
+                    println!("event_id={}", event.id);
+                }
+            }
+            for error in &report.record_quality.errors {
+                println!("error={error}");
+            }
+            for warning in &report.record_quality.warnings {
+                println!("warning={warning}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize runtime adoption capture report")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 adoption format: {other}"),
+    }
+}
+
+fn print_runtime_adoption_review(report: &RuntimeAdoptionReviewReport, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("writes={}", report.writes);
+            println!("total={}", report.total);
+            println!("conclusion={}", report.conclusion);
+            for reason in &report.reasons {
+                println!("reason={reason}");
+            }
+            for feature in &report.features {
+                println!(
+                    "feature={} total={} accepted={} rejected={} misses={} rollbacks={}",
+                    feature.feature,
+                    feature.stats.total,
+                    feature.stats.accepted,
+                    feature.stats.rejected,
+                    feature.stats.misses,
+                    feature.stats.rollbacks
+                );
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize runtime adoption review report")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 adoption format: {other}"),
+    }
+}
+
+fn print_runtime_adoption_record_quality(
+    report: &RuntimeAdoptionRecordQualityReport,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("writes={}", report.writes);
+            println!("valid={}", report.valid);
+            println!("quality={}", report.quality);
+            for error in &report.errors {
+                println!("error={error}");
+            }
+            for warning in &report.warnings {
+                println!("warning={warning}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report)
+                    .context("failed to serialize runtime adoption record quality report")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 adoption format: {other}"),
+    }
+}
+
+fn print_runtime_adoption_record_plan(
+    plan: &RuntimeAdoptionRecordPlan,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("writes={}", plan.writes);
+            println!("record_command={}", plan.record_command.join(" "));
+            if let Some(action) = plan.record_payload.get("action").and_then(Value::as_str) {
+                println!("action={action}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(plan)
+                    .context("failed to serialize runtime adoption record plan")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 adoption format: {other}"),
+    }
+}
+
+fn print_runtime_adoption_guidance(guidance: &RuntimeAdoptionGuidance, format: &str) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("version={}", guidance.version);
+            println!("recording_rule={}", guidance.recording_rule);
+            println!("required_fields={}", guidance.required_fields.join(","));
+            println!("optional_fields={}", guidance.optional_fields.join(","));
+            for signal in &guidance.signals {
+                println!("signal={} when={}", signal.signal, signal.when);
+            }
+            for track in &guidance.tracks {
+                println!(
+                    "track={} when={} feature_examples={}",
+                    track.track,
+                    track.when,
+                    track.feature_examples.join(",")
+                );
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(guidance)
+                    .context("failed to serialize runtime adoption guidance")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 adoption format: {other}"),
+    }
+}
+
+fn print_runtime_adoption_instrumentation_policy(
+    policy: &mempal::core::phase3::RuntimeAdoptionInstrumentationPolicy,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "plain" => {
+            println!("version={}", policy.version);
+            println!("writes={}", policy.writes);
+            println!("default_mode={}", policy.default_mode);
+            for mode in &policy.allowed_modes {
+                println!(
+                    "allowed_mode={} requires_execute={} requires_checked_capture={}",
+                    mode.mode, mode.requires_execute, mode.requires_checked_capture
+                );
+            }
+            for mode in &policy.forbidden_modes {
+                println!("forbidden_mode={mode}");
+            }
+            for requirement in &policy.requirements {
+                println!("requirement={requirement}");
+            }
+            for requirement in &policy.rollback_requirements {
+                println!("rollback_requirement={requirement}");
+            }
+            Ok(())
+        }
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(policy)
+                    .context("failed to serialize runtime adoption instrumentation policy")?
+            );
+            Ok(())
+        }
+        other => bail!("unsupported phase3 adoption format: {other}"),
     }
 }
 

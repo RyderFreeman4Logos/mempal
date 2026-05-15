@@ -264,6 +264,64 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    retrieval priority. Sleep must respect project boundaries and pinned facts;
    review status/sleep stats before trusting large maintenance runs.
 
+19. RECORD PHASE-3 RUNTIME ADOPTION EVIDENCE
+   Use mempal_phase3 to record and inspect runtime adoption evidence before
+   proposing stronger defaults or new authority. The tool supports
+   guidance/instrumentation_policy/prepare_record/capture/evaluator_advise/default_proposal/rollback_control/check_record/record_checked/review/readiness/record/list/stats/gate/research_validate_plan/research_ingest_plan
+   actions over Phase-3 runtime_adoption_events. Start with action=guidance
+   when unsure whether a runtime outcome should be recorded. Use
+   action=instrumentation_policy before building live tool instrumentation:
+   live instrumentation is opt-in, must preserve user opt-out, and must route
+   writes through checked capture or record_checked instead of silently
+   appending events. Use
+   action=prepare_record to validate and assemble exact record inputs before
+   writing; prepare_record is read-only and does not append events. Use
+   action=capture when you have a concrete runtime outcome but do not want to
+   manually choose track/signal/feature: capture maps surface/outcome to the
+   checked-record path, is read-only by default, and writes only with
+   execute=true. Use action=evaluator_advise for deterministic evaluator advice:
+   it returns replayable advisory output and a surface=evaluator capture plan,
+   but writes=false, has no lifecycle authority, cannot satisfy reviewer
+   requirements, and cannot bypass gates. Use action=default_proposal with
+   candidate=card-context to combine card-context readiness with explicit
+   rollback criteria before writing a future default-on spec; it is read-only
+   and does not change include_cards defaults. Use
+   CLI `mempal phase3 default-control card-context` to explicitly enable or
+   disable local card-context defaults: enable requires a proposal-ready P74
+   condition and rollback criteria, disable is always allowed, and the command
+   writes only local config (`context.include_cards_default`). Use
+   action=rollback_control or CLI `mempal phase3 rollback-control card-context`
+   to evaluate rollback evidence for the card-context default. The CLI executor
+   is read-only unless `--execute` is supplied; when executed, it only sets local
+   config `context.include_cards_default=false` and does not append runtime
+   adoption events or alter knowledge lifecycle state. Agents must not
+   autonomously promote, demote, or otherwise mutate durable knowledge lifecycle
+   state. Agents must not autonomously promote knowledge.
+   human/operator-triggered lifecycle mutation remains required through
+   explicit promote/demote commands with deterministic gates
+   and evidence refs. Evaluator advice remains advisory: it can support review
+   but cannot satisfy reviewer authority, bypass gates, or create autonomous
+   lifecycle authority. Use
+   action=check_record to evaluate event quality before writing; check_record is
+   advisory, read-only, and reports errors/warnings without blocking record. Use
+   action=record_checked for quality-gated writes: ready records write,
+   warning records require allow_warnings=true, and invalid records are blocked.
+   Use action=review to summarize accumulated evidence by track, feature, and
+   signal before proposing stronger defaults; review is read-only and advisory.
+   Use action=readiness with candidate=card-context-default to inspect whether
+   card-aware context is eligible for a future default-on spec; readiness is
+   read-only and does not enable the default.
+   Record used when guidance was actually consumed,
+   accepted when it materially helped, rejected when it was considered and
+   intentionally not followed, miss when useful guidance should have appeared
+   but did not, rollback when behavior was reverted because guidance degraded the outcome, contradiction when guidance
+   conflicted with stronger evidence or instructions, and neutral when no clear
+   outcome impact is known. Gate, research_validate_plan, and
+   research_ingest_plan are advisory and
+   read-only: they do not enable card context by default, add card embeddings,
+   mutate evaluator lifecycle state, ingest research output, or promote
+   research output into knowledge.
+
 TOOLS:
   mempal_status        — current state, feature/status flags, intelligence mode, queue stats + this protocol + AAAK format spec
   mempal_pinned_facts  — pinned/canonical facts for always-on session context, no embedding needed
@@ -275,6 +333,7 @@ TOOLS:
   mempal_knowledge_policy — read-only Stage-1 promotion policy thresholds
   mempal_knowledge_gate — read-only knowledge promotion readiness check
   mempal_knowledge_cards — Phase-2 knowledge card list/get/retrieve/events/gate/promote/demote with auto_generated filtering
+  mempal_phase3       — Phase-3 runtime adoption evidence guidance/instrumentation_policy/prepare_record/capture/evaluator_advise/default_proposal/rollback_control/check_record/record_checked/review/readiness/record/list/stats/gate/research_validate_plan/research_ingest_plan
   mempal_knowledge_promote — gate-enforced knowledge lifecycle promotion
   mempal_knowledge_demote — evidence-backed knowledge demotion or retirement
   mempal_knowledge_publish_anchor — metadata-only outward anchor publication

@@ -1298,6 +1298,384 @@ external JSON report/input contract with `report_id`, `title`, `sources`,
 research adapter ingestion still preserves the P49 evidence-first boundary and
 does not create promoted/canonical knowledge.
 
+P60 exposes the Phase-3 runtime evidence baseline to MCP-connected agents
+through `mempal_phase3`. The MCP tool uses `action` values
+`record/list/stats/gate/research_validate_plan`, mirroring the P54-P59 CLI
+surfaces without adding new authority. Later Phase-3 actions extend this same
+bounded MCP surface. `record` appends `runtime_adoption_events`; `list`,
+`stats`, `gate`, and `research_validate_plan` remain read-only. MCP research
+validation accepts a JSON report object and still does not ingest or promote
+knowledge.
+
+P61 adds a read-only runtime adoption recording protocol through
+`mempal_phase3 action=guidance`. The guidance tells agents when to record
+`used`, `accepted`, `rejected`, `miss`, `rollback`, `contradiction`, or
+`neutral`, and exposes the required `track`, `signal`, and `feature` fields
+plus optional context fields. This is a recording discipline, not automatic
+instrumentation: it adds no hooks, no background writes, no schema migration,
+and no default runtime behavior change.
+
+P62 exposes the same recording protocol through CLI parity with
+`mempal phase3 adoption guidance`. The CLI supports plain and JSON output and
+shares the guidance implementation with `mempal_phase3 action=guidance`, so MCP
+agents, humans, and non-MCP automation inspect the same semantics. This remains
+read-only and does not append adoption events or change Phase-3 gate policy.
+
+P63 adds a read-only record helper through
+`mempal phase3 adoption prepare-record` and
+`mempal_phase3 action=prepare_record`. The helper validates and normalizes
+candidate record inputs, then returns the equivalent CLI `record` command and
+MCP `record` payload with `writes=false`. It does not generate event ids unless
+the caller supplied one, and it does not append runtime adoption events.
+
+P64 adds a read-only record quality policy through
+`mempal phase3 adoption check-record` and
+`mempal_phase3 action=check_record`. The policy evaluates candidate runtime
+adoption event quality before writing and returns `writes=false`, `valid`,
+`quality`, `errors`, and `warnings`. It treats empty `feature` as an error,
+warns when outcome-bearing signals lack concrete note/query context, and warns
+when track-specific references such as `card_id`, `evaluator_id`, or
+`research_report_id` are missing. This remains advisory only: it does not append
+events and does not block the lower-level `record` command.
+
+P65 adds a read-only runtime adoption review report through
+`mempal phase3 adoption review` and `mempal_phase3 action=review`. The report
+summarizes accumulated adoption evidence with applied filters, aggregate signal
+counts, per-feature counts, an advisory conclusion, and reasons. It supports
+track, feature, and signal filtering without schema changes; signal filtering is
+applied after DB retrieval. This gives future default-on specs a compact
+evidence artifact while preserving the Phase-3 boundary: review reports do not
+write events, change gates, or authorize runtime default changes.
+
+P66 adds a read-only card-context default readiness report through
+`mempal phase3 readiness card-context-default` and
+`mempal_phase3 action=readiness` with `candidate=card-context-default`. The
+report reuses P65 review semantics filtered to `track=card_context` and
+`feature=include_cards`, then returns `writes=false`, `ready`, `decision`, the
+embedded review, and reasons. `ready=true` only means the surface is eligible
+for a future default-on spec; it does not change `mempal context` defaults,
+enable `include_cards`, mutate lifecycle state, or create card embeddings.
+
+P67 adds explicit evidence-first research ingestion through
+`mempal phase3 research-ingest-plan`. The command accepts the same P59 report
+contract and defaults to dry-run with `writes=false`. With `--execute`, it
+writes one `memory_kind=evidence` drawer per finding using
+`provenance=research`, stable drawer ids, and idempotent skip-on-existing
+behavior. `candidate_insights` are surfaced only as `mempal knowledge distill`
+suggestions backed by the planned evidence refs; P67 does not create knowledge
+drawers, promote research output, add a schema migration, or expose MCP write
+access.
+
+P68 exposes the P67 dry-run planning semantics through MCP as
+`mempal_phase3 action=research_ingest_plan`. The action accepts an inline
+`report` JSON object, returns planned research evidence drawer refs plus
+candidate `mempal knowledge distill` suggestions, and always reports
+`writes=false`. It shares the same pure planner as the CLI but deliberately does
+not expose `--execute`, create drawers or vectors, mutate runtime adoption
+events, or promote research output into knowledge.
+
+P69 adds a quality-gated runtime adoption write path through
+`mempal phase3 adoption record-checked` and
+`mempal_phase3 action=record_checked`. The command/action runs the P64 record
+quality policy immediately before writing. `quality=ready` records are written,
+`quality=warning` records are blocked by default unless `allow_warnings` is
+explicitly set, and `quality=invalid` records are always blocked. This reduces
+low-signal self-evolution evidence without adding hooks, background
+instrumentation, schema changes, or new authority for Phase-3 gates.
+
+P70 self-evolution completion audit records the current state against the
+larger objective: a complete self-evolving agent system. Complete
+self-evolving agent system deliverables are:
+
+- evidence substrate: the system can store cited raw evidence and runtime
+  adoption outcomes without losing provenance
+- knowledge governance: evidence can be distilled into governed knowledge and
+  moved through lifecycle gates
+- runtime retrieval: agents can request context/search/card/research guidance
+  without changing defaults implicitly
+- research bridge: external research output can enter as evidence and candidate
+  insight suggestions, not as direct dao
+- feedback loop: runtime use, acceptance, rejection, misses, rollbacks, and
+  contradictions can be recorded and reviewed
+- policy hardening path: stronger defaults require evidence, readiness checks,
+  rollback criteria, and a new P-level spec
+
+Prompt-to-artifact checklist:
+
+- Evidence substrate -> P54 runtime_adoption_events plus P0-P13 raw drawer
+  storage and cited search provide durable evidence records.
+- Knowledge governance -> P12-P28 implement typed `dao_tian` / `dao_ren` /
+  `shu` / `qi` drawers, context assembly, policy surfaces, distill, gate,
+  promote, demote, and anchor publication.
+- Knowledge cards -> P31-P45 implement Phase-2 card schema, core API, CLI,
+  MCP read/lifecycle/retrieval, backfill, and explicit card-aware context.
+- Research ingestion -> P49/P59/P67/P68 preserve evidence-first research
+  boundaries: validate report, plan evidence refs, write research evidence only
+  through explicit CLI `--execute`, and expose MCP dry-run planning.
+- Runtime adoption -> P54-P69 implement event storage, CLI/MCP record/list/stats,
+  guidance, prepare/check helpers, review, readiness, and quality-gated
+  `record_checked` writes.
+- Default hardening -> P56/P57/P58/P66 define read-only gates and readiness
+  reports for card context, card embeddings, evaluator APIs, and
+  card-context-default eligibility.
+
+P70 conclusion: not complete. P12-P69 establish a governed self-evolution
+substrate, but they do not yet prove a complete self-evolving agent system.
+Remaining gaps before full self-evolution:
+
+- no automatic or semi-automatic adoption capture around actual agent tool
+  execution; evidence still depends on explicit CLI/MCP calls
+- no end-to-end replay that demonstrates research -> evidence -> distill ->
+  gated promotion -> runtime context -> checked adoption record in one audited
+  scenario
+- no evaluator advisory API with replayable output contracts; P50/P58 only keep
+  evaluators advisory and gated
+- no default-on card context or card embeddings; P66 readiness only reports
+  eligibility for a future default-on spec
+- no autonomous promotion authority; lifecycle changes still require deterministic
+  gates, evidence refs, and human/reviewer boundaries
+- no rollback executor for default/runtime policy changes; rollback criteria are
+  policy requirements, not an automated runtime mechanism
+
+Future P candidates:
+
+- P71 self-evolution loop replay: implemented as a CLI E2E replay test that
+  walks research -> evidence -> knowledge card -> gate/promote -> context ->
+  checked adoption record. This proves the existing pieces can compose, but it
+  does not add automatic runtime capture.
+- P72 runtime adoption capture helper: implemented as explicit CLI/MCP
+  `capture` surfaces that map `surface/outcome` observations into existing
+  checked runtime adoption records. It is dry-run by default, writes only with
+  explicit execute, and does not add background instrumentation.
+- P73 evaluator advisory API: implemented as deterministic CLI/MCP advice
+  surfaces through `mempal phase3 evaluator advise` and
+  `mempal_phase3 action=evaluator_advise`. Advice output is replayable from
+  request fields, returns `writes=false`, `lifecycle_authority=false`,
+  `deterministic_gate_required=true`, reasons, and a `surface=evaluator`
+  adoption capture plan. It cannot mutate lifecycle state, satisfy reviewer
+  requirements, bypass gates, or call LLM/network evaluators.
+- P74 card context default-on proposal: implemented as read-only CLI/MCP
+  proposal surfaces through `mempal phase3 default-proposal card-context` and
+  `mempal_phase3 action=default_proposal`. The proposal embeds P66 readiness,
+  requires explicit rollback criteria, returns `writes=false`, and only marks
+  `proposal_ready=true` when both readiness and rollback criteria are present.
+  It deliberately keeps `mempal context` / `mempal_context` default
+  `include_cards=false`; any actual default change still requires a future
+  explicit spec.
+
+P75 self-evolution completion audit revisits the full objective after P71-P74
+landed on main.
+
+P75 objective restatement:
+
+- The system must preserve raw evidence and runtime outcome evidence with
+  provenance.
+- The system must distill evidence into governed knowledge and cards through
+  deterministic gates.
+- The system must expose retrieval/context surfaces that agents can use without
+  silently changing runtime defaults.
+- The system must accept external research only through evidence-first and
+  evidence-backed candidate insight paths.
+- The system must record, review, and quality-gate runtime adoption feedback.
+- The system must provide evaluator advice without granting lifecycle authority.
+- The system must provide a policy-hardening path where stronger defaults require
+  evidence, readiness checks, rollback criteria, and a new explicit spec.
+
+P75 prompt-to-artifact checklist:
+
+- Evidence substrate: P0-P13 raw drawer storage and citation-bearing search,
+  P54 `runtime_adoption_events`, and schema v9 tests prove durable evidence and
+  runtime outcome storage.
+- Knowledge governance: P12-P28 typed `dao_tian` / `dao_ren` / `shu` / `qi`
+  drawers, policy surfaces, distill, gate, promote/demote, and anchor
+  publication remain covered by `tests/knowledge_lifecycle.rs`.
+- Knowledge cards: P31-P45 card schema, core API, CLI, MCP, retrieval, backfill,
+  and lifecycle surfaces remain covered by `tests/knowledge_card_*` and explicit
+  card-aware context tests.
+- Research bridge: P49/P59/P67/P68 ensure research output enters as evidence or
+  evidence-backed candidate insight suggestions; P71 proves this path in
+  `tests/phase3_self_evolution_replay.rs`.
+- Self-evolution replay: P71 `tests/phase3_self_evolution_replay.rs` walks
+  research -> evidence -> card promotion -> context -> checked adoption record.
+- Adoption capture: P72 `mempal phase3 adoption capture` and
+  `mempal_phase3 action=capture` map concrete `surface/outcome` observations
+  into checked records without background instrumentation.
+- Evaluator advice: P73 `mempal phase3 evaluator advise` and
+  `mempal_phase3 action=evaluator_advise` return replayable advisory output with
+  `lifecycle_authority=false` and `deterministic_gate_required=true`.
+- Default hardening proposal: P74 `mempal phase3 default-proposal card-context`
+  and `mempal_phase3 action=default_proposal` combine P66 readiness with
+  rollback criteria while preserving `include_cards=false`.
+- Protocol and inventory evidence: `src/core/protocol.rs`, `AGENTS.md`, and
+  `CLAUDE.md` list the Phase-3 actions through
+  `capture/evaluator_advise/default_proposal`.
+- Mainline verification evidence: PRs #63, #64, #65, and #66 were merged to
+  main with green `fmt`, `default`, and `rest` CI checks.
+
+P75 conclusion: not complete.
+
+The governed self-evolution substrate is now substantially complete: evidence,
+knowledge governance, cards, research ingestion, runtime adoption feedback,
+replay, capture helpers, evaluator advice, and default-on proposal artifacts are
+implemented and tested. However, the full "complete self-evolving agent system"
+objective still has uncovered requirements if interpreted as autonomous runtime
+self-evolution.
+
+Remaining gaps after P75:
+
+- no automatic live tool instrumentation: adoption capture still requires
+  explicit CLI/MCP calls rather than wrapping actual agent tool execution
+- no actual default-on runtime change: `include_cards` remains opt-in by design,
+  and P74 only creates a proposal artifact
+- no rollback executor: rollback criteria are recorded in proposals but are not
+  executable runtime policy
+- no autonomous promotion authority: lifecycle mutation still requires
+  deterministic gates, evidence refs, and human/reviewer boundaries
+- no card embedding implementation: P57/P47 keep card-level embeddings behind
+  measured miss evidence and future rollback requirements
+
+P76 spec completeness invariant records the process rule that every numbered P
+must leave both a task contract and a matching plan. This includes
+documentation-only, audit-only, policy-only, and code implementation work. The
+rule exists because the P-series is no longer just a task list; it is the
+auditable decision trail for the mind-model implementation. Every P must leave
+a spec before it can be considered complete. A future spec-less P or missing
+spec is explicitly incomplete and must be fixed before implementation or merge.
+
+Updated recommended next P candidates after reserving P76 for governance:
+
+P77 live adoption instrumentation boundary adds a read-only policy surface for
+the live instrumentation gap. `mempal phase3 adoption instrumentation-policy`
+and `mempal_phase3 action=instrumentation_policy` return `writes=false`,
+`default_mode=manual_only`, allow only `opt_in_wrapper` as the semi-automatic
+mode, and explicitly forbid `implicit_background_capture`, silent event append,
+and quality gate bypass. This does not install hooks or wrappers; it defines the
+safe boundary future instrumentation must obey: opt-in, user opt-out, checked
+capture/record_checked writes, and rollback evidence when instrumentation
+degrades behavior.
+
+Updated recommended next P candidates after completing P77:
+
+P78 card context default runtime flag implements the first actual default
+runtime change path for cards. The default remains `false` unless local config
+sets `context.include_cards_default=true`. `mempal context` and `mempal_context`
+use that config only when the request omits explicit card flags; CLI
+`--include-cards` still opts in, CLI `--no-include-cards` opts out, and MCP
+`include_cards` overrides config when supplied. The only supported write path is
+`mempal phase3 default-control card-context`: enabling requires the P74
+proposal-ready conditions, including sufficient `card_context/include_cards`
+runtime adoption evidence and rollback criteria; disabling is always allowed
+and writes the flag back to false. The command writes local config only and does
+not append runtime adoption events, change schema, or alter search defaults.
+
+Updated recommended next P candidates after completing P78:
+
+- P79 rollback executor policy implements the first concrete rollback executor
+  for default/runtime policy changes. CLI `mempal phase3 rollback-control
+  card-context` evaluates `card_context/include_cards` rollback evidence and,
+  only with `--execute`, writes local config
+  `context.include_cards_default=false`. MCP `mempal_phase3
+  action=rollback_control` exposes the same rollback evidence check as a
+  read-only agent surface. No runtime adoption events, knowledge lifecycle
+  state, schema, or search defaults are changed by rollback control.
+
+Updated recommended next P candidates after completing P79:
+
+P80 autonomous promotion boundary audit resolves the last ambiguous "gap" from
+P70/P75 as a governance boundary rather than a missing implementation.
+Autonomous promotion is out of scope for the current complete self-evolution
+design. mempal can autonomously preserve evidence, prepare candidate knowledge,
+evaluate gates, produce evaluator advice, assemble context, propose default
+changes, and execute explicit rollback controls, but lifecycle authority remains
+human-gated.
+P80 decision: autonomous promotion is out of scope.
+
+human-gated lifecycle authority is the final governance boundary: promotion and
+demotion of Stage-1 knowledge drawers or Phase-2 knowledge cards must remain
+explicit human/operator-triggered lifecycle mutation surfaces. Deterministic
+gates, evidence refs, reviewer rules, evaluator advice, runtime adoption
+evidence, and research findings can support the decision, but none of them can
+silently convert a candidate into promoted knowledge. This boundary keeps the
+system self-evolving in the evidence/proposal/context/adoption loop while
+avoiding an agent that can grant itself durable knowledge authority.
+
+Updated recommended next P candidate after completing P80:
+
+- P81 self-evolution completion audit: re-evaluate the active objective against
+  the actual artifacts after P77-P80. If the governed, human-gated definition is
+  accepted as the intended objective, the audit can close the goal; if the goal
+  still requires fully autonomous lifecycle mutation, that requirement must be
+  reopened as a separate explicit spec rather than inferred.
+
+P81 self-evolution completion audit is the final audit for the active objective
+`完整自进化 agent 系统`.
+
+Objective restatement: the target is a governed human-gated complete
+self-evolving agent system. "Complete" means the agent can gather external and
+runtime evidence, preserve provenance, distill and structure knowledge, retrieve
+the right knowledge/skills/tools at runtime, record feedback, evaluate stronger
+defaults, apply explicit default/rollback controls, and keep durable knowledge
+lifecycle mutation under deterministic gates plus human/operator intent.
+
+Prompt-to-artifact checklist:
+
+- Evidence substrate: P0-P13 raw drawer storage, citation-bearing search, and
+  P54 `runtime_adoption_events` provide durable evidence and runtime outcome
+  storage. Evidence remains raw and cited; search/context do not rewrite source
+  content.
+- Knowledge governance: P12-P28 typed `dao_tian` / `dao_ren` / `shu` / `qi`
+  drawers, policy surfaces, distill, gate, promote/demote, and anchor
+  publication provide governed knowledge lifecycle for Stage-1 drawers.
+- Knowledge cards: P31-P45 implement card schema, evidence links, append-only
+  events, CLI/MCP lifecycle, backfill, retrieval, and explicit card-aware
+  context without making cards an implicit search/default source.
+- Research bridge: P49/P59/P67/P68 ensure external research enters as evidence
+  or evidence-backed candidate insight suggestions. Research output cannot
+  directly define dao or bypass gates.
+- Runtime feedback loop: P54-P69 provide runtime adoption event storage,
+  guidance, prepare/check helpers, review/readiness/gate reports, and
+  quality-gated `record_checked` writes.
+- Self-evolution replay: P71 `tests/phase3_self_evolution_replay.rs` proves the
+  composed path research -> evidence -> card promotion -> context -> checked
+  adoption record.
+- Live adoption boundary: P77 `instrumentation_policy` defines the safe boundary
+  for future live wrappers: opt-in, preserve opt-out, no silent event append,
+  and route writes through checked capture or `record_checked`.
+- Runtime default control: P74/P78 provide proposal-ready and explicit
+  `default-control` paths for card-aware context. Default change requires
+  runtime evidence and rollback criteria; request-level overrides still win.
+- Rollback and default control: P79 `rollback-control` turns rollback evidence
+  into an explicit reversible config action, setting
+  `context.include_cards_default=false` only with `--execute` and without
+  writing runtime events or lifecycle state.
+- Evaluator boundary: P50/P58/P73 keep evaluators advisory-only.
+  `evaluator_advise` is replayable, returns `lifecycle_authority=false`, and
+  cannot satisfy reviewer authority or bypass deterministic gates.
+- Lifecycle authority boundary: P80 declares autonomous promotion out of scope.
+  Human/operator-triggered promote/demote commands with evidence refs and gates
+  remain the only durable lifecycle mutation path.
+- Spec completeness: P76 requires every numbered P to leave a matching task spec
+  and plan. P77-P81 follow this rule.
+- Mainline verification: PR #68 through PR #72 are merged to main. Main CI runs
+  `25805677837`, `25806999068`, `25808402185`, `25809830828`, and
+  `25810588996` all completed with success across `fmt`, `default`, and `rest`
+  jobs.
+
+P81 conclusion: complete.
+
+The active objective is complete under the governed human-gated definition. The
+system now has an auditable loop from evidence intake to governed knowledge,
+runtime context, feedback capture, policy evaluation, explicit default control,
+and explicit rollback. It does not grant agents silent durable lifecycle
+authority, and that is an intentional design boundary rather than a missing
+implementation.
+
+Residual boundary: fully autonomous lifecycle mutation remains out of scope. If
+future work requires an agent to promote or demote durable knowledge without a
+human/operator-triggered lifecycle command, that is a new objective and must be
+opened as a separate P-level spec with its own evidence, rollback, safety, and
+acceptance criteria.
+
 ## Closing Summary
 
 The proposed system is not "RAG plus skills."

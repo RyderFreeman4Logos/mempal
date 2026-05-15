@@ -40,6 +40,7 @@ fn tiered_config_enabled() -> ContextConfig {
             t3_ratio: 0.20,
             overflow_to_t2: true,
         },
+        include_cards_default: false,
     }
 }
 

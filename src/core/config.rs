@@ -184,6 +184,24 @@ impl Config {
         Ok(config)
     }
 
+    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let contents = toml::to_string_pretty(self)?;
+        fs::write(path, contents).map_err(|source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    pub fn save_default(&self) -> Result<(), ConfigError> {
+        self.save_to(&default_config_path())
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if let Some(project_id) = self.project.id.as_deref() {
             super::project::validate_project_id(project_id)
@@ -1488,6 +1506,14 @@ pub enum ConfigError {
         #[source]
         source: toml::ser::Error,
     },
+    #[error("failed to write config to {path}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to serialize config TOML")]
+    Serialize(#[from] toml::ser::Error),
     #[error("invalid config: {0}")]
     Validation(String),
     #[error("invalid config: {0}")]
@@ -1719,6 +1745,8 @@ pub struct ContextConfig {
     pub t1_recency_lambda: f64,
     /// Token budget allocation per tier.
     pub budget: ContextBudgetConfig,
+    /// Include Phase-2 knowledge cards by default in context assembly.
+    pub include_cards_default: bool,
 }
 
 impl Default for ContextConfig {
@@ -1731,6 +1759,7 @@ impl Default for ContextConfig {
             t3_recency_window_days: DEFAULT_CONTEXT_T3_RECENCY_WINDOW_DAYS,
             t1_recency_lambda: DEFAULT_CONTEXT_T1_RECENCY_LAMBDA,
             budget: ContextBudgetConfig::default(),
+            include_cards_default: false,
         }
     }
 }
