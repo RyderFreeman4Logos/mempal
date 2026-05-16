@@ -8,11 +8,22 @@ use crate::core::{
     anchor::{self, DerivedAnchor},
     config::ConfigHandle,
     db::Database,
+    phase3::{
+        EvaluatorAdviceInput, RuntimeAdoptionCaptureInput, RuntimeAdoptionCheckedRecordReport,
+        RuntimeAdoptionRecordPlanInput, RuntimeAdoptionReviewFilters,
+        build_research_ingest_plan_from_value, capture_runtime_adoption_record_input,
+        card_context_default_proposal, card_context_default_readiness,
+        card_context_rollback_control, check_runtime_adoption_record, evaluator_advice,
+        prepare_runtime_adoption_capture, prepare_runtime_adoption_record,
+        review_runtime_adoption_events, runtime_adoption_guidance,
+        runtime_adoption_instrumentation_policy, should_write_checked_record,
+    },
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
         AnchorKind, BootstrapIdentityParts, Drawer, ExplicitTunnel, KnowledgeCardFilter,
-        KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance, SourceType,
+        KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance, RuntimeAdoptionEvent,
+        RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack, SourceType,
         TriggerHints, Triple, default_confidence,
     },
     utils::{
@@ -75,13 +86,15 @@ use super::tools::{
     KnowledgePromoteRequest, KnowledgePromoteResponse, KnowledgePublishAnchorRequest,
     KnowledgePublishAnchorResponse, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT,
     MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse,
-    PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse, QueueStatsDto,
-    ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
-    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, ScopeCount, ScrubStatsDto,
-    SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
-    SkillSummaryDto, SourceTypeCount, StatusResponse, SystemWarning, TaxonomyEntryDto,
-    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
-    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    Phase3GateDto, Phase3Request, Phase3Response, PinnedFactDto, PinnedFactProjectCount,
+    PinnedFactsRequest, PinnedFactsResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
+    ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto,
+    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto,
+    RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
+    SearchResultDto, SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount,
+    StatusResponse, SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse,
+    TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse,
+    TurnStorageStatusDto,
 };
 
 #[derive(Clone)]
@@ -331,6 +344,17 @@ impl MempalMcpServer {
         &self,
     ) -> std::result::Result<FieldTaxonomyResponse, ErrorData> {
         self.mempal_field_taxonomy()
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn phase3_json_for_test(
+        &self,
+        value: Value,
+    ) -> std::result::Result<Phase3Response, ErrorData> {
+        let request = serde_json::from_value(value)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        self.mempal_phase3(Parameters(request))
             .await
             .map(|response| response.0)
     }
@@ -976,6 +1000,237 @@ fn required_string<'a>(
     trim_to_option(value)
         .ok_or_else(|| ErrorData::invalid_params(format!("{field} is required"), None))
 }
+
+fn parse_runtime_adoption_track_opt(
+    value: Option<&str>,
+) -> std::result::Result<Option<RuntimeAdoptionTrack>, ErrorData> {
+    parse_enum(value, "track", |normalized| match normalized {
+        "runtime_adoption" => Some(RuntimeAdoptionTrack::RuntimeAdoption),
+        "card_context" => Some(RuntimeAdoptionTrack::CardContext),
+        "card_embedding" => Some(RuntimeAdoptionTrack::CardEmbedding),
+        "evaluator" => Some(RuntimeAdoptionTrack::Evaluator),
+        "research_adapter" => Some(RuntimeAdoptionTrack::ResearchAdapter),
+        _ => None,
+    })
+}
+
+fn parse_runtime_adoption_track(
+    value: &str,
+) -> std::result::Result<RuntimeAdoptionTrack, ErrorData> {
+    parse_runtime_adoption_track_opt(Some(value))?
+        .ok_or_else(|| ErrorData::invalid_params("track is required", None))
+}
+
+fn parse_runtime_adoption_signal(
+    value: &str,
+) -> std::result::Result<RuntimeAdoptionSignal, ErrorData> {
+    parse_enum(Some(value), "signal", |normalized| match normalized {
+        "used" => Some(RuntimeAdoptionSignal::Used),
+        "accepted" => Some(RuntimeAdoptionSignal::Accepted),
+        "rejected" => Some(RuntimeAdoptionSignal::Rejected),
+        "miss" => Some(RuntimeAdoptionSignal::Miss),
+        "rollback" => Some(RuntimeAdoptionSignal::Rollback),
+        "contradiction" => Some(RuntimeAdoptionSignal::Contradiction),
+        "neutral" => Some(RuntimeAdoptionSignal::Neutral),
+        _ => None,
+    })?
+    .ok_or_else(|| ErrorData::invalid_params("signal is required", None))
+}
+
+fn runtime_adoption_track_slug(track: &RuntimeAdoptionTrack) -> &'static str {
+    match track {
+        RuntimeAdoptionTrack::RuntimeAdoption => "runtime_adoption",
+        RuntimeAdoptionTrack::CardContext => "card_context",
+        RuntimeAdoptionTrack::CardEmbedding => "card_embedding",
+        RuntimeAdoptionTrack::Evaluator => "evaluator",
+        RuntimeAdoptionTrack::ResearchAdapter => "research_adapter",
+    }
+}
+
+fn runtime_adoption_signal_slug(signal: &RuntimeAdoptionSignal) -> &'static str {
+    match signal {
+        RuntimeAdoptionSignal::Used => "used",
+        RuntimeAdoptionSignal::Accepted => "accepted",
+        RuntimeAdoptionSignal::Rejected => "rejected",
+        RuntimeAdoptionSignal::Miss => "miss",
+        RuntimeAdoptionSignal::Rollback => "rollback",
+        RuntimeAdoptionSignal::Contradiction => "contradiction",
+        RuntimeAdoptionSignal::Neutral => "neutral",
+    }
+}
+
+fn phase3_event_id(
+    track: &RuntimeAdoptionTrack,
+    signal: &RuntimeAdoptionSignal,
+    feature: &str,
+) -> String {
+    let signal = match signal {
+        RuntimeAdoptionSignal::Used => "used",
+        RuntimeAdoptionSignal::Accepted => "accepted",
+        RuntimeAdoptionSignal::Rejected => "rejected",
+        RuntimeAdoptionSignal::Miss => "miss",
+        RuntimeAdoptionSignal::Rollback => "rollback",
+        RuntimeAdoptionSignal::Contradiction => "contradiction",
+        RuntimeAdoptionSignal::Neutral => "neutral",
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sanitized_feature = feature
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!(
+        "adoption_{}_{}_{}_{}",
+        runtime_adoption_track_slug(track),
+        signal,
+        sanitized_feature,
+        nanos
+    )
+}
+
+fn runtime_adoption_stats(events: &[RuntimeAdoptionEvent]) -> RuntimeAdoptionStatsDto {
+    let mut stats = RuntimeAdoptionStatsDto {
+        total: events.len(),
+        used: 0,
+        accepted: 0,
+        rejected: 0,
+        misses: 0,
+        rollbacks: 0,
+        contradictions: 0,
+        neutral: 0,
+    };
+    for event in events {
+        match event.signal {
+            RuntimeAdoptionSignal::Used => stats.used += 1,
+            RuntimeAdoptionSignal::Accepted => stats.accepted += 1,
+            RuntimeAdoptionSignal::Rejected => stats.rejected += 1,
+            RuntimeAdoptionSignal::Miss => stats.misses += 1,
+            RuntimeAdoptionSignal::Rollback => stats.rollbacks += 1,
+            RuntimeAdoptionSignal::Contradiction => stats.contradictions += 1,
+            RuntimeAdoptionSignal::Neutral => stats.neutral += 1,
+        }
+    }
+    stats
+}
+
+fn phase3_gate_report(
+    db: &Database,
+    candidate: &str,
+) -> std::result::Result<Phase3GateDto, ErrorData> {
+    let (track, ready_fn): (RuntimeAdoptionTrack, fn(&RuntimeAdoptionStatsDto) -> bool) =
+        match candidate {
+            "card-context-default" => (RuntimeAdoptionTrack::CardContext, |stats| {
+                stats.accepted >= 3 && stats.rollbacks == 0 && stats.rejected <= stats.accepted
+            }),
+            "card-embeddings" => (RuntimeAdoptionTrack::CardEmbedding, |stats| {
+                stats.misses >= 3 && stats.rollbacks == 0
+            }),
+            "evaluator-api" => (RuntimeAdoptionTrack::Evaluator, |stats| {
+                stats.accepted >= 3 && stats.rollbacks == 0 && stats.contradictions == 0
+            }),
+            "research-adapter" => (RuntimeAdoptionTrack::ResearchAdapter, |stats| {
+                stats.accepted >= 1 && stats.contradictions == 0 && stats.rollbacks == 0
+            }),
+            other => {
+                return Err(ErrorData::invalid_params(
+                    format!("unsupported phase3 candidate: {other}"),
+                    None,
+                ));
+            }
+        };
+    let events = db
+        .list_runtime_adoption_events(
+            &RuntimeAdoptionFilter {
+                track: Some(track.clone()),
+                feature: None,
+            },
+            10_000,
+        )
+        .map_err(|error| {
+            ErrorData::internal_error(
+                format!("failed to list runtime adoption events: {error}"),
+                None,
+            )
+        })?;
+    let stats = runtime_adoption_stats(&events);
+    let ready = ready_fn(&stats);
+    let mut reasons = Vec::new();
+    if ready {
+        reasons.push("minimum evidence threshold satisfied".to_string());
+    } else {
+        reasons.push("minimum evidence threshold not satisfied".to_string());
+    }
+    if stats.rollbacks > 0 {
+        reasons.push("rollback signals block default or authority changes".to_string());
+    }
+    if stats.contradictions > 0 {
+        reasons.push("contradiction signals require review before implementation".to_string());
+    }
+    Ok(Phase3GateDto {
+        candidate: candidate.to_string(),
+        ready,
+        required_track: runtime_adoption_track_slug(&track).to_string(),
+        stats,
+        reasons,
+    })
+}
+
+fn validate_research_adapter_plan_value(value: &serde_json::Value) -> ResearchAdapterPlanDto {
+    let mut errors = Vec::new();
+    let report_id = required_json_string(value, "report_id", &mut errors);
+    let title = required_json_string(value, "title", &mut errors);
+    let source_count = value
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    if source_count == 0 {
+        errors.push("sources must contain at least one item".to_string());
+    }
+    let finding_count = value
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    if finding_count == 0 {
+        errors.push("findings must contain at least one item".to_string());
+    }
+    let candidate_insight_count = value
+        .get("candidate_insights")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+
+    ResearchAdapterPlanDto {
+        valid: errors.is_empty(),
+        report_id,
+        title,
+        source_count,
+        finding_count,
+        candidate_insight_count,
+        errors,
+    }
+}
+
+fn required_json_string(
+    value: &serde_json::Value,
+    field: &'static str,
+    errors: &mut Vec<String>,
+) -> String {
+    match value.get(field).and_then(serde_json::Value::as_str) {
+        Some(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
+        _ => {
+            errors.push(format!("{field} is required"));
+            String::new()
+        }
+    }
+}
+
 fn anchor_error(error: anchor::AnchorError) -> ErrorData {
     ErrorData::invalid_params(error.to_string(), None)
 }
@@ -1591,6 +1846,10 @@ impl MempalMcpServer {
             .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
 
         let trigger = request.trigger.as_deref().map(parse_context_trigger);
+        let config = crate::core::config::ConfigHandle::current();
+        let include_cards = request
+            .include_cards
+            .unwrap_or(config.context.include_cards_default);
         let db = self.open_db()?;
         let pack = assemble_context_with_vector(
             &db,
@@ -1602,13 +1861,10 @@ impl MempalMcpServer {
                     .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
                 cwd,
                 include_evidence: request.include_evidence.unwrap_or(false),
-                include_cards: request.include_cards.unwrap_or(false),
+                include_cards,
                 max_items,
                 dao_tian_limit,
-                project_id: crate::core::config::ConfigHandle::current()
-                    .project
-                    .id
-                    .clone(),
+                project_id: config.project.id.clone(),
                 trigger,
                 context_cfg_override: None,
             },
@@ -3568,6 +3824,759 @@ impl MempalMcpServer {
             )),
         }
     }
+
+    #[tool(
+        name = "mempal_phase3",
+        description = "Phase-3 runtime adoption evidence and readiness gates. Actions: guidance/instrumentation_policy/prepare_record/capture/evaluator_advise/default_proposal/rollback_control/check_record/record_checked/review/readiness/record/list/stats/gate/research_validate_plan/research_ingest_plan. Guidance explains when agents should record used/accepted/rejected/miss/rollback signals; instrumentation_policy defines opt-in live instrumentation boundaries without writing; prepare_record validates and returns record inputs without writing; capture maps surface/outcome observations into checked record inputs and writes only with execute=true; evaluator_advise returns deterministic advisory-only evaluator output and a surface=evaluator capture plan without lifecycle authority; default_proposal combines readiness with rollback criteria without changing defaults; rollback_control evaluates card-context rollback evidence without writing; check_record evaluates record quality without writing; record_checked runs the quality gate before writing; review summarizes adoption evidence without writing; readiness evaluates default eligibility without writing; record appends runtime_adoption_events; list/stats/gate are read-only; research_validate_plan validates external research report JSON; research_ingest_plan previews evidence drawer refs and distill suggestions without ingesting or promoting knowledge."
+    )]
+    async fn mempal_phase3(
+        &self,
+        Parameters(request): Parameters<Phase3Request>,
+    ) -> std::result::Result<Json<Phase3Response>, ErrorData> {
+        let action = trim_to_option(Some(request.action.as_str()))
+            .ok_or_else(|| ErrorData::invalid_params("action must not be empty", None))?;
+
+        match action {
+            "guidance" => Ok(Json(Phase3Response {
+                guidance: Some(runtime_adoption_guidance().into()),
+                instrumentation_policy: None,
+                record_plan: None,
+                record_quality: None,
+                record_checked: None,
+                review_report: None,
+                readiness_report: None,
+                event: None,
+                events: Vec::new(),
+                stats: None,
+                gate: None,
+                research_plan: None,
+                research_ingest_plan: None,
+                evaluator_advice: None,
+                default_proposal: None,
+                rollback_control: None,
+            })),
+            "instrumentation_policy" => Ok(Json(Phase3Response {
+                guidance: None,
+                instrumentation_policy: Some(runtime_adoption_instrumentation_policy().into()),
+                record_plan: None,
+                record_quality: None,
+                record_checked: None,
+                review_report: None,
+                readiness_report: None,
+                event: None,
+                events: Vec::new(),
+                stats: None,
+                gate: None,
+                research_plan: None,
+                research_ingest_plan: None,
+                evaluator_advice: None,
+                default_proposal: None,
+                rollback_control: None,
+            })),
+            "prepare_record" => {
+                let track = parse_runtime_adoption_track(required_string(
+                    request.track.as_deref(),
+                    "track",
+                )?)?;
+                let signal = parse_runtime_adoption_signal(required_string(
+                    request.signal.as_deref(),
+                    "signal",
+                )?)?;
+                let feature = required_string(request.feature.as_deref(), "feature")?.to_string();
+                let plan = prepare_runtime_adoption_record(RuntimeAdoptionRecordPlanInput {
+                    id: trim_to_owned(request.id.as_deref()),
+                    track: runtime_adoption_track_slug(&track).to_string(),
+                    signal: runtime_adoption_signal_slug(&signal).to_string(),
+                    feature,
+                    query: trim_to_owned(request.query.as_deref()),
+                    context_hash: trim_to_owned(request.context_hash.as_deref()),
+                    card_id: trim_to_owned(request.card_id.as_deref()),
+                    evaluator_id: trim_to_owned(request.evaluator_id.as_deref()),
+                    research_report_id: trim_to_owned(request.research_report_id.as_deref()),
+                    note: trim_to_owned(request.note.as_deref()),
+                    metadata: request.metadata,
+                });
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: Some(plan.into()),
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "capture" => {
+                let surface = required_string(request.surface.as_deref(), "surface")?.to_string();
+                let outcome = required_string(request.outcome.as_deref(), "outcome")?.to_string();
+                let record_input =
+                    capture_runtime_adoption_record_input(RuntimeAdoptionCaptureInput {
+                        id: trim_to_owned(request.id.as_deref()),
+                        surface: surface.clone(),
+                        outcome: outcome.clone(),
+                        query: trim_to_owned(request.query.as_deref()),
+                        context_hash: trim_to_owned(request.context_hash.as_deref()),
+                        card_id: trim_to_owned(request.card_id.as_deref()),
+                        evaluator_id: trim_to_owned(request.evaluator_id.as_deref()),
+                        research_report_id: trim_to_owned(request.research_report_id.as_deref()),
+                        note: trim_to_owned(request.note.as_deref()),
+                        metadata: request.metadata,
+                    })
+                    .map_err(|error| ErrorData::invalid_params(error, None))?;
+                let mut capture = prepare_runtime_adoption_capture(
+                    surface,
+                    outcome,
+                    request.execute.unwrap_or(false),
+                    record_input.clone(),
+                );
+                if request.execute.unwrap_or(false) {
+                    let db = self.open_db()?;
+                    let track = parse_runtime_adoption_track(&record_input.track)?;
+                    let signal = parse_runtime_adoption_signal(&record_input.signal)?;
+                    let should_write = should_write_checked_record(
+                        &capture.record_quality,
+                        request.allow_warnings.unwrap_or(false),
+                    );
+                    let event = if should_write {
+                        let event = RuntimeAdoptionEvent {
+                            id: record_input.id.unwrap_or_else(|| {
+                                phase3_event_id(&track, &signal, &record_input.feature)
+                            }),
+                            track,
+                            signal,
+                            feature: record_input.feature,
+                            query: record_input.query,
+                            context_hash: record_input.context_hash,
+                            card_id: record_input.card_id,
+                            evaluator_id: record_input.evaluator_id,
+                            research_report_id: record_input.research_report_id,
+                            note: record_input.note,
+                            metadata: record_input.metadata,
+                            created_at: current_timestamp(),
+                        };
+                        db.insert_runtime_adoption_event(&event).map_err(|error| {
+                            ErrorData::internal_error(
+                                format!("failed to insert runtime adoption event: {error}"),
+                                None,
+                            )
+                        })?;
+                        Some(event)
+                    } else {
+                        None
+                    };
+                    capture.writes = event.is_some();
+                    capture.record_checked = Some(RuntimeAdoptionCheckedRecordReport {
+                        writes: event.is_some(),
+                        blocked: event.is_none(),
+                        record_quality: capture.record_quality.clone(),
+                        event,
+                    });
+                }
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: Some(capture.record_plan.into()),
+                    record_quality: Some(capture.record_quality.into()),
+                    record_checked: capture.record_checked.map(Into::into),
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "evaluator_advise" => {
+                let report = evaluator_advice(EvaluatorAdviceInput {
+                    evaluator_id: required_string(request.evaluator_id.as_deref(), "evaluator_id")?
+                        .to_string(),
+                    subject_kind: required_string(request.subject_kind.as_deref(), "subject_kind")?
+                        .to_string(),
+                    subject_id: required_string(request.subject_id.as_deref(), "subject_id")?
+                        .to_string(),
+                    proposed_action: required_string(
+                        request.proposed_action.as_deref(),
+                        "proposed_action",
+                    )?
+                    .to_string(),
+                    evidence_refs: request.evidence_refs.unwrap_or_default(),
+                    counterexample_refs: request.counterexample_refs.unwrap_or_default(),
+                    risk_notes: request.risk_notes.unwrap_or_default(),
+                    note: trim_to_owned(request.note.as_deref()),
+                })
+                .map_err(|error| ErrorData::invalid_params(error, None))?;
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: Some(report.into()),
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "default_proposal" => {
+                let candidate = required_string(request.candidate.as_deref(), "candidate")?;
+                let report = match candidate {
+                    "card-context" => {
+                        let db = self.open_db()?;
+                        let events = db
+                            .list_runtime_adoption_events(
+                                &RuntimeAdoptionFilter {
+                                    track: Some(RuntimeAdoptionTrack::CardContext),
+                                    feature: Some("include_cards".to_string()),
+                                },
+                                10_000,
+                            )
+                            .map_err(|error| {
+                                ErrorData::internal_error(
+                                    format!("failed to list runtime adoption events: {error}"),
+                                    None,
+                                )
+                            })?;
+                        card_context_default_proposal(
+                            &events,
+                            request.rollback_criteria.unwrap_or_default(),
+                        )
+                    }
+                    other => {
+                        return Err(ErrorData::invalid_params(
+                            format!("unsupported phase3 default proposal candidate: {other}"),
+                            None,
+                        ));
+                    }
+                };
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: Some(report.into()),
+                    rollback_control: None,
+                }))
+            }
+            "rollback_control" => {
+                let candidate = required_string(request.candidate.as_deref(), "candidate")?;
+                let report = match candidate {
+                    "card-context" => {
+                        if request.execute.unwrap_or(false) {
+                            return Err(ErrorData::invalid_params(
+                                "rollback_control execute is only supported by CLI in P79",
+                                None,
+                            ));
+                        }
+                        let db = self.open_db()?;
+                        let events = db
+                            .list_runtime_adoption_events(
+                                &RuntimeAdoptionFilter {
+                                    track: Some(RuntimeAdoptionTrack::CardContext),
+                                    feature: Some("include_cards".to_string()),
+                                },
+                                10_000,
+                            )
+                            .map_err(|error| {
+                                ErrorData::internal_error(
+                                    format!("failed to list runtime adoption events: {error}"),
+                                    None,
+                                )
+                            })?;
+                        card_context_rollback_control(
+                            &events,
+                            ConfigHandle::current().context.include_cards_default,
+                            false,
+                        )
+                    }
+                    other => {
+                        return Err(ErrorData::invalid_params(
+                            format!("unsupported phase3 rollback-control candidate: {other}"),
+                            None,
+                        ));
+                    }
+                };
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: Some(report.into()),
+                }))
+            }
+            "check_record" => {
+                let track = parse_runtime_adoption_track(required_string(
+                    request.track.as_deref(),
+                    "track",
+                )?)?;
+                let signal = parse_runtime_adoption_signal(required_string(
+                    request.signal.as_deref(),
+                    "signal",
+                )?)?;
+                let feature = request.feature.unwrap_or_default();
+                let input = RuntimeAdoptionRecordPlanInput {
+                    id: trim_to_owned(request.id.as_deref()),
+                    track: runtime_adoption_track_slug(&track).to_string(),
+                    signal: runtime_adoption_signal_slug(&signal).to_string(),
+                    feature,
+                    query: trim_to_owned(request.query.as_deref()),
+                    context_hash: trim_to_owned(request.context_hash.as_deref()),
+                    card_id: trim_to_owned(request.card_id.as_deref()),
+                    evaluator_id: trim_to_owned(request.evaluator_id.as_deref()),
+                    research_report_id: trim_to_owned(request.research_report_id.as_deref()),
+                    note: trim_to_owned(request.note.as_deref()),
+                    metadata: request.metadata,
+                };
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: Some(check_runtime_adoption_record(&input).into()),
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "record_checked" => {
+                let db = self.open_db()?;
+                let track = parse_runtime_adoption_track(required_string(
+                    request.track.as_deref(),
+                    "track",
+                )?)?;
+                let signal = parse_runtime_adoption_signal(required_string(
+                    request.signal.as_deref(),
+                    "signal",
+                )?)?;
+                let feature = request.feature.unwrap_or_default();
+                let input = RuntimeAdoptionRecordPlanInput {
+                    id: trim_to_owned(request.id.as_deref()),
+                    track: runtime_adoption_track_slug(&track).to_string(),
+                    signal: runtime_adoption_signal_slug(&signal).to_string(),
+                    feature,
+                    query: trim_to_owned(request.query.as_deref()),
+                    context_hash: trim_to_owned(request.context_hash.as_deref()),
+                    card_id: trim_to_owned(request.card_id.as_deref()),
+                    evaluator_id: trim_to_owned(request.evaluator_id.as_deref()),
+                    research_report_id: trim_to_owned(request.research_report_id.as_deref()),
+                    note: trim_to_owned(request.note.as_deref()),
+                    metadata: request.metadata,
+                };
+                let quality = check_runtime_adoption_record(&input);
+                let should_write =
+                    should_write_checked_record(&quality, request.allow_warnings.unwrap_or(false));
+                let event = if should_write {
+                    let event = RuntimeAdoptionEvent {
+                        id: input
+                            .id
+                            .unwrap_or_else(|| phase3_event_id(&track, &signal, &input.feature)),
+                        track,
+                        signal,
+                        feature: input.feature,
+                        query: input.query,
+                        context_hash: input.context_hash,
+                        card_id: input.card_id,
+                        evaluator_id: input.evaluator_id,
+                        research_report_id: input.research_report_id,
+                        note: input.note,
+                        metadata: input.metadata,
+                        created_at: current_timestamp(),
+                    };
+                    db.insert_runtime_adoption_event(&event).map_err(|error| {
+                        ErrorData::internal_error(
+                            format!("failed to insert runtime adoption event: {error}"),
+                            None,
+                        )
+                    })?;
+                    Some(event)
+                } else {
+                    None
+                };
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: Some(
+                        RuntimeAdoptionCheckedRecordReport {
+                            writes: event.is_some(),
+                            blocked: event.is_none(),
+                            record_quality: quality,
+                            event,
+                        }
+                        .into(),
+                    ),
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "review" => {
+                let db = self.open_db()?;
+                let track = parse_runtime_adoption_track_opt(request.track.as_deref())?;
+                let signal = request
+                    .signal
+                    .as_deref()
+                    .map(parse_runtime_adoption_signal)
+                    .transpose()?;
+                let feature = trim_to_owned(request.feature.as_deref());
+                let limit = request.limit.unwrap_or(10_000);
+                let events = db
+                    .list_runtime_adoption_events(
+                        &RuntimeAdoptionFilter {
+                            track: track.clone(),
+                            feature: feature.clone(),
+                        },
+                        limit,
+                    )
+                    .map_err(|error| {
+                        ErrorData::internal_error(
+                            format!("failed to list runtime adoption events: {error}"),
+                            None,
+                        )
+                    })?;
+                let report = review_runtime_adoption_events(
+                    &events,
+                    RuntimeAdoptionReviewFilters {
+                        track: track
+                            .as_ref()
+                            .map(runtime_adoption_track_slug)
+                            .map(str::to_string),
+                        feature,
+                        signal: signal
+                            .as_ref()
+                            .map(runtime_adoption_signal_slug)
+                            .map(str::to_string),
+                        limit,
+                    },
+                );
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: Some(report.into()),
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "readiness" => {
+                let db = self.open_db()?;
+                let candidate = required_string(request.candidate.as_deref(), "candidate")?;
+                let report = match candidate {
+                    "card-context-default" => {
+                        let events = db
+                            .list_runtime_adoption_events(
+                                &RuntimeAdoptionFilter {
+                                    track: Some(RuntimeAdoptionTrack::CardContext),
+                                    feature: Some("include_cards".to_string()),
+                                },
+                                10_000,
+                            )
+                            .map_err(|error| {
+                                ErrorData::internal_error(
+                                    format!("failed to list runtime adoption events: {error}"),
+                                    None,
+                                )
+                            })?;
+                        card_context_default_readiness(&events)
+                    }
+                    other => {
+                        return Err(ErrorData::invalid_params(
+                            format!("unsupported phase3 readiness candidate: {other}"),
+                            None,
+                        ));
+                    }
+                };
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: Some(report.into()),
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "record" => {
+                let db = self.open_db()?;
+                let track = parse_runtime_adoption_track(required_string(
+                    request.track.as_deref(),
+                    "track",
+                )?)?;
+                let signal = parse_runtime_adoption_signal(required_string(
+                    request.signal.as_deref(),
+                    "signal",
+                )?)?;
+                let feature = required_string(request.feature.as_deref(), "feature")?.to_string();
+                let event = RuntimeAdoptionEvent {
+                    id: request
+                        .id
+                        .unwrap_or_else(|| phase3_event_id(&track, &signal, &feature)),
+                    track,
+                    signal,
+                    feature,
+                    query: trim_to_owned(request.query.as_deref()),
+                    context_hash: trim_to_owned(request.context_hash.as_deref()),
+                    card_id: trim_to_owned(request.card_id.as_deref()),
+                    evaluator_id: trim_to_owned(request.evaluator_id.as_deref()),
+                    research_report_id: trim_to_owned(request.research_report_id.as_deref()),
+                    note: trim_to_owned(request.note.as_deref()),
+                    metadata: request.metadata,
+                    created_at: current_timestamp(),
+                };
+                db.insert_runtime_adoption_event(&event).map_err(|error| {
+                    ErrorData::internal_error(
+                        format!("failed to insert runtime adoption event: {error}"),
+                        None,
+                    )
+                })?;
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: Some(RuntimeAdoptionEventDto::from(event)),
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "list" => {
+                let db = self.open_db()?;
+                let events = db
+                    .list_runtime_adoption_events(
+                        &RuntimeAdoptionFilter {
+                            track: parse_runtime_adoption_track_opt(request.track.as_deref())?,
+                            feature: trim_to_owned(request.feature.as_deref()),
+                        },
+                        request.limit.unwrap_or(50),
+                    )
+                    .map_err(|error| {
+                        ErrorData::internal_error(
+                            format!("failed to list runtime adoption events: {error}"),
+                            None,
+                        )
+                    })?;
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: events
+                        .into_iter()
+                        .map(RuntimeAdoptionEventDto::from)
+                        .collect(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "stats" => {
+                let db = self.open_db()?;
+                let events = db
+                    .list_runtime_adoption_events(
+                        &RuntimeAdoptionFilter {
+                            track: parse_runtime_adoption_track_opt(request.track.as_deref())?,
+                            feature: trim_to_owned(request.feature.as_deref()),
+                        },
+                        10_000,
+                    )
+                    .map_err(|error| {
+                        ErrorData::internal_error(
+                            format!("failed to list runtime adoption events: {error}"),
+                            None,
+                        )
+                    })?;
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: Some(runtime_adoption_stats(&events)),
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "gate" => {
+                let db = self.open_db()?;
+                let candidate = required_string(request.candidate.as_deref(), "candidate")?;
+                let gate = phase3_gate_report(&db, candidate)?;
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: Some(gate),
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "research_validate_plan" => {
+                let report = request.report.ok_or_else(|| {
+                    ErrorData::invalid_params("report is required for research_validate_plan", None)
+                })?;
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: Some(validate_research_adapter_plan_value(&report)),
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "research_ingest_plan" => {
+                let report = request.report.ok_or_else(|| {
+                    ErrorData::invalid_params("report is required for research_ingest_plan", None)
+                })?;
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: Some(ResearchIngestPlanDto::from(
+                        build_research_ingest_plan_from_value(&report),
+                    )),
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            other => Err(ErrorData::invalid_params(
+                format!(
+                    "unsupported phase3 action: {other}; actions are guidance, instrumentation_policy, prepare_record, capture, evaluator_advise, default_proposal, rollback_control, check_record, record_checked, review, readiness, record, list, stats, gate, research_validate_plan, research_ingest_plan"
+                ),
+                None,
+            )),
+        }
+    }
 }
 
 fn skill_to_dto(skill: &crate::core::skills::Skill) -> SkillDto {
@@ -4082,6 +5091,7 @@ mod tests {
 
     use super::*;
     use crate::core::types::BootstrapEvidenceArgs;
+    use crate::core::types::{KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole};
     use crate::embed::Embedder;
 
     #[derive(Clone)]
@@ -4142,6 +5152,94 @@ mod tests {
             }),
         );
         (tempdir, db_path, server)
+    }
+
+    fn knowledge_card(
+        id: &str,
+        tier: KnowledgeTier,
+        status: KnowledgeStatus,
+        field: &str,
+    ) -> KnowledgeCard {
+        KnowledgeCard {
+            id: id.to_string(),
+            statement: format!("Statement for {id}."),
+            content: format!("Content for {id}."),
+            tier,
+            status,
+            domain: MemoryDomain::Project,
+            field: field.to_string(),
+            anchor_kind: AnchorKind::Repo,
+            anchor_id: "repo://mempal".to_string(),
+            parent_anchor_id: None,
+            scope_constraints: Some("Only for MCP read tests.".to_string()),
+            trigger_hints: Some(TriggerHints {
+                intent_tags: vec!["memory".to_string()],
+                workflow_bias: vec!["inspect-first".to_string()],
+                tool_needs: vec!["mcp".to_string()],
+            }),
+            auto_generated: false,
+            crystallization_score: None,
+            source_drawer_ids: Vec::new(),
+            created_at: "1713000000".to_string(),
+            updated_at: "1713000000".to_string(),
+        }
+    }
+
+    fn insert_knowledge_card(db_path: &Path, card: KnowledgeCard) {
+        let db = Database::open(db_path).expect("open db");
+        db.insert_knowledge_card(&card)
+            .expect("insert knowledge card");
+    }
+
+    fn insert_knowledge_card_link(
+        db_path: &Path,
+        id: &str,
+        card_id: &str,
+        evidence_drawer_id: &str,
+        role: KnowledgeEvidenceRole,
+    ) {
+        let db = Database::open(db_path).expect("open db");
+        db.insert_knowledge_evidence_link(&KnowledgeEvidenceLink {
+            id: id.to_string(),
+            card_id: card_id.to_string(),
+            evidence_drawer_id: evidence_drawer_id.to_string(),
+            role,
+            note: None,
+            created_at: "1713000000".to_string(),
+        })
+        .expect("insert knowledge card link");
+    }
+
+    /// Serializes tests that override the global `ConfigHandle` snapshot and
+    /// resets it to defaults on Drop so other parallel tests do not see leaked
+    /// overrides.
+    struct ConfigOverrideGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tempdir: TempDir,
+    }
+
+    impl ConfigOverrideGuard {
+        fn install(toml_contents: &str) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().expect("config override lock poisoned");
+            let tempdir = tempfile::tempdir().expect("config override tempdir");
+            let path = tempdir.path().join("override.toml");
+            fs::write(&path, toml_contents).expect("write config override");
+            crate::core::config::ConfigHandle::harness_reload_from_path(&path);
+            Self {
+                _lock: lock,
+                _tempdir: tempdir,
+            }
+        }
+    }
+
+    impl Drop for ConfigOverrideGuard {
+        fn drop(&mut self) {
+            let tempdir = tempfile::tempdir().expect("config reset tempdir");
+            let path = tempdir.path().join("default.toml");
+            fs::write(&path, "").expect("write default config");
+            crate::core::config::ConfigHandle::harness_reload_from_path(&path);
+        }
     }
 
     fn insert_drawer(
@@ -4597,6 +5695,48 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["qi", "evidence"]);
         assert_eq!(response.sections[1].items[0].drawer_id, "drawer_evidence");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_context_include_cards_omitted_uses_config_default() {
+        let _guard = ConfigOverrideGuard::install("[context]\ninclude_cards_default = true\n");
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "drawer_default_card_evidence",
+            "default card evidence",
+            "mempal",
+            Some("context"),
+            "/tmp/default-card-evidence.md",
+            2,
+        );
+        let mut card = knowledge_card(
+            "card_default_context",
+            KnowledgeTier::Shu,
+            KnowledgeStatus::Promoted,
+            "general",
+        );
+        card.anchor_id = anchor::LEGACY_REPO_ANCHOR_ID.to_string();
+        insert_knowledge_card(&db_path, card);
+        insert_knowledge_card_link(
+            &db_path,
+            "link_card_default_context",
+            "card_default_context",
+            "drawer_default_card_evidence",
+            KnowledgeEvidenceRole::Supporting,
+        );
+
+        let response = server
+            .context_json_for_test(serde_json::json!({ "query": "default card" }))
+            .await
+            .expect("context should succeed");
+        let card_item = response
+            .sections
+            .iter()
+            .flat_map(|section| section.items.iter())
+            .find(|item| item.card_id.as_deref() == Some("card_default_context"))
+            .expect("card item should appear when include_cards omitted and config default true");
+        assert_eq!(card_item.drawer_id, "card_default_context");
     }
 
     #[tokio::test]

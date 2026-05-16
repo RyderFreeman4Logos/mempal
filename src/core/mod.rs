@@ -7,6 +7,7 @@ pub mod db;
 pub mod decay;
 pub mod hot_reload;
 pub mod patterns;
+pub mod phase3;
 pub mod priming;
 pub mod project;
 pub mod protocol;

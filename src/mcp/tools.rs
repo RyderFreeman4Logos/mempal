@@ -1,8 +1,16 @@
 use crate::context::{ContextItem, ContextPack, ContextSection, TieredAssembly};
+use crate::core::phase3::{
+    Phase3ReadinessReport, ResearchCandidateInsightPlan, ResearchEvidenceDrawerPlan,
+    ResearchIngestPlanReport, RuntimeAdoptionCheckedRecordReport, RuntimeAdoptionGuidance,
+    RuntimeAdoptionInstrumentationMode, RuntimeAdoptionInstrumentationPolicy,
+    RuntimeAdoptionRecordPlan, RuntimeAdoptionRecordQualityReport, RuntimeAdoptionReviewFilters,
+    RuntimeAdoptionReviewReport, RuntimeAdoptionSignalCounts, RuntimeAdoptionSignalGuidance,
+    RuntimeAdoptionTrackGuidance,
+};
 use crate::core::types::{
     AnchorKind, ChunkNeighbors, KnowledgeCard, KnowledgeCardEvent, KnowledgeStatus, KnowledgeTier,
-    MemoryDomain, MemoryKind, NeighborChunk, RouteDecision, SearchResult, TaxonomyEntry,
-    TunnelEndpoint,
+    MemoryDomain, MemoryKind, NeighborChunk, RouteDecision, RuntimeAdoptionEvent,
+    RuntimeAdoptionSignal, RuntimeAdoptionTrack, SearchResult, TaxonomyEntry, TunnelEndpoint,
 };
 use crate::field_taxonomy::FieldTaxonomyEntry;
 use crate::ingest::gating::GatingDecision;
@@ -485,6 +493,604 @@ pub struct KnowledgeCardsResponse {
     pub promote: Option<KnowledgeCardPromoteDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub demote: Option<KnowledgeCardDemoteDto>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct Phase3Request {
+    pub action: String,
+    pub id: Option<String>,
+    pub surface: Option<String>,
+    pub outcome: Option<String>,
+    pub subject_kind: Option<String>,
+    pub subject_id: Option<String>,
+    pub proposed_action: Option<String>,
+    pub evidence_refs: Option<Vec<String>>,
+    pub counterexample_refs: Option<Vec<String>>,
+    pub risk_notes: Option<Vec<String>>,
+    pub rollback_criteria: Option<Vec<String>>,
+    pub track: Option<String>,
+    pub signal: Option<String>,
+    pub feature: Option<String>,
+    pub query: Option<String>,
+    pub context_hash: Option<String>,
+    pub card_id: Option<String>,
+    pub evaluator_id: Option<String>,
+    pub research_report_id: Option<String>,
+    pub note: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub limit: Option<usize>,
+    pub candidate: Option<String>,
+    pub report: Option<serde_json::Value>,
+    pub execute: Option<bool>,
+    pub allow_warnings: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct Phase3Response {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<RuntimeAdoptionGuidanceDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instrumentation_policy: Option<RuntimeAdoptionInstrumentationPolicyDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_plan: Option<RuntimeAdoptionRecordPlanDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_quality: Option<RuntimeAdoptionRecordQualityDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_checked: Option<RuntimeAdoptionCheckedRecordDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_report: Option<RuntimeAdoptionReviewReportDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_report: Option<Phase3ReadinessReportDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<RuntimeAdoptionEventDto>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub events: Vec<RuntimeAdoptionEventDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<RuntimeAdoptionStatsDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<Phase3GateDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub research_plan: Option<ResearchAdapterPlanDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub research_ingest_plan: Option<ResearchIngestPlanDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluator_advice: Option<EvaluatorAdviceDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_proposal: Option<CardContextDefaultProposalDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_control: Option<CardContextRollbackControlDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionGuidanceDto {
+    pub version: u32,
+    pub recording_rule: String,
+    pub required_fields: Vec<String>,
+    pub optional_fields: Vec<String>,
+    pub signals: Vec<RuntimeAdoptionSignalGuidanceDto>,
+    pub tracks: Vec<RuntimeAdoptionTrackGuidanceDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionSignalGuidanceDto {
+    pub signal: String,
+    pub when: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionTrackGuidanceDto {
+    pub track: String,
+    pub when: String,
+    pub feature_examples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionInstrumentationPolicyDto {
+    pub version: u32,
+    pub writes: bool,
+    pub default_mode: String,
+    pub allowed_modes: Vec<RuntimeAdoptionInstrumentationModeDto>,
+    pub forbidden_modes: Vec<String>,
+    pub requirements: Vec<String>,
+    pub rollback_requirements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionInstrumentationModeDto {
+    pub mode: String,
+    pub description: String,
+    pub requires_execute: bool,
+    pub requires_checked_capture: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionRecordPlanDto {
+    pub writes: bool,
+    pub record_command: Vec<String>,
+    pub record_payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionRecordQualityDto {
+    pub writes: bool,
+    pub valid: bool,
+    pub quality: String,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionCheckedRecordDto {
+    pub writes: bool,
+    pub blocked: bool,
+    pub record_quality: RuntimeAdoptionRecordQualityDto,
+    pub event: Option<RuntimeAdoptionEventDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionReviewReportDto {
+    pub writes: bool,
+    pub filters: RuntimeAdoptionReviewFiltersDto,
+    pub total: usize,
+    pub stats: RuntimeAdoptionSignalCountsDto,
+    pub features: Vec<RuntimeAdoptionFeatureReviewDto>,
+    pub conclusion: String,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionReviewFiltersDto {
+    pub track: Option<String>,
+    pub feature: Option<String>,
+    pub signal: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionSignalCountsDto {
+    pub total: usize,
+    pub used: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub misses: usize,
+    pub rollbacks: usize,
+    pub contradictions: usize,
+    pub neutral: usize,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionFeatureReviewDto {
+    pub feature: String,
+    pub stats: RuntimeAdoptionSignalCountsDto,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct Phase3ReadinessReportDto {
+    pub writes: bool,
+    pub candidate: String,
+    pub ready: bool,
+    pub decision: String,
+    pub required_track: String,
+    pub required_feature: String,
+    pub review: RuntimeAdoptionReviewReportDto,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct EvaluatorAdviceDto {
+    pub writes: bool,
+    pub evaluator_id: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub proposed_action: String,
+    pub recommendation: String,
+    pub lifecycle_authority: bool,
+    pub deterministic_gate_required: bool,
+    pub requires_human_review: bool,
+    pub evidence_refs: Vec<String>,
+    pub counterexample_refs: Vec<String>,
+    pub risk_notes: Vec<String>,
+    pub reasons: Vec<String>,
+    pub adoption_capture: RuntimeAdoptionRecordPlanDto,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CardContextDefaultProposalDto {
+    pub writes: bool,
+    pub candidate: String,
+    pub proposal_ready: bool,
+    pub decision: String,
+    pub readiness: Phase3ReadinessReportDto,
+    pub rollback_criteria: Vec<String>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CardContextRollbackControlDto {
+    pub writes: bool,
+    pub candidate: String,
+    pub execute: bool,
+    pub rollback_required: bool,
+    pub applied: bool,
+    pub include_cards_default_before: bool,
+    pub include_cards_default_after: bool,
+    pub review: RuntimeAdoptionReviewReportDto,
+    pub reasons: Vec<String>,
+}
+
+impl From<crate::core::phase3::CardContextDefaultProposalReport> for CardContextDefaultProposalDto {
+    fn from(report: crate::core::phase3::CardContextDefaultProposalReport) -> Self {
+        Self {
+            writes: report.writes,
+            candidate: report.candidate,
+            proposal_ready: report.proposal_ready,
+            decision: report.decision,
+            readiness: report.readiness.into(),
+            rollback_criteria: report.rollback_criteria,
+            reasons: report.reasons,
+        }
+    }
+}
+
+impl From<crate::core::phase3::CardContextRollbackControlReport> for CardContextRollbackControlDto {
+    fn from(report: crate::core::phase3::CardContextRollbackControlReport) -> Self {
+        Self {
+            writes: report.writes,
+            candidate: report.candidate,
+            execute: report.execute,
+            rollback_required: report.rollback_required,
+            applied: report.applied,
+            include_cards_default_before: report.include_cards_default_before,
+            include_cards_default_after: report.include_cards_default_after,
+            review: report.review.into(),
+            reasons: report.reasons,
+        }
+    }
+}
+
+impl From<crate::core::phase3::EvaluatorAdviceReport> for EvaluatorAdviceDto {
+    fn from(report: crate::core::phase3::EvaluatorAdviceReport) -> Self {
+        Self {
+            writes: report.writes,
+            evaluator_id: report.evaluator_id,
+            subject_kind: report.subject_kind,
+            subject_id: report.subject_id,
+            proposed_action: report.proposed_action,
+            recommendation: report.recommendation,
+            lifecycle_authority: report.lifecycle_authority,
+            deterministic_gate_required: report.deterministic_gate_required,
+            requires_human_review: report.requires_human_review,
+            evidence_refs: report.evidence_refs,
+            counterexample_refs: report.counterexample_refs,
+            risk_notes: report.risk_notes,
+            reasons: report.reasons,
+            adoption_capture: report.adoption_capture.into(),
+        }
+    }
+}
+
+impl From<RuntimeAdoptionRecordPlan> for RuntimeAdoptionRecordPlanDto {
+    fn from(plan: RuntimeAdoptionRecordPlan) -> Self {
+        Self {
+            writes: plan.writes,
+            record_command: plan.record_command,
+            record_payload: plan.record_payload,
+        }
+    }
+}
+
+impl From<RuntimeAdoptionRecordQualityReport> for RuntimeAdoptionRecordQualityDto {
+    fn from(report: RuntimeAdoptionRecordQualityReport) -> Self {
+        Self {
+            writes: report.writes,
+            valid: report.valid,
+            quality: report.quality,
+            errors: report.errors,
+            warnings: report.warnings,
+        }
+    }
+}
+
+impl From<RuntimeAdoptionCheckedRecordReport> for RuntimeAdoptionCheckedRecordDto {
+    fn from(report: RuntimeAdoptionCheckedRecordReport) -> Self {
+        Self {
+            writes: report.writes,
+            blocked: report.blocked,
+            record_quality: report.record_quality.into(),
+            event: report.event.map(RuntimeAdoptionEventDto::from),
+        }
+    }
+}
+
+impl From<RuntimeAdoptionReviewReport> for RuntimeAdoptionReviewReportDto {
+    fn from(report: RuntimeAdoptionReviewReport) -> Self {
+        Self {
+            writes: report.writes,
+            filters: report.filters.into(),
+            total: report.total,
+            stats: report.stats.into(),
+            features: report
+                .features
+                .into_iter()
+                .map(|feature| RuntimeAdoptionFeatureReviewDto {
+                    feature: feature.feature,
+                    stats: feature.stats.into(),
+                })
+                .collect(),
+            conclusion: report.conclusion,
+            reasons: report.reasons,
+        }
+    }
+}
+
+impl From<Phase3ReadinessReport> for Phase3ReadinessReportDto {
+    fn from(report: Phase3ReadinessReport) -> Self {
+        Self {
+            writes: report.writes,
+            candidate: report.candidate,
+            ready: report.ready,
+            decision: report.decision,
+            required_track: report.required_track,
+            required_feature: report.required_feature,
+            review: report.review.into(),
+            reasons: report.reasons,
+        }
+    }
+}
+
+impl From<RuntimeAdoptionReviewFilters> for RuntimeAdoptionReviewFiltersDto {
+    fn from(filters: RuntimeAdoptionReviewFilters) -> Self {
+        Self {
+            track: filters.track,
+            feature: filters.feature,
+            signal: filters.signal,
+            limit: filters.limit,
+        }
+    }
+}
+
+impl From<RuntimeAdoptionSignalCounts> for RuntimeAdoptionSignalCountsDto {
+    fn from(stats: RuntimeAdoptionSignalCounts) -> Self {
+        Self {
+            total: stats.total,
+            used: stats.used,
+            accepted: stats.accepted,
+            rejected: stats.rejected,
+            misses: stats.misses,
+            rollbacks: stats.rollbacks,
+            contradictions: stats.contradictions,
+            neutral: stats.neutral,
+        }
+    }
+}
+
+impl From<RuntimeAdoptionGuidance> for RuntimeAdoptionGuidanceDto {
+    fn from(guidance: RuntimeAdoptionGuidance) -> Self {
+        Self {
+            version: guidance.version,
+            recording_rule: guidance.recording_rule,
+            required_fields: guidance.required_fields,
+            optional_fields: guidance.optional_fields,
+            signals: guidance.signals.into_iter().map(Into::into).collect(),
+            tracks: guidance.tracks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<RuntimeAdoptionSignalGuidance> for RuntimeAdoptionSignalGuidanceDto {
+    fn from(guidance: RuntimeAdoptionSignalGuidance) -> Self {
+        Self {
+            signal: guidance.signal,
+            when: guidance.when,
+        }
+    }
+}
+
+impl From<RuntimeAdoptionTrackGuidance> for RuntimeAdoptionTrackGuidanceDto {
+    fn from(guidance: RuntimeAdoptionTrackGuidance) -> Self {
+        Self {
+            track: guidance.track,
+            when: guidance.when,
+            feature_examples: guidance.feature_examples,
+        }
+    }
+}
+
+impl From<RuntimeAdoptionInstrumentationPolicy> for RuntimeAdoptionInstrumentationPolicyDto {
+    fn from(policy: RuntimeAdoptionInstrumentationPolicy) -> Self {
+        Self {
+            version: policy.version,
+            writes: policy.writes,
+            default_mode: policy.default_mode,
+            allowed_modes: policy.allowed_modes.into_iter().map(Into::into).collect(),
+            forbidden_modes: policy.forbidden_modes,
+            requirements: policy.requirements,
+            rollback_requirements: policy.rollback_requirements,
+        }
+    }
+}
+
+impl From<RuntimeAdoptionInstrumentationMode> for RuntimeAdoptionInstrumentationModeDto {
+    fn from(mode: RuntimeAdoptionInstrumentationMode) -> Self {
+        Self {
+            mode: mode.mode,
+            description: mode.description,
+            requires_execute: mode.requires_execute,
+            requires_checked_capture: mode.requires_checked_capture,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionEventDto {
+    pub id: String,
+    pub track: String,
+    pub signal: String,
+    pub feature: String,
+    pub query: Option<String>,
+    pub context_hash: Option<String>,
+    pub card_id: Option<String>,
+    pub evaluator_id: Option<String>,
+    pub research_report_id: Option<String>,
+    pub note: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionStatsDto {
+    pub total: usize,
+    pub used: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub misses: usize,
+    pub rollbacks: usize,
+    pub contradictions: usize,
+    pub neutral: usize,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct Phase3GateDto {
+    pub candidate: String,
+    pub ready: bool,
+    pub required_track: String,
+    pub stats: RuntimeAdoptionStatsDto,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ResearchAdapterPlanDto {
+    pub valid: bool,
+    pub report_id: String,
+    pub title: String,
+    pub source_count: usize,
+    pub finding_count: usize,
+    pub candidate_insight_count: usize,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ResearchIngestPlanDto {
+    pub valid: bool,
+    pub writes: bool,
+    pub report_id: String,
+    pub title: String,
+    pub source_count: usize,
+    pub finding_count: usize,
+    pub candidate_insight_count: usize,
+    pub planned_evidence_count: usize,
+    pub created_count: usize,
+    pub skipped_count: usize,
+    pub errors: Vec<String>,
+    pub evidence_drawers: Vec<ResearchEvidenceDrawerPlanDto>,
+    pub candidate_insights: Vec<ResearchCandidateInsightPlanDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ResearchEvidenceDrawerPlanDto {
+    pub drawer_id: String,
+    pub finding_index: usize,
+    pub source_file: String,
+    pub created: bool,
+    pub skipped: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ResearchCandidateInsightPlanDto {
+    pub statement: String,
+    pub supporting_refs: Vec<String>,
+    pub suggested_command: Vec<String>,
+}
+
+impl From<ResearchIngestPlanReport> for ResearchIngestPlanDto {
+    fn from(report: ResearchIngestPlanReport) -> Self {
+        Self {
+            valid: report.valid,
+            writes: report.writes,
+            report_id: report.report_id,
+            title: report.title,
+            source_count: report.source_count,
+            finding_count: report.finding_count,
+            candidate_insight_count: report.candidate_insight_count,
+            planned_evidence_count: report.planned_evidence_count,
+            created_count: report.created_count,
+            skipped_count: report.skipped_count,
+            errors: report.errors,
+            evidence_drawers: report
+                .evidence_drawers
+                .into_iter()
+                .map(ResearchEvidenceDrawerPlanDto::from)
+                .collect(),
+            candidate_insights: report
+                .candidate_insights
+                .into_iter()
+                .map(ResearchCandidateInsightPlanDto::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<ResearchEvidenceDrawerPlan> for ResearchEvidenceDrawerPlanDto {
+    fn from(plan: ResearchEvidenceDrawerPlan) -> Self {
+        Self {
+            drawer_id: plan.drawer_id,
+            finding_index: plan.finding_index,
+            source_file: plan.source_file,
+            created: plan.created,
+            skipped: plan.skipped,
+        }
+    }
+}
+
+impl From<ResearchCandidateInsightPlan> for ResearchCandidateInsightPlanDto {
+    fn from(plan: ResearchCandidateInsightPlan) -> Self {
+        Self {
+            statement: plan.statement,
+            supporting_refs: plan.supporting_refs,
+            suggested_command: plan.suggested_command,
+        }
+    }
+}
+
+impl From<RuntimeAdoptionEvent> for RuntimeAdoptionEventDto {
+    fn from(event: RuntimeAdoptionEvent) -> Self {
+        Self {
+            id: event.id,
+            track: runtime_adoption_track_slug(&event.track).to_string(),
+            signal: runtime_adoption_signal_slug(&event.signal).to_string(),
+            feature: event.feature,
+            query: event.query,
+            context_hash: event.context_hash,
+            card_id: event.card_id,
+            evaluator_id: event.evaluator_id,
+            research_report_id: event.research_report_id,
+            note: event.note,
+            metadata: event.metadata,
+            created_at: event.created_at,
+        }
+    }
+}
+
+fn runtime_adoption_track_slug(track: &RuntimeAdoptionTrack) -> &'static str {
+    match track {
+        RuntimeAdoptionTrack::RuntimeAdoption => "runtime_adoption",
+        RuntimeAdoptionTrack::CardContext => "card_context",
+        RuntimeAdoptionTrack::CardEmbedding => "card_embedding",
+        RuntimeAdoptionTrack::Evaluator => "evaluator",
+        RuntimeAdoptionTrack::ResearchAdapter => "research_adapter",
+    }
+}
+
+fn runtime_adoption_signal_slug(signal: &RuntimeAdoptionSignal) -> &'static str {
+    match signal {
+        RuntimeAdoptionSignal::Used => "used",
+        RuntimeAdoptionSignal::Accepted => "accepted",
+        RuntimeAdoptionSignal::Rejected => "rejected",
+        RuntimeAdoptionSignal::Miss => "miss",
+        RuntimeAdoptionSignal::Rollback => "rollback",
+        RuntimeAdoptionSignal::Contradiction => "contradiction",
+        RuntimeAdoptionSignal::Neutral => "neutral",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
