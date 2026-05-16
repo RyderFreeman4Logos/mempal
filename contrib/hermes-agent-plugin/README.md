@@ -1,7 +1,18 @@
-# mempal hermes-agent plugin
+# mempal hermes-agent integration
 
-Plugs mempal into hermes-agent as a drop-in MemoryProvider.
-Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API calls.
+Three complementary integration paths — use any combination:
+
+| Path | Plugin type | What it does | Requires hermes core changes? |
+|------|-------------|-------------|------|
+| **MemoryProvider** | Memory plugin | Mirror/sync hermes built-in memory to mempal, expose search/conclude tools | No |
+| **Hooks** | General plugin | Inject deep mempal context per turn, capture tool observations | No |
+| **MCP** | Config entry | Give hermes LLM direct access to all mempal tools | No |
+
+All three work without forking hermes-agent. When hermes upstream resolves
+[#25526](https://github.com/NousResearch/hermes-agent/issues/25526) and
+[#25527](https://github.com/NousResearch/hermes-agent/issues/25527)
+(authoritative provider mode), the integration can be simplified to a single
+MemoryProvider — the hooks plugin gracefully becomes redundant.
 
 ## Prerequisites
 
@@ -17,14 +28,19 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
 
 2. Python 3.9+ with no extra pip dependencies required (uses stdlib `urllib`).
 
-## Setup
+## Path 1: MemoryProvider (mirror/sync)
 
-1. Copy or symlink this directory into hermes-agent's plugin search path:
+Plugs mempal into hermes-agent as a drop-in MemoryProvider.
+Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API calls.
+
+### Setup
+
+1. Copy or symlink into hermes-agent's memory plugin search path:
    ```bash
    cp -r contrib/hermes-agent-plugin/mempal  /path/to/hermes-agent/plugins/memory/mempal
    ```
 
-2. Configure hermes-agent to use the mempal provider:
+2. Configure hermes-agent:
    ```yaml
    # cli-config.yaml
    memory:
@@ -44,7 +60,7 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
    }
    ```
 
-## Tools exposed to the model
+### Tools exposed to the model
 
 | Tool | Description |
 |------|-------------|
@@ -52,23 +68,16 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
 | `mempal_search` | Hybrid BM25+vector search via `/api/search` |
 | `mempal_conclude` | Store a fact verbatim via `/api/ingest` |
 
-## Memory routing
+### Memory routing
 
 All memories are profile-scoped under `wing="hermes-user/{user_id}/{profile}"`.
-The default profile is `default`, and Hermes may pass it as `agent_identity`
-or `profile`.
 
 - Turns → `room="turns"` or `room="turns/{platform}/{chat_id}[/{thread_id}]"`
 - Explicit facts → `room="facts"` shared across chats for the same profile
 - Session summaries → `room="sessions/{session_id}"`
 - Built-in memory mirrors → `room="facts"`, scoped turns/session rooms, or `room="memory-mirror/{target}"`
 
-When Hermes provides `project_id`, the plugin forwards it to `/api/search`,
-`/api/timeline`, and `/api/ingest` for mempal project isolation. When only
-`cwd` is available, the plugin derives the project scope from the directory
-basename.
-
-## Intelligence modes
+### Intelligence modes
 
 Optional LLM-enhanced memory classification. Configure in `$HERMES_HOME/mempal.json`:
 
@@ -96,49 +105,124 @@ Optional LLM-enhanced memory classification. Configure in `$HERMES_HOME/mempal.j
 | `cloud_llm` | Use a paid/cloud endpoint for the same enhancements. |
 | `auto` | Try configured LLM, fall back to deterministic on failure or missing config. |
 
-All LLM output passes deterministic validation gates before acceptance.
-Failed/slow LLM calls fall back to deterministic behavior without blocking writes.
+## Path 2: Hooks plugin (deep context injection)
+
+General hermes plugin that registers lifecycle hooks. Works standalone or
+alongside the MemoryProvider — they complement each other:
+
+- **MemoryProvider**: mirrors hermes memory to mempal, provides 3 tools
+- **Hooks plugin**: injects deep mempal context into every turn, captures tool observations
+
+### Setup
+
+1. Copy or symlink into hermes-agent's general plugin search path:
+   ```bash
+   cp -r contrib/hermes-agent-plugin/mempal-hooks  /path/to/hermes-agent/plugins/mempal-hooks
+   ```
+
+2. No extra config needed — shares `$HERMES_HOME/mempal.json` and env vars with the MemoryProvider.
+
+### Hooks registered
+
+| Hook | When | What it does |
+|------|------|-------------|
+| `pre_llm_call` | Before each LLM turn | Searches mempal for relevant memories matching the user message, injects them as turn context |
+| `post_tool_call` | After each tool returns | Captures interesting tool results (shell, web search, code) as observation drawers in mempal |
+| `on_session_start` | Session begins | Warms up mempal connection |
+
+### Context injection
+
+On each turn, the `pre_llm_call` hook:
+1. Searches mempal with the user's message (`/api/search`, top 8 results)
+2. Formats results with memory_kind and importance tags
+3. Returns as `{"context": "## Relevant memories (mempal)\n..."}` appended to the user message
+
+### Tool observation capture
+
+After allowlisted tool calls (bash, web_search, python, etc.), the `post_tool_call` hook:
+1. Filters out mempal's own tools (no loops) and errored results
+2. Truncates result to 2000 chars
+3. Ingests to mempal as `room="tool-observations"`, `memory_kind="observation"`, `importance=1`
+
+These low-importance observations enrich future searches without cluttering high-priority memory.
+
+## Path 3: MCP server (full tool access)
+
+Register mempal's MCP server directly with hermes, giving the LLM access to
+**all** mempal tools (context, knowledge cards, timeline, kg, etc.) — far
+beyond the 3 tools the MemoryProvider interface allows.
+
+### Setup
+
+Add to hermes `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  mempal:
+    transport: stdio
+    command: "mempal"
+    args: ["mcp"]
+```
+
+Or if mempal runs as a daemon with REST+MCP:
+
+```yaml
+mcp_servers:
+  mempal:
+    transport: http
+    url: "http://127.0.0.1:3080/mcp"
+```
+
+Hermes discovers all mempal MCP tools at startup and makes them available to
+the LLM alongside built-in tools. Key tools the LLM gains:
+
+| Tool | Description |
+|------|-------------|
+| `mempal_context` | Tiered context assembly (dao_tian → qi layers) |
+| `mempal_search` | Hybrid BM25+vector search |
+| `mempal_knowledge_cards` | Phase-2 knowledge retrieval |
+| `mempal_timeline` | Chronological memory timeline |
+| `mempal_kg` | Knowledge graph queries |
+| `mempal_ingest` | Store new evidence |
+| `mempal_pinned_facts` | Always-active canonical facts |
+| `mempal_status` | System health and wing inventory |
+
+## Recommended combination
+
+For maximum enhancement before hermes authoritative mode lands:
+
+```
+MemoryProvider  →  mirror hermes writes, basic tools, system prompt facts
+Hooks plugin    →  per-turn context injection, observation capture
+MCP server      →  full tool palette for deep mempal operations
+```
+
+All three share the same mempal REST backend and `mempal.json` config.
 
 ## Circuit breaker
 
-After 5 consecutive REST failures the provider pauses for 120 seconds to avoid
-hammering a down server. Tool calls return a clear error message during cooldown.
+Both plugins use independent circuit breakers: after 5 consecutive REST
+failures, the plugin pauses for 120 seconds to avoid hammering a down server.
 
 ## Readiness suite
 
-Run the provider test suite to verify all features work correctly:
+Run the provider test suite to verify MemoryProvider features:
 
 ```bash
 python3 contrib/hermes-agent-plugin/test_mempal_provider.py -v
 ```
 
-The suite covers 67 tests across 12 test classes:
+## Future: authoritative mode
 
-| Area | Tests | What it verifies |
-|------|-------|-----------------|
-| Scope isolation | 9 | Profiles, wings, turn rooms, project_id, session switch, prefetch keying |
-| Write queue | 3 | Drain on shutdown, config-based availability, enqueue-not-thread |
-| Write semantics | 6 | add/replace/remove, drawer_id tracking, supersession, typed metadata |
-| Search results | 4 | Typed fields, None stripping, drawer_id in conclude/profile |
-| Pinned facts | 4 | System prompt injection, TTL cache, empty handling, session invalidation |
-| Intelligence modes | 9 | Mode switching, deterministic default, auto fallback, LLM breaker |
-| LLM client | 4 | Unconfigured returns None, breaker status, extra_body preserved |
-| Metadata validation | 6 | JSON parsing, code fence stripping, invalid kind/domain rejection |
-| Fact extraction | 5 | Grounded facts accepted, hallucination rejected, cap at 10 |
-| Provider activation | 6 | No-URL unavailable, tool schemas, breaker blocks/resets, health cache |
-| Durable memory | 5 | Single add, replace supersedes, remove deletes, verbatim conclude |
-| Reliability | 6 | 20-write drain, stale state clearing, breaker trip/reset, empty results |
+When hermes upstream merges #25526 (full memory bridge) and #25527
+(authoritative provider mode), the integration simplifies to:
 
-### Readiness checklist
+```yaml
+memory:
+  provider: mempal
+  provider_mode: authoritative
+```
 
-Before recommending `memory.provider=mempal` as authoritative backend:
-
-- [x] Scope isolation: profiles, chats, threads, projects do not leak
-- [x] Write semantics: add/replace/remove map correctly to ingest/supersede/delete
-- [x] Typed metadata: search and profile results include drawer_id and provenance
-- [x] Pinned facts: always-on context injected into system prompt
-- [x] Write queue: single worker, drains on shutdown, no data loss
-- [x] Intelligence modes: deterministic default, LLM optional, validation gates
-- [x] Circuit breaker: trips after failures, resets after cooldown
-- [x] Config: base_url, user_id, intelligence modes all configurable
-- [x] All blocker issues closed: #212, #213, #214, #215, #216, #191
+At that point the hooks plugin becomes optional — the MemoryProvider gets
+full memory operation pass-through and the LLM uses mempal as THE memory
+backend. The hooks plugin can be kept for observation capture if desired.

@@ -1,0 +1,3 @@
+name: mempal-hooks
+description: Enrich hermes-agent turns with mempal deep context and capture tool observations
+dependencies: []
