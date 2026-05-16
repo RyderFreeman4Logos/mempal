@@ -185,17 +185,39 @@ impl Config {
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
-                path: parent.to_path_buf(),
+        use std::io::Write as _;
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let contents = toml::to_string_pretty(self)?;
+        // Stage in same directory so persist() is an atomic rename, not a
+        // cross-filesystem copy. NamedTempFile is auto-removed on Drop if
+        // persist is not called (e.g. on error path).
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(parent).map_err(|source| ConfigError::Write {
+                path: path.to_path_buf(),
                 source,
             })?;
-        }
-        let contents = toml::to_string_pretty(self)?;
-        fs::write(path, contents).map_err(|source| ConfigError::Write {
-            path: path.to_path_buf(),
-            source,
-        })
+        tmp.write_all(contents.as_bytes())
+            .map_err(|source| ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        tmp.as_file()
+            .sync_all()
+            .map_err(|source| ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        tmp.persist(path)
+            .map_err(|err| ConfigError::Write {
+                path: path.to_path_buf(),
+                source: err.error,
+            })
+            .map(|_| ())
     }
 
     pub fn save_default(&self) -> Result<(), ConfigError> {

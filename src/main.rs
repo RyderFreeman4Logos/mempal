@@ -1161,7 +1161,6 @@ enum Phase3EvaluatorCommands {
 }
 
 #[derive(Subcommand)]
-#[allow(clippy::large_enum_variant)] // `record` intentionally carries the full event payload.
 enum Phase3AdoptionCommands {
     Guidance {
         #[arg(long, default_value = "plain")]

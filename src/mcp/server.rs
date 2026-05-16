@@ -1846,6 +1846,10 @@ impl MempalMcpServer {
             .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
 
         let trigger = request.trigger.as_deref().map(parse_context_trigger);
+        let config = crate::core::config::ConfigHandle::current();
+        let include_cards = request
+            .include_cards
+            .unwrap_or(config.context.include_cards_default);
         let db = self.open_db()?;
         let pack = assemble_context_with_vector(
             &db,
@@ -1857,13 +1861,10 @@ impl MempalMcpServer {
                     .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
                 cwd,
                 include_evidence: request.include_evidence.unwrap_or(false),
-                include_cards: request.include_cards.unwrap_or(false),
+                include_cards,
                 max_items,
                 dao_tian_limit,
-                project_id: crate::core::config::ConfigHandle::current()
-                    .project
-                    .id
-                    .clone(),
+                project_id: config.project.id.clone(),
                 trigger,
                 context_cfg_override: None,
             },
@@ -5090,6 +5091,7 @@ mod tests {
 
     use super::*;
     use crate::core::types::BootstrapEvidenceArgs;
+    use crate::core::types::{KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole};
     use crate::embed::Embedder;
 
     #[derive(Clone)]
@@ -5150,6 +5152,94 @@ mod tests {
             }),
         );
         (tempdir, db_path, server)
+    }
+
+    fn knowledge_card(
+        id: &str,
+        tier: KnowledgeTier,
+        status: KnowledgeStatus,
+        field: &str,
+    ) -> KnowledgeCard {
+        KnowledgeCard {
+            id: id.to_string(),
+            statement: format!("Statement for {id}."),
+            content: format!("Content for {id}."),
+            tier,
+            status,
+            domain: MemoryDomain::Project,
+            field: field.to_string(),
+            anchor_kind: AnchorKind::Repo,
+            anchor_id: "repo://mempal".to_string(),
+            parent_anchor_id: None,
+            scope_constraints: Some("Only for MCP read tests.".to_string()),
+            trigger_hints: Some(TriggerHints {
+                intent_tags: vec!["memory".to_string()],
+                workflow_bias: vec!["inspect-first".to_string()],
+                tool_needs: vec!["mcp".to_string()],
+            }),
+            auto_generated: false,
+            crystallization_score: None,
+            source_drawer_ids: Vec::new(),
+            created_at: "1713000000".to_string(),
+            updated_at: "1713000000".to_string(),
+        }
+    }
+
+    fn insert_knowledge_card(db_path: &Path, card: KnowledgeCard) {
+        let db = Database::open(db_path).expect("open db");
+        db.insert_knowledge_card(&card)
+            .expect("insert knowledge card");
+    }
+
+    fn insert_knowledge_card_link(
+        db_path: &Path,
+        id: &str,
+        card_id: &str,
+        evidence_drawer_id: &str,
+        role: KnowledgeEvidenceRole,
+    ) {
+        let db = Database::open(db_path).expect("open db");
+        db.insert_knowledge_evidence_link(&KnowledgeEvidenceLink {
+            id: id.to_string(),
+            card_id: card_id.to_string(),
+            evidence_drawer_id: evidence_drawer_id.to_string(),
+            role,
+            note: None,
+            created_at: "1713000000".to_string(),
+        })
+        .expect("insert knowledge card link");
+    }
+
+    /// Serializes tests that override the global `ConfigHandle` snapshot and
+    /// resets it to defaults on Drop so other parallel tests do not see leaked
+    /// overrides.
+    struct ConfigOverrideGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tempdir: TempDir,
+    }
+
+    impl ConfigOverrideGuard {
+        fn install(toml_contents: &str) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().expect("config override lock poisoned");
+            let tempdir = tempfile::tempdir().expect("config override tempdir");
+            let path = tempdir.path().join("override.toml");
+            fs::write(&path, toml_contents).expect("write config override");
+            crate::core::config::ConfigHandle::harness_reload_from_path(&path);
+            Self {
+                _lock: lock,
+                _tempdir: tempdir,
+            }
+        }
+    }
+
+    impl Drop for ConfigOverrideGuard {
+        fn drop(&mut self) {
+            let tempdir = tempfile::tempdir().expect("config reset tempdir");
+            let path = tempdir.path().join("default.toml");
+            fs::write(&path, "").expect("write default config");
+            crate::core::config::ConfigHandle::harness_reload_from_path(&path);
+        }
     }
 
     fn insert_drawer(
@@ -5605,6 +5695,48 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["qi", "evidence"]);
         assert_eq!(response.sections[1].items[0].drawer_id, "drawer_evidence");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_context_include_cards_omitted_uses_config_default() {
+        let _guard = ConfigOverrideGuard::install("[context]\ninclude_cards_default = true\n");
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "drawer_default_card_evidence",
+            "default card evidence",
+            "mempal",
+            Some("context"),
+            "/tmp/default-card-evidence.md",
+            2,
+        );
+        let mut card = knowledge_card(
+            "card_default_context",
+            KnowledgeTier::Shu,
+            KnowledgeStatus::Promoted,
+            "general",
+        );
+        card.anchor_id = anchor::LEGACY_REPO_ANCHOR_ID.to_string();
+        insert_knowledge_card(&db_path, card);
+        insert_knowledge_card_link(
+            &db_path,
+            "link_card_default_context",
+            "card_default_context",
+            "drawer_default_card_evidence",
+            KnowledgeEvidenceRole::Supporting,
+        );
+
+        let response = server
+            .context_json_for_test(serde_json::json!({ "query": "default card" }))
+            .await
+            .expect("context should succeed");
+        let card_item = response
+            .sections
+            .iter()
+            .flat_map(|section| section.items.iter())
+            .find(|item| item.card_id.as_deref() == Some("card_default_context"))
+            .expect("card item should appear when include_cards omitted and config default true");
+        assert_eq!(card_item.drawer_id, "card_default_context");
     }
 
     #[tokio::test]
