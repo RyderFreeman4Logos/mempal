@@ -39,7 +39,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 16;
+const CURRENT_SCHEMA_VERSION: u32 = 17;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -399,6 +399,19 @@ impl Database {
                 valid_until,
             ],
         )?;
+
+        if self.table_exists("drawers_fts")? {
+            let rowid: i64 = self.conn.query_row(
+                "SELECT rowid FROM drawers WHERE id = ?1",
+                [drawer.id.as_str()],
+                |row| row.get(0),
+            )?;
+            let tokenized = fts_tokenize_content(&drawer.content);
+            self.conn.execute(
+                "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
+                params![rowid, tokenized],
+            )?;
+        }
 
         Ok(())
     }
@@ -1487,9 +1500,10 @@ impl Database {
 
             for (rowid, id, content) in &rows {
                 if fts_exists {
+                    let tokenized = fts_tokenize_content(content);
                     self.conn.execute(
                         "INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', ?1, ?2)",
-                        params![rowid, content],
+                        params![rowid, tokenized],
                     )?;
                 }
                 if vectors_exist {
@@ -1713,9 +1727,10 @@ impl Database {
 
             let fts_exists = self.table_exists("drawers_fts")?;
             if fts_exists {
+                let old_tokenized = fts_tokenize_content(&old_content);
                 self.conn.execute(
                     "INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', ?1, ?2)",
-                    params![target_rowid, old_content],
+                    params![target_rowid, old_tokenized],
                 )?;
             }
 
@@ -1745,9 +1760,10 @@ impl Database {
             }
 
             if fts_exists {
+                let tokenized = fts_tokenize_content(merged_content);
                 self.conn.execute(
                     "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
-                    params![target_rowid, merged_content],
+                    params![target_rowid, tokenized],
                 )?;
             }
 
@@ -3936,6 +3952,9 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
             continue;
         }
         apply_migration_atomic(conn, migration)?;
+        if migration.version == 17 {
+            repopulate_fts_contentless(conn)?;
+        }
     }
 
     if current_version >= 5 {
@@ -3970,6 +3989,23 @@ fn apply_migration_atomic(conn: &Connection, migration: &Migration) -> Result<()
     })() {
         let _ = conn.execute_batch("ROLLBACK;");
         return Err(error);
+    }
+    Ok(())
+}
+
+fn repopulate_fts_contentless(conn: &Connection) -> Result<(), DbError> {
+    let mut stmt = conn.prepare("SELECT rowid, content FROM drawers WHERE deleted_at IS NULL")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (rowid, content) in rows {
+        let tokenized = fts_tokenize_content(&content);
+        conn.execute(
+            "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
+            params![rowid, tokenized],
+        )?;
     }
     Ok(())
 }
@@ -4900,6 +4936,18 @@ CREATE TABLE IF NOT EXISTS leases (
 );
 CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires_at);
 "#;
+
+const V17_MIGRATION_SQL: &str = r#"
+DROP TRIGGER IF EXISTS drawers_ai;
+DROP TRIGGER IF EXISTS drawers_au_softdelete;
+DROP TABLE IF EXISTS drawers_fts;
+CREATE VIRTUAL TABLE IF NOT EXISTS drawers_fts USING fts5(
+    content,
+    content='drawers',
+    content_rowid='rowid'
+);
+"#;
+
 const V12_COMPACTION_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
     ON drawers(compacted_into)
@@ -5046,6 +5094,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 16,
             sql: V16_MIGRATION_SQL,
+        },
+        Migration {
+            version: 17,
+            sql: V17_MIGRATION_SQL,
         },
     ];
     MIGRATIONS
@@ -5550,18 +5602,63 @@ fn parse_keywords(raw: Option<&str>) -> Result<Vec<String>, DbError> {
 }
 
 fn build_fts_match_query(query: &str) -> Option<String> {
-    let terms = query
-        .split_whitespace()
-        .map(str::trim)
+    let segments = segment_cjk_query(query);
+    let terms: Vec<String> = segments
+        .iter()
         .filter(|term| !term.is_empty())
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>();
+        .collect();
 
     if terms.is_empty() {
         None
     } else {
         Some(terms.join(" AND "))
     }
+}
+
+fn fts_tokenize_content(content: &str) -> String {
+    if !contains_cjk(content) {
+        return content.to_string();
+    }
+    crate::aaak::codec::jieba_cut_for_search(content)
+        .into_iter()
+        .filter(|w| !w.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn contains_cjk(s: &str) -> bool {
+    s.chars()
+        .any(|c| matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}'))
+}
+
+fn segment_cjk_query(query: &str) -> Vec<String> {
+    let raw_terms: Vec<&str> = query.split_whitespace().collect();
+    let mut result = Vec::new();
+    for term in raw_terms {
+        if contains_cjk(term) {
+            let words: Vec<String> = crate::aaak::codec::jieba_cut_for_search(term)
+                .into_iter()
+                .filter(|w| !w.trim().is_empty())
+                .map(|w| w.to_string())
+                .collect();
+            // Filter out compound words whose characters are fully covered by
+            // shorter segments (cut_for_search emits both sub-words and the
+            // original compound; only sub-words match the tokenized index).
+            for w in &words {
+                let is_compound = w.chars().count() > 1
+                    && words
+                        .iter()
+                        .any(|other| other != w && w.contains(other.as_str()));
+                if !is_compound {
+                    result.push(w.clone());
+                }
+            }
+        } else {
+            result.push(term.to_string());
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -6127,6 +6224,58 @@ mod tests {
         assert_eq!(
             repaired.6.as_deref(),
             Some(blake3::hash(b"legacy body").to_hex().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn cjk_segmentation_splits_chinese_query() {
+        let segments = segment_cjk_query("记忆系统设计");
+        assert!(
+            segments.len() > 1,
+            "should split CJK into multiple words: {:?}",
+            segments
+        );
+    }
+
+    #[test]
+    fn cjk_segmentation_preserves_english() {
+        let segments = segment_cjk_query("hello world");
+        assert_eq!(segments, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn cjk_segmentation_handles_mixed() {
+        let segments = segment_cjk_query("mempal 记忆系统 design");
+        assert!(segments.contains(&"mempal".to_string()));
+        assert!(segments.contains(&"design".to_string()));
+        assert!(
+            segments.len() > 3,
+            "CJK part should be split: {:?}",
+            segments
+        );
+    }
+
+    #[test]
+    fn build_fts_match_query_segments_cjk() {
+        let query = build_fts_match_query("记忆系统").unwrap();
+        assert!(
+            query.contains("AND"),
+            "CJK query should have multiple terms: {}",
+            query
+        );
+    }
+
+    #[test]
+    fn fts_chinese_content_matches_segmented_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("test.db")).unwrap();
+        insert_test_drawer(&db, "zh1", "这是一个记忆系统的设计方案", None);
+        let results = db
+            .search_fts("记忆系统", None, None, "all", None, 10)
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "CJK search should find Chinese content"
         );
     }
 }
