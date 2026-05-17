@@ -1,9 +1,11 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::thread;
+use std::time::Duration;
 
 use mempal::core::db::Database;
 use mempal::core::types::{
@@ -11,6 +13,8 @@ use mempal::core::types::{
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
+
+const CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
@@ -23,11 +27,69 @@ fn setup_cli_home() -> TempDir {
 }
 
 fn run_mempal(home: &Path, args: &[&str]) -> Output {
-    Command::new(mempal_bin())
-        .env("HOME", home)
-        .args(args)
-        .output()
-        .expect("run mempal")
+    run_mempal_timeout(home, args, CMD_TIMEOUT)
+}
+
+fn run_mempal_timeout(home: &Path, args: &[&str], timeout: Duration) -> Output {
+    let mut child = unsafe {
+        Command::new(mempal_bin())
+            .env("HOME", home)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // SAFETY: setsid creates a new process group so timeout can kill the entire tree.
+            .pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            })
+            .spawn()
+            .expect("spawn mempal")
+    };
+
+    let stdout_pipe = child.stdout.take().unwrap();
+    let stderr_pipe = child.stderr.take().unwrap();
+
+    let stdout_thread = thread::spawn(move || {
+        let mut v = Vec::new();
+        let mut pipe = stdout_pipe;
+        pipe.read_to_end(&mut v).ok();
+        v
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut v = Vec::new();
+        let mut pipe = stderr_pipe;
+        pipe.read_to_end(&mut v).ok();
+        v
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_thread.join().unwrap_or_default();
+                let stderr = stderr_thread.join().unwrap_or_default();
+                return Output {
+                    status,
+                    stdout,
+                    stderr,
+                };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // SAFETY: Sending SIGKILL to the process group created via setsid above.
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                    let _ = child.wait();
+                    panic!(
+                        "mempal command timed out after {}s: {:?}",
+                        timeout.as_secs(),
+                        args
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("error waiting for mempal process: {e}"),
+        }
+    }
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -101,14 +163,14 @@ fn start_embedding_stub(
             .expect("write embedding response");
     });
 
-    (format!("http://{address}/v1/embeddings"), handle)
+    (format!("http://{address}/v1"), handle)
 }
 
 fn write_cli_api_config(home: &Path, endpoint: &str) {
     fs::write(
         home.join(".mempal").join("config.toml"),
         format!(
-            "[embed]\nbackend = \"api\"\napi_endpoint = \"{endpoint}\"\napi_model = \"test-model\"\n"
+            "[embed]\nbackend = \"api\"\napi_endpoint = \"{endpoint}\"\napi_model = \"test-model\"\n\n[embed.openai_compat]\ndim = 384\n"
         ),
     )
     .expect("write cli config");
@@ -128,7 +190,6 @@ fn run_with_embedding_stub(
 }
 
 #[test]
-#[ignore] // hangs in pre-commit: spawns full daemon needing embedder (gb10:18002)
 fn test_cli_self_evolution_replay_research_to_context_to_adoption() {
     let home = setup_cli_home();
     let report_path = home.path().join("research-report.json");
