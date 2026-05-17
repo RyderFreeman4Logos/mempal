@@ -9,6 +9,14 @@ fn jieba() -> &'static Jieba {
     INSTANCE.get_or_init(Jieba::new)
 }
 
+pub fn jieba_cut_for_search(text: &str) -> Vec<String> {
+    jieba()
+        .cut_for_search(text, true)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 use super::model::{
     AaakDocument, AaakHeader, AaakLine, AaakMeta, EncodeOutput, EncodeReport, RoundtripReport,
     Zettel,
