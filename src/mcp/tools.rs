@@ -1545,6 +1545,60 @@ pub struct RollbackResponse {
     pub system_warnings: Vec<SystemWarning>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LeaseRequest {
+    /// Action to perform: "acquire", "release", "renew", or "status".
+    pub action: String,
+    /// Resource path to lock (e.g. "wing/room" or any string). Required for
+    /// acquire/release/renew.
+    pub resource_path: Option<String>,
+    /// Unique identifier for the lease holder (e.g. agent session ID). Required
+    /// for acquire/release/renew.
+    pub holder_id: Option<String>,
+    /// Time-to-live in seconds. The lease auto-expires after this duration.
+    /// Default: 300 (5 minutes). Used for acquire and renew.
+    pub ttl_secs: Option<u64>,
+    /// Optional context about why the lease is held (for acquire only).
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct LeaseInfoDto {
+    pub resource_path: String,
+    pub holder_id: String,
+    pub acquired_at: String,
+    pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+    pub remaining_secs: i64,
+}
+
+impl From<crate::core::types::LeaseInfo> for LeaseInfoDto {
+    fn from(info: crate::core::types::LeaseInfo) -> Self {
+        Self {
+            resource_path: info.resource_path,
+            holder_id: info.holder_id,
+            acquired_at: info.acquired_at,
+            expires_at: info.expires_at,
+            metadata: info.metadata,
+            remaining_secs: info.remaining_secs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct LeaseResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<LeaseInfoDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leases: Option<Vec<LeaseInfoDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct IngestResponse {
     /// ID of the first (or only) drawer created. For backward compatibility,

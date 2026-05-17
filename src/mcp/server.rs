@@ -84,17 +84,17 @@ use super::tools::{
     KnowledgeDemoteRequest, KnowledgeDemoteResponse, KnowledgeDistillRequest,
     KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse,
     KnowledgePromoteRequest, KnowledgePromoteResponse, KnowledgePublishAnchorRequest,
-    KnowledgePublishAnchorResponse, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT,
-    MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse,
-    Phase3GateDto, Phase3Request, Phase3Response, PinnedFactDto, PinnedFactProjectCount,
-    PinnedFactsRequest, PinnedFactsResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
-    ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto,
-    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto,
-    RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
-    SearchResultDto, SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount,
-    StatusResponse, SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse,
-    TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse,
-    TurnStorageStatusDto,
+    KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest, LeaseResponse, LlmStatusDto,
+    MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest,
+    PeekPartnerResponse, Phase3GateDto, Phase3Request, Phase3Response, PinnedFactDto,
+    PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse, QueueStatsDto,
+    ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
+    ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto, RollbackRequest,
+    RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto,
+    SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
+    SkillSummaryDto, SourceTypeCount, StatusResponse, SystemWarning, TaxonomyEntryDto,
+    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
+    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 #[derive(Clone)]
@@ -3143,6 +3143,122 @@ impl MempalMcpServer {
             dry_run,
             system_warnings: current_system_warnings(),
         }))
+    }
+
+    #[tool(
+        name = "mempal_lease",
+        description = "Coordinate multi-agent access to memory regions via advisory leases. Actions: 'acquire' (lock a resource), 'release' (unlock), 'renew' (extend TTL), 'status' (list active leases). Leases auto-expire after ttl_secs (default 300s) to prevent orphan locks from crashed agents."
+    )]
+    pub async fn mempal_lease(
+        &self,
+        Parameters(request): Parameters<LeaseRequest>,
+    ) -> std::result::Result<Json<LeaseResponse>, ErrorData> {
+        let db = self.open_db()?;
+        let ttl = request.ttl_secs.unwrap_or(300);
+        match request.action.as_str() {
+            "acquire" => {
+                let resource = request.resource_path.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("resource_path is required for acquire", None)
+                })?;
+                let holder = request.holder_id.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("holder_id is required for acquire", None)
+                })?;
+                let success = db
+                    .lease_acquire(resource, holder, ttl, request.metadata.as_deref())
+                    .map_err(db_error)?;
+                let lease: Option<LeaseInfoDto> = if success {
+                    db.lease_status(Some(resource))
+                        .map_err(db_error)?
+                        .into_iter()
+                        .next()
+                        .map(Into::into)
+                } else {
+                    None
+                };
+                Ok(Json(LeaseResponse {
+                    success,
+                    lease,
+                    leases: None,
+                    error: if success {
+                        None
+                    } else {
+                        Some("resource is held by another agent".to_string())
+                    },
+                    system_warnings: current_system_warnings(),
+                }))
+            }
+            "release" => {
+                let resource = request.resource_path.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("resource_path is required for release", None)
+                })?;
+                let holder = request.holder_id.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("holder_id is required for release", None)
+                })?;
+                let success = db.lease_release(resource, holder).map_err(db_error)?;
+                Ok(Json(LeaseResponse {
+                    success,
+                    lease: None,
+                    leases: None,
+                    error: if success {
+                        None
+                    } else {
+                        Some("lease not found or wrong holder".to_string())
+                    },
+                    system_warnings: current_system_warnings(),
+                }))
+            }
+            "renew" => {
+                let resource = request.resource_path.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("resource_path is required for renew", None)
+                })?;
+                let holder = request.holder_id.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params("holder_id is required for renew", None)
+                })?;
+                let success = db.lease_renew(resource, holder, ttl).map_err(db_error)?;
+                let lease: Option<LeaseInfoDto> = if success {
+                    db.lease_status(Some(resource))
+                        .map_err(db_error)?
+                        .into_iter()
+                        .next()
+                        .map(Into::into)
+                } else {
+                    None
+                };
+                Ok(Json(LeaseResponse {
+                    success,
+                    lease,
+                    leases: None,
+                    error: if success {
+                        None
+                    } else {
+                        Some("lease not found or wrong holder".to_string())
+                    },
+                    system_warnings: current_system_warnings(),
+                }))
+            }
+            "status" => {
+                let leases: Vec<LeaseInfoDto> = db
+                    .lease_status(request.resource_path.as_deref())
+                    .map_err(db_error)?
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                Ok(Json(LeaseResponse {
+                    success: true,
+                    lease: None,
+                    leases: Some(leases),
+                    error: None,
+                    system_warnings: current_system_warnings(),
+                }))
+            }
+            other => Err(ErrorData::invalid_params(
+                format!(
+                    "unknown action '{}'; expected acquire/release/renew/status",
+                    other
+                ),
+                None,
+            )),
+        }
     }
 
     #[tool(

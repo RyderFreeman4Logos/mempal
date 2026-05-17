@@ -689,6 +689,17 @@ pub struct SearchResult {
     pub matched_pattern_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseInfo {
+    pub resource_path: String,
+    pub holder_id: String,
+    pub acquired_at: String,
+    pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+    pub remaining_secs: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
