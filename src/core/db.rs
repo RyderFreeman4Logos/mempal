@@ -39,7 +39,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 15;
+const CURRENT_SCHEMA_VERSION: u32 = 16;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -3570,6 +3570,130 @@ impl Database {
         }
         Ok(total)
     }
+
+    // --- Lease coordination ---
+
+    pub fn lease_acquire(
+        &self,
+        resource_path: &str,
+        holder_id: &str,
+        ttl_secs: u64,
+        metadata: Option<&str>,
+    ) -> Result<bool, DbError> {
+        self.conn.execute(
+            "DELETE FROM leases WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            [],
+        )?;
+        let expires_at = crate::cowork::peek::format_rfc3339(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(ttl_secs),
+        );
+        let rows = self.conn.execute(
+            "INSERT OR IGNORE INTO leases (resource_path, holder_id, expires_at, metadata) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![resource_path, holder_id, &expires_at, metadata],
+        )?;
+        if rows > 0 {
+            return Ok(true);
+        }
+        let existing_holder: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT holder_id FROM leases WHERE resource_path = ?1",
+                [resource_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing_holder {
+            Some(ref h) if h == holder_id => {
+                self.conn.execute(
+                    "UPDATE leases SET expires_at = ?1 WHERE resource_path = ?2 AND holder_id = ?3",
+                    rusqlite::params![&expires_at, resource_path, holder_id],
+                )?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn lease_release(&self, resource_path: &str, holder_id: &str) -> Result<bool, DbError> {
+        let rows = self.conn.execute(
+            "DELETE FROM leases WHERE resource_path = ?1 AND holder_id = ?2",
+            rusqlite::params![resource_path, holder_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn lease_renew(
+        &self,
+        resource_path: &str,
+        holder_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, DbError> {
+        let expires_at = crate::cowork::peek::format_rfc3339(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(ttl_secs),
+        );
+        let rows = self.conn.execute(
+            "UPDATE leases SET expires_at = ?1 WHERE resource_path = ?2 AND holder_id = ?3",
+            rusqlite::params![&expires_at, resource_path, holder_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn lease_status(
+        &self,
+        resource_path: Option<&str>,
+    ) -> Result<Vec<crate::core::types::LeaseInfo>, DbError> {
+        self.conn.execute(
+            "DELETE FROM leases WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            [],
+        )?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut results = Vec::new();
+        let collect_row = |row: &rusqlite::Row| -> rusqlite::Result<crate::core::types::LeaseInfo> {
+            let exp: String = row.get(3)?;
+            let remaining = crate::cowork::peek::parse_rfc3339(&exp)
+                .map(|e| (e - now_secs).max(0))
+                .unwrap_or(0);
+            Ok(crate::core::types::LeaseInfo {
+                resource_path: row.get(0)?,
+                holder_id: row.get(1)?,
+                acquired_at: row.get(2)?,
+                expires_at: exp,
+                metadata: row.get(4)?,
+                remaining_secs: remaining,
+            })
+        };
+        if let Some(path) = resource_path {
+            let mut stmt = self.conn.prepare(
+                "SELECT resource_path, holder_id, acquired_at, expires_at, metadata \
+                 FROM leases WHERE resource_path = ?1",
+            )?;
+            let rows = stmt.query_map([path], collect_row)?;
+            for row in rows {
+                results.push(row?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT resource_path, holder_id, acquired_at, expires_at, metadata FROM leases",
+            )?;
+            let rows = stmt.query_map([], collect_row)?;
+            for row in rows {
+                results.push(row?);
+            }
+        }
+        Ok(results)
+    }
+
+    pub fn lease_cleanup_expired(&self) -> Result<usize, DbError> {
+        let rows = self.conn.execute(
+            "DELETE FROM leases WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            [],
+        )?;
+        Ok(rows)
+    }
 }
 
 pub fn find_similar_clusters(
@@ -4765,6 +4889,17 @@ const V12_MIGRATION_SQL: &str = "";
 const V13_MIGRATION_SQL: &str = "";
 const V14_MIGRATION_SQL: &str = "";
 const V15_MIGRATION_SQL: &str = "";
+
+const V16_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS leases (
+    resource_path TEXT NOT NULL PRIMARY KEY,
+    holder_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    expires_at TEXT NOT NULL,
+    metadata TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires_at);
+"#;
 const V12_COMPACTION_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
     ON drawers(compacted_into)
@@ -4907,6 +5042,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 15,
             sql: V15_MIGRATION_SQL,
+        },
+        Migration {
+            version: 16,
+            sql: V16_MIGRATION_SQL,
         },
     ];
     MIGRATIONS

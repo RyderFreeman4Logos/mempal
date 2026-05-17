@@ -128,6 +128,7 @@ fn run_with_embedding_stub(
 }
 
 #[test]
+#[ignore] // hangs in pre-commit: spawns full daemon needing embedder (gb10:18002)
 fn test_cli_self_evolution_replay_research_to_context_to_adoption() {
     let home = setup_cli_home();
     let report_path = home.path().join("research-report.json");
