@@ -2,6 +2,9 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
+    /// Claude Code session JSONL: each line is a top-level event with `type`,
+    /// `sessionId`, and `message` as a nested API message object.
+    CcSession,
     ClaudeJsonl,
     ChatGptJson,
     CodexJsonl,
@@ -10,6 +13,13 @@ pub enum Format {
 }
 
 pub fn detect_format(content: &str) -> Format {
+    // Check CcSession before ClaudeJsonl: CC sessions have `message` as an object
+    // (not a string), which causes is_claude_jsonl to return false, but we want
+    // an explicit match rather than falling through to PlainText.
+    if is_cc_session_jsonl(content) {
+        return Format::CcSession;
+    }
+
     if is_claude_jsonl(content) {
         return Format::ClaudeJsonl;
     }
@@ -27,6 +37,34 @@ pub fn detect_format(content: &str) -> Format {
     }
 
     Format::PlainText
+}
+
+/// Detect Claude Code session JSONL format. Each line must be a JSON object
+/// where user/assistant entries carry `message` as a nested object (Anthropic
+/// API message shape) and at least one line contains a `sessionId` field.
+fn is_cc_session_jsonl(content: &str) -> bool {
+    let mut has_session_id = false;
+    let mut has_msg_obj = false;
+
+    for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        if !value.is_object() {
+            return false;
+        }
+        if value.get("sessionId").and_then(Value::as_str).is_some() {
+            has_session_id = true;
+        }
+        let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if matches!(line_type, "user" | "assistant")
+            && value.get("message").is_some_and(Value::is_object)
+        {
+            has_msg_obj = true;
+        }
+    }
+
+    has_session_id && has_msg_obj
 }
 
 fn is_codex_jsonl(content: &str) -> bool {
