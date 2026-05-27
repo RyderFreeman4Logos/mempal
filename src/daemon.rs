@@ -15,6 +15,7 @@ use crate::core::{
     types::{BootstrapEvidenceArgs, Drawer, SourceType},
     utils::{current_timestamp, route_room_from_taxonomy, synthetic_source_file},
 };
+use crate::cowork::claude::claude_project_dir;
 use crate::embed::{
     EmbedError, Embedder, build_backend_from_name, global_embed_status,
     retry::{HeartbeatCallback, retry_embed_operation},
@@ -24,6 +25,7 @@ use crate::ingest::gating::{
     evaluate_tier1, tier2_enabled,
 };
 use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
+use crate::ingest::{IngestOptions, ingest_file_with_options};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -390,6 +392,10 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         last_drawer_id = Some(drawer_id);
     }
 
+    if envelope.event == crate::hook::HookEvent::SessionEnd.display_name() {
+        try_ingest_session_conversation(db, embedder, &envelope, &context).await;
+    }
+
     Ok(last_drawer_id.unwrap_or_else(|| message.id.clone()))
 }
 
@@ -641,6 +647,128 @@ fn load_session_review_payload(envelope: &CapturedHookEnvelope) -> Result<Option
             payload_path
         )
     })
+}
+
+fn session_already_ingested(db: &Database, session_id: &str) -> bool {
+    db.conn()
+        .query_row(
+            "SELECT 1 FROM drawers WHERE wing = 'conversation' AND room = ?1 AND deleted_at IS NULL LIMIT 1",
+            rusqlite::params![session_id],
+            |_| Ok(()),
+        )
+        .is_ok()
+}
+
+fn find_session_jsonl_path(
+    raw_payload: &str,
+    claude_cwd: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    // Try transcript_path from payload first (CC may include it directly).
+    if let Ok(val) = serde_json::from_str::<Value>(raw_payload) {
+        if let Some(path_str) = val.get("transcript_path").and_then(Value::as_str) {
+            let path = PathBuf::from(path_str);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+
+    // Fallback: $HOME/.claude/projects/<encoded_cwd>/<session_id>.jsonl
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let cwd = Path::new(claude_cwd);
+    let project_dir = claude_project_dir(&home, cwd);
+    let path = project_dir.join(format!("{session_id}.jsonl"));
+    if path.is_file() {
+        return Some(path);
+    }
+
+    None
+}
+
+async fn try_ingest_session_conversation<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    envelope: &CapturedHookEnvelope,
+    context: &DaemonIngestContext<'_>,
+) {
+    if !context.config.hooks.session_end.auto_ingest_conversation {
+        return;
+    }
+
+    let payload = match load_session_review_payload(envelope) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(?err, "auto_ingest_conversation: failed to load payload");
+            return;
+        }
+    };
+    let raw_payload = match payload.as_deref() {
+        Some(p) => p,
+        None => {
+            tracing::debug!("auto_ingest_conversation: empty payload");
+            return;
+        }
+    };
+
+    let session_id = match hook_payload_session_id(raw_payload) {
+        Some(id) => id,
+        None => {
+            tracing::warn!(
+                agent = %envelope.agent,
+                "auto_ingest_conversation: no session_id in SessionEnd payload"
+            );
+            return;
+        }
+    };
+
+    if session_already_ingested(db, &session_id) {
+        tracing::debug!(
+            session_id,
+            "auto_ingest_conversation: already ingested, skipping"
+        );
+        return;
+    }
+
+    let jsonl_path = match find_session_jsonl_path(raw_payload, &envelope.claude_cwd, &session_id) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                session_id,
+                cwd = %envelope.claude_cwd,
+                "auto_ingest_conversation: JSONL file not found"
+            );
+            return;
+        }
+    };
+
+    let options = IngestOptions {
+        room: Some(session_id.as_str()),
+        source_root: jsonl_path.parent(),
+        dry_run: false,
+        source_type: Some(SourceType::AgentInference),
+        ..IngestOptions::default()
+    };
+
+    match ingest_file_with_options(db, embedder, &jsonl_path, "conversation", options).await {
+        Ok(stats) => {
+            tracing::info!(
+                session_id,
+                chunks = stats.chunks,
+                skipped = stats.skipped,
+                dropped = stats.dropped_by_gate,
+                "auto_ingest_conversation: complete"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                session_id,
+                path = %jsonl_path.display(),
+                "auto_ingest_conversation: ingestion failed (non-fatal)"
+            );
+        }
+    }
 }
 
 fn build_audit_drawer_record(
