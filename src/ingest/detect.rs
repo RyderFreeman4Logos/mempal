@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+const JSONL_DETECTION_LINE_LIMIT: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     /// Claude Code session JSONL: each line is a top-level event with `type`,
@@ -46,7 +48,12 @@ fn is_cc_session_jsonl(content: &str) -> bool {
     let mut has_session_id = false;
     let mut has_msg_obj = false;
 
-    for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(JSONL_DETECTION_LINE_LIMIT)
+    {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return false;
         };

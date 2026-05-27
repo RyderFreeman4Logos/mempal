@@ -2,10 +2,17 @@ use std::path::Path;
 
 use serde_json::Value;
 
+const SESSION_ID_SCAN_LINE_LIMIT: usize = 64;
+
 /// Extract the session ID from JSONL content by scanning for a `sessionId` field.
 /// Returns `None` when no non-empty `sessionId` is found.
 pub fn extract_session_id_from_content(content: &str) -> Option<String> {
-    for raw_line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+    for raw_line in content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(SESSION_ID_SCAN_LINE_LIMIT)
+    {
         let Ok(value) = serde_json::from_str::<Value>(raw_line) else {
             continue;
         };
@@ -70,6 +77,15 @@ mod tests {
     fn test_extract_session_id_from_content_plain_text() {
         let content = "this is not json";
         assert_eq!(extract_session_id_from_content(content), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_from_content_limits_scan_window() {
+        let mut lines = vec![r#"{"type":"summary"}"#; SESSION_ID_SCAN_LINE_LIMIT];
+        lines.push(r#"{"type":"user","sessionId":"late","message":{"role":"user","content":[]}}"#);
+        let content = lines.join("\n");
+
+        assert_eq!(extract_session_id_from_content(&content), None);
     }
 
     #[test]

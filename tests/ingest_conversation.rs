@@ -92,6 +92,17 @@ fn test_detect_format_plain_text_unchanged() {
     assert_eq!(detect_format(content), Format::PlainText);
 }
 
+#[test]
+fn test_detect_format_cc_session_limits_scan_window() {
+    let mut lines = vec![r#"{"type":"summary","sessionId":"late-session"}"#; 64];
+    lines.push(
+        r#"{"type":"user","sessionId":"late-session","message":{"role":"user","content":[]}}"#,
+    );
+    let content = lines.join("\n");
+
+    assert_eq!(detect_format(&content), Format::PlainText);
+}
+
 // ---- Normalizer tests ----
 
 #[test]
