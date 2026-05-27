@@ -1,4 +1,5 @@
 pub mod model;
+pub mod parser;
 
 use thiserror::Error;
 

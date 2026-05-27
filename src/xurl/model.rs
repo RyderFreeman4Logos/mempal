@@ -58,6 +58,8 @@ pub struct RawTurn {
     pub git_branch: Option<String>,
     pub is_csa_delegated: bool,
     pub provenance: Provenance,
+    /// 0-based monotonic index within the session (counting only kept turns).
+    pub turn_index: u32,
 }
 
 #[cfg(test)]
