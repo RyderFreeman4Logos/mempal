@@ -1,7 +1,7 @@
 use serde_json::Value;
 
-use crate::xurl::model::{Provenance, RawTurn, Role, Tool};
 use crate::xurl::XurlResult;
+use crate::xurl::model::{Provenance, RawTurn, Role, Tool};
 
 const SESSION_ID_SCAN_LIMIT: usize = 64;
 
