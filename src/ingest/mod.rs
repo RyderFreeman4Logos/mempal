@@ -1,6 +1,7 @@
 #![warn(clippy::all)]
 
 pub mod chunk;
+pub mod conversation;
 pub mod detect;
 pub mod diary;
 pub mod gating;
@@ -336,14 +337,16 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
 
     // Stage 4: Chunking
     let chunks = match format {
-        Format::ClaudeJsonl | Format::ChatGptJson | Format::CodexJsonl | Format::SlackJson => {
-            chunk_conversation_token_aware(
-                &scrubbed,
-                chunker_config,
-                embedder,
-                Some(&source_display),
-            )
-        }
+        Format::CcSession
+        | Format::ClaudeJsonl
+        | Format::ChatGptJson
+        | Format::CodexJsonl
+        | Format::SlackJson => chunk_conversation_token_aware(
+            &scrubbed,
+            chunker_config,
+            embedder,
+            Some(&source_display),
+        ),
         Format::PlainText => {
             chunk_text_token_aware(&scrubbed, chunker_config, embedder, Some(&source_display))
         }

@@ -739,6 +739,9 @@ pub struct HooksSessionEndConfig {
     pub trailing_messages: usize,
     pub min_length: usize,
     pub wing: String,
+    /// Automatically ingest the session JSONL transcript into wing="conversation"
+    /// when a SessionEnd hook fires. Disabled by default.
+    pub auto_ingest_conversation: bool,
 }
 
 impl Default for HooksSessionEndConfig {
@@ -748,6 +751,7 @@ impl Default for HooksSessionEndConfig {
             trailing_messages: DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES,
             min_length: DEFAULT_SESSION_REVIEW_MIN_LENGTH,
             wing: DEFAULT_SESSION_REVIEW_WING.to_string(),
+            auto_ingest_conversation: false,
         }
     }
 }

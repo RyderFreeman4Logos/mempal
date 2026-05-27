@@ -47,6 +47,7 @@ pub fn normalize_content_with_options(
             content: content.trim().to_string(),
             noise_bytes_stripped: None,
         }),
+        Format::CcSession => normalize_cc_session_jsonl(content),
         Format::ClaudeJsonl => normalize_claude_jsonl(content, options.strip_noise),
         Format::ChatGptJson => Ok(NormalizeOutput {
             content: normalize_chatgpt_json(content)?,
@@ -58,6 +59,71 @@ pub fn normalize_content_with_options(
             noise_bytes_stripped: None,
         }),
     }
+}
+
+/// Extract plain text from a Claude API content-blocks array. Only `text` blocks
+/// are extracted; `tool_use`, `tool_result`, and `image` blocks are silently dropped.
+fn extract_text_from_cc_content(content: &Value) -> String {
+    match content {
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    block.get("text").and_then(Value::as_str).map(str::trim)
+                } else {
+                    None
+                }
+            })
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::String(s) => s.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Normalize a Claude Code session JSONL transcript to the standard `> user / assistant`
+/// transcript format. Skips non-conversational entries (tool, summary, system) and
+/// filters out tool_use / tool_result / image content blocks.
+fn normalize_cc_session_jsonl(content: &str) -> Result<NormalizeOutput> {
+    let mut lines = Vec::new();
+
+    for raw_line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let value: Value = serde_json::from_str(raw_line)?;
+
+        let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(line_type, "user" | "assistant") {
+            continue;
+        }
+
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or(line_type);
+
+        let Some(content_val) = message.get("content") else {
+            continue;
+        };
+        let text = extract_text_from_cc_content(content_val);
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        if role == "user" {
+            lines.push(format!("> {text}"));
+        } else {
+            lines.push(text);
+        }
+    }
+
+    Ok(NormalizeOutput {
+        content: lines.join("\n"),
+        noise_bytes_stripped: None,
+    })
 }
 
 fn normalize_claude_jsonl(content: &str, strip_noise: bool) -> Result<NormalizeOutput> {
