@@ -48,6 +48,7 @@ impl Provenance {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct RawTurn {
     pub session_id: String,
     pub tool: Tool,

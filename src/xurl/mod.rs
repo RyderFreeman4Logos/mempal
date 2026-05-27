@@ -1,5 +1,7 @@
+pub mod embed;
 pub mod model;
 pub mod parser;
+pub mod store;
 
 use thiserror::Error;
 
