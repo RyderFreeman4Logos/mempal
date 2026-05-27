@@ -1,3 +1,8 @@
+use crate::adoption_analytics::{RuntimeAdoptionAnalyticsGroup, RuntimeAdoptionAnalyticsReport};
+use crate::brief::{
+    BriefCard, BriefCitation, BriefEvidence, BriefEvidenceCitation, BriefFact, BriefSummary,
+    BriefUncertainty, BriefUnresolvedItem, CognitiveBrief,
+};
 use crate::context::{ContextItem, ContextPack, ContextSection, TieredAssembly};
 use crate::core::phase3::{
     Phase3ReadinessReport, ResearchCandidateInsightPlan, ResearchEvidenceDrawerPlan,
@@ -12,6 +17,7 @@ use crate::core::types::{
     MemoryDomain, MemoryKind, NeighborChunk, RouteDecision, RuntimeAdoptionEvent,
     RuntimeAdoptionSignal, RuntimeAdoptionTrack, SearchResult, TaxonomyEntry, TunnelEndpoint,
 };
+use crate::doctor::{DoctorDbReport, DoctorInstallReport, DoctorReport};
 use crate::field_taxonomy::FieldTaxonomyEntry;
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
@@ -548,6 +554,8 @@ pub struct Phase3Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<RuntimeAdoptionStatsDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub analytics: Option<RuntimeAdoptionAnalyticsDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<Phase3GateDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub research_plan: Option<ResearchAdapterPlanDto>,
@@ -947,6 +955,56 @@ pub struct RuntimeAdoptionStatsDto {
     pub rollbacks: usize,
     pub contradictions: usize,
     pub neutral: usize,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionAnalyticsDto {
+    pub writes: bool,
+    pub total_events: usize,
+    pub groups: Vec<RuntimeAdoptionAnalyticsGroupDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RuntimeAdoptionAnalyticsGroupDto {
+    pub track: String,
+    pub feature: String,
+    pub total: usize,
+    pub used: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub misses: usize,
+    pub rollbacks: usize,
+    pub contradictions: usize,
+    pub neutral: usize,
+    pub recommendation: String,
+}
+
+impl From<RuntimeAdoptionAnalyticsReport> for RuntimeAdoptionAnalyticsDto {
+    fn from(report: RuntimeAdoptionAnalyticsReport) -> Self {
+        Self {
+            writes: report.writes,
+            total_events: report.total_events,
+            groups: report.groups.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<RuntimeAdoptionAnalyticsGroup> for RuntimeAdoptionAnalyticsGroupDto {
+    fn from(group: RuntimeAdoptionAnalyticsGroup) -> Self {
+        Self {
+            track: group.track,
+            feature: group.feature,
+            total: group.total,
+            used: group.used,
+            accepted: group.accepted,
+            rejected: group.rejected,
+            misses: group.misses,
+            rollbacks: group.rollbacks,
+            contradictions: group.contradictions,
+            neutral: group.neutral,
+            recommendation: group.recommendation,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -2094,6 +2152,502 @@ pub struct FactCheckResponse {
     pub repair_packages: Vec<crate::repair::RepairPackage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DoctorRequest {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DoctorResponse {
+    pub current_version: String,
+    pub supported_schema_version: u32,
+    pub db: DoctorDbDto,
+    pub install: DoctorInstallDto,
+    pub warnings: Vec<String>,
+    pub recommendations: Vec<String>,
+    pub mcp: DoctorMcpDto,
+}
+
+impl DoctorResponse {
+    pub fn from_report(report: DoctorReport, mcp: DoctorMcpDto) -> Self {
+        Self {
+            current_version: report.current_version,
+            supported_schema_version: report.supported_schema_version,
+            db: report.db.into(),
+            install: report.install.into(),
+            warnings: report.warnings,
+            recommendations: report.recommendations,
+            mcp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DoctorDbDto {
+    pub path: String,
+    pub exists: bool,
+    pub schema_version: Option<u32>,
+    pub compatible: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DoctorInstallDto {
+    pub current_exe: Option<String>,
+    pub path_mempal: Option<String>,
+    pub path_matches_current_exe: Option<bool>,
+}
+
+impl From<DoctorDbReport> for DoctorDbDto {
+    fn from(report: DoctorDbReport) -> Self {
+        Self {
+            path: report.path,
+            exists: report.exists,
+            schema_version: report.schema_version,
+            compatible: report.compatible,
+            error: report.error,
+        }
+    }
+}
+
+impl From<DoctorInstallReport> for DoctorInstallDto {
+    fn from(report: DoctorInstallReport) -> Self {
+        Self {
+            current_exe: report.current_exe,
+            path_mempal: report.path_mempal,
+            path_matches_current_exe: report.path_matches_current_exe,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DoctorMcpDto {
+    pub required_tools: Vec<DoctorToolDto>,
+    pub phase3_actions: Vec<String>,
+    pub cowork_bus_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DoctorToolDto {
+    pub name: String,
+    pub advertised: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct BriefMcpRequest {
+    pub query: String,
+    pub field: Option<String>,
+    pub domain: Option<String>,
+    pub cwd: Option<String>,
+    pub max_items: Option<usize>,
+    pub dao_tian_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BriefMcpResponse {
+    pub query: String,
+    pub domain: String,
+    pub field: String,
+    pub summary: BriefSummaryDto,
+    pub key_facts: Vec<BriefFactDto>,
+    pub evidence: Vec<BriefEvidenceDto>,
+    pub cards: Vec<BriefCardDto>,
+    pub entities: Vec<String>,
+    pub unresolved_items: Vec<BriefUnresolvedItemDto>,
+    pub uncertainty: Vec<BriefUncertaintyDto>,
+    pub next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BriefSummaryDto {
+    pub narrative: String,
+    pub key_fact_count: usize,
+    pub evidence_count: usize,
+    pub card_count: usize,
+    pub unresolved_count: usize,
+    pub uncertainty_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BriefFactDto {
+    pub text: String,
+    pub section: String,
+    pub citation: BriefCitationDto,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BriefEvidenceDto {
+    pub text: String,
+    pub citation: BriefCitationDto,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BriefCardDto {
+    pub card_id: String,
+    pub text: String,
+    pub citation: BriefCitationDto,
+    pub evidence_citations: Vec<BriefEvidenceCitationDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BriefUnresolvedItemDto {
+    pub text: String,
+    pub citation: BriefCitationDto,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BriefUncertaintyDto {
+    pub kind: String,
+    pub message: String,
+    pub citations: Vec<BriefCitationDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BriefCitationDto {
+    pub drawer_id: String,
+    pub source_file: String,
+    pub anchor_kind: String,
+    pub anchor_id: String,
+    pub card_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BriefEvidenceCitationDto {
+    pub evidence_drawer_id: String,
+    pub role: String,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CoworkBusRequest {
+    /// Action to execute.
+    pub action: String,
+    /// Absolute filesystem path of the project cwd.
+    pub cwd: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub tmux_target: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub agents: Vec<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub now: Option<String>,
+    #[serde(default)]
+    pub seen_at: Option<String>,
+    #[serde(default)]
+    pub lines: Option<usize>,
+    #[serde(default)]
+    pub probe_tmux: Option<bool>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub summary_source: Option<String>,
+    #[serde(default)]
+    pub wing: Option<String>,
+    #[serde(default)]
+    pub room: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub capture: Option<bool>,
+    #[serde(default)]
+    pub execute: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusResponse {
+    pub action: String,
+    pub agents: Vec<CoworkBusAgentDto>,
+    pub delivered: Vec<CoworkBusDeliveryDto>,
+    pub messages: Vec<CoworkBusMessageDto>,
+    pub events: Vec<CoworkBusEventDto>,
+    pub deliveries: Vec<CoworkBusDeliveryStatusDto>,
+    pub channels: Vec<CoworkBusChannelDto>,
+    pub tmux_peek: Option<CoworkBusTmuxPeekDto>,
+    pub doctor: Option<CoworkBusDoctorDto>,
+    pub sessions: Vec<CoworkBusSessionDto>,
+    pub handoff: Option<CoworkBusHandoffDto>,
+    pub capture: Option<CoworkBusCaptureDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusAgentDto {
+    pub agent_id: String,
+    pub tool: String,
+    pub transport: String,
+    pub tmux_target: Option<String>,
+    pub registered_at: String,
+    pub updated_at: String,
+    pub last_seen_at: Option<String>,
+    pub presence: String,
+    pub pending_count: usize,
+    pub pending_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusDeliveryDto {
+    pub message_id: String,
+    pub target_agent_id: String,
+    pub transport: String,
+    pub inbox_path: Option<String>,
+    pub inbox_size_after: Option<u64>,
+    pub tmux_target: Option<String>,
+    pub thread_id: Option<String>,
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusMessageDto {
+    pub pushed_at: String,
+    pub from: String,
+    pub content: String,
+    pub thread_id: Option<String>,
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusEventDto {
+    pub event_id: String,
+    pub occurred_at: String,
+    pub event_type: String,
+    pub status: String,
+    pub actor_agent_id: Option<String>,
+    pub target_agent_ids: Vec<String>,
+    pub transport: Option<String>,
+    pub message_preview: Option<String>,
+    pub thread_id: Option<String>,
+    pub channel: Option<String>,
+    pub details: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusDeliveryStatusDto {
+    pub message_id: String,
+    pub event_type: String,
+    pub status: String,
+    pub from: String,
+    pub target_agent_id: String,
+    pub transport: String,
+    pub message_preview: Option<String>,
+    pub thread_id: Option<String>,
+    pub channel: Option<String>,
+    pub delivered_at: String,
+    pub updated_at: String,
+    pub acked_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusChannelDto {
+    pub channel: String,
+    pub agents: Vec<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusTmuxPeekDto {
+    pub agent_id: String,
+    pub tmux_target: String,
+    pub lines: usize,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusDoctorDto {
+    pub status: String,
+    pub agent_count: usize,
+    pub channel_count: usize,
+    pub session_count: usize,
+    pub stale_agents: usize,
+    pub never_seen_agents: usize,
+    pub pending_deliveries: usize,
+    pub warnings: Vec<String>,
+    pub tmux: Vec<CoworkBusTmuxProbeDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusTmuxProbeDto {
+    pub agent_id: String,
+    pub tmux_target: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusSessionDto {
+    pub session_id: String,
+    pub title: String,
+    pub goal: Option<String>,
+    pub agents: Vec<String>,
+    pub channels: Vec<String>,
+    pub thread_id: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusHandoffDto {
+    pub filters: CoworkBusHandoffFiltersDto,
+    pub sessions: Vec<CoworkBusSessionDto>,
+    pub agents: Vec<CoworkBusHandoffAgentDto>,
+    pub pending_deliveries: Vec<CoworkBusDeliveryStatusDto>,
+    pub recent_events: Vec<CoworkBusEventDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusHandoffFiltersDto {
+    pub thread_id: Option<String>,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusHandoffAgentDto {
+    pub agent_id: String,
+    pub tool: String,
+    pub presence: String,
+    pub pending_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CoworkBusCaptureDto {
+    pub writes: bool,
+    pub drawer_id: Option<String>,
+    pub wing: String,
+    pub room: Option<String>,
+    pub source: String,
+    pub content: String,
+}
+
+impl From<CognitiveBrief> for BriefMcpResponse {
+    fn from(brief: CognitiveBrief) -> Self {
+        Self {
+            query: brief.query,
+            domain: domain_slug(&brief.domain).to_string(),
+            field: brief.field,
+            summary: brief.summary.into(),
+            key_facts: brief.key_facts.into_iter().map(Into::into).collect(),
+            evidence: brief.evidence.into_iter().map(Into::into).collect(),
+            cards: brief.cards.into_iter().map(Into::into).collect(),
+            entities: brief.entities,
+            unresolved_items: brief.unresolved_items.into_iter().map(Into::into).collect(),
+            uncertainty: brief.uncertainty.into_iter().map(Into::into).collect(),
+            next_actions: brief.next_actions,
+        }
+    }
+}
+
+impl From<BriefSummary> for BriefSummaryDto {
+    fn from(summary: BriefSummary) -> Self {
+        Self {
+            narrative: summary.narrative,
+            key_fact_count: summary.key_fact_count,
+            evidence_count: summary.evidence_count,
+            card_count: summary.card_count,
+            unresolved_count: summary.unresolved_count,
+            uncertainty_count: summary.uncertainty_count,
+        }
+    }
+}
+
+impl From<BriefFact> for BriefFactDto {
+    fn from(fact: BriefFact) -> Self {
+        Self {
+            text: fact.text,
+            section: fact.section,
+            citation: fact.citation.into(),
+        }
+    }
+}
+
+impl From<BriefEvidence> for BriefEvidenceDto {
+    fn from(evidence: BriefEvidence) -> Self {
+        Self {
+            text: evidence.text,
+            citation: evidence.citation.into(),
+        }
+    }
+}
+
+impl From<BriefCard> for BriefCardDto {
+    fn from(card: BriefCard) -> Self {
+        Self {
+            card_id: card.card_id,
+            text: card.text,
+            citation: card.citation.into(),
+            evidence_citations: card
+                .evidence_citations
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
+impl From<BriefUnresolvedItem> for BriefUnresolvedItemDto {
+    fn from(item: BriefUnresolvedItem) -> Self {
+        Self {
+            text: item.text,
+            citation: item.citation.into(),
+        }
+    }
+}
+
+impl From<BriefUncertainty> for BriefUncertaintyDto {
+    fn from(uncertainty: BriefUncertainty) -> Self {
+        Self {
+            kind: uncertainty.kind,
+            message: uncertainty.message,
+            citations: uncertainty.citations.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<BriefCitation> for BriefCitationDto {
+    fn from(citation: BriefCitation) -> Self {
+        Self {
+            drawer_id: citation.drawer_id,
+            source_file: citation.source_file,
+            anchor_kind: anchor_kind_slug(&citation.anchor_kind).to_string(),
+            anchor_id: citation.anchor_id,
+            card_id: citation.card_id,
+        }
+    }
+}
+
+impl From<BriefEvidenceCitation> for BriefEvidenceCitationDto {
+    fn from(citation: BriefEvidenceCitation) -> Self {
+        Self {
+            evidence_drawer_id: citation.evidence_drawer_id,
+            role: knowledge_evidence_role_slug(&citation.role).to_string(),
+            source_file: citation.source_file,
+        }
+    }
 }
 
 impl SearchResultDto {

@@ -56,7 +56,7 @@ pub fn bootstrap_anchor() -> (AnchorKind, String, Option<String>) {
 pub fn bootstrap_provenance(source_type: &SourceType) -> Provenance {
     match source_type {
         SourceType::UserExplicit | SourceType::AgentObservation => Provenance::Human,
-        SourceType::AgentInference => Provenance::Research,
+        SourceType::AgentInference | SourceType::Manual => Provenance::Research,
         SourceType::SystemGenerated => Provenance::Runtime,
     }
 }
