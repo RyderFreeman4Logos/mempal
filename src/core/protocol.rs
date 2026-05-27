@@ -73,6 +73,10 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    mempal_search to verify project facts, past decisions, and citations.
    Do not use wake-up as a substitute for mempal_context when you need typed
    dao/shu/qi guidance; wake-up preserves a refresh-oriented L0/L1 shape.
+   Use CLI `mempal brief <query>` or MCP `mempal_brief` when a human or agent needs a compact
+   citation-first cognitive report rather than raw retrieval: it organizes key
+   facts, evidence, cards, unresolved cues, uncertainty, and next actions
+   without LLM synthesis or database writes.
    Use mempal_field_taxonomy when choosing a `field` value for typed evidence,
    knowledge, search, or context. Field taxonomy is guidance only; custom
    field strings remain valid when the recommended fields are too coarse.
@@ -194,6 +198,31 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    On InboxFull error: STOP pushing and wait for partner to drain. Do
    NOT retry — that would just fail again.
 
+10a. MULTI-AGENT COWORK BUS (concrete agent_id routing)
+   Use mempal_cowork_bus when one project has more than two agent
+   instances, for example claude-main, codex-a, and codex-b. This is
+   separate from legacy mempal_cowork_push partner routing: the bus
+   requires explicit agent_id values and does not infer concrete
+   instances from MCP client names.
+
+   Typical flow: action=register once per concrete agent_id, action=list
+   to inspect project bus state, action=send for one target, action=broadcast
+   for fanout, action=drain for the current agent's per-agent inbox,
+   action=events to replay the append-only operational event log,
+   action=deliveries to inspect pending/drained/acked/failed delivery status,
+   action=ack to explicitly acknowledge a delivery message_id, and
+   action=heartbeat to update explicit last-seen presence, and
+   action=channel_set/channel_list/channel_send to manage named group
+   channels. Use action=doctor for read-only diagnostics, session_create/
+   session_list/session_status/session_close for runtime team sessions, action=handoff for
+   deterministic handoff summaries, and action=capture only when you
+   explicitly want to lift a handoff summary into evidence memory.
+   Each target has an independent inbox under the project bus, so
+   one Codex instance draining its inbox does not consume another Codex
+   instance's message.
+   transport=inbox is the safe default; transport=tmux is explicit opt-in and
+   sends through a configured tmux_target without shell execution.
+
 11. VERIFY BEFORE INGEST (contradiction detection)
    Before ingesting a decision that asserts relationships between named
    entities ("X is Y's Z", "X works at Y", "X is the Z of Y"), call
@@ -267,13 +296,16 @@ You have persistent project memory via mempal. Follow these rules in every sessi
 19. RECORD PHASE-3 RUNTIME ADOPTION EVIDENCE
    Use mempal_phase3 to record and inspect runtime adoption evidence before
    proposing stronger defaults or new authority. The tool supports
-   guidance/instrumentation_policy/prepare_record/capture/evaluator_advise/default_proposal/rollback_control/check_record/record_checked/review/readiness/record/list/stats/gate/research_validate_plan/research_ingest_plan
+   guidance/instrumentation_policy/prepare_record/capture/evaluator_advise/default_proposal/rollback_control/check_record/record_checked/review/readiness/analytics/record/list/stats/gate/research_validate_plan/research_ingest_plan
    actions over Phase-3 runtime_adoption_events. Start with action=guidance
    when unsure whether a runtime outcome should be recorded. Use
    action=instrumentation_policy before building live tool instrumentation:
    live instrumentation is opt-in, must preserve user opt-out, and must route
    writes through checked capture or record_checked instead of silently
-   appending events. Use
+   appending events. Use CLI `mempal phase3 adoption wrap` for the supported
+   opt-in wrapper: it explicitly runs one child command after `--`, maps exit
+   code 0 to accepted and non-zero to rejected unless `--outcome` overrides it,
+   and writes only with `--execute` through checked capture. Use
    action=prepare_record to validate and assemble exact record inputs before
    writing; prepare_record is read-only and does not append events. Use
    action=capture when you have a concrete runtime outcome but do not want to
@@ -308,6 +340,8 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    warning records require allow_warnings=true, and invalid records are blocked.
    Use action=review to summarize accumulated evidence by track, feature, and
    signal before proposing stronger defaults; review is read-only and advisory.
+   Use action=analytics for compact grouped counts and deterministic
+   recommendations by track and feature; analytics is read-only.
    Use action=readiness with candidate=card-context-default to inspect whether
    card-aware context is eligible for a future default-on spec; readiness is
    read-only and does not enable the default.
@@ -326,14 +360,16 @@ TOOLS:
   mempal_status        — current state, feature/status flags, intelligence mode, queue stats + this protocol + AAAK format spec
   mempal_pinned_facts  — pinned/canonical facts for always-on session context, no embedding needed
   mempal_timeline      — project-scoped overview without a query, ordered by importance+recency
+  mempal_doctor        — release/install and MCP runtime diagnostics
   mempal_search        — hybrid/BM25 search with search_mode, typed fields, wing/room/project filters, citation-bearing
   mempal_context       — ordered mind-model runtime context (dao_tian -> dao_ren -> shu -> qi; evidence/cards opt-in)
+  mempal_brief         — citation-first cognitive brief with summary/facts/evidence/cards/uncertainty
   mempal_field_taxonomy — read-only recommended mind-model field values
   mempal_knowledge_distill — create candidate knowledge from evidence refs
   mempal_knowledge_policy — read-only Stage-1 promotion policy thresholds
   mempal_knowledge_gate — read-only knowledge promotion readiness check
   mempal_knowledge_cards — Phase-2 knowledge card list/get/retrieve/events/gate/promote/demote with auto_generated filtering
-  mempal_phase3       — Phase-3 runtime adoption evidence guidance/instrumentation_policy/prepare_record/capture/evaluator_advise/default_proposal/rollback_control/check_record/record_checked/review/readiness/record/list/stats/gate/research_validate_plan/research_ingest_plan
+  mempal_phase3       — Phase-3 runtime adoption evidence guidance/instrumentation_policy/prepare_record/capture/evaluator_advise/default_proposal/rollback_control/check_record/record_checked/review/readiness/analytics/record/list/stats/gate/research_validate_plan/research_ingest_plan
   mempal_knowledge_promote — gate-enforced knowledge lifecycle promotion
   mempal_knowledge_demote — evidence-backed knowledge demotion or retirement
   mempal_knowledge_publish_anchor — metadata-only outward anchor publication
@@ -344,6 +380,7 @@ TOOLS:
   mempal_tunnels       — discover cross-wing room links
   mempal_peek_partner  — read partner agent's live session (Claude ↔ Codex), pure read
   mempal_cowork_push   — send a short handoff message to partner agent (P8)
+  mempal_cowork_bus    — concrete agent_id multi-agent bus register/list/send/broadcast/drain/events/deliveries/ack/heartbeat/channel_set/channel_list/channel_send/tmux_peek/doctor/session_create/session_list/session_status/session_close/handoff/capture, with opt-in transport=tmux, event replay, delivery ack/status, presence, group channels, read-only tmux pane peek, diagnostics, sessions, handoff summaries, and explicit handoff-to-evidence capture (P85/P86/P87/P88/P89/P90/P91/P93/P94/P95/P96/P101)
   mempal_fact_check    — offline contradiction detection vs KG triples + entities (P9)
 
 Key invariant: mempal stores raw text verbatim. Every search result can be

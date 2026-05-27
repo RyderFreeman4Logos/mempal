@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::adoption_analytics::build_runtime_adoption_analytics;
+use crate::brief::brief_from_context;
 use crate::context::assemble_context_with_vector;
 use crate::core::{
     anchor::{self, DerivedAnchor},
@@ -32,7 +34,11 @@ use crate::core::{
         source_file_or_synthetic,
     },
 };
-use crate::cowork::{PeekError, PeekRequest as CoworkPeekRequest, Tool, peek_partner};
+use crate::cowork::{
+    AgentRecord, AgentStatus, BusError, DeliveryReport, InboxMessage, PeekError,
+    PeekRequest as CoworkPeekRequest, Tool, peek_partner,
+};
+use crate::doctor::{COWORK_BUS_ACTIONS, PHASE3_ACTIONS, REQUIRED_MCP_TOOLS, build_doctor_report};
 use crate::embed::{EmbedderFactory, global_embed_status};
 use crate::field_taxonomy::field_taxonomy;
 use crate::ingest::{
@@ -76,19 +82,24 @@ use serde_json::Value;
 
 use super::timeline::{TimelineRequest, TimelineResponse};
 use super::tools::{
-    ChunkerStatsDto, ContextRequest, ContextResponse, CoworkPushRequest, CoworkPushResponse,
-    DeleteRequest, DeleteResponse, DuplicateWarning, EmbedStatusDto, EndpointHealthDto,
-    FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto, FieldTaxonomyResponse,
-    IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto,
-    KnowledgeCardDto, KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse,
-    KnowledgeDemoteRequest, KnowledgeDemoteResponse, KnowledgeDistillRequest,
-    KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse,
-    KnowledgePromoteRequest, KnowledgePromoteResponse, KnowledgePublishAnchorRequest,
-    KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest, LeaseResponse, LlmStatusDto,
-    MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, PeekMessageDto, PeekPartnerRequest,
-    PeekPartnerResponse, Phase3GateDto, Phase3Request, Phase3Response, PinnedFactDto,
-    PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse, QueueStatsDto,
-    ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
+    BriefMcpRequest, BriefMcpResponse, ChunkerStatsDto, ContextRequest, ContextResponse,
+    CoworkBusAgentDto, CoworkBusCaptureDto, CoworkBusChannelDto, CoworkBusDeliveryDto,
+    CoworkBusDeliveryStatusDto, CoworkBusDoctorDto, CoworkBusEventDto, CoworkBusHandoffAgentDto,
+    CoworkBusHandoffDto, CoworkBusHandoffFiltersDto, CoworkBusMessageDto, CoworkBusRequest,
+    CoworkBusResponse, CoworkBusSessionDto, CoworkBusTmuxPeekDto, CoworkBusTmuxProbeDto,
+    CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DoctorMcpDto,
+    DoctorRequest, DoctorResponse, DoctorToolDto, DuplicateWarning, EmbedStatusDto,
+    EndpointHealthDto, FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto,
+    FieldTaxonomyResponse, IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest,
+    KgResponse, KgStatsDto, KnowledgeCardDto, KnowledgeCardEventDto, KnowledgeCardsRequest,
+    KnowledgeCardsResponse, KnowledgeDemoteRequest, KnowledgeDemoteResponse,
+    KnowledgeDistillRequest, KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse,
+    KnowledgePolicyResponse, KnowledgePromoteRequest, KnowledgePromoteResponse,
+    KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest,
+    LeaseResponse, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS,
+    PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
+    Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
+    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
     ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto, RollbackRequest,
     RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto,
     SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
@@ -3687,6 +3698,649 @@ impl MempalMcpServer {
     }
 
     #[tool(
+        name = "mempal_doctor",
+        description = "MCP runtime diagnostics for mempal install/schema compatibility and server-advertised runtime tools. Read-only; does not migrate or create the database."
+    )]
+    async fn mempal_doctor(
+        &self,
+        Parameters(_request): Parameters<DoctorRequest>,
+    ) -> std::result::Result<Json<DoctorResponse>, ErrorData> {
+        let advertised_tools = self.tool_router.list_all();
+        let mcp = DoctorMcpDto {
+            required_tools: REQUIRED_MCP_TOOLS
+                .iter()
+                .map(|name| DoctorToolDto {
+                    name: (*name).to_string(),
+                    advertised: advertised_tools.iter().any(|tool| tool.name == *name),
+                })
+                .collect(),
+            phase3_actions: PHASE3_ACTIONS
+                .iter()
+                .map(|action| (*action).to_string())
+                .collect(),
+            cowork_bus_actions: COWORK_BUS_ACTIONS
+                .iter()
+                .map(|action| (*action).to_string())
+                .collect(),
+        };
+        Ok(Json(DoctorResponse::from_report(
+            build_doctor_report(&self.db_path),
+            mcp,
+        )))
+    }
+
+    #[tool(
+        name = "mempal_brief",
+        description = "Assemble a deterministic citation-first cognitive brief from memory. Returns summary, key facts, evidence, cards, unresolved items, uncertainty, and next actions without LLM synthesis or writes."
+    )]
+    async fn mempal_brief(
+        &self,
+        Parameters(request): Parameters<BriefMcpRequest>,
+    ) -> std::result::Result<Json<BriefMcpResponse>, ErrorData> {
+        let max_items = request.max_items.unwrap_or(12);
+        if max_items == 0 {
+            return Err(ErrorData::invalid_params(
+                "max_items must be greater than 0",
+                None,
+            ));
+        }
+        let domain = parse_domain(request.domain.as_deref())?.unwrap_or(MemoryDomain::Project);
+        let cwd = match request.cwd.as_deref() {
+            Some(value) if !value.trim().is_empty() => PathBuf::from(value),
+            Some(_) => {
+                return Err(ErrorData::invalid_params(
+                    "cwd must not be empty when provided",
+                    None,
+                ));
+            }
+            None => std::env::current_dir().map_err(|error| {
+                ErrorData::internal_error(
+                    format!("failed to read current directory: {error}"),
+                    None,
+                )
+            })?,
+        };
+
+        let embedder = self.embedder_factory.build().await.map_err(|error| {
+            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
+        })?;
+        let query_vector = embedder
+            .embed(&[request.query.as_str()])
+            .await
+            .map_err(|error| ErrorData::internal_error(format!("embedding failed: {error}"), None))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
+        let db = self.open_db()?;
+        let context = assemble_context_with_vector(
+            &db,
+            crate::context::ContextRequest {
+                query: request.query,
+                domain,
+                field: request
+                    .field
+                    .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
+                cwd,
+                include_evidence: true,
+                include_cards: true,
+                max_items,
+                dao_tian_limit: request.dao_tian_limit.unwrap_or(1),
+                project_id: None,
+                trigger: None,
+                context_cfg_override: None,
+            },
+            &query_vector,
+        )
+        .map_err(|error| ErrorData::internal_error(format!("brief failed: {error}"), None))?;
+        let brief = brief_from_context(context);
+        Ok(Json(BriefMcpResponse::from(brief)))
+    }
+
+    #[tool(
+        name = "mempal_cowork_bus",
+        description = "Multi-agent cowork bus for concrete agent instances in one project. \
+                       Actions: register/list/send/broadcast/drain/events/deliveries/ack/heartbeat/channel_set/channel_list/channel_send/tmux_peek/doctor/session_create/session_list/session_status/session_close/handoff/capture. Uses explicit agent_id \
+                       values such as claude-main, codex-a, codex-b, per-agent inbox files, \
+                       and append-only events under ~/.mempal/cowork-bus/<project>. This is separate from legacy \
+                       mempal_cowork_push partner routing and does not infer concrete instances \
+                       from MCP client names. Most actions are file-backed runtime ops; action=capture writes \
+                       evidence only when execute=true."
+    )]
+    async fn mempal_cowork_bus(
+        &self,
+        Parameters(request): Parameters<CoworkBusRequest>,
+    ) -> std::result::Result<Json<CoworkBusResponse>, ErrorData> {
+        use crate::cowork::bus::{self, RegisterAgentRequest, SendRequest};
+
+        let mempal_home = crate::cowork::inbox::mempal_home();
+        let cwd = PathBuf::from(&request.cwd);
+        let action = request.action.as_str();
+
+        match action {
+            "register" => {
+                let agent_id = required_bus_field(request.agent_id, "agent_id", action)?;
+                let tool = required_bus_field(request.tool, "tool", action)?;
+                let record = bus::register_agent(
+                    &mempal_home,
+                    &cwd,
+                    RegisterAgentRequest {
+                        agent_id,
+                        tool,
+                        transport: request.transport.unwrap_or_else(|| "inbox".to_string()),
+                        tmux_target: request.tmux_target,
+                    },
+                )
+                .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: vec![agent_record_to_dto(record)],
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "list" => {
+                let statuses =
+                    bus::list_agent_status_at(&mempal_home, &cwd, request.now.as_deref())
+                        .map_err(bus_error_to_mcp)?
+                        .into_iter()
+                        .map(agent_status_to_dto)
+                        .collect();
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: statuses,
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "send" | "broadcast" => {
+                let from = required_bus_field(request.from, "from", action)?;
+                if request.to.is_empty() {
+                    return Err(ErrorData::invalid_params(
+                        format!("action `{action}` requires at least one `to` agent_id"),
+                        None,
+                    ));
+                }
+                if action == "send" && request.to.len() != 1 {
+                    return Err(ErrorData::invalid_params(
+                        "action `send` requires exactly one `to`; use broadcast for fanout",
+                        None,
+                    ));
+                }
+                let message = required_bus_field(request.message, "message", action)?;
+                let report = bus::send(
+                    &mempal_home,
+                    &cwd,
+                    SendRequest {
+                        from,
+                        targets: request.to,
+                        message,
+                        operation: if action == "send" {
+                            bus::SendOperation::Send
+                        } else {
+                            bus::SendOperation::Broadcast
+                        },
+                        thread_id: request.thread_id,
+                        channel: request.channel,
+                    },
+                )
+                .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: report.delivered.into_iter().map(delivery_to_dto).collect(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "drain" => {
+                let agent_id = required_bus_field(request.agent_id, "agent_id", action)?;
+                let messages = bus::drain_agent(&mempal_home, &cwd, &agent_id)
+                    .map_err(bus_error_to_mcp)?
+                    .into_iter()
+                    .map(message_to_dto)
+                    .collect();
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages,
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "events" => {
+                let events = bus::list_events(&mempal_home, &cwd, request.limit)
+                    .map_err(bus_error_to_mcp)?
+                    .into_iter()
+                    .map(event_to_dto)
+                    .collect();
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events,
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "deliveries" => {
+                let deliveries =
+                    bus::list_delivery_statuses(&mempal_home, &cwd, request.agent_id.as_deref())
+                        .map_err(bus_error_to_mcp)?
+                        .into_iter()
+                        .map(delivery_status_to_dto)
+                        .collect();
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries,
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "ack" => {
+                let agent_id = required_bus_field(request.agent_id, "agent_id", action)?;
+                let message_id = required_bus_field(request.message_id, "message_id", action)?;
+                let status = bus::ack_delivery(&mempal_home, &cwd, &agent_id, &message_id)
+                    .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: vec![delivery_status_to_dto(status)],
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "heartbeat" => {
+                let agent_id = required_bus_field(request.agent_id, "agent_id", action)?;
+                let record =
+                    bus::heartbeat_agent(&mempal_home, &cwd, &agent_id, request.seen_at.as_deref())
+                        .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: vec![agent_record_to_dto(record)],
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "channel_set" => {
+                let channel = required_bus_field(request.channel, "channel", action)?;
+                if request.agents.is_empty() {
+                    return Err(ErrorData::invalid_params(
+                        "action `channel_set` requires at least one `agents` entry",
+                        None,
+                    ));
+                }
+                let channel = bus::set_channel(&mempal_home, &cwd, &channel, request.agents)
+                    .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: vec![channel_to_dto(channel)],
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "channel_list" => {
+                let channels = bus::list_channels(&mempal_home, &cwd)
+                    .map_err(bus_error_to_mcp)?
+                    .into_iter()
+                    .map(channel_to_dto)
+                    .collect();
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels,
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "channel_send" => {
+                let from = required_bus_field(request.from, "from", action)?;
+                let channel = required_bus_field(request.channel, "channel", action)?;
+                let message = required_bus_field(request.message, "message", action)?;
+                let report = bus::send_channel(
+                    &mempal_home,
+                    &cwd,
+                    from,
+                    channel,
+                    message,
+                    request.thread_id,
+                )
+                .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: report.delivered.into_iter().map(delivery_to_dto).collect(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "tmux_peek" => {
+                let agent_id = required_bus_field(request.agent_id, "agent_id", action)?;
+                let peek = bus::tmux_peek_agent(
+                    &mempal_home,
+                    &cwd,
+                    &agent_id,
+                    request.lines.unwrap_or(80),
+                )
+                .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: Some(tmux_peek_to_dto(peek)),
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "doctor" => {
+                let report = bus::doctor(
+                    &mempal_home,
+                    &cwd,
+                    request.now.as_deref(),
+                    request.probe_tmux.unwrap_or(false),
+                )
+                .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: Some(doctor_to_dto(report)),
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "session_create" => {
+                let session_id = required_bus_field(request.session_id, "session_id", action)?;
+                let title = required_bus_field(request.title, "title", action)?;
+                if request.agents.is_empty() {
+                    return Err(ErrorData::invalid_params(
+                        "action `session_create` requires at least one `agents` entry",
+                        None,
+                    ));
+                }
+                let session = bus::create_session(
+                    &mempal_home,
+                    &cwd,
+                    bus::CreateSessionRequest {
+                        session_id,
+                        title,
+                        goal: request.goal,
+                        agents: request.agents,
+                        channels: if let Some(channel) = request.channel {
+                            vec![channel]
+                        } else {
+                            Vec::new()
+                        },
+                        thread_id: request.thread_id,
+                    },
+                )
+                .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: vec![session_to_dto(session)],
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "session_list" => {
+                let sessions = bus::list_sessions(&mempal_home, &cwd)
+                    .map_err(bus_error_to_mcp)?
+                    .into_iter()
+                    .map(session_to_dto)
+                    .collect();
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions,
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "session_status" => {
+                let session_id = required_bus_field(request.session_id, "session_id", action)?;
+                let status = required_bus_field(request.status, "status", action)?;
+                let session = bus::update_session_status(&mempal_home, &cwd, &session_id, &status)
+                    .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: vec![session_to_dto(session)],
+                    handoff: None,
+                    capture: None,
+                }))
+            }
+            "session_close" => {
+                let session_id = required_bus_field(request.session_id, "session_id", action)?;
+                let session = bus::update_session_status(&mempal_home, &cwd, &session_id, "closed")
+                    .map_err(bus_error_to_mcp)?;
+                let capture = if request.capture.unwrap_or(false) {
+                    let execute = request.execute.unwrap_or(false);
+                    let db = if execute { Some(self.open_db()?) } else { None };
+                    Some(
+                        bus::capture_handoff_to_memory(
+                            db.as_ref(),
+                            &mempal_home,
+                            &cwd,
+                            bus::CoworkCaptureRequest {
+                                summary_source: request
+                                    .summary_source
+                                    .unwrap_or_else(|| "handoff".to_string()),
+                                wing: request.wing.unwrap_or_else(|| "cowork-capture".to_string()),
+                                room: request.room,
+                                thread_id: request.thread_id,
+                                channel: request.channel,
+                                session_id: Some(session_id),
+                                note: request.note,
+                                execute,
+                            },
+                        )
+                        .map_err(bus_error_to_mcp)?,
+                    )
+                } else {
+                    None
+                };
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: vec![session_to_dto(session)],
+                    handoff: None,
+                    capture: capture.map(capture_to_dto),
+                }))
+            }
+            "handoff" => {
+                let summary = bus::build_handoff_summary(
+                    &mempal_home,
+                    &cwd,
+                    bus::HandoffFilters {
+                        thread_id: request.thread_id,
+                        channel: request.channel,
+                        session_id: request.session_id,
+                        limit: request.limit,
+                    },
+                )
+                .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: Some(handoff_to_dto(summary)),
+                    capture: None,
+                }))
+            }
+            "capture" => {
+                let execute = request.execute.unwrap_or(false);
+                let db = if execute { Some(self.open_db()?) } else { None };
+                let report = bus::capture_handoff_to_memory(
+                    db.as_ref(),
+                    &mempal_home,
+                    &cwd,
+                    bus::CoworkCaptureRequest {
+                        summary_source: request
+                            .summary_source
+                            .unwrap_or_else(|| "handoff".to_string()),
+                        wing: request.wing.unwrap_or_else(|| "cowork-capture".to_string()),
+                        room: request.room,
+                        thread_id: request.thread_id,
+                        channel: request.channel,
+                        session_id: request.session_id,
+                        note: request.note,
+                        execute,
+                    },
+                )
+                .map_err(bus_error_to_mcp)?;
+                Ok(Json(CoworkBusResponse {
+                    action: action.to_string(),
+                    agents: Vec::new(),
+                    delivered: Vec::new(),
+                    messages: Vec::new(),
+                    events: Vec::new(),
+                    deliveries: Vec::new(),
+                    channels: Vec::new(),
+                    tmux_peek: None,
+                    doctor: None,
+                    sessions: Vec::new(),
+                    handoff: None,
+                    capture: Some(capture_to_dto(report)),
+                }))
+            }
+            other => Err(ErrorData::invalid_params(
+                format!(
+                    "unknown action `{other}`: expected register|list|send|broadcast|drain|events|deliveries|ack|heartbeat|channel_set|channel_list|channel_send|tmux_peek|doctor|session_create|session_list|session_status|session_close|handoff|capture"
+                ),
+                None,
+            )),
+        }
+    }
+
+    #[tool(
         name = "mempal_fact_check",
         description = "Detect contradictions in text against KG triples + known entities. Returns SimilarNameConflict (similar-name typos), RelationContradiction (incompatible predicate for same endpoints), and StaleFact (KG valid_to expired) issues. Pure read, zero LLM, zero network, deterministic. Call before ingesting decisions that assert relationships between named entities to catch typos or outdated assumptions early."
     )]
@@ -3964,6 +4618,7 @@ impl MempalMcpServer {
                 event: None,
                 events: Vec::new(),
                 stats: None,
+                analytics: None,
                 gate: None,
                 research_plan: None,
                 research_ingest_plan: None,
@@ -3982,6 +4637,7 @@ impl MempalMcpServer {
                 event: None,
                 events: Vec::new(),
                 stats: None,
+                analytics: None,
                 gate: None,
                 research_plan: None,
                 research_ingest_plan: None,
@@ -4023,6 +4679,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4108,6 +4765,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4146,6 +4804,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4196,6 +4855,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4253,6 +4913,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4295,6 +4956,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4376,6 +5038,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4434,6 +5097,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4481,6 +5145,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4533,6 +5198,7 @@ impl MempalMcpServer {
                     event: Some(RuntimeAdoptionEventDto::from(event)),
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4571,6 +5237,7 @@ impl MempalMcpServer {
                         .map(RuntimeAdoptionEventDto::from)
                         .collect(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4606,6 +5273,37 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: Some(runtime_adoption_stats(&events)),
+                    analytics: None,
+                    gate: None,
+                    research_plan: None,
+                    research_ingest_plan: None,
+                    evaluator_advice: None,
+                    default_proposal: None,
+                    rollback_control: None,
+                }))
+            }
+            "analytics" => {
+                let db = self.open_db()?;
+                let events = db
+                    .list_runtime_adoption_events(&RuntimeAdoptionFilter::default(), 10_000)
+                    .map_err(|error| {
+                        ErrorData::internal_error(
+                            format!("failed to list runtime adoption events: {error}"),
+                            None,
+                        )
+                    })?;
+                Ok(Json(Phase3Response {
+                    guidance: None,
+                    instrumentation_policy: None,
+                    record_plan: None,
+                    record_quality: None,
+                    record_checked: None,
+                    review_report: None,
+                    readiness_report: None,
+                    event: None,
+                    events: Vec::new(),
+                    stats: None,
+                    analytics: Some(build_runtime_adoption_analytics(&events).into()),
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4629,6 +5327,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: Some(gate),
                     research_plan: None,
                     research_ingest_plan: None,
@@ -4652,6 +5351,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: Some(validate_research_adapter_plan_value(&report)),
                     research_ingest_plan: None,
@@ -4675,6 +5375,7 @@ impl MempalMcpServer {
                     event: None,
                     events: Vec::new(),
                     stats: None,
+                    analytics: None,
                     gate: None,
                     research_plan: None,
                     research_ingest_plan: Some(ResearchIngestPlanDto::from(
@@ -4709,6 +5410,244 @@ fn skill_to_dto(skill: &crate::core::skills::Skill) -> SkillDto {
         promoted_at_unix_ms: skill.promoted_at,
         updated_at_unix_ms: skill.updated_at,
         project_id: skill.project_id.clone(),
+    }
+}
+
+fn required_bus_field(
+    value: Option<String>,
+    field: &str,
+    action: &str,
+) -> std::result::Result<String, ErrorData> {
+    value.ok_or_else(|| {
+        ErrorData::invalid_params(format!("action `{action}` requires `{field}`"), None)
+    })
+}
+
+fn bus_error_to_mcp(error: BusError) -> ErrorData {
+    match error {
+        BusError::InvalidAgentId(_)
+        | BusError::InvalidTool(_)
+        | BusError::UnsupportedTransport(_)
+        | BusError::InvalidChannel(_)
+        | BusError::InvalidThreadId(_)
+        | BusError::UnknownChannel(_)
+        | BusError::EmptyChannel(_)
+        | BusError::TmuxTargetRequired
+        | BusError::TmuxFailed(_)
+        | BusError::TmuxCaptureFailed(_)
+        | BusError::TmuxProbeFailed(_)
+        | BusError::NotTmuxAgent(_)
+        | BusError::InvalidLineCount(_)
+        | BusError::InvalidSessionId(_)
+        | BusError::EmptySession(_)
+        | BusError::UnknownSession(_)
+        | BusError::InvalidSessionStatus(_)
+        | BusError::UnsupportedCaptureSource(_)
+        | BusError::MissingCaptureDatabase
+        | BusError::InvalidTimestamp(_)
+        | BusError::UnknownSource(_)
+        | BusError::UnknownTarget(_)
+        | BusError::UnknownAgent(_)
+        | BusError::UnknownDelivery(_)
+        | BusError::DeliveryTargetMismatch { .. }
+        | BusError::CannotAckFailed(_)
+        | BusError::SelfSend(_)
+        | BusError::MessageTooLarge(_)
+        | BusError::InboxFull { .. } => ErrorData::invalid_params(error.to_string(), None),
+        BusError::LegacyInbox(_) | BusError::Io(_) | BusError::Json(_) | BusError::Db(_) => {
+            ErrorData::internal_error(error.to_string(), None)
+        }
+    }
+}
+
+fn agent_record_to_dto(record: AgentRecord) -> CoworkBusAgentDto {
+    CoworkBusAgentDto {
+        agent_id: record.agent_id,
+        tool: record.tool,
+        transport: record.transport,
+        tmux_target: record.tmux_target,
+        registered_at: record.registered_at,
+        updated_at: record.updated_at,
+        presence: if record.last_seen_at.is_some() {
+            "online".to_string()
+        } else {
+            "never_seen".to_string()
+        },
+        last_seen_at: record.last_seen_at,
+        pending_count: 0,
+        pending_bytes: 0,
+    }
+}
+
+fn agent_status_to_dto(status: AgentStatus) -> CoworkBusAgentDto {
+    CoworkBusAgentDto {
+        agent_id: status.record.agent_id,
+        tool: status.record.tool,
+        transport: status.record.transport,
+        tmux_target: status.record.tmux_target,
+        registered_at: status.record.registered_at,
+        updated_at: status.record.updated_at,
+        last_seen_at: status.record.last_seen_at,
+        presence: status.presence,
+        pending_count: status.pending_count,
+        pending_bytes: status.pending_bytes,
+    }
+}
+
+fn delivery_to_dto(delivery: DeliveryReport) -> CoworkBusDeliveryDto {
+    CoworkBusDeliveryDto {
+        message_id: delivery.message_id,
+        target_agent_id: delivery.target_agent_id,
+        transport: delivery.transport,
+        inbox_path: delivery
+            .inbox_path
+            .map(|path| path.to_string_lossy().to_string()),
+        inbox_size_after: delivery.inbox_size_after,
+        tmux_target: delivery.tmux_target,
+        thread_id: delivery.thread_id,
+        channel: delivery.channel,
+    }
+}
+
+fn delivery_status_to_dto(
+    status: crate::cowork::bus::DeliveryStatus,
+) -> CoworkBusDeliveryStatusDto {
+    CoworkBusDeliveryStatusDto {
+        message_id: status.message_id,
+        event_type: status.event_type,
+        status: status.status,
+        from: status.from,
+        target_agent_id: status.target_agent_id,
+        transport: status.transport,
+        message_preview: status.message_preview,
+        thread_id: status.thread_id,
+        channel: status.channel,
+        delivered_at: status.delivered_at,
+        updated_at: status.updated_at,
+        acked_by: status.acked_by,
+    }
+}
+
+fn message_to_dto(message: InboxMessage) -> CoworkBusMessageDto {
+    CoworkBusMessageDto {
+        pushed_at: message.pushed_at,
+        from: message.from,
+        content: message.content,
+        thread_id: message.thread_id,
+        channel: message.channel,
+    }
+}
+
+fn event_to_dto(event: crate::cowork::bus::BusEvent) -> CoworkBusEventDto {
+    CoworkBusEventDto {
+        event_id: event.event_id,
+        occurred_at: event.occurred_at,
+        event_type: event.event_type,
+        status: event.status,
+        actor_agent_id: event.actor_agent_id,
+        target_agent_ids: event.target_agent_ids,
+        transport: event.transport,
+        message_preview: event.message_preview,
+        thread_id: event.details.get("thread_id").cloned(),
+        channel: event.details.get("channel").cloned(),
+        details: event.details,
+    }
+}
+
+fn channel_to_dto(channel: crate::cowork::bus::ChannelRecord) -> CoworkBusChannelDto {
+    CoworkBusChannelDto {
+        channel: channel.channel,
+        agents: channel.agents,
+        updated_at: channel.updated_at,
+    }
+}
+
+fn tmux_peek_to_dto(peek: crate::cowork::bus::TmuxPeek) -> CoworkBusTmuxPeekDto {
+    CoworkBusTmuxPeekDto {
+        agent_id: peek.agent_id,
+        tmux_target: peek.tmux_target,
+        lines: peek.lines,
+        content: peek.content,
+    }
+}
+
+fn doctor_to_dto(report: crate::cowork::bus::DoctorReport) -> CoworkBusDoctorDto {
+    CoworkBusDoctorDto {
+        status: report.status,
+        agent_count: report.agent_count,
+        channel_count: report.channel_count,
+        session_count: report.session_count,
+        stale_agents: report.stale_agents,
+        never_seen_agents: report.never_seen_agents,
+        pending_deliveries: report.pending_deliveries,
+        warnings: report.warnings,
+        tmux: report
+            .tmux
+            .into_iter()
+            .map(|probe| CoworkBusTmuxProbeDto {
+                agent_id: probe.agent_id,
+                tmux_target: probe.tmux_target,
+                status: probe.status,
+                detail: probe.detail,
+            })
+            .collect(),
+    }
+}
+
+fn session_to_dto(session: crate::cowork::bus::TeamSession) -> CoworkBusSessionDto {
+    CoworkBusSessionDto {
+        session_id: session.session_id,
+        title: session.title,
+        goal: session.goal,
+        agents: session.agents,
+        channels: session.channels,
+        thread_id: session.thread_id,
+        status: session.status,
+        created_at: session.created_at,
+        updated_at: session.updated_at,
+    }
+}
+
+fn handoff_to_dto(summary: crate::cowork::bus::HandoffSummary) -> CoworkBusHandoffDto {
+    CoworkBusHandoffDto {
+        filters: CoworkBusHandoffFiltersDto {
+            thread_id: summary.filters.thread_id,
+            channel: summary.filters.channel,
+            session_id: summary.filters.session_id,
+            limit: summary.filters.limit,
+        },
+        sessions: summary.sessions.into_iter().map(session_to_dto).collect(),
+        agents: summary
+            .agents
+            .into_iter()
+            .map(|agent| CoworkBusHandoffAgentDto {
+                agent_id: agent.agent_id,
+                tool: agent.tool,
+                presence: agent.presence,
+                pending_count: agent.pending_count,
+            })
+            .collect(),
+        pending_deliveries: summary
+            .pending_deliveries
+            .into_iter()
+            .map(delivery_status_to_dto)
+            .collect(),
+        recent_events: summary
+            .recent_events
+            .into_iter()
+            .map(event_to_dto)
+            .collect(),
+    }
+}
+
+fn capture_to_dto(report: crate::cowork::bus::CoworkCaptureReport) -> CoworkBusCaptureDto {
+    CoworkBusCaptureDto {
+        writes: report.writes,
+        drawer_id: report.drawer_id,
+        wing: report.wing,
+        room: report.room,
+        source: report.source,
+        content: report.content,
     }
 }
 

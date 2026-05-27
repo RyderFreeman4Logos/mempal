@@ -182,9 +182,10 @@ fn start_openai_embedding_stub(query: &str) -> (String, thread::JoinHandle<()>) 
                 Err(error) => panic!("accept request: {error}"),
             })
             .expect("embedding stub timed out waiting for request");
-        let mut request = [0_u8; 4096];
-        let bytes_read = stream.read(&mut request).expect("read embedding request");
-        let request = String::from_utf8_lossy(&request[..bytes_read]);
+        stream
+            .set_nonblocking(false)
+            .expect("set embedding request stream blocking");
+        let request = read_http_request(&mut stream);
         let (_, body) = request
             .split_once("\r\n\r\n")
             .expect("request should contain JSON body");
@@ -204,6 +205,44 @@ fn start_openai_embedding_stub(query: &str) -> (String, thread::JoinHandle<()>) 
             .expect("write embedding response");
     });
     (format!("http://{address}/v1/embeddings"), handle)
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let header_end = loop {
+        let bytes_read = stream.read(&mut chunk).expect("read embedding request");
+        assert!(
+            bytes_read > 0,
+            "embedding request closed before headers were complete"
+        );
+        request.extend_from_slice(&chunk[..bytes_read]);
+        if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .expect("embedding request content-length");
+    let expected_len = header_end + content_length;
+    while request.len() < expected_len {
+        let bytes_read = stream
+            .read(&mut chunk)
+            .expect("read embedding request body");
+        assert!(
+            bytes_read > 0,
+            "embedding request closed before body was complete"
+        );
+        request.extend_from_slice(&chunk[..bytes_read]);
+    }
+    String::from_utf8_lossy(&request[..expected_len]).into_owned()
 }
 
 fn write_cli_api_config(home: &TempDir, endpoint: &str) {
@@ -1378,6 +1417,180 @@ fn test_cli_phase3_adoption_capture_rejects_unknown_surface() {
 }
 
 #[test]
+#[ignore = "upstream wrap subcommand not yet integrated into fork CLI"]
+fn test_cli_phase3_adoption_wrap_dry_run_executes_child_without_writing() {
+    let home = setup_cli_home();
+    let output = run_mempal(
+        &home,
+        &[
+            "phase3",
+            "adoption",
+            "wrap",
+            "--surface",
+            "runtime-context",
+            "--query",
+            "context pack",
+            "--format",
+            "json",
+            "--",
+            "sh",
+            "-c",
+            "printf wrapper-child; exit 0",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "wrap dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("wrap json");
+    assert_eq!(report["writes"], false);
+    assert_eq!(report["execute"], false);
+    assert_eq!(report["child_exit_code"], 0);
+    assert_eq!(report["child_stdout"], "wrapper-child");
+    assert_eq!(report["outcome"], "accepted");
+    assert_eq!(report["capture"]["record_quality"]["quality"], "ready");
+
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    assert!(
+        db.list_runtime_adoption_events(&RuntimeAdoptionFilter::default(), 10)
+            .expect("events")
+            .is_empty()
+    );
+}
+
+#[test]
+#[ignore = "upstream wrap subcommand not yet integrated into fork CLI"]
+fn test_cli_phase3_adoption_wrap_execute_writes_ready_event() {
+    let home = setup_cli_home();
+    let output = run_mempal(
+        &home,
+        &[
+            "phase3",
+            "adoption",
+            "wrap",
+            "--surface",
+            "runtime-context",
+            "--query",
+            "context pack",
+            "--note",
+            "wrapper helped",
+            "--execute",
+            "--format",
+            "json",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "wrap execute failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("wrap json");
+    assert_eq!(report["writes"], true);
+    assert_eq!(report["capture"]["record_checked"]["blocked"], false);
+
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    let events = db
+        .list_runtime_adoption_events(&RuntimeAdoptionFilter::default(), 10)
+        .expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].signal, RuntimeAdoptionSignal::Accepted);
+}
+
+#[test]
+#[ignore = "upstream wrap subcommand not yet integrated into fork CLI"]
+fn test_cli_phase3_adoption_wrap_failure_maps_rejected_and_exits_nonzero() {
+    let home = setup_cli_home();
+    let output = run_mempal(
+        &home,
+        &[
+            "phase3",
+            "adoption",
+            "wrap",
+            "--surface",
+            "runtime-context",
+            "--format",
+            "json",
+            "--",
+            "sh",
+            "-c",
+            "exit 7",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(7));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("wrap json");
+    assert_eq!(report["writes"], false);
+    assert_eq!(report["child_exit_code"], 7);
+    assert_eq!(report["outcome"], "rejected");
+
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    assert!(
+        db.list_runtime_adoption_events(&RuntimeAdoptionFilter::default(), 10)
+            .expect("events")
+            .is_empty()
+    );
+}
+
+#[test]
+#[ignore = "upstream wrap subcommand not yet integrated into fork CLI"]
+fn test_cli_phase3_adoption_wrap_blocks_warning_by_default() {
+    let home = setup_cli_home();
+    let output = run_mempal(
+        &home,
+        &[
+            "phase3",
+            "adoption",
+            "wrap",
+            "--surface",
+            "card-context",
+            "--execute",
+            "--format",
+            "json",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "wrap warning should return blocked JSON: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("wrap json");
+    assert_eq!(report["writes"], false);
+    assert_eq!(report["capture"]["record_quality"]["quality"], "warning");
+    assert_eq!(report["capture"]["record_checked"]["blocked"], true);
+
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    assert!(
+        db.list_runtime_adoption_events(&RuntimeAdoptionFilter::default(), 10)
+            .expect("events")
+            .is_empty()
+    );
+}
+
+#[test]
+#[ignore = "upstream wrap subcommand not yet integrated into fork CLI"]
+fn test_cli_phase3_adoption_wrap_rejects_missing_child_command() {
+    let home = setup_cli_home();
+    let output = run_mempal(
+        &home,
+        &["phase3", "adoption", "wrap", "--surface", "runtime-context"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("required") || stderr.contains("command"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
 fn test_cli_phase3_adoption_check_record_json_accepts_supported_event() {
     let home = setup_cli_home();
     let output = run_mempal(
@@ -2322,4 +2535,77 @@ fn test_cli_phase3_research_ingest_plan_rejects_invalid_format() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported phase3 research ingest format"));
+}
+
+#[test]
+#[ignore = "upstream analytics subcommand not yet integrated into fork CLI"]
+fn test_cli_phase3_adoption_analytics_json() {
+    let home = setup_cli_home();
+    record_card_context_acceptance(&home, "analytics_accept_1");
+    record_card_context_acceptance(&home, "analytics_accept_2");
+    let rejected = run_mempal(
+        &home,
+        &[
+            "phase3",
+            "adoption",
+            "record",
+            "--id",
+            "analytics_reject_1",
+            "--track",
+            "card_context",
+            "--signal",
+            "rejected",
+            "--feature",
+            "include_cards",
+            "--query",
+            "skill trigger context",
+        ],
+    );
+    assert!(rejected.status.success());
+
+    let output = run_mempal(
+        &home,
+        &["phase3", "adoption", "analytics", "--format", "json"],
+    );
+    assert!(
+        output.status.success(),
+        "analytics failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("analytics json");
+    assert_eq!(report["writes"], false);
+    let groups = report["groups"].as_array().expect("groups");
+    let include_cards = groups
+        .iter()
+        .find(|group| group["feature"] == "include_cards")
+        .expect("include_cards group");
+    assert_eq!(include_cards["accepted"], 2);
+    assert_eq!(include_cards["rejected"], 1);
+    assert!(
+        include_cards["recommendation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("observe")
+    );
+}
+
+#[test]
+#[ignore = "upstream analytics subcommand not yet integrated into fork CLI"]
+fn test_cli_phase3_adoption_analytics_plain() {
+    let home = setup_cli_home();
+    record_card_context_acceptance(&home, "analytics_plain_accept");
+
+    let output = run_mempal(
+        &home,
+        &["phase3", "adoption", "analytics", "--format", "plain"],
+    );
+    assert!(
+        output.status.success(),
+        "analytics failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("adoption analytics"), "{out}");
+    assert!(out.contains("include_cards"), "{out}");
+    assert!(out.contains("accepted=1"), "{out}");
 }

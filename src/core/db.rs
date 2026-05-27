@@ -39,7 +39,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-const CURRENT_SCHEMA_VERSION: u32 = 17;
+pub const CURRENT_SCHEMA_VERSION: u32 = 17;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 

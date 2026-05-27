@@ -43,6 +43,7 @@ pub enum SourceType {
     UserExplicit,
     AgentObservation,
     SystemGenerated,
+    Manual,
 }
 
 impl SourceType {
@@ -52,6 +53,7 @@ impl SourceType {
             Self::AgentObservation => "agent_observation",
             Self::AgentInference => "agent_inference",
             Self::SystemGenerated => "system_generated",
+            Self::Manual => "manual",
         }
     }
 }
@@ -99,7 +101,7 @@ pub fn default_confidence(source_type: SourceType) -> f64 {
     match source_type {
         SourceType::UserExplicit => 0.9,
         SourceType::AgentObservation => 0.7,
-        SourceType::AgentInference => 0.5,
+        SourceType::AgentInference | SourceType::Manual => 0.5,
         SourceType::SystemGenerated => 0.3,
     }
 }
