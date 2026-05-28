@@ -2,6 +2,7 @@ pub mod embed;
 pub mod ingest;
 pub mod model;
 pub mod parser;
+pub mod search;
 pub mod store;
 
 use thiserror::Error;

@@ -744,6 +744,61 @@ enum XurlCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Semantic search over indexed conversation turns.
+    Search {
+        /// Search query string.
+        query: String,
+        /// Filter by tool: cc, codex, or hermes.
+        #[arg(long, value_enum)]
+        tool: Option<XurlTool>,
+        /// Filter to a specific session ID.
+        #[arg(long)]
+        session: Option<String>,
+        /// Only return turns newer than this duration (e.g. 7d, 24h, 10m).
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum number of results to return.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Also include CSA-delegated turns (excluded by default).
+        #[arg(long)]
+        include_csa: bool,
+        /// Also include agent-generated user prompts (excluded by default).
+        #[arg(long)]
+        include_agent_prompts: bool,
+        /// Output format: markdown (default) or json.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
+    /// Show conversation turns in reverse-chronological order.
+    Timeline {
+        /// Filter by tool: cc, codex, or hermes.
+        #[arg(long, value_enum)]
+        tool: Option<XurlTool>,
+        /// Filter to a specific session ID.
+        #[arg(long)]
+        session: Option<String>,
+        /// Only return turns newer than this duration (e.g. 7d, 24h, 10m).
+        #[arg(long)]
+        since: Option<String>,
+        /// Number of turns per page.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Page number (0-based).
+        #[arg(long, default_value_t = 0)]
+        page: usize,
+        /// Also include CSA-delegated turns (excluded by default).
+        #[arg(long)]
+        include_csa: bool,
+        /// Also include agent-generated user prompts (excluded by default).
+        #[arg(long)]
+        include_agent_prompts: bool,
+        /// Output format: markdown (default) or json.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
+    /// Show per-tool turn counts and date ranges.
+    Stats,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -7890,6 +7945,23 @@ async fn serve_mcp_and_rest_command(config: &Config) -> Result<()> {
     tokio::select! { mcp_result = &mut mcp_task => { let _ = rest_state.drain_write_queue().await; rest_task.abort(); match rest_task.await { Ok(Ok(())) => {} Ok(Err(e)) => return Err(e), Err(je) if je.is_cancelled() => {} Err(je) => return Err(anyhow::Error::new(je).context("failed to join REST task")) } mcp_result } rest_result = &mut rest_task => match rest_result { Ok(Ok(())) => bail!("REST server exited unexpectedly"), Ok(Err(e)) => Err(e), Err(je) => Err(anyhow::Error::new(je).context("failed to join REST task")) } }
 }
 
+/// Parse a duration string like "7d", "24h", "10m" into a Unix epoch threshold.
+fn parse_since_to_epoch(since: &str) -> Result<f64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system clock error: {e}"))?
+        .as_secs_f64();
+    let (value, unit) = since.split_at(since.len() - 1);
+    let n: f64 = value.parse().context("invalid duration value")?;
+    let secs = match unit {
+        "d" => n * 86400.0,
+        "h" => n * 3600.0,
+        "m" => n * 60.0,
+        other => anyhow::bail!("unknown duration unit '{}'; use d/h/m", other),
+    };
+    Ok(now - secs)
+}
+
 async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlCommands) -> Result<()> {
     match command {
         XurlCommands::Ingest {
@@ -7928,6 +8000,144 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 println!("turns skipped:  {}", stats.turns_skipped);
                 println!("turns updated:  {}", stats.turns_updated);
                 println!("vectors created:{}", stats.vectors_created);
+            }
+            Ok(())
+        }
+
+        XurlCommands::Search {
+            query,
+            tool,
+            session,
+            since,
+            limit,
+            include_csa,
+            include_agent_prompts,
+            format,
+        } => {
+            let since_epoch = since.as_deref().map(parse_since_to_epoch).transpose()?;
+            let filter = mempal::xurl::store::TurnFilter {
+                tool: tool.map(Into::into),
+                session_id: session,
+                since_epoch,
+                limit,
+                offset: 0,
+            };
+            let embedder = build_embedder(config).await?;
+            let hits = mempal::xurl::search::search(
+                db,
+                embedder.as_ref(),
+                &query,
+                limit,
+                Some(filter),
+                include_csa,
+                include_agent_prompts,
+            )
+            .await
+            .context("xurl search failed")?;
+
+            if format == "json" {
+                println!(
+                    "{}",
+                    serde_json::to_string(&hits).context("json serialize")?
+                );
+            } else {
+                mempal::xurl::search::print_hits_markdown(&hits);
+            }
+            Ok(())
+        }
+
+        XurlCommands::Timeline {
+            tool,
+            session,
+            since,
+            limit,
+            page,
+            include_csa,
+            include_agent_prompts,
+            format,
+        } => {
+            let since_epoch = since.as_deref().map(parse_since_to_epoch).transpose()?;
+            let filter = mempal::xurl::store::TurnFilter {
+                tool: tool.map(Into::into),
+                session_id: session,
+                since_epoch,
+                limit,
+                offset: page * limit,
+            };
+            let turns = mempal::xurl::store::get_turns_filtered(
+                db.conn(),
+                filter,
+                include_csa,
+                include_agent_prompts,
+            )
+            .context("xurl timeline query failed")?;
+
+            if format == "json" {
+                // Serialize as JSON array of simplified objects
+                let json_turns: Vec<serde_json::Value> = turns
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "id": t.id,
+                            "session_id": t.session_id,
+                            "tool": t.tool.as_str(),
+                            "role": t.role.as_str(),
+                            "content": t.content,
+                            "timestamp_epoch": t.timestamp_epoch,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string(&json_turns).context("json serialize")?
+                );
+            } else {
+                if turns.is_empty() {
+                    println!("No turns found.");
+                } else {
+                    for t in &turns {
+                        let session_abbrev = if t.session_id.len() > 8 {
+                            &t.session_id[..8]
+                        } else {
+                            &t.session_id
+                        };
+                        let ts = mempal::xurl::search::format_timestamp(t.timestamp_epoch);
+                        println!("---");
+                        println!(
+                            "**[{}]** `{}` · {} · {}",
+                            t.tool.as_str(),
+                            session_abbrev,
+                            ts,
+                            t.role.as_str()
+                        );
+                        println!();
+                        let preview = if t.content.len() > 300 {
+                            format!("{}…", &t.content[..300])
+                        } else {
+                            t.content.clone()
+                        };
+                        println!("{}", preview.trim());
+                        println!();
+                    }
+                    println!("---");
+                }
+            }
+            Ok(())
+        }
+
+        XurlCommands::Stats => {
+            let stats =
+                mempal::xurl::store::get_stats(db.conn()).context("xurl stats query failed")?;
+            if stats.is_empty() {
+                println!("No conversation turns indexed yet. Run `mempal xurl ingest` first.");
+                return Ok(());
+            }
+            println!("| tool   | turns | first                | last                 |");
+            println!("|--------|------:|----------------------|----------------------|");
+            for s in &stats {
+                let first = mempal::xurl::search::format_timestamp(s.min_timestamp);
+                let last = mempal::xurl::search::format_timestamp(s.max_timestamp);
+                println!("| {:<6} | {:>5} | {} | {} |", s.tool, s.count, first, last);
             }
             Ok(())
         }

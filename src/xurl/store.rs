@@ -233,6 +233,93 @@ pub fn get_turns(conn: &Connection, filter: TurnFilter) -> XurlResult<Vec<Stored
     Ok(turns)
 }
 
+/// Like `get_turns` but with optional exclusion of CSA-delegated and non-human-provenance turns.
+pub fn get_turns_filtered(
+    conn: &Connection,
+    filter: TurnFilter,
+    include_csa: bool,
+    include_agent_prompts: bool,
+) -> XurlResult<Vec<StoredTurn>> {
+    let limit = if filter.limit == 0 { 20 } else { filter.limit };
+
+    let mut conditions = Vec::<String>::new();
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut idx = 1usize;
+
+    if !include_csa {
+        conditions.push("is_csa_delegated = 0".into());
+    }
+    if !include_agent_prompts {
+        conditions.push("provenance = 'human'".into());
+    }
+    if let Some(ref tool) = filter.tool {
+        conditions.push(format!("tool = ?{idx}"));
+        params_vec.push(Box::new(tool.as_str().to_string()));
+        idx += 1;
+    }
+    if let Some(ref sid) = filter.session_id {
+        conditions.push(format!("session_id = ?{idx}"));
+        params_vec.push(Box::new(sid.clone()));
+        idx += 1;
+    }
+    if let Some(since) = filter.since_epoch {
+        conditions.push(format!("timestamp_epoch >= ?{idx}"));
+        params_vec.push(Box::new(since));
+        idx += 1;
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT id, session_id, tool, turn_index, role, content, timestamp_epoch, \
+         token_count, project_path, git_branch, is_csa_delegated, provenance \
+         FROM conversation_turns \
+         {where_clause} \
+         ORDER BY timestamp_epoch DESC \
+         LIMIT ?{idx} OFFSET ?{}",
+        idx + 1
+    );
+
+    params_vec.push(Box::new(limit as i64));
+    params_vec.push(Box::new(filter.offset as i64));
+
+    let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+
+    let mut stmt = conn.prepare(&sql).map_err(XurlError::Database)?;
+    let rows = stmt
+        .query_map(refs.as_slice(), |row| {
+            let tool_str: String = row.get(2)?;
+            let role_str: String = row.get(4)?;
+            let provenance_str: String = row.get(11)?;
+            let is_csa: i64 = row.get(10)?;
+            Ok(StoredTurn {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                tool: parse_tool(&tool_str).unwrap_or(Tool::Cc),
+                turn_index: row.get::<_, i64>(3)? as u32,
+                role: parse_role(&role_str).unwrap_or(Role::User),
+                content: row.get(5)?,
+                timestamp_epoch: row.get(6)?,
+                token_count: row.get(7)?,
+                project_path: row.get(8)?,
+                git_branch: row.get(9)?,
+                is_csa_delegated: is_csa != 0,
+                provenance: parse_provenance(&provenance_str),
+            })
+        })
+        .map_err(XurlError::Database)?;
+
+    let mut turns = Vec::new();
+    for row in rows {
+        turns.push(row.map_err(XurlError::Database)?);
+    }
+    Ok(turns)
+}
+
 /// Per-tool aggregate statistics.
 pub fn get_stats(conn: &Connection) -> XurlResult<Vec<ToolStat>> {
     let mut stmt = conn
