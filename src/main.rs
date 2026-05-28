@@ -173,15 +173,6 @@ struct ConsolidateCommandOptions<'a> {
     limit: Option<usize>,
 }
 
-struct IngestConversationCommandOptions<'a> {
-    path: &'a Path,
-    session_id: Option<&'a str>,
-    project: Option<&'a str>,
-    dry_run: bool,
-    json: bool,
-    no_gate: bool,
-}
-
 struct SleepCommandOptions {
     nrem: bool,
     rem: bool,
@@ -1697,25 +1688,14 @@ fn run() -> Result<()> {
                 valid_until: valid_until.as_deref(),
             },
         )),
-        Commands::IngestConversation {
-            path,
-            session_id,
-            project,
-            dry_run,
-            json,
-            no_gate,
-        } => block_on_result(ingest_conversation_command(
-            &db,
-            config.as_ref(),
-            IngestConversationCommandOptions {
-                path: &path,
-                session_id: session_id.as_deref(),
-                project: project.as_deref(),
-                dry_run,
-                json,
-                no_gate,
-            },
-        )),
+        Commands::IngestConversation { .. } => {
+            eprintln!(
+                "error: `mempal ingest-conversation` was removed in P16.\n\
+                 Use `mempal xurl ingest --tool cc --path <path>` instead.\n\
+                 To scan all default directories: `mempal xurl ingest`"
+            );
+            std::process::exit(1);
+        }
         Commands::Search {
             query,
             wing,
@@ -2404,87 +2384,6 @@ async fn ingest_command(
         stats.lock_wait_ms.unwrap_or(0),
         stats.superseded_drawer_id.as_deref().unwrap_or("")
     );
-    Ok(())
-}
-
-async fn ingest_conversation_command(
-    db: &Database,
-    config: &Config,
-    opts: IngestConversationCommandOptions<'_>,
-) -> Result<()> {
-    use mempal::ingest::conversation::session_id_for_path;
-
-    let path = opts.path;
-    if !path.exists() {
-        bail!("path `{}` does not exist", path.display());
-    }
-    if !path.is_file() {
-        bail!(
-            "`mempal ingest-conversation` expects a file, got `{}`",
-            path.display()
-        );
-    }
-
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .with_context(|| format!("failed to read `{}`", path.display()))?;
-
-    let resolved_session_id = opts
-        .session_id
-        .map(|s| s.to_owned())
-        .unwrap_or_else(|| session_id_for_path(path, &content));
-
-    let project_id = resolve_project_id(opts.project, config, Some(path))
-        .context("failed to resolve project id")?;
-
-    let base_options = IngestOptions {
-        room: Some(resolved_session_id.as_str()),
-        source_root: path.parent(),
-        dry_run: opts.dry_run,
-        project_id: project_id.as_deref(),
-        source_type: Some(SourceType::AgentInference),
-        ..IngestOptions::default()
-    };
-
-    let stats = if opts.dry_run {
-        ingest_file_with_options(db, &NoopEmbedder, path, "conversation", base_options).await?
-    } else {
-        let prototype_classifier = if config.ingest_gating.enabled && !opts.no_gate {
-            compile_classifier_from_config(config)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))
-                .context("gating prototypes unavailable")?
-        } else {
-            None
-        };
-        let embedder = build_embedder(config).await?;
-        let live_options = IngestOptions {
-            gating: (!opts.no_gate).then_some(&config.ingest_gating),
-            prototype_classifier: prototype_classifier.as_ref(),
-            ..base_options
-        };
-        ingest_file_with_options(db, &*embedder, path, "conversation", live_options).await?
-    };
-
-    if opts.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "session_id": resolved_session_id,
-                "dry_run": opts.dry_run,
-                "chunks": stats.chunks,
-                "skipped": stats.skipped,
-                "dropped_by_gate": stats.dropped_by_gate,
-                "drawer_ids": stats.drawer_ids,
-            }))
-            .context("failed to serialize output")?
-        );
-    } else {
-        println!(
-            "session_id={} dry_run={} chunks={} skipped={} dropped_by_gate={}",
-            resolved_session_id, opts.dry_run, stats.chunks, stats.skipped, stats.dropped_by_gate,
-        );
-    }
     Ok(())
 }
 

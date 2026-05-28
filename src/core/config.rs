@@ -739,8 +739,8 @@ pub struct HooksSessionEndConfig {
     pub trailing_messages: usize,
     pub min_length: usize,
     pub wing: String,
-    /// Automatically ingest the session JSONL transcript into wing="conversation"
-    /// when a SessionEnd hook fires. Disabled by default.
+    /// Deprecated (P16): SessionEnd auto-ingest was removed. Field kept for config
+    /// compat; set to false in your config to suppress the deprecation warning.
     pub auto_ingest_conversation: bool,
 }
 

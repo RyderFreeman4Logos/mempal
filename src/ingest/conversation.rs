@@ -1,3 +1,5 @@
+// Legacy CC session ID helpers; xurl parsers use their own session discovery.
+
 use std::path::Path;
 
 use serde_json::Value;
