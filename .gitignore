@@ -31,3 +31,9 @@ skills/rust-skills/
 
 # Local git worktrees
 .worktrees/
+
+# mdBook generated output
+books/*/book/
+
+# Browser verification artifacts
+.playwright-mcp/
