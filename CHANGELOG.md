@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR bumps introduce new features, PATCH bumps are bug-fix only).
 
+## [0.5.1] — 2026-05-29
+
+Bug-fix release. **0.5.0's MCP tool list failed to load in strict clients.**
+
+### Fixed
+
+- **MCP tool list now loads in Claude Code (and other strict clients).** The
+  `mempal_phase3` tool's `metadata` and `report` inputs are free-form JSON
+  (`serde_json::Value`), for which schemars emits a boolean `true` property
+  schema. Claude Code's Zod-based validator rejects a boolean property schema
+  and then refuses the **entire** tool list (`tools[..].inputSchema.properties.
+  {metadata,report}: Invalid input`), so all 23 tools silently disappeared in
+  0.5.0. Both fields now advertise a concrete `{"type": "object"}` schema via a
+  `schema_with` helper, and a regression test asserts they never revert to a
+  boolean schema. CLI behavior is unchanged.
+
 ## [0.5.0] — 2026-05-29
 
 Large feature release covering P10–P105: the mind-model knowledge layer,
@@ -198,6 +214,7 @@ P8) on top of hybrid search and the knowledge graph.
 Earlier releases (0.1.x, 0.2.x) are tracked only in Git history. Run
 `git log --oneline` on the repository to inspect them.
 
+[0.5.1]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.1
 [0.5.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.4.0
 [0.3.1]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.3.1

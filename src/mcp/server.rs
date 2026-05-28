@@ -6207,6 +6207,42 @@ mod tests {
         );
     }
 
+    // Regression: strict MCP clients (e.g. Claude Code's Zod validator) reject a
+    // boolean property schema and then fail to load the ENTIRE tool list. The
+    // free-form `metadata` / `report` fields on Phase3Request must advertise a
+    // concrete object schema, not the boolean `true` schemars emits for
+    // `serde_json::Value`.
+    #[test]
+    fn test_phase3_free_form_fields_advertise_object_schema() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let tools = server.tool_router.list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_phase3")
+            .expect("mempal_phase3 tool exists");
+        let json = serde_json::to_value(tool).expect("serialize tool");
+        let properties = json
+            .get("inputSchema")
+            .and_then(|schema| schema.get("properties"))
+            .and_then(|props| props.as_object())
+            .expect("phase3 input schema has properties");
+
+        for field in ["metadata", "report"] {
+            let prop = properties
+                .get(field)
+                .unwrap_or_else(|| panic!("phase3 input schema exposes `{field}`"));
+            assert!(
+                prop.is_object(),
+                "`{field}` property schema must be an object, not a boolean (was {prop})"
+            );
+            assert_eq!(
+                prop.get("type").and_then(|value| value.as_str()),
+                Some("object"),
+                "`{field}` property schema must declare type=object (was {prop})"
+            );
+        }
+    }
+
     #[test]
     fn test_mcp_tool_registry_and_protocol_include_knowledge_cards_lifecycle() {
         let (_tempdir, _db_path, server) = setup_server();

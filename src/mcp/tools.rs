@@ -447,6 +447,20 @@ pub struct KnowledgeCardsResponse {
     pub demote: Option<KnowledgeCardDemoteDto>,
 }
 
+/// Emit a concrete object JSON Schema for free-form JSON fields.
+///
+/// `serde_json::Value` makes schemars emit a boolean `true` schema for the
+/// field. Strict MCP clients (e.g. Claude Code's Zod-based validator) reject a
+/// boolean property schema and then fail to load the *entire* tool list. Emit a
+/// well-formed `{"type": "object"}` schema instead so the tool advertises
+/// cleanly while still accepting arbitrary JSON objects.
+fn free_form_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "additionalProperties": true
+    })
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct Phase3Request {
     pub action: String,
@@ -469,9 +483,11 @@ pub struct Phase3Request {
     pub evaluator_id: Option<String>,
     pub research_report_id: Option<String>,
     pub note: Option<String>,
+    #[schemars(schema_with = "free_form_object_schema")]
     pub metadata: Option<serde_json::Value>,
     pub limit: Option<usize>,
     pub candidate: Option<String>,
+    #[schemars(schema_with = "free_form_object_schema")]
     pub report: Option<serde_json::Value>,
     pub execute: Option<bool>,
     pub allow_warnings: Option<bool>,
