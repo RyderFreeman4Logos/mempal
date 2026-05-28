@@ -336,19 +336,38 @@ agent-spec lint specs/p6-cowork-peek-and-decide.spec.md --min-score 0.7
 8. 基于 mempal 结果作答时，必须引用 `drawer_id` 和 `source_file`。
 9. 如果没有找到高信号结果，要明确说明“没找到足够证据”，然后扩大查询范围；不要猜。
 
-## Workspace 结构
+## 代码结构
+
+单 crate（`mempal`），无 cargo workspace。模块全部在 `src/` 下：
 
 ```
-crates/
-├── mempal-core/      # 数据模型 + SQLite schema v9 + taxonomy + triples
-├── mempal-ingest/    # 导入管道
-├── mempal-search/    # 混合搜索（BM25+向量+RRF）+ 路由 + tunnel hints
-├── mempal-embed/     # 嵌入层（model2vec 默认, ort 可选）
-├── mempal-aaak/      # AAAK 编解码（输出侧）
-├── mempal-mcp/       # MCP 服务器（9 工具）
-├── mempal-api/       # REST API（feature-gated）
-└── mempal-cli/       # CLI 入口（含 reindex, kg, tunnels）
+src/
+├── main.rs                    # CLI 入口（clap 命令树：search/context/brief/knowledge/
+│                              #   knowledge-card/phase3/cowork-*/kg/tunnels/reindex/doctor 等）
+├── lib.rs                     # 库导出
+├── core/                      # 数据模型 + SQLite schema v9 + taxonomy + triples（db.rs / types.rs）
+├── ingest/                    # 导入管道（格式检测/归一化/分块/存储 + per-source lock）
+├── search/                    # 混合搜索（BM25 + 向量 + RRF，mod.rs）+ 路由 + tunnel hints + rerank
+├── embed/                     # 嵌入层（model2vec 默认, ort 可选）
+├── aaak/                      # AAAK 编解码（输出侧）
+├── mcp/                       # MCP 服务器（server.rs，23 工具）
+├── api/                       # REST API（feature-gated `rest`）
+├── cowork/                    # 多 agent cowork bus / peek / push
+├── factcheck/                 # 离线矛盾检测（relations / contradictions）
+├── context.rs                 # mind-model runtime context assembler
+├── brief.rs                   # deterministic cognitive brief
+├── doctor.rs                  # install/runtime 诊断
+├── field_taxonomy.rs          # field taxonomy guidance
+├── knowledge_gate.rs          # 确定性 promotion gate + policy 表
+├── knowledge_distill.rs       # evidence -> candidate distill
+├── knowledge_lifecycle.rs     # Stage-1 typed-drawer promote/demote
+├── knowledge_anchor.rs        # outward anchor publication
+├── knowledge_card_*.rs        # Phase-2 card lifecycle / retrieval / backfill
+└── adoption_analytics.rs      # Phase-3 runtime adoption analytics
 ```
+
+> 注意：早期文档曾把 mempal 描述成 8-crate workspace（`crates/mempal-core` 等），
+> 那只是早期设想，实际实现是单 crate。`cargo install mempal` 装的是这一个 crate。
 
 ## 代码规范
 
