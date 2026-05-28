@@ -14,13 +14,40 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 15;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 16;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
 // idx_drawers_project_id (added in fork_ext v5), cutting project_breakdown() from ~8s to
 // sub-second on 500K+ row databases. idx_drawers_wing_room_active does the same for
 // scope_counts() (GROUP BY wing, room WHERE deleted_at IS NULL).
+pub const FORK_EXT_V16_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    id              TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    tool            TEXT NOT NULL,
+    turn_index      INTEGER NOT NULL,
+    role            TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    timestamp_epoch REAL NOT NULL,
+    token_count     INTEGER,
+    project_path    TEXT,
+    git_branch      TEXT,
+    is_csa_delegated BOOLEAN NOT NULL DEFAULT FALSE,
+    provenance       TEXT NOT NULL DEFAULT 'human',
+    UNIQUE(session_id, tool, turn_index)
+);
+CREATE TABLE IF NOT EXISTS conversation_turn_vectors (
+    turn_id     TEXT NOT NULL REFERENCES conversation_turns(id),
+    chunk_index INTEGER NOT NULL DEFAULT 0,
+    vector      BLOB NOT NULL,
+    PRIMARY KEY (turn_id, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_ct_session   ON conversation_turns(session_id, tool);
+CREATE INDEX IF NOT EXISTS idx_ct_timestamp ON conversation_turns(timestamp_epoch DESC);
+CREATE INDEX IF NOT EXISTS idx_ct_project   ON conversation_turns(project_path);
+"#;
+
 pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_project_id_active
     ON drawers(project_id)
@@ -323,6 +350,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 15,
             up: apply_v15,
         },
+        Migration {
+            version: 16,
+            up: apply_v16,
+        },
     ]
 }
 
@@ -430,6 +461,10 @@ fn apply_v14(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v15(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V15_SCHEMA_SQL)
+}
+
+fn apply_v16(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V16_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {
