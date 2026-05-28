@@ -659,6 +659,11 @@ enum Commands {
         #[command(subcommand)]
         command: repair_cli::RepairCommands,
     },
+    /// Index and query conversation turns from CC, Codex, and Hermes sessions.
+    Xurl {
+        #[command(subcommand)]
+        command: XurlCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -720,6 +725,42 @@ enum DaemonSubcommand {
     Restart,
     /// Show daemon status, PID, and queue stats.
     Status,
+}
+
+#[derive(Subcommand)]
+enum XurlCommands {
+    /// Ingest turns from a single file or scan all default tool directories.
+    Ingest {
+        /// Tool source: cc, codex, or hermes. Required when --path is given.
+        #[arg(long, value_enum)]
+        tool: Option<XurlTool>,
+        /// Path to a specific file to ingest. Omit to scan default directories.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Override session ID (only used with --path).
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Print result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum XurlTool {
+    Cc,
+    Codex,
+    Hermes,
+}
+
+impl From<XurlTool> for mempal::xurl::model::Tool {
+    fn from(t: XurlTool) -> Self {
+        match t {
+            XurlTool::Cc => mempal::xurl::model::Tool::Cc,
+            XurlTool::Codex => mempal::xurl::model::Tool::Codex,
+            XurlTool::Hermes => mempal::xurl::model::Tool::Hermes,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -1981,6 +2022,9 @@ fn run() -> Result<()> {
         Commands::Patterns { command } => patterns::run_command(config.as_ref(), command),
         Commands::Skills { command } => skills::run_command(config.as_ref(), command),
         Commands::Repair { command } => repair_cli::run_command(config.as_ref(), command),
+        Commands::Xurl { command } => {
+            block_on_result(xurl_ingest_command(&db, config.as_ref(), command))
+        }
         Commands::CoworkDrain { .. }
         | Commands::CoworkStatus { .. }
         | Commands::CoworkInstallHooks { .. }
@@ -7844,6 +7888,50 @@ async fn serve_mcp_and_rest_command(config: &Config) -> Result<()> {
         Ok(())
     });
     tokio::select! { mcp_result = &mut mcp_task => { let _ = rest_state.drain_write_queue().await; rest_task.abort(); match rest_task.await { Ok(Ok(())) => {} Ok(Err(e)) => return Err(e), Err(je) if je.is_cancelled() => {} Err(je) => return Err(anyhow::Error::new(je).context("failed to join REST task")) } mcp_result } rest_result = &mut rest_task => match rest_result { Ok(Ok(())) => bail!("REST server exited unexpectedly"), Ok(Err(e)) => Err(e), Err(je) => Err(anyhow::Error::new(je).context("failed to join REST task")) } }
+}
+
+async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlCommands) -> Result<()> {
+    match command {
+        XurlCommands::Ingest {
+            tool,
+            path,
+            session_id,
+            json,
+        } => {
+            let embedder = build_embedder(config).await?;
+            let stats = if let Some(p) = path {
+                let t =
+                    tool.ok_or_else(|| anyhow::anyhow!("--tool is required when --path is given"))?;
+                mempal::xurl::ingest::ingest_file(
+                    db,
+                    embedder.as_ref(),
+                    &p,
+                    t.into(),
+                    session_id.as_deref(),
+                )
+                .await
+                .context("xurl ingest failed")?
+            } else {
+                let cfg = mempal::xurl::ingest::AutoScanConfig::default();
+                mempal::xurl::ingest::ingest_all(db, embedder.as_ref(), &cfg)
+                    .await
+                    .context("xurl ingest-all failed")?
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&stats).context("json serialize")?
+                );
+            } else {
+                println!("turns parsed:   {}", stats.turns_parsed);
+                println!("turns inserted: {}", stats.turns_inserted);
+                println!("turns skipped:  {}", stats.turns_skipped);
+                println!("turns updated:  {}", stats.turns_updated);
+                println!("vectors created:{}", stats.vectors_created);
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn build_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
