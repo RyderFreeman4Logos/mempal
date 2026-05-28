@@ -6,6 +6,56 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR bumps introduce new features, PATCH bumps are bug-fix only).
 
+## [0.5.0] — 2026-05-29
+
+Large feature release covering P10–P105: the mind-model knowledge layer,
+Phase-2 knowledge cards, Phase-3 runtime adoption evidence, the multi-agent
+cowork bus, release/ops tooling, and the first Chinese mdBook. Schema advances
+to **v9**. No breaking CLI removals; existing commands keep their semantics.
+
+### Added
+
+- **Mind-model knowledge layer (P12–P29).** Typed drawers with `dao_tian /
+  dao_ren / shu / qi / evidence` tiers and `global / repo / worktree` anchors;
+  `mempal context` / `mempal_context` runtime context assembler; knowledge
+  lifecycle CLI/MCP (`distill`, `gate`, `promote`, `demote`, `publish-anchor`);
+  read-only promotion policy and field-taxonomy surfaces.
+- **Phase-2 knowledge cards (P30–P48).** Schema v8 `knowledge_cards` /
+  `knowledge_evidence_links` / `knowledge_events`; card core API, CLI, MCP
+  read + gate/promote/demote/retrieve; Stage-1 → card backfill; card-aware
+  context (`--include-cards`, opt-in).
+- **Phase-3 runtime adoption evidence (P49–P82).** Schema v9
+  `runtime_adoption_events`; `mempal phase3` (record/list/stats/gate/review/
+  analytics/readiness/default-proposal/default-control/rollback-control),
+  checked records, capture helpers, opt-in instrumentation wrapper, evaluator
+  advisory API, research validate/ingest planning.
+- **Cognitive brief (P83, P102).** `mempal brief` / `mempal_brief` —
+  deterministic citation-first brief; no LLM, no DB writes.
+- **Multi-agent cowork bus (P84–P96, P101).** Concrete `agent_id` registry +
+  per-agent inbox, events log, delivery ack/status, presence/heartbeat,
+  threads/channels, tmux transport + live peek, sessions, handoff summary, and
+  explicit handoff-to-evidence capture; `mempal_cowork_bus` MCP surface.
+- **Release & ops tooling (P97–P104).** `mempal doctor` / `mempal_doctor`,
+  `mempal release-readiness`, `mempal maintenance guided-run`, maintenance &
+  cowork runbooks, adoption analytics.
+- **Chinese mdBook (P105).** `books/zh-CN` — preface + 10 chapters + appendix,
+  Mermaid via committed local JS assets. Excluded from the published crate.
+
+### Changed
+
+- Storage schema advances to **v9**; `reindex --stale` migrates drawers behind
+  the current `normalize_version`.
+- `mempal_search` results carry AAAK-derived structured signals (`entities`,
+  `topics`, `flags`, `emotions`, `importance_stars`); `content` stays raw.
+- Published crate now also excludes `books/**` (mdBook manuscript + local
+  Mermaid asset) alongside the existing `specs/**` and `docs/plans/**`.
+
+### Notes
+
+- Governance boundaries are deliberate: no silent promotion, evaluator stays
+  advisory, research cannot define `dao` directly, and cowork runtime logs do
+  not enter durable memory without explicit capture.
+
 ## [0.4.0] — 2026-04-20
 
 First release with **write-safety** + **content-sanity** guarantees for the
@@ -148,6 +198,7 @@ P8) on top of hybrid search and the knowledge graph.
 Earlier releases (0.1.x, 0.2.x) are tracked only in Git history. Run
 `git log --oneline` on the repository to inspect them.
 
+[0.5.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.4.0
 [0.3.1]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.3.1
 [0.3.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.3.0
