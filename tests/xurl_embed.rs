@@ -105,7 +105,7 @@ async fn long_assistant_turn_produces_multiple_vectors() {
     );
 
     let embedder = MockEmbedder::new_fixed_dim(256);
-    embed::embed_unindexed_turns(&db.inner, &embedder)
+    embed::embed_unindexed_turns(&db.inner, &embedder, None)
         .await
         .unwrap();
 
@@ -142,7 +142,7 @@ async fn short_turn_produces_exactly_one_vector() {
     );
 
     let embedder = MockEmbedder::new_fixed_dim(256);
-    embed::embed_unindexed_turns(&db.inner, &embedder)
+    embed::embed_unindexed_turns(&db.inner, &embedder, None)
         .await
         .unwrap();
 
@@ -178,13 +178,13 @@ async fn re_embed_already_indexed_turns_is_noop() {
     let embedder = MockEmbedder::new_fixed_dim(256);
 
     // First run: should embed
-    let stats1 = embed::embed_unindexed_turns(&db.inner, &embedder)
+    let stats1 = embed::embed_unindexed_turns(&db.inner, &embedder, None)
         .await
         .unwrap();
     assert_eq!(stats1.turns_processed, 1);
 
     // Second run: already indexed, should be a noop
-    let stats2 = embed::embed_unindexed_turns(&db.inner, &embedder)
+    let stats2 = embed::embed_unindexed_turns(&db.inner, &embedder, None)
         .await
         .unwrap();
     assert_eq!(stats2.embedded, 0, "re-embedding should be a noop");
@@ -223,10 +223,65 @@ async fn embed_stats_counts_chunks() {
     );
 
     let embedder = MockEmbedder::new_fixed_dim(64);
-    let stats = embed::embed_unindexed_turns(&db.inner, &embedder)
+    let stats = embed::embed_unindexed_turns(&db.inner, &embedder, None)
         .await
         .unwrap();
     assert_eq!(stats.turns_processed, 2);
     assert_eq!(stats.chunks_total, 2);
     assert_eq!(stats.embedded, 2);
+}
+
+#[tokio::test]
+async fn test_embed_batch_progress() {
+    let db = open_temp_db_at_fork_ext(16);
+
+    // 120 turns → 3 batches of 50 (EMBED_BATCH_SIZE=50): progress_fn fires 3 times.
+    for i in 0..120usize {
+        insert_raw_turn_row(
+            db.conn(),
+            TurnRow {
+                id: &format!("turn-bp-{i:03}"),
+                session: "sess-bp",
+                tool: "cc",
+                turn_index: i as i64,
+                role: "user",
+                content: &format!("batch progress test turn {i}"),
+                timestamp: i as f64,
+                token_count: None,
+            },
+        );
+    }
+
+    let call_count = std::sync::atomic::AtomicUsize::new(0);
+    let embedder = MockEmbedder::new_fixed_dim(256);
+
+    let stats = embed::embed_unindexed_turns(
+        &db.inner,
+        &embedder,
+        Some(&|_done, _total| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }),
+    )
+    .await
+    .expect("embed_unindexed_turns should succeed");
+
+    let calls = call_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        calls > 1,
+        "expected multiple progress callbacks for 120 turns, got {calls}"
+    );
+    assert_eq!(
+        stats.turns_processed, 120,
+        "all 120 turns should be processed"
+    );
+
+    let indexed_count: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(DISTINCT turn_id) FROM conversation_turn_vectors",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count indexed turns");
+    assert_eq!(indexed_count, 120, "all 120 turns should have vectors");
 }

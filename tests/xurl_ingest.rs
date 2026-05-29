@@ -115,7 +115,7 @@ async fn ingest_cc_file_end_to_end() {
     let file = write_cc_fixture(&dir, 10, 8, 12);
     let embedder = MockEmbedder::new_fixed_dim(256);
 
-    let stats = ingest::ingest_file(&db.inner, &embedder, &file, Tool::Cc, None)
+    let stats = ingest::ingest_file(&db.inner, &embedder, &file, Tool::Cc, None, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -127,7 +127,7 @@ async fn ingest_cc_file_end_to_end() {
     assert_eq!(stats.turns_skipped, 0);
 
     // Re-ingest the same file → no new turns, all skipped
-    let stats2 = ingest::ingest_file(&db.inner, &embedder, &file, Tool::Cc, None)
+    let stats2 = ingest::ingest_file(&db.inner, &embedder, &file, Tool::Cc, None, None, None)
         .await
         .unwrap();
     assert_eq!(stats2.turns_inserted, 0);
@@ -142,7 +142,7 @@ async fn ingest_empty_file_succeeds() {
     std::fs::write(&path, "").unwrap();
     let embedder = MockEmbedder::new_fixed_dim(64);
 
-    let stats = ingest::ingest_file(&db.inner, &embedder, &path, Tool::Cc, None)
+    let stats = ingest::ingest_file(&db.inner, &embedder, &path, Tool::Cc, None, None, None)
         .await
         .unwrap();
     assert_eq!(stats.turns_parsed, 0);

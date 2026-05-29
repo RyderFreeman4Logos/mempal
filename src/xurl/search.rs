@@ -1,6 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+/// Internal per-turn accumulator: (score, session_id, tool, role, content, timestamp, source_path).
+type TurnBestEntry = (f32, String, String, String, String, f64, Option<String>);
 
 use crate::core::db::Database;
 use crate::embed::Embedder;
@@ -16,6 +20,19 @@ pub struct SearchHit {
     pub content: String,
     pub timestamp_epoch: f64,
     pub score: f32,
+    pub source_path: Option<String>,
+}
+
+/// Aggregated result returned by [`search`].
+#[derive(Debug, Serialize)]
+pub struct SearchResult {
+    pub hits: Vec<SearchHit>,
+    /// Highest score among hits that were filtered out by `min_score_floor`.
+    pub best_score_below_floor: Option<f32>,
+    /// Total unique candidates (after per-turn and per-content dedup, before floor and limit).
+    pub total_candidates: usize,
+    /// The min-score threshold that was applied, if any.
+    pub min_score_floor: Option<f32>,
 }
 
 /// Deserialize a raw f32 little-endian BLOB into a vector.
@@ -40,22 +57,50 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Options controlling semantic search behaviour.
+#[derive(Debug, Default)]
+pub struct SearchOptions {
+    /// Maximum number of hits to return (0 ⇒ empty result immediately).
+    pub limit: usize,
+    /// Column-level pre-filter applied before scoring.
+    pub filter: Option<TurnFilter>,
+    /// Include CSA-delegated turns (default: false).
+    pub include_csa: bool,
+    /// Include non-human-provenance turns (default: false).
+    pub include_agent_prompts: bool,
+    /// Exclude hits scoring below this threshold.
+    pub min_score: Option<f32>,
+}
+
 /// Semantic search over `conversation_turn_vectors` using brute-force cosine similarity.
 ///
 /// The query is embedded via `embedder`, then every stored vector is scored.
 /// Multi-chunk turns are deduplicated by keeping the best-scoring chunk.
+/// Identical-content turns are deduplicated, keeping the highest-scored representative.
 /// Default filtering excludes CSA-delegated turns and non-human-provenance turns.
+///
+/// If `opts.min_score` is set, hits below the floor are excluded;
+/// [`SearchResult::best_score_below_floor`] reflects the highest score that did not make the cut.
 pub async fn search<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,
     query: &str,
-    limit: usize,
-    filter: Option<TurnFilter>,
-    include_csa: bool,
-    include_agent_prompts: bool,
-) -> XurlResult<Vec<SearchHit>> {
+    opts: SearchOptions,
+) -> XurlResult<SearchResult> {
+    let SearchOptions {
+        limit,
+        filter,
+        include_csa,
+        include_agent_prompts,
+        min_score,
+    } = opts;
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(SearchResult {
+            hits: Vec::new(),
+            best_score_below_floor: None,
+            total_candidates: 0,
+            min_score_floor: min_score,
+        });
     }
 
     // Embed the query string.
@@ -105,7 +150,7 @@ pub async fn search<E: Embedder + ?Sized>(
 
     let sql = format!(
         "SELECT ctv.turn_id, ctv.vector, \
-         ct.session_id, ct.tool, ct.role, ct.content, ct.timestamp_epoch \
+         ct.session_id, ct.tool, ct.role, ct.content, ct.timestamp_epoch, ct.project_path \
          FROM conversation_turn_vectors ctv \
          JOIN conversation_turns ct ON ct.id = ctv.turn_id \
          {where_clause}"
@@ -119,6 +164,7 @@ pub async fn search<E: Embedder + ?Sized>(
         role: String,
         content: String,
         timestamp_epoch: f64,
+        project_path: Option<String>,
     }
 
     let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
@@ -133,6 +179,7 @@ pub async fn search<E: Embedder + ?Sized>(
                 role: row.get(4)?,
                 content: row.get(5)?,
                 timestamp_epoch: row.get(6)?,
+                project_path: row.get(7)?,
             })
         })
         .map_err(XurlError::Database)?
@@ -140,9 +187,7 @@ pub async fn search<E: Embedder + ?Sized>(
         .map_err(XurlError::Database)?;
 
     // Score each chunk, deduplicate by turn_id keeping best score.
-    // Value: (best_score, session_id, tool, role, content, timestamp_epoch)
-    let mut best_by_turn: HashMap<String, (f32, String, String, String, String, f64)> =
-        HashMap::new();
+    let mut best_by_turn: HashMap<String, TurnBestEntry> = HashMap::new();
 
     for row in rows {
         let vec = deserialize_vector(&row.vector);
@@ -154,35 +199,70 @@ pub async fn search<E: Embedder + ?Sized>(
             row.role,
             row.content,
             row.timestamp_epoch,
+            row.project_path,
         ));
         if score > entry.0 {
             entry.0 = score;
         }
     }
 
-    // Sort by descending score, truncate to limit.
-    let mut hits: Vec<SearchHit> = best_by_turn
+    // Convert to SearchHit and sort by descending score.
+    let mut all_hits: Vec<SearchHit> = best_by_turn
         .into_iter()
         .map(
-            |(turn_id, (score, session_id, tool, role, content, timestamp_epoch))| SearchHit {
-                turn_id,
-                session_id,
-                tool,
-                role,
-                content,
-                timestamp_epoch,
-                score,
+            |(turn_id, (score, session_id, tool, role, content, timestamp_epoch, source_path))| {
+                SearchHit {
+                    turn_id,
+                    session_id,
+                    tool,
+                    role,
+                    content,
+                    timestamp_epoch,
+                    score,
+                    source_path,
+                }
             },
         )
         .collect();
 
-    hits.sort_by(|a, b| {
+    all_hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    hits.truncate(limit);
-    Ok(hits)
+
+    // Dedup by content hash: hits are sorted desc by score, so the first occurrence per
+    // content hash is always the highest-scored representative.
+    let mut seen_content_hashes: HashSet<String> = HashSet::new();
+    let deduped: Vec<SearchHit> = all_hits
+        .into_iter()
+        .filter(|hit| {
+            let hash = format!("{:x}", Sha256::digest(hit.content.as_bytes()));
+            seen_content_hashes.insert(hash)
+        })
+        .collect();
+
+    let total_candidates = deduped.len();
+
+    // Apply min_score floor, then truncate.
+    let (mut passing, below_floor): (Vec<SearchHit>, Vec<SearchHit>) =
+        if let Some(floor) = min_score {
+            deduped.into_iter().partition(|h| h.score >= floor)
+        } else {
+            (deduped, Vec::new())
+        };
+
+    // below_floor is sorted desc by score (partitioned from a sorted vec), so first = highest.
+    let best_score_below_floor = below_floor.into_iter().next().map(|h| h.score);
+
+    passing.truncate(limit);
+
+    Ok(SearchResult {
+        hits: passing,
+        best_score_below_floor,
+        total_candidates,
+        min_score_floor: min_score,
+    })
 }
 
 /// Format a Unix timestamp as a compact ISO 8601 date-time string.
@@ -244,26 +324,34 @@ fn is_leap(y: u64) -> bool {
 }
 
 /// Print search hits in markdown format to stdout.
-pub fn print_hits_markdown(hits: &[SearchHit]) {
-    if hits.is_empty() {
-        println!("No results found.");
+pub fn print_hits_markdown(result: &SearchResult) {
+    if result.hits.is_empty() {
+        if let Some(best) = result.best_score_below_floor {
+            let floor = result.min_score_floor.unwrap_or(0.0);
+            println!("No confident match (best score {best:.3} < floor {floor:.2})");
+        } else {
+            println!("No results found.");
+        }
         return;
     }
-    for hit in hits {
-        let session_abbrev = if hit.session_id.len() > 8 {
-            &hit.session_id[..8]
-        } else {
-            &hit.session_id
-        };
+    for hit in &result.hits {
         let ts = format_timestamp(hit.timestamp_epoch);
         println!("---");
         println!(
             "**[{}]** `{}` · {} · {} (score: {:.3})",
-            hit.tool, session_abbrev, ts, hit.role, hit.score
+            hit.tool, hit.session_id, ts, hit.role, hit.score
         );
+        if let Some(ref path) = hit.source_path {
+            println!("  source: {path}");
+        }
         println!();
         println!("{}", hit.content.trim());
         println!();
     }
     println!("---");
+    println!(
+        "_{} candidates considered ({} shown after dedup + min-score floor)_",
+        result.total_candidates,
+        result.hits.len()
+    );
 }
