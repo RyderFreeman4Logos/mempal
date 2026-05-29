@@ -11,6 +11,11 @@ use crate::xurl::parser::{cc::parse_cc_jsonl, codex::parse_codex_jsonl, hermes::
 use crate::xurl::store;
 use crate::xurl::{XurlError, XurlResult};
 
+/// Callback invoked after each file is parsed: `(filename, turns_parsed)`.
+type ParsedCb<'a> = Option<&'a dyn Fn(&str, usize)>;
+/// Callback invoked after each embed batch: `(done, total)`.
+type EmbedCb<'a> = Option<&'a dyn Fn(usize, usize)>;
+
 #[derive(Debug, Default, Serialize)]
 pub struct IngestStats {
     pub turns_parsed: usize,
@@ -96,16 +101,24 @@ fn parse_and_store_file(
 }
 
 /// Ingest a single file (or SQLite DB for Hermes) and embed any newly inserted turns.
+///
+/// `on_file_parsed` is called after parsing with `(filename, turns_parsed)`.
+/// `on_embed_progress` is forwarded to `embed_unindexed_turns` after parsing.
 pub async fn ingest_file<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,
     path: &Path,
     tool: Tool,
     session_id_override: Option<&str>,
+    on_file_parsed: ParsedCb<'_>,
+    on_embed_progress: EmbedCb<'_>,
 ) -> XurlResult<IngestStats> {
-    let (_, turns_parsed, insert_stats) =
+    let (filename, turns_parsed, insert_stats) =
         parse_and_store_file(db, path, tool, session_id_override)?;
-    let embed_stats = embed::embed_unindexed_turns(db, embedder, None).await?;
+    if let Some(f) = on_file_parsed {
+        f(&filename, turns_parsed);
+    }
+    let embed_stats = embed::embed_unindexed_turns(db, embedder, on_embed_progress).await?;
 
     Ok(IngestStats {
         turns_parsed,
@@ -122,14 +135,14 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
 /// then all unindexed turns are embedded in batched transactions (Phase 2).
 /// This avoids the per-file embed overhead that stalls on large DBs.
 ///
-/// `on_file_parsed`, if provided, is called after each file's turns are stored
-/// with `(filename, turns_parsed)`.
-#[allow(clippy::type_complexity)]
+/// `on_file_parsed` is called after each file's turns are stored with `(filename, turns_parsed)`.
+/// `on_embed_progress` is forwarded to `embed_unindexed_turns` during Phase 2.
 pub async fn ingest_all<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,
     cfg: &AutoScanConfig,
-    on_file_parsed: Option<&dyn Fn(&str, usize)>,
+    on_file_parsed: ParsedCb<'_>,
+    on_embed_progress: EmbedCb<'_>,
 ) -> XurlResult<IngestStats> {
     let mut total = IngestStats::default();
 
@@ -182,15 +195,8 @@ pub async fn ingest_all<E: Embedder + ?Sized>(
         }
     }
 
-    // Phase 2: embed all unindexed turns in one batched pass with stderr progress.
-    let embed_stats = embed::embed_unindexed_turns(
-        db,
-        embedder,
-        Some(&|done, total_turns| {
-            eprintln!("embedding turns: {done}/{total_turns}");
-        }),
-    )
-    .await?;
+    // Phase 2: embed all unindexed turns in one batched pass.
+    let embed_stats = embed::embed_unindexed_turns(db, embedder, on_embed_progress).await?;
     total.vectors_created += embed_stats.embedded;
 
     Ok(total)
