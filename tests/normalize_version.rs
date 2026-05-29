@@ -661,3 +661,45 @@ fn test_room_scoped_replace_leaves_other_rooms_behind() {
         "room-scoped replace leaves the other room's stale drawer behind"
     );
 }
+
+// Regression: triples.source_drawer is a FK (RESTRICT) to drawers(id) and
+// mempal opens connections with foreign_keys=ON. Hard-deleting a drawer that a
+// KG triple references must not fail with a FOREIGN KEY constraint error; the
+// replace path clears the stale source pointer first and keeps the triple.
+#[test]
+fn test_replace_clears_triple_source_drawer_fk() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    insert_source_drawer(&db, "drawer_referenced", "docs/y.md", None);
+    db.insert_triple(&mempal::core::types::Triple {
+        id: "triple_ref".to_string(),
+        subject: "drawer_referenced".to_string(),
+        predicate: "elaborates".to_string(),
+        object: "something_else".to_string(),
+        valid_from: None,
+        valid_to: None,
+        confidence: 1.0,
+        source_drawer: Some("drawer_referenced".to_string()),
+    })
+    .expect("insert triple referencing the drawer");
+
+    let deleted = db
+        .replace_active_source_drawers_across_rooms("docs/y.md", "mempal")
+        .expect("replace must not fail on FK-referenced drawer");
+    assert_eq!(deleted, 1);
+    assert_eq!(active_count_for_source(&db, "docs/y.md"), 0);
+
+    // The KG fact survives; only its dangling source pointer is cleared.
+    let source_drawer: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT source_drawer FROM triples WHERE id = ?1",
+            ["triple_ref"],
+            |row| row.get(0),
+        )
+        .expect("triple still exists");
+    assert_eq!(
+        source_drawer, None,
+        "source_drawer must be cleared after the referenced drawer is deleted"
+    );
+}

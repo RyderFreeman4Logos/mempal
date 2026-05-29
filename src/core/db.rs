@@ -654,6 +654,15 @@ impl Database {
                     self.conn
                         .execute("DELETE FROM drawer_vectors WHERE id = ?1", [id])?;
                 }
+                // triples.source_drawer is a FK to drawers(id) (RESTRICT). Drop
+                // the dangling provenance link before the hard delete, otherwise
+                // deleting a drawer referenced by a KG triple fails with a
+                // FOREIGN KEY constraint error. The triple (a KG fact) is kept;
+                // only its stale source pointer is cleared.
+                self.conn.execute(
+                    "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
+                    [id],
+                )?;
                 self.conn
                     .execute("DELETE FROM drawers WHERE rowid = ?1", [rowid])?;
             }
@@ -1299,6 +1308,13 @@ impl Database {
                 self.conn
                     .execute("DELETE FROM drawer_vectors WHERE id = ?1", [id])?;
             }
+            // Clear the triples.source_drawer FK (RESTRICT) before the hard
+            // delete so purging a soft-deleted drawer referenced by a KG triple
+            // does not fail with a FOREIGN KEY constraint error.
+            self.conn.execute(
+                "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
+                [id],
+            )?;
             self.conn
                 .execute("DELETE FROM drawers WHERE id = ?1", [id])?;
         }

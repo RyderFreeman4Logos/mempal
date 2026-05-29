@@ -6,6 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR bumps introduce new features, PATCH bumps are bug-fix only).
 
+## [0.5.3] — 2026-05-29
+
+Bug-fix release. **Reindex/purge crashed when deleting a drawer referenced by a
+KG triple** (surfaced while self-healing the 0.5.2 duplicate cleanup).
+
+### Fixed
+
+- **Hard-deleting a drawer that a KG triple references no longer fails with
+  `FOREIGN KEY constraint failed`.** `triples.source_drawer` is a `RESTRICT`
+  FK to `drawers(id)` and mempal opens connections with `foreign_keys=ON`, so
+  the across-rooms reindex replace (and `purge_deleted`) errored out and rolled
+  back when a stale drawer was referenced by a triple. Both hard-delete paths
+  now clear the dangling `source_drawer` pointer (`UPDATE triples SET
+  source_drawer = NULL`) before deleting the drawer — the KG fact is kept, only
+  its stale provenance link is dropped. Adds a regression test. Without this,
+  `mempal reindex --stale` could not finish cleaning the 0.5.2-era duplicates.
+
 ## [0.5.2] — 2026-05-29
 
 Bug-fix release. **`reindex` left duplicate drawers when a source re-routed to
@@ -235,6 +252,7 @@ P8) on top of hybrid search and the knowledge graph.
 Earlier releases (0.1.x, 0.2.x) are tracked only in Git history. Run
 `git log --oneline` on the repository to inspect them.
 
+[0.5.3]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.3
 [0.5.2]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.2
 [0.5.1]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.1
 [0.5.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.0
