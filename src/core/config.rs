@@ -2024,6 +2024,8 @@ mod tests {
     #[test]
     fn apply_env_overrides_present_applies() {
         let _guard = env_lock();
+        // SAFETY: single-threaded test context; ENV_LOCK mutex serializes all env mutations
+        // in this module, so no concurrent env access is possible.
         unsafe {
             std::env::set_var("MEMPAL_EMBED_BACKEND", "stub");
             std::env::set_var("MEMPAL_EMBED_BASE_URL", "http://127.0.0.1:9999/v1");
@@ -2031,6 +2033,8 @@ mod tests {
             std::env::set_var("MEMPAL_EMBED_DIM", "512");
         }
         let config = Config::parse("").expect("parse with env overrides");
+        // SAFETY: single-threaded test context; ENV_LOCK mutex serializes all env mutations
+        // in this module, so no concurrent env access is possible.
         unsafe {
             std::env::remove_var("MEMPAL_EMBED_BACKEND");
             std::env::remove_var("MEMPAL_EMBED_BASE_URL");
@@ -2056,6 +2060,8 @@ mod tests {
         let url_was = std::env::var("MEMPAL_EMBED_BASE_URL").ok();
         let model_was = std::env::var("MEMPAL_EMBED_MODEL").ok();
         let dim_was = std::env::var("MEMPAL_EMBED_DIM").ok();
+        // SAFETY: single-threaded test context; ENV_LOCK mutex serializes all env mutations
+        // in this module, so no concurrent env access is possible.
         unsafe {
             std::env::remove_var("MEMPAL_EMBED_BACKEND");
             std::env::remove_var("MEMPAL_EMBED_BASE_URL");
@@ -2063,6 +2069,8 @@ mod tests {
             std::env::remove_var("MEMPAL_EMBED_DIM");
         }
         let config = Config::parse("").expect("parse without env overrides");
+        // SAFETY: single-threaded test context; ENV_LOCK mutex serializes all env mutations
+        // in this module, so no concurrent env access is possible.
         unsafe {
             if let Some(v) = backend_was {
                 std::env::set_var("MEMPAL_EMBED_BACKEND", v);

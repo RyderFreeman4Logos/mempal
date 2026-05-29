@@ -2,6 +2,9 @@ use async_trait::async_trait;
 
 use super::{Embedder, Result};
 
+/// Fallback dimension used ONLY when the stub backend is selected with no explicit dim
+/// configured. Production paths supply dim explicitly (e.g., `openai_compat.dim` defaults
+/// to `Some(4096)`), so this constant is never reached in normal operation.
 pub const DEFAULT_STUB_DIM: usize = 384;
 
 /// Hermetic, zero-network embedder for tests and CI.
