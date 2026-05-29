@@ -76,6 +76,7 @@ strip = true           # strip debug symbols from binary
 panic = "abort"        # no unwinding — smaller binary, faster panic
 
 [dev-dependencies]
+dotenvy = "0.15"
 axum = "0.8"
 hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 mockito = "1"

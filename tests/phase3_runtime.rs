@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::thread;
 
 use mempal::core::db::Database;
@@ -23,12 +24,47 @@ fn setup_cli_home() -> TempDir {
     tmp
 }
 
+static LOAD_DOTENV: OnceLock<()> = OnceLock::new();
+
+/// Inject hermetic embed environment into a child Command.
+fn inject_embed_env(cmd: &mut Command) {
+    LOAD_DOTENV.get_or_init(|| {
+        dotenvy::dotenv().ok();
+    });
+    for key in [
+        "MEMPAL_EMBED_BACKEND",
+        "MEMPAL_EMBED_BASE_URL",
+        "MEMPAL_EMBED_MODEL",
+        "MEMPAL_EMBED_DIM",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+    if std::env::var("MEMPAL_EMBED_BACKEND").is_err() {
+        cmd.env("MEMPAL_EMBED_BACKEND", "stub");
+    }
+}
+
 fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
-    Command::new(mempal_bin())
-        .args(args)
-        .env("HOME", home.path())
-        .output()
-        .expect("run mempal")
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(args).env("HOME", home.path());
+    inject_embed_env(&mut cmd);
+    cmd.output().expect("run mempal")
+}
+
+fn run_mempal_with_env(
+    home: &TempDir,
+    args: &[&str],
+    envs: &[(&str, String)],
+) -> std::process::Output {
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(args).env("HOME", home.path());
+    inject_embed_env(&mut cmd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("run mempal")
 }
 
 fn record_card_context_acceptance(home: &TempDir, id: &str) {
@@ -243,23 +279,6 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> String {
         request.extend_from_slice(&chunk[..bytes_read]);
     }
     String::from_utf8_lossy(&request[..expected_len]).into_owned()
-}
-
-fn write_cli_api_config(home: &TempDir, endpoint: &str) {
-    let config_path = home.path().join(".mempal/config.toml");
-    let existing = fs::read_to_string(&config_path).unwrap_or_default();
-    let prefix = if existing.trim().is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", existing.trim_end())
-    };
-    fs::write(
-        config_path,
-        format!(
-            "{prefix}[embed]\nbackend = \"api\"\napi_endpoint = \"{endpoint}\"\napi_model = \"test-model\"\n\n[embed.openai_compat]\ndim = 384\n"
-        ),
-    )
-    .expect("write config");
 }
 
 fn read_include_cards_default(home: &TempDir) -> bool {
@@ -585,8 +604,17 @@ fn test_cli_phase3_default_proposal_keeps_context_cards_opt_in() {
 
     let query = "card-aware";
     let (endpoint, handle) = start_openai_embedding_stub(query);
-    write_cli_api_config(&home, &endpoint);
-    let context = run_mempal(&home, &["context", query, "--format", "json"]);
+    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
+    let context = run_mempal_with_env(
+        &home,
+        &["context", query, "--format", "json"],
+        &[
+            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
+            ("MEMPAL_EMBED_BASE_URL", base_url),
+            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
+            ("MEMPAL_EMBED_DIM", "384".to_string()),
+        ],
+    );
     assert!(
         context.status.success(),
         "context failed: {}",
@@ -1417,7 +1445,7 @@ fn test_cli_phase3_adoption_capture_rejects_unknown_surface() {
 }
 
 #[test]
-#[ignore = "upstream wrap subcommand not yet integrated into fork CLI"]
+
 fn test_cli_phase3_adoption_wrap_dry_run_executes_child_without_writing() {
     let home = setup_cli_home();
     let output = run_mempal(
@@ -1460,7 +1488,7 @@ fn test_cli_phase3_adoption_wrap_dry_run_executes_child_without_writing() {
 }
 
 #[test]
-#[ignore = "upstream wrap subcommand not yet integrated into fork CLI"]
+
 fn test_cli_phase3_adoption_wrap_execute_writes_ready_event() {
     let home = setup_cli_home();
     let output = run_mempal(
@@ -1502,7 +1530,7 @@ fn test_cli_phase3_adoption_wrap_execute_writes_ready_event() {
 }
 
 #[test]
-#[ignore = "upstream wrap subcommand not yet integrated into fork CLI"]
+
 fn test_cli_phase3_adoption_wrap_failure_maps_rejected_and_exits_nonzero() {
     let home = setup_cli_home();
     let output = run_mempal(
@@ -1536,7 +1564,7 @@ fn test_cli_phase3_adoption_wrap_failure_maps_rejected_and_exits_nonzero() {
 }
 
 #[test]
-#[ignore = "upstream wrap subcommand not yet integrated into fork CLI"]
+
 fn test_cli_phase3_adoption_wrap_blocks_warning_by_default() {
     let home = setup_cli_home();
     let output = run_mempal(
@@ -1575,7 +1603,7 @@ fn test_cli_phase3_adoption_wrap_blocks_warning_by_default() {
 }
 
 #[test]
-#[ignore = "upstream wrap subcommand not yet integrated into fork CLI"]
+
 fn test_cli_phase3_adoption_wrap_rejects_missing_child_command() {
     let home = setup_cli_home();
     let output = run_mempal(
@@ -1587,6 +1615,94 @@ fn test_cli_phase3_adoption_wrap_rejects_missing_child_command() {
     assert!(
         stderr.contains("required") || stderr.contains("command"),
         "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_phase3_adoption_wrap_outcome_override() {
+    let home = setup_cli_home();
+    let output = run_mempal(
+        &home,
+        &[
+            "phase3",
+            "adoption",
+            "wrap",
+            "--surface",
+            "runtime-context",
+            "--query",
+            "override test",
+            "--outcome",
+            "rejected",
+            "--execute",
+            "--format",
+            "json",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "wrap outcome override failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("wrap json");
+    assert_eq!(report["child_exit_code"], 0, "child exited 0");
+    assert_eq!(report["outcome"], "rejected", "override should take effect");
+    assert_eq!(
+        report["writes"], true,
+        "override rejected should still write"
+    );
+
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    let events = db
+        .list_runtime_adoption_events(&RuntimeAdoptionFilter::default(), 10)
+        .expect("events");
+    assert_eq!(events.len(), 1, "one event persisted");
+    assert_eq!(
+        events[0].signal,
+        RuntimeAdoptionSignal::Rejected,
+        "persisted signal is rejected"
+    );
+}
+
+#[test]
+fn test_cli_phase3_adoption_wrap_invalid_outcome_fails() {
+    let home = setup_cli_home();
+    // Use a marker file so we can prove the child did NOT execute on invalid args.
+    let marker_dir = TempDir::new().expect("marker tempdir");
+    let marker_path = marker_dir.path().join("child_ran");
+    let marker_script = format!("touch {}", marker_path.display());
+    let output = run_mempal(
+        &home,
+        &[
+            "phase3",
+            "adoption",
+            "wrap",
+            "--outcome",
+            "bogus",
+            "--surface",
+            "runtime-context",
+            "--",
+            "sh",
+            "-c",
+            marker_script.as_str(),
+        ],
+    );
+    assert!(!output.status.success(), "invalid --outcome should fail");
+    assert!(
+        !marker_path.exists(),
+        "child must NOT have run before --outcome validation; marker found at {marker_path:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bogus"),
+        "stderr should mention the invalid value; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("accepted") || stderr.contains("valid"),
+        "stderr should list valid values; got: {stderr}"
     );
 }
 
@@ -2538,7 +2654,7 @@ fn test_cli_phase3_research_ingest_plan_rejects_invalid_format() {
 }
 
 #[test]
-#[ignore = "upstream analytics subcommand not yet integrated into fork CLI"]
+
 fn test_cli_phase3_adoption_analytics_json() {
     let home = setup_cli_home();
     record_card_context_acceptance(&home, "analytics_accept_1");
@@ -2590,7 +2706,7 @@ fn test_cli_phase3_adoption_analytics_json() {
 }
 
 #[test]
-#[ignore = "upstream analytics subcommand not yet integrated into fork CLI"]
+
 fn test_cli_phase3_adoption_analytics_plain() {
     let home = setup_cli_home();
     record_card_context_acceptance(&home, "analytics_plain_accept");

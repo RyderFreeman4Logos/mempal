@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
-use mempal::core::db::Database;
+use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -10,21 +11,42 @@ fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
 }
 
+static LOAD_DOTENV: OnceLock<()> = OnceLock::new();
+
+/// Inject hermetic embed environment into a child Command.
+fn inject_embed_env(cmd: &mut Command) {
+    LOAD_DOTENV.get_or_init(|| {
+        dotenvy::dotenv().ok();
+    });
+    for key in [
+        "MEMPAL_EMBED_BACKEND",
+        "MEMPAL_EMBED_BASE_URL",
+        "MEMPAL_EMBED_MODEL",
+        "MEMPAL_EMBED_DIM",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+    if std::env::var("MEMPAL_EMBED_BACKEND").is_err() {
+        cmd.env("MEMPAL_EMBED_BACKEND", "stub");
+    }
+}
+
 fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
-    Command::new(mempal_bin())
-        .args(args)
-        .env("HOME", home.path())
-        .output()
-        .expect("run mempal")
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(args).env("HOME", home.path());
+    inject_embed_env(&mut cmd);
+    cmd.output().expect("run mempal")
 }
 
 fn run_mempal_with_path(home: &TempDir, args: &[&str], path_value: &str) -> std::process::Output {
-    Command::new(mempal_bin())
-        .args(args)
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(args)
         .env("HOME", home.path())
-        .env("PATH", path_value)
-        .output()
-        .expect("run mempal")
+        .env("PATH", path_value);
+    inject_embed_env(&mut cmd);
+    cmd.output().expect("run mempal")
 }
 
 fn stdout(output: &std::process::Output) -> String {
@@ -65,12 +87,12 @@ fn install_fake_path_mempal(home: &TempDir) -> String {
 }
 
 #[test]
-#[ignore = "upstream doctor subcommand not yet integrated into fork CLI"]
+
 fn test_cli_doctor_json_reports_schema_and_path() {
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
     let db = Database::open(&palace_db_path(&home)).expect("open db");
-    assert_eq!(db.schema_version().expect("schema"), 9);
+    assert_eq!(db.schema_version().expect("schema"), CURRENT_SCHEMA_VERSION);
     drop(db);
     let path_value = install_fake_path_mempal(&home);
 
@@ -81,9 +103,9 @@ fn test_cli_doctor_json_reports_schema_and_path() {
         value["current_version"].as_str(),
         Some(env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(value["supported_schema_version"], 9);
+    assert_eq!(value["supported_schema_version"], CURRENT_SCHEMA_VERSION);
     assert_eq!(value["db"]["exists"], true);
-    assert_eq!(value["db"]["schema_version"], 9);
+    assert_eq!(value["db"]["schema_version"], CURRENT_SCHEMA_VERSION);
     assert_eq!(value["install"]["path_matches_current_exe"], false);
     assert!(
         value["warnings"]
@@ -95,7 +117,7 @@ fn test_cli_doctor_json_reports_schema_and_path() {
 }
 
 #[test]
-#[ignore = "upstream doctor subcommand not yet integrated into fork CLI"]
+
 fn test_cli_doctor_plain_no_db_is_read_only() {
     let home = TempDir::new().expect("home");
     let output = run_mempal(&home, &["doctor", "--format", "plain"]);
@@ -106,7 +128,7 @@ fn test_cli_doctor_plain_no_db_is_read_only() {
 }
 
 #[test]
-#[ignore = "upstream doctor subcommand not yet integrated into fork CLI"]
+
 fn test_cli_doctor_rejects_invalid_format() {
     let home = TempDir::new().expect("home");
     let output = run_mempal(&home, &["doctor", "--format", "yaml"]);
@@ -116,7 +138,7 @@ fn test_cli_doctor_rejects_invalid_format() {
 }
 
 #[test]
-#[ignore = "upstream maintenance-guided-run subcommand not yet integrated into fork CLI"]
+
 fn test_cli_maintenance_guided_run_json() {
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
@@ -139,7 +161,7 @@ fn test_cli_maintenance_guided_run_json() {
 }
 
 #[test]
-#[ignore = "upstream maintenance-guided-run subcommand not yet integrated into fork CLI"]
+
 fn test_cli_maintenance_guided_run_plain() {
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
@@ -154,7 +176,7 @@ fn test_cli_maintenance_guided_run_plain() {
 }
 
 #[test]
-#[ignore = "upstream maintenance-guided-run subcommand not yet integrated into fork CLI"]
+
 fn test_cli_maintenance_guided_run_rejects_invalid_format() {
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
@@ -166,15 +188,15 @@ fn test_cli_maintenance_guided_run_rejects_invalid_format() {
 }
 
 #[test]
-#[ignore = "upstream release-readiness subcommand not yet integrated into fork CLI"]
+
 fn test_cli_release_readiness_json() {
     let home = TempDir::new().expect("home");
-    let output = Command::new(mempal_bin())
-        .args(["release-readiness", "--format", "json"])
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(["release-readiness", "--format", "json"])
         .env("HOME", home.path())
-        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
-        .output()
-        .expect("run mempal");
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")));
+    inject_embed_env(&mut cmd);
+    let output = cmd.output().expect("run mempal");
     assert_success(&output);
     let value: Value = serde_json::from_str(&stdout(&output)).expect("release readiness json");
     assert_eq!(value["writes"], false);
@@ -202,15 +224,15 @@ fn test_cli_release_readiness_json() {
 }
 
 #[test]
-#[ignore = "upstream release-readiness subcommand not yet integrated into fork CLI"]
+
 fn test_cli_release_readiness_plain() {
     let home = TempDir::new().expect("home");
-    let output = Command::new(mempal_bin())
-        .args(["release-readiness", "--format", "plain"])
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(["release-readiness", "--format", "plain"])
         .env("HOME", home.path())
-        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
-        .output()
-        .expect("run mempal");
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")));
+    inject_embed_env(&mut cmd);
+    let output = cmd.output().expect("run mempal");
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("Release Readiness"), "{out}");
@@ -219,15 +241,15 @@ fn test_cli_release_readiness_plain() {
 }
 
 #[test]
-#[ignore = "upstream release-readiness subcommand not yet integrated into fork CLI"]
+
 fn test_cli_release_readiness_rejects_invalid_format() {
     let home = TempDir::new().expect("home");
-    let output = Command::new(mempal_bin())
-        .args(["release-readiness", "--format", "yaml"])
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(["release-readiness", "--format", "yaml"])
         .env("HOME", home.path())
-        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
-        .output()
-        .expect("run mempal");
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")));
+    inject_embed_env(&mut cmd);
+    let output = cmd.output().expect("run mempal");
     assert!(!output.status.success());
     assert!(stderr(&output).contains("unsupported release-readiness format"));
 }

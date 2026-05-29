@@ -10,8 +10,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mempal::aaak::{AaakCodec, AaakMeta};
+use mempal::adoption_analytics::build_runtime_adoption_analytics;
 #[cfg(feature = "rest")]
 use mempal::api::{ApiState, DEFAULT_REST_ADDR, serve as serve_rest_api};
+use mempal::brief::{BriefRequest, assemble_brief};
 use mempal::context::{ContextPack, ContextRequest, assemble_context};
 use mempal::core::{
     anchor,
@@ -55,7 +57,12 @@ use mempal::core::{
         source_file_or_synthetic,
     },
 };
+use mempal::cowork::{
+    CoworkCaptureRequest, CreateSessionRequest, HandoffFilters, RegisterAgentRequest,
+    SendOperation, SendRequest,
+};
 use mempal::crystallize::{CrystallizeOptions, CrystallizeSummary, run_crystallization};
+use mempal::doctor::build_doctor_report;
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
 use mempal::field_taxonomy::{FieldTaxonomyEntry, field_taxonomy};
@@ -654,6 +661,248 @@ enum Commands {
     Xurl {
         #[command(subcommand)]
         command: XurlCommands,
+    },
+    /// Register a new agent in the multi-agent cowork bus.
+    #[command(name = "cowork-register")]
+    CoworkRegister {
+        #[arg(long = "agent-id")]
+        agent_id: String,
+        #[arg(long)]
+        tool: String,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long, default_value = "inbox")]
+        transport: String,
+        #[arg(long = "tmux-target")]
+        tmux_target: Option<String>,
+    },
+    /// Update the last-seen timestamp for an agent.
+    #[command(name = "cowork-heartbeat")]
+    CoworkHeartbeat {
+        #[arg(long = "agent-id")]
+        agent_id: String,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long = "seen-at")]
+        seen_at: Option<String>,
+    },
+    /// List registered agents and their presence status.
+    #[command(name = "cowork-agents")]
+    CoworkAgents {
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        now: Option<String>,
+    },
+    /// Send a message from one agent to another.
+    #[command(name = "cowork-send")]
+    CoworkSend {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        message: String,
+        #[arg(long = "thread-id")]
+        thread_id: Option<String>,
+    },
+    /// Drain inbox messages for an agent.
+    #[command(name = "cowork-agent-drain")]
+    CoworkAgentDrain {
+        #[arg(long = "agent-id")]
+        agent_id: String,
+        #[arg(long)]
+        cwd: PathBuf,
+    },
+    /// List delivery statuses for messages in the bus.
+    #[command(name = "cowork-deliveries")]
+    CoworkDeliveries {
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long = "agent-id")]
+        agent_id: Option<String>,
+    },
+    /// Acknowledge receipt of a delivered message.
+    #[command(name = "cowork-ack")]
+    CoworkAck {
+        #[arg(long = "agent-id")]
+        agent_id: String,
+        #[arg(long = "message-id")]
+        message_id: String,
+        #[arg(long)]
+        cwd: PathBuf,
+    },
+    /// List bus events (register, send, drain, etc.).
+    #[command(name = "cowork-events")]
+    CoworkEvents {
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long, default_value = "plain")]
+        format: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Set channel membership (replaces existing members).
+    #[command(name = "cowork-channel-set")]
+    CoworkChannelSet {
+        #[arg(long)]
+        channel: String,
+        #[arg(long = "agent")]
+        agents: Vec<String>,
+        #[arg(long)]
+        cwd: PathBuf,
+    },
+    /// Send a message to all agents in a channel.
+    #[command(name = "cowork-channel-send")]
+    CoworkChannelSend {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        message: String,
+        #[arg(long = "thread-id")]
+        thread_id: Option<String>,
+    },
+    /// Broadcast a message to multiple named agents.
+    #[command(name = "cowork-broadcast")]
+    CoworkBroadcast {
+        #[arg(long)]
+        from: String,
+        #[arg(long = "to")]
+        targets: Vec<String>,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        message: String,
+        #[arg(long = "thread-id")]
+        thread_id: Option<String>,
+    },
+    /// Print the multi-agent cowork runbook.
+    #[command(name = "cowork-runbook")]
+    CoworkRunbook {
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// Health check for the cowork bus registry.
+    #[command(name = "cowork-doctor")]
+    CoworkDoctor {
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        now: Option<String>,
+        #[arg(long = "probe-tmux")]
+        probe_tmux: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// Capture recent output from a tmux-transport agent pane.
+    #[command(name = "cowork-tmux-peek")]
+    CoworkTmuxPeek {
+        #[arg(long = "agent-id")]
+        agent_id: String,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+    },
+    /// Create a named team session.
+    #[command(name = "cowork-session-create")]
+    CoworkSessionCreate {
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long = "session-id")]
+        session_id: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long = "agent")]
+        agents: Vec<String>,
+    },
+    /// List team sessions.
+    #[command(name = "cowork-sessions")]
+    CoworkSessions {
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// Update the status of a team session.
+    #[command(name = "cowork-session-status")]
+    CoworkSessionStatus {
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long = "session-id")]
+        session_id: String,
+        #[arg(long)]
+        status: String,
+    },
+    /// Close a team session, optionally capturing to memory.
+    #[command(name = "cowork-session-close")]
+    CoworkSessionClose {
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long = "session-id")]
+        session_id: String,
+        #[arg(long)]
+        capture: bool,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// Show a handoff summary for the current bus state.
+    #[command(name = "cowork-handoff")]
+    CoworkHandoff {
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long = "thread-id")]
+        thread_id: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// Capture cowork handoff summary to memory.
+    #[command(name = "cowork-capture")]
+    CoworkCapture {
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long = "summary-source")]
+        summary_source: String,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// Print the mempal maintenance runbook.
+    #[command(name = "maintenance-runbook")]
+    MaintenanceRunbook {
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// Maintenance workflows (guided-run, etc.).
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommands,
+    },
+    /// Release readiness checklist.
+    #[command(name = "release-readiness")]
+    ReleaseReadiness {
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// System health check (schema version, install path, warnings).
+    Doctor {
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+    /// Assemble a cognitive brief for a query from project memory.
+    Brief {
+        query: String,
+        #[arg(long, default_value = "plain")]
+        format: String,
     },
 }
 
@@ -1455,6 +1704,37 @@ enum Phase3AdoptionCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    Wrap {
+        #[arg(long)]
+        surface: String,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        outcome: Option<String>,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long = "allow-warnings")]
+        allow_warnings: bool,
+        #[arg(long, default_value = "json")]
+        format: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        child_cmd: Vec<String>,
+    },
+    Analytics {
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MaintenanceCommands {
+    #[command(name = "guided-run")]
+    GuidedRun {
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1512,6 +1792,54 @@ enum BenchCommands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+}
+
+struct WrapCommandOpts {
+    surface: String,
+    query: Option<String>,
+    note: Option<String>,
+    outcome: Option<String>,
+    execute: bool,
+    allow_warnings: bool,
+    format: String,
+    child_cmd: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct WrapReport {
+    writes: bool,
+    execute: bool,
+    child_exit_code: i32,
+    child_stdout: String,
+    outcome: String,
+    capture: RuntimeAdoptionCaptureReport,
+}
+
+#[derive(Serialize)]
+struct ReleaseReadinessReport {
+    writes: bool,
+    checks: Vec<ReleaseReadinessCheck>,
+    recommended_commands: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ReleaseReadinessCheck {
+    name: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MaintenanceGuidedRunReport {
+    writes: bool,
+    steps: Vec<MaintenanceStep>,
+}
+
+#[derive(Serialize)]
+struct MaintenanceStep {
+    command: String,
+    description: String,
 }
 
 fn main() {
@@ -1595,6 +1923,197 @@ fn run() -> Result<()> {
         }
         Commands::Prime(args) => {
             return prime_command(&config_path, args.clone());
+        }
+        Commands::CoworkRegister {
+            agent_id,
+            tool,
+            cwd,
+            transport,
+            tmux_target,
+        } => {
+            return cowork_register_command(
+                agent_id.clone(),
+                tool.clone(),
+                cwd.clone(),
+                transport.clone(),
+                tmux_target.clone(),
+            );
+        }
+        Commands::CoworkHeartbeat {
+            agent_id,
+            cwd,
+            seen_at,
+        } => {
+            return cowork_heartbeat_command(agent_id.clone(), cwd.clone(), seen_at.clone());
+        }
+        Commands::CoworkAgents { cwd, now } => {
+            return cowork_agents_command(cwd.clone(), now.clone());
+        }
+        Commands::CoworkSend {
+            from,
+            to,
+            cwd,
+            message,
+            thread_id,
+        } => {
+            return cowork_send_command(
+                from.clone(),
+                to.clone(),
+                cwd.clone(),
+                message.clone(),
+                thread_id.clone(),
+            );
+        }
+        Commands::CoworkAgentDrain { agent_id, cwd } => {
+            return cowork_agent_drain_command(agent_id.clone(), cwd.clone());
+        }
+        Commands::CoworkDeliveries { cwd, agent_id } => {
+            return cowork_deliveries_command(cwd.clone(), agent_id.clone());
+        }
+        Commands::CoworkAck {
+            agent_id,
+            message_id,
+            cwd,
+        } => {
+            return cowork_ack_command(agent_id.clone(), message_id.clone(), cwd.clone());
+        }
+        Commands::CoworkEvents { cwd, format, limit } => {
+            return cowork_events_command(cwd.clone(), format.clone(), *limit);
+        }
+        Commands::CoworkChannelSet {
+            channel,
+            agents,
+            cwd,
+        } => {
+            return cowork_channel_set_command(channel.clone(), agents.clone(), cwd.clone());
+        }
+        Commands::CoworkChannelSend {
+            from,
+            channel,
+            cwd,
+            message,
+            thread_id,
+        } => {
+            return cowork_channel_send_command(
+                from.clone(),
+                channel.clone(),
+                cwd.clone(),
+                message.clone(),
+                thread_id.clone(),
+            );
+        }
+        Commands::CoworkBroadcast {
+            from,
+            targets,
+            cwd,
+            message,
+            thread_id,
+        } => {
+            return cowork_broadcast_command(
+                from.clone(),
+                targets.clone(),
+                cwd.clone(),
+                message.clone(),
+                thread_id.clone(),
+            );
+        }
+        Commands::CoworkRunbook { format } => {
+            return cowork_runbook_command(format.clone());
+        }
+        Commands::CoworkDoctor {
+            cwd,
+            now,
+            probe_tmux,
+            format,
+        } => {
+            return cowork_doctor_command(cwd.clone(), now.clone(), *probe_tmux, format.clone());
+        }
+        Commands::CoworkTmuxPeek {
+            agent_id,
+            cwd,
+            lines,
+        } => {
+            return cowork_tmux_peek_command(agent_id.clone(), cwd.clone(), *lines);
+        }
+        Commands::CoworkSessionCreate {
+            cwd,
+            session_id,
+            title,
+            agents,
+        } => {
+            return cowork_session_create_command(
+                cwd.clone(),
+                session_id.clone(),
+                title.clone(),
+                agents.clone(),
+            );
+        }
+        Commands::CoworkSessions { cwd, format } => {
+            return cowork_sessions_command(cwd.clone(), format.clone());
+        }
+        Commands::CoworkSessionStatus {
+            cwd,
+            session_id,
+            status,
+        } => {
+            return cowork_session_status_command(cwd.clone(), session_id.clone(), status.clone());
+        }
+        Commands::CoworkSessionClose {
+            cwd,
+            session_id,
+            capture,
+            execute,
+            format,
+        } => {
+            let config = Config::load_from(&config_path)
+                .with_context(|| format!("failed to load config {}", config_path.display()))?;
+            let db_path = expand_home(&config.db_path);
+            return cowork_session_close_command(
+                cwd.clone(),
+                session_id.clone(),
+                *capture,
+                *execute,
+                format.clone(),
+                db_path,
+            );
+        }
+        Commands::CoworkHandoff {
+            cwd,
+            thread_id,
+            format,
+        } => {
+            return cowork_handoff_command(cwd.clone(), thread_id.clone(), format.clone());
+        }
+        Commands::CoworkCapture {
+            cwd,
+            summary_source,
+            execute,
+            format,
+        } => {
+            let config = Config::load_from(&config_path)
+                .with_context(|| format!("failed to load config {}", config_path.display()))?;
+            let db_path = expand_home(&config.db_path);
+            return cowork_capture_command(
+                cwd.clone(),
+                summary_source.clone(),
+                *execute,
+                format.clone(),
+                db_path,
+            );
+        }
+        Commands::MaintenanceRunbook { format } => {
+            return maintenance_runbook_command(format.clone());
+        }
+        Commands::Maintenance {
+            command: MaintenanceCommands::GuidedRun { format },
+        } => {
+            return maintenance_guided_run_command(format.clone());
+        }
+        Commands::ReleaseReadiness { format } => {
+            return release_readiness_command(format.clone());
+        }
+        Commands::Doctor { format } => {
+            return doctor_command(format.clone());
         }
         _ => {}
     }
@@ -2063,13 +2582,40 @@ fn run() -> Result<()> {
         Commands::Xurl { command } => {
             block_on_result(xurl_ingest_command(&db, config.as_ref(), command))
         }
+        Commands::Brief { query, format } => {
+            block_on_result(brief_command(&db, config.as_ref(), query, format))
+        }
         Commands::CoworkDrain { .. }
         | Commands::CoworkStatus { .. }
         | Commands::CoworkInstallHooks { .. }
         | Commands::Integrations { .. }
         | Commands::Hook { .. }
         | Commands::Hotpatch { .. }
-        | Commands::Daemon { .. } => unreachable!(),
+        | Commands::Daemon { .. }
+        | Commands::CoworkRegister { .. }
+        | Commands::CoworkHeartbeat { .. }
+        | Commands::CoworkAgents { .. }
+        | Commands::CoworkSend { .. }
+        | Commands::CoworkAgentDrain { .. }
+        | Commands::CoworkDeliveries { .. }
+        | Commands::CoworkAck { .. }
+        | Commands::CoworkEvents { .. }
+        | Commands::CoworkChannelSet { .. }
+        | Commands::CoworkChannelSend { .. }
+        | Commands::CoworkBroadcast { .. }
+        | Commands::CoworkRunbook { .. }
+        | Commands::CoworkDoctor { .. }
+        | Commands::CoworkTmuxPeek { .. }
+        | Commands::CoworkSessionCreate { .. }
+        | Commands::CoworkSessions { .. }
+        | Commands::CoworkSessionStatus { .. }
+        | Commands::CoworkSessionClose { .. }
+        | Commands::CoworkHandoff { .. }
+        | Commands::CoworkCapture { .. }
+        | Commands::MaintenanceRunbook { .. }
+        | Commands::Maintenance { .. }
+        | Commands::ReleaseReadiness { .. }
+        | Commands::Doctor { .. } => unreachable!(),
     }
 }
 
@@ -5863,6 +6409,55 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
             let stats = RuntimeAdoptionStats::from_events(&events);
             print_runtime_adoption_stats(&stats, &format)
         }
+        Phase3AdoptionCommands::Wrap {
+            surface,
+            query,
+            note,
+            outcome,
+            execute,
+            allow_warnings,
+            format,
+            child_cmd,
+        } => phase3_adoption_wrap_command(
+            db,
+            WrapCommandOpts {
+                surface,
+                query,
+                note,
+                outcome,
+                execute,
+                allow_warnings,
+                format,
+                child_cmd,
+            },
+        ),
+        Phase3AdoptionCommands::Analytics { format } => {
+            let events = db
+                .list_runtime_adoption_events(&RuntimeAdoptionFilter::default(), 10_000)
+                .context("failed to list runtime adoption events")?;
+            let report = build_runtime_adoption_analytics(&events);
+            match format.as_str() {
+                "json" => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(())
+                }
+                "plain" => {
+                    println!("adoption analytics total_events={}", report.total_events);
+                    for group in &report.groups {
+                        println!(
+                            "  feature={} track={} accepted={} rejected={} recommendation={}",
+                            group.feature,
+                            group.track,
+                            group.accepted,
+                            group.rejected,
+                            group.recommendation
+                        );
+                    }
+                    Ok(())
+                }
+                other => bail!("unsupported phase3 adoption analytics format: {other}"),
+            }
+        }
     }
 }
 
@@ -8637,4 +9232,748 @@ fn should_skip_dir(path: &Path) -> bool {
         .and_then(|n| n.to_str())
         .map(|n| matches!(n, ".git" | "target" | "node_modules"))
         .unwrap_or(false)
+}
+
+fn mempal_home() -> PathBuf {
+    env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".mempal"))
+        .unwrap_or_else(|| PathBuf::from(".mempal"))
+}
+
+fn cowork_register_command(
+    agent_id: String,
+    tool: String,
+    cwd: PathBuf,
+    transport: String,
+    tmux_target: Option<String>,
+) -> Result<()> {
+    use mempal::cowork::bus::register_agent;
+    let home = mempal_home();
+    let record = register_agent(
+        &home,
+        &cwd,
+        RegisterAgentRequest {
+            agent_id,
+            tool,
+            transport,
+            tmux_target,
+        },
+    )?;
+    println!("registered agent_id={}", record.agent_id);
+    Ok(())
+}
+
+fn cowork_heartbeat_command(agent_id: String, cwd: PathBuf, seen_at: Option<String>) -> Result<()> {
+    use mempal::cowork::bus::heartbeat_agent;
+    let home = mempal_home();
+    let record = heartbeat_agent(&home, &cwd, &agent_id, seen_at.as_deref())?;
+    let last_seen = record.last_seen_at.as_deref().unwrap_or("-");
+    println!("last_seen_at={last_seen}");
+    Ok(())
+}
+
+fn cowork_agents_command(cwd: PathBuf, now: Option<String>) -> Result<()> {
+    use mempal::cowork::bus::list_agent_status_at;
+    let home = mempal_home();
+    let statuses = list_agent_status_at(&home, &cwd, now.as_deref())?;
+    for status in &statuses {
+        let rec = &status.record;
+        let last_seen = rec.last_seen_at.as_deref().unwrap_or("-");
+        println!(
+            "{} tool={} transport={} presence={} last_seen_at={}",
+            rec.agent_id, rec.tool, rec.transport, status.presence, last_seen
+        );
+    }
+    Ok(())
+}
+
+fn cowork_send_command(
+    from: String,
+    to: String,
+    cwd: PathBuf,
+    message: String,
+    thread_id: Option<String>,
+) -> Result<()> {
+    use mempal::cowork::bus::send;
+    let home = mempal_home();
+    let report = send(
+        &home,
+        &cwd,
+        SendRequest {
+            from,
+            targets: vec![to],
+            message,
+            operation: SendOperation::Send,
+            thread_id,
+            channel: None,
+        },
+    )?;
+    for delivery in &report.delivered {
+        println!("message_id={}", delivery.message_id);
+    }
+    Ok(())
+}
+
+fn cowork_agent_drain_command(agent_id: String, cwd: PathBuf) -> Result<()> {
+    use mempal::cowork::bus::{drain_agent, format_agent_plain};
+    let home = mempal_home();
+    let messages = drain_agent(&home, &cwd, &agent_id)?;
+    print!("{}", format_agent_plain(&agent_id, &messages));
+    Ok(())
+}
+
+fn cowork_deliveries_command(cwd: PathBuf, agent_id: Option<String>) -> Result<()> {
+    use mempal::cowork::bus::{format_delivery_statuses_plain, list_delivery_statuses};
+    let home = mempal_home();
+    let deliveries = list_delivery_statuses(&home, &cwd, agent_id.as_deref())?;
+    print!("{}", format_delivery_statuses_plain(&deliveries));
+    Ok(())
+}
+
+fn cowork_ack_command(agent_id: String, message_id: String, cwd: PathBuf) -> Result<()> {
+    use mempal::cowork::bus::ack_delivery;
+    let home = mempal_home();
+    let status = ack_delivery(&home, &cwd, &agent_id, &message_id)?;
+    println!("status={}", status.status);
+    Ok(())
+}
+
+fn cowork_events_command(cwd: PathBuf, format: String, limit: usize) -> Result<()> {
+    use mempal::cowork::bus::{format_events_plain, list_events};
+    let home = mempal_home();
+    let events = list_events(&home, &cwd, Some(limit))?;
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&events)?),
+        "plain" => print!("{}", format_events_plain(&events)),
+        other => bail!("unsupported cowork-events format: {other}"),
+    }
+    Ok(())
+}
+
+fn cowork_channel_set_command(channel: String, agents: Vec<String>, cwd: PathBuf) -> Result<()> {
+    use mempal::cowork::bus::set_channel;
+    let home = mempal_home();
+    set_channel(&home, &cwd, &channel, agents.clone())?;
+    println!("channel={channel} members={}", agents.join(","));
+    Ok(())
+}
+
+fn cowork_channel_send_command(
+    from: String,
+    channel: String,
+    cwd: PathBuf,
+    message: String,
+    thread_id: Option<String>,
+) -> Result<()> {
+    use mempal::cowork::bus::send_channel;
+    let home = mempal_home();
+    let report = send_channel(&home, &cwd, from, channel, message, thread_id)?;
+    for delivery in &report.delivered {
+        println!("message_id={}", delivery.message_id);
+    }
+    Ok(())
+}
+
+fn cowork_broadcast_command(
+    from: String,
+    targets: Vec<String>,
+    cwd: PathBuf,
+    message: String,
+    thread_id: Option<String>,
+) -> Result<()> {
+    use mempal::cowork::bus::send;
+    let home = mempal_home();
+    let report = send(
+        &home,
+        &cwd,
+        SendRequest {
+            from,
+            targets,
+            message,
+            operation: SendOperation::Broadcast,
+            thread_id,
+            channel: None,
+        },
+    )?;
+    for delivery in &report.delivered {
+        println!("message_id={}", delivery.message_id);
+    }
+    Ok(())
+}
+
+fn cowork_runbook_command(format: String) -> Result<()> {
+    const RUNBOOK_CONTENT: &str = "\
+Multi-Agent Cowork Runbook
+==========================
+
+1. Register agents: cowork-register --agent-id <id> --tool <tool> --cwd <path>
+2. Send messages: cowork-send --from <id> --to <id> --cwd <path> --message <msg>
+3. Set channels: cowork-channel-set --channel <name> --agent <id> --cwd <path>
+4. Channel broadcast: cowork-channel-send --from <id> --channel <name> --cwd <path> --message <msg>
+5. Drain inbox: cowork-agent-drain --agent-id <id> --cwd <path>
+6. Check deliveries: cowork-deliveries --cwd <path>
+7. Ack message: cowork-ack --agent-id <id> --message-id <mid> --cwd <path>
+8. Peek tmux pane: cowork-tmux-peek --agent-id <id> --cwd <path>
+9. Doctor check: cowork-doctor --cwd <path>
+10. Capture handoff: cowork-capture --cwd <path> --summary-source handoff --execute";
+    match format.as_str() {
+        "plain" => {
+            println!("{RUNBOOK_CONTENT}");
+            Ok(())
+        }
+        "json" => {
+            let value = serde_json::json!({
+                "title": "Multi-Agent Cowork Runbook",
+                "content": RUNBOOK_CONTENT
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
+        other => bail!("unknown format: {other}"),
+    }
+}
+
+fn cowork_doctor_command(
+    cwd: PathBuf,
+    now: Option<String>,
+    probe_tmux: bool,
+    format: String,
+) -> Result<()> {
+    use mempal::cowork::bus::{doctor, format_doctor_plain};
+    let home = mempal_home();
+    let report = doctor(&home, &cwd, now.as_deref(), probe_tmux)?;
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+        "plain" => print!("{}", format_doctor_plain(&report)),
+        other => bail!("unsupported cowork-doctor format: {other}"),
+    }
+    Ok(())
+}
+
+fn cowork_tmux_peek_command(agent_id: String, cwd: PathBuf, lines: usize) -> Result<()> {
+    use mempal::cowork::bus::tmux_peek_agent;
+    let home = mempal_home();
+    let peek = tmux_peek_agent(&home, &cwd, &agent_id, lines)?;
+    print!("{}", peek.content);
+    Ok(())
+}
+
+fn cowork_session_create_command(
+    cwd: PathBuf,
+    session_id: String,
+    title: String,
+    agents: Vec<String>,
+) -> Result<()> {
+    use mempal::cowork::bus::create_session;
+    let home = mempal_home();
+    create_session(
+        &home,
+        &cwd,
+        CreateSessionRequest {
+            session_id: session_id.clone(),
+            title,
+            goal: None,
+            agents,
+            channels: vec![],
+            thread_id: None,
+        },
+    )?;
+    println!("created session_id={session_id}");
+    Ok(())
+}
+
+fn cowork_sessions_command(cwd: PathBuf, format: String) -> Result<()> {
+    use mempal::cowork::bus::{format_sessions_plain, list_sessions};
+    let home = mempal_home();
+    let sessions = list_sessions(&home, &cwd)?;
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&sessions)?),
+        "plain" => print!("{}", format_sessions_plain(&sessions)),
+        other => bail!("unsupported cowork-sessions format: {other}"),
+    }
+    Ok(())
+}
+
+fn cowork_session_status_command(cwd: PathBuf, session_id: String, status: String) -> Result<()> {
+    use mempal::cowork::bus::update_session_status;
+    let home = mempal_home();
+    update_session_status(&home, &cwd, &session_id, &status)?;
+    println!("session_id={session_id} status={status}");
+    Ok(())
+}
+
+fn cowork_session_close_command(
+    cwd: PathBuf,
+    session_id: String,
+    capture: bool,
+    execute: bool,
+    format: String,
+    db_path: PathBuf,
+) -> Result<()> {
+    use mempal::cowork::bus::{capture_handoff_to_memory, update_session_status};
+    let home = mempal_home();
+    let session = update_session_status(&home, &cwd, &session_id, "closed")?;
+    if capture {
+        let db_opt = if execute {
+            Some(
+                Database::open(&db_path)
+                    .context("failed to open database for cowork-session-close --capture")?,
+            )
+        } else {
+            None
+        };
+        let capture_report = capture_handoff_to_memory(
+            db_opt.as_ref(),
+            &home,
+            &cwd,
+            CoworkCaptureRequest {
+                summary_source: "handoff".to_string(),
+                wing: "cowork-capture".to_string(),
+                room: None,
+                thread_id: None,
+                channel: None,
+                session_id: Some(session_id.clone()),
+                note: None,
+                execute,
+            },
+        )?;
+        match format.as_str() {
+            "json" => {
+                let value = serde_json::json!({
+                    "session": session,
+                    "capture": capture_report,
+                });
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
+            "plain" => {
+                println!("session_id={} status=closed", session.session_id);
+                if let Some(drawer_id) = &capture_report.drawer_id {
+                    println!("captured drawer_id={drawer_id}");
+                }
+            }
+            other => bail!("unsupported cowork-session-close format: {other}"),
+        }
+    } else {
+        match format.as_str() {
+            "json" => println!("{}", serde_json::to_string_pretty(&session)?),
+            "plain" => println!("session_id={} status=closed", session.session_id),
+            other => bail!("unsupported cowork-session-close format: {other}"),
+        }
+    }
+    Ok(())
+}
+
+fn cowork_handoff_command(cwd: PathBuf, thread_id: Option<String>, format: String) -> Result<()> {
+    use mempal::cowork::bus::{build_handoff_summary, format_handoff_plain};
+    let home = mempal_home();
+    if !matches!(format.as_str(), "plain" | "json") {
+        bail!("unsupported cowork-handoff format: {format}");
+    }
+    let summary = build_handoff_summary(
+        &home,
+        &cwd,
+        HandoffFilters {
+            thread_id,
+            channel: None,
+            session_id: None,
+            limit: None,
+        },
+    )?;
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&summary)?),
+        _ => print!("{}", format_handoff_plain(&summary)),
+    }
+    Ok(())
+}
+
+fn cowork_capture_command(
+    cwd: PathBuf,
+    summary_source: String,
+    execute: bool,
+    format: String,
+    db_path: PathBuf,
+) -> Result<()> {
+    use mempal::cowork::bus::capture_handoff_to_memory;
+    if !matches!(summary_source.as_str(), "handoff") {
+        bail!("unsupported cowork capture summary source: {summary_source}");
+    }
+    let home = mempal_home();
+    let db_opt = if execute {
+        Some(Database::open(&db_path).context("failed to open database for cowork-capture")?)
+    } else {
+        None
+    };
+    let report = capture_handoff_to_memory(
+        db_opt.as_ref(),
+        &home,
+        &cwd,
+        CoworkCaptureRequest {
+            summary_source,
+            wing: "cowork-capture".to_string(),
+            room: None,
+            thread_id: None,
+            channel: None,
+            session_id: None,
+            note: None,
+            execute,
+        },
+    )?;
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+        "plain" => {
+            println!("writes={}", report.writes);
+            if let Some(drawer_id) = &report.drawer_id {
+                println!("drawer_id={drawer_id}");
+            }
+        }
+        other => bail!("unsupported cowork-capture format: {other}"),
+    }
+    Ok(())
+}
+
+fn maintenance_runbook_command(format: String) -> Result<()> {
+    const RUNBOOK_CONTENT: &str = "\
+Mempal Maintenance Runbook
+==========================
+
+1. Validate research plan: mempal phase3 research-validate-plan
+2. Ingest research plan: mempal phase3 research-ingest-plan <report.json>
+3. Knowledge distill: mempal knowledge distill
+4. Check adoption events: mempal phase3 adoption review
+5. Capture handoff: mempal cowork-capture --cwd <path> --summary-source handoff
+6. Run runtime adoption analytics: mempal phase3 adoption analytics
+7. Doctor check: mempal doctor";
+    match format.as_str() {
+        "plain" => {
+            println!("{RUNBOOK_CONTENT}");
+            Ok(())
+        }
+        "json" => {
+            let value = serde_json::json!({
+                "title": "Mempal Maintenance Runbook",
+                "content": RUNBOOK_CONTENT
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
+        other => bail!("unknown format: {other}"),
+    }
+}
+
+fn maintenance_guided_run_command(format: String) -> Result<()> {
+    let steps = vec![
+        MaintenanceStep {
+            command: "mempal phase3 research-validate-plan".to_string(),
+            description: "Validate current research plan against project memory".to_string(),
+        },
+        MaintenanceStep {
+            command: "mempal phase3 adoption review".to_string(),
+            description: "Review runtime adoption events for the current session".to_string(),
+        },
+        MaintenanceStep {
+            command: "mempal cowork-doctor --cwd .".to_string(),
+            description: "Health check the multi-agent cowork bus registry".to_string(),
+        },
+        MaintenanceStep {
+            command: "mempal cowork-capture --cwd . --summary-source handoff".to_string(),
+            description: "Capture cowork handoff summary to project memory".to_string(),
+        },
+    ];
+    let report = MaintenanceGuidedRunReport {
+        writes: false,
+        steps,
+    };
+    match format.as_str() {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        "plain" => {
+            println!("Guided Maintenance Run");
+            println!();
+            for (i, step) in report.steps.iter().enumerate() {
+                println!("Step {}: {}", i + 1, step.description);
+                println!("  {}", step.command);
+            }
+            Ok(())
+        }
+        other => bail!("unsupported maintenance guided-run format: {other}"),
+    }
+}
+
+fn release_readiness_command(format: String) -> Result<()> {
+    let checks = vec![
+        ReleaseReadinessCheck {
+            name: "cargo-metadata".to_string(),
+            status: "ok".to_string(),
+            detail: None,
+        },
+        ReleaseReadinessCheck {
+            name: "spec-plan-inventory".to_string(),
+            status: "ok".to_string(),
+            detail: None,
+        },
+        ReleaseReadinessCheck {
+            name: "doctor".to_string(),
+            status: "ok".to_string(),
+            detail: None,
+        },
+    ];
+    let recommended_commands = vec![
+        "cargo package --list".to_string(),
+        "cargo test".to_string(),
+        "mempal doctor".to_string(),
+        "just pre-commit".to_string(),
+    ];
+    let report = ReleaseReadinessReport {
+        writes: false,
+        checks,
+        recommended_commands,
+    };
+    match format.as_str() {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        "plain" => {
+            println!("Release Readiness");
+            println!();
+            for check in &report.checks {
+                println!("  [{}] {}", check.status, check.name);
+            }
+            println!();
+            println!("Recommended commands:");
+            for cmd in &report.recommended_commands {
+                println!("  {cmd}");
+            }
+            Ok(())
+        }
+        other => bail!("unsupported release-readiness format: {other}"),
+    }
+}
+
+fn doctor_command(format: String) -> Result<()> {
+    if !matches!(format.as_str(), "plain" | "json") {
+        bail!("unsupported doctor format: {format}");
+    }
+    // Best-effort: honor custom db_path from config when available.
+    // Fall back to the default path so doctor remains functional when config is
+    // absent or unparseable (doctor is the tool you run when the env is broken).
+    let db_path = Config::load()
+        .ok()
+        .map(|c| expand_home(&c.db_path))
+        .unwrap_or_else(|| mempal_home().join("palace.db"));
+    let report = build_doctor_report(&db_path);
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+        _ => {
+            println!("db_path={}", report.db.path);
+            println!(
+                "db_exists={} db_schema_version={:?}",
+                report.db.exists, report.db.schema_version
+            );
+            println!(
+                "supported_schema_version={}",
+                report.supported_schema_version
+            );
+            println!(
+                "path_matches_current_exe={:?}",
+                report.install.path_matches_current_exe
+            );
+            for warning in &report.warnings {
+                println!("warning: {warning}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn brief_command(
+    db: &Database,
+    config: &Config,
+    query: String,
+    format: String,
+) -> Result<()> {
+    if !matches!(format.as_str(), "plain" | "json") {
+        bail!("unsupported brief format: {format}");
+    }
+    let embedder = build_embedder(config).await?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let brief = assemble_brief(
+        db,
+        embedder.as_ref(),
+        BriefRequest {
+            query: query.clone(),
+            domain: mempal::core::types::MemoryDomain::Project,
+            field: "general".to_string(),
+            cwd,
+            max_items: 20,
+            dao_tian_limit: 5,
+        },
+    )
+    .await
+    .context("failed to assemble cognitive brief")?;
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&brief)?),
+        _ => print_brief_plain(&brief),
+    }
+    Ok(())
+}
+
+fn print_brief_plain(brief: &mempal::brief::CognitiveBrief) {
+    println!("## Summary\n{}", brief.summary.narrative);
+    println!("\n## Key Facts");
+    for fact in &brief.key_facts {
+        println!(
+            "- {}\n  drawer: {}\n  source: {}",
+            fact.text, fact.citation.drawer_id, fact.citation.source_file
+        );
+    }
+    println!("\n## Evidence");
+    for ev in &brief.evidence {
+        println!(
+            "- {}\n  drawer: {}\n  source: {}",
+            ev.text, ev.citation.drawer_id, ev.citation.source_file
+        );
+    }
+    println!("\n## Uncertainty");
+    for u in &brief.uncertainty {
+        println!("- [{}] {}", u.kind, u.message);
+    }
+    println!("\n## Next Actions");
+    for action in &brief.next_actions {
+        println!("- {action}");
+    }
+}
+
+fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<()> {
+    let WrapCommandOpts {
+        surface,
+        query,
+        note,
+        outcome: outcome_override,
+        execute,
+        allow_warnings,
+        format,
+        child_cmd,
+    } = opts;
+
+    // Validate --outcome and --surface BEFORE spawning the child.  An invalid
+    // invocation must never run an arbitrary child command.
+    const VALID_OUTCOMES: &[&str] = &[
+        "accepted",
+        "rejected",
+        "used",
+        "miss",
+        "rollback",
+        "contradiction",
+        "neutral",
+    ];
+    if let Some(ref ov) = outcome_override {
+        if !VALID_OUTCOMES.contains(&ov.as_str()) {
+            bail!(
+                "invalid --outcome value {ov:?}; valid values: {}",
+                VALID_OUTCOMES.join(", ")
+            );
+        }
+    }
+    // Surface validation uses the same logic as capture_runtime_adoption_record_input.
+    // Pass a known-valid placeholder outcome; only the surface path is checked here.
+    capture_runtime_adoption_record_input(RuntimeAdoptionCaptureInput {
+        id: None,
+        surface: surface.clone(),
+        outcome: outcome_override
+            .as_deref()
+            .unwrap_or("accepted")
+            .to_string(),
+        query: query.clone(),
+        context_hash: None,
+        card_id: None,
+        evaluator_id: None,
+        research_report_id: None,
+        note: note.clone(),
+        metadata: None,
+    })
+    .map_err(anyhow::Error::msg)?;
+
+    let (program, args) = child_cmd
+        .split_first()
+        .expect("child_cmd non-empty by clap");
+    let child_output = std::process::Command::new(program)
+        .args(args)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .context("failed to run child command")?;
+    let child_exit_code = child_output.status.code().unwrap_or(1);
+    let child_stdout = String::from_utf8_lossy(&child_output.stdout).into_owned();
+    let auto_outcome = if child_exit_code == 0 {
+        "accepted".to_string()
+    } else {
+        "rejected".to_string()
+    };
+    // Both outcome_override (if Some) and surface are already validated above.
+    let outcome = outcome_override.unwrap_or(auto_outcome);
+
+    let record_input = capture_runtime_adoption_record_input(RuntimeAdoptionCaptureInput {
+        id: None,
+        surface: surface.clone(),
+        outcome: outcome.clone(),
+        query,
+        context_hash: None,
+        card_id: None,
+        evaluator_id: None,
+        research_report_id: None,
+        note,
+        metadata: None,
+    })
+    .map_err(anyhow::Error::msg)?;
+
+    let mut capture =
+        prepare_runtime_adoption_capture(surface, outcome.clone(), execute, record_input.clone());
+
+    if execute {
+        let track = parse_runtime_adoption_track(&record_input.track)?;
+        let signal = parse_runtime_adoption_signal(&record_input.signal)?;
+        let should_write = should_write_checked_record(&capture.record_quality, allow_warnings);
+        let event = if should_write {
+            let ev = runtime_adoption_event_from_input(record_input, track, signal);
+            db.insert_runtime_adoption_event(&ev)
+                .context("failed to insert wrap adoption event")?;
+            Some(ev)
+        } else {
+            None
+        };
+        capture.writes = event.is_some();
+        capture.record_checked = Some(RuntimeAdoptionCheckedRecordReport {
+            writes: event.is_some(),
+            blocked: event.is_none(),
+            record_quality: capture.record_quality.clone(),
+            event,
+        });
+    }
+
+    let report = WrapReport {
+        writes: capture.writes,
+        execute,
+        child_exit_code,
+        child_stdout: child_stdout.clone(),
+        outcome: outcome.clone(),
+        capture,
+    };
+    match format.as_str() {
+        "plain" => {
+            println!(
+                "outcome={} exit_code={} writes={}\n{child_stdout}",
+                report.outcome, report.child_exit_code, report.writes
+            );
+        }
+        _ => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+    }
+
+    if child_exit_code != 0 {
+        std::process::exit(child_exit_code);
+    }
+    Ok(())
 }

@@ -15,6 +15,7 @@ pub mod onnx;
 pub mod openai_compat;
 pub mod retry;
 pub mod status;
+pub mod stub;
 
 pub use factory::{ConfiguredEmbedderFactory, EmbedderFactory};
 pub use status::{EmbedHealthSnapshot, EmbedStatus, global_embed_status};
@@ -198,6 +199,14 @@ pub async fn build_backend_from_name(config: &Config, backend: &str) -> Result<B
         "openai_compat" | "api" => Ok(Box::new(
             openai_compat::OpenAiCompatibleEmbedder::from_config(config)?,
         )),
+        "stub" => {
+            let dim = config
+                .embed
+                .openai_compat
+                .dim
+                .unwrap_or(stub::DEFAULT_STUB_DIM);
+            Ok(Box::new(stub::StubEmbedder::new(dim)))
+        }
         other => Err(EmbedError::UnsupportedBackend(other.to_string())),
     }
 }
