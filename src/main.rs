@@ -7875,7 +7875,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             let embedder = build_embedder(config).await?;
             let parse_cb = |name: &str, turns: usize| {
                 if json {
-                    println!(
+                    eprintln!(
                         "{}",
                         serde_json::json!({"phase":"parse","file":name,"turns":turns})
                     );
@@ -7885,7 +7885,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             };
             let embed_cb = |done: usize, total: usize| {
                 if json {
-                    println!(
+                    eprintln!(
                         "{}",
                         serde_json::json!({"phase":"embed","done":done,"total":total})
                     );
@@ -7958,11 +7958,13 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 db,
                 embedder.as_ref(),
                 &query,
-                limit,
-                Some(filter),
-                include_csa,
-                include_agent_prompts,
-                Some(min_score),
+                mempal::xurl::search::SearchOptions {
+                    limit,
+                    filter: Some(filter),
+                    include_csa,
+                    include_agent_prompts,
+                    min_score: Some(min_score),
+                },
             )
             .await
             .context("xurl search failed")?;

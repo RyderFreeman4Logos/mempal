@@ -1,7 +1,7 @@
 use mempal::core::db::Database;
 use mempal::embed::Embedder;
 use mempal::xurl::model::{Provenance, RawTurn, Role, Tool};
-use mempal::xurl::search;
+use mempal::xurl::search::{self, SearchOptions};
 use mempal::xurl::store::{self, TurnFilter};
 use tempfile::TempDir;
 
@@ -177,11 +177,10 @@ async fn search_returns_semantically_relevant_turn() {
         &db.inner,
         &embedder,
         "database migration",
-        5,
-        None,
-        false,
-        false,
-        None,
+        SearchOptions {
+            limit: 5,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -230,15 +229,15 @@ async fn search_with_tool_filter() {
         &db.inner,
         &embedder,
         "rust ownership",
-        10,
-        Some(TurnFilter {
-            tool: Some(Tool::Cc),
+        SearchOptions {
             limit: 10,
+            filter: Some(TurnFilter {
+                tool: Some(Tool::Cc),
+                limit: 10,
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
-        false,
-        false,
-        None,
+        },
     )
     .await
     .unwrap();
@@ -292,7 +291,13 @@ async fn search_deduplicates_multi_chunk_turns() {
     ).unwrap();
 
     let results = search::search(
-        &db.inner, &embedder, "anything", 10, None, false, false, None,
+        &db.inner,
+        &embedder,
+        "anything",
+        SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -320,16 +325,33 @@ async fn search_excludes_csa_by_default() {
         .unwrap();
 
     // Default search (exclude CSA)
-    let results = search::search(&db.inner, &embedder, "turn", 10, None, false, false, None)
-        .await
-        .unwrap();
+    let results = search::search(
+        &db.inner,
+        &embedder,
+        "turn",
+        SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(results.hits.len(), 1, "should exclude CSA turn by default");
     assert_eq!(results.hits[0].content, "normal turn");
 
     // With include_csa=true
-    let results_all = search::search(&db.inner, &embedder, "turn", 10, None, true, false, None)
-        .await
-        .unwrap();
+    let results_all = search::search(
+        &db.inner,
+        &embedder,
+        "turn",
+        SearchOptions {
+            limit: 10,
+            include_csa: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(
         results_all.hits.len(),
         2,
@@ -342,7 +364,13 @@ async fn search_empty_db_returns_empty() {
     let db = open_temp_db();
     let embedder = FixedEmbedder { dim: 16 };
     let results = search::search(
-        &db.inner, &embedder, "anything", 10, None, false, false, None,
+        &db.inner,
+        &embedder,
+        "anything",
+        SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -382,11 +410,11 @@ async fn test_search_min_score_filters_low_hits() {
         &db.inner,
         &embedder,
         "database migration",
-        10,
-        None,
-        false,
-        false,
-        Some(0.9),
+        SearchOptions {
+            limit: 10,
+            min_score: Some(0.9),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -425,11 +453,10 @@ async fn test_search_dedup_identical_content() {
         &db.inner,
         &embedder,
         "identical",
-        10,
-        None,
-        false,
-        false,
-        None,
+        SearchOptions {
+            limit: 10,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();

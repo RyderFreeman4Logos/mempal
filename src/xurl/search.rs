@@ -57,6 +57,21 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Options controlling semantic search behaviour.
+#[derive(Debug, Default)]
+pub struct SearchOptions {
+    /// Maximum number of hits to return (0 ⇒ empty result immediately).
+    pub limit: usize,
+    /// Column-level pre-filter applied before scoring.
+    pub filter: Option<TurnFilter>,
+    /// Include CSA-delegated turns (default: false).
+    pub include_csa: bool,
+    /// Include non-human-provenance turns (default: false).
+    pub include_agent_prompts: bool,
+    /// Exclude hits scoring below this threshold.
+    pub min_score: Option<f32>,
+}
+
 /// Semantic search over `conversation_turn_vectors` using brute-force cosine similarity.
 ///
 /// The query is embedded via `embedder`, then every stored vector is scored.
@@ -64,19 +79,21 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Identical-content turns are deduplicated, keeping the highest-scored representative.
 /// Default filtering excludes CSA-delegated turns and non-human-provenance turns.
 ///
-/// If `min_score` is set, hits below the floor are excluded; [`SearchResult::best_score_below_floor`]
-/// reflects the highest score that did not make the cut.
-#[allow(clippy::too_many_arguments)]
+/// If `opts.min_score` is set, hits below the floor are excluded;
+/// [`SearchResult::best_score_below_floor`] reflects the highest score that did not make the cut.
 pub async fn search<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,
     query: &str,
-    limit: usize,
-    filter: Option<TurnFilter>,
-    include_csa: bool,
-    include_agent_prompts: bool,
-    min_score: Option<f32>,
+    opts: SearchOptions,
 ) -> XurlResult<SearchResult> {
+    let SearchOptions {
+        limit,
+        filter,
+        include_csa,
+        include_agent_prompts,
+        min_score,
+    } = opts;
     if limit == 0 {
         return Ok(SearchResult {
             hits: Vec::new(),
@@ -332,4 +349,9 @@ pub fn print_hits_markdown(result: &SearchResult) {
         println!();
     }
     println!("---");
+    println!(
+        "_{} candidates considered ({} shown after dedup + min-score floor)_",
+        result.total_candidates,
+        result.hits.len()
+    );
 }

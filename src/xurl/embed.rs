@@ -70,18 +70,27 @@ pub async fn embed_unindexed_turns<E: Embedder + ?Sized>(
     let mut stats = EmbedStats::default();
 
     for batch in unindexed.chunks(EMBED_BATCH_SIZE) {
+        // Phase 1: embed the whole batch with no write transaction open.
+        let rows = embed_batch_turns(embedder, batch, &config, &mut stats).await?;
+
+        // Phase 2: bulk-insert all collected vectors under a single short transaction.
         conn.execute_batch("BEGIN").map_err(XurlError::Database)?;
-
-        let batch_result = embed_batch_turns(conn, embedder, batch, &config, &mut stats).await;
-
-        match batch_result {
-            Ok(()) => {
-                conn.execute_batch("COMMIT").map_err(XurlError::Database)?;
+        let insert_result = (|| -> XurlResult<()> {
+            for (turn_id, chunk_index, blob) in &rows {
+                conn.execute(
+                    "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(turn_id, chunk_index) DO NOTHING",
+                    params![turn_id, *chunk_index as i64, blob],
+                )
+                .map_err(XurlError::Database)?;
             }
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
+            conn.execute_batch("COMMIT").map_err(XurlError::Database)?;
+            Ok(())
+        })();
+        if let Err(e) = insert_result {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
         }
 
         if let Some(f) = progress_fn {
@@ -92,13 +101,17 @@ pub async fn embed_unindexed_turns<E: Embedder + ?Sized>(
     Ok(stats)
 }
 
+/// Embed all turns in `batch` and return serialised `(turn_id, chunk_index, blob)` rows.
+///
+/// No database connection is used here; the caller is responsible for writing
+/// the returned rows inside a transaction.
 async fn embed_batch_turns<E: Embedder + ?Sized>(
-    conn: &rusqlite::Connection,
     embedder: &E,
     batch: &[(String, String)],
     config: &ChunkerConfig,
     stats: &mut EmbedStats,
-) -> XurlResult<()> {
+) -> XurlResult<Vec<(String, usize, Vec<u8>)>> {
+    let mut rows = Vec::new();
     for (turn_id, content) in batch {
         let chunks = chunk_text_token_aware(content, config, embedder, Some(turn_id));
         let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
@@ -109,19 +122,12 @@ async fn embed_batch_turns<E: Embedder + ?Sized>(
             .map_err(|e| XurlError::Parse(format!("embedding failed: {e}")))?;
 
         for (chunk_index, vector) in vectors.iter().enumerate() {
-            let blob = serialize_vector(vector);
-            conn.execute(
-                "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(turn_id, chunk_index) DO NOTHING",
-                params![turn_id, chunk_index as i64, blob],
-            )
-            .map_err(XurlError::Database)?;
+            rows.push((turn_id.clone(), chunk_index, serialize_vector(vector)));
         }
 
         stats.embedded += vectors.len();
         stats.chunks_total += chunks.len();
         stats.turns_processed += 1;
     }
-    Ok(())
+    Ok(rows)
 }
