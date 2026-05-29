@@ -9752,11 +9752,18 @@ fn doctor_command(format: String) -> Result<()> {
     if !matches!(format.as_str(), "plain" | "json") {
         bail!("unsupported doctor format: {format}");
     }
-    let db_path = mempal_home().join("palace.db");
+    // Best-effort: honor custom db_path from config when available.
+    // Fall back to the default path so doctor remains functional when config is
+    // absent or unparseable (doctor is the tool you run when the env is broken).
+    let db_path = Config::load()
+        .ok()
+        .map(|c| expand_home(&c.db_path))
+        .unwrap_or_else(|| mempal_home().join("palace.db"));
     let report = build_doctor_report(&db_path);
     match format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&report)?),
         _ => {
+            println!("db_path={}", report.db.path);
             println!(
                 "db_exists={} db_schema_version={:?}",
                 report.db.exists, report.db.schema_version
