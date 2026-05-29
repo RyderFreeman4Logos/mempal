@@ -9246,8 +9246,7 @@ fn cowork_register_command(
             transport,
             tmux_target,
         },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    )?;
     println!("registered agent_id={}", record.agent_id);
     Ok(())
 }
@@ -9255,8 +9254,7 @@ fn cowork_register_command(
 fn cowork_heartbeat_command(agent_id: String, cwd: PathBuf, seen_at: Option<String>) -> Result<()> {
     use mempal::cowork::bus::heartbeat_agent;
     let home = mempal_home();
-    let record = heartbeat_agent(&home, &cwd, &agent_id, seen_at.as_deref())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let record = heartbeat_agent(&home, &cwd, &agent_id, seen_at.as_deref())?;
     let last_seen = record.last_seen_at.as_deref().unwrap_or("-");
     println!("last_seen_at={last_seen}");
     Ok(())
@@ -9265,8 +9263,7 @@ fn cowork_heartbeat_command(agent_id: String, cwd: PathBuf, seen_at: Option<Stri
 fn cowork_agents_command(cwd: PathBuf, now: Option<String>) -> Result<()> {
     use mempal::cowork::bus::list_agent_status_at;
     let home = mempal_home();
-    let statuses =
-        list_agent_status_at(&home, &cwd, now.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let statuses = list_agent_status_at(&home, &cwd, now.as_deref())?;
     for status in &statuses {
         let rec = &status.record;
         let last_seen = rec.last_seen_at.as_deref().unwrap_or("-");
@@ -9298,8 +9295,7 @@ fn cowork_send_command(
             thread_id,
             channel: None,
         },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    )?;
     for delivery in &report.delivered {
         println!("message_id={}", delivery.message_id);
     }
@@ -9309,7 +9305,7 @@ fn cowork_send_command(
 fn cowork_agent_drain_command(agent_id: String, cwd: PathBuf) -> Result<()> {
     use mempal::cowork::bus::{drain_agent, format_agent_plain};
     let home = mempal_home();
-    let messages = drain_agent(&home, &cwd, &agent_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let messages = drain_agent(&home, &cwd, &agent_id)?;
     print!("{}", format_agent_plain(&agent_id, &messages));
     Ok(())
 }
@@ -9317,8 +9313,7 @@ fn cowork_agent_drain_command(agent_id: String, cwd: PathBuf) -> Result<()> {
 fn cowork_deliveries_command(cwd: PathBuf, agent_id: Option<String>) -> Result<()> {
     use mempal::cowork::bus::{format_delivery_statuses_plain, list_delivery_statuses};
     let home = mempal_home();
-    let deliveries = list_delivery_statuses(&home, &cwd, agent_id.as_deref())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let deliveries = list_delivery_statuses(&home, &cwd, agent_id.as_deref())?;
     print!("{}", format_delivery_statuses_plain(&deliveries));
     Ok(())
 }
@@ -9326,8 +9321,7 @@ fn cowork_deliveries_command(cwd: PathBuf, agent_id: Option<String>) -> Result<(
 fn cowork_ack_command(agent_id: String, message_id: String, cwd: PathBuf) -> Result<()> {
     use mempal::cowork::bus::ack_delivery;
     let home = mempal_home();
-    let status =
-        ack_delivery(&home, &cwd, &agent_id, &message_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let status = ack_delivery(&home, &cwd, &agent_id, &message_id)?;
     println!("status={}", status.status);
     Ok(())
 }
@@ -9335,7 +9329,7 @@ fn cowork_ack_command(agent_id: String, message_id: String, cwd: PathBuf) -> Res
 fn cowork_events_command(cwd: PathBuf, format: String, limit: usize) -> Result<()> {
     use mempal::cowork::bus::{format_events_plain, list_events};
     let home = mempal_home();
-    let events = list_events(&home, &cwd, Some(limit)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let events = list_events(&home, &cwd, Some(limit))?;
     match format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&events)?),
         "plain" => print!("{}", format_events_plain(&events)),
@@ -9347,7 +9341,7 @@ fn cowork_events_command(cwd: PathBuf, format: String, limit: usize) -> Result<(
 fn cowork_channel_set_command(channel: String, agents: Vec<String>, cwd: PathBuf) -> Result<()> {
     use mempal::cowork::bus::set_channel;
     let home = mempal_home();
-    set_channel(&home, &cwd, &channel, agents.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    set_channel(&home, &cwd, &channel, agents.clone())?;
     println!("channel={channel} members={}", agents.join(","));
     Ok(())
 }
@@ -9361,8 +9355,7 @@ fn cowork_channel_send_command(
 ) -> Result<()> {
     use mempal::cowork::bus::send_channel;
     let home = mempal_home();
-    let report = send_channel(&home, &cwd, from, channel, message, thread_id)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let report = send_channel(&home, &cwd, from, channel, message, thread_id)?;
     for delivery in &report.delivered {
         println!("message_id={}", delivery.message_id);
     }
@@ -9389,8 +9382,7 @@ fn cowork_broadcast_command(
             thread_id,
             channel: None,
         },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    )?;
     for delivery in &report.delivered {
         println!("message_id={}", delivery.message_id);
     }
@@ -9425,10 +9417,7 @@ Multi-Agent Cowork Runbook
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        _ => {
-            eprintln!("error: unknown format: {format}");
-            std::process::exit(1);
-        }
+        other => bail!("unknown format: {other}"),
     }
 }
 
@@ -9440,8 +9429,7 @@ fn cowork_doctor_command(
 ) -> Result<()> {
     use mempal::cowork::bus::{doctor, format_doctor_plain};
     let home = mempal_home();
-    let report =
-        doctor(&home, &cwd, now.as_deref(), probe_tmux).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let report = doctor(&home, &cwd, now.as_deref(), probe_tmux)?;
     match format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&report)?),
         "plain" => print!("{}", format_doctor_plain(&report)),
@@ -9453,8 +9441,7 @@ fn cowork_doctor_command(
 fn cowork_tmux_peek_command(agent_id: String, cwd: PathBuf, lines: usize) -> Result<()> {
     use mempal::cowork::bus::tmux_peek_agent;
     let home = mempal_home();
-    let peek =
-        tmux_peek_agent(&home, &cwd, &agent_id, lines).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let peek = tmux_peek_agent(&home, &cwd, &agent_id, lines)?;
     print!("{}", peek.content);
     Ok(())
 }
@@ -9478,8 +9465,7 @@ fn cowork_session_create_command(
             channels: vec![],
             thread_id: None,
         },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    )?;
     println!("created session_id={session_id}");
     Ok(())
 }
@@ -9487,7 +9473,7 @@ fn cowork_session_create_command(
 fn cowork_sessions_command(cwd: PathBuf, format: String) -> Result<()> {
     use mempal::cowork::bus::{format_sessions_plain, list_sessions};
     let home = mempal_home();
-    let sessions = list_sessions(&home, &cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let sessions = list_sessions(&home, &cwd)?;
     match format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&sessions)?),
         "plain" => print!("{}", format_sessions_plain(&sessions)),
@@ -9499,7 +9485,7 @@ fn cowork_sessions_command(cwd: PathBuf, format: String) -> Result<()> {
 fn cowork_session_status_command(cwd: PathBuf, session_id: String, status: String) -> Result<()> {
     use mempal::cowork::bus::update_session_status;
     let home = mempal_home();
-    update_session_status(&home, &cwd, &session_id, &status).map_err(|e| anyhow::anyhow!("{e}"))?;
+    update_session_status(&home, &cwd, &session_id, &status)?;
     println!("session_id={session_id} status={status}");
     Ok(())
 }
@@ -9513,8 +9499,7 @@ fn cowork_session_close_command(
 ) -> Result<()> {
     use mempal::cowork::bus::{capture_handoff_to_memory, update_session_status};
     let home = mempal_home();
-    let session = update_session_status(&home, &cwd, &session_id, "closed")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let session = update_session_status(&home, &cwd, &session_id, "closed")?;
     if capture {
         let db_opt = if execute {
             Some(
@@ -9538,8 +9523,7 @@ fn cowork_session_close_command(
                 note: None,
                 execute,
             },
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        )?;
         match format.as_str() {
             "json" => {
                 let value = serde_json::json!({
@@ -9581,8 +9565,7 @@ fn cowork_handoff_command(cwd: PathBuf, thread_id: Option<String>, format: Strin
             session_id: None,
             limit: None,
         },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    )?;
     match format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&summary)?),
         _ => print!("{}", format_handoff_plain(&summary)),
@@ -9598,8 +9581,7 @@ fn cowork_capture_command(
 ) -> Result<()> {
     use mempal::cowork::bus::capture_handoff_to_memory;
     if !matches!(summary_source.as_str(), "handoff") {
-        eprintln!("error: unsupported cowork capture summary source: {summary_source}");
-        std::process::exit(1);
+        bail!("unsupported cowork capture summary source: {summary_source}");
     }
     let home = mempal_home();
     let db_opt = if execute {
@@ -9624,8 +9606,7 @@ fn cowork_capture_command(
             note: None,
             execute,
         },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    )?;
     match format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&report)?),
         "plain" => {
@@ -9664,10 +9645,7 @@ Mempal Maintenance Runbook
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        _ => {
-            eprintln!("error: unknown format: {format}");
-            std::process::exit(1);
-        }
+        other => bail!("unknown format: {other}"),
     }
 }
 
@@ -9708,10 +9686,7 @@ fn maintenance_guided_run_command(format: String) -> Result<()> {
             }
             Ok(())
         }
-        other => {
-            eprintln!("error: unsupported maintenance guided-run format: {other}");
-            std::process::exit(1);
-        }
+        other => bail!("unsupported maintenance guided-run format: {other}"),
     }
 }
 
@@ -9762,17 +9737,13 @@ fn release_readiness_command(format: String) -> Result<()> {
             }
             Ok(())
         }
-        other => {
-            eprintln!("error: unsupported release-readiness format: {other}");
-            std::process::exit(1);
-        }
+        other => bail!("unsupported release-readiness format: {other}"),
     }
 }
 
 fn doctor_command(format: String) -> Result<()> {
     if !matches!(format.as_str(), "plain" | "json") {
-        eprintln!("error: unsupported doctor format: {format}");
-        std::process::exit(1);
+        bail!("unsupported doctor format: {format}");
     }
     let db_path = mempal_home().join("palace.db");
     let report = build_doctor_report(&db_path);
