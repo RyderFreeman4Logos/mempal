@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR bumps introduce new features, PATCH bumps are bug-fix only).
 
+## [0.5.2] — 2026-05-29
+
+Bug-fix release. **`reindex` left duplicate drawers when a source re-routed to
+a different room.**
+
+### Fixed
+
+- **`reindex --stale` / `--force` no longer leave stale drawers behind when a
+  source auto-routes to a new room.** Re-ingesting a source replaced its prior
+  drawers only within the freshly resolved room
+  (`replace_active_source_drawers` is keyed on `(source_file, wing, room)`). If
+  taxonomy routing now sent the source to a different room than its existing
+  drawers occupied, the old-room drawers were never deleted and coexisted with
+  the new ones as duplicates — and their stale `normalize_version` could never
+  be cleared. Reindex now deletes a source's prior drawers across **all** rooms
+  via the new `Database::replace_active_source_drawers_across_rooms`, gated by a
+  `replace_across_rooms` ingest option (reindex-only; normal ingest keeps
+  room-scoped replace). Adds regression tests covering both the across-rooms
+  delete and the room-scoped contrast. After upgrading, run `mempal reindex
+  --stale` once to self-heal any duplicates left by an earlier version.
+
 ## [0.5.1] — 2026-05-29
 
 Bug-fix release. **0.5.0's MCP tool list failed to load in strict clients.**
@@ -214,6 +235,7 @@ P8) on top of hybrid search and the knowledge graph.
 Earlier releases (0.1.x, 0.2.x) are tracked only in Git history. Run
 `git log --oneline` on the repository to inspect them.
 
+[0.5.2]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.2
 [0.5.1]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.1
 [0.5.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.4.0

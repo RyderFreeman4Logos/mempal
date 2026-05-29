@@ -60,6 +60,11 @@ pub struct IngestOptions<'a> {
     pub dry_run: bool,
     pub source_file_override: Option<&'a str>,
     pub replace_existing_source: bool,
+    /// When replacing an existing source, delete its prior drawers across all
+    /// rooms (not just the freshly resolved room). Reindex sets this so a
+    /// source that re-routes to a new room does not leave stale drawers behind
+    /// in its old room. Ignored unless `replace_existing_source` is true.
+    pub replace_across_rooms: bool,
     pub no_strip_noise: bool,
     pub diary_rollup: bool,
     pub diary_rollup_day: Option<&'a str>,
@@ -165,6 +170,7 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             dry_run: false,
             source_file_override: None,
             replace_existing_source: false,
+            replace_across_rooms: false,
             no_strip_noise: false,
             diary_rollup: false,
             diary_rollup_day: None,
@@ -277,11 +283,15 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
 
     let source_type = source_type_for(format);
     if options.replace_existing_source && !options.dry_run {
-        db.replace_active_source_drawers(&source_file, wing, Some(resolved_room.as_str()))
-            .map_err(|source| IngestError::ReplaceSource {
-                source_file: source_file.clone(),
-                source,
-            })?;
+        let replace_result = if options.replace_across_rooms {
+            db.replace_active_source_drawers_across_rooms(&source_file, wing)
+        } else {
+            db.replace_active_source_drawers(&source_file, wing, Some(resolved_room.as_str()))
+        };
+        replace_result.map_err(|source| IngestError::ReplaceSource {
+            source_file: source_file.clone(),
+            source,
+        })?;
     }
 
     let mut pending = Vec::new();
@@ -379,6 +389,7 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             dry_run: false,
             source_file_override: None,
             replace_existing_source: false,
+            replace_across_rooms: false,
             no_strip_noise: false,
             diary_rollup: false,
             diary_rollup_day: None,

@@ -2079,6 +2079,7 @@ async fn ingest_command(db: &Database, config: &Config, args: IngestCommandArgs<
         dry_run: args.dry_run,
         source_file_override: None,
         replace_existing_source: false,
+        replace_across_rooms: false,
         no_strip_noise: args.no_strip_noise,
         diary_rollup: args.diary_rollup,
         diary_rollup_day: None,

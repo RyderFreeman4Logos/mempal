@@ -587,3 +587,77 @@ fn test_reindex_respects_per_source_lock() {
     let db = Database::open(&db_path).expect("reopen db");
     assert_eq!(stale_drawer_count_raw(&db), 0);
 }
+
+fn insert_source_drawer(db: &Database, id: &str, source_file: &str, room: Option<&str>) {
+    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: format!("content for {id}"),
+        wing: "mempal".to_string(),
+        room: room.map(|value| value.to_string()),
+        source_file: Some(source_file.to_string()),
+        source_type: SourceType::Project,
+        added_at: "1710000000".to_string(),
+        chunk_index: Some(0),
+        importance: 0,
+    });
+    db.insert_drawer(&drawer).expect("insert source drawer");
+}
+
+fn active_count_for_source(db: &Database, source_file: &str) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL AND source_file = ?1",
+            [source_file],
+            |row| row.get(0),
+        )
+        .expect("count source drawers")
+}
+
+// Regression: reindex re-routes a source to a different room, so a room-scoped
+// replace would miss the stale drawers in the old room and leave duplicates.
+// The across-rooms variant must delete every prior drawer for the source.
+#[test]
+fn test_replace_across_rooms_deletes_every_room_for_source() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    insert_source_drawer(&db, "drawer_old_nullroom", "docs/x.md", None);
+    insert_source_drawer(&db, "drawer_new_coreroom", "docs/x.md", Some("mempal-core"));
+    assert_eq!(active_count_for_source(&db, "docs/x.md"), 2);
+
+    let deleted = db
+        .replace_active_source_drawers_across_rooms("docs/x.md", "mempal")
+        .expect("replace across rooms");
+    assert_eq!(
+        deleted, 2,
+        "across-rooms replace must delete the source's drawers in every room"
+    );
+    assert_eq!(
+        active_count_for_source(&db, "docs/x.md"),
+        0,
+        "no stale drawer may survive in any room after across-rooms replace"
+    );
+}
+
+// Demonstrates the original bug surface the across-rooms variant fixes: a
+// room-scoped replace only clears the matching room and leaves the source's
+// drawers behind in any other room it was previously routed into.
+#[test]
+fn test_room_scoped_replace_leaves_other_rooms_behind() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    insert_source_drawer(&db, "drawer_old_nullroom", "docs/x.md", None);
+    insert_source_drawer(&db, "drawer_new_coreroom", "docs/x.md", Some("mempal-core"));
+
+    let deleted = db
+        .replace_active_source_drawers("docs/x.md", "mempal", Some("mempal-core"))
+        .expect("room-scoped replace");
+    assert_eq!(
+        deleted, 1,
+        "room-scoped replace only touches the matching room"
+    );
+    assert_eq!(
+        active_count_for_source(&db, "docs/x.md"),
+        1,
+        "room-scoped replace leaves the other room's stale drawer behind"
+    );
+}

@@ -555,6 +555,14 @@ impl Database {
         Ok(rows)
     }
 
+    /// Hard-delete the active drawers for a source scoped to a specific room
+    /// (NULL room matches NULL room), removing their FTS and vector rows too.
+    ///
+    /// Use this when the caller knows the exact room the drawers live in.
+    /// For reindex, prefer [`replace_active_source_drawers_across_rooms`]:
+    /// re-ingesting a physical source may re-route it to a different room, and
+    /// a room-scoped delete would miss the stale drawers in the old room and
+    /// leave duplicates behind.
     pub fn replace_active_source_drawers(
         &self,
         source_file: &str,
@@ -583,6 +591,49 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
 
+        self.delete_source_drawer_rows(rows)
+    }
+
+    /// Hard-delete the active drawers for a source across ALL rooms in a wing.
+    ///
+    /// This is the correct replace semantics for reindex: a physical source
+    /// file maps to one logical source, so re-indexing it should keep only the
+    /// freshly produced drawers regardless of which room each previous version
+    /// was routed into. Without this, a source that auto-routes to a new room
+    /// on reindex leaves its old-room drawers behind as duplicates.
+    pub fn replace_active_source_drawers_across_rooms(
+        &self,
+        source_file: &str,
+        wing: &str,
+    ) -> Result<u64, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT rowid, id, content
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND source_file = ?1
+              AND wing = ?2
+            ORDER BY rowid
+            "#,
+        )?;
+        let rows = statement
+            .query_map((source_file, wing), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        self.delete_source_drawer_rows(rows)
+    }
+
+    /// Transactionally hard-delete the given (rowid, id, content) drawer rows
+    /// along with their FTS and vector entries. Shared by the room-scoped and
+    /// across-rooms source replacement paths.
+    fn delete_source_drawer_rows(&self, rows: Vec<(i64, String, String)>) -> Result<u64, DbError> {
         if rows.is_empty() {
             return Ok(0);
         }
