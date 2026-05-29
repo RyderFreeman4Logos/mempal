@@ -1,10 +1,9 @@
 //! Integration tests for P84 multi-agent cowork bus.
-//! All tests ignored: upstream cowork subcommands not yet integrated into fork CLI.
-//! Tracked by issue #237.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use tempfile::TempDir;
 
 fn mempal_bin() -> String {
@@ -17,12 +16,33 @@ fn setup_repo(tmp: &TempDir, name: &str) -> PathBuf {
     repo
 }
 
+static LOAD_DOTENV: OnceLock<()> = OnceLock::new();
+
+/// Inject hermetic embed environment into a child Command.
+fn inject_embed_env(cmd: &mut Command) {
+    LOAD_DOTENV.get_or_init(|| {
+        dotenvy::dotenv().ok();
+    });
+    for key in [
+        "MEMPAL_EMBED_BACKEND",
+        "MEMPAL_EMBED_BASE_URL",
+        "MEMPAL_EMBED_MODEL",
+        "MEMPAL_EMBED_DIM",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+    if std::env::var("MEMPAL_EMBED_BACKEND").is_err() {
+        cmd.env("MEMPAL_EMBED_BACKEND", "stub");
+    }
+}
+
 fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
-    Command::new(mempal_bin())
-        .args(args)
-        .env("HOME", home.path())
-        .output()
-        .expect("run mempal")
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(args).env("HOME", home.path());
+    inject_embed_env(&mut cmd);
+    cmd.output().expect("run mempal")
 }
 
 fn run_mempal_with_env(
@@ -30,12 +50,13 @@ fn run_mempal_with_env(
     args: &[&str],
     envs: &[(&str, String)],
 ) -> std::process::Output {
-    let mut command = Command::new(mempal_bin());
-    command.args(args).env("HOME", home.path());
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(args).env("HOME", home.path());
+    inject_embed_env(&mut cmd);
     for (key, value) in envs {
-        command.env(key, value);
+        cmd.env(key, value);
     }
-    command.output().expect("run mempal")
+    cmd.output().expect("run mempal")
 }
 
 fn install_fake_tmux(home: &TempDir, exit_code: i32) -> (String, PathBuf) {
@@ -166,7 +187,7 @@ fn failed_event_id(home: &TempDir, repo: &Path) -> String {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_register_and_agents_list() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "multi-agent-proj");
@@ -197,7 +218,7 @@ fn test_cli_cowork_register_and_agents_list() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_heartbeat_updates_presence() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "presence-proj");
@@ -236,7 +257,7 @@ fn test_cli_cowork_heartbeat_updates_presence() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_agents_marks_stale_presence() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "presence-stale-proj");
@@ -270,7 +291,7 @@ fn test_cli_cowork_agents_marks_stale_presence() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_heartbeat_rejects_unknown_agent() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "presence-missing-proj");
@@ -290,7 +311,7 @@ fn test_cli_cowork_heartbeat_rejects_unknown_agent() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_send_drains_only_target_agent() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "multi-agent-proj");
@@ -355,7 +376,7 @@ fn test_cli_cowork_send_drains_only_target_agent() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_delivery_status_pending() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "delivery-pending-proj");
@@ -392,7 +413,7 @@ fn test_cli_cowork_delivery_status_pending() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_delivery_status_drained() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "delivery-drained-proj");
@@ -444,7 +465,7 @@ fn test_cli_cowork_delivery_status_drained() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_ack_marks_delivery_acked() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "delivery-acked-proj");
@@ -511,7 +532,7 @@ fn test_cli_cowork_ack_marks_delivery_acked() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_send_with_thread_metadata() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "thread-proj");
@@ -555,7 +576,7 @@ fn test_cli_cowork_send_with_thread_metadata() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_channel_send_fans_out() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "channel-proj");
@@ -630,7 +651,7 @@ fn test_cli_cowork_channel_send_fans_out() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_channel_set_replaces_members() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "channel-replace-proj");
@@ -711,7 +732,7 @@ fn test_cli_cowork_channel_set_replaces_members() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_channel_send_rejects_unknown_channel() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "channel-missing-proj");
@@ -736,7 +757,7 @@ fn test_cli_cowork_channel_send_rejects_unknown_channel() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_events_records_register_send_drain() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "events-proj");
@@ -790,7 +811,7 @@ fn test_cli_cowork_events_records_register_send_drain() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_events_json_is_machine_readable() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "events-json-proj");
@@ -816,7 +837,7 @@ fn test_cli_cowork_events_json_is_machine_readable() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_events_file_output_is_append_only() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "events-append-proj");
@@ -847,7 +868,7 @@ fn test_cli_cowork_events_file_output_is_append_only() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_events_limit_returns_latest() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "events-limit-proj");
@@ -901,7 +922,7 @@ fn test_cli_cowork_events_limit_returns_latest() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_broadcast_fans_out_to_each_agent() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "multi-agent-proj");
@@ -944,7 +965,7 @@ fn test_cli_cowork_broadcast_fans_out_to_each_agent() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_bus_rejects_invalid_addressing() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "multi-agent-proj");
@@ -1017,7 +1038,7 @@ fn test_legacy_cowork_status_still_lists_tool_inboxes() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_send_to_tmux_transport_invokes_tmux() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "tmux-proj");
@@ -1084,7 +1105,7 @@ fn test_cli_cowork_send_to_tmux_transport_invokes_tmux() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_register_tmux_requires_target() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "tmux-proj");
@@ -1108,7 +1129,7 @@ fn test_cli_cowork_register_tmux_requires_target() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_tmux_failure_does_not_write_inbox() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "tmux-proj");
@@ -1165,7 +1186,7 @@ fn test_cli_cowork_tmux_failure_does_not_write_inbox() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_tmux_peek_captures_pane() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "tmux-peek-proj");
@@ -1214,7 +1235,7 @@ fn test_cli_cowork_tmux_peek_captures_pane() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_tmux_peek_rejects_inbox_agent() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "tmux-peek-inbox-proj");
@@ -1235,7 +1256,7 @@ fn test_cli_cowork_tmux_peek_rejects_inbox_agent() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_tmux_peek_has_no_bus_side_effects() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "tmux-peek-side-effect-proj");
@@ -1277,7 +1298,7 @@ fn test_cli_cowork_tmux_peek_has_no_bus_side_effects() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_tmux_peek_does_not_write_file_output() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "tmux-peek-no-file-proj");
@@ -1322,7 +1343,7 @@ fn test_cli_cowork_tmux_peek_does_not_write_file_output() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_events_records_tmux_failure() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "events-tmux-proj");
@@ -1387,7 +1408,7 @@ fn test_cli_cowork_events_records_tmux_failure() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_failed_delivery_cannot_be_acked() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "delivery-failed-proj");
@@ -1461,7 +1482,7 @@ fn test_cli_cowork_failed_delivery_cannot_be_acked() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_runbook_plain() {
     let home = TempDir::new().expect("home");
     let output = run_mempal(&home, &["cowork-runbook", "--format", "plain"]);
@@ -1474,7 +1495,7 @@ fn test_cli_cowork_runbook_plain() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_runbook_json() {
     let home = TempDir::new().expect("home");
     let output = run_mempal(&home, &["cowork-runbook", "--format", "json"]);
@@ -1495,7 +1516,7 @@ fn test_cli_cowork_runbook_json() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_runbook_rejects_invalid_format() {
     let home = TempDir::new().expect("home");
     let output = run_mempal(&home, &["cowork-runbook", "--format", "yaml"]);
@@ -1505,7 +1526,7 @@ fn test_cli_cowork_runbook_rejects_invalid_format() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_doctor_empty_registry() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "doctor-empty");
@@ -1518,7 +1539,7 @@ fn test_cli_cowork_doctor_empty_registry() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_doctor_reports_stale_and_pending() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "doctor-stale");
@@ -1571,7 +1592,7 @@ fn test_cli_cowork_doctor_reports_stale_and_pending() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_doctor_json_tmux_probe() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "doctor-tmux");
@@ -1615,7 +1636,7 @@ fn test_cli_cowork_doctor_json_tmux_probe() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_session_create_and_list() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "session-create");
@@ -1645,7 +1666,7 @@ fn test_cli_cowork_session_create_and_list() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_session_rejects_unknown_agent() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "session-reject");
@@ -1672,7 +1693,7 @@ fn test_cli_cowork_session_rejects_unknown_agent() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_session_status_update() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "session-status");
@@ -1727,7 +1748,7 @@ fn test_cli_cowork_session_status_update() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_session_close_no_capture() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "session-close");
@@ -1778,7 +1799,7 @@ fn test_cli_cowork_session_close_no_capture() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_session_close_capture_execute() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "session-close-capture");
@@ -1829,7 +1850,7 @@ fn test_cli_cowork_session_close_capture_execute() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_handoff_plain() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "handoff-plain");
@@ -1874,7 +1895,7 @@ fn test_cli_cowork_handoff_plain() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_handoff_filters_thread() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "handoff-thread");
@@ -1917,7 +1938,7 @@ fn test_cli_cowork_handoff_filters_thread() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_handoff_rejects_invalid_format() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "handoff-invalid");
@@ -1939,7 +1960,7 @@ fn test_cli_cowork_handoff_rejects_invalid_format() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_capture_dry_run_no_write() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "capture-dry-run");
@@ -1963,7 +1984,7 @@ fn test_cli_cowork_capture_dry_run_no_write() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_capture_execute_writes_evidence() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "capture-execute");
@@ -1995,7 +2016,7 @@ fn test_cli_cowork_capture_execute_writes_evidence() {
 }
 
 #[test]
-#[ignore = "upstream cowork subcommands not yet integrated into fork CLI"]
+
 fn test_cli_cowork_capture_rejects_unknown_source() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "capture-unknown");
@@ -2014,7 +2035,7 @@ fn test_cli_cowork_capture_rejects_unknown_source() {
 }
 
 #[test]
-#[ignore = "upstream maintenance-runbook subcommand not yet integrated into fork CLI"]
+
 fn test_cli_maintenance_runbook_plain() {
     let home = TempDir::new().expect("home");
     let output = run_mempal(&home, &["maintenance-runbook", "--format", "plain"]);
@@ -2026,7 +2047,7 @@ fn test_cli_maintenance_runbook_plain() {
 }
 
 #[test]
-#[ignore = "upstream maintenance-runbook subcommand not yet integrated into fork CLI"]
+
 fn test_cli_maintenance_runbook_json() {
     let home = TempDir::new().expect("home");
     let output = run_mempal(&home, &["maintenance-runbook", "--format", "json"]);
@@ -2048,7 +2069,7 @@ fn test_cli_maintenance_runbook_json() {
 }
 
 #[test]
-#[ignore = "upstream maintenance-runbook subcommand not yet integrated into fork CLI"]
+
 fn test_cli_maintenance_runbook_rejects_invalid_format() {
     let home = TempDir::new().expect("home");
     let output = run_mempal(&home, &["maintenance-runbook", "--format", "yaml"]);

@@ -38,8 +38,9 @@ clippy:
 
 # Fast test tier for pre-commit. Slow endpoint and long-running migration tests
 # are behind the `integration` feature.
+# CARGO_BUILD_JOBS=4 limits parallel LLVM codegen to avoid OOM on this host.
 test:
-    cargo test
+    CARGO_BUILD_JOBS=2 cargo test
 
 # Full test tier, including integration-gated endpoint and long-running tests.
 test-all:

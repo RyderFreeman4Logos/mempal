@@ -1062,7 +1062,7 @@ pub fn capture_handoff_to_memory(
     content.push_str("## Handoff Summary\n\n");
     content.push_str(&format_handoff_plain(&summary));
 
-    let source_type = SourceType::Manual;
+    let source_type = SourceType::AgentObservation;
     let drawer_id = build_bootstrap_evidence_drawer_id(
         &request.wing,
         request.room.as_deref(),

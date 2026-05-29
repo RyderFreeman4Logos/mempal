@@ -1,8 +1,8 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::thread;
 
 use mempal::core::anchor;
@@ -27,12 +27,51 @@ fn setup_cli_home() -> (TempDir, Database) {
     (tmp, db)
 }
 
+static LOAD_DOTENV: OnceLock<()> = OnceLock::new();
+
+/// Inject hermetic embed environment into a child Command.
+///
+/// Forwards `MEMPAL_EMBED_*` vars from the test-process env (populated from
+/// `.env` via dotenvy on first call).  If `MEMPAL_EMBED_BACKEND` is absent,
+/// defaults to `stub` so no model download or network call occurs in CI.
+fn inject_embed_env(cmd: &mut Command) {
+    LOAD_DOTENV.get_or_init(|| {
+        dotenvy::dotenv().ok();
+    });
+    for key in [
+        "MEMPAL_EMBED_BACKEND",
+        "MEMPAL_EMBED_BASE_URL",
+        "MEMPAL_EMBED_MODEL",
+        "MEMPAL_EMBED_DIM",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+    if std::env::var("MEMPAL_EMBED_BACKEND").is_err() {
+        cmd.env("MEMPAL_EMBED_BACKEND", "stub");
+    }
+}
+
 fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
-    Command::new(mempal_bin())
-        .args(args)
-        .env("HOME", home.path())
-        .output()
-        .expect("run mempal")
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(args).env("HOME", home.path());
+    inject_embed_env(&mut cmd);
+    cmd.output().expect("run mempal")
+}
+
+fn run_mempal_with_env(
+    home: &TempDir,
+    args: &[&str],
+    envs: &[(&str, String)],
+) -> std::process::Output {
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(args).env("HOME", home.path());
+    inject_embed_env(&mut cmd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("run mempal")
 }
 
 fn vector() -> Vec<f32> {
@@ -46,7 +85,7 @@ fn evidence_drawer(id: &str, content: &str) -> Drawer {
         wing: "mempal".to_string(),
         room: Some("brief".to_string()),
         source_file: Some(format!("tests://brief/{id}")),
-        source_type: SourceType::Manual,
+        source_type: SourceType::UserExplicit,
         added_at: "1710000000".to_string(),
         chunk_index: Some(0),
         normalize_version: 1,
@@ -83,7 +122,7 @@ fn knowledge_drawer(id: &str, statement: &str, content: &str, evidence_id: &str)
         wing: "mempal".to_string(),
         room: Some("brief".to_string()),
         source_file: Some(format!("knowledge://project/brief/{id}")),
-        source_type: SourceType::Manual,
+        source_type: SourceType::UserExplicit,
         added_at: "1710000000".to_string(),
         chunk_index: Some(0),
         normalize_version: 1,
@@ -198,16 +237,6 @@ fn start_openai_embedding_stub(
     (format!("http://{address}/v1/embeddings"), handle)
 }
 
-fn write_cli_api_config(home: &Path, endpoint: &str) {
-    fs::write(
-        home.join(".mempal/config.toml"),
-        format!(
-            "[embed]\nbackend = \"api\"\napi_endpoint = \"{endpoint}\"\napi_model = \"test-model\"\n"
-        ),
-    )
-    .expect("write config");
-}
-
 fn seed_brief_fixture(db: &Database) {
     let evidence = evidence_drawer(
         "brief_evidence_alice",
@@ -225,15 +254,24 @@ fn seed_brief_fixture(db: &Database) {
 }
 
 #[test]
-#[ignore = "upstream brief subcommand not yet integrated into fork CLI"]
+
 fn test_cli_brief_json_includes_citations_uncertainty_and_actions() {
     let (home, db) = setup_cli_home();
     seed_brief_fixture(&db);
     let query = "Alice pricing";
     let (endpoint, handle) = start_openai_embedding_stub(query, 1);
-    write_cli_api_config(home.path(), &endpoint);
+    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
 
-    let output = run_mempal(&home, &["brief", query, "--format", "json"]);
+    let output = run_mempal_with_env(
+        &home,
+        &["brief", query, "--format", "json"],
+        &[
+            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
+            ("MEMPAL_EMBED_BASE_URL", base_url),
+            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
+            ("MEMPAL_EMBED_DIM", "384".to_string()),
+        ],
+    );
     assert!(
         output.status.success(),
         "brief failed: {}",
@@ -273,15 +311,24 @@ fn test_cli_brief_json_includes_citations_uncertainty_and_actions() {
 }
 
 #[test]
-#[ignore = "upstream brief subcommand not yet integrated into fork CLI"]
+
 fn test_cli_brief_plain_lists_sections_and_citations() {
     let (home, db) = setup_cli_home();
     seed_brief_fixture(&db);
     let query = "Alice pricing";
     let (endpoint, handle) = start_openai_embedding_stub(query, 1);
-    write_cli_api_config(home.path(), &endpoint);
+    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
 
-    let output = run_mempal(&home, &["brief", query]);
+    let output = run_mempal_with_env(
+        &home,
+        &["brief", query],
+        &[
+            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
+            ("MEMPAL_EMBED_BASE_URL", base_url),
+            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
+            ("MEMPAL_EMBED_DIM", "384".to_string()),
+        ],
+    );
     assert!(
         output.status.success(),
         "brief failed: {}",
@@ -299,14 +346,23 @@ fn test_cli_brief_plain_lists_sections_and_citations() {
 }
 
 #[test]
-#[ignore = "upstream brief subcommand not yet integrated into fork CLI"]
+
 fn test_cli_brief_no_evidence_reports_uncertainty() {
     let (home, _db) = setup_cli_home();
     let query = "Unknown account";
     let (endpoint, handle) = start_openai_embedding_stub(query, 1);
-    write_cli_api_config(home.path(), &endpoint);
+    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
 
-    let output = run_mempal(&home, &["brief", query, "--format", "json"]);
+    let output = run_mempal_with_env(
+        &home,
+        &["brief", query, "--format", "json"],
+        &[
+            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
+            ("MEMPAL_EMBED_BASE_URL", base_url),
+            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
+            ("MEMPAL_EMBED_DIM", "384".to_string()),
+        ],
+    );
     assert!(
         output.status.success(),
         "brief failed: {}",
@@ -332,7 +388,7 @@ fn test_cli_brief_no_evidence_reports_uncertainty() {
 }
 
 #[test]
-#[ignore = "upstream brief subcommand not yet integrated into fork CLI"]
+
 fn test_cli_brief_rejects_invalid_format() {
     let (home, _db) = setup_cli_home();
     let output = run_mempal(&home, &["brief", "Alice pricing", "--format", "yaml"]);

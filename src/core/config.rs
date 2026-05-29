@@ -163,7 +163,8 @@ impl Config {
         match fs::read_to_string(path) {
             Ok(contents) => Self::parse(&contents),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let config = Self::default();
+                let mut config = Self::default();
+                config.apply_env_overrides();
                 config.validate()?;
                 Ok(config)
             }
@@ -180,8 +181,47 @@ impl Config {
         if root.get("embed").is_none() && root.get("embedder").is_none() {
             config.embed.backend = "model2vec".to_string();
         }
+        config.apply_env_overrides();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Override embed config from environment variables.
+    ///
+    /// Applied after TOML parsing so env vars take priority over config file.
+    /// Only applies when the variable is present and non-empty.
+    ///
+    /// Variables:
+    /// - `MEMPAL_EMBED_BACKEND`  — sets `embed.backend`
+    /// - `MEMPAL_EMBED_BASE_URL` — sets `embed.openai_compat.base_url`
+    /// - `MEMPAL_EMBED_MODEL`    — sets `embed.openai_compat.model`
+    /// - `MEMPAL_EMBED_DIM`      — sets `embed.openai_compat.dim` (parsed as usize; invalid values are ignored with a warning)
+    fn apply_env_overrides(&mut self) {
+        if let Ok(val) = env::var("MEMPAL_EMBED_BACKEND") {
+            if !val.is_empty() {
+                self.embed.backend = val;
+            }
+        }
+        if let Ok(val) = env::var("MEMPAL_EMBED_BASE_URL") {
+            if !val.is_empty() {
+                self.embed.openai_compat.base_url = Some(val);
+            }
+        }
+        if let Ok(val) = env::var("MEMPAL_EMBED_MODEL") {
+            if !val.is_empty() {
+                self.embed.openai_compat.model = Some(val);
+            }
+        }
+        if let Ok(val) = env::var("MEMPAL_EMBED_DIM") {
+            if !val.is_empty() {
+                match val.parse::<usize>() {
+                    Ok(dim) => self.embed.openai_compat.dim = Some(dim),
+                    Err(_) => eprintln!(
+                        "warning: MEMPAL_EMBED_DIM={val:?} is not a valid usize, ignoring"
+                    ),
+                }
+            }
+        }
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
@@ -1916,7 +1956,15 @@ impl Default for SleepConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::{Config, DecayMode};
+
+    // Serialize env-mutating tests to prevent flaky parallel interference.
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.get_or_init(Mutex::default).lock().unwrap()
+    }
 
     #[test]
     fn search_decay_defaults_to_none() {
@@ -1970,6 +2018,72 @@ mod tests {
         assert!(
             err.to_string().contains("search.decay.step_reduced_weight"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_env_overrides_present_applies() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("MEMPAL_EMBED_BACKEND", "stub");
+            std::env::set_var("MEMPAL_EMBED_BASE_URL", "http://127.0.0.1:9999/v1");
+            std::env::set_var("MEMPAL_EMBED_MODEL", "my-model");
+            std::env::set_var("MEMPAL_EMBED_DIM", "512");
+        }
+        let config = Config::parse("").expect("parse with env overrides");
+        unsafe {
+            std::env::remove_var("MEMPAL_EMBED_BACKEND");
+            std::env::remove_var("MEMPAL_EMBED_BASE_URL");
+            std::env::remove_var("MEMPAL_EMBED_MODEL");
+            std::env::remove_var("MEMPAL_EMBED_DIM");
+        }
+        assert_eq!(config.embed.backend, "stub");
+        assert_eq!(
+            config.embed.openai_compat.base_url.as_deref(),
+            Some("http://127.0.0.1:9999/v1")
+        );
+        assert_eq!(
+            config.embed.openai_compat.model.as_deref(),
+            Some("my-model")
+        );
+        assert_eq!(config.embed.openai_compat.dim, Some(512));
+    }
+
+    #[test]
+    fn apply_env_overrides_absent_leaves_default() {
+        let _guard = env_lock();
+        let backend_was = std::env::var("MEMPAL_EMBED_BACKEND").ok();
+        let url_was = std::env::var("MEMPAL_EMBED_BASE_URL").ok();
+        let model_was = std::env::var("MEMPAL_EMBED_MODEL").ok();
+        let dim_was = std::env::var("MEMPAL_EMBED_DIM").ok();
+        unsafe {
+            std::env::remove_var("MEMPAL_EMBED_BACKEND");
+            std::env::remove_var("MEMPAL_EMBED_BASE_URL");
+            std::env::remove_var("MEMPAL_EMBED_MODEL");
+            std::env::remove_var("MEMPAL_EMBED_DIM");
+        }
+        let config = Config::parse("").expect("parse without env overrides");
+        unsafe {
+            if let Some(v) = backend_was {
+                std::env::set_var("MEMPAL_EMBED_BACKEND", v);
+            }
+            if let Some(v) = url_was {
+                std::env::set_var("MEMPAL_EMBED_BASE_URL", v);
+            }
+            if let Some(v) = model_was {
+                std::env::set_var("MEMPAL_EMBED_MODEL", v);
+            }
+            if let Some(v) = dim_was {
+                std::env::set_var("MEMPAL_EMBED_DIM", v);
+            }
+        }
+        // Empty config.toml with no env overrides → model2vec fallback; dim keeps struct default
+        assert_eq!(config.embed.backend, "model2vec");
+        assert!(config.embed.openai_compat.base_url.is_none());
+        assert!(config.embed.openai_compat.model.is_none());
+        assert_eq!(
+            config.embed.openai_compat.dim,
+            Some(super::DEFAULT_OPENAI_DIM)
         );
     }
 }
