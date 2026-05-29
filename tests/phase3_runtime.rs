@@ -1619,6 +1619,86 @@ fn test_cli_phase3_adoption_wrap_rejects_missing_child_command() {
 }
 
 #[test]
+fn test_cli_phase3_adoption_wrap_outcome_override() {
+    let home = setup_cli_home();
+    let output = run_mempal(
+        &home,
+        &[
+            "phase3",
+            "adoption",
+            "wrap",
+            "--surface",
+            "runtime-context",
+            "--query",
+            "override test",
+            "--outcome",
+            "rejected",
+            "--execute",
+            "--format",
+            "json",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "wrap outcome override failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("wrap json");
+    assert_eq!(report["child_exit_code"], 0, "child exited 0");
+    assert_eq!(report["outcome"], "rejected", "override should take effect");
+    assert_eq!(
+        report["writes"], true,
+        "override rejected should still write"
+    );
+
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    let events = db
+        .list_runtime_adoption_events(&RuntimeAdoptionFilter::default(), 10)
+        .expect("events");
+    assert_eq!(events.len(), 1, "one event persisted");
+    assert_eq!(
+        events[0].signal,
+        RuntimeAdoptionSignal::Rejected,
+        "persisted signal is rejected"
+    );
+}
+
+#[test]
+fn test_cli_phase3_adoption_wrap_invalid_outcome_fails() {
+    let home = setup_cli_home();
+    let output = run_mempal(
+        &home,
+        &[
+            "phase3",
+            "adoption",
+            "wrap",
+            "--outcome",
+            "bogus",
+            "--surface",
+            "runtime-context",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(!output.status.success(), "invalid --outcome should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bogus"),
+        "stderr should mention the invalid value; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("accepted") || stderr.contains("valid"),
+        "stderr should list valid values; got: {stderr}"
+    );
+}
+
+#[test]
 fn test_cli_phase3_adoption_check_record_json_accepts_supported_event() {
     let home = setup_cli_home();
     let output = run_mempal(

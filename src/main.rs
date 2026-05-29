@@ -1712,6 +1712,8 @@ enum Phase3AdoptionCommands {
         #[arg(long)]
         note: Option<String>,
         #[arg(long)]
+        outcome: Option<String>,
+        #[arg(long)]
         execute: bool,
         #[arg(long = "allow-warnings")]
         allow_warnings: bool,
@@ -1796,6 +1798,7 @@ struct WrapCommandOpts {
     surface: String,
     query: Option<String>,
     note: Option<String>,
+    outcome: Option<String>,
     execute: bool,
     allow_warnings: bool,
     format: String,
@@ -6411,6 +6414,7 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
             surface,
             query,
             note,
+            outcome,
             execute,
             allow_warnings,
             format,
@@ -6421,6 +6425,7 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
                 surface,
                 query,
                 note,
+                outcome,
                 execute,
                 allow_warnings,
                 format,
@@ -9847,6 +9852,7 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
         surface,
         query,
         note,
+        outcome: outcome_override,
         execute,
         allow_warnings,
         format,
@@ -9862,10 +9868,30 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
         .context("failed to run child command")?;
     let child_exit_code = child_output.status.code().unwrap_or(1);
     let child_stdout = String::from_utf8_lossy(&child_output.stdout).into_owned();
-    let outcome = if child_exit_code == 0 {
+    let auto_outcome = if child_exit_code == 0 {
         "accepted".to_string()
     } else {
         "rejected".to_string()
+    };
+    let outcome = if let Some(ov) = outcome_override {
+        const VALID: &[&str] = &[
+            "accepted",
+            "rejected",
+            "used",
+            "miss",
+            "rollback",
+            "contradiction",
+            "neutral",
+        ];
+        if !VALID.contains(&ov.as_str()) {
+            bail!(
+                "invalid --outcome value {ov:?}; valid values: {}",
+                VALID.join(", ")
+            );
+        }
+        ov
+    } else {
+        auto_outcome
     };
 
     let record_input = capture_runtime_adoption_record_input(RuntimeAdoptionCaptureInput {
@@ -9885,7 +9911,7 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
     let mut capture =
         prepare_runtime_adoption_capture(surface, outcome.clone(), execute, record_input.clone());
 
-    if execute && outcome == "accepted" {
+    if execute {
         let track = parse_runtime_adoption_track(&record_input.track)?;
         let signal = parse_runtime_adoption_signal(&record_input.signal)?;
         let should_write = should_write_checked_record(&capture.record_quality, allow_warnings);

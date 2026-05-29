@@ -109,6 +109,26 @@ Scenario: CLI wrap rejects missing child command
   Then the command fails
   And stderr mentions that a child command is required
 
+Scenario: CLI wrap outcome override overrides auto-mapped outcome
+  Test:
+    Filter: cargo test --test phase3_runtime test_cli_phase3_adoption_wrap_outcome_override
+    Targets: CLI wrapper --outcome override and DB write behavior.
+  Given an empty runtime adoption event table
+  When running wrap with `--outcome rejected --execute --surface runtime-context --query "override test" --format json -- sh -c "exit 0"`
+  Then the child command exits with code 0
+  And the report has `outcome=rejected`
+  And the report has `writes=true`
+  And exactly one runtime adoption event is persisted with `signal=rejected`
+
+Scenario: CLI wrap invalid outcome value fails with clear error
+  Test:
+    Filter: cargo test --test phase3_runtime test_cli_phase3_adoption_wrap_invalid_outcome_fails
+    Targets: CLI wrapper --outcome validation.
+  Given the wrapper command with an invalid --outcome value
+  When running `mempal phase3 adoption wrap --outcome bogus --surface runtime-context -- sh -c "exit 0"`
+  Then the command fails
+  And stderr mentions the invalid value and lists valid outcome values
+
 Scenario: Protocol and inventories include P82
   Test:
     Filter: rg -n "p82-opt-in-runtime-instrumentation-wrapper|P82 opt-in runtime instrumentation wrapper|phase3 adoption wrap" AGENTS.md CLAUDE.md docs/MIND-MODEL-DESIGN.md src/core/protocol.rs
