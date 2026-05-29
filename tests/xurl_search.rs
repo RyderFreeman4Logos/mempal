@@ -130,7 +130,7 @@ async fn seed_turn<E: Embedder + ?Sized>(
 ) {
     let turn = make_turn(session_id, tool, turn_index, role, content);
     store::insert_turns(db.conn(), &[turn]).unwrap();
-    mempal::xurl::embed::embed_unindexed_turns(&db.inner, embedder)
+    mempal::xurl::embed::embed_unindexed_turns(&db.inner, embedder, None)
         .await
         .unwrap();
 }
@@ -181,13 +181,14 @@ async fn search_returns_semantically_relevant_turn() {
         None,
         false,
         false,
+        None,
     )
     .await
     .unwrap();
 
-    assert!(!results.is_empty(), "expected at least one result");
+    assert!(!results.hits.is_empty(), "expected at least one result");
     // Top result should be about database/migration, not bread
-    let top = &results[0];
+    let top = &results.hits[0];
     let is_database = top.content.contains("database")
         || top.content.contains("migration")
         || top.content.contains("flyway");
@@ -237,15 +238,20 @@ async fn search_with_tool_filter() {
         }),
         false,
         false,
+        None,
     )
     .await
     .unwrap();
 
-    assert!(!results.is_empty());
+    assert!(!results.hits.is_empty());
     assert!(
-        results.iter().all(|r| r.tool == "cc"),
+        results.hits.iter().all(|r| r.tool == "cc"),
         "all results should be cc, got: {:?}",
-        results.iter().map(|r| r.tool.as_str()).collect::<Vec<_>>()
+        results
+            .hits
+            .iter()
+            .map(|r| r.tool.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -285,12 +291,14 @@ async fn search_deduplicates_multi_chunk_turns() {
         rusqlite::params![&turn_id, &blob],
     ).unwrap();
 
-    let results = search::search(&db.inner, &embedder, "anything", 10, None, false, false)
-        .await
-        .unwrap();
+    let results = search::search(
+        &db.inner, &embedder, "anything", 10, None, false, false, None,
+    )
+    .await
+    .unwrap();
 
     // Even though there are two chunks, the turn should appear exactly once
-    let ids: Vec<&str> = results.iter().map(|r| r.turn_id.as_str()).collect();
+    let ids: Vec<&str> = results.hits.iter().map(|r| r.turn_id.as_str()).collect();
     let unique_ids: std::collections::HashSet<&&str> = ids.iter().collect();
     assert_eq!(ids.len(), unique_ids.len(), "duplicate turn_ids in results");
 }
@@ -307,23 +315,23 @@ async fn search_excludes_csa_by_default() {
     csa.is_csa_delegated = true;
 
     store::insert_turns(db.conn(), &[normal, csa]).unwrap();
-    mempal::xurl::embed::embed_unindexed_turns(&db.inner, &embedder)
+    mempal::xurl::embed::embed_unindexed_turns(&db.inner, &embedder, None)
         .await
         .unwrap();
 
     // Default search (exclude CSA)
-    let results = search::search(&db.inner, &embedder, "turn", 10, None, false, false)
+    let results = search::search(&db.inner, &embedder, "turn", 10, None, false, false, None)
         .await
         .unwrap();
-    assert_eq!(results.len(), 1, "should exclude CSA turn by default");
-    assert_eq!(results[0].content, "normal turn");
+    assert_eq!(results.hits.len(), 1, "should exclude CSA turn by default");
+    assert_eq!(results.hits[0].content, "normal turn");
 
     // With include_csa=true
-    let results_all = search::search(&db.inner, &embedder, "turn", 10, None, true, false)
+    let results_all = search::search(&db.inner, &embedder, "turn", 10, None, true, false, None)
         .await
         .unwrap();
     assert_eq!(
-        results_all.len(),
+        results_all.hits.len(),
         2,
         "should include CSA turn when flag is set"
     );
@@ -333,8 +341,105 @@ async fn search_excludes_csa_by_default() {
 async fn search_empty_db_returns_empty() {
     let db = open_temp_db();
     let embedder = FixedEmbedder { dim: 16 };
-    let results = search::search(&db.inner, &embedder, "anything", 10, None, false, false)
+    let results = search::search(
+        &db.inner, &embedder, "anything", 10, None, false, false, None,
+    )
+    .await
+    .unwrap();
+    assert!(results.hits.is_empty());
+}
+
+#[tokio::test]
+async fn test_search_min_score_filters_low_hits() {
+    let db = open_temp_db();
+    // Use a SemanticEmbedder so the query "database migration" gets score ~1.0 for
+    // database-matching content and score 0.0 for unrelated content.
+    let embedder = SemanticEmbedder::new(16);
+
+    seed_turn(
+        &db,
+        &embedder,
+        "sess1",
+        Tool::Cc,
+        0,
+        Role::User,
+        "database migration strategy",
+    )
+    .await;
+    seed_turn(
+        &db,
+        &embedder,
+        "sess2",
+        Tool::Cc,
+        0,
+        Role::User,
+        "how to bake bread",
+    )
+    .await;
+
+    // With a high floor, only the relevant result should pass
+    let result = search::search(
+        &db.inner,
+        &embedder,
+        "database migration",
+        10,
+        None,
+        false,
+        false,
+        Some(0.9),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.hits.len(),
+        1,
+        "only the high-score hit should pass the floor"
+    );
+    assert!(
+        result.hits[0].content.contains("database") || result.hits[0].content.contains("migration"),
+        "passing hit should be database-related"
+    );
+    // bread hit should be captured as best_score_below_floor
+    assert!(
+        result.best_score_below_floor.is_some(),
+        "low-score hit should be captured in best_score_below_floor"
+    );
+    assert_eq!(result.min_score_floor, Some(0.9));
+}
+
+#[tokio::test]
+async fn test_search_dedup_identical_content() {
+    let db = open_temp_db();
+    let embedder = FixedEmbedder { dim: 16 };
+
+    // Two different turns with identical content (simulates overlapping session ingestion)
+    let turn_a = make_turn("sess-a", Tool::Cc, 0, Role::User, "identical content here");
+    let turn_b = make_turn("sess-b", Tool::Cc, 0, Role::User, "identical content here");
+    store::insert_turns(db.conn(), &[turn_a, turn_b]).unwrap();
+    mempal::xurl::embed::embed_unindexed_turns(&db.inner, &embedder, None)
         .await
         .unwrap();
-    assert!(results.is_empty());
+
+    let result = search::search(
+        &db.inner,
+        &embedder,
+        "identical",
+        10,
+        None,
+        false,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Despite two stored turns, identical content should yield only one hit
+    assert_eq!(
+        result.hits.len(),
+        1,
+        "identical-content turns should be deduped to one hit, got: {}",
+        result.hits.len()
+    );
+    assert_eq!(result.hits[0].content, "identical content here");
 }

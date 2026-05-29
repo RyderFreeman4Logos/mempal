@@ -20,16 +20,6 @@ pub struct IngestStats {
     pub vectors_created: usize,
 }
 
-impl IngestStats {
-    fn merge(&mut self, other: &Self) {
-        self.turns_parsed += other.turns_parsed;
-        self.turns_inserted += other.turns_inserted;
-        self.turns_skipped += other.turns_skipped;
-        self.turns_updated += other.turns_updated;
-        self.vectors_created += other.vectors_created;
-    }
-}
-
 pub struct AutoScanConfig {
     pub cc_root: PathBuf,
     pub codex_root: PathBuf,
@@ -62,14 +52,15 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Ingest a single file (or SQLite DB for Hermes) and embed any newly inserted turns.
-pub async fn ingest_file<E: Embedder + ?Sized>(
+/// Parse a file and insert turns into the DB. Does not embed.
+///
+/// Returns `(filename, turns_parsed, insert_stats)`.
+fn parse_and_store_file(
     db: &Database,
-    embedder: &E,
     path: &Path,
     tool: Tool,
     session_id_override: Option<&str>,
-) -> XurlResult<IngestStats> {
+) -> XurlResult<(String, usize, store::InsertStats)> {
     let fallback = session_id_override.map(str::to_string).unwrap_or_else(|| {
         path.file_stem()
             .and_then(|s| s.to_str())
@@ -94,9 +85,27 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
         Tool::Hermes => parse_hermes_db(path, &fallback, is_csa)?,
     };
 
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
     let turns_parsed = turns.len();
     let insert_stats = store::insert_turns(db.conn(), &turns)?;
-    let embed_stats = embed::embed_unindexed_turns(db, embedder).await?;
+    Ok((filename, turns_parsed, insert_stats))
+}
+
+/// Ingest a single file (or SQLite DB for Hermes) and embed any newly inserted turns.
+pub async fn ingest_file<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    path: &Path,
+    tool: Tool,
+    session_id_override: Option<&str>,
+) -> XurlResult<IngestStats> {
+    let (_, turns_parsed, insert_stats) =
+        parse_and_store_file(db, path, tool, session_id_override)?;
+    let embed_stats = embed::embed_unindexed_turns(db, embedder, None).await?;
 
     Ok(IngestStats {
         turns_parsed,
@@ -108,17 +117,34 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
 }
 
 /// Scan all default tool directories and ingest every discovered file.
+///
+/// Uses a two-phase approach: first all files are parsed and stored (Phase 1),
+/// then all unindexed turns are embedded in batched transactions (Phase 2).
+/// This avoids the per-file embed overhead that stalls on large DBs.
+///
+/// `on_file_parsed`, if provided, is called after each file's turns are stored
+/// with `(filename, turns_parsed)`.
+#[allow(clippy::type_complexity)]
 pub async fn ingest_all<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,
     cfg: &AutoScanConfig,
+    on_file_parsed: Option<&dyn Fn(&str, usize)>,
 ) -> XurlResult<IngestStats> {
     let mut total = IngestStats::default();
 
+    // Phase 1: parse and store all files (no embedding yet).
     if cfg.cc_root.exists() {
         for path in collect_files_with_ext(&cfg.cc_root, "jsonl") {
-            let stats = ingest_file(db, embedder, &path, Tool::Cc, None).await?;
-            total.merge(&stats);
+            let (filename, turns_parsed, insert_stats) =
+                parse_and_store_file(db, &path, Tool::Cc, None)?;
+            total.turns_parsed += turns_parsed;
+            total.turns_inserted += insert_stats.inserted;
+            total.turns_skipped += insert_stats.skipped;
+            total.turns_updated += insert_stats.updated;
+            if let Some(f) = on_file_parsed {
+                f(&filename, turns_parsed);
+            }
         }
     }
 
@@ -129,18 +155,43 @@ pub async fn ingest_all<E: Embedder + ?Sized>(
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
             if name.starts_with("rollout-") {
-                let stats = ingest_file(db, embedder, &path, Tool::Codex, None).await?;
-                total.merge(&stats);
+                let (filename, turns_parsed, insert_stats) =
+                    parse_and_store_file(db, &path, Tool::Codex, None)?;
+                total.turns_parsed += turns_parsed;
+                total.turns_inserted += insert_stats.inserted;
+                total.turns_skipped += insert_stats.skipped;
+                total.turns_updated += insert_stats.updated;
+                if let Some(f) = on_file_parsed {
+                    f(&filename, turns_parsed);
+                }
             }
         }
     }
 
     if let Some(hermes_path) = &cfg.hermes_db {
         if hermes_path.exists() {
-            let stats = ingest_file(db, embedder, hermes_path, Tool::Hermes, None).await?;
-            total.merge(&stats);
+            let (filename, turns_parsed, insert_stats) =
+                parse_and_store_file(db, hermes_path, Tool::Hermes, None)?;
+            total.turns_parsed += turns_parsed;
+            total.turns_inserted += insert_stats.inserted;
+            total.turns_skipped += insert_stats.skipped;
+            total.turns_updated += insert_stats.updated;
+            if let Some(f) = on_file_parsed {
+                f(&filename, turns_parsed);
+            }
         }
     }
+
+    // Phase 2: embed all unindexed turns in one batched pass with stderr progress.
+    let embed_stats = embed::embed_unindexed_turns(
+        db,
+        embedder,
+        Some(&|done, total_turns| {
+            eprintln!("embedding turns: {done}/{total_turns}");
+        }),
+    )
+    .await?;
+    total.vectors_created += embed_stats.embedded;
 
     Ok(total)
 }

@@ -650,21 +650,23 @@ fn validate_write_target(
     let file_name = path.file_name().and_then(|name| name.to_str());
 
     match target {
-        HookInstallTarget::ClaudeCode => {
-            if parent_name != Some(CLAUDE_SETTINGS_DIR) || file_name != Some(CLAUDE_SETTINGS_FILE) {
-                bail!(
-                    "refusing to edit non-canonical Claude settings target {}",
-                    path.display()
-                );
-            }
+        HookInstallTarget::ClaudeCode
+            if parent_name != Some(CLAUDE_SETTINGS_DIR)
+                || file_name != Some(CLAUDE_SETTINGS_FILE) =>
+        {
+            bail!(
+                "refusing to edit non-canonical Claude settings target {}",
+                path.display()
+            );
         }
-        HookInstallTarget::Codex => {
-            if parent_name != Some(CODEX_SETTINGS_DIR) || file_name != Some(CODEX_SETTINGS_FILE) {
-                bail!(
-                    "refusing to edit non-canonical Codex settings target {}",
-                    path.display()
-                );
-            }
+        HookInstallTarget::Codex
+            if parent_name != Some(CODEX_SETTINGS_DIR)
+                || file_name != Some(CODEX_SETTINGS_FILE) =>
+        {
+            bail!(
+                "refusing to edit non-canonical Codex settings target {}",
+                path.display()
+            );
         }
         _ => {}
     }

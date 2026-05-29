@@ -757,6 +757,9 @@ enum XurlCommands {
         /// Also include agent-generated user prompts (excluded by default).
         #[arg(long)]
         include_agent_prompts: bool,
+        /// Minimum cosine similarity score (0.0–1.0). Hits below this floor are suppressed.
+        #[arg(long, default_value_t = 0.70)]
+        min_score: f32,
         /// Output format: markdown (default) or json.
         #[arg(long, default_value = "markdown")]
         format: String,
@@ -7884,7 +7887,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 .context("xurl ingest failed")?
             } else {
                 let cfg = mempal::xurl::ingest::AutoScanConfig::default();
-                mempal::xurl::ingest::ingest_all(db, embedder.as_ref(), &cfg)
+                mempal::xurl::ingest::ingest_all(db, embedder.as_ref(), &cfg, None)
                     .await
                     .context("xurl ingest-all failed")?
             };
@@ -7911,6 +7914,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             limit,
             include_csa,
             include_agent_prompts,
+            min_score,
             format,
         } => {
             let since_epoch = since.as_deref().map(parse_since_to_epoch).transpose()?;
@@ -7922,7 +7926,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 offset: 0,
             };
             let embedder = build_embedder(config).await?;
-            let hits = mempal::xurl::search::search(
+            let result = mempal::xurl::search::search(
                 db,
                 embedder.as_ref(),
                 &query,
@@ -7930,6 +7934,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 Some(filter),
                 include_csa,
                 include_agent_prompts,
+                Some(min_score),
             )
             .await
             .context("xurl search failed")?;
@@ -7937,10 +7942,10 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             if format == "json" {
                 println!(
                     "{}",
-                    serde_json::to_string(&hits).context("json serialize")?
+                    serde_json::to_string(&result).context("json serialize")?
                 );
             } else {
-                mempal::xurl::search::print_hits_markdown(&hits);
+                mempal::xurl::search::print_hits_markdown(&result);
             }
             Ok(())
         }
@@ -7995,17 +8000,12 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                     println!("No turns found.");
                 } else {
                     for t in &turns {
-                        let session_abbrev = if t.session_id.len() > 8 {
-                            &t.session_id[..8]
-                        } else {
-                            &t.session_id
-                        };
                         let ts = mempal::xurl::search::format_timestamp(t.timestamp_epoch);
                         println!("---");
                         println!(
                             "**[{}]** `{}` · {} · {}",
                             t.tool.as_str(),
-                            session_abbrev,
+                            t.session_id,
                             ts,
                             t.role.as_str()
                         );

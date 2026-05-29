@@ -6,6 +6,8 @@ use crate::embed::Embedder;
 use crate::ingest::chunk::chunk_text_token_aware;
 use crate::xurl::{XurlError, XurlResult};
 
+const EMBED_BATCH_SIZE: usize = 50;
+
 #[derive(Debug, Default)]
 pub struct EmbedStats {
     pub turns_processed: usize,
@@ -20,15 +22,20 @@ fn serialize_vector(v: &[f32]) -> Vec<u8> {
 
 /// Find turns that have no entries in `conversation_turn_vectors` and embed them.
 ///
-/// Long turns (>512 tokens by default) are split into overlapping chunks using
-/// the same `chunk_text_token_aware` function used by the drawer ingest pipeline.
-/// Each chunk produces a separate row in `conversation_turn_vectors` with an
-/// incrementing `chunk_index`.
+/// Processes turns in batches of `EMBED_BATCH_SIZE`. Each batch is wrapped in a
+/// transaction to avoid per-row journal overhead on large DBs. On error within a
+/// batch the transaction is rolled back before propagating the error.
+///
+/// `progress_fn`, if provided, is called after each batch with `(done_so_far, total)`.
 pub async fn embed_unindexed_turns<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,
+    progress_fn: Option<&dyn Fn(usize, usize)>,
 ) -> XurlResult<EmbedStats> {
     let conn = db.conn();
+
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")
+        .map_err(XurlError::Database)?;
 
     // Find all turns that have no vector yet.
     let unindexed: Vec<(String, String)> = {
@@ -58,11 +65,42 @@ pub async fn embed_unindexed_turns<E: Embedder + ?Sized>(
         return Ok(EmbedStats::default());
     }
 
+    let total = unindexed.len();
     let config = ChunkerConfig::default();
     let mut stats = EmbedStats::default();
 
-    for (turn_id, content) in &unindexed {
-        let chunks = chunk_text_token_aware(content, &config, embedder, Some(turn_id));
+    for batch in unindexed.chunks(EMBED_BATCH_SIZE) {
+        conn.execute_batch("BEGIN").map_err(XurlError::Database)?;
+
+        let batch_result = embed_batch_turns(conn, embedder, batch, &config, &mut stats).await;
+
+        match batch_result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT").map_err(XurlError::Database)?;
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+
+        if let Some(f) = progress_fn {
+            f(stats.turns_processed, total);
+        }
+    }
+
+    Ok(stats)
+}
+
+async fn embed_batch_turns<E: Embedder + ?Sized>(
+    conn: &rusqlite::Connection,
+    embedder: &E,
+    batch: &[(String, String)],
+    config: &ChunkerConfig,
+    stats: &mut EmbedStats,
+) -> XurlResult<()> {
+    for (turn_id, content) in batch {
+        let chunks = chunk_text_token_aware(content, config, embedder, Some(turn_id));
         let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
 
         let vectors = embedder
@@ -85,6 +123,5 @@ pub async fn embed_unindexed_turns<E: Embedder + ?Sized>(
         stats.chunks_total += chunks.len();
         stats.turns_processed += 1;
     }
-
-    Ok(stats)
+    Ok(())
 }
