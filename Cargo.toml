@@ -44,7 +44,6 @@ bimap = "0.6"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 daemonize = "0.5"
-dotenvy = "0.15"
 jieba-rs = "0.8"
 libc = "0.2"
 model2vec-rs = { version = "0.1", optional = true }
@@ -77,6 +76,7 @@ strip = true           # strip debug symbols from binary
 panic = "abort"        # no unwinding — smaller binary, faster panic
 
 [dev-dependencies]
+dotenvy = "0.15"
 axum = "0.8"
 hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 mockito = "1"

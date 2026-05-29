@@ -1843,7 +1843,6 @@ struct MaintenanceStep {
 }
 
 fn main() {
-    dotenvy::dotenv().ok();
     if let Err(error) = run() {
         eprintln!("error: {error}");
         for cause in error.chain().skip(1) {
@@ -9858,6 +9857,45 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
         format,
         child_cmd,
     } = opts;
+
+    // Validate --outcome and --surface BEFORE spawning the child.  An invalid
+    // invocation must never run an arbitrary child command.
+    const VALID_OUTCOMES: &[&str] = &[
+        "accepted",
+        "rejected",
+        "used",
+        "miss",
+        "rollback",
+        "contradiction",
+        "neutral",
+    ];
+    if let Some(ref ov) = outcome_override {
+        if !VALID_OUTCOMES.contains(&ov.as_str()) {
+            bail!(
+                "invalid --outcome value {ov:?}; valid values: {}",
+                VALID_OUTCOMES.join(", ")
+            );
+        }
+    }
+    // Surface validation uses the same logic as capture_runtime_adoption_record_input.
+    // Pass a known-valid placeholder outcome; only the surface path is checked here.
+    capture_runtime_adoption_record_input(RuntimeAdoptionCaptureInput {
+        id: None,
+        surface: surface.clone(),
+        outcome: outcome_override
+            .as_deref()
+            .unwrap_or("accepted")
+            .to_string(),
+        query: query.clone(),
+        context_hash: None,
+        card_id: None,
+        evaluator_id: None,
+        research_report_id: None,
+        note: note.clone(),
+        metadata: None,
+    })
+    .map_err(anyhow::Error::msg)?;
+
     let (program, args) = child_cmd
         .split_first()
         .expect("child_cmd non-empty by clap");
@@ -9873,26 +9911,8 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
     } else {
         "rejected".to_string()
     };
-    let outcome = if let Some(ov) = outcome_override {
-        const VALID: &[&str] = &[
-            "accepted",
-            "rejected",
-            "used",
-            "miss",
-            "rollback",
-            "contradiction",
-            "neutral",
-        ];
-        if !VALID.contains(&ov.as_str()) {
-            bail!(
-                "invalid --outcome value {ov:?}; valid values: {}",
-                VALID.join(", ")
-            );
-        }
-        ov
-    } else {
-        auto_outcome
-    };
+    // Both outcome_override (if Some) and surface are already validated above.
+    let outcome = outcome_override.unwrap_or(auto_outcome);
 
     let record_input = capture_runtime_adoption_record_input(RuntimeAdoptionCaptureInput {
         id: None,

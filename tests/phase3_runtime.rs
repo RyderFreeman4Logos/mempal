@@ -1670,6 +1670,10 @@ fn test_cli_phase3_adoption_wrap_outcome_override() {
 #[test]
 fn test_cli_phase3_adoption_wrap_invalid_outcome_fails() {
     let home = setup_cli_home();
+    // Use a marker file so we can prove the child did NOT execute on invalid args.
+    let marker_dir = TempDir::new().expect("marker tempdir");
+    let marker_path = marker_dir.path().join("child_ran");
+    let marker_script = format!("touch {}", marker_path.display());
     let output = run_mempal(
         &home,
         &[
@@ -1683,10 +1687,14 @@ fn test_cli_phase3_adoption_wrap_invalid_outcome_fails() {
             "--",
             "sh",
             "-c",
-            "exit 0",
+            marker_script.as_str(),
         ],
     );
     assert!(!output.status.success(), "invalid --outcome should fail");
+    assert!(
+        !marker_path.exists(),
+        "child must NOT have run before --outcome validation; marker found at {marker_path:?}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("bogus"),
