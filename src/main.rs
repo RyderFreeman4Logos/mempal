@@ -8635,11 +8635,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                             t.role.as_str()
                         );
                         println!();
-                        let preview = if t.content.len() > 300 {
-                            format!("{}…", &t.content[..300])
-                        } else {
-                            t.content.clone()
-                        };
+                        let preview = char_safe_preview(&t.content, 300);
                         println!("{}", preview.trim());
                         println!();
                     }
@@ -9196,6 +9192,18 @@ fn truncate_for_summary(content: &str, limit: usize) -> String {
         return compact;
     }
     compact.chars().take(limit).collect::<String>() + "..."
+}
+/// Truncate `s` to at most `max_chars` characters, appending an ellipsis only
+/// when truncation actually occurs. Operates on `char` boundaries so it never
+/// panics on multi-byte UTF-8 input (issue #249: a byte-index slice such as
+/// `&s[..300]` aborts when byte 300 lands inside a multi-byte CJK char).
+fn char_safe_preview(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        let head: String = s.chars().take(max_chars).collect();
+        format!("{head}…")
+    } else {
+        s.to_string()
+    }
 }
 fn estimate_wake_up_tokens(drawers: &[mempal::core::types::Drawer]) -> usize {
     drawers
@@ -9976,4 +9984,38 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
         std::process::exit(child_exit_code);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for issue #249: `mempal xurl timeline` aborted with
+    /// "byte index 300 is not a char boundary" when a turn's content had a
+    /// multi-byte UTF-8 char straddling byte 300 (common with CJK text).
+    #[test]
+    fn char_safe_preview_does_not_panic_on_multibyte_boundary() {
+        // 298 ASCII bytes (indices 0..=297), then '前' (3 bytes) occupies
+        // bytes 298, 299, 300 — so byte index 300 is mid-char and the old
+        // `&s[..300]` byte slice would have panicked.
+        let mut content = "a".repeat(298);
+        content.push_str(&"前".repeat(50));
+        assert!(
+            !content.is_char_boundary(300),
+            "test precondition: byte 300 must fall inside a multi-byte char"
+        );
+        assert!(content.chars().count() > 300, "must exceed the char limit");
+
+        let preview = char_safe_preview(&content, 300);
+
+        // 300 retained chars plus the single ellipsis char.
+        assert_eq!(preview.chars().count(), 301);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn char_safe_preview_returns_input_unchanged_when_short() {
+        let content = "短文本"; // 3 chars, well under the limit
+        assert_eq!(char_safe_preview(content, 300), content);
+    }
 }
