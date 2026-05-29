@@ -31,6 +31,14 @@ use crate::knowledge_gate::{GateReport, PromotionPolicyEntry};
 use crate::knowledge_lifecycle::{DemoteOutcome, PromoteOutcome};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
+
+/// schemars 1.x emits boolean `true` for `serde_json::Value`, which MCP clients
+/// (e.g. Claude Code) reject when validating `tools/list`. Use this helper via
+/// `#[schemars(schema_with = "json_object_schema")]` to advertise an object schema
+/// instead, without changing the field's runtime Rust type.
+fn json_object_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "object" })
+}
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -523,9 +531,11 @@ pub struct Phase3Request {
     pub evaluator_id: Option<String>,
     pub research_report_id: Option<String>,
     pub note: Option<String>,
+    #[schemars(schema_with = "json_object_schema")]
     pub metadata: Option<serde_json::Value>,
     pub limit: Option<usize>,
     pub candidate: Option<String>,
+    #[schemars(schema_with = "json_object_schema")]
     pub report: Option<serde_json::Value>,
     pub execute: Option<bool>,
     pub allow_warnings: Option<bool>,
