@@ -2017,6 +2017,65 @@ fn test_cli_cowork_capture_execute_writes_evidence() {
 
 #[test]
 
+fn test_cli_cowork_capture_execute_respects_custom_db_path() {
+    // Validates finding 1 from the tier-4 review of f5e3474:
+    // --execute capture must write to config.db_path, not the hardcoded default.
+    let home = TempDir::new().expect("home");
+    let repo = setup_repo(&home, "capture-custom-db");
+    register(&home, &repo, "claude-main", "claude");
+
+    // Write a config.toml that redirects palace.db to a non-default path.
+    let custom_db_path = home.path().join("custom_data").join("palace.db");
+    let config_dir = home.path().join(".mempal");
+    fs::create_dir_all(&config_dir).expect("create .mempal dir");
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "db_path = \"{}\"\n",
+            custom_db_path.to_str().expect("valid utf8 path")
+        ),
+    )
+    .expect("write config.toml");
+
+    let capture = run_mempal(
+        &home,
+        &[
+            "cowork-capture",
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--summary-source",
+            "handoff",
+            "--execute",
+            "--format",
+            "json",
+        ],
+    );
+    assert_success(&capture);
+    let value: serde_json::Value = serde_json::from_slice(&capture.stdout).expect("capture json");
+    assert_eq!(value["writes"], true);
+    let drawer_id = value["drawer_id"].as_str().expect("drawer id in response");
+
+    // Drawer must be in the CUSTOM db, not the default palace.db location.
+    assert!(
+        custom_db_path.exists(),
+        "custom db should have been created at {custom_db_path:?}"
+    );
+    let db = mempal::core::db::Database::open(&custom_db_path).expect("open custom db");
+    let drawer = db
+        .get_drawer(drawer_id)
+        .expect("get drawer")
+        .expect("drawer should exist in custom db");
+    assert_eq!(drawer.wing, "cowork-capture");
+
+    // The default palace.db path must NOT exist — nothing was written there.
+    assert!(
+        !palace_db_path(&home).exists(),
+        "default palace.db should NOT exist when custom db_path is configured"
+    );
+}
+
+#[test]
+
 fn test_cli_cowork_capture_rejects_unknown_source() {
     let home = TempDir::new().expect("home");
     let repo = setup_repo(&home, "capture-unknown");

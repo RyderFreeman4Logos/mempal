@@ -2063,12 +2063,16 @@ fn run() -> Result<()> {
             execute,
             format,
         } => {
+            let config = Config::load_from(&config_path)
+                .with_context(|| format!("failed to load config {}", config_path.display()))?;
+            let db_path = expand_home(&config.db_path);
             return cowork_session_close_command(
                 cwd.clone(),
                 session_id.clone(),
                 *capture,
                 *execute,
                 format.clone(),
+                db_path,
             );
         }
         Commands::CoworkHandoff {
@@ -2084,11 +2088,15 @@ fn run() -> Result<()> {
             execute,
             format,
         } => {
+            let config = Config::load_from(&config_path)
+                .with_context(|| format!("failed to load config {}", config_path.display()))?;
+            let db_path = expand_home(&config.db_path);
             return cowork_capture_command(
                 cwd.clone(),
                 summary_source.clone(),
                 *execute,
                 format.clone(),
+                db_path,
             );
         }
         Commands::MaintenanceRunbook { format } => {
@@ -9496,6 +9504,7 @@ fn cowork_session_close_command(
     capture: bool,
     execute: bool,
     format: String,
+    db_path: PathBuf,
 ) -> Result<()> {
     use mempal::cowork::bus::{capture_handoff_to_memory, update_session_status};
     let home = mempal_home();
@@ -9503,7 +9512,7 @@ fn cowork_session_close_command(
     if capture {
         let db_opt = if execute {
             Some(
-                Database::open(&home.join("palace.db"))
+                Database::open(&db_path)
                     .context("failed to open database for cowork-session-close --capture")?,
             )
         } else {
@@ -9578,6 +9587,7 @@ fn cowork_capture_command(
     summary_source: String,
     execute: bool,
     format: String,
+    db_path: PathBuf,
 ) -> Result<()> {
     use mempal::cowork::bus::capture_handoff_to_memory;
     if !matches!(summary_source.as_str(), "handoff") {
@@ -9585,10 +9595,7 @@ fn cowork_capture_command(
     }
     let home = mempal_home();
     let db_opt = if execute {
-        Some(
-            Database::open(&home.join("palace.db"))
-                .context("failed to open database for cowork-capture")?,
-        )
+        Some(Database::open(&db_path).context("failed to open database for cowork-capture")?)
     } else {
         None
     };
@@ -9843,6 +9850,7 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
         .expect("child_cmd non-empty by clap");
     let child_output = std::process::Command::new(program)
         .args(args)
+        .stderr(std::process::Stdio::inherit())
         .output()
         .context("failed to run child command")?;
     let child_exit_code = child_output.status.code().unwrap_or(1);
