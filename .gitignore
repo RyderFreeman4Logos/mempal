@@ -31,3 +31,7 @@ skills/rust-skills/
 
 # Local git worktrees
 .worktrees/
+
+# Python bytecode cache (contrib/ plugins)
+__pycache__/
+*.py[cod]
