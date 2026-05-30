@@ -12,9 +12,10 @@
 //!      daemon" and both daemonize, converging on duplicate orphans.
 //!
 //!   2. **Sibling enumeration** — `daemon status` / `daemon stop` scan
-//!      `/proc/<pid>/cmdline` for every live `<binary> daemon …` invocation so
-//!      `status` reports the true count and `stop` reaps orphans the single
-//!      pidfile PID could never see.
+//!      `/proc/<pid>/cmdline` for every live `<binary> daemon …` invocation, then
+//!      keep only processes that hold this home's `daemon.lock` fd. That home
+//!      filter keeps stop/status isolated when multiple mempal homes run on the
+//!      same host.
 //!
 //! The `flock` primitive mirrors the proven inline-extern pattern in
 //! `src/ingest/lock.rs` (no libc dep on Unix; Windows no-op fallback). The
@@ -136,7 +137,8 @@ pub fn parse_proc_cmdline(raw: &[u8]) -> Vec<String> {
 /// exactly `daemon`. This intentionally excludes `mempal serve --mcp`
 /// (argv[1] = `serve`), `mempal status` (argv[1] = `status`), and unrelated
 /// programs such as `claude -p …` (different basename). Pure and unit-testable;
-/// the `/proc` scan in [`enumerate_daemon_pids`] feeds parsed argv through it.
+/// the `/proc` scan in [`enumerate_daemon_pids`] feeds parsed argv through it
+/// before checking the candidate's lock fd.
 pub fn is_daemon_argv<S: AsRef<str>>(argv: &[S], binary_name: &str) -> bool {
     let Some(program) = argv.first() else {
         return false;
@@ -150,18 +152,32 @@ pub fn is_daemon_argv<S: AsRef<str>>(argv: &[S], binary_name: &str) -> bool {
     program_base == Some(binary_name) && subcommand.as_ref() == "daemon"
 }
 
-/// Enumerate the PIDs of every live `<binary_name> daemon …` process, excluding
-/// the calling process itself.
+/// Enumerate the PIDs of every live `<binary_name> daemon …` process for
+/// `mempal_home`, excluding the calling process itself.
 ///
 /// Linux: scans `/proc/<pid>/cmdline`. Non-Linux: returns empty (the pidfile
 /// path still applies; robust sibling reaping is a Linux-only refinement).
 #[cfg(target_os = "linux")]
-pub fn enumerate_daemon_pids(binary_name: &str) -> Vec<i32> {
+pub fn enumerate_daemon_pids(binary_name: &str, mempal_home: &Path) -> Vec<i32> {
     let self_pid = std::process::id() as i32;
+    enumerate_daemon_pids_in_proc(binary_name, mempal_home, Path::new("/proc"), self_pid)
+}
+
+#[cfg(target_os = "linux")]
+fn enumerate_daemon_pids_in_proc(
+    binary_name: &str,
+    mempal_home: &Path,
+    proc_root: &Path,
+    self_pid: i32,
+) -> Vec<i32> {
     let mut pids = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Some(lock_path) = canonical_daemon_lock_path(mempal_home) else {
         return pids;
     };
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return pids;
+    };
+
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
@@ -180,7 +196,8 @@ pub fn enumerate_daemon_pids(binary_name: &str) -> Vec<i32> {
             continue; // kernel threads expose an empty cmdline
         }
         let argv = parse_proc_cmdline(&raw);
-        if is_daemon_argv(&argv, binary_name) {
+        if is_daemon_argv(&argv, binary_name) && process_holds_lock_file(&entry.path(), &lock_path)
+        {
             pids.push(pid);
         }
     }
@@ -188,8 +205,26 @@ pub fn enumerate_daemon_pids(binary_name: &str) -> Vec<i32> {
     pids
 }
 
+#[cfg(target_os = "linux")]
+fn canonical_daemon_lock_path(mempal_home: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(mempal_home.join(DAEMON_LOCK_FILE)).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_holds_lock_file(proc_pid_dir: &Path, lock_path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(proc_pid_dir.join("fd")) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        std::fs::read_link(entry.path())
+            .map(|target| target == lock_path)
+            .unwrap_or(false)
+    })
+}
+
 #[cfg(not(target_os = "linux"))]
-pub fn enumerate_daemon_pids(_binary_name: &str) -> Vec<i32> {
+pub fn enumerate_daemon_pids(_binary_name: &str, _mempal_home: &Path) -> Vec<i32> {
     Vec::new()
 }
 
@@ -344,8 +379,44 @@ mod tests {
         // own PID (enumerate filters self out regardless).
         let self_pid = std::process::id() as i32;
         let name = current_binary_name().unwrap_or_else(|| "mempal".to_string());
-        assert!(!enumerate_daemon_pids(&name).contains(&self_pid));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        File::create(tmp.path().join(DAEMON_LOCK_FILE)).expect("lock file");
+        assert!(!enumerate_daemon_pids(&name, tmp.path()).contains(&self_pid));
         // Sanity: a binary name that cannot match anything yields no PIDs.
-        assert!(enumerate_daemon_pids("\0no-such-binary").is_empty());
+        assert!(enumerate_daemon_pids("\0no-such-binary", tmp.path()).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_enumerate_filters_daemons_by_matching_home_lock_fd() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home_a = tmp.path().join("home-a");
+        let home_b = tmp.path().join("home-b");
+        let proc_root = tmp.path().join("proc");
+        std::fs::create_dir_all(&home_a).expect("home a");
+        std::fs::create_dir_all(&home_b).expect("home b");
+        std::fs::create_dir_all(&proc_root).expect("proc root");
+        let lock_a = home_a.join(DAEMON_LOCK_FILE);
+        let lock_b = home_b.join(DAEMON_LOCK_FILE);
+        File::create(&lock_a).expect("lock a");
+        File::create(&lock_b).expect("lock b");
+
+        write_fake_proc_daemon(&proc_root, 101, &lock_a);
+        write_fake_proc_daemon(&proc_root, 202, &lock_b);
+
+        let pids = enumerate_daemon_pids_in_proc("mempal", &home_a, &proc_root, 0);
+
+        assert_eq!(pids, vec![101]);
+
+        fn write_fake_proc_daemon(proc_root: &Path, pid: i32, lock_path: &Path) {
+            let pid_dir = proc_root.join(pid.to_string());
+            let fd_dir = pid_dir.join("fd");
+            std::fs::create_dir_all(&fd_dir).expect("fd dir");
+            std::fs::write(pid_dir.join("cmdline"), b"mempal\0daemon\0--foreground\0")
+                .expect("cmdline");
+            symlink(lock_path, fd_dir.join("3")).expect("lock fd symlink");
+        }
     }
 }

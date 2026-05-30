@@ -8852,6 +8852,13 @@ fn daemon_config_db_path(config_path: &Path) -> Result<PathBuf> {
     Ok(expand_home(&config.db_path))
 }
 
+fn daemon_home_from_db_path(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn run_daemon_start(config_path: PathBuf, foreground: bool) -> Result<()> {
     let db_path = daemon_config_db_path(&config_path)?;
     if let Some(pid) = read_daemon_pid(&db_path)? {
@@ -8875,7 +8882,8 @@ fn run_daemon_stop(db_path: &Path) -> Result<()> {
     // visible through a /proc enumeration of the daemon's own argv.
     let binary =
         mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
-    let mut targets = mempal::daemon_singleton::enumerate_daemon_pids(&binary);
+    let mempal_home = daemon_home_from_db_path(db_path);
+    let mut targets = mempal::daemon_singleton::enumerate_daemon_pids(&binary, &mempal_home);
 
     // Defensively include the pidfile PID if it is live but escaped the scan
     // (e.g. a transient /proc read race), so stop never misses it.
@@ -8887,9 +8895,7 @@ fn run_daemon_stop(db_path: &Path) -> Result<()> {
     }
 
     if targets.is_empty() {
-        if let Some(mempal_home) = db_path.parent() {
-            let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
-        }
+        let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
         bail!("daemon is not running");
     }
 
@@ -8924,9 +8930,7 @@ fn run_daemon_stop(db_path: &Path) -> Result<()> {
         bail!("daemon(s) did not exit within 30s: {pids}");
     }
 
-    if let Some(mempal_home) = db_path.parent() {
-        let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
-    }
+    let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
     if reaped > 1 {
         println!("daemon stopped ({reaped} processes reaped)");
     } else {
@@ -8962,7 +8966,8 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
     // (#257). The scan excludes this `daemon status` process itself.
     let binary =
         mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
-    let siblings = mempal::daemon_singleton::enumerate_daemon_pids(&binary);
+    let mempal_home = daemon_home_from_db_path(db_path);
+    let siblings = mempal::daemon_singleton::enumerate_daemon_pids(&binary, &mempal_home);
 
     match read_daemon_pid(db_path)? {
         None => {
@@ -8976,13 +8981,11 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
             if process_is_running(pid)? {
                 println!("status: running");
                 println!("pid: {pid}");
-                if let Some(mempal_home) = db_path.parent() {
-                    let pid_path = mempal_home.join("daemon.pid");
-                    if let Ok(meta) = std::fs::metadata(&pid_path) {
-                        if let Ok(modified) = meta.modified() {
-                            if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
-                                println!("uptime_secs: {}", age.as_secs());
-                            }
+                let pid_path = mempal_home.join("daemon.pid");
+                if let Ok(meta) = std::fs::metadata(&pid_path) {
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
+                            println!("uptime_secs: {}", age.as_secs());
                         }
                     }
                 }
