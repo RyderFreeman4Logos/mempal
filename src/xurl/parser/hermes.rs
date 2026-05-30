@@ -30,6 +30,7 @@ pub fn parse_hermes_db(
     // Attempt to read a session_id from the DB metadata (some versions store it).
     // Fall back to `fallback_session_id` if unavailable.
     let session_id = read_session_id(&conn).unwrap_or_else(|| fallback_session_id.to_string());
+    let project_path = read_project_path(&conn);
 
     let mut stmt = conn
         .prepare(
@@ -71,7 +72,7 @@ pub fn parse_hermes_db(
             role,
             content,
             timestamp_epoch,
-            project_path: None,
+            project_path: project_path.clone(),
             git_branch: None,
             is_csa_delegated,
             provenance: Provenance::Human,
@@ -93,6 +94,56 @@ fn read_session_id(conn: &Connection) -> Option<String> {
         |row| row.get::<_, String>(0),
     )
     .ok()
+}
+
+/// Attempt to read a project/cwd path from known Hermes metadata shapes.
+/// Returns `None` if the table/column is absent or the stored value is empty.
+fn read_project_path(conn: &Connection) -> Option<String> {
+    query_optional_text(
+        conn,
+        "SELECT value FROM metadata \
+         WHERE key IN ('project_path', 'cwd', 'project') \
+         ORDER BY CASE key \
+             WHEN 'project_path' THEN 0 \
+             WHEN 'cwd' THEN 1 \
+             ELSE 2 \
+         END \
+         LIMIT 1",
+    )
+    .or_else(|| query_optional_text(conn, "SELECT project_path FROM sessions LIMIT 1"))
+    .or_else(|| query_optional_text(conn, "SELECT cwd FROM sessions LIMIT 1"))
+    .or_else(|| query_optional_text(conn, "SELECT project FROM sessions LIMIT 1"))
+    .or_else(|| {
+        query_optional_text(
+            conn,
+            "SELECT project_path FROM messages \
+             WHERE project_path IS NOT NULL AND project_path != '' \
+             LIMIT 1",
+        )
+    })
+    .or_else(|| {
+        query_optional_text(
+            conn,
+            "SELECT cwd FROM messages \
+             WHERE cwd IS NOT NULL AND cwd != '' \
+             LIMIT 1",
+        )
+    })
+    .or_else(|| {
+        query_optional_text(
+            conn,
+            "SELECT project FROM messages \
+             WHERE project IS NOT NULL AND project != '' \
+             LIMIT 1",
+        )
+    })
+}
+
+fn query_optional_text(conn: &Connection, sql: &str) -> Option<String> {
+    conn.query_row(sql, [], |row| row.get::<_, String>(0))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Strip `<context>…</context>` and `<system-reminder>…</system-reminder>` tags.
@@ -237,6 +288,25 @@ mod tests {
 
         let turns_user = parse_hermes_db(&db_path, "s", false).unwrap();
         assert!(!turns_user[0].is_csa_delegated);
+    }
+
+    #[test]
+    fn hermes_parser_reads_project_path_from_metadata_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        setup_hermes_fixture(&db_path, &[("user", "hi", 1.0)]);
+        let conn = Connection::open(&db_path).expect("open fixture db");
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT NOT NULL, value TEXT NOT NULL);
+             INSERT INTO metadata (key, value) VALUES ('cwd', '/repo/hermes');",
+        )
+        .expect("insert metadata");
+        drop(conn);
+
+        let turns = parse_hermes_db(&db_path, "s", false).unwrap();
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].project_path.as_deref(), Some("/repo/hermes"));
     }
 
     #[test]

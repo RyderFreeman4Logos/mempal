@@ -13,9 +13,12 @@ const SESSION_ID_SCAN_LIMIT: usize = 64;
 pub fn parse_cc_jsonl(
     content: &str,
     fallback_session_id: &str,
+    fallback_project_path: Option<&str>,
     is_csa_delegated: bool,
 ) -> XurlResult<Vec<RawTurn>> {
     let session_id = extract_session_id(content).unwrap_or_else(|| fallback_session_id.to_string());
+    let fallback_project_path = fallback_project_path.map(str::to_string);
+    let mut last_cwd: Option<String> = None;
     let mut turns = Vec::new();
     let mut turn_index: u32 = 0;
 
@@ -29,6 +32,11 @@ pub fn parse_cc_jsonl(
             Some(t) => t,
             None => continue,
         };
+
+        if let Some(cwd) = extract_cwd(&obj) {
+            last_cwd = Some(cwd);
+        }
+        let project_path = last_cwd.clone().or_else(|| fallback_project_path.clone());
 
         match entry_type {
             "user" => {
@@ -72,7 +80,7 @@ pub fn parse_cc_jsonl(
                     role: Role::User,
                     content: text,
                     timestamp_epoch,
-                    project_path: None,
+                    project_path,
                     git_branch: None,
                     is_csa_delegated,
                     provenance,
@@ -104,7 +112,7 @@ pub fn parse_cc_jsonl(
                     role: Role::Assistant,
                     content: text,
                     timestamp_epoch,
-                    project_path: None,
+                    project_path,
                     git_branch: None,
                     is_csa_delegated,
                     provenance: Provenance::Human,
@@ -117,6 +125,14 @@ pub fn parse_cc_jsonl(
     }
 
     Ok(turns)
+}
+
+fn extract_cwd(obj: &Value) -> Option<String> {
+    obj.get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn extract_session_id(content: &str) -> Option<String> {
@@ -240,7 +256,7 @@ mod tests {
     fn cc_parser_extracts_35_turns_from_50_entry_file() {
         // 20 user text + 15 assistant text + 15 tool_use/tool_result
         let jsonl = build_cc_fixture(20, 15, 15);
-        let turns = parse_cc_jsonl(&jsonl, "sess123", false).unwrap();
+        let turns = parse_cc_jsonl(&jsonl, "sess123", None, false).unwrap();
         assert_eq!(turns.len(), 35);
         let user_count = turns.iter().filter(|t| t.role == Role::User).count();
         let asst_count = turns.iter().filter(|t| t.role == Role::Assistant).count();
@@ -265,7 +281,7 @@ mod tests {
             }
         })
         .to_string();
-        let turns = parse_cc_jsonl(&line, "s1", false).unwrap();
+        let turns = parse_cc_jsonl(&line, "s1", None, false).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].content, "Here is my answer.");
     }
@@ -273,7 +289,7 @@ mod tests {
     #[test]
     fn cc_parser_normalizes_timestamp_to_epoch() {
         let line = make_user_line("s2", "2026-05-27T14:30:00Z", "external", "hi");
-        let turns = parse_cc_jsonl(&line, "s2", false).unwrap();
+        let turns = parse_cc_jsonl(&line, "s2", None, false).unwrap();
         // 2026-05-27T14:30:00Z = 1779892200.0
         assert!((turns[0].timestamp_epoch - 1779892200.0).abs() < 1.0);
     }
@@ -281,14 +297,14 @@ mod tests {
     #[test]
     fn cc_parser_tool_result_only_user_turn_skipped() {
         let tool_result = make_tool_result_user("s3", "2026-05-27T12:00:00Z");
-        let turns = parse_cc_jsonl(&tool_result, "s3", false).unwrap();
+        let turns = parse_cc_jsonl(&tool_result, "s3", None, false).unwrap();
         assert_eq!(turns.len(), 0);
     }
 
     #[test]
     fn cc_parser_external_user_type_is_human_provenance() {
         let line = make_user_line("s4", "2026-05-27T12:00:00Z", "external", "hello");
-        let turns = parse_cc_jsonl(&line, "s4", false).unwrap();
+        let turns = parse_cc_jsonl(&line, "s4", None, false).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].provenance, Provenance::Human);
     }
@@ -296,7 +312,7 @@ mod tests {
     #[test]
     fn cc_parser_internal_user_type_is_agent_provenance() {
         let line = make_user_line("s5", "2026-05-27T12:00:00Z", "internal", "agent prompt");
-        let turns = parse_cc_jsonl(&line, "s5", false).unwrap();
+        let turns = parse_cc_jsonl(&line, "s5", None, false).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].provenance, Provenance::Agent);
     }
@@ -313,7 +329,7 @@ mod tests {
             }
         })
         .to_string();
-        let turns = parse_cc_jsonl(&line, "s6", false).unwrap();
+        let turns = parse_cc_jsonl(&line, "s6", None, false).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].provenance, Provenance::Agent);
     }
@@ -321,10 +337,10 @@ mod tests {
     #[test]
     fn cc_parser_csa_delegated_flag_propagated() {
         let line = make_user_line("s7", "2026-05-27T12:00:00Z", "external", "hi");
-        let turns = parse_cc_jsonl(&line, "s7", true).unwrap();
+        let turns = parse_cc_jsonl(&line, "s7", None, true).unwrap();
         assert!(turns[0].is_csa_delegated);
 
-        let turns2 = parse_cc_jsonl(&line, "s7", false).unwrap();
+        let turns2 = parse_cc_jsonl(&line, "s7", None, false).unwrap();
         assert!(!turns2[0].is_csa_delegated);
     }
 
@@ -350,12 +366,46 @@ mod tests {
         let t4 = make_assistant_line("s8", ts, &[("text", "Sync complete, PR #238 created")]);
 
         let jsonl = [t0, t1, t2, t3, t4].join("\n");
-        let turns = parse_cc_jsonl(&jsonl, "s8", false).unwrap();
+        let turns = parse_cc_jsonl(&jsonl, "s8", None, false).unwrap();
         // t0, t1, t4 → 3 turns (t2 has no text, t3 is tool_result-only user)
         assert_eq!(turns.len(), 3);
         assert_eq!(turns[0].content, "sync upstream");
         assert_eq!(turns[0].provenance, Provenance::Human);
         assert_eq!(turns[1].content, "Starting upstream sync...");
         assert_eq!(turns[2].content, "Sync complete, PR #238 created");
+    }
+
+    #[test]
+    fn cc_parser_propagates_cwd_with_last_seen_fallback() {
+        let first = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-05-27T12:00:00Z",
+            "sessionId": "sess",
+            "userType": "external",
+            "cwd": "/repo/one",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "first"}]
+            }
+        })
+        .to_string();
+        let second = make_assistant_line("sess", "2026-05-27T12:00:01Z", &[("text", "second")]);
+        let fixture = format!("{first}\n{second}");
+
+        let turns = parse_cc_jsonl(&fixture, "fallback", Some("/fallback"), false).unwrap();
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].project_path.as_deref(), Some("/repo/one"));
+        assert_eq!(turns[1].project_path.as_deref(), Some("/repo/one"));
+    }
+
+    #[test]
+    fn cc_parser_uses_project_path_fallback_before_any_cwd() {
+        let fixture = make_user_line("sess", "2026-05-27T12:00:00Z", "external", "first");
+
+        let turns = parse_cc_jsonl(&fixture, "fallback", Some("/fallback"), false).unwrap();
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].project_path.as_deref(), Some("/fallback"));
     }
 }

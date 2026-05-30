@@ -83,7 +83,13 @@ fn parse_and_store_file(
     let turns = match tool {
         Tool::Cc => {
             let content = fs::read_to_string(path).map_err(XurlError::Io)?;
-            parse_cc_jsonl(&content, &fallback, is_csa)?
+            let fallback_project_path = decode_claude_project_path(path);
+            parse_cc_jsonl(
+                &content,
+                &fallback,
+                fallback_project_path.as_deref(),
+                is_csa,
+            )?
         }
         Tool::Codex => {
             let content = fs::read_to_string(path).map_err(XurlError::Io)?;
@@ -212,6 +218,28 @@ fn collect_files_with_ext(root: &Path, ext: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     collect_recursive(root, ext, &mut out);
     out
+}
+
+fn decode_claude_project_path(path: &Path) -> Option<String> {
+    let session_dir = path.parent()?;
+    let projects_dir = session_dir.parent()?;
+    if projects_dir.file_name().and_then(|name| name.to_str()) != Some("projects") {
+        return None;
+    }
+    if projects_dir
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        != Some(".claude")
+    {
+        return None;
+    }
+    session_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|encoded| !encoded.is_empty())
+        .map(|encoded| encoded.replace('-', "/"))
 }
 
 fn collect_recursive(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {

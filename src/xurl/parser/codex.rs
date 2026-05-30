@@ -19,6 +19,7 @@ pub fn parse_codex_jsonl(
     is_csa_delegated: bool,
 ) -> XurlResult<Vec<RawTurn>> {
     let mut session_id = fallback_session_id.to_string();
+    let mut project_path: Option<String> = None;
     let mut turns = Vec::new();
     let mut turn_index: u32 = 0;
 
@@ -44,6 +45,9 @@ pub fn parse_codex_jsonl(
                     if !id.is_empty() {
                         session_id = id.to_string();
                     }
+                }
+                if let Some(cwd) = extract_session_cwd(&obj) {
+                    project_path = Some(cwd);
                 }
             }
 
@@ -75,7 +79,7 @@ pub fn parse_codex_jsonl(
                             role: Role::User,
                             content: text,
                             timestamp_epoch,
-                            project_path: None,
+                            project_path: project_path.clone(),
                             git_branch: None,
                             is_csa_delegated,
                             provenance: Provenance::Human,
@@ -99,7 +103,7 @@ pub fn parse_codex_jsonl(
                             role: Role::Assistant,
                             content: text,
                             timestamp_epoch,
-                            project_path: None,
+                            project_path: project_path.clone(),
                             git_branch: None,
                             is_csa_delegated,
                             provenance: Provenance::Human,
@@ -148,7 +152,7 @@ pub fn parse_codex_jsonl(
                     role: Role::Assistant,
                     content: text,
                     timestamp_epoch,
-                    project_path: None,
+                    project_path: project_path.clone(),
                     git_branch: None,
                     is_csa_delegated,
                     provenance: Provenance::Human,
@@ -161,7 +165,23 @@ pub fn parse_codex_jsonl(
         }
     }
 
+    if let Some(path) = project_path {
+        for turn in &mut turns {
+            turn.project_path = Some(path.clone());
+        }
+    }
+
     Ok(turns)
+}
+
+fn extract_session_cwd(obj: &Value) -> Option<String> {
+    obj.get("payload")
+        .and_then(|p| p.get("cwd"))
+        .or_else(|| obj.get("cwd"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn parse_timestamp(obj: &Value) -> f64 {
@@ -235,6 +255,23 @@ mod tests {
         let turns = parse_codex_jsonl(jsonl, "fallback", false).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].session_id, "real-id-xyz");
+    }
+
+    #[test]
+    fn codex_parser_applies_session_meta_cwd_to_all_turns() {
+        let jsonl = concat!(
+            "{\"timestamp\":\"2026-05-27T12:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}",
+            "\n",
+            "{\"timestamp\":\"2026-05-27T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"real-id-xyz\",\"cwd\":\"/repo/codex\"}}",
+            "\n",
+            "{\"timestamp\":\"2026-05-27T12:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"hello\"}}",
+            "\n",
+        );
+        let turns = parse_codex_jsonl(jsonl, "fallback", false).unwrap();
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].project_path.as_deref(), Some("/repo/codex"));
+        assert_eq!(turns[1].project_path.as_deref(), Some("/repo/codex"));
     }
 
     #[test]

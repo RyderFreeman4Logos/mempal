@@ -14,6 +14,7 @@ pub struct StoredTurn {
     pub timestamp_epoch: f64,
     pub token_count: Option<i64>,
     pub project_path: Option<String>,
+    pub source_path: Option<String>,
     pub git_branch: Option<String>,
     pub is_csa_delegated: bool,
     pub provenance: Provenance,
@@ -231,6 +232,7 @@ pub fn get_turns(conn: &Connection, filter: TurnFilter) -> XurlResult<Vec<Stored
             let role_str: String = row.get(4)?;
             let provenance_str: String = row.get(11)?;
             let is_csa: i64 = row.get(10)?;
+            let project_path: Option<String> = row.get(8)?;
             Ok(StoredTurn {
                 id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -240,7 +242,8 @@ pub fn get_turns(conn: &Connection, filter: TurnFilter) -> XurlResult<Vec<Stored
                 content: row.get(5)?,
                 timestamp_epoch: row.get(6)?,
                 token_count: row.get(7)?,
-                project_path: row.get(8)?,
+                source_path: project_path.clone(),
+                project_path,
                 git_branch: row.get(9)?,
                 is_csa_delegated: is_csa != 0,
                 provenance: parse_provenance(&provenance_str),
@@ -318,6 +321,7 @@ pub fn get_turns_filtered(
             let role_str: String = row.get(4)?;
             let provenance_str: String = row.get(11)?;
             let is_csa: i64 = row.get(10)?;
+            let project_path: Option<String> = row.get(8)?;
             Ok(StoredTurn {
                 id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -327,7 +331,8 @@ pub fn get_turns_filtered(
                 content: row.get(5)?,
                 timestamp_epoch: row.get(6)?,
                 token_count: row.get(7)?,
-                project_path: row.get(8)?,
+                source_path: project_path.clone(),
+                project_path,
                 git_branch: row.get(9)?,
                 is_csa_delegated: is_csa != 0,
                 provenance: parse_provenance(&provenance_str),
