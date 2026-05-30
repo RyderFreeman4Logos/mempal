@@ -441,6 +441,12 @@ pub fn search_with_vector_and_scope_options(
         retain_currently_valid_results(&mut results, &temporal_metadata, now_secs);
     }
 
+    // Read effective_importance from a single consistent snapshot before the
+    // importance pipeline (boost -> decay -> rerank) so a concurrent
+    // access-tracking update cannot tear the read across drawers and make the
+    // rerank nondeterministic (GitHub #254).
+    apply_consistent_effective_importance(db, &mut results);
+
     // Pattern boosting (P13): boost exemplar drawers of active patterns that
     // match the query vector. Fire-and-forget on error.
     apply_pattern_boost(db, query_vector, scope.project_id.as_deref(), &mut results);
@@ -536,6 +542,76 @@ fn retain_currently_valid_results(
     });
 }
 
+/// Re-read `effective_importance` for the result set in a single consistent
+/// SQLite snapshot and overwrite each result's value before the importance
+/// rerank.
+///
+/// Why this exists: every search fires a fire-and-forget `dispatch_access_update`
+/// that recomputes `effective_importance` for the hit drawers in one atomic
+/// batch. The per-result `hydrate_result_metadata` path reads each drawer with a
+/// *separate* `get_drawer` query, so a concurrent access-update commit landing
+/// between two of those reads produces a TORN read: two drawers that share the
+/// same base importance end up with inconsistent `effective_importance` (e.g.
+/// `0.0` pre-update vs `0.2` post-update). `rerank_by_effective_importance` then
+/// reorders them nondeterministically (GitHub #254). A single `IN (...)` query
+/// reads all rows from one snapshot, so batched-together drawers are always
+/// mutually consistent and the rerank stays a deterministic no-op for
+/// equal-importance results.
+///
+/// Tunnel cross-project results are skipped: they carry a deliberately
+/// penalty-scaled `effective_importance` that must not be overwritten by the raw
+/// stored value. Fail-soft: on any read error the existing (possibly torn)
+/// values are left in place rather than failing the search.
+fn apply_consistent_effective_importance(db: &Database, results: &mut [SearchResult]) {
+    let ids = results
+        .iter()
+        .filter(|result| result.source != SearchResultSource::TunnelCrossProject)
+        .map(|result| result.drawer_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if ids.is_empty() {
+        return;
+    }
+
+    let placeholders = (1..=ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Mirror `get_drawer`'s COALESCE so the snapshot value matches what the
+    // per-result hydrate would have produced absent a concurrent write.
+    let sql = format!(
+        "SELECT id, COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) \
+         FROM drawers WHERE id IN ({placeholders})"
+    );
+    let snapshot: std::collections::HashMap<String, f64> = match db.conn().prepare(&sql) {
+        Ok(mut statement) => {
+            let rows = statement
+                .query_map(params_from_iter(ids.iter().map(String::as_str)), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                });
+            match rows.and_then(|mapped| mapped.collect::<std::result::Result<_, _>>()) {
+                Ok(map) => map,
+                Err(err) => {
+                    tracing::warn!(error = %err, "consistent effective_importance read failed");
+                    return;
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "consistent effective_importance read failed");
+            return;
+        }
+    };
+
+    for result in results.iter_mut() {
+        if result.source == SearchResultSource::TunnelCrossProject {
+            continue;
+        }
+        if let Some(&effective_importance) = snapshot.get(&result.drawer_id) {
+            result.effective_importance = effective_importance;
+        }
+    }
+}
+
 fn apply_temporal_decay(
     results: &mut [SearchResult],
     metadata: &std::collections::HashMap<String, TemporalMetadata>,
@@ -558,6 +634,7 @@ fn apply_temporal_decay(
         b.similarity
             .partial_cmp(&a.similarity)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.drawer_id.cmp(&b.drawer_id))
     });
 }
 
@@ -731,6 +808,9 @@ pub fn search_bm25_only_with_options(
     if !options.include_expired {
         retain_currently_valid_results(&mut results, &temporal_metadata, now_secs);
     }
+    // Consistent-snapshot effective_importance read before the importance
+    // pipeline, mirroring the hybrid path — see GitHub #254.
+    apply_consistent_effective_importance(db, &mut results);
     apply_temporal_decay(
         &mut results,
         &temporal_metadata,
@@ -1038,6 +1118,7 @@ fn rrf_merge(
         b.similarity
             .partial_cmp(&a.similarity)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.drawer_id.cmp(&b.drawer_id))
     });
     merged.truncate(top_k);
     merged
@@ -1389,7 +1470,12 @@ where
         let (a_dist, a_row) = (&a.0, &a.1);
         let (b_dist, b_row) = (&b.0, &b.1);
         match (a_dist, b_dist) {
-            (Ok(left), Ok(right)) => left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal),
+            (Ok(left), Ok(right)) => left
+                .partial_cmp(right)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Tie-break equal cosine distances by drawer_id so the exact
+                // vector ranking is reproducible regardless of SQL row order.
+                .then_with(|| a_row.0.cmp(&b_row.0)),
             (Ok(_), Err(_)) => std::cmp::Ordering::Less,
             (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
             // Tie-break two invalid-blob candidates by drawer_id, matching the
