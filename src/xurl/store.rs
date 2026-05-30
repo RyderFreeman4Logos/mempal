@@ -1,4 +1,5 @@
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::xurl::model::{Provenance, RawTurn, Role, Tool};
@@ -41,6 +42,51 @@ pub struct ToolStat {
     pub count: i64,
     pub min_timestamp: f64,
     pub max_timestamp: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TimelineTurn {
+    pub id: String,
+    pub session_id: String,
+    pub tool: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp_epoch: f64,
+    pub source_path: Option<String>,
+}
+
+impl From<&StoredTurn> for TimelineTurn {
+    fn from(turn: &StoredTurn) -> Self {
+        Self {
+            id: turn.id.clone(),
+            session_id: turn.session_id.clone(),
+            tool: turn.tool.as_str().to_string(),
+            role: turn.role.as_str().to_string(),
+            content: turn.content.clone(),
+            timestamp_epoch: turn.timestamp_epoch,
+            source_path: turn.source_path.clone(),
+        }
+    }
+}
+
+pub fn timeline_json_turns(turns: &[StoredTurn]) -> Vec<TimelineTurn> {
+    turns.iter().map(TimelineTurn::from).collect()
+}
+
+pub fn format_timeline_header(turn: &StoredTurn) -> String {
+    let ts = crate::xurl::search::format_timestamp(turn.timestamp_epoch);
+    let mut header = format!(
+        "**[{}]** `{}` · {} · {}",
+        turn.tool.as_str(),
+        turn.session_id,
+        ts,
+        turn.role.as_str()
+    );
+    if let Some(ref path) = turn.source_path {
+        header.push_str(" · ");
+        header.push_str(path);
+    }
+    header
 }
 
 /// Generate a deterministic turn ID from the natural key fields.
