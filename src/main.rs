@@ -8628,20 +8628,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             .context("xurl timeline query failed")?;
 
             if format == "json" {
-                // Serialize as JSON array of simplified objects
-                let json_turns: Vec<serde_json::Value> = turns
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "id": t.id,
-                            "session_id": t.session_id,
-                            "tool": t.tool.as_str(),
-                            "role": t.role.as_str(),
-                            "content": t.content,
-                            "timestamp_epoch": t.timestamp_epoch,
-                        })
-                    })
-                    .collect();
+                let json_turns = mempal::xurl::store::timeline_json_turns(&turns);
                 println!(
                     "{}",
                     serde_json::to_string(&json_turns).context("json serialize")?
@@ -8651,15 +8638,8 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                     println!("No turns found.");
                 } else {
                     for t in &turns {
-                        let ts = mempal::xurl::search::format_timestamp(t.timestamp_epoch);
                         println!("---");
-                        println!(
-                            "**[{}]** `{}` · {} · {}",
-                            t.tool.as_str(),
-                            t.session_id,
-                            ts,
-                            t.role.as_str()
-                        );
+                        println!("{}", mempal::xurl::store::format_timeline_header(t));
                         println!();
                         let preview = char_safe_preview(&t.content, 300);
                         println!("{}", preview.trim());

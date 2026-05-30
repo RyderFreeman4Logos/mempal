@@ -2,6 +2,9 @@ use mempal::core::db::Database;
 use mempal::xurl::model::{Provenance, RawTurn, Role, Tool};
 use mempal::xurl::store::{self, TurnFilter};
 use rusqlite::params;
+use serde_json::Value;
+use std::path::Path;
+use std::process::{Command, Output};
 use tempfile::TempDir;
 
 // ── test DB helper ────────────────────────────────────────────────────────────
@@ -27,6 +30,25 @@ fn open_temp_db() -> TestDb {
     }
 }
 
+fn mempal_bin() -> String {
+    env!("CARGO_BIN_EXE_mempal").to_string()
+}
+
+fn open_home_db(home: &Path) -> Database {
+    let mempal_home = home.join(".mempal");
+    std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+    Database::open(&mempal_home.join("palace.db")).expect("open home db")
+}
+
+fn run_xurl_timeline(home: &Path, args: &[&str]) -> Output {
+    Command::new(mempal_bin())
+        .args(["xurl", "timeline"])
+        .args(args)
+        .env("HOME", home)
+        .output()
+        .expect("run mempal xurl timeline")
+}
+
 // ── fixture helpers ───────────────────────────────────────────────────────────
 
 struct RawTurnRow<'a> {
@@ -41,23 +63,50 @@ struct RawTurnRow<'a> {
 
 /// Insert a raw turn row directly into conversation_turns (bypasses store logic).
 fn insert_raw_turn(db: &TestDb, row: RawTurnRow<'_>) {
-    db.conn()
-        .execute(
-            "INSERT INTO conversation_turns \
-             (id, session_id, tool, turn_index, role, content, timestamp_epoch, \
-              token_count, project_path, git_branch, is_csa_delegated, provenance) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,NULL,NULL,0,'human')",
-            params![
-                row.id,
-                row.session_id,
-                row.tool,
-                row.turn_index,
-                row.role,
-                row.content,
-                row.timestamp_epoch
-            ],
-        )
-        .expect("insert raw turn");
+    insert_raw_turn_with_project_path(db.conn(), row, None);
+}
+
+fn insert_raw_turn_with_project_path(
+    conn: &rusqlite::Connection,
+    row: RawTurnRow<'_>,
+    project_path: Option<&str>,
+) {
+    conn.execute(
+        "INSERT INTO conversation_turns \
+         (id, session_id, tool, turn_index, role, content, timestamp_epoch, \
+          token_count, project_path, git_branch, is_csa_delegated, provenance) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,NULL,0,'human')",
+        params![
+            row.id,
+            row.session_id,
+            row.tool,
+            row.turn_index,
+            row.role,
+            row.content,
+            row.timestamp_epoch,
+            project_path,
+        ],
+    )
+    .expect("insert raw turn");
+}
+
+fn insert_home_turn(db: &Database, row: RawTurnRow<'_>, project_path: Option<&str>) {
+    insert_raw_turn_with_project_path(db.conn(), row, project_path);
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8(output.stdout.clone()).expect("stdout utf8")
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8(output.stderr.clone()).expect("stderr utf8")
+}
+
+fn json_turn_by_id<'a>(turns: &'a [Value], id: &str) -> &'a Value {
+    turns
+        .iter()
+        .find(|turn| turn["id"] == id)
+        .unwrap_or_else(|| panic!("missing turn {id}: {turns:?}"))
 }
 
 fn make_raw_turn(
@@ -83,6 +132,123 @@ fn make_raw_turn(
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn timeline_json_includes_source_path_for_backfilled_and_null_turns() {
+    let home = TempDir::new().expect("home");
+    let db = open_home_db(home.path());
+    insert_home_turn(
+        &db,
+        RawTurnRow {
+            id: "with-source",
+            session_id: "with-project",
+            tool: "cc",
+            turn_index: 0,
+            role: "user",
+            content: "turn with project path",
+            timestamp_epoch: 2_000.0,
+        },
+        Some("/repo/with-project"),
+    );
+    insert_home_turn(
+        &db,
+        RawTurnRow {
+            id: "without-source",
+            session_id: "without-project",
+            tool: "cc",
+            turn_index: 1,
+            role: "assistant",
+            content: "turn without project path",
+            timestamp_epoch: 1_000.0,
+        },
+        None,
+    );
+
+    let output = run_xurl_timeline(home.path(), &["--format", "json", "--limit", "10"]);
+    assert!(
+        output.status.success(),
+        "timeline json failed: {}",
+        stderr(&output)
+    );
+    let turns: Vec<Value> = serde_json::from_str(&stdout(&output)).expect("timeline json");
+
+    let with_source = json_turn_by_id(&turns, "with-source");
+    assert_eq!(
+        with_source["source_path"],
+        Value::String("/repo/with-project".to_string())
+    );
+    let without_source = json_turn_by_id(&turns, "without-source");
+    assert!(
+        without_source["source_path"].is_null(),
+        "source_path must be JSON null for unbackfilled turns: {without_source}"
+    );
+}
+
+#[test]
+fn timeline_markdown_shows_source_path_segment_only_when_present() {
+    let home = TempDir::new().expect("home");
+    let db = open_home_db(home.path());
+    insert_home_turn(
+        &db,
+        RawTurnRow {
+            id: "with-source",
+            session_id: "with-project",
+            tool: "cc",
+            turn_index: 0,
+            role: "user",
+            content: "turn with project path",
+            timestamp_epoch: 2_000.0,
+        },
+        Some("/repo/with-project"),
+    );
+    insert_home_turn(
+        &db,
+        RawTurnRow {
+            id: "without-source",
+            session_id: "without-project",
+            tool: "cc",
+            turn_index: 1,
+            role: "assistant",
+            content: "turn without project path",
+            timestamp_epoch: 1_000.0,
+        },
+        None,
+    );
+
+    let output = run_xurl_timeline(home.path(), &["--limit", "10"]);
+    assert!(
+        output.status.success(),
+        "timeline markdown failed: {}",
+        stderr(&output)
+    );
+    let markdown = stdout(&output);
+    let with_header = markdown
+        .lines()
+        .find(|line| line.contains("with-project"))
+        .expect("with-project header");
+    assert!(
+        with_header.contains(" · /repo/with-project"),
+        "expected provenance segment in header: {with_header}"
+    );
+
+    let without_header = markdown
+        .lines()
+        .find(|line| line.contains("without-project"))
+        .expect("without-project header");
+    assert!(
+        !without_header.contains("null"),
+        "NULL project_path must not be printed: {without_header}"
+    );
+    assert!(
+        !without_header.ends_with(" · "),
+        "NULL project_path must not leave a dangling separator: {without_header}"
+    );
+    assert_eq!(
+        without_header.matches(" · ").count(),
+        2,
+        "NULL header should only contain session/timestamp/role separators: {without_header}"
+    );
+}
 
 #[test]
 fn timeline_returns_newest_first() {
