@@ -51,6 +51,59 @@ impl Embedder for MockEmbedder {
     }
 }
 
+/// An embedder that records how many times `embed()` is called, the total
+/// number of chunks embedded, and the largest single call — used to prove that
+/// chunks are merged ACROSS turns into a few sub-batch calls rather than one
+/// HTTP round-trip per turn.
+struct CountingEmbedder {
+    dim: usize,
+    calls: std::sync::atomic::AtomicUsize,
+    total_inputs: std::sync::atomic::AtomicUsize,
+    max_call_len: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingEmbedder {
+    fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            total_inputs: std::sync::atomic::AtomicUsize::new(0),
+            max_call_len: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn total_inputs(&self) -> usize {
+        self.total_inputs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn max_call_len(&self) -> usize {
+        self.max_call_len.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedder for CountingEmbedder {
+    async fn embed(&self, texts: &[&str]) -> mempal::embed::Result<Vec<Vec<f32>>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.calls.fetch_add(1, Relaxed);
+        self.total_inputs.fetch_add(texts.len(), Relaxed);
+        self.max_call_len.fetch_max(texts.len(), Relaxed);
+        Ok(texts.iter().map(|_| vec![0.1f32; self.dim]).collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dim
+    }
+
+    fn name(&self) -> &str {
+        "counting"
+    }
+}
+
 /// Minimal description of a turn row for test fixtures.
 struct TurnRow<'a> {
     id: &'a str,
@@ -284,4 +337,164 @@ async fn test_embed_batch_progress() {
         )
         .expect("count indexed turns");
     assert_eq!(indexed_count, 120, "all 120 turns should have vectors");
+}
+
+/// Batching proof (issue #258): chunks from many turns are merged into a few
+/// sub-batch `embed()` calls — `ceil(total_chunks / EMBED_MAX_CHUNKS_PER_CALL)` —
+/// NOT one call per turn. Uses several long turns whose combined chunk count
+/// exceeds the per-call cap so the sub-batch split is exercised.
+#[tokio::test]
+async fn test_embed_batches_chunks_across_turns() {
+    let db = open_temp_db_at_fork_ext(16);
+
+    // 10 long turns sit in a single EMBED_BATCH_SIZE (50) window. Each ~30K
+    // chars → ~25 chunks, so the window holds well over the 128 per-call cap.
+    let n_turns = 10usize;
+    let long_content = "word ".repeat(6000);
+    for i in 0..n_turns {
+        insert_raw_turn_row(
+            db.conn(),
+            TurnRow {
+                id: &format!("turn-cb-{i:02}"),
+                session: "sess-cb",
+                tool: "cc",
+                turn_index: i as i64,
+                role: "assistant",
+                content: &long_content,
+                timestamp: i as f64,
+                token_count: None,
+            },
+        );
+    }
+
+    let embedder = CountingEmbedder::new(64);
+    let stats = embed::embed_unindexed_turns(&db.inner, &embedder, None)
+        .await
+        .expect("embed should succeed");
+
+    let cap = embed::EMBED_MAX_CHUNKS_PER_CALL;
+    let total_chunks = embedder.total_inputs();
+
+    assert_eq!(stats.turns_processed, n_turns, "all turns processed");
+    assert_eq!(
+        total_chunks, stats.chunks_total,
+        "embedder should see every produced chunk exactly once"
+    );
+    assert!(
+        total_chunks > cap,
+        "test must produce more than one sub-batch worth of chunks; got {total_chunks} (cap {cap})"
+    );
+    assert_eq!(
+        embedder.calls(),
+        total_chunks.div_ceil(cap),
+        "embed() calls must equal ceil(total_chunks / cap), proving cross-turn merge"
+    );
+    assert!(
+        embedder.calls() < n_turns,
+        "must NOT be one embed() call per turn ({} calls for {n_turns} turns)",
+        embedder.calls()
+    );
+    assert!(
+        embedder.max_call_len() <= cap,
+        "no single embed() call may exceed the per-call cap"
+    );
+}
+
+/// Scope proof (issue #258): a scoped embed touches only the requested turns.
+/// A pre-seeded unindexed turn from session A stays unindexed while a scoped
+/// embed for session B's turn indexes only B.
+#[tokio::test]
+async fn test_embed_scope_isolates_other_sessions() {
+    let db = open_temp_db_at_fork_ext(16);
+
+    insert_raw_turn_row(
+        db.conn(),
+        TurnRow {
+            id: "turn-A",
+            session: "sessA",
+            tool: "cc",
+            turn_index: 0,
+            role: "user",
+            content: "alpha content from session A",
+            timestamp: 1.0,
+            token_count: None,
+        },
+    );
+    insert_raw_turn_row(
+        db.conn(),
+        TurnRow {
+            id: "turn-B",
+            session: "sessB",
+            tool: "cc",
+            turn_index: 0,
+            role: "user",
+            content: "bravo content from session B",
+            timestamp: 2.0,
+            token_count: None,
+        },
+    );
+
+    let embedder = MockEmbedder::new_fixed_dim(64);
+    let scope = vec!["turn-B".to_string()];
+    let stats = embed::embed_unindexed_turns_scoped(&db.inner, &embedder, &scope, None)
+        .await
+        .expect("scoped embed should succeed");
+    assert_eq!(
+        stats.turns_processed, 1,
+        "only the scoped turn should be processed"
+    );
+
+    let a_vectors: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM conversation_turn_vectors WHERE turn_id=?",
+            params!["turn-A"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let b_vectors: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM conversation_turn_vectors WHERE turn_id=?",
+            params!["turn-B"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(a_vectors, 0, "session A turn must remain unindexed");
+    assert!(b_vectors >= 1, "session B turn must be indexed");
+}
+
+/// Backlog drain proof (issue #258): the unscoped path that `xurl reindex`
+/// wires to embeds every remaining unindexed turn.
+#[tokio::test]
+async fn test_reindex_path_drains_all_unindexed() {
+    let db = open_temp_db_at_fork_ext(16);
+
+    for i in 0..30usize {
+        insert_raw_turn_row(
+            db.conn(),
+            TurnRow {
+                id: &format!("turn-bl-{i:02}"),
+                session: "sess-bl",
+                tool: "cc",
+                turn_index: i as i64,
+                role: "user",
+                content: &format!("backlog turn {i}"),
+                timestamp: i as f64,
+                token_count: None,
+            },
+        );
+    }
+
+    let before = mempal::xurl::store::count_unindexed_turns(db.conn()).unwrap();
+    assert_eq!(before, 30, "all 30 turns start unindexed");
+
+    let embedder = MockEmbedder::new_fixed_dim(32);
+    let stats = embed::embed_unindexed_turns(&db.inner, &embedder, None)
+        .await
+        .expect("reindex drain should succeed");
+    assert_eq!(stats.turns_processed, 30, "drain must process every turn");
+
+    let after = mempal::xurl::store::count_unindexed_turns(db.conn()).unwrap();
+    assert_eq!(after, 0, "reindex must drain the entire backlog");
 }

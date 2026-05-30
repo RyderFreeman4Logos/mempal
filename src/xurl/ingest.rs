@@ -59,13 +59,15 @@ fn home_dir() -> PathBuf {
 
 /// Parse a file and insert turns into the DB. Does not embed.
 ///
-/// Returns `(filename, turns_parsed, insert_stats)`.
+/// Returns `(filename, turns_parsed, insert_stats, turn_ids)` where `turn_ids`
+/// are the deterministic IDs of every parsed turn — used to scope a single-file
+/// embed pass to just this file's turns.
 fn parse_and_store_file(
     db: &Database,
     path: &Path,
     tool: Tool,
     session_id_override: Option<&str>,
-) -> XurlResult<(String, usize, store::InsertStats)> {
+) -> XurlResult<(String, usize, store::InsertStats, Vec<String>)> {
     let fallback = session_id_override.map(str::to_string).unwrap_or_else(|| {
         path.file_stem()
             .and_then(|s| s.to_str())
@@ -96,14 +98,15 @@ fn parse_and_store_file(
         .unwrap_or("unknown")
         .to_string();
     let turns_parsed = turns.len();
+    let turn_ids: Vec<String> = turns.iter().map(store::turn_id_for).collect();
     let insert_stats = store::insert_turns(db.conn(), &turns)?;
-    Ok((filename, turns_parsed, insert_stats))
+    Ok((filename, turns_parsed, insert_stats, turn_ids))
 }
 
 /// Ingest a single file (or SQLite DB for Hermes) and embed any newly inserted turns.
 ///
 /// `on_file_parsed` is called after parsing with `(filename, turns_parsed)`.
-/// `on_embed_progress` is forwarded to `embed_unindexed_turns` after parsing.
+/// `on_embed_progress` is forwarded to the scoped embed pass after parsing.
 pub async fn ingest_file<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,
@@ -113,12 +116,15 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
     on_file_parsed: ParsedCb<'_>,
     on_embed_progress: EmbedCb<'_>,
 ) -> XurlResult<IngestStats> {
-    let (filename, turns_parsed, insert_stats) =
+    let (filename, turns_parsed, insert_stats, turn_ids) =
         parse_and_store_file(db, path, tool, session_id_override)?;
     if let Some(f) = on_file_parsed {
         f(&filename, turns_parsed);
     }
-    let embed_stats = embed::embed_unindexed_turns(db, embedder, on_embed_progress).await?;
+    // Scope the embed pass to just this file's turns so a single-file ingest
+    // returns promptly instead of draining the entire historical backlog.
+    let embed_stats =
+        embed::embed_unindexed_turns_scoped(db, embedder, &turn_ids, on_embed_progress).await?;
 
     Ok(IngestStats {
         turns_parsed,
@@ -149,7 +155,7 @@ pub async fn ingest_all<E: Embedder + ?Sized>(
     // Phase 1: parse and store all files (no embedding yet).
     if cfg.cc_root.exists() {
         for path in collect_files_with_ext(&cfg.cc_root, "jsonl") {
-            let (filename, turns_parsed, insert_stats) =
+            let (filename, turns_parsed, insert_stats, _turn_ids) =
                 parse_and_store_file(db, &path, Tool::Cc, None)?;
             total.turns_parsed += turns_parsed;
             total.turns_inserted += insert_stats.inserted;
@@ -168,7 +174,7 @@ pub async fn ingest_all<E: Embedder + ?Sized>(
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
             if name.starts_with("rollout-") {
-                let (filename, turns_parsed, insert_stats) =
+                let (filename, turns_parsed, insert_stats, _turn_ids) =
                     parse_and_store_file(db, &path, Tool::Codex, None)?;
                 total.turns_parsed += turns_parsed;
                 total.turns_inserted += insert_stats.inserted;
@@ -183,7 +189,7 @@ pub async fn ingest_all<E: Embedder + ?Sized>(
 
     if let Some(hermes_path) = &cfg.hermes_db {
         if hermes_path.exists() {
-            let (filename, turns_parsed, insert_stats) =
+            let (filename, turns_parsed, insert_stats, _turn_ids) =
                 parse_and_store_file(db, hermes_path, Tool::Hermes, None)?;
             total.turns_parsed += turns_parsed;
             total.turns_inserted += insert_stats.inserted;

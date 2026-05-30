@@ -55,6 +55,28 @@ fn generate_turn_id(session_id: &str, tool: &str, turn_index: u32) -> String {
     format!("turn_{}", &digest[..16])
 }
 
+/// Deterministic turn ID for a raw turn, matching the key `insert_turns` uses.
+///
+/// Lets callers (e.g. a single-file ingest) compute the IDs of just-stored
+/// turns so the embed pass can be scoped to them without re-scanning the table.
+pub fn turn_id_for(turn: &RawTurn) -> String {
+    generate_turn_id(&turn.session_id, turn.tool.as_str(), turn.turn_index)
+}
+
+/// Count turns that still lack a vector (no row in `conversation_turn_vectors`).
+/// Surfaced by `xurl stats` so the recall gap is visible.
+pub fn count_unindexed_turns(conn: &Connection) -> XurlResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) \
+         FROM conversation_turns ct \
+         LEFT JOIN conversation_turn_vectors ctv ON ctv.turn_id = ct.id AND ctv.chunk_index = 0 \
+         WHERE ctv.turn_id IS NULL",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(XurlError::Database)
+}
+
 fn parse_tool(s: &str) -> Option<Tool> {
     match s {
         "cc" => Some(Tool::Cc),
