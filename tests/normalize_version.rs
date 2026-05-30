@@ -703,3 +703,89 @@ fn test_replace_clears_triple_source_drawer_fk() {
         "source_drawer must be cleared after the referenced drawer is deleted"
     );
 }
+
+// Regression: `purge_deleted` clears triples.source_drawer before the hard
+// delete, but another RESTRICT FK (knowledge_evidence_links.evidence_drawer_id)
+// can block the drawer delete. The purge must be atomic — a blocked delete must
+// roll back the source_drawer NULL, never silently dropping provenance for a
+// drawer that was not actually purged.
+#[test]
+fn test_purge_blocked_by_evidence_link_keeps_triple_source_drawer() {
+    use mempal::core::types::{
+        AnchorKind, KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus,
+        KnowledgeTier, MemoryDomain, Triple,
+    };
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+
+    insert_source_drawer(&db, "drawer_evidence", "docs/z.md", None);
+    db.insert_triple(&Triple {
+        id: "triple_prov".to_string(),
+        subject: "drawer_evidence".to_string(),
+        predicate: "supports".to_string(),
+        object: "claim".to_string(),
+        valid_from: None,
+        valid_to: None,
+        confidence: 1.0,
+        source_drawer: Some("drawer_evidence".to_string()),
+    })
+    .expect("insert triple");
+
+    db.insert_knowledge_card(&KnowledgeCard {
+        id: "card_x".to_string(),
+        statement: "stmt".to_string(),
+        content: "content".to_string(),
+        tier: KnowledgeTier::Qi,
+        status: KnowledgeStatus::Candidate,
+        domain: MemoryDomain::Project,
+        field: "general".to_string(),
+        anchor_kind: AnchorKind::Repo,
+        anchor_id: "repo://test".to_string(),
+        parent_anchor_id: None,
+        scope_constraints: None,
+        trigger_hints: None,
+        created_at: "1710000000".to_string(),
+        updated_at: "1710000000".to_string(),
+    })
+    .expect("insert card");
+    // Link the card to the drawer: this installs the RESTRICT FK that will block
+    // a later hard delete of the drawer. Must happen while the drawer is active.
+    db.insert_knowledge_evidence_link(&KnowledgeEvidenceLink {
+        id: "link_x".to_string(),
+        card_id: "card_x".to_string(),
+        evidence_drawer_id: "drawer_evidence".to_string(),
+        role: KnowledgeEvidenceRole::Supporting,
+        note: None,
+        created_at: "1710000000".to_string(),
+    })
+    .expect("insert evidence link");
+
+    assert!(
+        db.soft_delete_drawer("drawer_evidence")
+            .expect("soft delete"),
+        "drawer should be soft-deleted so it becomes a purge candidate"
+    );
+
+    // purge must fail because the evidence link FK (RESTRICT) blocks the delete.
+    let purge = db.purge_deleted(None);
+    assert!(
+        purge.is_err(),
+        "purge must fail when an evidence link blocks the hard delete"
+    );
+
+    // Atomicity: the blocked delete must have rolled back the source_drawer NULL.
+    let source_drawer: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT source_drawer FROM triples WHERE id = ?1",
+            ["triple_prov"],
+            |row| row.get(0),
+        )
+        .expect("triple still exists");
+    assert_eq!(
+        source_drawer,
+        Some("drawer_evidence".to_string()),
+        "a blocked purge must not strip triple provenance (transaction must roll back)"
+    );
+}

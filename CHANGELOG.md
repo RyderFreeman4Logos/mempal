@@ -6,6 +6,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR bumps introduce new features, PATCH bumps are bug-fix only).
 
+## [0.5.4] — 2026-05-30
+
+Bug-fix release. **`purge_deleted` could silently drop triple provenance when a
+hard delete was blocked by another foreign key** (a non-atomic edge case left by
+0.5.3's FK fix).
+
+### Fixed
+
+- **`purge_deleted` is now atomic.** 0.5.3 cleared `triples.source_drawer` before
+  hard-deleting a drawer, but `purge_deleted` ran each statement outside a
+  transaction. If the subsequent `DELETE FROM drawers` was blocked by another
+  `RESTRICT` foreign key — e.g. `knowledge_evidence_links.evidence_drawer_id`,
+  which protects a card's evidence — the `source_drawer = NULL` had already
+  committed, silently dropping KG provenance for a drawer that was never purged.
+  The purge loop is now wrapped in `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`, so
+  a blocked delete rolls back the NULL too. The reindex replace path was already
+  transactional and unaffected. Adds a regression test that blocks a purge with
+  an evidence link and asserts the triple provenance survives.
+
 ## [0.5.3] — 2026-05-29
 
 Bug-fix release. **Reindex/purge crashed when deleting a drawer referenced by a
@@ -252,6 +271,7 @@ P8) on top of hybrid search and the knowledge graph.
 Earlier releases (0.1.x, 0.2.x) are tracked only in Git history. Run
 `git log --oneline` on the repository to inspect them.
 
+[0.5.4]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.4
 [0.5.3]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.3
 [0.5.2]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.2
 [0.5.1]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.1

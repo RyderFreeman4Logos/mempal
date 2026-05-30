@@ -1303,23 +1303,42 @@ impl Database {
             |row| row.get(0),
         )?;
 
-        for id in &ids {
-            if vectors_exist {
+        // Wrap the purge in a single transaction. Clearing the
+        // triples.source_drawer FK and deleting the drawer must be atomic:
+        // another RESTRICT FK (e.g. knowledge_evidence_links.evidence_drawer_id)
+        // can block `DELETE FROM drawers`, and without a transaction the prior
+        // `UPDATE triples SET source_drawer = NULL` would have already committed
+        // — silently dropping provenance for a drawer that was not purged.
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<u64, DbError> {
+            for id in &ids {
+                if vectors_exist {
+                    self.conn
+                        .execute("DELETE FROM drawer_vectors WHERE id = ?1", [id])?;
+                }
+                // Clear the triples.source_drawer FK (RESTRICT) before the hard
+                // delete so purging a soft-deleted drawer referenced by a KG
+                // triple does not fail with a FOREIGN KEY constraint error.
+                self.conn.execute(
+                    "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
+                    [id],
+                )?;
                 self.conn
-                    .execute("DELETE FROM drawer_vectors WHERE id = ?1", [id])?;
+                    .execute("DELETE FROM drawers WHERE id = ?1", [id])?;
             }
-            // Clear the triples.source_drawer FK (RESTRICT) before the hard
-            // delete so purging a soft-deleted drawer referenced by a KG triple
-            // does not fail with a FOREIGN KEY constraint error.
-            self.conn.execute(
-                "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
-                [id],
-            )?;
-            self.conn
-                .execute("DELETE FROM drawers WHERE id = ?1", [id])?;
-        }
+            Ok(ids.len() as u64)
+        })();
 
-        Ok(ids.len() as u64)
+        match result {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(count)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
     }
 
     pub fn deleted_drawer_count(&self) -> Result<i64, DbError> {
