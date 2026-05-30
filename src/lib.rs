@@ -12,6 +12,7 @@ pub mod cowork;
 pub mod crystallize;
 pub mod daemon;
 pub mod daemon_bootstrap;
+pub mod daemon_singleton;
 pub mod doctor;
 pub mod embed;
 pub mod endpoint_health;
