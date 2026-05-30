@@ -48,7 +48,17 @@ pub fn run_command_with_bootstrap_events(
     bootstrap_events: Option<mpsc::Sender<BootstrapEvent>>,
 ) -> Result<()> {
     // harness-point: PR0
-    let context = DaemonContext::bootstrap_with_events(config_path, foreground, bootstrap_events)?;
+    let context =
+        match DaemonContext::bootstrap_with_events(config_path, foreground, bootstrap_events) {
+            Ok(context) => context,
+            // A concurrent daemon already holds the singleton lock (#257): this is
+            // a clean no-op, not a failure. Exit success without daemonizing.
+            Err(error) if error.is::<crate::daemon_singleton::DaemonAlreadyRunning>() => {
+                eprintln!("daemon already running; exiting");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
     context.runtime.block_on(run_loop(&context))
 }
 

@@ -8870,29 +8870,69 @@ fn run_daemon_start(config_path: PathBuf, foreground: bool) -> Result<()> {
 fn run_daemon_stop(db_path: &Path) -> Result<()> {
     use std::time::{Duration, Instant};
 
-    let pid = read_daemon_pid(db_path)?
-        .ok_or_else(|| anyhow::anyhow!("daemon is not running (no pid file)"))?;
-    if !process_is_running(pid)? {
+    // Reap EVERY live `mempal daemon` sibling, not just the pidfile PID (#257).
+    // Orphans (e.g. a race-duplicate that outlived its pidfile) are only
+    // visible through a /proc enumeration of the daemon's own argv.
+    let binary =
+        mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
+    let mut targets = mempal::daemon_singleton::enumerate_daemon_pids(&binary);
+
+    // Defensively include the pidfile PID if it is live but escaped the scan
+    // (e.g. a transient /proc read race), so stop never misses it.
+    if let Some(pid) = read_daemon_pid(db_path)?
+        && process_is_running(pid)?
+        && !targets.contains(&pid)
+    {
+        targets.push(pid);
+    }
+
+    if targets.is_empty() {
         if let Some(mempal_home) = db_path.parent() {
             let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
         }
-        bail!("daemon is not running (stale pid {pid})");
+        bail!("daemon is not running");
     }
-    // SAFETY: kill(2) with SIGTERM is safe; we only write the signal number.
-    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-    if rc != 0 {
-        let error = std::io::Error::last_os_error();
-        bail!("failed to send SIGTERM to daemon (pid {pid}): {error}");
+
+    let reaped = targets.len();
+    for pid in &targets {
+        // SAFETY: kill(2) with SIGTERM only writes the signal number. ESRCH
+        // (the process already exited between enumeration and now) is benign.
+        let rc = unsafe { libc::kill(*pid, libc::SIGTERM) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                bail!("failed to send SIGTERM to daemon (pid {pid}): {error}");
+            }
+        }
     }
+
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut remaining = targets.clone();
     while Instant::now() < deadline {
-        if !process_is_running(pid)? {
-            println!("daemon stopped");
-            return Ok(());
+        remaining.retain(|pid| process_is_running(*pid).unwrap_or(false));
+        if remaining.is_empty() {
+            break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    bail!("daemon (pid {pid}) did not exit within 30s")
+    if !remaining.is_empty() {
+        let pids = remaining
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("daemon(s) did not exit within 30s: {pids}");
+    }
+
+    if let Some(mempal_home) = db_path.parent() {
+        let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
+    }
+    if reaped > 1 {
+        println!("daemon stopped ({reaped} processes reaped)");
+    } else {
+        println!("daemon stopped");
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -8917,9 +8957,20 @@ fn run_daemon_restart(config_path: PathBuf) -> Result<()> {
 }
 
 fn run_daemon_status(db_path: &Path) -> Result<()> {
+    // Enumerate ALL live `mempal daemon` siblings so status reports the true
+    // process count and can warn on duplicates the single pidfile PID hides
+    // (#257). The scan excludes this `daemon status` process itself.
+    let binary =
+        mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
+    let siblings = mempal::daemon_singleton::enumerate_daemon_pids(&binary);
+
     match read_daemon_pid(db_path)? {
         None => {
-            println!("status: stopped");
+            if siblings.is_empty() {
+                println!("status: stopped");
+            } else {
+                println!("status: running (no pid file; orphaned daemon)");
+            }
         }
         Some(pid) => {
             if process_is_running(pid)? {
@@ -8942,10 +8993,30 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
                         println!("queue.failed: {}", stats.failed);
                     }
                 }
-            } else {
+            } else if siblings.is_empty() {
                 println!("status: stopped (stale pid file, pid {pid} not running)");
+            } else {
+                println!(
+                    "status: running (stale pid file, pid {pid} not running; orphaned daemon)"
+                );
             }
         }
+    }
+
+    if !siblings.is_empty() {
+        let pids = siblings
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("live_daemons: {}", siblings.len());
+        println!("daemon_pids: {pids}");
+    }
+    if siblings.len() > 1 {
+        println!(
+            "warning: {} duplicate daemon processes detected (expected 1); run `mempal daemon stop` to reap orphans",
+            siblings.len()
+        );
     }
     Ok(())
 }

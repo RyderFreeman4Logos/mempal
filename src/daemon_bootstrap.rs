@@ -49,7 +49,11 @@ pub struct DaemonContext {
     pub config: std::sync::Arc<crate::core::config::Config>,
     pub mempal_home: PathBuf,
     pub log_path: PathBuf,
+    // Drop order matters: remove the pidfile (pid_guard) BEFORE releasing the
+    // singleton lock (lock_guard), so a successor that wins the lock never
+    // observes a stale pidfile pointing at the just-stopped daemon.
     _pid_guard: PidFileGuard,
+    _lock_guard: crate::daemon_singleton::DaemonLockGuard,
 }
 
 impl DaemonWriteObserver {
@@ -184,6 +188,23 @@ fn bootstrap_inner(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
+    // Atomic singleton gate (#257): acquire the exclusive daemon lock BEFORE
+    // daemonizing. A race loser that cannot get the lock concludes a healthy
+    // daemon already holds it and returns `DaemonAlreadyRunning` so the caller
+    // can exit cleanly WITHOUT daemonizing. The lock's open file description
+    // survives the double-fork in `perform_daemonize`, keeping the singleton
+    // guarantee through the daemon's whole lifetime.
+    let lock_guard = match crate::daemon_singleton::try_acquire(&mempal_home)
+        .context("failed to acquire daemon singleton lock")?
+    {
+        crate::daemon_singleton::DaemonLockAcquisition::Acquired(guard) => guard,
+        crate::daemon_singleton::DaemonLockAcquisition::AlreadyHeld => {
+            return Err(anyhow::Error::new(
+                crate::daemon_singleton::DaemonAlreadyRunning,
+            ));
+        }
+    };
+
     // harness-point: PR0
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::Daemonize);
     perform_daemonize(foreground, &mempal_home, &log_path)?;
@@ -227,6 +248,7 @@ fn bootstrap_inner(
         mempal_home,
         log_path,
         _pid_guard: pid_guard,
+        _lock_guard: lock_guard,
     })
 }
 
