@@ -1042,6 +1042,12 @@ enum XurlCommands {
     },
     /// Show per-tool turn counts and date ranges.
     Stats,
+    /// Embed all turns that still lack a vector (drains the historical backlog).
+    Reindex {
+        /// Print progress as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -8658,6 +8664,46 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 let first = mempal::xurl::search::format_timestamp(s.min_timestamp);
                 let last = mempal::xurl::search::format_timestamp(s.max_timestamp);
                 println!("| {:<6} | {:>5} | {} | {} |", s.tool, s.count, first, last);
+            }
+            let unindexed_remaining = mempal::xurl::store::count_unindexed_turns(db.conn())
+                .context("xurl unindexed count failed")?;
+            println!();
+            println!("unindexed_remaining: {unindexed_remaining}");
+            if unindexed_remaining > 0 {
+                println!("(run `mempal xurl reindex` to embed the backlog)");
+            }
+            Ok(())
+        }
+
+        XurlCommands::Reindex { json } => {
+            let embedder = build_embedder(config).await?;
+            let embed_cb = |done: usize, total: usize| {
+                if json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"phase":"embed","done":done,"total":total})
+                    );
+                } else {
+                    eprintln!("[embed] {done}/{total} turns vectorized");
+                }
+            };
+            let stats =
+                mempal::xurl::embed::embed_unindexed_turns(db, embedder.as_ref(), Some(&embed_cb))
+                    .await
+                    .context("xurl reindex failed")?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "turns_processed": stats.turns_processed,
+                        "chunks_total": stats.chunks_total,
+                        "vectors_created": stats.embedded,
+                    })
+                );
+            } else {
+                println!("turns processed: {}", stats.turns_processed);
+                println!("chunks total:    {}", stats.chunks_total);
+                println!("vectors created: {}", stats.embedded);
             }
             Ok(())
         }
