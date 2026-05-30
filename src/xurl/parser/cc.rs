@@ -135,7 +135,7 @@ fn extract_cwd(obj: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn extract_session_id(content: &str) -> Option<String> {
+pub(crate) fn extract_session_id(content: &str) -> Option<String> {
     for raw_line in content
         .lines()
         .map(str::trim)

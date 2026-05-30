@@ -1,3 +1,4 @@
+pub mod backfill;
 pub mod embed;
 pub mod ingest;
 pub mod model;

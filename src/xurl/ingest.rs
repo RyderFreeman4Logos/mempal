@@ -220,7 +220,7 @@ fn collect_files_with_ext(root: &Path, ext: &str) -> Vec<PathBuf> {
     out
 }
 
-fn decode_claude_project_path(path: &Path) -> Option<String> {
+pub(crate) fn decode_claude_project_path(path: &Path) -> Option<String> {
     let session_dir = path.parent()?;
     let projects_dir = session_dir.parent()?;
     if projects_dir.file_name().and_then(|name| name.to_str()) != Some("projects") {

@@ -1048,6 +1048,15 @@ enum XurlCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Backfill project_path for historical turns without re-ingesting content.
+    Backfill {
+        /// Show what would be updated without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -8715,6 +8724,46 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 println!("turns processed: {}", stats.turns_processed);
                 println!("chunks total:    {}", stats.chunks_total);
                 println!("vectors created: {}", stats.embedded);
+            }
+            Ok(())
+        }
+
+        XurlCommands::Backfill { dry_run, json } => {
+            let stats = mempal::xurl::backfill::backfill_project_paths(
+                db.conn(),
+                &mempal::xurl::backfill::BackfillSourceConfig::default(),
+                mempal::xurl::backfill::BackfillOptions {
+                    dry_run,
+                    batch_size: 1_000,
+                },
+            )
+            .context("xurl backfill failed")?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&stats).context("json serialize")?
+                );
+            } else {
+                println!("sessions scanned:       {}", stats.sessions_scanned);
+                if dry_run {
+                    println!("turns would fill:       {}", stats.turns_filled);
+                } else {
+                    println!("turns filled:           {}", stats.turns_filled);
+                }
+                println!("turns skipped no source: {}", stats.turns_skipped_no_source);
+                println!("turns already set:      {}", stats.turns_already_set);
+                println!("batches:                {}", stats.batches);
+                if !stats.by_project_path.is_empty() {
+                    println!();
+                    println!("| project_path | sessions | turns |");
+                    println!("|--------------|---------:|------:|");
+                    for (project_path, group) in &stats.by_project_path {
+                        println!(
+                            "| `{}` | {} | {} |",
+                            project_path, group.sessions, group.turns
+                        );
+                    }
+                }
             }
             Ok(())
         }

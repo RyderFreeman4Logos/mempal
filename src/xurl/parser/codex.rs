@@ -174,7 +174,7 @@ pub fn parse_codex_jsonl(
     Ok(turns)
 }
 
-fn extract_session_cwd(obj: &Value) -> Option<String> {
+pub(crate) fn extract_session_cwd(obj: &Value) -> Option<String> {
     obj.get("payload")
         .and_then(|p| p.get("cwd"))
         .or_else(|| obj.get("cwd"))
