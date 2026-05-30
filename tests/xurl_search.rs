@@ -3,6 +3,8 @@ use mempal::embed::Embedder;
 use mempal::xurl::model::{Provenance, RawTurn, Role, Tool};
 use mempal::xurl::search::{self, SearchOptions};
 use mempal::xurl::store::{self, TurnFilter};
+use std::path::Path;
+use std::process::{Command, Output};
 use tempfile::TempDir;
 
 // ── test DB helper ────────────────────────────────────────────────────────────
@@ -26,6 +28,23 @@ fn open_temp_db() -> TestDb {
         _dir: dir,
         inner: db,
     }
+}
+
+fn mempal_bin() -> String {
+    env!("CARGO_BIN_EXE_mempal").to_string()
+}
+
+fn run_xurl_search(home: &Path, args: &[&str]) -> Output {
+    Command::new(mempal_bin())
+        .args(["xurl", "search"])
+        .args(args)
+        .env("HOME", home)
+        .output()
+        .expect("run mempal xurl search")
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8(output.stderr.clone()).expect("stderr utf8")
 }
 
 // ── mock embedders ────────────────────────────────────────────────────────────
@@ -101,6 +120,23 @@ impl Embedder for SemanticEmbedder {
     }
 }
 
+struct AxisEmbedder;
+
+#[async_trait::async_trait]
+impl Embedder for AxisEmbedder {
+    async fn embed(&self, texts: &[&str]) -> mempal::embed::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        2
+    }
+
+    fn name(&self) -> &str {
+        "axis"
+    }
+}
+
 // ── fixture helpers ───────────────────────────────────────────────────────────
 
 fn make_turn(session_id: &str, tool: Tool, turn_index: u32, role: Role, content: &str) -> RawTurn {
@@ -135,7 +171,45 @@ async fn seed_turn<E: Embedder + ?Sized>(
         .unwrap();
 }
 
+fn seed_scored_turn(db: &TestDb, turn_index: u32, score: f32) -> String {
+    let content = format!("ranked search turn {turn_index}");
+    let turn = make_turn("paged-search", Tool::Cc, turn_index, Role::User, &content);
+    store::insert_turns(db.conn(), &[turn]).unwrap();
+    let turn_id: String = db
+        .conn()
+        .query_row(
+            "SELECT id FROM conversation_turns WHERE session_id='paged-search' AND turn_index=?1",
+            rusqlite::params![turn_index],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let y = (1.0 - score * score).sqrt();
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&score.to_le_bytes());
+    blob.extend_from_slice(&y.to_le_bytes());
+    db.conn()
+        .execute(
+            "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) VALUES (?1, 0, ?2)",
+            rusqlite::params![&turn_id, &blob],
+        )
+        .unwrap();
+    turn_id
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn search_rejects_invalid_format_at_parse_time() {
+    let home = TempDir::new().expect("home");
+    let output = run_xurl_search(home.path(), &["needle", "--format", "bogus"]);
+
+    assert!(!output.status.success(), "search format should fail");
+    let err = stderr(&output);
+    assert!(
+        err.contains("invalid value") && err.contains("markdown") && err.contains("json"),
+        "clap error should list valid formats, got: {err}"
+    );
+}
 
 #[tokio::test]
 async fn search_returns_semantically_relevant_turn() {
@@ -196,6 +270,60 @@ async fn search_returns_semantically_relevant_turn() {
         "top result should be database-related, got: {}",
         top.content
     );
+}
+
+#[tokio::test]
+async fn search_paginates_ranked_results_with_filter_offset() {
+    let db = open_temp_db();
+    let embedder = AxisEmbedder;
+    let ids = [
+        seed_scored_turn(&db, 0, 0.99),
+        seed_scored_turn(&db, 1, 0.90),
+        seed_scored_turn(&db, 2, 0.80),
+        seed_scored_turn(&db, 3, 0.70),
+        seed_scored_turn(&db, 4, 0.60),
+    ];
+
+    let page0 = search::search(
+        &db.inner,
+        &embedder,
+        "needle",
+        SearchOptions {
+            limit: 2,
+            filter: Some(TurnFilter {
+                limit: 2,
+                offset: 0,
+                ..Default::default()
+            }),
+            min_score: Some(0.0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let page1 = search::search(
+        &db.inner,
+        &embedder,
+        "needle",
+        SearchOptions {
+            limit: 2,
+            filter: Some(TurnFilter {
+                limit: 2,
+                offset: 2,
+                ..Default::default()
+            }),
+            min_score: Some(0.0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let page0_ids: Vec<&str> = page0.hits.iter().map(|hit| hit.turn_id.as_str()).collect();
+    let page1_ids: Vec<&str> = page1.hits.iter().map(|hit| hit.turn_id.as_str()).collect();
+    assert_eq!(page0_ids, vec![ids[0].as_str(), ids[1].as_str()]);
+    assert_eq!(page1_ids, vec![ids[2].as_str(), ids[3].as_str()]);
+    assert!(page0_ids.iter().all(|id| !page1_ids.contains(id)));
 }
 
 #[tokio::test]
