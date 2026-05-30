@@ -1124,9 +1124,26 @@ pub fn search_by_vector(
         return Ok(Vec::new());
     }
 
-    // When the candidate set fits within the sqlite-vec KNN limit, use
-    // the exact in-memory path regardless of scope mode -- this avoids
-    // approximate recall loss and sidesteps the 4096 KNN cap entirely.
+    // When the *filtered* candidate set (wing + room + project scope all
+    // applied by `build_filter_clause` above) fits within the sqlite-vec KNN
+    // limit, use the exact in-memory path regardless of scope mode. This is a
+    // deliberate recall-preserving choice, not a perf compromise:
+    //
+    //   - The exact path applies the FULL filter (wing/room/project) *before*
+    //     scoring, so it returns the true top-k over exactly the filtered set.
+    //   - The KNN path (`build_vector_search_sql`) pushes only `project_id`
+    //     into the vector CTE; `wing`/`room` are applied as a POST-filter on
+    //     the `k`-nearest window (filter.rs:47). A wing/room-scoped query whose
+    //     matching drawers fall outside the global k-nearest window would then
+    //     silently return fewer than top-k rows -- an approximate-recall loss.
+    //
+    // After the decorate-sort-undecorate fix in `search_by_vector_scoped_exact`
+    // the exact path costs one cosine evaluation per candidate (O(n)), so
+    // scoring up to 4096 candidates is milliseconds -- there is no longer a
+    // latency reason to prefer the approximate KNN path here. Flipping this
+    // gate to favor KNN for the common case is a recall-semantics change and
+    // must go through debate / orchestrator sign-off (see issue #250); do NOT
+    // change it as part of the perf fix.
     if candidate_count <= 4_096 {
         return search_by_vector_scoped_exact(
             db,
@@ -1235,7 +1252,7 @@ fn search_by_vector_scoped_exact(
         .conn()
         .prepare(&search_sql)
         .map_err(SearchError::PrepareSearch)?;
-    let mut rows = statement
+    let rows = statement
         .query_map(
             (
                 applied_wing,
@@ -1263,27 +1280,29 @@ fn search_by_vector_scoped_exact(
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(SearchError::CollectSearchRows)?;
 
-    rows.sort_by(|a, b| {
-        let a_distance = cosine_distance_from_blob(&a.0, &a.6, query_vector);
-        let b_distance = cosine_distance_from_blob(&b.0, &b.6, query_vector);
-        match (a_distance, b_distance) {
-            (Ok(left), Ok(right)) => left
-                .partial_cmp(&right)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Err(_)) => a.0.cmp(&b.0),
-        }
+    // Decorate-sort-undecorate: score every candidate exactly once (O(n) cosine
+    // evaluations) instead of recomputing the distance inside the O(n log n)
+    // sort comparator (which previously did ~2 decodes per comparison plus a
+    // third decode in the result-building map). The query L2 norm is computed a
+    // single time and shared across all candidates.
+    let query_norm = l2_norm(query_vector);
+    let ranked = rank_exact_candidates(rows, top_k as usize, |drawer_id, embedding| {
+        cosine_distance_from_blob_with_norm(drawer_id, embedding, query_vector, query_norm)
     });
 
-    let results = rows
+    let results = ranked
         .into_iter()
-        .take(top_k as usize)
         .map(
-            |(drawer_id, content, wing, room, source_file, row_project_id, embedding)| {
-                let distance = cosine_distance_from_blob(&drawer_id, &embedding, query_vector)?;
+            |(
+                distance,
+                (drawer_id, content, wing, room, source_file, row_project_id, _embedding),
+            )| {
+                // Reuse the distance computed during ranking; never re-decode the
+                // blob. Invalid-blob candidates carry an `Err` here and propagate
+                // exactly as the legacy path did when one entered the top-k.
+                let distance = distance?;
                 Ok(SearchResult {
-                    drawer_id: drawer_id.clone(),
+                    drawer_id,
                     content,
                     wing,
                     room,
@@ -1320,10 +1339,89 @@ fn search_by_vector_scoped_exact(
         .collect())
 }
 
-fn cosine_distance_from_blob(
+/// Candidate row pulled from the exact (brute-force) vector path: the joined
+/// drawer columns plus the raw little-endian `f32` embedding blob, before any
+/// scoring. Carried verbatim through ranking so the result-building step never
+/// needs to re-query.
+type ExactCandidate = (
+    String,         // drawer_id
+    String,         // content
+    String,         // wing
+    Option<String>, // room
+    String,         // source_file (already synthetic-resolved)
+    Option<String>, // project_id
+    Vec<u8>,        // embedding blob
+);
+
+/// Rank exact-path candidates by ascending cosine distance using
+/// decorate-sort-undecorate, then truncate to `top_k`.
+///
+/// Each candidate is scored EXACTLY ONCE -- `distance_fn` is invoked
+/// `rows.len()` times total (O(n)), and the cached distance is what the sort
+/// comparator reads. This replaces the previous design that recomputed the
+/// cosine distance inside the O(n log n) comparator (~2 decodes per comparison)
+/// and a third time while building results.
+///
+/// Ordering matches the legacy comparator byte-for-byte: valid distances sort
+/// ascending (NaN compared as `Equal`, so equal distances stay in stable input
+/// order); candidates whose distance errors (invalid/corrupt blob) sort last;
+/// and two errored candidates tie-break by `drawer_id`. The cached
+/// `Result<f64>` distance is returned alongside each surviving row so the
+/// caller reuses it (and propagates an `Err` if one lands inside the top-k,
+/// exactly as before) without decoding the blob again.
+fn rank_exact_candidates<F>(
+    rows: Vec<ExactCandidate>,
+    top_k: usize,
+    mut distance_fn: F,
+) -> Vec<(Result<f64>, ExactCandidate)>
+where
+    F: FnMut(&str, &[u8]) -> Result<f64>,
+{
+    let mut scored: Vec<(Result<f64>, ExactCandidate)> = rows
+        .into_iter()
+        .map(|row| {
+            let distance = distance_fn(&row.0, &row.6);
+            (distance, row)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| {
+        let (a_dist, a_row) = (&a.0, &a.1);
+        let (b_dist, b_row) = (&b.0, &b.1);
+        match (a_dist, b_dist) {
+            (Ok(left), Ok(right)) => left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            // Tie-break two invalid-blob candidates by drawer_id, matching the
+            // legacy comparator's `a.0.cmp(&b.0)`.
+            (Err(_), Err(_)) => a_row.0.cmp(&b_row.0),
+        }
+    });
+
+    scored.truncate(top_k);
+    scored
+}
+
+/// L2 (Euclidean) norm of a vector, computed in `f64` to match the precision
+/// used by `cosine_distance_from_blob_with_norm`.
+fn l2_norm(vector: &[f32]) -> f64 {
+    vector
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// Cosine distance (`1 - cosine_similarity`, clamped to `[0, 2]`) between a
+/// stored embedding blob and the query vector, given the query's precomputed
+/// L2 norm. Decodes the little-endian `f32` blob exactly once. Hoisting the
+/// query norm out of this function lets the exact path compute it a single time
+/// for the whole candidate set instead of once per scored row.
+fn cosine_distance_from_blob_with_norm(
     drawer_id: &str,
     embedding_blob: &[u8],
     query_vector: &[f32],
+    query_norm: f64,
 ) -> Result<f64> {
     if embedding_blob.len() % std::mem::size_of::<f32>() != 0 {
         return Err(SearchError::InvalidEmbeddingBlob {
@@ -1350,15 +1448,10 @@ fn cosine_distance_from_blob(
         .map(|value| f64::from(*value) * f64::from(*value))
         .sum::<f64>()
         .sqrt();
-    let right_norm = query_vector
-        .iter()
-        .map(|value| f64::from(*value) * f64::from(*value))
-        .sum::<f64>()
-        .sqrt();
-    let cosine_similarity = if left_norm == 0.0 || right_norm == 0.0 {
+    let cosine_similarity = if left_norm == 0.0 || query_norm == 0.0 {
         0.0
     } else {
-        dot / (left_norm * right_norm)
+        dot / (left_norm * query_norm)
     };
     Ok((1.0 - cosine_similarity).clamp(0.0, 2.0))
 }
@@ -2067,5 +2160,141 @@ mod tests {
             assert!(k >= 100, "k={k} below floor for top_k={top_k}");
             assert!(k <= 4_096, "k={k} above ceiling for top_k={top_k}");
         }
+    }
+
+    // --- exact vector path: decorate-sort-undecorate (issue #250) ---
+
+    /// Build a synthetic `ExactCandidate` whose embedding blob is the
+    /// little-endian encoding of `embedding`. Distance closures in these tests
+    /// decode that blob to derive a deterministic distance.
+    fn exact_candidate(id: &str, embedding: &[f32]) -> ExactCandidate {
+        let blob: Vec<u8> = embedding.iter().flat_map(|v| v.to_le_bytes()).collect();
+        (
+            id.to_string(),
+            format!("content {id}"),
+            "alpha".to_string(),
+            Some("decision".to_string()),
+            format!("{id}.md"),
+            None,
+            blob,
+        )
+    }
+
+    fn decode_first_f32(blob: &[u8]) -> f64 {
+        let bytes: [u8; 4] = blob[..4].try_into().expect("4-byte blob prefix");
+        f64::from(f32::from_le_bytes(bytes))
+    }
+
+    /// The core regression guard for issue #250: the cosine distance must be
+    /// computed O(n) -- exactly once per candidate -- not O(n log n) inside the
+    /// sort comparator. A call counter on the injected distance function proves
+    /// the invocation count equals the candidate count and is independent of
+    /// `top_k`.
+    #[test]
+    fn rank_exact_candidates_scores_each_candidate_exactly_once() {
+        let n = 64usize;
+        let rows: Vec<ExactCandidate> = (0..n)
+            .map(|i| exact_candidate(&format!("d{i:02}"), &[i as f32]))
+            .collect();
+
+        let mut calls = 0usize;
+        let top_k = 5usize;
+        let ranked = rank_exact_candidates(rows, top_k, |_id, blob| {
+            calls += 1;
+            Ok(decode_first_f32(blob))
+        });
+
+        // O(n): one distance evaluation per candidate, regardless of top_k.
+        // The legacy comparator-based design called it ~2*n*log2(n) times.
+        assert_eq!(
+            calls, n,
+            "distance must be computed exactly once per candidate (O(n))"
+        );
+        assert_eq!(ranked.len(), top_k, "output truncated to top_k");
+
+        // Ascending distance: smallest stored values first.
+        let ids: Vec<&str> = ranked.iter().map(|(_, row)| row.0.as_str()).collect();
+        assert_eq!(ids, vec!["d00", "d01", "d02", "d03", "d04"]);
+        let dists: Vec<f64> = ranked
+            .iter()
+            .map(|(d, _)| *d.as_ref().expect("ok distance"))
+            .collect();
+        assert!(
+            dists.windows(2).all(|w| w[0] <= w[1]),
+            "cached distances must be ascending: {dists:?}"
+        );
+    }
+
+    /// Ordering semantics must match the legacy comparator byte-for-byte:
+    /// valid distances ascending, invalid-blob candidates last, and two
+    /// invalid candidates tie-broken by `drawer_id`.
+    #[test]
+    fn rank_exact_candidates_orders_invalid_blobs_last_with_drawer_id_tiebreak() {
+        let rows = vec![
+            exact_candidate("good-2", &[2.0]),
+            exact_candidate("bad-z", &[0.0]),
+            exact_candidate("good-1", &[1.0]),
+            exact_candidate("bad-a", &[0.0]),
+        ];
+        let ranked = rank_exact_candidates(rows, 10, |id, blob| {
+            if id.starts_with("bad") {
+                Err(SearchError::InvalidEmbeddingBlob {
+                    drawer_id: id.to_string(),
+                })
+            } else {
+                Ok(decode_first_f32(blob))
+            }
+        });
+
+        let ids: Vec<&str> = ranked.iter().map(|(_, row)| row.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["good-1", "good-2", "bad-a", "bad-z"],
+            "valid ascending, invalid last, invalid tie-broken by drawer_id"
+        );
+    }
+
+    /// End-to-end: the exact path (taken because the corpus is far below the
+    /// 4096 gate) must return drawers ordered by ascending cosine distance with
+    /// strictly decreasing similarity.
+    #[test]
+    fn exact_vector_path_preserves_cosine_ordering() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        let drawers = [
+            ("d-near", vec![1.0_f32, 0.0, 0.0, 0.0]),
+            ("d-mid", vec![0.6_f32, 0.8, 0.0, 0.0]),
+            ("d-far", vec![0.0_f32, 0.0, 1.0, 0.0]),
+        ];
+        for (id, embedding) in &drawers {
+            let drawer = make_drawer(id, "alpha", "decision");
+            db.insert_drawer_with_project(&drawer, None)
+                .expect("insert drawer");
+            db.insert_vector(id, embedding).expect("insert vector");
+        }
+
+        let query = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let results = search_by_vector(
+            &db,
+            &query,
+            route(),
+            &ProjectSearchScope::all_projects(),
+            10,
+        )
+        .expect("vector search");
+
+        let ids: Vec<&str> = results.iter().map(|r| r.drawer_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["d-near", "d-mid", "d-far"],
+            "results ordered by ascending cosine distance"
+        );
+
+        let sims: Vec<f32> = results.iter().map(|r| r.similarity).collect();
+        assert!(
+            sims[0] > sims[1] && sims[1] > sims[2],
+            "similarity must strictly decrease along the ranking: {sims:?}"
+        );
     }
 }
