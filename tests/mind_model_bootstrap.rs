@@ -2015,6 +2015,13 @@ async fn test_search_filters_by_memory_kind_and_tier_without_rerank_changes() {
         .map(|result| result.drawer_id.as_str())
         .collect();
 
+    // Order is the deterministic RRF ranking (evidence > shu > qi by RRF
+    // score). All three drawers share importance=2, so the post-RRF importance
+    // rerank is a stable no-op that preserves this order — provided
+    // effective_importance is read consistently across drawers (see
+    // `apply_consistent_effective_importance`; GitHub #254). The drawers are NOT
+    // reordered to drawer_id order: the rerank tie preserves RRF order, it does
+    // not impose an alphabetic one.
     assert_eq!(
         unfiltered_ids,
         vec![
@@ -2028,6 +2035,96 @@ async fn test_search_filters_by_memory_kind_and_tier_without_rerank_changes() {
         vec!["drawer_search_knowledge_shu", "drawer_search_knowledge_qi"]
     );
     assert_eq!(shu_only_ids, vec!["drawer_search_knowledge_shu"]);
+}
+
+/// Determinism regression for RRF fusion ties (GitHub #254).
+///
+/// Constructs two drawers with deliberately symmetric ranks so their RRF scores
+/// are EXACTLY equal: `tie_a` is rank 0 in the vector list (its stored embedding
+/// equals the stub query vector) and rank 1 in BM25; `tie_b` is the mirror image
+/// (rank 1 vector, rank 0 BM25, via a higher term frequency). Both therefore
+/// accumulate `1/(60+0+1) + 1/(60+1+1)`.
+///
+/// Before the fix, `rrf_merge` collected scores from a `HashMap` and sorted with
+/// no tiebreaker, so the tied pair surfaced in randomized hash-iteration order.
+/// With the `drawer_id` tiebreaker the tie resolves to ascending `drawer_id`
+/// (`tie_a` before `tie_b`) on every call. Running the search many times
+/// in-process (each `rrf_merge` builds a fresh `HashMap` with a fresh seed)
+/// must yield byte-identical ordering every time.
+#[tokio::test]
+async fn test_rrf_tie_orders_deterministically_by_drawer_id() {
+    let (_tmp, db, server) = setup_mcp_server();
+
+    // Stub query vector is [0.1, 0.2, 0.3]. `tie_a`'s embedding matches it
+    // exactly (cosine distance 0 -> vector rank 0); `tie_b`'s is far (vector
+    // rank 1). `tie_b` has the higher "zeta" term frequency (BM25 rank 0) while
+    // `tie_a` has the lower (BM25 rank 1). Symmetric ranks => equal RRF score.
+    let tie_a = bootstrap_drawer(
+        "drawer_rrf_tie_a",
+        "zeta aaa bbb ccc",
+        MemoryKind::Evidence,
+        None,
+        None,
+        None,
+    );
+    let tie_b = bootstrap_drawer(
+        "drawer_rrf_tie_b",
+        "zeta zeta zeta zeta",
+        MemoryKind::Evidence,
+        None,
+        None,
+        None,
+    );
+    insert_search_fixture(&db, &tie_a, &[0.1, 0.2, 0.3]);
+    insert_search_fixture(&db, &tie_b, &[0.95, 0.05, 0.0]);
+
+    let mut observed_orders = Vec::new();
+    for _ in 0..25 {
+        let response = server
+            .search_json_for_test(json!({
+                "query": "zeta",
+                "wing": "mempal",
+                "room": "bootstrap",
+                "top_k": 5
+            }))
+            .await
+            .expect("tie search should succeed");
+        let ids: Vec<String> = response
+            .results
+            .iter()
+            .map(|result| result.drawer_id.clone())
+            .collect();
+        // Confirm the RRF tie is genuine: equal similarity for the two drawers.
+        let sim_a = response
+            .results
+            .iter()
+            .find(|r| r.drawer_id == "drawer_rrf_tie_a")
+            .map(|r| r.similarity)
+            .expect("tie_a present");
+        let sim_b = response
+            .results
+            .iter()
+            .find(|r| r.drawer_id == "drawer_rrf_tie_b")
+            .map(|r| r.similarity)
+            .expect("tie_b present");
+        assert_eq!(
+            sim_a, sim_b,
+            "RRF scores must be exactly equal for the tie to exercise the tiebreaker"
+        );
+        observed_orders.push(ids);
+    }
+
+    // Every run must produce the same drawer_id-ascending order.
+    let expected = vec![
+        "drawer_rrf_tie_a".to_string(),
+        "drawer_rrf_tie_b".to_string(),
+    ];
+    for (run, order) in observed_orders.iter().enumerate() {
+        assert_eq!(
+            order, &expected,
+            "run {run} returned a non-deterministic RRF tie order: {order:?}"
+        );
+    }
 }
 
 #[tokio::test]
