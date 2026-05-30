@@ -8398,6 +8398,17 @@ fn process_is_running(_pid: i32) -> Result<bool> {
     Ok(false)
 }
 
+#[derive(Debug)]
+struct DaemonNotRunning;
+
+impl std::fmt::Display for DaemonNotRunning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("daemon is not running")
+    }
+}
+
+impl std::error::Error for DaemonNotRunning {}
+
 async fn serve_command(config: &Config, mcp: bool) -> Result<()> {
     if mcp {
         return serve_mcp_command(config).await;
@@ -8896,7 +8907,7 @@ fn run_daemon_stop(db_path: &Path) -> Result<()> {
 
     if targets.is_empty() {
         let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
-        bail!("daemon is not running");
+        return Err(DaemonNotRunning.into());
     }
 
     let reaped = targets.len();
@@ -8946,16 +8957,10 @@ fn run_daemon_stop(_db_path: &Path) -> Result<()> {
 
 fn run_daemon_restart(config_path: PathBuf) -> Result<()> {
     let db_path = daemon_config_db_path(&config_path)?;
-    match read_daemon_pid(&db_path)? {
-        Some(pid) if process_is_running(pid)? => {
-            run_daemon_stop(&db_path)?;
-        }
-        Some(_) => {
-            if let Some(mempal_home) = db_path.parent() {
-                let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
-            }
-        }
-        None => {}
+    if let Err(error) = run_daemon_stop(&db_path)
+        && !error.is::<DaemonNotRunning>()
+    {
+        return Err(error);
     }
     mempal::daemon::run_command(config_path, false)
 }

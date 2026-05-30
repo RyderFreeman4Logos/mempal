@@ -46,6 +46,94 @@ log_path = "{}"
     (tmp, db_path, config_path)
 }
 
+#[cfg(unix)]
+struct DaemonHomeCleanup {
+    home: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for DaemonHomeCleanup {
+    fn drop(&mut self) {
+        let mempal_home = self.home.join(".mempal");
+        for pid in mempal::daemon_singleton::enumerate_daemon_pids("mempal", &mempal_home) {
+            // SAFETY: this test owns the temporary mempal_home being enumerated;
+            // the signal is restricted to processes holding that exact lock fd.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running_for_test(pid: i32) -> bool {
+    // SAFETY: kill(2) with signal 0 probes liveness without delivering a
+    // signal. EPERM still means a process exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn wait_for_pid_file(pid_path: &std::path::Path, timeout: Duration) -> Option<i32> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(content) = fs::read_to_string(pid_path)
+            && let Ok(pid) = content.trim().parse::<i32>()
+        {
+            return Some(pid);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_is_running_for_test(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[cfg(unix)]
+fn spawn_lock_holding_fake_daemon(mempal_home: &std::path::Path) -> i32 {
+    let lock_path = mempal_home.join(mempal::daemon_singleton::DAEMON_LOCK_FILE);
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(
+            r#"(exec 9>"$LOCK_PATH"; flock -x 9; exec -a mempal yes daemon >/dev/null 2>&1) & echo $!"#,
+        )
+        .env("LOCK_PATH", &lock_path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn fake daemon");
+    assert!(
+        output.status.success(),
+        "fake daemon spawn failed: status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pid = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i32>()
+        .expect("fake daemon pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let pids = mempal::daemon_singleton::enumerate_daemon_pids("mempal", mempal_home);
+        if pids.contains(&pid) {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("fake daemon pid {pid} was not enumerated");
+}
+
 #[test]
 fn test_daemon_context_bootstrap_ordering() {
     let (_tmp, _db_path, config_path) = setup_daemon_home();
@@ -83,6 +171,54 @@ fn test_daemon_context_bootstrap_ordering() {
     );
     drop(context);
     assert!(!pid_path.exists(), "pid file must be removed on drop");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_daemon_restart_reaps_orphan_without_pidfile() {
+    let (tmp, _db_path, _config_path) = setup_daemon_home();
+    let _cleanup = DaemonHomeCleanup {
+        home: tmp.path().to_path_buf(),
+    };
+    let pid_path = tmp.path().join(".mempal/daemon.pid");
+    let mempal_home = tmp.path().join(".mempal");
+
+    let orphan_pid = spawn_lock_holding_fake_daemon(&mempal_home);
+    assert!(
+        process_is_running_for_test(orphan_pid),
+        "fake orphan daemon pid {orphan_pid} should be running"
+    );
+    assert!(
+        !pid_path.exists(),
+        "fake orphan must hold the singleton lock without a pidfile"
+    );
+
+    let output = Command::new(mempal_bin())
+        .args(["daemon", "restart"])
+        .env("HOME", tmp.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daemon restart");
+    assert!(
+        output.status.success(),
+        "daemon restart failed: status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        wait_for_process_exit(orphan_pid, Duration::from_secs(10)),
+        "orphan daemon pid {orphan_pid} should be reaped by restart"
+    );
+
+    let restarted_pid =
+        wait_for_pid_file(&pid_path, Duration::from_secs(10)).expect("restarted daemon pidfile");
+    assert_ne!(restarted_pid, orphan_pid);
+    assert!(
+        process_is_running_for_test(restarted_pid),
+        "restarted daemon pid {restarted_pid} should be running"
+    );
 }
 
 #[cfg(unix)]
