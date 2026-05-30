@@ -98,7 +98,7 @@ fn read_session_id(conn: &Connection) -> Option<String> {
 
 /// Attempt to read a project/cwd path from known Hermes metadata shapes.
 /// Returns `None` if the table/column is absent or the stored value is empty.
-fn read_project_path(conn: &Connection) -> Option<String> {
+pub(crate) fn read_project_path(conn: &Connection) -> Option<String> {
     query_optional_text(
         conn,
         "SELECT value FROM metadata \
