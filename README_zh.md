@@ -85,6 +85,8 @@ api_model = "nomic-embed-text"
 | `mempal fact-check [PATH\|-] [--wing W] [--room R] [--now <UNIX_SECS>]` | 离线矛盾检查（对照 KG 三元组 + 已知 entity） |
 | `mempal bench longmemeval <FILE>` | LongMemEval 检索 benchmark |
 
+> **注意 —— 两个不同的 `xurl`。** `mempal xurl` 是 mempal 的子命令：针对 agent session transcript 的 `ingest` / `search` / `timeline` / `stats` / `reindex` / `backfill` 管道。它**不是**那个独立的 `xurl` CLI 工具（Xuanwo 的 "Resolve and read code-agent threads"，调用形如 `xurl …`、用 `agents://` URI）。两者是恰好同名的独立项目，互不为别名。
+
 ## MCP 服务器（10 个工具）
 
 `mempal serve --mcp` 通过 Model Context Protocol 暴露：

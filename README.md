@@ -95,6 +95,8 @@ api_model = "nomic-embed-text"
 | `mempal fact-check [PATH\|-] [--wing W] [--room R] [--now <UNIX_SECS>]` | Offline contradiction check against KG triples + known entities |
 | `mempal bench longmemeval <FILE>` | LongMemEval retrieval benchmark |
 
+> **Heads-up — two different `xurl`s.** `mempal xurl` is a mempal subcommand: an `ingest` / `search` / `timeline` / `stats` / `reindex` / `backfill` pipeline over agent session transcripts. It is **not** the standalone `xurl` CLI (Xuanwo's "Resolve and read code-agent threads", invoked as `xurl …` with `agents://` URIs). The two are independent projects that happen to share a name — neither is an alias for the other.
+
 ## MCP Server (10 tools)
 
 `mempal serve --mcp` exposes these tools via Model Context Protocol:
