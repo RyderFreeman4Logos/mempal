@@ -115,6 +115,7 @@ pub async fn search<E: Embedder + ?Sized>(
 
     let conn = db.conn();
     let filter = filter.unwrap_or_default();
+    let offset = filter.offset;
 
     // Build WHERE clause and parameter list dynamically.
     let mut conditions: Vec<String> = Vec::new();
@@ -245,20 +246,19 @@ pub async fn search<E: Embedder + ?Sized>(
     let total_candidates = deduped.len();
 
     // Apply min_score floor, then truncate.
-    let (mut passing, below_floor): (Vec<SearchHit>, Vec<SearchHit>) =
-        if let Some(floor) = min_score {
-            deduped.into_iter().partition(|h| h.score >= floor)
-        } else {
-            (deduped, Vec::new())
-        };
+    let (passing, below_floor): (Vec<SearchHit>, Vec<SearchHit>) = if let Some(floor) = min_score {
+        deduped.into_iter().partition(|h| h.score >= floor)
+    } else {
+        (deduped, Vec::new())
+    };
 
     // below_floor is sorted desc by score (partitioned from a sorted vec), so first = highest.
     let best_score_below_floor = below_floor.into_iter().next().map(|h| h.score);
 
-    passing.truncate(limit);
+    let hits = passing.into_iter().skip(offset).take(limit).collect();
 
     Ok(SearchResult {
-        hits: passing,
+        hits,
         best_score_below_floor,
         total_candidates,
         min_score_floor: min_score,

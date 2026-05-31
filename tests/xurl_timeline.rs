@@ -49,6 +49,15 @@ fn run_xurl_timeline(home: &Path, args: &[&str]) -> Output {
         .expect("run mempal xurl timeline")
 }
 
+fn run_xurl_stats(home: &Path, args: &[&str]) -> Output {
+    Command::new(mempal_bin())
+        .args(["xurl", "stats"])
+        .args(args)
+        .env("HOME", home)
+        .output()
+        .expect("run mempal xurl stats")
+}
+
 // ── fixture helpers ───────────────────────────────────────────────────────────
 
 struct RawTurnRow<'a> {
@@ -247,6 +256,19 @@ fn timeline_markdown_shows_source_path_segment_only_when_present() {
         without_header.matches(" · ").count(),
         2,
         "NULL header should only contain session/timestamp/role separators: {without_header}"
+    );
+}
+
+#[test]
+fn timeline_rejects_invalid_format_at_parse_time() {
+    let home = TempDir::new().expect("home");
+    let output = run_xurl_timeline(home.path(), &["--format", "bogus"]);
+
+    assert!(!output.status.success(), "timeline format should fail");
+    let err = stderr(&output);
+    assert!(
+        err.contains("invalid value") && err.contains("markdown") && err.contains("json"),
+        "clap error should list valid formats, got: {err}"
     );
 }
 
@@ -477,6 +499,67 @@ fn stats_includes_date_range() {
     let cc = stats.iter().find(|s| s.tool == "cc").unwrap();
     assert_eq!(cc.min_timestamp, 1000.0);
     assert_eq!(cc.max_timestamp, 9000.0);
+}
+
+#[test]
+fn stats_cli_json_reports_tools_and_unindexed_remaining() {
+    let home = TempDir::new().expect("home");
+    let db = open_home_db(home.path());
+    insert_home_turn(
+        &db,
+        RawTurnRow {
+            id: "cc-stat",
+            session_id: "s1",
+            tool: "cc",
+            turn_index: 0,
+            role: "user",
+            content: "hi",
+            timestamp_epoch: 1_000.0,
+        },
+        None,
+    );
+    insert_home_turn(
+        &db,
+        RawTurnRow {
+            id: "codex-stat",
+            session_id: "s2",
+            tool: "codex",
+            turn_index: 0,
+            role: "assistant",
+            content: "bye",
+            timestamp_epoch: 2_000.0,
+        },
+        None,
+    );
+
+    let json_output = run_xurl_stats(home.path(), &["--json"]);
+    assert!(
+        json_output.status.success(),
+        "stats json failed: {}",
+        stderr(&json_output)
+    );
+    let report: Value = serde_json::from_str(&stdout(&json_output)).expect("stats json");
+    assert_eq!(report["unindexed_remaining"], Value::from(2));
+    let tools = report["tools"].as_array().expect("tools array");
+    let cc = tools
+        .iter()
+        .find(|tool| tool["tool"] == "cc")
+        .expect("cc stats");
+    assert_eq!(cc["count"], Value::from(1));
+    assert_eq!(cc["min_timestamp"], Value::from(1_000.0));
+    assert_eq!(cc["max_timestamp"], Value::from(1_000.0));
+    assert!(cc["first"].as_str().expect("first").contains('T'));
+    assert!(cc["last"].as_str().expect("last").contains('T'));
+
+    let human_output = run_xurl_stats(home.path(), &[]);
+    assert!(
+        human_output.status.success(),
+        "stats human failed: {}",
+        stderr(&human_output)
+    );
+    let human = stdout(&human_output);
+    assert!(human.contains("| tool"));
+    assert!(human.contains("unindexed_remaining: 2"));
 }
 
 #[test]

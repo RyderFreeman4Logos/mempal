@@ -1000,6 +1000,9 @@ enum XurlCommands {
         /// Maximum number of results to return.
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Page number (0-based).
+        #[arg(long, default_value_t = 0)]
+        page: usize,
         /// Also include CSA-delegated turns (excluded by default).
         #[arg(long)]
         include_csa: bool,
@@ -1010,8 +1013,8 @@ enum XurlCommands {
         #[arg(long, default_value_t = 0.70)]
         min_score: f32,
         /// Output format: markdown (default) or json.
-        #[arg(long, default_value = "markdown")]
-        format: String,
+        #[arg(long, value_enum, default_value_t = XurlFormat::Markdown)]
+        format: XurlFormat,
     },
     /// Show conversation turns in reverse-chronological order.
     Timeline {
@@ -1037,11 +1040,15 @@ enum XurlCommands {
         #[arg(long)]
         include_agent_prompts: bool,
         /// Output format: markdown (default) or json.
-        #[arg(long, default_value = "markdown")]
-        format: String,
+        #[arg(long, value_enum, default_value_t = XurlFormat::Markdown)]
+        format: XurlFormat,
     },
     /// Show per-tool turn counts and date ranges.
-    Stats,
+    Stats {
+        /// Print result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Embed all turns that still lack a vector (drains the historical backlog).
     Reindex {
         /// Print progress as JSON.
@@ -1064,6 +1071,28 @@ enum XurlTool {
     Cc,
     Codex,
     Hermes,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum XurlFormat {
+    Markdown,
+    Json,
+}
+
+#[derive(Serialize)]
+struct XurlStatsJson {
+    tools: Vec<XurlStatsToolJson>,
+    unindexed_remaining: i64,
+}
+
+#[derive(Serialize)]
+struct XurlStatsToolJson {
+    tool: String,
+    count: i64,
+    first: String,
+    last: String,
+    min_timestamp: f64,
+    max_timestamp: f64,
 }
 
 impl From<XurlTool> for mempal::xurl::model::Tool {
@@ -8561,6 +8590,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             session,
             since,
             limit,
+            page,
             include_csa,
             include_agent_prompts,
             min_score,
@@ -8572,7 +8602,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 session_id: session,
                 since_epoch,
                 limit,
-                offset: 0,
+                offset: page * limit,
             };
             let embedder = build_embedder(config).await?;
             let result = mempal::xurl::search::search(
@@ -8590,13 +8620,16 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             .await
             .context("xurl search failed")?;
 
-            if format == "json" {
-                println!(
-                    "{}",
-                    serde_json::to_string(&result).context("json serialize")?
-                );
-            } else {
-                mempal::xurl::search::print_hits_markdown(&result);
+            match format {
+                XurlFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&result).context("json serialize")?
+                    );
+                }
+                XurlFormat::Markdown => {
+                    mempal::xurl::search::print_hits_markdown(&result);
+                }
             }
             Ok(())
         }
@@ -8627,33 +8660,60 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             )
             .context("xurl timeline query failed")?;
 
-            if format == "json" {
-                let json_turns = mempal::xurl::store::timeline_json_turns(&turns);
-                println!(
-                    "{}",
-                    serde_json::to_string(&json_turns).context("json serialize")?
-                );
-            } else {
-                if turns.is_empty() {
-                    println!("No turns found.");
-                } else {
-                    for t in &turns {
+            match format {
+                XurlFormat::Json => {
+                    let json_turns = mempal::xurl::store::timeline_json_turns(&turns);
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json_turns).context("json serialize")?
+                    );
+                }
+                XurlFormat::Markdown => {
+                    if turns.is_empty() {
+                        println!("No turns found.");
+                    } else {
+                        for t in &turns {
+                            println!("---");
+                            println!("{}", mempal::xurl::store::format_timeline_header(t));
+                            println!();
+                            let preview = char_safe_preview(&t.content, 300);
+                            println!("{}", preview.trim());
+                            println!();
+                        }
                         println!("---");
-                        println!("{}", mempal::xurl::store::format_timeline_header(t));
-                        println!();
-                        let preview = char_safe_preview(&t.content, 300);
-                        println!("{}", preview.trim());
-                        println!();
                     }
-                    println!("---");
                 }
             }
             Ok(())
         }
 
-        XurlCommands::Stats => {
+        XurlCommands::Stats { json } => {
             let stats =
                 mempal::xurl::store::get_stats(db.conn()).context("xurl stats query failed")?;
+            let unindexed_remaining = mempal::xurl::store::count_unindexed_turns(db.conn())
+                .context("xurl unindexed count failed")?;
+            if json {
+                let tools: Vec<XurlStatsToolJson> = stats
+                    .iter()
+                    .map(|s| XurlStatsToolJson {
+                        tool: s.tool.clone(),
+                        count: s.count,
+                        first: mempal::xurl::search::format_timestamp(s.min_timestamp),
+                        last: mempal::xurl::search::format_timestamp(s.max_timestamp),
+                        min_timestamp: s.min_timestamp,
+                        max_timestamp: s.max_timestamp,
+                    })
+                    .collect();
+                let report = XurlStatsJson {
+                    tools,
+                    unindexed_remaining,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&report).context("json serialize")?
+                );
+                return Ok(());
+            }
             if stats.is_empty() {
                 println!("No conversation turns indexed yet. Run `mempal xurl ingest` first.");
                 return Ok(());
@@ -8665,8 +8725,6 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 let last = mempal::xurl::search::format_timestamp(s.max_timestamp);
                 println!("| {:<6} | {:>5} | {} | {} |", s.tool, s.count, first, last);
             }
-            let unindexed_remaining = mempal::xurl::store::count_unindexed_turns(db.conn())
-                .context("xurl unindexed count failed")?;
             println!();
             println!("unindexed_remaining: {unindexed_remaining}");
             if unindexed_remaining > 0 {
