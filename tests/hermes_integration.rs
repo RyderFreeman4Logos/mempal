@@ -18,7 +18,9 @@ use mempal::crystallize::{CrystallizeOptions, run_crystallization_deterministic}
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory, global_embed_status};
 use mempal::factcheck::{self, FactIssue};
 use mempal::intelligence::IntelligenceRouter;
-use mempal::mcp::{IngestRequest, MempalMcpServer, PinnedFactsRequest, SearchRequest};
+use mempal::mcp::{
+    IngestRequest, MempalMcpServer, PinnedFactsRequest, SearchRequest, StatusDetail, StatusRequest,
+};
 use mempal::sleep::{SleepPhaseSelection, SleepRunOptions, run_sleep_cycle};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
@@ -1045,7 +1047,16 @@ async fn test_status_reflects_all_features() {
         Some("project-a"),
     );
 
-    let status = env.server().mempal_status().await.expect("status").0;
+    let status = env
+        .server()
+        .mempal_status_with_options(StatusRequest {
+            detail: Some(StatusDetail::Full),
+            scope: None,
+            project_id: None,
+        })
+        .await
+        .expect("status")
+        .0;
 
     assert_eq!(status.intelligence_status.mode, "deterministic");
     assert_eq!(status.queue_stats.pending, 0);

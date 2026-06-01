@@ -22,6 +22,7 @@ use thiserror::Error;
 
 use super::anchor;
 use super::{
+    project::{ProjectFilterMode, ProjectSearchScope},
     types::{
         AnchorKind, ChunkNeighbors, CompactionStrategy, ConsolidationStats, Drawer, DrawerDetails,
         DrawerSummary, DrawerVectorDetails, ExplicitTunnel, KnowledgeCard, KnowledgeCardEvent,
@@ -1695,6 +1696,45 @@ impl Database {
                     row.get::<_, i64>(2)?,
                 ))
             })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn scope_counts_for_search_scope(
+        &self,
+        scope: &ProjectSearchScope,
+    ) -> Result<Vec<(String, Option<String>, i64)>, DbError> {
+        if scope.mode == ProjectFilterMode::AllProjects
+            || !drawers_column_exists(&self.conn, "project_id")?
+        {
+            return self.scope_counts();
+        }
+
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT wing, room, COUNT(*)
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND (
+                (?1 = 'project' AND project_id = ?2)
+                OR (?1 = 'project_plus_global' AND (project_id = ?2 OR project_id IS NULL))
+                OR (?1 = 'null_only' AND project_id IS NULL)
+              )
+            GROUP BY wing, room
+            ORDER BY wing, room
+            "#,
+        )?;
+        let rows = statement
+            .query_map(
+                params![scope.mode_param(), scope.project_id.as_deref()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }

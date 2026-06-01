@@ -42,6 +42,36 @@ fn json_object_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema 
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct StatusRequest {
+    /// Response detail level. Defaults to `compact`; `full` includes the
+    /// protocol and AAAK reference text and mirrors CLI `status --full`.
+    pub detail: Option<StatusDetail>,
+
+    /// Scope breakdown to include. Defaults to the detail-level scope:
+    /// `project` for compact responses and `all` for full responses.
+    pub scope: Option<StatusScope>,
+
+    /// Optional explicit project scope. When omitted, mempal resolves the
+    /// current project from `[project]` config or MCP roots.
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusDetail {
+    #[default]
+    Compact,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusScope {
+    Project,
+    All,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     /// Natural-language query. Use the user's actual question verbatim
     /// when possible — the embedding model handles paraphrase and translation.
@@ -1750,7 +1780,9 @@ pub struct StatusResponse {
     pub source_type_distribution: Vec<SourceTypeCount>,
     /// Pinned canonical recall counts per project.
     pub pinned_fact_counts: Vec<PinnedFactProjectCount>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub aaak_spec: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub memory_protocol: String,
     pub endpoint_health: EndpointHealthDto,
     pub embed_status: EmbedStatusDto,
