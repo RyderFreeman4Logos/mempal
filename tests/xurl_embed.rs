@@ -2,6 +2,9 @@ use mempal::core::db::Database;
 use mempal::embed::Embedder;
 use mempal::xurl::embed;
 use rusqlite::params;
+use serde_json::Value;
+use std::path::Path;
+use std::process::{Command, Output};
 use tempfile::TempDir;
 
 struct TestDb {
@@ -23,6 +26,26 @@ fn open_temp_db_at_fork_ext(_version: u32) -> TestDb {
         _dir: dir,
         inner: db,
     }
+}
+
+fn mempal_bin() -> String {
+    env!("CARGO_BIN_EXE_mempal").to_string()
+}
+
+fn open_home_db(home: &Path) -> Database {
+    let mempal_home = home.join(".mempal");
+    std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+    Database::open(&mempal_home.join("palace.db")).expect("open home db")
+}
+
+fn run_xurl_reindex(home: &Path, args: &[&str]) -> Output {
+    Command::new(mempal_bin())
+        .args(["xurl", "reindex"])
+        .args(args)
+        .env("HOME", home)
+        .env("MEMPAL_EMBED_BACKEND", "unsupported-dry-run-backend")
+        .output()
+        .expect("run mempal xurl reindex")
 }
 
 /// A mock embedder that always returns fixed-value vectors of the given dimension.
@@ -135,6 +158,15 @@ fn insert_raw_turn_row(conn: &rusqlite::Connection, row: TurnRow<'_>) {
         ],
     )
     .expect("insert test row");
+}
+
+fn vector_count(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM conversation_turn_vectors",
+        [],
+        |row| row.get(0),
+    )
+    .expect("count vectors")
 }
 
 #[tokio::test]
@@ -497,4 +529,93 @@ async fn test_reindex_path_drains_all_unindexed() {
 
     let after = mempal::xurl::store::count_unindexed_turns(db.conn()).unwrap();
     assert_eq!(after, 0, "reindex must drain the entire backlog");
+}
+
+#[test]
+fn test_xurl_reindex_dry_run_reports_without_embed_or_writes() {
+    let home = TempDir::new().expect("home");
+    let db = open_home_db(home.path());
+
+    insert_raw_turn_row(
+        db.conn(),
+        TurnRow {
+            id: "turn-dry-a",
+            session: "thread-a",
+            tool: "cc",
+            turn_index: 0,
+            role: "user",
+            content: "dry run pending a",
+            timestamp: 1.0,
+            token_count: None,
+        },
+    );
+    insert_raw_turn_row(
+        db.conn(),
+        TurnRow {
+            id: "turn-dry-b",
+            session: "thread-a",
+            tool: "cc",
+            turn_index: 1,
+            role: "assistant",
+            content: "dry run pending b",
+            timestamp: 2.0,
+            token_count: None,
+        },
+    );
+    insert_raw_turn_row(
+        db.conn(),
+        TurnRow {
+            id: "turn-dry-c",
+            session: "thread-b",
+            tool: "codex",
+            turn_index: 0,
+            role: "user",
+            content: "dry run pending c",
+            timestamp: 3.0,
+            token_count: None,
+        },
+    );
+    insert_raw_turn_row(
+        db.conn(),
+        TurnRow {
+            id: "turn-indexed",
+            session: "thread-indexed",
+            tool: "cc",
+            turn_index: 0,
+            role: "user",
+            content: "already indexed",
+            timestamp: 4.0,
+            token_count: None,
+        },
+    );
+    db.conn()
+        .execute(
+            "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) VALUES (?1, 0, ?2)",
+            params!["turn-indexed", vec![0_u8; 8]],
+        )
+        .expect("insert existing vector");
+
+    let before_vectors = vector_count(db.conn());
+    let output = run_xurl_reindex(home.path(), &["--dry-run", "--json"]);
+    assert!(
+        output.status.success(),
+        "dry-run reindex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("dry-run reindex json report");
+
+    assert_eq!(report["dry_run"], Value::from(true));
+    assert_eq!(report["threads_would_process"], Value::from(2));
+    assert_eq!(report["turns_would_process"], Value::from(3));
+    assert_eq!(
+        vector_count(db.conn()),
+        before_vectors,
+        "dry-run must not write vectors"
+    );
+    assert_eq!(
+        mempal::xurl::store::count_unindexed_turns(db.conn()).unwrap(),
+        3,
+        "dry-run must leave candidate turns unindexed"
+    );
 }

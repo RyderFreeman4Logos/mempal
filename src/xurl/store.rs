@@ -44,6 +44,12 @@ pub struct ToolStat {
     pub max_timestamp: f64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnindexedTurnSummary {
+    pub threads: i64,
+    pub turns: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TimelineTurn {
     pub id: String,
@@ -113,14 +119,47 @@ pub fn turn_id_for(turn: &RawTurn) -> String {
 /// Count turns that still lack a vector (no row in `conversation_turn_vectors`).
 /// Surfaced by `xurl stats` so the recall gap is visible.
 pub fn count_unindexed_turns(conn: &Connection) -> XurlResult<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) \
+    count_unindexed_turns_filtered(conn, &TurnFilter::default())
+}
+
+pub fn count_unindexed_turns_filtered(conn: &Connection, filter: &TurnFilter) -> XurlResult<i64> {
+    summarize_unindexed_turns_filtered(conn, filter).map(|summary| summary.turns)
+}
+
+pub fn summarize_unindexed_turns(conn: &Connection) -> XurlResult<UnindexedTurnSummary> {
+    summarize_unindexed_turns_filtered(conn, &TurnFilter::default())
+}
+
+pub fn summarize_unindexed_turns_filtered(
+    conn: &Connection,
+    filter: &TurnFilter,
+) -> XurlResult<UnindexedTurnSummary> {
+    let mut conditions = vec!["ctv.turn_id IS NULL".to_string()];
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut idx = 1usize;
+    push_filter_conditions(
+        filter,
+        Some("ct"),
+        &mut conditions,
+        &mut params_vec,
+        &mut idx,
+    );
+
+    let sql = format!(
+        "SELECT COUNT(DISTINCT ct.session_id), COUNT(*) \
          FROM conversation_turns ct \
          LEFT JOIN conversation_turn_vectors ctv ON ctv.turn_id = ct.id AND ctv.chunk_index = 0 \
-         WHERE ctv.turn_id IS NULL",
-        [],
-        |row| row.get(0),
-    )
+         WHERE {}",
+        conditions.join(" AND ")
+    );
+    let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+
+    conn.query_row(&sql, refs.as_slice(), |row| {
+        Ok(UnindexedTurnSummary {
+            threads: row.get(0)?,
+            turns: row.get(1)?,
+        })
+    })
     .map_err(XurlError::Database)
 }
 
@@ -393,20 +432,77 @@ pub fn get_turns_filtered(
     Ok(turns)
 }
 
+fn filter_column(prefix: Option<&str>, column: &str) -> String {
+    prefix.map_or_else(|| column.to_string(), |prefix| format!("{prefix}.{column}"))
+}
+
+fn push_filter_conditions(
+    filter: &TurnFilter,
+    column_prefix: Option<&str>,
+    conditions: &mut Vec<String>,
+    params_vec: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    idx: &mut usize,
+) {
+    if let Some(ref tool) = filter.tool {
+        conditions.push(format!(
+            "{} = ?{}",
+            filter_column(column_prefix, "tool"),
+            *idx
+        ));
+        params_vec.push(Box::new(tool.as_str().to_string()));
+        *idx += 1;
+    }
+    if let Some(ref sid) = filter.session_id {
+        conditions.push(format!(
+            "{} = ?{}",
+            filter_column(column_prefix, "session_id"),
+            *idx
+        ));
+        params_vec.push(Box::new(sid.clone()));
+        *idx += 1;
+    }
+    if let Some(since) = filter.since_epoch {
+        conditions.push(format!(
+            "{} >= ?{}",
+            filter_column(column_prefix, "timestamp_epoch"),
+            *idx
+        ));
+        params_vec.push(Box::new(since));
+        *idx += 1;
+    }
+}
+
 /// Per-tool aggregate statistics.
 pub fn get_stats(conn: &Connection) -> XurlResult<Vec<ToolStat>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT tool, COUNT(*) as count, \
-             MIN(timestamp_epoch), MAX(timestamp_epoch) \
-             FROM conversation_turns \
-             GROUP BY tool \
-             ORDER BY tool",
-        )
-        .map_err(XurlError::Database)?;
+    get_stats_filtered(conn, &TurnFilter::default())
+}
+
+pub fn get_stats_filtered(conn: &Connection, filter: &TurnFilter) -> XurlResult<Vec<ToolStat>> {
+    let mut conditions = Vec::<String>::new();
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut idx = 1usize;
+    push_filter_conditions(filter, None, &mut conditions, &mut params_vec, &mut idx);
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT tool, COUNT(*) as count, \
+         MIN(timestamp_epoch), MAX(timestamp_epoch) \
+         FROM conversation_turns \
+         {where_clause} \
+         GROUP BY tool \
+         ORDER BY tool"
+    );
+    let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+
+    let mut stmt = conn.prepare(&sql).map_err(XurlError::Database)?;
 
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(refs.as_slice(), |row| {
             Ok(ToolStat {
                 tool: row.get(0)?,
                 count: row.get(1)?,
