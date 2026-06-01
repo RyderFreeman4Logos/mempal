@@ -431,6 +431,9 @@ enum Commands {
         force: bool,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Return failed embed-queue messages to pending for daemon retry.
+        #[arg(long, default_value_t = false)]
+        failed: bool,
         /// Recompute importance scores for existing drawers using rule-based heuristics.
         /// Mutually exclusive with embedder-based reindex; does not re-embed.
         #[arg(long, default_value_t = false)]
@@ -2383,11 +2386,26 @@ fn run() -> Result<()> {
             stale,
             force,
             dry_run,
+            failed,
             recompute_importance,
             only_zero,
             normalize_added_at,
         } => {
-            if normalize_added_at {
+            if failed {
+                if embedder.is_some()
+                    || from_config
+                    || resume
+                    || stale
+                    || force
+                    || dry_run
+                    || recompute_importance
+                    || only_zero
+                    || normalize_added_at
+                {
+                    bail!("--failed is mutually exclusive with other reindex modes and modifiers");
+                }
+                reindex_failed_queue_command(&db)
+            } else if normalize_added_at {
                 if recompute_importance || embedder.is_some() || from_config {
                     bail!(
                         "--normalize-added-at is mutually exclusive with --embedder, --from-config, and --recompute-importance"
@@ -4814,6 +4832,16 @@ fn recompute_importance_command(db: &Database, only_zero: bool) -> Result<()> {
         .bulk_update_importance(&updates)
         .context("failed to apply importance scores")?;
     println!("updated {updated} drawers with recomputed importance scores");
+    Ok(())
+}
+
+fn reindex_failed_queue_command(db: &Database) -> Result<()> {
+    let store = mempal::core::queue::PendingMessageStore::new(db.path())
+        .context("failed to open pending message queue")?;
+    let retried = store
+        .retry_failed_embed_messages()
+        .context("failed to requeue failed embed messages")?;
+    println!("requeued failed embed queue items: {retried}");
     Ok(())
 }
 
@@ -8234,7 +8262,9 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         "config: version={} loaded_unix_ms={}",
         cfg_meta.version, cfg_meta.loaded_at_unix_ms
     );
-    println!("embed_fail_count: {}", embed_status.fail_count);
+    let embed_failure_headline =
+        mempal::core::queue::failure_headline_count(embed_status.fail_count, &queue_stats);
+    println!("embed_fail_count: {embed_failure_headline}");
     println!("embed_degraded: {}", embed_status.degraded);
     if let Some(last_error) = embed_status.last_error {
         println!("embed_last_error: {last_error}");

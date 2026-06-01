@@ -314,6 +314,7 @@ fn test_status_command_shows_queue_stats() {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
     assert!(stdout.contains("Queue:"), "{stdout}");
+    assert!(stdout.contains("embed_fail_count: 1"), "{stdout}");
     assert!(stdout.contains("pending: 1"), "{stdout}");
     assert!(stdout.contains("claimed: 1"), "{stdout}");
     assert!(stdout.contains("failed: 1"), "{stdout}");
@@ -323,6 +324,55 @@ fn test_status_command_shows_queue_stats() {
     assert!(stdout.contains("oldest_pending_age_secs:"), "{stdout}");
     assert!(stdout.contains("Source Types:"), "{stdout}");
     assert!(stdout.contains("user_explicit: 1"), "{stdout}");
+}
+
+#[test]
+fn test_reindex_failed_requeues_only_failed_embed_queue_items() {
+    let (home, db_path) = setup_home();
+    let store = PendingMessageStore::new(&db_path).expect("create store");
+    let failed_embed = store
+        .enqueue("hook_event", r#"{"n":1}"#)
+        .expect("enqueue failed embed");
+    let failed_llm = store
+        .enqueue("llm_task", r#"{"n":2}"#)
+        .expect("enqueue failed llm");
+    let pending_embed = store
+        .enqueue("hook_event", r#"{"n":3}"#)
+        .expect("enqueue pending embed");
+
+    Connection::open(&db_path)
+        .expect("open sqlite")
+        .execute(
+            "UPDATE pending_messages SET status = 'failed', retry_count = 4, last_error = 'boom' WHERE id IN (?1, ?2)",
+            params![failed_embed, failed_llm],
+        )
+        .expect("mark failed rows");
+
+    let output = Command::new(mempal_bin())
+        .args(["reindex", "--failed"])
+        .env("HOME", home.path())
+        .output()
+        .expect("run mempal reindex --failed");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("reindex stdout utf8");
+    assert!(
+        stdout.contains("requeued failed embed queue items: 1"),
+        "{stdout}"
+    );
+
+    let conn = Connection::open(db_path).expect("open sqlite");
+    let status_for = |id: &str| -> (String, i64) {
+        conn.query_row(
+            "SELECT status, retry_count FROM pending_messages WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read queue row")
+    };
+    assert_eq!(status_for(&failed_embed), ("pending".to_string(), 0));
+    assert_eq!(status_for(&failed_llm), ("failed".to_string(), 4));
+    assert_eq!(status_for(&pending_embed), ("pending".to_string(), 0));
 }
 
 #[test]

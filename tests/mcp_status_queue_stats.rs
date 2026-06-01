@@ -145,6 +145,35 @@ async fn test_mcp_status_surfaces_queue_stats() {
 }
 
 #[tokio::test]
+async fn test_mcp_status_headline_reflects_failed_queue() {
+    let (_tmp, db_path, config) = setup_env();
+    let store = PendingMessageStore::with_config(
+        &db_path,
+        QueueConfig {
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            max_retries: 0,
+        },
+    )
+    .expect("create store");
+
+    store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
+    let failed = store
+        .claim_next("worker-failed", 60)
+        .expect("claim")
+        .expect("failed row");
+    store.mark_failed(&failed.id, "boom").expect("mark failed");
+
+    let server = MempalMcpServer::new(db_path, config);
+    let response = server.mempal_status().await.expect("status").0;
+
+    assert_eq!(response.queue_stats.failed, 1);
+    assert_eq!(response.embed_status.failed_count, 1);
+    assert_eq!(response.embed_status.fail_count, 1);
+    assert_eq!(response.embed_status.failure_count, 1);
+}
+
+#[tokio::test]
 async fn test_mcp_status_surfaces_source_type_distribution() {
     let (_tmp, db_path, config) = setup_env();
     insert_drawer_with_source_type(&db_path, "drawer-user", SourceType::UserExplicit);
