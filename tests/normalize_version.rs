@@ -3,10 +3,11 @@ use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use mempal::embed::{Embedder, EmbedderFactory};
 use mempal::ingest::lock::{acquire_source_lock, source_key};
 use mempal::ingest::normalize::CURRENT_NORMALIZE_VERSION;
-use mempal::ingest::reindex::{ReindexMode, ReindexOptions, reindex_sources};
+use mempal::ingest::reindex::{ReindexError, ReindexMode, ReindexOptions, reindex_sources};
 use mempal::ingest::{IngestOptions, ingest_file_with_options};
 use mempal::mcp::MempalMcpServer;
 use rusqlite::Connection;
+use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
@@ -213,6 +214,72 @@ fn stale_drawer_count_raw(db: &Database) -> i64 {
             |row| row.get(0),
         )
         .expect("count stale drawers")
+}
+
+fn active_drawer_rows_for_source(
+    db: &Database,
+    source_file: &str,
+) -> Vec<(String, String, Option<String>)> {
+    let mut statement = db
+        .conn()
+        .prepare(
+            r#"
+            SELECT id, content, project_id
+            FROM drawers
+            WHERE deleted_at IS NULL AND source_file = ?1
+            ORDER BY project_id, id
+            "#,
+        )
+        .expect("prepare active drawer rows");
+    statement
+        .query_map([source_file], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .expect("query active drawer rows")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect active drawer rows")
+}
+
+fn active_vector_project_ids_for_source(
+    db: &Database,
+    source_file: &str,
+) -> BTreeMap<String, Option<String>> {
+    let mut statement = db
+        .conn()
+        .prepare(
+            r#"
+            SELECT v.id, v.project_id
+            FROM drawer_vectors v
+            JOIN drawers d ON d.id = v.id
+            WHERE d.deleted_at IS NULL AND d.source_file = ?1
+            ORDER BY v.id
+            "#,
+        )
+        .expect("prepare vector project rows");
+    statement
+        .query_map([source_file], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .expect("query vector project rows")
+        .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+        .expect("collect vector project rows")
+}
+
+fn assert_project_source_reindex_unsupported(error: ReindexError) {
+    match error {
+        ReindexError::ProjectScopedSourceReindexUnsupported {
+            candidate_drawers,
+            candidate_sources,
+        } => {
+            assert_eq!(candidate_drawers, 2);
+            assert_eq!(candidate_sources, 1);
+        }
+        other => panic!("unexpected reindex error: {other:?}"),
+    }
 }
 
 fn mempal_bin() -> String {
@@ -444,6 +511,111 @@ async fn test_reindex_force_reprocesses_all() {
     assert_eq!(report.candidate_sources, 2);
     assert_eq!(report.processed_sources, 2);
     assert_eq!(stale_drawer_count_raw(&db), 0);
+}
+
+#[tokio::test]
+async fn test_project_scoped_source_reindex_rejects_stale_and_force_without_mutation() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let project_a = tmp.path().join("project-a");
+    let project_b = tmp.path().join("project-b");
+    std::fs::create_dir_all(&project_a).expect("create project-a");
+    std::fs::create_dir_all(&project_b).expect("create project-b");
+    let source_a = project_a.join("note.md");
+    let source_b = project_b.join("note.md");
+    std::fs::write(&source_a, "project a original").expect("write project-a source");
+    std::fs::write(&source_b, "project b original").expect("write project-b source");
+
+    for (path, root, project_id) in [
+        (&source_a, &project_a, "project-a"),
+        (&source_b, &project_b, "project-b"),
+    ] {
+        ingest_file_with_options(
+            &db,
+            &StubEmbedder,
+            path,
+            "mempal",
+            IngestOptions {
+                room: Some("normalize"),
+                source_root: Some(root),
+                dry_run: false,
+                project_id: Some(project_id),
+                source_file_override: None,
+                replace_existing_source: false,
+                no_strip_noise: false,
+                ..IngestOptions::default()
+            },
+        )
+        .await
+        .expect("ingest project source");
+    }
+
+    db.conn()
+        .execute(
+            "UPDATE drawers SET normalize_version = 0 WHERE source_file = 'note.md'",
+            [],
+        )
+        .expect("mark project drawers stale");
+    std::fs::write(&source_a, "project a replacement").expect("rewrite project-a source");
+    std::fs::write(&source_b, "project b replacement").expect("rewrite project-b source");
+
+    let before_drawers = active_drawer_rows_for_source(&db, "note.md");
+    assert_eq!(before_drawers.len(), 2);
+    assert_eq!(
+        before_drawers
+            .iter()
+            .map(|(_, _, project_id)| project_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("project-a"), Some("project-b")]
+    );
+    let before_vectors = active_vector_project_ids_for_source(&db, "note.md");
+    assert_eq!(before_vectors.len(), 2);
+
+    let stale_error = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Stale,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect_err("project-scoped stale reindex must fail fast");
+    assert_project_source_reindex_unsupported(stale_error);
+    assert_eq!(
+        active_drawer_rows_for_source(&db, "note.md"),
+        before_drawers
+    );
+    assert_eq!(
+        active_vector_project_ids_for_source(&db, "note.md"),
+        before_vectors
+    );
+
+    let force_error = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Force,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect_err("project-scoped force reindex must fail fast");
+    assert_project_source_reindex_unsupported(force_error);
+    assert_eq!(
+        active_drawer_rows_for_source(&db, "note.md"),
+        before_drawers
+    );
+    assert_eq!(
+        active_vector_project_ids_for_source(&db, "note.md"),
+        before_vectors
+    );
+
+    let drawer_project_ids: BTreeMap<_, _> = before_drawers
+        .iter()
+        .map(|(id, _, project_id)| (id.clone(), project_id.clone()))
+        .collect();
+    assert_eq!(before_vectors, drawer_project_ids);
 }
 
 #[tokio::test]

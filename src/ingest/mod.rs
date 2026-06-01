@@ -386,11 +386,16 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         .confidence
         .unwrap_or_else(|| default_confidence(source_type));
     if options.replace_existing_source && !options.dry_run {
-        db.replace_active_source_drawers(&source_file, wing, Some(resolved_room.as_str()))
-            .map_err(|source| IngestError::ReplaceSource {
-                source_file: source_file.clone(),
-                source,
-            })?;
+        db.replace_active_source_drawers(
+            &source_file,
+            wing,
+            Some(resolved_room.as_str()),
+            options.project_id,
+        )
+        .map_err(|source| IngestError::ReplaceSource {
+            source_file: source_file.clone(),
+            source,
+        })?;
     }
 
     let scrubbed_replace_text = options
