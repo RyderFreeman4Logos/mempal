@@ -111,6 +111,31 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr utf8")
 }
 
+fn count_home_turns(home: &Path) -> i64 {
+    let db = open_home_db(home);
+    db.conn()
+        .query_row("SELECT COUNT(*) FROM conversation_turns", [], |row| {
+            row.get(0)
+        })
+        .expect("count conversation turns")
+}
+
+fn assert_since_duration_error(output: &Output, label: &str) {
+    assert!(!output.status.success(), "{label} should fail");
+    let err = stderr(output);
+    assert!(
+        err.contains("invalid --since duration")
+            && err.contains(r#""7d""#)
+            && err.contains(r#""24h""#)
+            && err.contains(r#""30m""#),
+        "error should name valid --since forms, got: {err}"
+    );
+    assert!(
+        !err.contains("panicked"),
+        "{label} should return an error, not panic: {err}"
+    );
+}
+
 fn json_turn_by_id<'a>(turns: &'a [Value], id: &str) -> &'a Value {
     turns
         .iter()
@@ -277,6 +302,52 @@ fn timeline_rejects_invalid_format_at_parse_time() {
         err.contains("invalid value") && err.contains("markdown") && err.contains("json"),
         "clap error should list valid formats, got: {err}"
     );
+}
+
+#[test]
+fn stats_and_timeline_since_empty_return_cli_error_without_mutating_turns() {
+    let home = TempDir::new().expect("home");
+    {
+        let db = open_home_db(home.path());
+        insert_home_turn(
+            &db,
+            RawTurnRow {
+                id: "empty-since-kept",
+                session_id: "sess1",
+                tool: "cc",
+                turn_index: 0,
+                role: "user",
+                content: "existing turn",
+                timestamp_epoch: 1.0,
+            },
+            None,
+        );
+    }
+    let before = count_home_turns(home.path());
+
+    let stats_output = run_xurl_stats(home.path(), &["--since", ""]);
+    assert_since_duration_error(&stats_output, "xurl stats --since empty");
+    assert_eq!(
+        count_home_turns(home.path()),
+        before,
+        "stats error path must not mutate turns"
+    );
+
+    let timeline_output = run_xurl_timeline(home.path(), &["--since", ""]);
+    assert_since_duration_error(&timeline_output, "xurl timeline --since empty");
+    assert_eq!(
+        count_home_turns(home.path()),
+        before,
+        "timeline error path must not mutate turns"
+    );
+}
+
+#[test]
+fn stats_since_malformed_returns_cli_error() {
+    let home = TempDir::new().expect("home");
+    let output = run_xurl_stats(home.path(), &["--since", "abc"]);
+
+    assert_since_duration_error(&output, "xurl stats --since malformed");
 }
 
 #[test]

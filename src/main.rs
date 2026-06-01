@@ -8659,18 +8659,28 @@ async fn serve_mcp_and_rest_command(config: &Config) -> Result<()> {
 
 /// Parse a duration string like "7d", "24h", "10m" into a Unix epoch threshold.
 fn parse_since_to_epoch(since: &str) -> Result<f64> {
+    const VALID_FORMS: &str = r#"valid forms are "7d", "24h", or "30m""#;
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| anyhow::anyhow!("system clock error: {e}"))?
         .as_secs_f64();
-    let (value, unit) = since.split_at(since.len() - 1);
-    let n: f64 = value.parse().context("invalid duration value")?;
-    let secs = match unit {
-        "d" => n * 86400.0,
-        "h" => n * 3600.0,
-        "m" => n * 60.0,
-        other => anyhow::bail!("unknown duration unit '{}'; use d/h/m", other),
+    let (value, unit_secs) = if let Some(value) = since.strip_suffix('d') {
+        (value, 86400.0)
+    } else if let Some(value) = since.strip_suffix('h') {
+        (value, 3600.0)
+    } else if let Some(value) = since.strip_suffix('m') {
+        (value, 60.0)
+    } else {
+        anyhow::bail!("invalid --since duration '{since}'; {VALID_FORMS}");
     };
+    if value.is_empty() {
+        anyhow::bail!("invalid --since duration '{since}'; {VALID_FORMS}");
+    }
+    let n: f64 = value
+        .parse()
+        .with_context(|| format!("invalid --since duration '{since}'; {VALID_FORMS}"))?;
+    let secs = n * unit_secs;
     Ok(now - secs)
 }
 
