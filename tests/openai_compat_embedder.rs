@@ -72,6 +72,28 @@ async fn test_openai_compat_embed_api_error() {
 
     mock.assert();
     assert!(matches!(error, EmbedError::HttpStatus { .. }));
+    assert!(error.is_retryable());
+}
+
+#[tokio::test]
+async fn test_openai_compat_embed_client_error_is_not_retryable() {
+    let mut server = Server::new_async().await;
+    let mock = server
+        .mock("POST", "/v1/embeddings")
+        .with_status(400)
+        .with_body("bad input")
+        .create();
+    let config = config_for(&server, "");
+    let embedder = OpenAiCompatibleEmbedder::from_config(&config).expect("build embedder");
+
+    let error = embedder
+        .embed(&["bad input"])
+        .await
+        .expect_err("client error");
+
+    mock.assert();
+    assert!(matches!(error, EmbedError::HttpStatus { .. }));
+    assert!(!error.is_retryable());
 }
 
 #[tokio::test]
@@ -92,6 +114,7 @@ async fn test_openai_compat_embed_malformed_response() {
 
     mock.assert();
     assert!(matches!(error, EmbedError::DecodeResponse { .. }));
+    assert!(!error.is_retryable());
 }
 
 #[tokio::test]

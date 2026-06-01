@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::Database;
-use mempal::core::queue::{LAST_ERROR_MAX_BYTES, PendingMessageStore, QueueConfig};
+use mempal::core::queue::{
+    LAST_ERROR_MAX_BYTES, PendingMessageStore, QueueConfig, QueueFailureDisposition,
+};
 use rusqlite::Connection;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
@@ -122,6 +124,67 @@ fn test_mark_failed_sets_backoff_next_attempt() {
 }
 
 #[test]
+fn test_retryable_failure_is_retried_not_dead_lettered_first() {
+    let (_tmp, db_path, store) = new_store();
+    let id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
+    store
+        .claim_next("worker-a", 60)
+        .expect("claim")
+        .expect("message");
+
+    store
+        .mark_failed_with_disposition(&id, "transport timeout", QueueFailureDisposition::Retryable)
+        .expect("mark retryable failure");
+
+    let (status, retry_count): (String, i64) = Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT status, retry_count FROM pending_messages WHERE id = ?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read queue row");
+    assert_eq!(status, "pending");
+    assert_eq!(retry_count, 1);
+}
+
+#[test]
+fn test_terminal_failure_dead_letters_immediately() {
+    let (_tmp, db_path, store) = new_store();
+    let id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
+    store
+        .claim_next("worker-a", 60)
+        .expect("claim")
+        .expect("message");
+
+    store
+        .mark_failed_with_disposition(
+            &id,
+            "invalid embedding input",
+            QueueFailureDisposition::Terminal,
+        )
+        .expect("mark terminal failure");
+
+    let (status, retry_count, next_attempt_at): (String, i64, i64) = Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT status, retry_count, next_attempt_at FROM pending_messages WHERE id = ?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read queue row");
+    assert_eq!(status, "failed");
+    assert_eq!(retry_count, 1);
+    assert!(next_attempt_at <= now_secs());
+    assert!(
+        store
+            .claim_next("worker-b", 60)
+            .expect("claim after terminal")
+            .is_none()
+    );
+}
+
+#[test]
 fn test_max_retries_marks_failed_permanently() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
@@ -161,6 +224,61 @@ fn test_max_retries_marks_failed_permanently() {
             .expect("claim after failed")
             .is_none()
     );
+}
+
+#[test]
+fn test_retry_failed_embed_messages_requeues_only_failed_embed_items() {
+    let (_tmp, db_path, store) = new_store();
+    let failed_embed = store
+        .enqueue("hook_event", r#"{"n":1}"#)
+        .expect("enqueue failed embed");
+    let failed_llm = store
+        .enqueue("llm_task", r#"{"n":2}"#)
+        .expect("enqueue failed llm");
+    let pending_embed = store
+        .enqueue("hook_event", r#"{"n":3}"#)
+        .expect("enqueue pending embed");
+    let claimed_embed = store
+        .enqueue("hook_event", r#"{"n":4}"#)
+        .expect("enqueue claimed embed");
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE pending_messages SET status = 'failed', retry_count = 7, retry_backoff_ms = 5000, last_error = 'boom' WHERE id IN (?1, ?2)",
+        rusqlite::params![failed_embed, failed_llm],
+    )
+    .expect("mark failed rows");
+    conn.execute(
+        "UPDATE pending_messages SET status = 'claimed', claim_token = 'worker:claim', claimed_at = ?2, heartbeat_at = ?2 WHERE id = ?1",
+        rusqlite::params![claimed_embed, now_secs()],
+    )
+    .expect("mark claimed row");
+    drop(conn);
+
+    let retried = store
+        .retry_failed_embed_messages()
+        .expect("retry failed embed messages");
+    assert_eq!(retried, 1);
+
+    let conn = Connection::open(db_path).expect("open sqlite");
+    let rows = [
+        (&failed_embed, "pending", 0_i64, None),
+        (&failed_llm, "failed", 7_i64, Some("boom")),
+        (&pending_embed, "pending", 0_i64, None),
+        (&claimed_embed, "claimed", 0_i64, None),
+    ];
+    for (id, expected_status, expected_retry_count, expected_error) in rows {
+        let (status, retry_count, last_error): (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, retry_count, last_error FROM pending_messages WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read row");
+        assert_eq!(status, expected_status, "{id}");
+        assert_eq!(retry_count, expected_retry_count, "{id}");
+        assert_eq!(last_error.as_deref(), expected_error, "{id}");
+    }
 }
 
 /// Verifies concurrent enqueue doesn't deadlock or starve.

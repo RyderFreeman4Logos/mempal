@@ -119,16 +119,31 @@ pub enum EmbedError {
 
 impl EmbedError {
     pub fn is_retryable(&self) -> bool {
-        !matches!(
-            self,
-            Self::InvalidResponse(_)
-                | Self::EmptyVectors
-                | Self::InvalidDimensions { .. }
-                | Self::UnsupportedBackend(_)
-                | Self::MissingConfiguration(_)
-                | Self::InvalidConfiguration(_)
-                | Self::ReadApiKeyEnv { .. }
-        )
+        match self {
+            Self::HttpRequest { source, .. } => source.status().is_none_or(is_retryable_status),
+            Self::HttpStatus { source, .. } | Self::DownloadStatus { source, .. } => {
+                source.status().is_some_and(is_retryable_status)
+            }
+            Self::Download { .. }
+            | Self::ReadDownloadBody { .. }
+            | Self::Runtime(_)
+            | Self::WorkerPanic(_) => true,
+            Self::CreateModelDir { .. }
+            | Self::CheckPathExists { .. }
+            | Self::WriteFile { .. }
+            | Self::RenameFile { .. }
+            | Self::SessionBuilder(_)
+            | Self::LoadModel { .. }
+            | Self::Tokenizer(_)
+            | Self::DecodeResponse { .. }
+            | Self::InvalidResponse(_)
+            | Self::EmptyVectors
+            | Self::InvalidDimensions { .. }
+            | Self::UnsupportedBackend(_)
+            | Self::MissingConfiguration(_)
+            | Self::InvalidConfiguration(_)
+            | Self::ReadApiKeyEnv { .. } => false,
+        }
     }
 
     pub fn endpoint(&self) -> Option<&str> {
@@ -139,6 +154,12 @@ impl EmbedError {
             _ => None,
         }
     }
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
 #[async_trait::async_trait]

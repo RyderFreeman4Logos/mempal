@@ -1327,6 +1327,9 @@ impl MempalMcpServer {
             });
         }
 
+        let embed_failure_headline =
+            crate::core::queue::failure_headline_count(embed_snapshot.fail_count, &queue_stats);
+
         Ok(Json(StatusResponse {
             schema_version,
             normalize_version_current: CURRENT_NORMALIZE_VERSION,
@@ -1368,8 +1371,8 @@ impl MempalMcpServer {
                 claimed_count: queue_stats.claimed,
                 failed_count: queue_stats.failed,
                 degraded: embed_snapshot.degraded,
-                fail_count: embed_snapshot.fail_count,
-                failure_count: embed_snapshot.fail_count,
+                fail_count: embed_failure_headline,
+                failure_count: embed_failure_headline,
                 last_error: embed_snapshot.last_error,
                 last_success_at_unix_ms: embed_snapshot.last_success_at_unix_ms,
             },

@@ -53,6 +53,15 @@ pub struct QueueConfig {
     pub max_retries: u32,
 }
 
+/// Controls whether a processing failure is retried or dead-lettered immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueFailureDisposition {
+    /// Retry with bounded queue backoff until `QueueConfig::max_retries` is exhausted.
+    Retryable,
+    /// Move directly to the failed/dead-letter state without another attempt.
+    Terminal,
+}
+
 impl Default for QueueConfig {
     fn default() -> Self {
         Self {
@@ -303,6 +312,16 @@ impl PendingMessageStore {
     }
 
     pub fn mark_failed(&self, id: &str, error: &str) -> Result<()> {
+        self.mark_failed_with_disposition(id, error, QueueFailureDisposition::Retryable)
+    }
+
+    /// Record a failed processing attempt with explicit retry/dead-letter policy.
+    pub fn mark_failed_with_disposition(
+        &self,
+        id: &str,
+        error: &str,
+        disposition: QueueFailureDisposition,
+    ) -> Result<()> {
         let mut conn = self.open_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let redacted_error = sanitize_last_error(error);
@@ -317,9 +336,18 @@ impl PendingMessageStore {
         let next_retry = current_retry.saturating_add(1);
         let next_retry_u32 = u32::try_from(next_retry)
             .map_err(|_| QueueError::RetryCountOverflow { id: id.to_string() })?;
-        let backoff_ms = self.compute_backoff_ms(next_retry_u32);
-        let next_attempt_at = now_secs().saturating_add(div_ceil(backoff_ms, 1_000));
-        let terminal = next_retry_u32 > self.config.max_retries;
+        let terminal = disposition == QueueFailureDisposition::Terminal
+            || next_retry_u32 > self.config.max_retries;
+        let backoff_ms = if terminal {
+            0
+        } else {
+            self.compute_backoff_ms(next_retry_u32)
+        };
+        let next_attempt_at = if terminal {
+            now_secs()
+        } else {
+            now_secs().saturating_add(div_ceil(backoff_ms, 1_000))
+        };
         let status = if terminal { "failed" } else { "pending" };
 
         let updated = tx.execute(
@@ -350,6 +378,32 @@ impl PendingMessageStore {
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Return dead-lettered embed-queue messages to pending for a targeted retry.
+    ///
+    /// LLM tasks share the same storage table but are not embed queue work, so
+    /// they are intentionally left untouched.
+    pub fn retry_failed_embed_messages(&self) -> Result<u64> {
+        let now = now_secs();
+        let conn = self.open_connection()?;
+        let updated = conn.execute(
+            r#"
+            UPDATE pending_messages
+            SET status = 'pending',
+                retry_count = 0,
+                retry_backoff_ms = 0,
+                next_attempt_at = ?1,
+                claim_token = NULL,
+                claimed_at = NULL,
+                heartbeat_at = NULL,
+                last_error = NULL
+            WHERE status = 'failed'
+              AND kind != 'llm_task'
+            "#,
+            [now],
+        )?;
+        Ok(updated as u64)
     }
 
     /// Return a claimed message to pending without counting it as a failure.
@@ -504,6 +558,10 @@ fn compute_queue_stats(conn: &Connection) -> Result<QueueStats> {
         avg_processing_ms,
         eta_secs,
     })
+}
+
+pub fn failure_headline_count(live_fail_count: u64, queue_stats: &QueueStats) -> u64 {
+    live_fail_count.max(queue_stats.failed)
 }
 
 fn reclaim_stale_tx(conn: &rusqlite::Transaction<'_>, stale_cutoff: i64) -> rusqlite::Result<u64> {

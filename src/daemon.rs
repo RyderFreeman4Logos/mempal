@@ -10,7 +10,7 @@ use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
     db::Database,
     project::resolve_project_id,
-    queue::{ClaimedMessage, PendingMessageStore},
+    queue::{ClaimedMessage, PendingMessageStore, QueueFailureDisposition},
     strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{BootstrapEvidenceArgs, Drawer, SourceType},
     utils::{current_timestamp, route_room_from_taxonomy, synthetic_source_file},
@@ -243,9 +243,14 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                     Err(error) => {
                         tracing::error!("daemon message {message_id} failed: {error}");
                         context.write_observer.record_error(error.to_string());
+                        let disposition = queue_failure_disposition(&error);
                         context
                             .store
-                            .mark_failed(&message_id, &error.to_string())
+                            .mark_failed_with_disposition(
+                                &message_id,
+                                &error.to_string(),
+                                disposition,
+                            )
                             .with_context(|| format!("failed to mark_failed {message_id}"))?;
                     }
                 }
@@ -454,6 +459,22 @@ async fn embed_text_with_heartbeat<E: Embedder + ?Sized>(
         .into_iter()
         .next()
         .ok_or_else(|| EmbedError::Runtime("embedder returned no vectors".to_string()))
+}
+
+fn queue_failure_disposition(error: &anyhow::Error) -> QueueFailureDisposition {
+    for cause in error.chain() {
+        if let Some(embed_error) = cause.downcast_ref::<EmbedError>() {
+            return if embed_error.is_retryable() {
+                QueueFailureDisposition::Retryable
+            } else {
+                QueueFailureDisposition::Terminal
+            };
+        }
+        if cause.downcast_ref::<serde_json::Error>().is_some() {
+            return QueueFailureDisposition::Terminal;
+        }
+    }
+    QueueFailureDisposition::Retryable
 }
 
 #[derive(Debug, Clone)]
