@@ -37,6 +37,13 @@ pub struct ReindexReport {
 pub enum ReindexError {
     #[error(transparent)]
     Db(#[from] crate::core::db::DbError),
+    #[error(
+        "project-scoped source reindex is unsupported for isolation safety: {candidate_drawers} candidate drawers across {candidate_sources} source identities have project_id; use `mempal reindex --from-config --stale` for project-safe embedder/vector reindex"
+    )]
+    ProjectScopedSourceReindexUnsupported {
+        candidate_drawers: u64,
+        candidate_sources: u64,
+    },
     #[error("failed to reindex source {source_file}")]
     Ingest {
         source_file: String,
@@ -50,6 +57,17 @@ pub async fn reindex_sources<E: Embedder + ?Sized>(
     embedder: &E,
     options: ReindexOptions,
 ) -> Result<ReindexReport, ReindexError> {
+    let project_scoped = match options.mode {
+        ReindexMode::Stale => db.project_scoped_reindex_sources_stale(CURRENT_NORMALIZE_VERSION)?,
+        ReindexMode::Force => db.project_scoped_reindex_sources_force()?,
+    };
+    if project_scoped.drawer_count > 0 {
+        return Err(ReindexError::ProjectScopedSourceReindexUnsupported {
+            candidate_drawers: project_scoped.drawer_count,
+            candidate_sources: project_scoped.source_count,
+        });
+    }
+
     let sources = match options.mode {
         ReindexMode::Stale => db.reindex_sources_stale(CURRENT_NORMALIZE_VERSION)?,
         ReindexMode::Force => db.reindex_sources_force()?,

@@ -212,6 +212,12 @@ pub enum DbError {
     LlmCompactionNotImplemented,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ReindexSourceScopeSummary {
+    pub(crate) drawer_count: u64,
+    pub(crate) source_count: u64,
+}
+
 pub struct Database {
     conn: Connection,
     path: PathBuf,
@@ -1523,6 +1529,30 @@ impl Database {
         Ok(rows)
     }
 
+    pub(crate) fn project_scoped_reindex_sources_stale(
+        &self,
+        current_normalize_version: u32,
+    ) -> Result<ReindexSourceScopeSummary, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT COALESCE(SUM(drawer_count), 0), COUNT(*)
+            FROM (
+                SELECT source_file, wing, room, COUNT(*) AS drawer_count
+                FROM drawers
+                WHERE deleted_at IS NULL
+                  AND normalize_version < ?1
+                  AND project_id IS NOT NULL
+                GROUP BY source_file, wing, room
+            )
+            "#,
+        )?;
+        let summary = statement.query_row(
+            [i64::from(current_normalize_version)],
+            reindex_source_scope_summary_from_row,
+        )?;
+        Ok(summary)
+    }
+
     pub fn reindex_sources_force(&self) -> Result<Vec<ReindexSource>, DbError> {
         let mut statement = self.conn.prepare(
             r#"
@@ -1537,6 +1567,25 @@ impl Database {
             .query_map([], reindex_source_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub(crate) fn project_scoped_reindex_sources_force(
+        &self,
+    ) -> Result<ReindexSourceScopeSummary, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT COALESCE(SUM(drawer_count), 0), COUNT(*)
+            FROM (
+                SELECT source_file, wing, room, COUNT(*) AS drawer_count
+                FROM drawers
+                WHERE deleted_at IS NULL
+                  AND project_id IS NOT NULL
+                GROUP BY source_file, wing, room
+            )
+            "#,
+        )?;
+        let summary = statement.query_row([], reindex_source_scope_summary_from_row)?;
+        Ok(summary)
     }
 
     pub fn replace_active_source_drawers(
@@ -4725,6 +4774,17 @@ fn reindex_source_from_row(row: &Row<'_>) -> rusqlite::Result<ReindexSource> {
         wing: row.get(1)?,
         room: row.get(2)?,
         drawer_count: drawer_count as u64,
+    })
+}
+
+fn reindex_source_scope_summary_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<ReindexSourceScopeSummary> {
+    let drawer_count = row.get::<_, i64>(0)?;
+    let source_count = row.get::<_, i64>(1)?;
+    Ok(ReindexSourceScopeSummary {
+        drawer_count: drawer_count as u64,
+        source_count: source_count as u64,
     })
 }
 
