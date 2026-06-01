@@ -417,7 +417,9 @@ pub struct TunnelFollowResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReindexSource {
+    pub source_root: Option<String>,
     pub source_file: Option<String>,
+    pub project_id: Option<String>,
     pub wing: String,
     pub room: Option<String>,
     pub drawer_count: u64,

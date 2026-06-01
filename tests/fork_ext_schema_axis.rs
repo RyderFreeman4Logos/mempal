@@ -79,6 +79,68 @@ fn test_upstream_user_version_preserved_after_fork_ext_init() {
 }
 
 #[test]
+fn test_fork_ext_v16_to_v17_adds_drawers_source_root_idempotently() {
+    let conn = Connection::open_in_memory().expect("open sqlite connection");
+    let schema_version = current_schema_version();
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE fork_ext_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO fork_ext_meta (key, value) VALUES ('fork_ext_version', '16');
+        CREATE TABLE drawers (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            source_file TEXT,
+            wing TEXT NOT NULL,
+            room TEXT,
+            normalize_version INTEGER NOT NULL DEFAULT 1,
+            deleted_at TEXT
+        );
+        PRAGMA user_version = {schema_version};
+        "#
+    ))
+    .expect("create v16 schema");
+
+    apply_fork_ext_migrations_to(&conn, 17).expect("first v17 migration");
+    apply_fork_ext_migrations_to(&conn, 17).expect("second v17 migration");
+
+    let source_root = table_columns(&conn, "drawers")
+        .into_iter()
+        .find(|(name, _)| name == "source_root")
+        .expect("source_root column exists");
+    assert_eq!(source_root.1, "TEXT");
+    let not_null: i64 = conn
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('drawers') WHERE name = 'source_root'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read source_root notnull");
+    assert_eq!(not_null, 0);
+    let index_exists: i64 = conn
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND name = 'idx_drawers_reindex_source_identity_active'
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .expect("read index");
+    assert_eq!(index_exists, 1);
+    assert_eq!(read_fork_ext_version(&conn).expect("read version"), 17);
+    let user_version = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        .expect("read user_version");
+    assert_eq!(user_version, schema_version);
+    assert_eq!(schema_version, current_schema_version());
+}
+
+#[test]
 fn test_fork_ext_meta_table_exists_after_init() {
     let (_tmp, _db_path, db) = new_test_db();
 

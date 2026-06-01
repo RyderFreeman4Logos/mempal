@@ -105,6 +105,12 @@ pub enum IngestError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to canonicalize source root {path}")]
+    CanonicalizeSourceRoot {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to normalize {path}")]
     Normalize {
         path: PathBuf,
@@ -223,7 +229,7 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
         wing,
         IngestOptions {
             room,
-            source_root: path.parent(),
+            source_root: None,
             dry_run: false,
             project_id: None,
             gating: None,
@@ -367,6 +373,21 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         .source_file_override
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| normalize_source_file(path, options.source_root));
+    let persisted_source_root = if options.dry_run {
+        None
+    } else {
+        options
+            .source_root
+            .map(|root| {
+                root.canonicalize()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .map_err(|source| IngestError::CanonicalizeSourceRoot {
+                        path: root.to_path_buf(),
+                        source,
+                    })
+            })
+            .transpose()?
+    };
 
     // Per-source ingest lock (P9-B). Guards dedup-check + insert critical
     // section against concurrent Claude↔Codex ingests of the same source.
@@ -391,6 +412,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             wing,
             Some(resolved_room.as_str()),
             options.project_id,
+            persisted_source_root.as_deref(),
         )
         .map_err(|source| IngestError::ReplaceSource {
             source_file: source_file.clone(),
@@ -613,6 +635,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         db.insert_drawer_with_project_validity(
             &drawer,
             options.project_id,
+            persisted_source_root.as_deref(),
             options.valid_from,
             options.valid_until,
         )

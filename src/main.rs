@@ -2915,11 +2915,7 @@ async fn ingest_command(
     let confidence = resolve_confidence_bound("--confidence", source_type, options.confidence)?;
     let base_options = IngestOptions {
         room: options.room,
-        source_root: if path.is_file() {
-            path.parent()
-        } else {
-            Some(path)
-        },
+        source_root: if path.is_file() { None } else { Some(path) },
         dry_run: options.dry_run,
         project_id: project_id.as_deref(),
         gating: None,
@@ -2955,11 +2951,7 @@ async fn ingest_command(
         let embedder = build_embedder(config).await?;
         let live_options = IngestOptions {
             room: options.room,
-            source_root: if path.is_file() {
-                path.parent()
-            } else {
-                Some(path)
-            },
+            source_root: if path.is_file() { None } else { Some(path) },
             dry_run: false,
             project_id: project_id.as_deref(),
             gating: (!options.no_gate).then_some(&config.ingest_gating),
@@ -3390,8 +3382,14 @@ async fn ingest_stdin_command(
         link_superseded_drawer(&mut drawer, old_id);
     }
 
-    db.insert_drawer_with_project_validity(&drawer, project_id.as_deref(), valid_from, valid_until)
-        .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
+    db.insert_drawer_with_project_validity(
+        &drawer,
+        project_id.as_deref(),
+        None,
+        valid_from,
+        valid_until,
+    )
+    .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
     db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
         .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
 
