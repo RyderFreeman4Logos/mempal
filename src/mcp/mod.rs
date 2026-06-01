@@ -12,5 +12,5 @@ pub use tools::{
     PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
     ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
     RollbackRequest, RollbackResponse, RouteDecisionDto, SearchRequest, SearchResponse,
-    SearchResultDto, StatusResponse,
+    SearchResultDto, StatusDetail, StatusRequest, StatusResponse, StatusScope,
 };

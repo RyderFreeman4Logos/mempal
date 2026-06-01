@@ -103,9 +103,9 @@ use super::tools::{
     ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto, RollbackRequest,
     RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto,
     SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
-    SkillSummaryDto, SourceTypeCount, StatusResponse, SystemWarning, TaxonomyEntryDto,
-    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
-    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    SkillSummaryDto, SourceTypeCount, StatusDetail, StatusRequest, StatusResponse, StatusScope,
+    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
+    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 #[derive(Clone)]
@@ -319,6 +319,27 @@ impl MempalMcpServer {
 
     pub async fn status_json_for_test(&self) -> std::result::Result<StatusResponse, ErrorData> {
         self.mempal_status().await.map(|response| response.0)
+    }
+
+    pub async fn status_json_with_request_for_test(
+        &self,
+        request: StatusRequest,
+    ) -> std::result::Result<StatusResponse, ErrorData> {
+        self.mempal_status_with_options(request)
+            .await
+            .map(|response| response.0)
+    }
+
+    pub async fn mempal_status(&self) -> std::result::Result<Json<StatusResponse>, ErrorData> {
+        self.mempal_status_with_options(StatusRequest::default())
+            .await
+    }
+
+    pub async fn mempal_status_with_options(
+        &self,
+        request: StatusRequest,
+    ) -> std::result::Result<Json<StatusResponse>, ErrorData> {
+        self.mempal_status_tool(Parameters(request)).await
     }
 
     pub async fn pinned_facts_json_for_test(
@@ -1258,12 +1279,37 @@ fn anchor_error(error: anchor::AnchorError) -> ErrorData {
 impl MempalMcpServer {
     #[tool(
         name = "mempal_status",
-        description = "Return schema version, drawer counts, feature/status flags, intelligence mode, queue stats, pinned fact counts, sleep/crystallize stats, endpoint health, the AAAK format spec, and the memory protocol. Call once at session start if you haven't seen the protocol yet."
+        description = "Return compact health/status by default. Use detail=\"full\" to include the memory protocol and AAAK spec, and scope=\"all\" to include all-project scope counts."
     )]
-    pub async fn mempal_status(&self) -> std::result::Result<Json<StatusResponse>, ErrorData> {
+    pub async fn mempal_status_tool(
+        &self,
+        Parameters(request): Parameters<StatusRequest>,
+    ) -> std::result::Result<Json<StatusResponse>, ErrorData> {
+        let detail = request.detail.unwrap_or_default();
+        let scope_mode = request.scope.unwrap_or(match detail {
+            StatusDetail::Compact => StatusScope::Project,
+            StatusDetail::Full => StatusScope::All,
+        });
         let cfg_meta = ConfigHandle::snapshot_meta();
         let config = ConfigHandle::current();
         let db = self.open_db()?;
+        let project_id = self
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await?;
+        let unresolved_project_scope = scope_mode == StatusScope::Project && project_id.is_none();
+        let project_scope = match scope_mode {
+            StatusScope::All => ProjectSearchScope::all_projects(),
+            StatusScope::Project => match project_id {
+                Some(project_id) => ProjectSearchScope {
+                    project_id: Some(project_id),
+                    mode: crate::core::project::ProjectFilterMode::ProjectScoped,
+                },
+                None => ProjectSearchScope {
+                    project_id: None,
+                    mode: crate::core::project::ProjectFilterMode::NullOnly,
+                },
+            },
+        };
         let queue_stats = crate::core::queue::PendingMessageStore::new(db.path())
             .map_err(|error| {
                 ErrorData::internal_error(format!("queue init failed: {error}"), None)
@@ -1292,7 +1338,7 @@ impl MempalMcpServer {
         let db_size_bytes = db.database_size_bytes().map_err(db_error)?;
         let diary_rollup_days = db.diary_rollup_days().map_err(db_error)?;
         let scopes = db
-            .scope_counts()
+            .scope_counts_for_search_scope(&project_scope)
             .map_err(db_error)?
             .into_iter()
             .map(|(wing, room, drawer_count)| ScopeCount {
@@ -1326,6 +1372,13 @@ impl MempalMcpServer {
                 source: "project_isolation".to_string(),
             });
         }
+        if unresolved_project_scope && config.search.strict_project_isolation {
+            system_warnings.push(SystemWarning {
+                level: "warn".to_string(),
+                message: "no project scope resolved, isolation strict".to_string(),
+                source: "project_isolation".to_string(),
+            });
+        }
 
         let embed_failure_headline =
             crate::core::queue::failure_headline_count(embed_snapshot.fail_count, &queue_stats);
@@ -1353,8 +1406,14 @@ impl MempalMcpServer {
             scopes,
             source_type_distribution,
             pinned_fact_counts,
-            aaak_spec: crate::aaak::generate_spec(),
-            memory_protocol: crate::core::protocol::MEMORY_PROTOCOL.to_string(),
+            aaak_spec: match detail {
+                StatusDetail::Compact => String::new(),
+                StatusDetail::Full => crate::aaak::generate_spec(),
+            },
+            memory_protocol: match detail {
+                StatusDetail::Compact => String::new(),
+                StatusDetail::Full => crate::core::protocol::MEMORY_PROTOCOL.to_string(),
+            },
             endpoint_health: EndpointHealthDto {
                 embedding_reachable: endpoint_health.embedding.reachable,
                 embedding_latency_ms: endpoint_health.embedding.latency_ms,
@@ -6335,6 +6394,196 @@ mod tests {
         .expect("insert drawer");
         db.insert_vector(id, &[0.1, 0.2, 0.3])
             .expect("insert vector");
+    }
+
+    fn insert_drawer_with_project(
+        db_path: &Path,
+        id: &str,
+        wing: &str,
+        room: Option<&str>,
+        project_id: Option<&str>,
+    ) {
+        let db = Database::open(db_path).expect("open db");
+        let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: id.to_string(),
+            content: format!("project scoped status fixture {id}"),
+            wing: wing.to_string(),
+            room: room.map(str::to_string),
+            source_file: Some(format!("{id}.md")),
+            source_type: SourceType::AgentInference,
+            added_at: "1713000000".to_string(),
+            chunk_index: Some(0),
+            importance: 1,
+        });
+        db.insert_drawer_with_project(&drawer, project_id)
+            .expect("insert project drawer");
+    }
+
+    fn scope_keys(status: &StatusResponse) -> Vec<(String, Option<String>)> {
+        let mut keys = status
+            .scopes
+            .iter()
+            .map(|scope| (scope.wing.clone(), scope.room.clone()))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test]
+    async fn test_mempal_status_compact_default_omits_protocol_but_keeps_health() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer_with_project(
+            &db_path,
+            "status-null-stale",
+            "mempal",
+            Some("status"),
+            None,
+        );
+        let store = crate::core::queue::PendingMessageStore::with_config(
+            &db_path,
+            crate::core::queue::QueueConfig {
+                base_delay_ms: 0,
+                max_delay_ms: 0,
+                max_retries: 0,
+            },
+        )
+        .expect("create queue store");
+        store
+            .enqueue("hook_event", r#"{"status":true}"#)
+            .expect("enqueue failed fixture");
+        let failed = store
+            .claim_next("status-worker", 60)
+            .expect("claim failed fixture")
+            .expect("failed fixture row");
+        store.mark_failed(&failed.id, "boom").expect("mark failed");
+
+        let status = server.mempal_status().await.expect("status").0;
+        let json = serde_json::to_value(&status).expect("serialize compact status");
+
+        assert!(json.get("memory_protocol").is_none());
+        assert!(json.get("aaak_spec").is_none());
+        assert!(json.get("schema_version").and_then(Value::as_u64).is_some());
+        assert!(
+            json.get("stale_drawer_count")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert_eq!(status.queue_stats.failed, 1);
+        assert_eq!(status.embed_status.failed_count, 1);
+        assert!(json.get("endpoint_health").is_some());
+        assert!(json.get("intelligence_status").is_some());
+        assert!(
+            status
+                .system_warnings
+                .iter()
+                .any(|warning| warning.source == "project_isolation"),
+            "compact status must keep actionable warnings"
+        );
+
+        let info = <MempalMcpServer as ServerHandler>::get_info(&server);
+        let instructions = info.instructions.expect("server instructions");
+        assert!(instructions.contains("MEMPAL MEMORY PROTOCOL"));
+    }
+
+    #[tokio::test]
+    async fn test_mempal_status_full_includes_protocol_and_aaak() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer_with_project(
+            &db_path,
+            "status-full-null-warning",
+            "mempal",
+            Some("status"),
+            None,
+        );
+
+        let status = server
+            .mempal_status_with_options(StatusRequest {
+                detail: Some(StatusDetail::Full),
+                scope: Some(StatusScope::Project),
+                project_id: None,
+            })
+            .await
+            .expect("full status")
+            .0;
+        let json = serde_json::to_value(&status).expect("serialize full status");
+
+        assert!(status.memory_protocol.contains("MEMPAL MEMORY PROTOCOL"));
+        assert!(status.aaak_spec.contains("AAAK"));
+        assert!(json.get("memory_protocol").is_some());
+        assert!(json.get("aaak_spec").is_some());
+        assert!(json.get("queue_stats").is_some());
+        assert!(json.get("embed_status").is_some());
+        assert!(json.get("stale_drawer_count").is_some());
+        assert!(json.get("system_warnings").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_mempal_status_scopes_project_by_default_and_all_on_opt_in() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer_with_project(
+            &db_path,
+            "status-project-a",
+            "project-a-wing",
+            Some("status"),
+            Some("project-a"),
+        );
+        insert_drawer_with_project(
+            &db_path,
+            "status-project-b",
+            "project-b-wing",
+            Some("status"),
+            Some("project-b"),
+        );
+        insert_drawer_with_project(
+            &db_path,
+            "status-global",
+            "global-wing",
+            Some("status"),
+            None,
+        );
+
+        let project_status = server
+            .mempal_status_with_options(StatusRequest {
+                detail: None,
+                scope: None,
+                project_id: Some("project-a".to_string()),
+            })
+            .await
+            .expect("project status")
+            .0;
+        assert_eq!(
+            scope_keys(&project_status),
+            vec![("project-a-wing".to_string(), Some("status".to_string()))]
+        );
+
+        let all_status = server
+            .mempal_status_with_options(StatusRequest {
+                detail: None,
+                scope: Some(StatusScope::All),
+                project_id: Some("project-a".to_string()),
+            })
+            .await
+            .expect("all status")
+            .0;
+        let all_keys = scope_keys(&all_status);
+        assert!(all_keys.contains(&("project-a-wing".to_string(), Some("status".to_string()))));
+        assert!(all_keys.contains(&("project-b-wing".to_string(), Some("status".to_string()))));
+        assert!(all_keys.contains(&("global-wing".to_string(), Some("status".to_string()))));
+
+        let full_status = server
+            .mempal_status_with_options(StatusRequest {
+                detail: Some(StatusDetail::Full),
+                scope: None,
+                project_id: Some("project-a".to_string()),
+            })
+            .await
+            .expect("full status")
+            .0;
+        assert!(
+            scope_keys(&full_status)
+                .contains(&("project-b-wing".to_string(), Some("status".to_string()))),
+            "detail=full defaults to the CLI --full all-scope breakdown"
+        );
     }
 
     fn insert_knowledge_drawer(
