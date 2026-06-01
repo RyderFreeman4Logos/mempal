@@ -317,13 +317,14 @@ impl Database {
         drawer: &Drawer,
         project_id: Option<&str>,
     ) -> Result<(), DbError> {
-        self.insert_drawer_with_project_validity(drawer, project_id, None, None)
+        self.insert_drawer_with_project_validity(drawer, project_id, None, None, None)
     }
 
     pub fn insert_drawer_with_project_validity(
         &self,
         drawer: &Drawer,
         project_id: Option<&str>,
+        source_root: Option<&str>,
         valid_from: Option<&str>,
         valid_until: Option<&str>,
     ) -> Result<(), DbError> {
@@ -339,6 +340,7 @@ impl Database {
                 wing,
                 room,
                 source_file,
+                source_root,
                 source_type,
                 confidence,
                 added_at,
@@ -369,7 +371,7 @@ impl Database {
                 valid_from,
                 valid_until
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)
             "#,
             params![
                 drawer.id.as_str(),
@@ -377,6 +379,7 @@ impl Database {
                 drawer.wing.as_str(),
                 drawer.room.as_deref(),
                 drawer.source_file.as_deref(),
+                source_root,
                 source_type_as_str(&drawer.source_type),
                 drawer.confidence,
                 drawer.added_at.as_str(),
@@ -1513,11 +1516,11 @@ impl Database {
     ) -> Result<Vec<ReindexSource>, DbError> {
         let mut statement = self.conn.prepare(
             r#"
-            SELECT source_file, wing, room, COUNT(*)
+            SELECT source_root, source_file, project_id, wing, room, COUNT(*)
             FROM drawers
             WHERE deleted_at IS NULL AND normalize_version < ?1
-            GROUP BY source_file, wing, room
-            ORDER BY source_file, wing, room
+            GROUP BY project_id, source_root, source_file, wing, room
+            ORDER BY project_id, source_root, source_file, wing, room
             "#,
         )?;
         let rows = statement
@@ -1537,12 +1540,13 @@ impl Database {
             r#"
             SELECT COALESCE(SUM(drawer_count), 0), COUNT(*)
             FROM (
-                SELECT source_file, wing, room, COUNT(*) AS drawer_count
+                SELECT source_root, source_file, project_id, wing, room, COUNT(*) AS drawer_count
                 FROM drawers
                 WHERE deleted_at IS NULL
                   AND normalize_version < ?1
                   AND project_id IS NOT NULL
-                GROUP BY source_file, wing, room
+                  AND source_root IS NULL
+                GROUP BY project_id, source_root, source_file, wing, room
             )
             "#,
         )?;
@@ -1556,11 +1560,11 @@ impl Database {
     pub fn reindex_sources_force(&self) -> Result<Vec<ReindexSource>, DbError> {
         let mut statement = self.conn.prepare(
             r#"
-            SELECT source_file, wing, room, COUNT(*)
+            SELECT source_root, source_file, project_id, wing, room, COUNT(*)
             FROM drawers
             WHERE deleted_at IS NULL
-            GROUP BY source_file, wing, room
-            ORDER BY source_file, wing, room
+            GROUP BY project_id, source_root, source_file, wing, room
+            ORDER BY project_id, source_root, source_file, wing, room
             "#,
         )?;
         let rows = statement
@@ -1576,11 +1580,12 @@ impl Database {
             r#"
             SELECT COALESCE(SUM(drawer_count), 0), COUNT(*)
             FROM (
-                SELECT source_file, wing, room, COUNT(*) AS drawer_count
+                SELECT source_root, source_file, project_id, wing, room, COUNT(*) AS drawer_count
                 FROM drawers
                 WHERE deleted_at IS NULL
                   AND project_id IS NOT NULL
-                GROUP BY source_file, wing, room
+                  AND source_root IS NULL
+                GROUP BY project_id, source_root, source_file, wing, room
             )
             "#,
         )?;
@@ -1594,6 +1599,7 @@ impl Database {
         wing: &str,
         room: Option<&str>,
         project_id: Option<&str>,
+        source_root: Option<&str>,
     ) -> Result<u64, DbError> {
         let mut statement = self.conn.prepare(
             r#"
@@ -1604,11 +1610,12 @@ impl Database {
               AND wing = ?2
               AND ((?3 IS NULL AND room IS NULL) OR room = ?3)
               AND ((?4 IS NULL AND project_id IS NULL) OR project_id = ?4)
+              AND ((?5 IS NULL AND source_root IS NULL) OR source_root = ?5)
             ORDER BY rowid
             "#,
         )?;
         let rows = statement
-            .query_map((source_file, wing, room, project_id), |row| {
+            .query_map((source_file, wing, room, project_id, source_root), |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1641,8 +1648,16 @@ impl Database {
                         DELETE FROM drawer_vectors
                         WHERE id = ?1
                           AND ((?2 IS NULL AND project_id IS NULL) OR project_id = ?2)
+                          AND EXISTS (
+                              SELECT 1
+                              FROM drawers
+                              WHERE rowid = ?3
+                                AND id = ?1
+                                AND ((?2 IS NULL AND project_id IS NULL) OR project_id = ?2)
+                                AND ((?4 IS NULL AND source_root IS NULL) OR source_root = ?4)
+                          )
                         "#,
-                        params![id, project_id],
+                        params![id, project_id, rowid, source_root],
                     )?;
                 }
                 self.conn.execute(
@@ -1650,8 +1665,9 @@ impl Database {
                     DELETE FROM drawers
                     WHERE rowid = ?1
                       AND ((?2 IS NULL AND project_id IS NULL) OR project_id = ?2)
+                      AND ((?3 IS NULL AND source_root IS NULL) OR source_root = ?3)
                     "#,
-                    params![rowid, project_id],
+                    params![rowid, project_id, source_root],
                 )?;
             }
 
@@ -4782,11 +4798,13 @@ fn explicit_tunnel_from_row(row: &Row<'_>) -> rusqlite::Result<ExplicitTunnel> {
 }
 
 fn reindex_source_from_row(row: &Row<'_>) -> rusqlite::Result<ReindexSource> {
-    let drawer_count = row.get::<_, i64>(3)?;
+    let drawer_count = row.get::<_, i64>(5)?;
     Ok(ReindexSource {
-        source_file: row.get(0)?,
-        wing: row.get(1)?,
-        room: row.get(2)?,
+        source_root: row.get(0)?,
+        source_file: row.get(1)?,
+        project_id: row.get(2)?,
+        wing: row.get(3)?,
+        room: row.get(4)?,
         drawer_count: drawer_count as u64,
     })
 }
@@ -5982,9 +6000,27 @@ mod tests {
         source_file: &str,
         project_id: Option<&str>,
     ) {
+        insert_test_source_drawer_with_vector_and_root(
+            db,
+            id,
+            content,
+            source_file,
+            project_id,
+            None,
+        );
+    }
+
+    fn insert_test_source_drawer_with_vector_and_root(
+        db: &Database,
+        id: &str,
+        content: &str,
+        source_file: &str,
+        project_id: Option<&str>,
+        source_root: Option<&str>,
+    ) {
         let mut drawer = test_drawer(id, content);
         drawer.source_file = Some(source_file.to_string());
-        db.insert_drawer_with_project(&drawer, project_id)
+        db.insert_drawer_with_project_validity(&drawer, project_id, source_root, None, None)
             .expect("insert drawer");
         db.insert_vector_with_project(id, &[1.0_f32, 0.0, 0.0], project_id)
             .expect("insert vector");
@@ -6012,6 +6048,17 @@ mod tests {
             .expect("read vector project_id")
     }
 
+    fn active_drawer_source_root(db: &Database, id: &str) -> Option<Option<String>> {
+        db.conn()
+            .query_row(
+                "SELECT source_root FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .expect("read active drawer source_root")
+    }
+
     #[test]
     fn test_replace_active_source_drawers_global_scope_preserves_project_drawers_and_vectors() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -6035,7 +6082,7 @@ mod tests {
         );
 
         let replaced = db
-            .replace_active_source_drawers(source_file, "test-wing", Some("test-room"), None)
+            .replace_active_source_drawers(source_file, "test-wing", Some("test-room"), None, None)
             .expect("replace global source drawers");
 
         assert_eq!(replaced, 1);
@@ -6086,6 +6133,7 @@ mod tests {
                 "test-wing",
                 Some("test-room"),
                 Some("proj-a"),
+                None,
             )
             .expect("replace project source drawers");
 
@@ -6102,6 +6150,65 @@ mod tests {
         );
         assert_eq!(active_drawer_project_id(&db, "global-source"), Some(None));
         assert_eq!(vector_project_id(&db, "global-source"), Some(None));
+    }
+
+    #[test]
+    fn test_replace_active_source_drawers_scopes_source_root() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let source_file = "note.md";
+        let root_a = tempdir.path().join("root-a");
+        let root_b = tempdir.path().join("root-b");
+        std::fs::create_dir_all(&root_a).expect("create root-a");
+        std::fs::create_dir_all(&root_b).expect("create root-b");
+        let root_a = root_a.canonicalize().expect("canonical root-a");
+        let root_b = root_b.canonicalize().expect("canonical root-b");
+        let root_a = root_a.to_string_lossy().to_string();
+        let root_b = root_b.to_string_lossy().to_string();
+
+        insert_test_source_drawer_with_vector_and_root(
+            &db,
+            "project-a-root-a",
+            "root a content",
+            source_file,
+            Some("proj-a"),
+            Some(&root_a),
+        );
+        insert_test_source_drawer_with_vector_and_root(
+            &db,
+            "project-a-root-b",
+            "root b content",
+            source_file,
+            Some("proj-a"),
+            Some(&root_b),
+        );
+
+        let replaced = db
+            .replace_active_source_drawers(
+                source_file,
+                "test-wing",
+                Some("test-room"),
+                Some("proj-a"),
+                Some(&root_a),
+            )
+            .expect("replace source-root scoped drawers");
+
+        assert_eq!(replaced, 1);
+        assert_eq!(active_drawer_project_id(&db, "project-a-root-a"), None);
+        assert_eq!(vector_project_id(&db, "project-a-root-a"), None);
+        assert_eq!(
+            active_drawer_project_id(&db, "project-a-root-b"),
+            Some(Some("proj-a".to_string()))
+        );
+        assert_eq!(
+            active_drawer_source_root(&db, "project-a-root-b"),
+            Some(Some(root_b))
+        );
+        assert_eq!(
+            vector_project_id(&db, "project-a-root-b"),
+            Some(Some("proj-a".to_string()))
+        );
     }
 
     #[test]

@@ -837,6 +837,7 @@ async fn process_ingest_request(
             db.insert_drawer_with_project_validity(
                 &drawer,
                 project_id.as_deref(),
+                None,
                 request.valid_from.as_deref(),
                 request.valid_until.as_deref(),
             )

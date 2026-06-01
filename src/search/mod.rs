@@ -1816,9 +1816,9 @@ mod tests {
         let mut expired = make_drawer("expired", "alpha", "decision");
         expired.content = "needle expired".to_string();
 
-        db.insert_drawer_with_project_validity(&active, None, None, None)
+        db.insert_drawer_with_project_validity(&active, None, None, None, None)
             .expect("insert active");
-        db.insert_drawer_with_project_validity(&expired, None, Some("0"), Some("1"))
+        db.insert_drawer_with_project_validity(&expired, None, None, Some("0"), Some("1"))
             .expect("insert expired");
 
         let results = search_bm25_only_with_options(
@@ -1864,7 +1864,7 @@ mod tests {
         let mut future = make_drawer("future", "alpha", "decision");
         future.content = "needle future".to_string();
 
-        db.insert_drawer_with_project_validity(&future, None, Some("4102444800"), None)
+        db.insert_drawer_with_project_validity(&future, None, None, Some("4102444800"), None)
             .expect("insert future");
 
         let results = search_bm25_only_with_options(

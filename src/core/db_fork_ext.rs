@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 16;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 17;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS conversation_turn_vectors (
 CREATE INDEX IF NOT EXISTS idx_ct_session   ON conversation_turns(session_id, tool);
 CREATE INDEX IF NOT EXISTS idx_ct_timestamp ON conversation_turns(timestamp_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_ct_project   ON conversation_turns(project_path);
+"#;
+
+pub const FORK_EXT_V17_SCHEMA_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_drawers_reindex_source_identity_active
+    ON drawers(project_id, source_root, source_file, wing, room, normalize_version)
+    WHERE deleted_at IS NULL;
 "#;
 
 pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
@@ -354,6 +360,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 16,
             up: apply_v16,
         },
+        Migration {
+            version: 17,
+            up: apply_v17,
+        },
     ]
 }
 
@@ -465,6 +475,11 @@ fn apply_v15(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v16(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V16_SCHEMA_SQL)
+}
+
+fn apply_v17(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_nullable_column(conn, "drawers", "source_root", "TEXT")?;
+    conn.execute_batch(FORK_EXT_V17_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {

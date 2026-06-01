@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -89,7 +89,10 @@ pub async fn reindex_sources<E: Embedder + ?Sized>(
             report.skipped_missing_drawers += source.drawer_count;
             continue;
         };
-        let source_path = PathBuf::from(source_file);
+        let source_path = match source.source_root.as_deref() {
+            Some(source_root) => PathBuf::from(source_root).join(source_file),
+            None => PathBuf::from(source_file),
+        };
         if !source_path.is_file() {
             report.skipped_missing_sources += 1;
             report.skipped_missing_drawers += source.drawer_count;
@@ -120,7 +123,8 @@ async fn reindex_one_source<E: Embedder + ?Sized>(
         &source.wing,
         IngestOptions {
             room: source.room.as_deref(),
-            source_root: source_path.parent(),
+            project_id: source.project_id.as_deref(),
+            source_root: source.source_root.as_deref().map(Path::new),
             dry_run: false,
             source_file_override: Some(source_file),
             replace_existing_source: true,

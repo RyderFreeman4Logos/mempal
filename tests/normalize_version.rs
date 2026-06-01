@@ -4,7 +4,7 @@ use mempal::embed::{Embedder, EmbedderFactory};
 use mempal::ingest::lock::{acquire_source_lock, source_key};
 use mempal::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use mempal::ingest::reindex::{ReindexError, ReindexMode, ReindexOptions, reindex_sources};
-use mempal::ingest::{IngestOptions, ingest_file_with_options};
+use mempal::ingest::{IngestOptions, ingest_dir_with_options, ingest_file_with_options};
 use mempal::mcp::MempalMcpServer;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
@@ -172,6 +172,18 @@ fn insert_versioned_drawer(
     content: &str,
     normalize_version: u32,
 ) {
+    insert_versioned_drawer_with_scope(db, id, source_file, content, normalize_version, None, None);
+}
+
+fn insert_versioned_drawer_with_scope(
+    db: &Database,
+    id: &str,
+    source_file: &str,
+    content: &str,
+    normalize_version: u32,
+    project_id: Option<&str>,
+    source_root: Option<&str>,
+) {
     let mut drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: id.to_string(),
         content: content.to_string(),
@@ -184,7 +196,8 @@ fn insert_versioned_drawer(
         importance: 0,
     });
     drawer.normalize_version = normalize_version;
-    db.insert_drawer(&drawer).expect("insert versioned drawer");
+    db.insert_drawer_with_project_validity(&drawer, project_id, source_root, None, None)
+        .expect("insert versioned drawer");
 }
 
 fn active_drawer_versions(db: &Database) -> Vec<u32> {
@@ -269,14 +282,37 @@ fn active_vector_project_ids_for_source(
         .expect("collect vector project rows")
 }
 
-fn assert_project_source_reindex_unsupported(error: ReindexError) {
+fn active_source_roots_for_source(db: &Database, source_file: &str) -> Vec<Option<String>> {
+    let mut statement = db
+        .conn()
+        .prepare(
+            r#"
+            SELECT source_root
+            FROM drawers
+            WHERE deleted_at IS NULL AND source_file = ?1
+            ORDER BY project_id, id
+            "#,
+        )
+        .expect("prepare source roots");
+    statement
+        .query_map([source_file], |row| row.get::<_, Option<String>>(0))
+        .expect("query source roots")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect source roots")
+}
+
+fn assert_project_source_reindex_unsupported(
+    error: ReindexError,
+    expected_drawers: u64,
+    expected_sources: u64,
+) {
     match error {
         ReindexError::ProjectScopedSourceReindexUnsupported {
             candidate_drawers,
             candidate_sources,
         } => {
-            assert_eq!(candidate_drawers, 2);
-            assert_eq!(candidate_sources, 1);
+            assert_eq!(candidate_drawers, expected_drawers);
+            assert_eq!(candidate_sources, expected_sources);
         }
         other => panic!("unexpected reindex error: {other:?}"),
     }
@@ -367,6 +403,52 @@ async fn test_new_ingest_writes_current_normalize_version() {
 
     let versions = distinct_versions_for_source(&db, "doc.md");
     assert_eq!(versions, vec![CURRENT_NORMALIZE_VERSION]);
+}
+
+#[tokio::test]
+async fn test_directory_ingest_persists_canonical_source_root() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("open db");
+    let root = tmp.path().join("source-root");
+    let nested = root.join("nested");
+    std::fs::create_dir_all(&nested).expect("create nested source dir");
+    std::fs::write(nested.join("doc.md"), "directory source root content").expect("write source");
+
+    ingest_dir_with_options(
+        &db,
+        &StubEmbedder,
+        &root,
+        "mempal",
+        IngestOptions {
+            room: Some("normalize"),
+            source_root: Some(&root),
+            dry_run: false,
+            source_file_override: None,
+            replace_existing_source: false,
+            no_strip_noise: false,
+            ..IngestOptions::default()
+        },
+    )
+    .await
+    .expect("ingest directory");
+
+    let (source_file, source_root) = db
+        .conn()
+        .query_row(
+            r#"
+            SELECT source_file, source_root
+            FROM drawers
+            WHERE deleted_at IS NULL
+            "#,
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("read source identity");
+    let canonical_root = root.canonicalize().expect("canonical root");
+
+    assert_eq!(source_file, "nested/doc.md");
+    assert_eq!(source_root, canonical_root.to_string_lossy());
 }
 
 fn distinct_versions_for_source(db: &Database, source_file: &str) -> Vec<u32> {
@@ -514,7 +596,7 @@ async fn test_reindex_force_reprocesses_all() {
 }
 
 #[tokio::test]
-async fn test_project_scoped_source_reindex_rejects_stale_and_force_without_mutation() {
+async fn test_project_source_reindex_two_projects_same_relative_file() {
     let tmp = TempDir::new().expect("tempdir");
     let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
     let project_a = tmp.path().join("project-a");
@@ -559,17 +641,81 @@ async fn test_project_scoped_source_reindex_rejects_stale_and_force_without_muta
     std::fs::write(&source_a, "project a replacement").expect("rewrite project-a source");
     std::fs::write(&source_b, "project b replacement").expect("rewrite project-b source");
 
-    let before_drawers = active_drawer_rows_for_source(&db, "note.md");
-    assert_eq!(before_drawers.len(), 2);
+    let report = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Stale,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("project-scoped source reindex with provenance");
+
+    assert_eq!(report.candidate_drawers, 2);
+    assert_eq!(report.candidate_sources, 2);
+    assert_eq!(report.processed_sources, 2);
+    let active_drawers = active_drawer_rows_for_source(&db, "note.md");
     assert_eq!(
-        before_drawers
+        active_drawers
             .iter()
-            .map(|(_, _, project_id)| project_id.as_deref())
+            .map(|(_, content, project_id)| (content.as_str(), project_id.as_deref()))
             .collect::<Vec<_>>(),
-        vec![Some("project-a"), Some("project-b")]
+        vec![
+            ("project a replacement", Some("project-a")),
+            ("project b replacement", Some("project-b")),
+        ]
     );
-    let before_vectors = active_vector_project_ids_for_source(&db, "note.md");
-    assert_eq!(before_vectors.len(), 2);
+    let root_a = project_a
+        .canonicalize()
+        .expect("canonical project-a")
+        .to_string_lossy()
+        .to_string();
+    let root_b = project_b
+        .canonicalize()
+        .expect("canonical project-b")
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        active_source_roots_for_source(&db, "note.md"),
+        vec![Some(root_a), Some(root_b)]
+    );
+    let mut vector_project_ids = active_vector_project_ids_for_source(&db, "note.md")
+        .into_values()
+        .collect::<Vec<_>>();
+    vector_project_ids.sort();
+    assert_eq!(
+        vector_project_ids,
+        vec![Some("project-a".to_string()), Some("project-b".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn test_legacy_project_source_reindex_null_root_fails_fast_without_mutation() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let source = tmp.path().join("legacy.md");
+    std::fs::write(&source, "legacy replacement").expect("write legacy source");
+    let source_file = source.to_string_lossy().to_string();
+    insert_versioned_drawer_with_scope(
+        &db,
+        "legacy_project_drawer",
+        &source_file,
+        "legacy original",
+        0,
+        Some("legacy-project"),
+        None,
+    );
+    db.insert_vector_with_project(
+        "legacy_project_drawer",
+        &[0.1, 0.2, 0.3],
+        Some("legacy-project"),
+    )
+    .expect("insert legacy vector");
+
+    let before_drawers = active_drawer_rows_for_source(&db, &source_file);
+    let before_vectors = active_vector_project_ids_for_source(&db, &source_file);
+    let before_roots = active_source_roots_for_source(&db, &source_file);
 
     let stale_error = reindex_sources(
         &db,
@@ -580,15 +726,19 @@ async fn test_project_scoped_source_reindex_rejects_stale_and_force_without_muta
         },
     )
     .await
-    .expect_err("project-scoped stale reindex must fail fast");
-    assert_project_source_reindex_unsupported(stale_error);
+    .expect_err("legacy project-scoped stale reindex must fail fast");
+    assert_project_source_reindex_unsupported(stale_error, 1, 1);
     assert_eq!(
-        active_drawer_rows_for_source(&db, "note.md"),
+        active_drawer_rows_for_source(&db, &source_file),
         before_drawers
     );
     assert_eq!(
-        active_vector_project_ids_for_source(&db, "note.md"),
+        active_vector_project_ids_for_source(&db, &source_file),
         before_vectors
+    );
+    assert_eq!(
+        active_source_roots_for_source(&db, &source_file),
+        before_roots
     );
 
     let force_error = reindex_sources(
@@ -600,22 +750,70 @@ async fn test_project_scoped_source_reindex_rejects_stale_and_force_without_muta
         },
     )
     .await
-    .expect_err("project-scoped force reindex must fail fast");
-    assert_project_source_reindex_unsupported(force_error);
+    .expect_err("legacy project-scoped force reindex must fail fast");
+    assert_project_source_reindex_unsupported(force_error, 1, 1);
     assert_eq!(
-        active_drawer_rows_for_source(&db, "note.md"),
+        active_drawer_rows_for_source(&db, &source_file),
         before_drawers
     );
     assert_eq!(
-        active_vector_project_ids_for_source(&db, "note.md"),
+        active_vector_project_ids_for_source(&db, &source_file),
         before_vectors
     );
+    assert_eq!(
+        active_source_roots_for_source(&db, &source_file),
+        before_roots
+    );
+}
 
-    let drawer_project_ids: BTreeMap<_, _> = before_drawers
-        .iter()
-        .map(|(id, _, project_id)| (id.clone(), project_id.clone()))
-        .collect();
-    assert_eq!(before_vectors, drawer_project_ids);
+#[tokio::test]
+async fn test_global_source_reindex_null_root_unchanged() {
+    let tmp = tempfile::Builder::new()
+        .prefix("mempal-global-reindex-")
+        .tempdir_in(std::env::current_dir().expect("current dir"))
+        .expect("tempdir in current dir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let source = tmp.path().join("global.md");
+    std::fs::write(&source, "global replacement").expect("write global source");
+    let cwd = std::env::current_dir().expect("current dir");
+    let source_file = source
+        .strip_prefix(&cwd)
+        .expect("source under cwd")
+        .to_string_lossy()
+        .replace('\\', "/");
+    insert_versioned_drawer(
+        &db,
+        "global_legacy_drawer",
+        &source_file,
+        "global original",
+        0,
+    );
+
+    let report = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Stale,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("global null-root source reindex");
+
+    assert_eq!(report.candidate_drawers, 1);
+    assert_eq!(report.candidate_sources, 1);
+    assert_eq!(report.processed_sources, 1);
+    assert_eq!(
+        active_drawer_rows_for_source(&db, &source_file)
+            .into_iter()
+            .map(|(_, content, project_id)| (content, project_id))
+            .collect::<Vec<_>>(),
+        vec![("global replacement".to_string(), None)]
+    );
+    assert_eq!(
+        active_source_roots_for_source(&db, &source_file),
+        vec![None]
+    );
 }
 
 #[tokio::test]
