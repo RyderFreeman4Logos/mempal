@@ -25,6 +25,7 @@ use mempal::core::project::{
     infer_project_id_from_path, infer_project_id_from_root_uri, migrate_null_project_ids,
     validate_project_id,
 };
+use mempal::core::reindex::ReindexProgressStore;
 use mempal::core::types::{Drawer, SourceType};
 use mempal::cowork::{PeekRequest, Tool, peek_partner};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
@@ -368,6 +369,8 @@ fn drawer_project_ids(conn: &Connection, table: &str) -> Vec<Option<String>> {
 fn downgrade_to_v4(conn: &Connection, drop_vector_table: bool) {
     conn.execute_batch("DROP INDEX IF EXISTS idx_drawers_project_id;")
         .expect("drop project index");
+    conn.execute_batch("DROP INDEX IF EXISTS idx_drawers_project_id_active;")
+        .expect("drop active project index");
     if column_names(conn, "drawers")
         .iter()
         .any(|column| column == "project_id")
@@ -649,6 +652,223 @@ fn test_lazy_create_after_v5_has_project_id_column() {
         "lazy-created drawer_vectors missing project_id: {vector_sql}"
     );
     assert_eq!(stored.as_deref(), Some("proj-lazy"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stale_reindex_preserves_project_id() {
+    let _guard = config_guard().await;
+    let (addr, handle) = start_embed_mock(0).await.expect("start mock");
+    let tmp = TempDir::new().expect("tempdir");
+    let home = install_cli_home(&tmp);
+    let db_path = home.join(".mempal").join("palace.db");
+    let config_path = home.join(".mempal").join("config.toml");
+    write_config_atomic(
+        &config_path,
+        &cli_embed_config(&db_path, &format!("http://{addr}/v1"), Some("proj-A")),
+    );
+
+    let db = Database::open(&db_path).expect("open db");
+    db.insert_drawer_with_project(
+        &Drawer {
+            id: "stale-project-drawer".to_string(),
+            content: "project scoped stale unique".to_string(),
+            wing: "code".to_string(),
+            room: Some("room".to_string()),
+            source_file: Some("stale-project.md".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "1713000000".to_string(),
+            chunk_index: Some(0),
+            importance: 0,
+            ..Drawer::default()
+        },
+        Some("proj-A"),
+    )
+    .expect("insert project drawer");
+    db.insert_vector_with_project(
+        "stale-project-drawer",
+        &[0.1, 0.2, 0.3, 0.4],
+        Some("proj-A"),
+    )
+    .expect("insert project vector");
+    db.conn()
+        .execute(
+            "UPDATE fork_ext_meta SET value = 'old' WHERE key = 'reindex:stale-project-drawer:index_version'",
+            [],
+        )
+        .expect("mark vector stale");
+
+    let mut command = Command::new(mempal_bin());
+    for key in [
+        "MEMPAL_EMBED_BACKEND",
+        "MEMPAL_EMBED_BASE_URL",
+        "MEMPAL_EMBED_MODEL",
+        "MEMPAL_EMBED_DIM",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command
+        .env("HOME", &home)
+        .args(["reindex", "--from-config", "--stale", "--batch-size", "1"])
+        .output()
+        .expect("run stale reindex");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stored_project_id = db
+        .conn()
+        .query_row(
+            "SELECT project_id FROM drawer_vectors WHERE id = 'stale-project-drawer'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("read vector project_id");
+    let null_project_count = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawer_vectors WHERE id = 'stale-project-drawer' AND project_id IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count null-project vectors");
+    assert_eq!(stored_project_id.as_deref(), Some("proj-A"));
+    assert_eq!(null_project_count, 0);
+
+    ConfigHandle::bootstrap(&config_path).expect("bootstrap search config");
+    let server = MempalMcpServer::new_with_factory(
+        db_path.clone(),
+        Arc::new(StaticEmbedderFactory {
+            vector: vec![0.0, 0.0, 0.0, 0.0],
+        }),
+    );
+    let project_ids = parse_search_ids(
+        &search_response_json_with_request(
+            &server,
+            SearchRequest {
+                query: "project scoped stale unique".to_string(),
+                top_k: Some(5),
+                project_id: Some("proj-A".to_string()),
+                include_global: None,
+                ..SearchRequest::default()
+            },
+        )
+        .await,
+    );
+    assert_eq!(project_ids, vec!["stale-project-drawer".to_string()]);
+    let other_project_ids = parse_search_ids(
+        &search_response_json_with_request(
+            &server,
+            SearchRequest {
+                query: "project scoped stale unique".to_string(),
+                top_k: Some(5),
+                project_id: Some("proj-B".to_string()),
+                include_global: Some(true),
+                ..SearchRequest::default()
+            },
+        )
+        .await,
+    );
+    assert!(other_project_ids.is_empty(), "{other_project_ids:?}");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stale_reindex_resume_preserves_project_id() {
+    let _guard = config_guard().await;
+    let (addr, handle) = start_embed_mock(0).await.expect("start mock");
+    let tmp = TempDir::new().expect("tempdir");
+    let home = install_cli_home(&tmp);
+    let db_path = home.join(".mempal").join("palace.db");
+    let config_path = home.join(".mempal").join("config.toml");
+    write_config_atomic(
+        &config_path,
+        &cli_embed_config(&db_path, &format!("http://{addr}/v1"), Some("proj-A")),
+    );
+
+    let db = Database::open(&db_path).expect("open db");
+    db.insert_drawer_with_project(
+        &Drawer {
+            id: "resume-stale-project-drawer".to_string(),
+            content: "project scoped stale resume unique".to_string(),
+            wing: "code".to_string(),
+            room: Some("room".to_string()),
+            source_file: Some("resume-stale-project.md".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "1713000000".to_string(),
+            chunk_index: Some(0),
+            importance: 0,
+            ..Drawer::default()
+        },
+        Some("proj-A"),
+    )
+    .expect("insert project drawer");
+    db.insert_vector_with_project(
+        "resume-stale-project-drawer",
+        &[0.1, 0.2, 0.3, 0.4],
+        Some("proj-A"),
+    )
+    .expect("insert project vector");
+    db.conn()
+        .execute(
+            "UPDATE fork_ext_meta SET value = 'old' WHERE key = 'reindex:resume-stale-project-drawer:index_version'",
+            [],
+        )
+        .expect("mark vector stale");
+    ReindexProgressStore::new(&db_path)
+        .upsert_running("aaa-prior-source.md", Some(0), "openai_compat")
+        .expect("write resume checkpoint");
+
+    let mut command = Command::new(mempal_bin());
+    for key in [
+        "MEMPAL_EMBED_BACKEND",
+        "MEMPAL_EMBED_BASE_URL",
+        "MEMPAL_EMBED_MODEL",
+        "MEMPAL_EMBED_DIM",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command
+        .env("HOME", &home)
+        .args(["reindex", "--from-config", "--stale", "--resume"])
+        .output()
+        .expect("run stale resume reindex");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("re-embedding 1 drawers"),
+        "resume stale path should use row-by-row resume writer, stdout: {stdout}"
+    );
+    assert_eq!(handle.request_count(), 1);
+
+    let stored_project_id = db
+        .conn()
+        .query_row(
+            "SELECT project_id FROM drawer_vectors WHERE id = 'resume-stale-project-drawer'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("read vector project_id");
+    let null_project_count = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawer_vectors WHERE id = 'resume-stale-project-drawer' AND project_id IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count null-project vectors");
+    assert_eq!(stored_project_id.as_deref(), Some("proj-A"));
+    assert_eq!(null_project_count, 0);
+
+    handle.shutdown().await;
 }
 
 #[test]

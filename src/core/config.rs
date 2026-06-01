@@ -14,6 +14,7 @@ use super::types::IntelligenceMode;
 
 const DEFAULT_DB_PATH: &str = "~/.mempal/palace.db";
 const DEFAULT_EMBED_BACKEND: &str = "openai_compat";
+pub const DEFAULT_MODEL2VEC_FINGERPRINT_MODEL: &str = "model2vec/potion-multilingual-128M";
 const DEFAULT_CHUNKER_MAX_TOKENS: usize = 1024;
 const DEFAULT_CHUNKER_TARGET_TOKENS: usize = 512;
 const DEFAULT_CHUNKER_OVERLAP_TOKENS: usize = 64;
@@ -905,6 +906,32 @@ impl Default for EmbedConfig {
 }
 
 impl EmbedConfig {
+    pub fn vector_embedder_fingerprint(&self, backend: &str, dim: usize) -> String {
+        let base_url = self
+            .resolved_openai_base_url()
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        let model = self.vector_fingerprint_model(backend);
+        format!("{backend}:{model}:{base_url}:{dim}")
+    }
+
+    pub fn current_vector_embedder_fingerprint(&self, dim: usize) -> String {
+        self.vector_embedder_fingerprint(self.backend.as_str(), dim)
+    }
+
+    fn vector_fingerprint_model(&self, backend: &str) -> String {
+        if backend == "model2vec" {
+            return self
+                .model
+                .clone()
+                .unwrap_or_else(|| DEFAULT_MODEL2VEC_FINGERPRINT_MODEL.to_string());
+        }
+        self.resolved_openai_model()
+            .or(self.model.as_deref())
+            .unwrap_or_default()
+            .to_string()
+    }
+
     pub fn resolved_openai_base_url(&self) -> Option<&str> {
         self.openai_compat
             .base_url

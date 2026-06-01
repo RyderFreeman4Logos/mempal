@@ -747,10 +747,11 @@ fn recreate_drawer_vectors_with_project_id(conn: &Connection) -> rusqlite::Resul
         r#"
         CREATE VIRTUAL TABLE drawer_vectors USING vec0(
             id TEXT PRIMARY KEY,
-            embedding FLOAT[{dimension}],
+            embedding FLOAT[{dimension}] distance_metric={metric},
             +project_id TEXT
         );
-        "#
+        "#,
+        metric = super::VECTOR_DISTANCE_METRIC
     ))?;
     conn.execute_batch(
         r#"

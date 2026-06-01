@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
-use mempal::core::db::Database;
+use mempal::core::db::{CURRENT_VECTOR_INDEX_VERSION, Database};
 use mempal::core::project::ProjectSearchScope;
 use mempal::core::queue::PendingMessageStore;
 use mempal::core::types::{Drawer, SourceType};
@@ -846,6 +846,15 @@ fn test_view_prints_full_drawer() {
             4,
         ),
     );
+    let db = Database::open(&env.db_path).expect("open db");
+    db.insert_vector("view-full", &[0.1, 0.2, 0.3, 0.4])
+        .expect("insert view vector");
+    db.record_vector_metadata(
+        "view-full",
+        CURRENT_VECTOR_INDEX_VERSION,
+        "model2vec:model2vec/potion-multilingual-128M::4",
+    )
+    .expect("record view vector metadata");
 
     let output = run_mempal(&env.home, env.cwd(), &["view", "view-full"]);
     assert!(
@@ -858,6 +867,19 @@ fn test_view_prints_full_drawer() {
     assert!(stdout.contains("drawer_id: view-full"), "{stdout}");
     assert!(stdout.contains("scope: default/view"), "{stdout}");
     assert!(stdout.contains("created_at:"), "{stdout}");
+    assert!(stdout.contains("has_vector: true"), "{stdout}");
+    assert!(stdout.contains("vector_dimension: 4"), "{stdout}");
+    assert!(
+        stdout.contains("vector_distance_metric: cosine"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("vector_embedder: model2vec"), "{stdout}");
+    assert!(
+        stdout.contains("vector_model: model2vec/potion-multilingual-128M"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("vector_index_version: v2"), "{stdout}");
+    assert!(stdout.contains("vector_stale: false"), "{stdout}");
     assert!(stdout.contains("content_truncated: false"), "{stdout}");
     assert!(stdout.contains("original_content_bytes:"), "{stdout}");
     assert!(stdout.contains("Decision: use CLI dashboard"), "{stdout}");

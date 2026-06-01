@@ -1459,6 +1459,16 @@ pub struct ReadDrawerResponse {
     pub updated_at: Option<String>,
     pub merge_count: u32,
     pub importance_stars: u8,
+    pub has_vector: bool,
+    pub vector_dimension: Option<usize>,
+    pub vector_embedder: Option<String>,
+    pub vector_model: Option<String>,
+    pub vector_embedder_fingerprint: Option<String>,
+    pub vector_index_version: Option<String>,
+    pub vector_current_embedder_fingerprint: Option<String>,
+    pub vector_current_index_version: String,
+    pub vector_distance_metric: Option<String>,
+    pub vector_stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

@@ -4,14 +4,15 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use common::harness::start as start_mock;
-use mempal::core::config::{Config, ConfigHandle};
-use mempal::core::db::Database;
+use mempal::core::config::{Config, ConfigHandle, DEFAULT_MODEL2VEC_FINGERPRINT_MODEL};
+use mempal::core::db::{Database, VECTOR_DISTANCE_METRIC};
+use mempal::core::reindex::ReindexProgressStore;
 use mempal::core::types::{Drawer, SourceType};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory, global_embed_status};
 use mempal::ingest::{IngestError, IngestOptions, ingest_file_with_options};
@@ -70,6 +71,18 @@ block_writes_when_degraded = {}
     )
 }
 
+fn model2vec_reindex_config(db_path: &Path) -> String {
+    format!(
+        r#"
+db_path = "{}"
+
+[embed]
+backend = "model2vec"
+"#,
+        db_path.display()
+    )
+}
+
 struct TestHome {
     _tmp: TempDir,
     home: PathBuf,
@@ -125,12 +138,58 @@ fn seed_drawers(db_path: &Path, count: usize, vector_dim: usize) {
 fn run_reindex(home: &Path, args: &[&str], extra_env: &[(&str, String)]) -> Output {
     let mut command = Command::new(mempal_bin());
     command.env("HOME", home);
+    for key in [
+        "MEMPAL_EMBED_BACKEND",
+        "MEMPAL_EMBED_BASE_URL",
+        "MEMPAL_EMBED_MODEL",
+        "MEMPAL_EMBED_DIM",
+    ] {
+        command.env_remove(key);
+    }
     command.arg("reindex");
     command.args(args);
     for (key, value) in extra_env {
         command.env(key, value);
     }
     command.output().expect("run reindex")
+}
+
+fn replace_vectors_with_metricless_l2(db_path: &Path, count: usize, dim: usize) {
+    let db = Database::open(db_path).expect("open db");
+    db.conn()
+        .execute_batch(&format!(
+            r#"
+            DROP TABLE drawer_vectors;
+            CREATE VIRTUAL TABLE drawer_vectors USING vec0(
+                id TEXT PRIMARY KEY,
+                embedding FLOAT[{dim}]
+            );
+            "#
+        ))
+        .expect("recreate metricless vector table");
+    let vector = vec![0.2_f32; dim];
+    let vector_json = serde_json::to_string(&vector).expect("serialize vector");
+    for index in 0..count {
+        let id = format!("drawer-{index:02}");
+        db.conn()
+            .execute(
+                "INSERT INTO drawer_vectors (id, embedding) VALUES (?1, vec_f32(?2))",
+                rusqlite::params![id, vector_json.as_str()],
+            )
+            .expect("insert metricless vector");
+    }
+}
+
+fn read_vector(db: &Database, drawer_id: &str) -> Vec<f32> {
+    let json = db
+        .conn()
+        .query_row(
+            "SELECT vec_to_json(embedding) FROM drawer_vectors WHERE id = ?1",
+            [drawer_id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read vector json");
+    serde_json::from_str(&json).expect("parse vector json")
 }
 
 async fn wait_for_request_count(handle: &common::harness::MockEmbedHandle, expected: u32) {
@@ -366,10 +425,10 @@ async fn test_reindex_stale_only() {
     let db = Database::open(&env.db_path).expect("open db");
     db.conn()
         .execute(
-            "UPDATE fork_ext_meta SET value = 'old' WHERE key = 'reindex:drawer-01:normalize_version'",
+            "UPDATE fork_ext_meta SET value = 'old' WHERE key = 'reindex:drawer-01:index_version'",
             [],
         )
-        .expect("mark normalize stale");
+        .expect("mark index stale");
     db.conn()
         .execute(
             "UPDATE fork_ext_meta SET value = 'other' WHERE key = 'reindex:drawer-04:embedder_fingerprint'",
@@ -383,7 +442,223 @@ async fn test_reindex_stale_only() {
         "stderr: {}",
         String::from_utf8_lossy(&second.stderr)
     );
-    assert_eq!(handle.request_count(), 8);
+    assert_eq!(handle.request_count(), 7);
+    assert!(
+        String::from_utf8_lossy(&second.stdout)
+            .contains("batch 1: re-embedded 2 stale/new drawers"),
+        "stdout: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stale_reindex_skips_concurrent_content_update() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    handle.pause();
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-stale-concurrent-update.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        true,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, true),
+    );
+    seed_drawers(&env.db_path, 1, 4);
+
+    let db = Database::open(&env.db_path).expect("open db");
+    db.conn()
+        .execute(
+            "UPDATE fork_ext_meta SET value = 'old' WHERE key = 'reindex:drawer-00:index_version'",
+            [],
+        )
+        .expect("mark index stale");
+
+    let mut child = TokioCommand::new(mempal_bin());
+    child
+        .arg("reindex")
+        .arg("--from-config")
+        .arg("--stale")
+        .arg("--batch-size")
+        .arg("1")
+        .env("HOME", &env.home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = child.spawn().expect("spawn stale reindex child");
+    wait_for_request_count(&handle, 1).await;
+
+    ConfigHandle::bootstrap(&env.config_path).expect("bootstrap config");
+    let fresh_vector = vec![0.25_f32, 0.5, 0.75, 1.0];
+    db.upsert_drawer_and_replace_vector(
+        &Drawer {
+            id: "drawer-00".to_string(),
+            content: "drawer content changed while stale embed was in flight".to_string(),
+            wing: "test".to_string(),
+            room: Some("reindex".to_string()),
+            source_file: Some("fixtures/source.txt".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "1713000000".to_string(),
+            chunk_index: Some(0),
+            importance: 0,
+            ..Drawer::default()
+        },
+        &fresh_vector,
+    )
+    .expect("simulate concurrent ingest update");
+
+    handle.resume();
+    let output = tokio::time::timeout(Duration::from_secs(3), child.wait_with_output())
+        .await
+        .expect("child wait timeout")
+        .expect("wait stale reindex child");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("skipped 1 concurrent updates"),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        handle.request_count(),
+        1,
+        "stale command should not re-embed the freshly updated drawer"
+    );
+    assert_eq!(read_vector(&db, "drawer-00"), fresh_vector);
+
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stale_reindex_skips_concurrent_real_merge_update() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    handle.pause();
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-stale-concurrent-merge.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        true,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, true),
+    );
+    seed_drawers(&env.db_path, 1, 4);
+
+    let db = Database::open(&env.db_path).expect("open db");
+    db.conn()
+        .execute(
+            "UPDATE fork_ext_meta SET value = 'old' WHERE key = 'reindex:drawer-00:index_version'",
+            [],
+        )
+        .expect("mark index stale");
+
+    let mut child = TokioCommand::new(mempal_bin());
+    child
+        .arg("reindex")
+        .arg("--from-config")
+        .arg("--stale")
+        .arg("--batch-size")
+        .arg("1")
+        .env("HOME", &env.home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = child.spawn().expect("spawn stale reindex child");
+    wait_for_request_count(&handle, 1).await;
+
+    ConfigHandle::bootstrap(&env.config_path).expect("bootstrap config");
+    let fresh_vector = vec![0.25_f32, 0.5, 0.75, 1.0];
+    db.update_drawer_after_merge(
+        "drawer-00",
+        "drawer content 0\n\nSUPPLEMENTARY (test): merged while stale embed was in flight",
+        "1713009999",
+        &fresh_vector,
+    )
+    .expect("simulate concurrent novelty merge update");
+
+    handle.resume();
+    let output = tokio::time::timeout(Duration::from_secs(3), child.wait_with_output())
+        .await
+        .expect("child wait timeout")
+        .expect("wait stale reindex child");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("skipped 1 concurrent updates"),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        handle.request_count(),
+        1,
+        "stale command should not re-embed the freshly merged drawer"
+    );
+    assert_eq!(read_vector(&db, "drawer-00"), fresh_vector);
+
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_reindex_stale_resume_rebuilds_metricless_vector_table() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-stale-resume-l2.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        true,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, true),
+    );
+    seed_drawers(&env.db_path, 6, 4);
+    replace_vectors_with_metricless_l2(&env.db_path, 6, 4);
+    ReindexProgressStore::new(&env.db_path)
+        .upsert_running("fixtures/source.txt", Some(5), "openai_compat")
+        .expect("write resume checkpoint");
+
+    let output = run_reindex(&env.home, &["--from-config", "--stale", "--resume"], &[]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "resume checkpoint ignored because drawer_vectors metric or dimension is stale"
+        ),
+        "stdout: {stdout}"
+    );
+    assert_eq!(handle.request_count(), 6);
+
+    let db = Database::open(&env.db_path).expect("open db");
+    assert_eq!(
+        db.vector_table_distance_metric()
+            .expect("read vector metric")
+            .as_deref(),
+        Some(VECTOR_DISTANCE_METRIC)
+    );
+    let count = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count vectors");
+    assert_eq!(count, 6);
 
     handle.shutdown().await;
 }
@@ -440,6 +715,43 @@ async fn test_reindex_dim_change_invalidates_existing() {
 
     handle4.shutdown().await;
     handle6.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_default_model2vec_reindex_records_non_stale_fingerprint() {
+    let _guard = test_guard().await;
+    let env = TestHome::new(&model2vec_reindex_config(Path::new(
+        "/tmp/mempal-model2vec-fingerprint.db",
+    )));
+    write_config(&env.config_path, &model2vec_reindex_config(&env.db_path));
+    seed_drawers(&env.db_path, 1, 2);
+
+    let output = run_reindex(
+        &env.home,
+        &["--from-config"],
+        &[("MEMPAL_EMBED_BACKEND", "model2vec".to_string())],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    ConfigHandle::bootstrap(&env.config_path).expect("bootstrap model2vec config");
+    let db = Database::open(&env.db_path).expect("open db");
+    let details = db
+        .drawer_vector_details("drawer-00")
+        .expect("load vector details");
+    assert!(details.has_vector);
+    assert_eq!(
+        details.embedder_fingerprint.as_deref(),
+        details.current_embedder_fingerprint.as_deref()
+    );
+    assert_eq!(
+        details.model.as_deref(),
+        Some(DEFAULT_MODEL2VEC_FINGERPRINT_MODEL)
+    );
+    assert!(!details.stale, "{details:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
