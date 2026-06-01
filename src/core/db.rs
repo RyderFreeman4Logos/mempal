@@ -1593,6 +1593,7 @@ impl Database {
         source_file: &str,
         wing: &str,
         room: Option<&str>,
+        project_id: Option<&str>,
     ) -> Result<u64, DbError> {
         let mut statement = self.conn.prepare(
             r#"
@@ -1602,11 +1603,12 @@ impl Database {
               AND source_file = ?1
               AND wing = ?2
               AND ((?3 IS NULL AND room IS NULL) OR room = ?3)
+              AND ((?4 IS NULL AND project_id IS NULL) OR project_id = ?4)
             ORDER BY rowid
             "#,
         )?;
         let rows = statement
-            .query_map((source_file, wing, room), |row| {
+            .query_map((source_file, wing, room, project_id), |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1634,11 +1636,23 @@ impl Database {
                     )?;
                 }
                 if vectors_exist {
-                    self.conn
-                        .execute("DELETE FROM drawer_vectors WHERE id = ?1", [id])?;
+                    self.conn.execute(
+                        r#"
+                        DELETE FROM drawer_vectors
+                        WHERE id = ?1
+                          AND ((?2 IS NULL AND project_id IS NULL) OR project_id = ?2)
+                        "#,
+                        params![id, project_id],
+                    )?;
                 }
-                self.conn
-                    .execute("DELETE FROM drawers WHERE rowid = ?1", [rowid])?;
+                self.conn.execute(
+                    r#"
+                    DELETE FROM drawers
+                    WHERE rowid = ?1
+                      AND ((?2 IS NULL AND project_id IS NULL) OR project_id = ?2)
+                    "#,
+                    params![rowid, project_id],
+                )?;
             }
 
             Ok(rows.len() as u64)
@@ -5959,6 +5973,135 @@ mod tests {
     fn insert_test_drawer(db: &Database, id: &str, content: &str, project_id: Option<&str>) {
         db.insert_drawer_with_project(&test_drawer(id, content), project_id)
             .expect("insert drawer");
+    }
+
+    fn insert_test_source_drawer_with_vector(
+        db: &Database,
+        id: &str,
+        content: &str,
+        source_file: &str,
+        project_id: Option<&str>,
+    ) {
+        let mut drawer = test_drawer(id, content);
+        drawer.source_file = Some(source_file.to_string());
+        db.insert_drawer_with_project(&drawer, project_id)
+            .expect("insert drawer");
+        db.insert_vector_with_project(id, &[1.0_f32, 0.0, 0.0], project_id)
+            .expect("insert vector");
+    }
+
+    fn active_drawer_project_id(db: &Database, id: &str) -> Option<Option<String>> {
+        db.conn()
+            .query_row(
+                "SELECT project_id FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .expect("read active drawer project_id")
+    }
+
+    fn vector_project_id(db: &Database, id: &str) -> Option<Option<String>> {
+        db.conn()
+            .query_row(
+                "SELECT project_id FROM drawer_vectors WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .expect("read vector project_id")
+    }
+
+    #[test]
+    fn test_replace_active_source_drawers_global_scope_preserves_project_drawers_and_vectors() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let source_file = "shared-note.md";
+
+        insert_test_source_drawer_with_vector(
+            &db,
+            "global-source",
+            "global content",
+            source_file,
+            None,
+        );
+        insert_test_source_drawer_with_vector(
+            &db,
+            "project-source",
+            "project content",
+            source_file,
+            Some("proj-a"),
+        );
+
+        let replaced = db
+            .replace_active_source_drawers(source_file, "test-wing", Some("test-room"), None)
+            .expect("replace global source drawers");
+
+        assert_eq!(replaced, 1);
+        assert_eq!(active_drawer_project_id(&db, "global-source"), None);
+        assert_eq!(vector_project_id(&db, "global-source"), None);
+        assert_eq!(
+            active_drawer_project_id(&db, "project-source"),
+            Some(Some("proj-a".to_string()))
+        );
+        assert_eq!(
+            vector_project_id(&db, "project-source"),
+            Some(Some("proj-a".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_replace_active_source_drawers_project_scope_preserves_other_scopes() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let source_file = "shared-note.md";
+
+        insert_test_source_drawer_with_vector(
+            &db,
+            "global-source",
+            "global content",
+            source_file,
+            None,
+        );
+        insert_test_source_drawer_with_vector(
+            &db,
+            "project-a-source",
+            "project a content",
+            source_file,
+            Some("proj-a"),
+        );
+        insert_test_source_drawer_with_vector(
+            &db,
+            "project-b-source",
+            "project b content",
+            source_file,
+            Some("proj-b"),
+        );
+
+        let replaced = db
+            .replace_active_source_drawers(
+                source_file,
+                "test-wing",
+                Some("test-room"),
+                Some("proj-a"),
+            )
+            .expect("replace project source drawers");
+
+        assert_eq!(replaced, 1);
+        assert_eq!(active_drawer_project_id(&db, "project-a-source"), None);
+        assert_eq!(vector_project_id(&db, "project-a-source"), None);
+        assert_eq!(
+            active_drawer_project_id(&db, "project-b-source"),
+            Some(Some("proj-b".to_string()))
+        );
+        assert_eq!(
+            vector_project_id(&db, "project-b-source"),
+            Some(Some("proj-b".to_string()))
+        );
+        assert_eq!(active_drawer_project_id(&db, "global-source"), Some(None));
+        assert_eq!(vector_project_id(&db, "global-source"), Some(None));
     }
 
     #[test]
