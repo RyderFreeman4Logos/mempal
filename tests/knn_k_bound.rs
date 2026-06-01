@@ -82,6 +82,53 @@ fn search_by_vector_succeeds_with_more_than_4096_drawers() {
 }
 
 #[test]
+fn search_by_vector_large_index_uses_cosine_not_l2() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("test.db")).expect("open db");
+
+    for i in 0..DRAWER_COUNT {
+        let drawer = make_drawer(i);
+        db.insert_drawer_with_project(&drawer, None)
+            .expect("insert decoy drawer");
+        db.insert_vector(&drawer.id, &[1.0, 0.20, 0.0, 0.0])
+            .expect("insert decoy vector");
+    }
+
+    let target = Drawer {
+        id: "target-cosine".to_string(),
+        content: "semantic target".to_string(),
+        wing: "test".to_string(),
+        room: Some("room".to_string()),
+        source_file: None,
+        source_type: SourceType::AgentInference,
+        added_at: "1700000000".to_string(),
+        chunk_index: None,
+        importance: 0,
+        ..Drawer::default()
+    };
+    db.insert_drawer_with_project(&target, None)
+        .expect("insert target drawer");
+    db.insert_vector(&target.id, &[10.0, 0.0, 0.0, 0.0])
+        .expect("insert target vector");
+
+    let route = RouteDecision {
+        wing: None,
+        room: None,
+        confidence: 0.0,
+        reason: "test".to_string(),
+    };
+    let scope = ProjectSearchScope::from_request(None, true, false, false);
+
+    let results = search_by_vector(&db, &[1.0, 0.0, 0.0, 0.0], route, &scope, 10)
+        .expect("large-index vector search");
+    assert_eq!(
+        results.first().map(|result| result.drawer_id.as_str()),
+        Some("target-cosine"),
+        "sqlite-vec KNN must use cosine distance, not L2 distance"
+    );
+}
+
+#[test]
 fn search_by_vector_succeeds_with_20000_drawers() {
     let tmp = TempDir::new().expect("tempdir");
     let db = Database::open(&tmp.path().join("test.db")).expect("open db");

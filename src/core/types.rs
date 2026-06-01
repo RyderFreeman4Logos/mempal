@@ -576,6 +576,21 @@ pub struct DrawerDetails {
     pub updated_at: Option<String>,
     pub merge_count: u32,
     pub project_id: Option<String>,
+    pub vector: DrawerVectorDetails,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrawerVectorDetails {
+    pub has_vector: bool,
+    pub dimension: Option<usize>,
+    pub embedder: Option<String>,
+    pub model: Option<String>,
+    pub embedder_fingerprint: Option<String>,
+    pub index_version: Option<String>,
+    pub current_embedder_fingerprint: Option<String>,
+    pub current_index_version: String,
+    pub distance_metric: Option<String>,
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

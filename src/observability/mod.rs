@@ -401,6 +401,31 @@ pub fn view_command(db: &Database, config: &Config, options: ViewOptions<'_>) ->
         details.updated_at.as_deref().unwrap_or("none")
     );
     println!("merge_count: {}", details.merge_count);
+    println!("has_vector: {}", details.vector.has_vector);
+    println!(
+        "vector_dimension: {}",
+        details
+            .vector
+            .dimension
+            .map_or_else(|| "none".to_string(), |value| value.to_string())
+    );
+    println!(
+        "vector_distance_metric: {}",
+        details.vector.distance_metric.as_deref().unwrap_or("none")
+    );
+    println!(
+        "vector_embedder: {}",
+        details.vector.embedder.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "vector_model: {}",
+        details.vector.model.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "vector_index_version: {}",
+        details.vector.index_version.as_deref().unwrap_or("unknown")
+    );
+    println!("vector_stale: {}", details.vector.stale);
     println!(
         "source_file: {}",
         maybe_escape(

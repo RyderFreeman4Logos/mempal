@@ -19,7 +19,10 @@ use mempal::core::{
     anchor,
     compaction::merge_cluster,
     config::{CompiledPrivacyConfig, Config, ConfigHandle, default_config_path},
-    db::{Database, find_similar_clusters},
+    db::{
+        CURRENT_VECTOR_INDEX_VERSION, Database, VECTOR_DISTANCE_METRIC, find_similar_clusters,
+        vector_metadata_key,
+    },
     phase3::{
         CardContextDefaultProposalReport, CardContextRollbackControlReport, EvaluatorAdviceInput,
         EvaluatorAdviceReport, Phase3ReadinessReport, ResearchIngestPlanReport,
@@ -431,6 +434,9 @@ enum Commands {
         force: bool,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// With --embedder/--from-config --stale: number of stale/new drawers to embed per write batch.
+        #[arg(long)]
+        batch_size: Option<usize>,
         /// Return failed embed-queue messages to pending for daemon retry.
         #[arg(long, default_value_t = false)]
         failed: bool,
@@ -2386,6 +2392,7 @@ fn run() -> Result<()> {
             stale,
             force,
             dry_run,
+            batch_size,
             failed,
             recompute_importance,
             only_zero,
@@ -2398,6 +2405,7 @@ fn run() -> Result<()> {
                     || stale
                     || force
                     || dry_run
+                    || batch_size.is_some()
                     || recompute_importance
                     || only_zero
                     || normalize_added_at
@@ -2415,6 +2423,11 @@ fn run() -> Result<()> {
             } else if recompute_importance {
                 recompute_importance_command(&db, only_zero)
             } else if embedder.is_some() || from_config {
+                if dry_run {
+                    bail!(
+                        "--dry-run is only supported by source reindex (`mempal reindex --stale --dry-run`)"
+                    );
+                }
                 let backend = match (embedder.as_deref(), from_config) {
                     (Some(name), false) => name.to_string(),
                     (None, true) => config.embed.backend.clone(),
@@ -2429,8 +2442,12 @@ fn run() -> Result<()> {
                     &backend,
                     resume,
                     stale,
+                    batch_size.unwrap_or(1000),
                 ))
             } else {
+                if batch_size.is_some() {
+                    bail!("--batch-size requires --embedder or --from-config with --stale");
+                }
                 block_on_result(reindex_command_sources(
                     &db,
                     config.as_ref(),
@@ -4942,13 +4959,19 @@ async fn reindex_command_by_embedder(
     embedder_name: &str,
     resume: bool,
     stale_only: bool,
+    batch_size: usize,
 ) -> Result<()> {
     let embedder = build_specific_embedder(config, embedder_name).await?;
     let new_dim = embedder.dimensions();
     let current_dim = current_vector_dim(db).context("failed to read embedding dim")?;
+    let current_metric = db
+        .vector_table_distance_metric()
+        .context("failed to read vector distance metric")?;
     let progress_store = ReindexProgressStore::new(db.path());
-    let target_fingerprint = reindex_embedder_fingerprint(config, embedder_name, new_dim);
-    let resume_checkpoint = if resume {
+    let target_fingerprint = config
+        .embed
+        .vector_embedder_fingerprint(embedder_name, new_dim);
+    let mut resume_checkpoint = if resume {
         progress_store
             .latest_resumable(Some(embedder_name))
             .context("failed to load reindex checkpoint")?
@@ -4961,7 +4984,24 @@ async fn reindex_command_by_embedder(
     } else {
         println!("current vector dim: (empty table)");
     }
-    if resume_checkpoint.is_none() && (!stale_only || current_dim != Some(new_dim)) {
+    println!(
+        "current vector metric: {}",
+        current_metric.as_deref().unwrap_or("(empty table)")
+    );
+    let metric_is_current = current_metric.as_deref() == Some(VECTOR_DISTANCE_METRIC);
+    let table_layout_is_current = current_dim == Some(new_dim) && metric_is_current;
+    let should_recreate_table = if stale_only {
+        !table_layout_is_current
+    } else {
+        resume_checkpoint.is_none() || !table_layout_is_current
+    };
+    if should_recreate_table {
+        if resume_checkpoint.is_some() {
+            println!(
+                "resume checkpoint ignored because drawer_vectors metric or dimension is stale"
+            );
+            resume_checkpoint = None;
+        }
         println!("recreating drawer_vectors with {new_dim} dimensions...");
         db.recreate_vectors_table(new_dim)
             .context("failed to recreate vectors table")?;
@@ -4969,6 +5009,16 @@ async fn reindex_command_by_embedder(
         println!("stale-only reindex preserving existing drawer_vectors table");
     } else {
         println!("resume checkpoint found; preserving existing drawer_vectors table");
+    }
+    if stale_only && resume_checkpoint.is_none() {
+        return reindex_stale_batches(
+            db,
+            embedder.as_ref(),
+            embedder_name,
+            &target_fingerprint,
+            batch_size,
+        )
+        .await;
     }
     let mut drawers = reindex_rows(db).context("failed to load active drawers for reindex")?;
     if stale_only {
@@ -5013,12 +5063,12 @@ async fn reindex_command_by_embedder(
         db.conn()
             .execute("DELETE FROM drawer_vectors WHERE id = ?1", [&row.id])
             .with_context(|| format!("failed to clear existing vector for {}", row.id))?;
-        db.insert_vector(&row.id, &vector)
+        db.insert_vector_with_project(&row.id, &vector, row.project_id.as_deref())
             .with_context(|| format!("failed to insert vector for {}", row.id))?;
         record_reindex_metadata(
             db,
             &row.id,
-            CURRENT_REINDEX_NORMALIZE_VERSION,
+            CURRENT_VECTOR_INDEX_VERSION,
             &target_fingerprint,
         )
         .with_context(|| format!("failed to record reindex metadata for {}", row.id))?;
@@ -5041,6 +5091,74 @@ async fn reindex_command_by_embedder(
             .context("failed to finalize reindex checkpoint")?;
     }
     println!("reindex complete: {total} drawers, {new_dim}d vectors");
+    Ok(())
+}
+
+async fn reindex_stale_batches(
+    db: &Database,
+    embedder: &dyn Embedder,
+    embedder_name: &str,
+    target_fingerprint: &str,
+    batch_size: usize,
+) -> Result<()> {
+    if batch_size == 0 {
+        bail!("--batch-size must be greater than 0");
+    }
+    println!("stale-only reindex batch size: {batch_size}");
+    let mut processed = 0usize;
+    let mut skipped_concurrent_update = 0usize;
+    let mut batch_index = 0usize;
+    loop {
+        let rows = reindex_stale_batch_rows(db, target_fingerprint, batch_size)
+            .context("failed to load stale reindex batch")?;
+        if rows.is_empty() {
+            break;
+        }
+        let texts = rows
+            .iter()
+            .map(|row| row.content.as_str())
+            .collect::<Vec<_>>();
+        let vectors = embedder
+            .embed(&texts)
+            .await
+            .context("embedding failed during stale batch reindex")?;
+        if vectors.len() != rows.len() {
+            bail!(
+                "embedder returned {} vectors for {} stale drawers",
+                vectors.len(),
+                rows.len()
+            );
+        }
+        let stats = write_reindex_vector_batch(db, &rows, &vectors, target_fingerprint)
+            .context("failed to write stale reindex batch")?;
+        batch_index += 1;
+        processed += stats.reindexed;
+        skipped_concurrent_update += stats.skipped_concurrent_update;
+        if stats.skipped_concurrent_update == 0 {
+            println!(
+                "batch {batch_index}: re-embedded {} stale/new drawers (total {processed})",
+                stats.reindexed
+            );
+        } else {
+            println!(
+                "batch {batch_index}: re-embedded {} stale/new drawers, skipped {} concurrent updates (total {processed})",
+                stats.reindexed, stats.skipped_concurrent_update
+            );
+        }
+        let progress_store = ReindexProgressStore::new(db.path());
+        if let Some(last) = rows.last() {
+            progress_store
+                .upsert_running(&last.source_path, Some(last.chunk_index), embedder_name)
+                .context("failed to persist reindex checkpoint")?;
+        }
+    }
+    if skipped_concurrent_update == 0 {
+        println!("stale reindex complete: {processed} drawers");
+    } else {
+        println!(
+            "stale reindex complete: {processed} drawers ({skipped_concurrent_update} skipped due to concurrent updates)"
+        );
+    }
     Ok(())
 }
 
@@ -8858,20 +8976,29 @@ async fn build_specific_embedder(config: &Config, backend: &str) -> Result<Box<d
 struct ReindexRow {
     id: String,
     content: String,
+    content_hash: Option<String>,
     source_path: String,
     chunk_index: i64,
+    project_id: Option<String>,
 }
-const CURRENT_REINDEX_NORMALIZE_VERSION: &str = "v1";
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ReindexBatchWriteStats {
+    reindexed: usize,
+    skipped_concurrent_update: usize,
+}
 
 fn reindex_rows(db: &Database) -> Result<Vec<ReindexRow>> {
-    let mut stmt = db.conn().prepare(r#"SELECT id, content, COALESCE(source_file, id) AS source_path, COALESCE(chunk_index, 0) AS chunk_index FROM drawers WHERE deleted_at IS NULL ORDER BY source_path ASC, chunk_index ASC, id ASC"#).context("failed to prepare reindex query")?;
+    let mut stmt = db.conn().prepare(r#"SELECT id, content, content_hash, COALESCE(source_file, id) AS source_path, COALESCE(chunk_index, 0) AS chunk_index, project_id FROM drawers WHERE deleted_at IS NULL ORDER BY source_path ASC, chunk_index ASC, id ASC"#).context("failed to prepare reindex query")?;
     let rows = stmt
         .query_map([], |row| {
             Ok(ReindexRow {
                 id: row.get(0)?,
                 content: row.get(1)?,
-                source_path: row.get(2)?,
-                chunk_index: row.get(3)?,
+                content_hash: row.get(2)?,
+                source_path: row.get(3)?,
+                chunk_index: row.get(4)?,
+                project_id: row.get(5)?,
             })
         })
         .context("failed to query reindex rows")?
@@ -8879,6 +9006,166 @@ fn reindex_rows(db: &Database) -> Result<Vec<ReindexRow>> {
         .context("failed to collect reindex rows")?;
     Ok(rows)
 }
+
+fn reindex_stale_batch_rows(
+    db: &Database,
+    target_fingerprint: &str,
+    batch_size: usize,
+) -> Result<Vec<ReindexRow>> {
+    let limit = i64::try_from(batch_size).context("batch size is too large")?;
+    let vectors_exist = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to query vector table presence")?;
+    let rows = if vectors_exist {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                r#"
+                SELECT d.id,
+                       d.content,
+                       d.content_hash,
+                       COALESCE(d.source_file, d.id) AS source_path,
+                       COALESCE(d.chunk_index, 0) AS chunk_index,
+                       d.project_id
+                FROM drawers d
+                LEFT JOIN drawer_vectors v ON v.id = d.id
+                LEFT JOIN fork_ext_meta idx
+                  ON idx.key = 'reindex:' || d.id || ':index_version'
+                LEFT JOIN fork_ext_meta legacy_idx
+                  ON legacy_idx.key = 'reindex:' || d.id || ':normalize_version'
+                LEFT JOIN fork_ext_meta fp
+                  ON fp.key = 'reindex:' || d.id || ':embedder_fingerprint'
+                WHERE d.deleted_at IS NULL
+                  AND (
+                      v.id IS NULL
+                      OR COALESCE(idx.value, legacy_idx.value, '') != ?1
+                      OR COALESCE(fp.value, '') != ?2
+                  )
+                ORDER BY source_path ASC, chunk_index ASC, d.id ASC
+                LIMIT ?3
+                "#,
+            )
+            .context("failed to prepare stale vector batch query")?;
+        stmt.query_map(
+            (CURRENT_VECTOR_INDEX_VERSION, target_fingerprint, limit),
+            |row| {
+                Ok(ReindexRow {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    content_hash: row.get(2)?,
+                    source_path: row.get(3)?,
+                    chunk_index: row.get(4)?,
+                    project_id: row.get(5)?,
+                })
+            },
+        )
+        .context("failed to query stale vector batch")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect stale vector batch")?
+    } else {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                r#"
+                SELECT id,
+                       content,
+                       content_hash,
+                       COALESCE(source_file, id) AS source_path,
+                       COALESCE(chunk_index, 0) AS chunk_index,
+                       project_id
+                FROM drawers
+                WHERE deleted_at IS NULL
+                ORDER BY source_path ASC, chunk_index ASC, id ASC
+                LIMIT ?1
+                "#,
+            )
+            .context("failed to prepare missing-vector batch query")?;
+        stmt.query_map([limit], |row| {
+            Ok(ReindexRow {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                content_hash: row.get(2)?,
+                source_path: row.get(3)?,
+                chunk_index: row.get(4)?,
+                project_id: row.get(5)?,
+            })
+        })
+        .context("failed to query missing-vector batch")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect missing-vector batch")?
+    };
+    Ok(rows)
+}
+
+fn write_reindex_vector_batch(
+    db: &Database,
+    rows: &[ReindexRow],
+    vectors: &[Vec<f32>],
+    target_fingerprint: &str,
+) -> Result<ReindexBatchWriteStats> {
+    use rusqlite::OptionalExtension;
+
+    db.conn()
+        .busy_timeout(std::time::Duration::from_millis(0))
+        .context("failed to set fail-fast busy timeout")?;
+    let begin = db.conn().execute_batch("BEGIN IMMEDIATE;");
+    db.conn()
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .context("failed to restore busy timeout")?;
+    begin.context("failed to begin stale reindex batch transaction")?;
+
+    let result = (|| -> Result<ReindexBatchWriteStats> {
+        let mut stats = ReindexBatchWriteStats::default();
+        for (row, vector) in rows.iter().zip(vectors) {
+            let current_token = db
+                .conn()
+                .query_row(
+                    "SELECT content_hash FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+                    [&row.id],
+                    |db_row| db_row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .with_context(|| format!("failed to verify current drawer token for {}", row.id))?;
+            if current_token != Some(row.content_hash.clone()) {
+                stats.skipped_concurrent_update += 1;
+                continue;
+            }
+            db.conn()
+                .execute("DELETE FROM drawer_vectors WHERE id = ?1", [&row.id])
+                .with_context(|| format!("failed to clear existing vector for {}", row.id))?;
+            db.insert_vector_with_project(&row.id, vector, row.project_id.as_deref())
+                .with_context(|| format!("failed to insert vector for {}", row.id))?;
+            record_reindex_metadata(
+                db,
+                &row.id,
+                CURRENT_VECTOR_INDEX_VERSION,
+                target_fingerprint,
+            )
+            .with_context(|| format!("failed to record reindex metadata for {}", row.id))?;
+            stats.reindexed += 1;
+        }
+        Ok(stats)
+    })();
+
+    match result {
+        Ok(stats) => {
+            db.conn()
+                .execute_batch("COMMIT;")
+                .context("failed to commit stale reindex batch")?;
+            Ok(stats)
+        }
+        Err(error) => {
+            let _ = db.conn().execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
 fn should_skip_reindex_row(
     checkpoint: Option<&mempal::core::reindex::ReindexProgressRow>,
     source_path: &str,
@@ -8914,24 +9201,12 @@ fn current_vector_dim(db: &Database) -> Result<Option<usize>> {
         .map(|v| v as usize);
     Ok(dim)
 }
-fn reindex_embedder_fingerprint(config: &Config, backend: &str, dim: usize) -> String {
-    let base_url = config
-        .embed
-        .resolved_openai_base_url()
-        .unwrap_or_default()
-        .trim_end_matches('/');
-    let model = config.embed.resolved_openai_model().unwrap_or_default();
-    format!("{backend}:{model}:{base_url}:{dim}")
-}
-fn reindex_metadata_key(drawer_id: &str, field: &str) -> String {
-    format!("reindex:{drawer_id}:{field}")
-}
 fn load_reindex_metadata(db: &Database, drawer_id: &str, field: &str) -> Result<Option<String>> {
     use rusqlite::OptionalExtension;
     db.conn()
         .query_row(
             "SELECT value FROM fork_ext_meta WHERE key = ?1",
-            [reindex_metadata_key(drawer_id, field)],
+            [vector_metadata_key(drawer_id, field)],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -8943,7 +9218,7 @@ fn record_reindex_metadata(
     normalize_version: &str,
     embedder_fingerprint: &str,
 ) -> Result<()> {
-    db.conn().execute(r#"INSERT INTO fork_ext_meta (key, value) VALUES (?1, ?2), (?3, ?4) ON CONFLICT(key) DO UPDATE SET value = excluded.value"#, rusqlite::params![reindex_metadata_key(drawer_id, "normalize_version"), normalize_version, reindex_metadata_key(drawer_id, "embedder_fingerprint"), embedder_fingerprint]).context("failed to write reindex metadata")?;
+    db.conn().execute(r#"INSERT INTO fork_ext_meta (key, value) VALUES (?1, ?2), (?3, ?4), (?5, ?6) ON CONFLICT(key) DO UPDATE SET value = excluded.value"#, rusqlite::params![vector_metadata_key(drawer_id, "index_version"), normalize_version, vector_metadata_key(drawer_id, "normalize_version"), normalize_version, vector_metadata_key(drawer_id, "embedder_fingerprint"), embedder_fingerprint]).context("failed to write reindex metadata")?;
     Ok(())
 }
 fn drawer_vector_exists(db: &Database, drawer_id: &str) -> Result<bool> {
@@ -8962,8 +9237,15 @@ fn reindex_row_is_stale(db: &Database, row: &ReindexRow, target_fingerprint: &st
     if !drawer_vector_exists(db, &row.id)? {
         return Ok(true);
     }
-    let nv = load_reindex_metadata(db, &row.id, "normalize_version")?;
-    if nv.as_deref() != Some(CURRENT_REINDEX_NORMALIZE_VERSION) {
+    if db.vector_table_distance_metric()?.as_deref() != Some(VECTOR_DISTANCE_METRIC) {
+        return Ok(true);
+    }
+    let nv = load_reindex_metadata(db, &row.id, "index_version")?.or(load_reindex_metadata(
+        db,
+        &row.id,
+        "normalize_version",
+    )?);
+    if nv.as_deref() != Some(CURRENT_VECTOR_INDEX_VERSION) {
         return Ok(true);
     }
     let fp = load_reindex_metadata(db, &row.id, "embedder_fingerprint")?;

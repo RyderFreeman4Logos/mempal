@@ -6023,6 +6023,7 @@ fn intelligence_llm_state(config: &crate::core::config::Config, reachable: bool)
 fn read_drawer_response(details: crate::core::types::DrawerDetails) -> ReadDrawerResponse {
     let signals = crate::aaak::analyze(&details.drawer.content);
     let original_content_bytes = details.drawer.content.len() as u64;
+    let vector = details.vector;
     let drawer = details.drawer;
     ReadDrawerResponse {
         drawer_id: drawer.id.clone(),
@@ -6036,6 +6037,16 @@ fn read_drawer_response(details: crate::core::types::DrawerDetails) -> ReadDrawe
         updated_at: details.updated_at,
         merge_count: details.merge_count,
         importance_stars: signals.importance_stars,
+        has_vector: vector.has_vector,
+        vector_dimension: vector.dimension,
+        vector_embedder: vector.embedder,
+        vector_model: vector.model,
+        vector_embedder_fingerprint: vector.embedder_fingerprint,
+        vector_index_version: vector.index_version,
+        vector_current_embedder_fingerprint: vector.current_embedder_fingerprint,
+        vector_current_index_version: vector.current_index_version,
+        vector_distance_metric: vector.distance_metric,
+        vector_stale: vector.stale,
     }
 }
 

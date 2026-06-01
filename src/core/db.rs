@@ -24,12 +24,12 @@ use super::anchor;
 use super::{
     types::{
         AnchorKind, ChunkNeighbors, CompactionStrategy, ConsolidationStats, Drawer, DrawerDetails,
-        DrawerSummary, ExplicitTunnel, KnowledgeCard, KnowledgeCardEvent, KnowledgeCardFilter,
-        KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus,
-        KnowledgeTier, MemoryDomain, MemoryKind, NeighborChunk, Provenance, ReindexSource,
-        RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack,
-        SleepStats, SourceType, TaxonomyEntry, Triple, TripleStats, TunnelDrawer, TunnelEndpoint,
-        TunnelFollowResult,
+        DrawerSummary, DrawerVectorDetails, ExplicitTunnel, KnowledgeCard, KnowledgeCardEvent,
+        KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole,
+        KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, NeighborChunk, Provenance,
+        ReindexSource, RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal,
+        RuntimeAdoptionTrack, SleepStats, SourceType, TaxonomyEntry, Triple, TripleStats,
+        TunnelDrawer, TunnelEndpoint, TunnelFollowResult,
     },
     utils::{
         build_drawer_id, build_scoped_drawer_id, build_tunnel_id, current_timestamp,
@@ -40,6 +40,8 @@ use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 17;
+pub const CURRENT_VECTOR_INDEX_VERSION: &str = "v2";
+pub const VECTOR_DISTANCE_METRIC: &str = "cosine";
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -665,6 +667,7 @@ impl Database {
     ) -> Result<(), DbError> {
         self.ensure_vectors_table(vector.len())?;
         let vector_json = serde_json::to_string(vector)?;
+        let content_hash = content_hash_hex(merged_content);
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<(), DbError> {
             self.conn.execute(
@@ -672,10 +675,11 @@ impl Database {
                 UPDATE drawers
                 SET content = ?2,
                     updated_at = ?3,
+                    content_hash = ?4,
                     merge_count = COALESCE(merge_count, 0) + 1
                 WHERE id = ?1
                 "#,
-                params![drawer_id, merged_content, updated_at],
+                params![drawer_id, merged_content, updated_at, content_hash],
             )?;
             self.conn
                 .execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])?;
@@ -688,6 +692,7 @@ impl Database {
                 "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
                 params![drawer_id, vector_json, project_id],
             )?;
+            self.record_current_vector_metadata(drawer_id, vector.len())?;
             Ok(())
         })();
         match result {
@@ -969,7 +974,10 @@ impl Database {
             "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
             params![drawer_id, vector_json.as_str(), project_id],
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.record_current_vector_metadata(drawer_id, vector.len())?;
+                Ok(())
+            }
             // sqlite-vec's vec0 virtual table does not honor INSERT OR IGNORE
             // or INSERT OR REPLACE — it always raises a UNIQUE primary key
             // violation on duplicate id, regardless of conflict clause. Match
@@ -983,6 +991,74 @@ impl Database {
             }
             Err(e) => Err(DbError::Sqlite(e)),
         }
+    }
+
+    pub fn vector_table_distance_metric(&self) -> Result<Option<String>, DbError> {
+        if !self.table_exists("drawer_vectors")? {
+            return Ok(None);
+        }
+        let sql = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drawer_vectors'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(sql) = sql else {
+            return Ok(None);
+        };
+        let lower = sql.to_ascii_lowercase();
+        if lower.contains("distance_metric=cosine") {
+            Ok(Some("cosine".to_string()))
+        } else if lower.contains("distance_metric=l2") {
+            Ok(Some("l2".to_string()))
+        } else {
+            // sqlite-vec defaults vec0 float vectors to L2 when no metric is declared.
+            Ok(Some("l2".to_string()))
+        }
+    }
+
+    pub fn current_vector_embedder_fingerprint(dim: usize) -> String {
+        let config = super::config::ConfigHandle::current();
+        config.embed.current_vector_embedder_fingerprint(dim)
+    }
+
+    pub fn record_current_vector_metadata(
+        &self,
+        drawer_id: &str,
+        dim: usize,
+    ) -> Result<(), DbError> {
+        self.record_vector_metadata(
+            drawer_id,
+            CURRENT_VECTOR_INDEX_VERSION,
+            &Self::current_vector_embedder_fingerprint(dim),
+        )
+    }
+
+    pub fn record_vector_metadata(
+        &self,
+        drawer_id: &str,
+        index_version: &str,
+        embedder_fingerprint: &str,
+    ) -> Result<(), DbError> {
+        if !self.table_exists("fork_ext_meta")? {
+            return Ok(());
+        }
+        self.conn.execute(
+            r#"
+            INSERT INTO fork_ext_meta (key, value)
+            VALUES (?1, ?2), (?3, ?4)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            params![
+                vector_metadata_key(drawer_id, "index_version"),
+                index_version,
+                vector_metadata_key(drawer_id, "embedder_fingerprint"),
+                embedder_fingerprint,
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_drawer_and_replace_vector(
@@ -1094,6 +1170,7 @@ impl Database {
                 "INSERT INTO drawer_vectors (id, embedding) VALUES (?1, vec_f32(?2))",
                 params![drawer.id.as_str(), vector_json.as_str()],
             )?;
+            self.record_current_vector_metadata(&drawer.id, vector.len())?;
 
             Ok(())
         })();
@@ -1200,7 +1277,7 @@ impl Database {
             ""
         };
         self.conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS drawer_vectors USING vec0(id TEXT PRIMARY KEY, embedding FLOAT[{dim}]{project_column});"
+            "CREATE VIRTUAL TABLE IF NOT EXISTS drawer_vectors USING vec0(id TEXT PRIMARY KEY, embedding FLOAT[{dim}] distance_metric={VECTOR_DISTANCE_METRIC}{project_column});"
         ))?;
         Ok(())
     }
@@ -1533,6 +1610,67 @@ impl Database {
         table_exists_conn(&self.conn, table_name)
     }
 
+    pub fn drawer_vector_details(&self, drawer_id: &str) -> Result<DrawerVectorDetails, DbError> {
+        let metric = self.vector_table_distance_metric()?;
+        let dimension = if metric.is_some() {
+            self.conn
+                .query_row(
+                    "SELECT vec_length(embedding) FROM drawer_vectors WHERE id = ?1",
+                    [drawer_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .map(|value| value as usize)
+        } else {
+            None
+        };
+        let has_vector = dimension.is_some();
+        let index_version = self
+            .load_vector_metadata(drawer_id, "index_version")?
+            .or(self.load_vector_metadata(drawer_id, "normalize_version")?);
+        let embedder_fingerprint = self.load_vector_metadata(drawer_id, "embedder_fingerprint")?;
+        let current_embedder_fingerprint = dimension.map(Self::current_vector_embedder_fingerprint);
+        let (embedder, model) = embedder_fingerprint
+            .as_deref()
+            .map(parse_vector_fingerprint)
+            .unwrap_or((None, None));
+        let stale = !has_vector
+            || metric.as_deref() != Some(VECTOR_DISTANCE_METRIC)
+            || index_version.as_deref() != Some(CURRENT_VECTOR_INDEX_VERSION)
+            || embedder_fingerprint.as_deref() != current_embedder_fingerprint.as_deref();
+
+        Ok(DrawerVectorDetails {
+            has_vector,
+            dimension,
+            embedder,
+            model,
+            embedder_fingerprint,
+            index_version,
+            current_embedder_fingerprint,
+            current_index_version: CURRENT_VECTOR_INDEX_VERSION.to_string(),
+            distance_metric: metric,
+            stale,
+        })
+    }
+
+    fn load_vector_metadata(
+        &self,
+        drawer_id: &str,
+        field: &str,
+    ) -> Result<Option<String>, DbError> {
+        if !self.table_exists("fork_ext_meta")? {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT value FROM fork_ext_meta WHERE key = ?1",
+                [vector_metadata_key(drawer_id, field)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(DbError::Sqlite)
+    }
+
     pub fn taxonomy_count(&self) -> Result<i64, DbError> {
         Ok(self
             .conn
@@ -1597,18 +1735,30 @@ impl Database {
             let updated_at = row.get::<_, Option<String>>(32)?;
             let merge_count = row.get::<_, u32>(33)?;
             let project_id = row.get::<_, Option<String>>(34)?;
-            Ok(DrawerDetails {
-                drawer,
-                updated_at,
-                merge_count,
-                project_id,
-            })
+            Ok((drawer, updated_at, merge_count, project_id))
         })?;
 
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
-        }
+        let details = match rows.next() {
+            Some(row) => {
+                let (drawer, updated_at, merge_count, project_id) = row?;
+                Some((drawer, updated_at, merge_count, project_id))
+            }
+            None => None,
+        };
+        drop(rows);
+        drop(statement);
+        details
+            .map(|(drawer, updated_at, merge_count, project_id)| {
+                let vector = self.drawer_vector_details(&drawer.id)?;
+                Ok(DrawerDetails {
+                    drawer,
+                    updated_at,
+                    merge_count,
+                    project_id,
+                    vector,
+                })
+            })
+            .transpose()
     }
 
     pub fn get_drawer_details_batch(
@@ -1654,17 +1804,27 @@ impl Database {
                 let project_id = row.get::<_, Option<String>>(34)?;
                 Ok((
                     drawer.id.clone(),
-                    DrawerDetails {
-                        drawer,
-                        updated_at,
-                        merge_count,
-                        project_id,
-                    },
+                    drawer,
+                    updated_at,
+                    merge_count,
+                    project_id,
                 ))
             })?;
 
+            let mut base_rows = Vec::new();
             for row in rows {
-                let (id, details) = row?;
+                base_rows.push(row?);
+            }
+            drop(statement);
+            for (id, drawer, updated_at, merge_count, project_id) in base_rows {
+                let vector = self.drawer_vector_details(&id)?;
+                let details = DrawerDetails {
+                    drawer,
+                    updated_at,
+                    merge_count,
+                    project_id,
+                    vector,
+                };
                 found_by_id.insert(id, details);
             }
         }
@@ -3218,7 +3378,7 @@ impl Database {
             DROP TABLE IF EXISTS drawer_vectors;
             CREATE VIRTUAL TABLE drawer_vectors USING vec0(
                 id TEXT PRIMARY KEY,
-                embedding FLOAT[{dim}]{project_column}
+                embedding FLOAT[{dim}] distance_metric={VECTOR_DISTANCE_METRIC}{project_column}
             );
             "#
         ))?;
@@ -5133,6 +5293,23 @@ fn register_sqlite_vec() -> Result<(), DbError> {
 
 fn source_type_as_str(source_type: &SourceType) -> &'static str {
     source_type.as_str()
+}
+
+pub fn vector_metadata_key(drawer_id: &str, field: &str) -> String {
+    format!("reindex:{drawer_id}:{field}")
+}
+
+fn parse_vector_fingerprint(value: &str) -> (Option<String>, Option<String>) {
+    let mut parts = value.splitn(3, ':');
+    let embedder = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .map(str::to_string);
+    let model = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .map(str::to_string);
+    (embedder, model)
 }
 
 fn source_type_from_str(source_type: &str) -> Result<SourceType, DbError> {

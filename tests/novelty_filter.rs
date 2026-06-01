@@ -284,6 +284,17 @@ fn drawer_content(db_path: &Path, drawer_id: &str) -> String {
         .expect("drawer content")
 }
 
+fn drawer_content_hash(db_path: &Path, drawer_id: &str) -> String {
+    Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT content_hash FROM drawers WHERE id = ?1",
+            [drawer_id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("drawer content_hash")
+}
+
 fn merge_state(db_path: &Path, drawer_id: &str) -> (i64, Option<String>) {
     Connection::open(db_path)
         .expect("open sqlite")
@@ -659,6 +670,13 @@ async fn test_medium_similarity_candidate_merged() {
     assert!(content.contains("Decision: use Arc<Mutex<>>"));
     assert!(content.contains("SUPPLEMENTARY ("));
     assert!(content.contains(candidate));
+    let stored_hash = drawer_content_hash(&env.db_path, "existing");
+    let expected_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+    let original_hash = blake3::hash("Decision: use Arc<Mutex<>>".as_bytes())
+        .to_hex()
+        .to_string();
+    assert_eq!(stored_hash, expected_hash);
+    assert_ne!(stored_hash, original_hash);
     let (merge_count, updated_at) = merge_state(&env.db_path, "existing");
     assert_eq!(merge_count, 1);
     assert!(updated_at.is_some(), "merge must set updated_at");
