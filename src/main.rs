@@ -1054,12 +1054,24 @@ enum XurlCommands {
     },
     /// Show per-tool turn counts and date ranges.
     Stats {
+        /// Filter by tool: cc, codex, or hermes.
+        #[arg(long, value_enum)]
+        tool: Option<XurlTool>,
+        /// Filter to a specific session ID.
+        #[arg(long)]
+        session: Option<String>,
+        /// Only include turns newer than this duration (e.g. 7d, 24h, 10m).
+        #[arg(long)]
+        since: Option<String>,
         /// Print result as JSON.
         #[arg(long)]
         json: bool,
     },
     /// Embed all turns that still lack a vector (drains the historical backlog).
     Reindex {
+        /// Show how many threads/turns would be embedded without writing vectors.
+        #[arg(long)]
+        dry_run: bool,
         /// Print progress as JSON.
         #[arg(long)]
         json: bool,
@@ -8835,11 +8847,24 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             Ok(())
         }
 
-        XurlCommands::Stats { json } => {
-            let stats =
-                mempal::xurl::store::get_stats(db.conn()).context("xurl stats query failed")?;
-            let unindexed_remaining = mempal::xurl::store::count_unindexed_turns(db.conn())
-                .context("xurl unindexed count failed")?;
+        XurlCommands::Stats {
+            tool,
+            session,
+            since,
+            json,
+        } => {
+            let since_epoch = since.as_deref().map(parse_since_to_epoch).transpose()?;
+            let filter = mempal::xurl::store::TurnFilter {
+                tool: tool.map(Into::into),
+                session_id: session,
+                since_epoch,
+                ..Default::default()
+            };
+            let stats = mempal::xurl::store::get_stats_filtered(db.conn(), &filter)
+                .context("xurl stats query failed")?;
+            let unindexed_remaining =
+                mempal::xurl::store::count_unindexed_turns_filtered(db.conn(), &filter)
+                    .context("xurl unindexed count failed")?;
             if json {
                 let tools: Vec<XurlStatsToolJson> = stats
                     .iter()
@@ -8881,7 +8906,27 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             Ok(())
         }
 
-        XurlCommands::Reindex { json } => {
+        XurlCommands::Reindex { dry_run, json } => {
+            if dry_run {
+                let summary = mempal::xurl::store::summarize_unindexed_turns(db.conn())
+                    .context("xurl reindex dry-run query failed")?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "dry_run": true,
+                            "threads_would_process": summary.threads,
+                            "turns_would_process": summary.turns,
+                        })
+                    );
+                } else {
+                    println!("dry-run: true");
+                    println!("threads would process: {}", summary.threads);
+                    println!("turns would process:   {}", summary.turns);
+                    println!("vectors written:       0");
+                }
+                return Ok(());
+            }
             let embedder = build_embedder(config).await?;
             let embed_cb = |done: usize, total: usize| {
                 if json {

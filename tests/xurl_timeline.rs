@@ -118,6 +118,13 @@ fn json_turn_by_id<'a>(turns: &'a [Value], id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing turn {id}: {turns:?}"))
 }
 
+fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after unix epoch")
+        .as_secs_f64()
+}
+
 fn make_raw_turn(
     session_id: &str,
     tool: Tool,
@@ -560,6 +567,122 @@ fn stats_cli_json_reports_tools_and_unindexed_remaining() {
     let human = stdout(&human_output);
     assert!(human.contains("| tool"));
     assert!(human.contains("unindexed_remaining: 2"));
+}
+
+#[test]
+fn stats_cli_filters_tool_session_and_since_counts() {
+    let home = TempDir::new().expect("home");
+    let db = open_home_db(home.path());
+    let now = now_epoch();
+    let recent = now - 60.0 * 60.0;
+    let old = now - 10.0 * 24.0 * 60.0 * 60.0;
+
+    insert_home_turn(
+        &db,
+        RawTurnRow {
+            id: "cc-recent-keep",
+            session_id: "keep",
+            tool: "cc",
+            turn_index: 0,
+            role: "user",
+            content: "recent cc keep",
+            timestamp_epoch: recent,
+        },
+        None,
+    );
+    insert_home_turn(
+        &db,
+        RawTurnRow {
+            id: "cc-old-keep",
+            session_id: "keep",
+            tool: "cc",
+            turn_index: 1,
+            role: "user",
+            content: "old cc keep",
+            timestamp_epoch: old,
+        },
+        None,
+    );
+    insert_home_turn(
+        &db,
+        RawTurnRow {
+            id: "cc-recent-other-session",
+            session_id: "other",
+            tool: "cc",
+            turn_index: 0,
+            role: "user",
+            content: "recent cc other",
+            timestamp_epoch: recent,
+        },
+        None,
+    );
+    insert_home_turn(
+        &db,
+        RawTurnRow {
+            id: "codex-recent-keep",
+            session_id: "keep",
+            tool: "codex",
+            turn_index: 0,
+            role: "assistant",
+            content: "recent codex keep",
+            timestamp_epoch: recent,
+        },
+        None,
+    );
+
+    let global_output = run_xurl_stats(home.path(), &["--json"]);
+    assert!(
+        global_output.status.success(),
+        "global stats failed: {}",
+        stderr(&global_output)
+    );
+    let global: Value = serde_json::from_str(&stdout(&global_output)).expect("global stats json");
+    assert_eq!(global["unindexed_remaining"], Value::from(4));
+    let global_tools = global["tools"].as_array().expect("global tools");
+    let global_cc = global_tools
+        .iter()
+        .find(|tool| tool["tool"] == "cc")
+        .expect("global cc stat");
+    assert_eq!(global_cc["count"], Value::from(3));
+
+    let filtered_output = run_xurl_stats(
+        home.path(),
+        &[
+            "--tool",
+            "cc",
+            "--session",
+            "keep",
+            "--since",
+            "2d",
+            "--json",
+        ],
+    );
+    assert!(
+        filtered_output.status.success(),
+        "filtered stats failed: {}",
+        stderr(&filtered_output)
+    );
+    let filtered: Value =
+        serde_json::from_str(&stdout(&filtered_output)).expect("filtered stats json");
+    assert_eq!(filtered["unindexed_remaining"], Value::from(1));
+    let filtered_tools = filtered["tools"].as_array().expect("filtered tools");
+    assert_eq!(filtered_tools.len(), 1);
+    assert_eq!(filtered_tools[0]["tool"], Value::from("cc"));
+    assert_eq!(filtered_tools[0]["count"], Value::from(1));
+    let min_timestamp = filtered_tools[0]["min_timestamp"]
+        .as_f64()
+        .expect("min timestamp");
+    let max_timestamp = filtered_tools[0]["max_timestamp"]
+        .as_f64()
+        .expect("max timestamp");
+    assert!(
+        (min_timestamp - recent).abs() < 0.001,
+        "unexpected min timestamp: {min_timestamp}"
+    );
+    assert!(
+        (max_timestamp - recent).abs() < 0.001,
+        "unexpected max timestamp: {max_timestamp}"
+    );
 }
 
 #[test]
