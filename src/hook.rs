@@ -21,14 +21,19 @@ const PREVIEW_MAX_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum HookCommands {
+    /// Capture a PostToolUse hook payload.
     #[command(name = "PostToolUse", alias = "hook_post_tool")]
     PostToolUse,
+    /// Capture a UserPromptSubmit hook payload.
     #[command(name = "UserPromptSubmit", alias = "hook_user_prompt")]
     UserPromptSubmit,
+    /// Capture a SessionStart hook payload.
     #[command(name = "SessionStart", alias = "hook_session_start")]
     SessionStart,
+    /// Capture a SessionEnd hook payload.
     #[command(name = "SessionEnd", alias = "hook_session_end")]
     SessionEnd,
+    /// Install or uninstall passive capture hooks.
     Install {
         #[arg(long, value_enum)]
         target: HookInstallTarget,

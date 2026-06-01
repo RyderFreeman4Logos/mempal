@@ -11,6 +11,7 @@ pub mod manager;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum HotpatchCommands {
+    /// Review pending hotpatch suggestions.
     Review {
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -19,16 +20,19 @@ pub enum HotpatchCommands {
         #[arg(long, default_value_t = false)]
         include_dismissed: bool,
     },
+    /// Apply hotpatch suggestions for a directory.
     Apply {
         #[arg(long)]
         dir: PathBuf,
         #[arg(long, default_value_t = false)]
         confirm: bool,
     },
+    /// Dismiss hotpatch suggestions for a directory.
     Dismiss {
         #[arg(long)]
         dir: PathBuf,
     },
+    /// Remove old hotpatch suggestion entries.
     Clean {
         #[arg(long, default_value = "30d")]
         older_than: String,

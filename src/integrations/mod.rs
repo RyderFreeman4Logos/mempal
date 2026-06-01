@@ -24,17 +24,21 @@ const MANIFEST_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum IntegrationCommands {
+    /// Bootstrap bundled integration assets.
     Bootstrap,
+    /// Install an integration for a tool.
     Install {
         #[arg(long, value_enum)]
         tool: IntegrationTool,
         #[arg(long, value_enum, default_value_t = IntegrationProfile::User)]
         profile: IntegrationProfile,
     },
+    /// Uninstall an integration for a tool.
     Uninstall {
         #[arg(long, value_enum)]
         tool: IntegrationTool,
     },
+    /// Show integration status.
     Status,
 }
 

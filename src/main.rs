@@ -119,7 +119,7 @@ use crate::longmemeval::{BenchMode, LongMemEvalArgs, LongMemEvalGranularity, def
 use crate::prime_cli::{PrimeArgs, PrimeFormat};
 
 #[derive(Parser)]
-#[command(name = "mempal", about = "Project memory for coding agents")]
+#[command(name = "mempal", about = "Project memory for coding agents", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -232,11 +232,13 @@ enum WakeUpFormat {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize taxonomy rooms from a directory.
     Init {
         dir: PathBuf,
         #[arg(long)]
         dry_run: bool,
     },
+    /// Import memories from a directory or stdin.
     Ingest {
         dir: Option<PathBuf>,
         #[arg(long)]
@@ -302,6 +304,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_gate: bool,
     },
+    /// Search indexed memories with optional filters.
     Search {
         query: String,
         #[arg(long)]
@@ -337,6 +340,7 @@ enum Commands {
         #[arg(long = "include-expired")]
         include_expired: bool,
     },
+    /// Assemble tiered context for a query.
     Context {
         query: String,
         #[arg(long, default_value = "general")]
@@ -361,39 +365,42 @@ enum Commands {
         #[arg(long)]
         trigger: Option<String>,
     },
+    /// Inspect configuration and intelligence settings.
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Manage project-scoped drawer metadata.
     Project {
         #[command(subcommand)]
         command: ProjectCommands,
     },
+    /// Inspect ingest gating telemetry.
     Gating {
         #[command(subcommand)]
         command: GatingCommands,
     },
+    /// Print wake-up context and memory protocol.
     WakeUp {
         #[arg(long, value_enum)]
         format: Option<WakeUpFormat>,
     },
+    /// Prime the current session with recent project memory.
     Prime(PrimeArgs),
-    Compress {
-        text: String,
-    },
+    /// Encode text as an AAAK document.
+    Compress { text: String },
+    /// Run evaluation benchmarks.
     Bench {
         #[command(subcommand)]
         command: BenchCommands,
     },
-    Delete {
-        drawer_id: String,
-    },
-    Pin {
-        drawer_id: String,
-    },
-    Unpin {
-        drawer_id: String,
-    },
+    /// Soft-delete a drawer by ID.
+    Delete { drawer_id: String },
+    /// Pin a drawer by ID.
+    Pin { drawer_id: String },
+    /// Unpin a drawer by ID.
+    Unpin { drawer_id: String },
+    /// List or reorder pinned drawers.
     Pinned {
         #[arg(long)]
         project: Option<String>,
@@ -402,6 +409,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Soft-delete recent drawers matching rollback filters.
     Rollback {
         #[arg(long)]
         since: String,
@@ -416,11 +424,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Permanently purge soft-deleted drawers.
     Purge {
         /// Only purge drawers soft-deleted before this ISO timestamp
         #[arg(long)]
         before: Option<String>,
     },
+    /// Rebuild indexes and derived metadata.
     Reindex {
         #[arg(long)]
         embedder: Option<String>,
@@ -453,6 +463,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         normalize_added_at: bool,
     },
+    /// Merge near-duplicate drawers using configured consolidation.
     Consolidate {
         #[arg(long)]
         wing: Option<String>,
@@ -469,6 +480,7 @@ enum Commands {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Create candidate knowledge cards from evidence clusters.
     Crystallize {
         #[arg(long)]
         dry_run: bool,
@@ -477,6 +489,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Run offline sleep-cycle maintenance.
     Sleep {
         #[arg(long)]
         nrem: bool,
@@ -487,18 +500,22 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Manage knowledge graph triples.
     Kg {
         #[command(subcommand)]
         command: KgCommands,
     },
+    /// Manage distilled knowledge drawers.
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommands,
     },
+    /// Manage governed knowledge cards.
     KnowledgeCard {
         #[command(subcommand)]
         command: KnowledgeCardCommands,
     },
+    /// Review or moderate auto-generated cards.
     Cards {
         #[arg(long)]
         pending: bool,
@@ -509,22 +526,27 @@ enum Commands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Record and inspect runtime adoption evidence.
     Phase3 {
         #[command(subcommand)]
         command: Phase3Commands,
     },
+    /// Manage explicit tunnels between memory scopes.
     Tunnels {
         #[command(subcommand)]
         command: Option<TunnelCommands>,
     },
+    /// Manage wing and room routing taxonomy.
     Taxonomy {
         #[command(subcommand)]
         command: TaxonomyCommands,
     },
+    /// List recommended mind-model field taxonomy.
     FieldTaxonomy {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Serve the MCP or REST interface.
     Serve {
         #[arg(long)]
         mcp: bool,
@@ -535,6 +557,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         full: bool,
     },
+    /// List recent drawers from the CLI dashboard.
     Tail {
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -554,6 +577,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// Show a memory timeline from the CLI dashboard.
     Timeline {
         #[arg(long)]
         wing: Option<String>,
@@ -569,15 +593,18 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// Show dashboard statistics.
     Stats {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// View a drawer by ID.
     View {
         drawer_id: String,
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// Audit gating, embedding, novelty, and stale-memory signals.
     Audit {
         #[command(subcommand)]
         command: Option<AuditCommands>,
@@ -627,18 +654,22 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         global_codex: bool,
     },
+    /// Manage external tool integrations.
     Integrations {
         #[command(subcommand)]
         command: mempal::integrations::IntegrationCommands,
     },
+    /// Run passive capture hooks and hook installer.
     Hook {
         #[command(subcommand)]
         command: mempal::hook::HookCommands,
     },
+    /// Review and apply CLAUDE.md hotpatch suggestions.
     Hotpatch {
         #[command(subcommand)]
         command: mempal::hotpatch::HotpatchCommands,
     },
+    /// Manage the background daemon.
     Daemon {
         #[command(subcommand)]
         command: Option<DaemonSubcommand>,
@@ -1195,7 +1226,9 @@ enum AuditCommands {
 
 #[derive(Subcommand)]
 enum TaxonomyCommands {
+    /// List taxonomy routing entries.
     List,
+    /// Update keywords for a wing and room.
     Edit {
         wing: String,
         room: String,
@@ -1206,6 +1239,7 @@ enum TaxonomyCommands {
 
 #[derive(Subcommand)]
 enum GatingCommands {
+    /// Show ingest gating decision statistics.
     Stats {
         #[arg(long)]
         since: Option<String>,
@@ -1214,6 +1248,7 @@ enum GatingCommands {
 
 #[derive(Subcommand)]
 enum KgCommands {
+    /// Add a knowledge graph triple.
     Add {
         subject: String,
         predicate: String,
@@ -1221,6 +1256,7 @@ enum KgCommands {
         #[arg(long)]
         source_drawer: Option<String>,
     },
+    /// Query knowledge graph triples.
     Query {
         #[arg(long)]
         subject: Option<String>,
@@ -1231,19 +1267,20 @@ enum KgCommands {
         #[arg(long)]
         all: bool,
     },
-    Invalidate {
-        triple_id: String,
-    },
-    Timeline {
-        entity: String,
-    },
+    /// Invalidate a knowledge graph triple.
+    Invalidate { triple_id: String },
+    /// Show the timeline for an entity.
+    Timeline { entity: String },
+    /// Show knowledge graph statistics.
     Stats,
+    /// List knowledge graph triples.
     List,
 }
 
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum KnowledgeCommands {
+    /// Distill reusable knowledge from evidence drawers.
     Distill {
         #[arg(long)]
         statement: String,
@@ -1280,6 +1317,7 @@ enum KnowledgeCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Promote a knowledge drawer to a new lifecycle status.
     Promote {
         drawer_id: String,
         #[arg(long)]
@@ -1291,6 +1329,7 @@ enum KnowledgeCommands {
         #[arg(long)]
         reviewer: Option<String>,
     },
+    /// Demote a knowledge drawer with counter-evidence.
     Demote {
         drawer_id: String,
         #[arg(long)]
@@ -1302,6 +1341,7 @@ enum KnowledgeCommands {
         #[arg(long = "reason-type")]
         reason_type: String,
     },
+    /// Evaluate promotion readiness for a knowledge drawer.
     Gate {
         drawer_id: String,
         #[arg(long = "target-status")]
@@ -1313,10 +1353,12 @@ enum KnowledgeCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Show the knowledge promotion policy.
     Policy {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Publish knowledge to a broader anchor scope.
     PublishAnchor {
         drawer_id: String,
         #[arg(long)]
@@ -1334,6 +1376,7 @@ enum KnowledgeCommands {
 
 #[derive(Subcommand)]
 enum KnowledgeCardCommands {
+    /// Create a knowledge card.
     Create {
         #[arg(long)]
         id: Option<String>,
@@ -1366,11 +1409,13 @@ enum KnowledgeCardCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Show a knowledge card by ID.
     Get {
         card_id: String,
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// List knowledge cards with optional filters.
     List {
         #[arg(long)]
         tier: Option<String>,
@@ -1387,6 +1432,7 @@ enum KnowledgeCardCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Retrieve knowledge cards for a query.
     Retrieve {
         query: String,
         #[arg(long, default_value = "project")]
@@ -1402,6 +1448,7 @@ enum KnowledgeCardCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Link evidence to a knowledge card.
     Link {
         card_id: String,
         evidence_drawer_id: String,
@@ -1412,6 +1459,7 @@ enum KnowledgeCardCommands {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Append a lifecycle event to a knowledge card.
     Event {
         card_id: String,
         #[arg(long = "type")]
@@ -1429,11 +1477,13 @@ enum KnowledgeCardCommands {
         #[arg(long)]
         id: Option<String>,
     },
+    /// List lifecycle events for a knowledge card.
     Events {
         card_id: String,
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Evaluate lifecycle readiness for a knowledge card.
     Gate {
         card_id: String,
         #[arg(long = "target-status")]
@@ -1445,6 +1495,7 @@ enum KnowledgeCardCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Promote a knowledge card to a new lifecycle status.
     Promote {
         card_id: String,
         #[arg(long)]
@@ -1462,6 +1513,7 @@ enum KnowledgeCardCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Demote a knowledge card with counter-evidence.
     Demote {
         card_id: String,
         #[arg(long)]
@@ -1475,6 +1527,7 @@ enum KnowledgeCardCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Plan evidence backfill for knowledge cards.
     BackfillPlan {
         #[arg(long)]
         tier: Option<String>,
@@ -1491,6 +1544,7 @@ enum KnowledgeCardCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Apply evidence backfill for knowledge cards.
     BackfillApply {
         #[arg(long)]
         tier: Option<String>,
@@ -1514,14 +1568,17 @@ enum KnowledgeCardCommands {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // clap command enums favor direct argument fields over boxing.
 enum Phase3Commands {
+    /// Manage runtime adoption records.
     Adoption {
         #[command(subcommand)]
         command: Phase3AdoptionCommands,
     },
+    /// Request deterministic evaluator advice.
     Evaluator {
         #[command(subcommand)]
         command: Phase3EvaluatorCommands,
     },
+    /// Prepare a default-on proposal for a candidate feature.
     DefaultProposal {
         candidate: String,
         #[arg(long = "rollback-criterion")]
@@ -1529,6 +1586,7 @@ enum Phase3Commands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Enable or disable a governed default feature.
     DefaultControl {
         candidate: String,
         #[arg(long, conflicts_with = "disable")]
@@ -1540,6 +1598,7 @@ enum Phase3Commands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Evaluate rollback evidence for a default feature.
     RollbackControl {
         candidate: String,
         #[arg(long)]
@@ -1547,21 +1606,25 @@ enum Phase3Commands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Evaluate Phase 3 gate readiness for a candidate.
     Gate {
         candidate: String,
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Show readiness for a Phase 3 candidate.
     Readiness {
         candidate: String,
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Validate a research adapter plan.
     ResearchValidatePlan {
         path: PathBuf,
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Ingest a validated research adapter plan.
     ResearchIngestPlan {
         path: PathBuf,
         #[arg(long)]
@@ -1573,6 +1636,7 @@ enum Phase3Commands {
 
 #[derive(Subcommand)]
 enum Phase3EvaluatorCommands {
+    /// Produce deterministic evaluator advice.
     Advise {
         #[arg(long = "evaluator-id")]
         evaluator_id: Option<String>,
@@ -1597,14 +1661,17 @@ enum Phase3EvaluatorCommands {
 
 #[derive(Subcommand)]
 enum Phase3AdoptionCommands {
+    /// Show Phase 3 adoption guidance.
     Guidance {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Show runtime adoption instrumentation policy.
     InstrumentationPolicy {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Prepare a runtime adoption record without writing it.
     PrepareRecord {
         #[arg(long)]
         track: String,
@@ -1631,6 +1698,7 @@ enum Phase3AdoptionCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Capture a runtime adoption outcome.
     Capture {
         #[arg(long)]
         surface: String,
@@ -1659,6 +1727,7 @@ enum Phase3AdoptionCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Check runtime adoption record quality.
     CheckRecord {
         #[arg(long)]
         track: String,
@@ -1685,6 +1754,7 @@ enum Phase3AdoptionCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Write a quality-checked runtime adoption record.
     RecordChecked {
         #[arg(long)]
         track: String,
@@ -1713,6 +1783,7 @@ enum Phase3AdoptionCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Review runtime adoption evidence.
     Review {
         #[arg(long)]
         track: Option<String>,
@@ -1725,6 +1796,7 @@ enum Phase3AdoptionCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Write a runtime adoption record.
     Record {
         #[arg(long)]
         track: String,
@@ -1751,6 +1823,7 @@ enum Phase3AdoptionCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// List runtime adoption records.
     List {
         #[arg(long)]
         track: Option<String>,
@@ -1761,6 +1834,7 @@ enum Phase3AdoptionCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Show runtime adoption statistics.
     Stats {
         #[arg(long)]
         track: Option<String>,
@@ -1769,6 +1843,7 @@ enum Phase3AdoptionCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Run a child command and capture adoption outcome.
     Wrap {
         #[arg(long)]
         surface: String,
@@ -1787,6 +1862,7 @@ enum Phase3AdoptionCommands {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         child_cmd: Vec<String>,
     },
+    /// Show runtime adoption analytics.
     Analytics {
         #[arg(long, default_value = "plain")]
         format: String,
@@ -1795,6 +1871,7 @@ enum Phase3AdoptionCommands {
 
 #[derive(Subcommand)]
 enum MaintenanceCommands {
+    /// Print a guided maintenance run report.
     #[command(name = "guided-run")]
     GuidedRun {
         #[arg(long, default_value = "plain")]
@@ -1804,6 +1881,7 @@ enum MaintenanceCommands {
 
 #[derive(Subcommand)]
 enum TunnelCommands {
+    /// Add an explicit tunnel between two scopes.
     Add {
         #[arg(long)]
         left: String,
@@ -1812,15 +1890,16 @@ enum TunnelCommands {
         #[arg(long)]
         label: String,
     },
+    /// List explicit tunnels.
     List {
         #[arg(long)]
         wing: Option<String>,
         #[arg(long, default_value = "all")]
         kind: String,
     },
-    Delete {
-        tunnel_id: String,
-    },
+    /// Delete an explicit tunnel by ID.
+    Delete { tunnel_id: String },
+    /// Follow tunnels from a starting scope.
     Follow {
         #[arg(long)]
         from: String,
@@ -1831,6 +1910,7 @@ enum TunnelCommands {
 
 #[derive(Subcommand)]
 enum ProjectCommands {
+    /// Migrate drawers into a project scope.
     Migrate {
         #[arg(long)]
         project: String,
@@ -1841,6 +1921,7 @@ enum ProjectCommands {
 
 #[derive(Subcommand)]
 enum BenchCommands {
+    /// Run the LongMemEval benchmark.
     #[command(name = "longmemeval")]
     LongMemEval {
         data_file: PathBuf,
