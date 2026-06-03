@@ -227,6 +227,74 @@ fn test_retryable_failure_stays_retryable_past_max_retries() {
 }
 
 #[test]
+fn test_claim_next_breaks_timestamp_ties_by_id() {
+    let (_tmp, db_path, store) = new_store();
+    let first = store
+        .enqueue("hook_event", r#"{"n":1}"#)
+        .expect("enqueue first");
+    let second = store
+        .enqueue("hook_event", r#"{"n":2}"#)
+        .expect("enqueue second");
+    let tied_at = now_secs().saturating_sub(10);
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE pending_messages SET created_at = ?3, next_attempt_at = ?3 WHERE id IN (?1, ?2)",
+        rusqlite::params![first, second, tied_at],
+    )
+    .expect("force timestamp tie");
+    drop(conn);
+
+    let claimed_first = store
+        .claim_next("worker-first", 60)
+        .expect("claim first")
+        .expect("first tied item");
+    let claimed_second = store
+        .claim_next("worker-second", 60)
+        .expect("claim second")
+        .expect("second tied item");
+
+    assert_eq!(claimed_first.id, first);
+    assert_eq!(claimed_second.id, second);
+}
+
+#[test]
+fn test_retry_failed_embed_messages_preserves_fifo_after_later_retry() {
+    let (_tmp, db_path, store) = new_store();
+    let failed_embed = store
+        .enqueue("hook_event", r#"{"n":1}"#)
+        .expect("enqueue failed embed");
+    let pending_embed = store
+        .enqueue("hook_event", r#"{"n":2}"#)
+        .expect("enqueue pending embed");
+    let base = now_secs().saturating_sub(10);
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE pending_messages SET status = 'failed', retry_count = 7, retry_backoff_ms = 5000, last_error = 'boom', created_at = ?2, next_attempt_at = ?2 WHERE id = ?1",
+        rusqlite::params![failed_embed, base],
+    )
+    .expect("mark failed embed with older queue position");
+    conn.execute(
+        "UPDATE pending_messages SET created_at = ?2, next_attempt_at = ?2 WHERE id = ?1",
+        rusqlite::params![pending_embed, base + 1],
+    )
+    .expect("place pending embed after failed embed but before retry time");
+    drop(conn);
+
+    let retried = store
+        .retry_failed_embed_messages()
+        .expect("retry failed embed messages");
+    assert_eq!(retried, 1);
+
+    let recovered = store
+        .claim_next("retry-worker", 60)
+        .expect("claim requeued failed embed")
+        .expect("requeued failed embed item");
+    assert_eq!(recovered.id, failed_embed);
+}
+
+#[test]
 fn test_retry_failed_embed_messages_requeues_only_failed_embed_items() {
     let (_tmp, db_path, store) = new_store();
     let failed_embed = store
