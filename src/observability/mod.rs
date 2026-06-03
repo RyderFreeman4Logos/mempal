@@ -43,6 +43,9 @@ pub struct StatsOptions {
 pub struct ViewOptions<'a> {
     pub drawer_id: &'a str,
     pub raw: bool,
+    pub project: Option<&'a str>,
+    pub include_global: bool,
+    pub all_projects: bool,
 }
 
 pub struct GatingStatsOptions<'a> {
@@ -376,7 +379,12 @@ pub fn stats_command(db: &Database, config: &Config, options: StatsOptions) -> R
 }
 
 pub fn view_command(db: &Database, config: &Config, options: ViewOptions<'_>) -> Result<()> {
-    let scope = dashboard_scope(config)?;
+    let scope = dashboard_scope_with_request(
+        config,
+        options.project,
+        options.include_global,
+        options.all_projects,
+    )?;
     let details = db
         .get_drawer_details(options.drawer_id)
         .context("failed to load drawer")?
@@ -989,20 +997,33 @@ fn is_db_event(event: &Event, db_file_name: &str) -> bool {
 }
 
 fn dashboard_scope(config: &Config) -> Result<ProjectSearchScope> {
+    dashboard_scope_with_request(config, None, false, false)
+}
+
+fn dashboard_scope_with_request(
+    config: &Config,
+    project: Option<&str>,
+    include_global: bool,
+    all_projects: bool,
+) -> Result<ProjectSearchScope> {
     let current_dir = env::current_dir().ok();
-    let project_id = resolve_project_id(None, config, None)
+    let project_id = resolve_project_id(project, config, None)
         .context("failed to resolve dashboard project scope")?
         .or_else(|| {
-            current_dir
-                .as_deref()
-                .filter(|cwd| is_git_repo(cwd))
-                .and_then(|cwd| resolve_project_id(None, config, Some(cwd)).ok())
-                .flatten()
+            if project.is_some() {
+                None
+            } else {
+                current_dir
+                    .as_deref()
+                    .filter(|cwd| is_git_repo(cwd))
+                    .and_then(|cwd| resolve_project_id(None, config, Some(cwd)).ok())
+                    .flatten()
+            }
         });
     Ok(ProjectSearchScope::from_request(
         project_id,
-        false,
-        false,
+        include_global,
+        all_projects,
         config.search.strict_project_isolation,
     ))
 }

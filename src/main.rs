@@ -164,6 +164,32 @@ struct IngestCommandOptions<'a> {
     valid_until: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ReindexVectorTarget {
+    drawer_ids: Vec<String>,
+    project_id: Option<String>,
+    wing: Option<String>,
+    room: Option<String>,
+    limit: Option<usize>,
+}
+
+impl ReindexVectorTarget {
+    fn is_empty(&self) -> bool {
+        self.drawer_ids.is_empty()
+            && self.project_id.is_none()
+            && self.wing.is_none()
+            && self.room.is_none()
+            && self.limit.is_none()
+    }
+
+    fn has_scope_filter(&self) -> bool {
+        !self.drawer_ids.is_empty()
+            || self.project_id.is_some()
+            || self.wing.is_some()
+            || self.room.is_some()
+    }
+}
+
 struct RollbackCommandOptions<'a> {
     since: &'a str,
     wing: Option<&'a str>,
@@ -447,6 +473,21 @@ enum Commands {
         /// With --embedder/--from-config --stale: number of stale/new drawers to embed per write batch.
         #[arg(long)]
         batch_size: Option<usize>,
+        /// With --embedder/--from-config --stale: re-embed only this drawer ID.
+        #[arg(long = "drawer-id")]
+        drawer_ids: Vec<String>,
+        /// With --embedder/--from-config --stale: re-embed only this project.
+        #[arg(long)]
+        project: Option<String>,
+        /// With --embedder/--from-config --stale: re-embed only this wing.
+        #[arg(long)]
+        wing: Option<String>,
+        /// With --embedder/--from-config --stale: re-embed only this room.
+        #[arg(long)]
+        room: Option<String>,
+        /// With --embedder/--from-config --stale: stop after this many candidate drawers.
+        #[arg(long)]
+        limit: Option<usize>,
         /// Return failed embed-queue messages to pending for daemon retry.
         #[arg(long, default_value_t = false)]
         failed: bool,
@@ -603,6 +644,15 @@ enum Commands {
         drawer_id: String,
         #[arg(long, default_value_t = false)]
         raw: bool,
+        /// Inspect the drawer in an explicit project scope.
+        #[arg(long)]
+        project: Option<String>,
+        /// With --project, also allow legacy global drawers.
+        #[arg(long, default_value_t = false)]
+        include_global: bool,
+        /// Inspect drawers across all project scopes.
+        #[arg(long, default_value_t = false)]
+        all_projects: bool,
     },
     /// Audit gating, embedding, novelty, and stale-memory signals.
     Audit {
@@ -2486,11 +2536,32 @@ fn run() -> Result<()> {
             force,
             dry_run,
             batch_size,
+            drawer_ids,
+            project,
+            wing,
+            room,
+            limit,
             failed,
             recompute_importance,
             only_zero,
             normalize_added_at,
         } => {
+            let current_dir = env::current_dir().ok();
+            let target_project_id = project
+                .as_deref()
+                .map(|project| {
+                    resolve_project_id(Some(project), config.as_ref(), current_dir.as_deref())
+                })
+                .transpose()
+                .context("failed to resolve reindex project filter")?
+                .flatten();
+            let vector_target = ReindexVectorTarget {
+                drawer_ids,
+                project_id: target_project_id,
+                wing,
+                room,
+                limit,
+            };
             if failed {
                 if embedder.is_some()
                     || from_config
@@ -2499,6 +2570,7 @@ fn run() -> Result<()> {
                     || force
                     || dry_run
                     || batch_size.is_some()
+                    || !vector_target.is_empty()
                     || recompute_importance
                     || only_zero
                     || normalize_added_at
@@ -2507,19 +2579,36 @@ fn run() -> Result<()> {
                 }
                 reindex_failed_queue_command(&db)
             } else if normalize_added_at {
-                if recompute_importance || embedder.is_some() || from_config {
+                if recompute_importance
+                    || embedder.is_some()
+                    || from_config
+                    || !vector_target.is_empty()
+                {
                     bail!(
                         "--normalize-added-at is mutually exclusive with --embedder, --from-config, and --recompute-importance"
                     );
                 }
                 normalize_added_at_command(&db)
             } else if recompute_importance {
+                if !vector_target.is_empty() {
+                    bail!(
+                        "--drawer-id/--project/--wing/--room/--limit require --embedder or --from-config with --stale"
+                    );
+                }
                 recompute_importance_command(&db, only_zero)
             } else if embedder.is_some() || from_config {
                 if dry_run {
                     bail!(
                         "--dry-run is only supported by source reindex (`mempal reindex --stale --dry-run`)"
                     );
+                }
+                if !vector_target.is_empty() && !stale {
+                    bail!(
+                        "--drawer-id/--project/--wing/--room/--limit require --embedder or --from-config with --stale"
+                    );
+                }
+                if !vector_target.is_empty() && resume {
+                    bail!("--resume cannot be combined with targeted stale reindex filters");
                 }
                 let backend = match (embedder.as_deref(), from_config) {
                     (Some(name), false) => name.to_string(),
@@ -2536,10 +2625,13 @@ fn run() -> Result<()> {
                     resume,
                     stale,
                     batch_size.unwrap_or(1000),
+                    vector_target,
                 ))
             } else {
-                if batch_size.is_some() {
-                    bail!("--batch-size requires --embedder or --from-config with --stale");
+                if batch_size.is_some() || !vector_target.is_empty() {
+                    bail!(
+                        "--batch-size/--drawer-id/--project/--wing/--room/--limit require --embedder or --from-config with --stale"
+                    );
                 }
                 block_on_result(reindex_command_sources(
                     &db,
@@ -2666,12 +2758,21 @@ fn run() -> Result<()> {
         Commands::Stats { raw } => {
             observability::stats_command(&db, config.as_ref(), observability::StatsOptions { raw })
         }
-        Commands::View { drawer_id, raw } => observability::view_command(
+        Commands::View {
+            drawer_id,
+            raw,
+            project,
+            include_global,
+            all_projects,
+        } => observability::view_command(
             &db,
             config.as_ref(),
             observability::ViewOptions {
                 drawer_id: &drawer_id,
                 raw,
+                project: project.as_deref(),
+                include_global,
+                all_projects,
             },
         ),
         Commands::Audit {
@@ -5051,6 +5152,7 @@ async fn reindex_command_by_embedder(
     resume: bool,
     stale_only: bool,
     batch_size: usize,
+    target: ReindexVectorTarget,
 ) -> Result<()> {
     let embedder = build_specific_embedder(config, embedder_name).await?;
     let new_dim = embedder.dimensions();
@@ -5086,6 +5188,19 @@ async fn reindex_command_by_embedder(
     } else {
         resume_checkpoint.is_none() || !table_layout_is_current
     };
+    if stale_only
+        && should_recreate_table
+        && reindex_target_narrows_store(db, &target)
+            .context("failed to evaluate targeted stale reindex safety")?
+    {
+        bail!(
+            "vector table layout is stale (metric/dim mismatch) and requires a full rebuild; \
+             a targeted reindex (--drawer-id/--project/--wing/--room/--limit) cannot rebuild \
+             the table without dropping non-target vectors. Re-run a full \
+             `mempal reindex --from-config --stale` (no target filters) to rebuild and \
+             re-embed the whole store."
+        );
+    }
     if should_recreate_table {
         if resume_checkpoint.is_some() {
             println!(
@@ -5108,6 +5223,7 @@ async fn reindex_command_by_embedder(
             embedder_name,
             &target_fingerprint,
             batch_size,
+            target,
         )
         .await;
     }
@@ -5185,25 +5301,72 @@ async fn reindex_command_by_embedder(
     Ok(())
 }
 
+fn reindex_target_narrows_store(db: &Database, target: &ReindexVectorTarget) -> Result<bool> {
+    if target.has_scope_filter() {
+        return Ok(true);
+    }
+    let Some(limit) = target.limit else {
+        return Ok(false);
+    };
+    let active_drawer_count = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count active drawers")?;
+    let active_drawer_count =
+        usize::try_from(active_drawer_count).context("active drawer count is invalid")?;
+    Ok(limit < active_drawer_count)
+}
+
 async fn reindex_stale_batches(
     db: &Database,
     embedder: &dyn Embedder,
     embedder_name: &str,
     target_fingerprint: &str,
     batch_size: usize,
+    target: ReindexVectorTarget,
 ) -> Result<()> {
     if batch_size == 0 {
         bail!("--batch-size must be greater than 0");
     }
+    if target.limit == Some(0) {
+        bail!("--limit must be greater than 0");
+    }
     println!("stale-only reindex batch size: {batch_size}");
+    if !target.drawer_ids.is_empty() {
+        println!("target drawer ids: {}", target.drawer_ids.join(", "));
+    }
+    if let Some(project_id) = target.project_id.as_deref() {
+        println!("target project: {project_id}");
+    }
+    if let Some(wing) = target.wing.as_deref() {
+        println!("target wing: {wing}");
+    }
+    if let Some(room) = target.room.as_deref() {
+        println!("target room: {room}");
+    }
+    if let Some(limit) = target.limit {
+        println!("target limit: {limit}");
+    }
     let mut processed = 0usize;
     let mut skipped_concurrent_update = 0usize;
     let mut batch_index = 0usize;
+    let mut remaining = target.limit;
     loop {
-        let rows = reindex_stale_batch_rows(db, target_fingerprint, batch_size)
+        let effective_batch_size = remaining.map_or(batch_size, |value| value.min(batch_size));
+        if effective_batch_size == 0 {
+            break;
+        }
+        let rows = reindex_stale_batch_rows(db, target_fingerprint, effective_batch_size, &target)
             .context("failed to load stale reindex batch")?;
         if rows.is_empty() {
             break;
+        }
+        if let Some(value) = remaining.as_mut() {
+            *value = value.saturating_sub(rows.len());
         }
         let texts = rows
             .iter()
@@ -9141,10 +9304,49 @@ fn reindex_rows(db: &Database) -> Result<Vec<ReindexRow>> {
     Ok(rows)
 }
 
+fn append_reindex_target_filters(
+    sql: &mut String,
+    values: &mut Vec<rusqlite::types::Value>,
+    target: &ReindexVectorTarget,
+    alias: &str,
+) {
+    let prefix = if alias.is_empty() {
+        String::new()
+    } else {
+        format!("{alias}.")
+    };
+    if !target.drawer_ids.is_empty() {
+        let placeholders = std::iter::repeat_n("?", target.drawer_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" AND {prefix}id IN ({placeholders})"));
+        values.extend(
+            target
+                .drawer_ids
+                .iter()
+                .cloned()
+                .map(rusqlite::types::Value::Text),
+        );
+    }
+    if let Some(project_id) = target.project_id.as_ref() {
+        sql.push_str(&format!(" AND {prefix}project_id = ?"));
+        values.push(rusqlite::types::Value::Text(project_id.clone()));
+    }
+    if let Some(wing) = target.wing.as_ref() {
+        sql.push_str(&format!(" AND {prefix}wing = ?"));
+        values.push(rusqlite::types::Value::Text(wing.clone()));
+    }
+    if let Some(room) = target.room.as_ref() {
+        sql.push_str(&format!(" AND {prefix}room = ?"));
+        values.push(rusqlite::types::Value::Text(room.clone()));
+    }
+}
+
 fn reindex_stale_batch_rows(
     db: &Database,
     target_fingerprint: &str,
     batch_size: usize,
+    target: &ReindexVectorTarget,
 ) -> Result<Vec<ReindexRow>> {
     let limit = i64::try_from(batch_size).context("batch size is too large")?;
     let vectors_exist = db
@@ -9156,10 +9358,7 @@ fn reindex_stale_batch_rows(
         )
         .context("failed to query vector table presence")?;
     let rows = if vectors_exist {
-        let mut stmt = db
-            .conn()
-            .prepare(
-                r#"
+        let mut sql = r#"
                 SELECT d.id,
                        d.content,
                        d.content_hash,
@@ -9177,35 +9376,42 @@ fn reindex_stale_batch_rows(
                 WHERE d.deleted_at IS NULL
                   AND (
                       v.id IS NULL
-                      OR COALESCE(idx.value, legacy_idx.value, '') != ?1
-                      OR COALESCE(fp.value, '') != ?2
+                      OR COALESCE(idx.value, legacy_idx.value, '') != ?
+                      OR COALESCE(fp.value, '') != ?
                   )
+                "#
+        .to_string();
+        let mut values = vec![
+            rusqlite::types::Value::Text(CURRENT_VECTOR_INDEX_VERSION.to_string()),
+            rusqlite::types::Value::Text(target_fingerprint.to_string()),
+        ];
+        append_reindex_target_filters(&mut sql, &mut values, target, "d");
+        sql.push_str(
+            r#"
                 ORDER BY source_path ASC, chunk_index ASC, d.id ASC
-                LIMIT ?3
+                LIMIT ?
                 "#,
-            )
+        );
+        values.push(rusqlite::types::Value::Integer(limit));
+        let mut stmt = db
+            .conn()
+            .prepare(&sql)
             .context("failed to prepare stale vector batch query")?;
-        stmt.query_map(
-            (CURRENT_VECTOR_INDEX_VERSION, target_fingerprint, limit),
-            |row| {
-                Ok(ReindexRow {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    content_hash: row.get(2)?,
-                    source_path: row.get(3)?,
-                    chunk_index: row.get(4)?,
-                    project_id: row.get(5)?,
-                })
-            },
-        )
+        stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            Ok(ReindexRow {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                content_hash: row.get(2)?,
+                source_path: row.get(3)?,
+                chunk_index: row.get(4)?,
+                project_id: row.get(5)?,
+            })
+        })
         .context("failed to query stale vector batch")?
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to collect stale vector batch")?
     } else {
-        let mut stmt = db
-            .conn()
-            .prepare(
-                r#"
+        let mut sql = r#"
                 SELECT id,
                        content,
                        content_hash,
@@ -9214,12 +9420,22 @@ fn reindex_stale_batch_rows(
                        project_id
                 FROM drawers
                 WHERE deleted_at IS NULL
+                "#
+        .to_string();
+        let mut values = Vec::new();
+        append_reindex_target_filters(&mut sql, &mut values, target, "");
+        sql.push_str(
+            r#"
                 ORDER BY source_path ASC, chunk_index ASC, id ASC
-                LIMIT ?1
+                LIMIT ?
                 "#,
-            )
+        );
+        values.push(rusqlite::types::Value::Integer(limit));
+        let mut stmt = db
+            .conn()
+            .prepare(&sql)
             .context("failed to prepare missing-vector batch query")?;
-        stmt.query_map([limit], |row| {
+        stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
             Ok(ReindexRow {
                 id: row.get(0)?,
                 content: row.get(1)?,

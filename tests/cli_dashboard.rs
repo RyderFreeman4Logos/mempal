@@ -922,6 +922,61 @@ fn test_view_raw_is_verbatim() {
     );
 }
 
+#[test]
+fn test_view_project_allows_cross_project_vector_diagnostics() {
+    let env = DashboardEnv::new();
+    env.set_project_scope(Some("default"), false);
+    let content = "Decision: inspect another project drawer";
+    insert_drawer_with_project(
+        &env.db_path,
+        &drawer_seed(
+            "view-cross-project",
+            content,
+            "default",
+            Some("view"),
+            "1713000000",
+            4,
+        ),
+        Some("other-project"),
+    );
+    let db = Database::open(&env.db_path).expect("open db");
+    db.insert_vector_with_project(
+        "view-cross-project",
+        &[0.1, 0.2, 0.3, 0.4],
+        Some("other-project"),
+    )
+    .expect("insert view vector");
+    db.record_vector_metadata(
+        "view-cross-project",
+        CURRENT_VECTOR_INDEX_VERSION,
+        "model2vec:model2vec/potion-multilingual-128M::4",
+    )
+    .expect("record view vector metadata");
+
+    let blocked = run_mempal(&env.home, env.cwd(), &["view", "view-cross-project"]);
+    assert!(
+        !blocked.status.success(),
+        "view without --project unexpectedly succeeded"
+    );
+
+    let output = run_mempal(
+        &env.home,
+        env.cwd(),
+        &["view", "view-cross-project", "--project", "other-project"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("drawer_id: view-cross-project"), "{stdout}");
+    assert!(stdout.contains("has_vector: true"), "{stdout}");
+    assert!(stdout.contains("vector_dimension: 4"), "{stdout}");
+    assert!(stdout.contains("vector_stale: false"), "{stdout}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_tail_follow_fallback_on_inotify_silence() {
     let env = DashboardEnv::new();
