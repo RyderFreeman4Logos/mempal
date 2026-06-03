@@ -27,6 +27,8 @@ pub struct SearchHit {
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
     pub hits: Vec<SearchHit>,
+    /// Number of hits that passed `min_score_floor` before pagination.
+    pub passing_total: usize,
     /// Highest score among hits that were filtered out by `min_score_floor`.
     pub best_score_below_floor: Option<f32>,
     /// Total unique candidates (after per-turn and per-content dedup, before floor and limit).
@@ -97,6 +99,7 @@ pub async fn search<E: Embedder + ?Sized>(
     if limit == 0 {
         return Ok(SearchResult {
             hits: Vec::new(),
+            passing_total: 0,
             best_score_below_floor: None,
             total_candidates: 0,
             min_score_floor: min_score,
@@ -255,10 +258,12 @@ pub async fn search<E: Embedder + ?Sized>(
     // below_floor is sorted desc by score (partitioned from a sorted vec), so first = highest.
     let best_score_below_floor = below_floor.into_iter().next().map(|h| h.score);
 
+    let passing_total = passing.len();
     let hits = passing.into_iter().skip(offset).take(limit).collect();
 
     Ok(SearchResult {
         hits,
+        passing_total,
         best_score_below_floor,
         total_candidates,
         min_score_floor: min_score,
@@ -323,35 +328,56 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Print search hits in markdown format to stdout.
-pub fn print_hits_markdown(result: &SearchResult) {
+/// Render search hits in markdown format.
+pub fn format_hits_markdown(result: &SearchResult) -> String {
+    let mut output = String::new();
     if result.hits.is_empty() {
-        if let Some(best) = result.best_score_below_floor {
-            let floor = result.min_score_floor.unwrap_or(0.0);
-            println!("No confident match (best score {best:.3} < floor {floor:.2})");
+        if result.passing_total == 0 {
+            if let Some(best) = result.best_score_below_floor {
+                let floor = result.min_score_floor.unwrap_or(0.0);
+                let count = result.total_candidates;
+                let noun = if count == 1 { "result" } else { "results" };
+                let target = if count == 1 { "it" } else { "them" };
+                let suggested = (best * 10.0).floor() / 10.0;
+                output.push_str(&format!(
+                    "No confident match (best score {best:.3} < floor {floor:.2}; \
+                     {count} {noun} below the {floor:.2} floor - rerun with --min-score {suggested:.1} or lower \
+                     to view {target})\n"
+                ));
+            } else {
+                output.push_str("No results found.\n");
+            }
         } else {
-            println!("No results found.");
+            output.push_str("No more results on this page.\n");
         }
-        return;
+        return output;
     }
     for hit in &result.hits {
         let ts = format_timestamp(hit.timestamp_epoch);
-        println!("---");
-        println!(
+        output.push_str("---\n");
+        output.push_str(&format!(
             "**[{}]** `{}` · {} · {} (score: {:.3})",
             hit.tool, hit.session_id, ts, hit.role, hit.score
-        );
+        ));
+        output.push('\n');
         if let Some(ref path) = hit.source_path {
-            println!("  source: {path}");
+            output.push_str(&format!("  source: {path}\n"));
         }
-        println!();
-        println!("{}", hit.content.trim());
-        println!();
+        output.push('\n');
+        output.push_str(hit.content.trim());
+        output.push_str("\n\n");
     }
-    println!("---");
-    println!(
+    output.push_str("---\n");
+    output.push_str(&format!(
         "_{} candidates considered ({} shown after dedup + min-score floor)_",
         result.total_candidates,
         result.hits.len()
-    );
+    ));
+    output.push('\n');
+    output
+}
+
+/// Print search hits in markdown format to stdout.
+pub fn print_hits_markdown(result: &SearchResult) {
+    print!("{}", format_hits_markdown(result));
 }

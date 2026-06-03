@@ -598,3 +598,108 @@ async fn test_search_dedup_identical_content() {
     );
     assert_eq!(result.hits[0].content, "identical content here");
 }
+
+#[test]
+fn markdown_reports_sub_floor_candidates_when_floor_hides_all_hits() {
+    let rendered = search::format_hits_markdown(&search::SearchResult {
+        hits: Vec::new(),
+        passing_total: 0,
+        best_score_below_floor: Some(0.645),
+        total_candidates: 3,
+        min_score_floor: Some(0.70),
+    });
+
+    assert!(
+        rendered.contains("best score 0.645 < floor 0.70"),
+        "best sub-floor score should be visible, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("3 results below the 0.70 floor"),
+        "sub-floor candidate count should be visible, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("rerun with --min-score 0.6"),
+        "actionable min-score hint should be visible, got: {rendered}"
+    );
+}
+
+#[test]
+fn markdown_derives_sub_floor_hint_from_low_best_score() {
+    let rendered = search::format_hits_markdown(&search::SearchResult {
+        hits: Vec::new(),
+        passing_total: 0,
+        best_score_below_floor: Some(0.350),
+        total_candidates: 3,
+        min_score_floor: Some(0.70),
+    });
+
+    assert!(
+        !rendered.contains("0.4"),
+        "hint should not use the old hardcoded threshold, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("--min-score 0.3"),
+        "hint should round the best score down to a revealing threshold, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("3 results below the 0.70 floor"),
+        "sub-floor candidate count should be visible, got: {rendered}"
+    );
+}
+
+#[test]
+fn markdown_keeps_confident_match_output_free_of_sub_floor_hint() {
+    let rendered = search::format_hits_markdown(&search::SearchResult {
+        hits: vec![search::SearchHit {
+            turn_id: "turn_confident".to_string(),
+            session_id: "sess-confident".to_string(),
+            tool: "cc".to_string(),
+            role: "user".to_string(),
+            content: "database migration strategy".to_string(),
+            timestamp_epoch: 1_748_000_000.0,
+            score: 0.910,
+            source_path: None,
+        }],
+        passing_total: 1,
+        best_score_below_floor: Some(0.645),
+        total_candidates: 2,
+        min_score_floor: Some(0.70),
+    });
+
+    assert!(
+        rendered.contains("(score: 0.910)"),
+        "confident match should still render normally, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("rerun with --min-score"),
+        "confident match output should not include sub-floor hint noise, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("results below the"),
+        "confident match output should not summarize hidden sub-floor results, got: {rendered}"
+    );
+}
+
+#[test]
+fn markdown_reports_no_more_results_for_empty_page_with_passing_matches() {
+    let rendered = search::format_hits_markdown(&search::SearchResult {
+        hits: Vec::new(),
+        passing_total: 1,
+        best_score_below_floor: Some(0.55),
+        total_candidates: 2,
+        min_score_floor: Some(0.70),
+    });
+
+    assert!(
+        rendered.contains("No more results on this page."),
+        "empty paginated page should report pagination exhaustion, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("--min-score"),
+        "empty paginated page should not suggest lowering min-score, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("below the"),
+        "empty paginated page should not report floor-hidden results, got: {rendered}"
+    );
+}
