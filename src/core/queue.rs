@@ -136,7 +136,7 @@ impl PendingMessageStore {
                 FROM pending_messages
                 WHERE status = 'pending' AND next_attempt_at <= ?1
                   AND kind != 'llm_task'
-                ORDER BY next_attempt_at ASC, created_at ASC, id ASC
+                ORDER BY next_attempt_at ASC, id ASC
                 LIMIT 1
                 "#,
                 [now],
@@ -203,7 +203,7 @@ impl PendingMessageStore {
                 SELECT id, kind, payload, retry_count, source_hash
                 FROM pending_messages
                 WHERE status = 'pending' AND next_attempt_at <= ?1 AND kind = ?2
-                ORDER BY next_attempt_at ASC, created_at ASC, id ASC
+                ORDER BY next_attempt_at ASC, id ASC
                 LIMIT 1
                 "#,
                 params![now, kind_filter],
@@ -383,6 +383,9 @@ impl PendingMessageStore {
 
     /// Return dead-lettered embed-queue messages to pending for a targeted retry.
     ///
+    /// Retried messages keep their original FIFO position among immediately
+    /// available work instead of moving behind already-pending items.
+    ///
     /// LLM tasks share the same storage table but are not embed queue work, so
     /// they are intentionally left untouched.
     pub fn retry_failed_embed_messages(&self) -> Result<u64> {
@@ -394,7 +397,7 @@ impl PendingMessageStore {
             SET status = 'pending',
                 retry_count = 0,
                 retry_backoff_ms = 0,
-                next_attempt_at = ?1,
+                next_attempt_at = MIN(created_at, ?1),
                 claim_token = NULL,
                 claimed_at = NULL,
                 heartbeat_at = NULL,
