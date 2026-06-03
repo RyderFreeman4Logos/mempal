@@ -9,7 +9,7 @@ use crate::context::assemble_context_with_vector;
 use crate::core::{
     anchor::{self, DerivedAnchor},
     config::ConfigHandle,
-    db::Database,
+    db::{Database, read_fork_ext_version},
     phase3::{
         EvaluatorAdviceInput, RuntimeAdoptionCaptureInput, RuntimeAdoptionCheckedRecordReport,
         RuntimeAdoptionRecordPlanInput, RuntimeAdoptionReviewFilters,
@@ -1323,6 +1323,7 @@ impl MempalMcpServer {
         let embed_snapshot = global_embed_status().snapshot();
         let intelligence_snapshot = crate::intelligence::global_intelligence_status().snapshot();
         let schema_version = db.schema_version().map_err(db_error)?;
+        let fork_ext_version = read_fork_ext_version(db.conn()).map_err(db_error)?;
         let stale_drawer_count = db
             .stale_drawer_count(CURRENT_NORMALIZE_VERSION)
             .map_err(db_error)? as u64;
@@ -1386,6 +1387,7 @@ impl MempalMcpServer {
 
         Ok(Json(StatusResponse {
             schema_version,
+            fork_ext_version,
             normalize_version_current: CURRENT_NORMALIZE_VERSION,
             stale_drawer_count,
             search_decay_mode: config.search.decay.mode.to_string(),
@@ -6220,6 +6222,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::core::db::read_fork_ext_version;
     use crate::core::types::BootstrapEvidenceArgs;
     use crate::core::types::{KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole};
     use crate::embed::Embedder;
@@ -6461,10 +6464,18 @@ mod tests {
 
         let status = server.mempal_status().await.expect("status").0;
         let json = serde_json::to_value(&status).expect("serialize compact status");
+        let fork_ext_version =
+            read_fork_ext_version(Database::open(&db_path).expect("open db").conn())
+                .expect("read fork ext version");
 
         assert!(json.get("memory_protocol").is_none());
         assert!(json.get("aaak_spec").is_none());
         assert!(json.get("schema_version").and_then(Value::as_u64).is_some());
+        assert_eq!(
+            json.get("fork_ext_version").and_then(Value::as_u64),
+            Some(fork_ext_version.into())
+        );
+        assert_eq!(status.fork_ext_version, fork_ext_version);
         assert!(
             json.get("stale_drawer_count")
                 .and_then(Value::as_u64)
