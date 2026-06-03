@@ -454,6 +454,132 @@ async fn test_reindex_stale_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_reindex_stale_drawer_id_targets_single_stale_vector() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-stale-drawer-id.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        true,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, true),
+    );
+    seed_drawers(&env.db_path, 4, 4);
+
+    let first = run_reindex(&env.home, &["--from-config"], &[]);
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(handle.request_count(), 4);
+
+    let db = Database::open(&env.db_path).expect("open db");
+    for id in ["drawer-01", "drawer-03"] {
+        db.conn()
+            .execute(
+                "UPDATE fork_ext_meta SET value = 'old' WHERE key = ?1",
+                [format!("reindex:{id}:index_version")],
+            )
+            .expect("mark index stale");
+    }
+
+    let second = run_reindex(
+        &env.home,
+        &["--from-config", "--stale", "--drawer-id", "drawer-03"],
+        &[],
+    );
+    assert!(
+        second.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        handle.request_count(),
+        5,
+        "targeted stale reindex should embed exactly one additional drawer"
+    );
+
+    ConfigHandle::bootstrap(&env.config_path).expect("bootstrap reindex config");
+    let target = db
+        .drawer_vector_details("drawer-03")
+        .expect("load target vector details");
+    assert!(!target.stale, "{target:?}");
+    let untouched = db
+        .drawer_vector_details("drawer-01")
+        .expect("load untouched vector details");
+    assert!(untouched.stale, "{untouched:?}");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_reindex_stale_drawer_id_rebuilds_l2_table_without_full_reindex() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-stale-drawer-id-l2.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        true,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, true),
+    );
+    seed_drawers(&env.db_path, 6, 4);
+    replace_vectors_with_metricless_l2(&env.db_path, 6, 4);
+
+    let output = run_reindex(
+        &env.home,
+        &["--from-config", "--stale", "--drawer-id", "drawer-04"],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        handle.request_count(),
+        1,
+        "targeted stale reindex should not re-embed the full l2 table"
+    );
+
+    ConfigHandle::bootstrap(&env.config_path).expect("bootstrap reindex config");
+    let db = Database::open(&env.db_path).expect("open db");
+    assert_eq!(
+        db.vector_table_distance_metric()
+            .expect("read vector metric")
+            .as_deref(),
+        Some(VECTOR_DISTANCE_METRIC)
+    );
+    let count = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count vectors");
+    assert_eq!(count, 1);
+    let target = db
+        .drawer_vector_details("drawer-04")
+        .expect("load target vector details");
+    assert!(!target.stale, "{target:?}");
+    let untouched = db
+        .drawer_vector_details("drawer-01")
+        .expect("load untouched vector details");
+    assert!(!untouched.has_vector, "{untouched:?}");
+    assert!(untouched.stale, "{untouched:?}");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_stale_reindex_skips_concurrent_content_update() {
     let _guard = test_guard().await;
     let (addr, handle) = start_mock(0).await.expect("start mock");
@@ -643,7 +769,11 @@ async fn test_reindex_stale_resume_rebuilds_metricless_vector_table() {
         ),
         "stdout: {stdout}"
     );
-    assert_eq!(handle.request_count(), 6);
+    assert_eq!(
+        handle.request_count(),
+        1,
+        "stale batch reindex should send one embedding request for the six-row batch"
+    );
 
     let db = Database::open(&env.db_path).expect("open db");
     assert_eq!(
