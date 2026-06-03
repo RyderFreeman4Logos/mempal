@@ -50,13 +50,15 @@ pub struct QueueStats {
 pub struct QueueConfig {
     pub base_delay_ms: i64,
     pub max_delay_ms: i64,
+    /// Legacy compatibility knob. Terminal dead-lettering is controlled by
+    /// `QueueFailureDisposition::Terminal`, not by retryable attempt count.
     pub max_retries: u32,
 }
 
 /// Controls whether a processing failure is retried or dead-lettered immediately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueFailureDisposition {
-    /// Retry with bounded queue backoff until `QueueConfig::max_retries` is exhausted.
+    /// Retry with queue backoff without converting the item to a terminal dead-letter.
     Retryable,
     /// Move directly to the failed/dead-letter state without another attempt.
     Terminal,
@@ -336,8 +338,7 @@ impl PendingMessageStore {
         let next_retry = current_retry.saturating_add(1);
         let next_retry_u32 = u32::try_from(next_retry)
             .map_err(|_| QueueError::RetryCountOverflow { id: id.to_string() })?;
-        let terminal = disposition == QueueFailureDisposition::Terminal
-            || next_retry_u32 > self.config.max_retries;
+        let terminal = disposition == QueueFailureDisposition::Terminal;
         let backoff_ms = if terminal {
             0
         } else {

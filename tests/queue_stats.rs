@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::{Database, apply_fork_ext_migrations_to};
-use mempal::core::queue::{PendingMessageStore, QueueConfig};
+use mempal::core::queue::{PendingMessageStore, QueueConfig, QueueFailureDisposition};
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -221,7 +221,9 @@ fn test_queue_stats_reflects_current_state() {
         .expect("claim")
         .expect("failed row");
     assert_eq!(failed.id, failed_id);
-    store.mark_failed(&failed.id, "boom").expect("mark failed");
+    store
+        .mark_failed_with_disposition(&failed.id, "boom", QueueFailureDisposition::Terminal)
+        .expect("mark terminal failed");
 
     let stats = store.stats().expect("stats");
     assert_eq!(stats.pending, 1);
@@ -303,7 +305,9 @@ fn test_status_command_shows_queue_stats() {
         .expect("claim")
         .expect("failed");
     assert_eq!(failed.id, failed_id);
-    store.mark_failed(&failed.id, "boom").expect("mark failed");
+    store
+        .mark_failed_with_disposition(&failed.id, "boom", QueueFailureDisposition::Terminal)
+        .expect("mark terminal failed");
 
     let output = Command::new(mempal_bin())
         .arg("status")

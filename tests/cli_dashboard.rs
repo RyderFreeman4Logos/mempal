@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use blake3::Hasher;
 use mempal::core::db::{CURRENT_VECTOR_INDEX_VERSION, Database};
 use mempal::core::project::ProjectSearchScope;
-use mempal::core::queue::PendingMessageStore;
+use mempal::core::queue::{PendingMessageStore, QueueFailureDisposition};
 use mempal::core::types::{Drawer, SourceType};
 use mempal::ingest::gating::GatingDecision;
 use mempal::ingest::novelty::NoveltyAction;
@@ -180,7 +180,9 @@ fn seed_queue_rows(db_path: &Path) {
         .claim_next("dashboard-test", 120)
         .expect("claim next")
         .expect("claimed message");
-    store.mark_failed(&failed, "boom").expect("mark failed");
+    store
+        .mark_failed_with_disposition(&failed, "boom", QueueFailureDisposition::Terminal)
+        .expect("mark terminal failed");
 }
 
 fn write_config_atomic(path: &Path, contents: &str) {

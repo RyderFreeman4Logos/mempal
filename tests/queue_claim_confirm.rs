@@ -185,7 +185,7 @@ fn test_terminal_failure_dead_letters_immediately() {
 }
 
 #[test]
-fn test_max_retries_marks_failed_permanently() {
+fn test_retryable_failure_stays_retryable_past_max_retries() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     Database::open(&db_path).expect("open db");
@@ -210,20 +210,20 @@ fn test_max_retries_marks_failed_permanently() {
     }
 
     let conn = Connection::open(&db_path).expect("open sqlite");
-    let status = conn
+    let (status, retry_count): (String, i64) = conn
         .query_row(
-            "SELECT status FROM pending_messages WHERE id = ?1",
+            "SELECT status, retry_count FROM pending_messages WHERE id = ?1",
             [&id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("query status");
-    assert_eq!(status, "failed");
-    assert!(
-        store
-            .claim_next("worker-z", 60)
-            .expect("claim after failed")
-            .is_none()
-    );
+    assert_eq!(status, "pending");
+    assert_eq!(retry_count, 4);
+    let retry = store
+        .claim_next("worker-z", 60)
+        .expect("claim after retryable failures")
+        .expect("retryable message");
+    assert_eq!(retry.id, id);
 }
 
 #[test]
@@ -279,6 +279,13 @@ fn test_retry_failed_embed_messages_requeues_only_failed_embed_items() {
         assert_eq!(retry_count, expected_retry_count, "{id}");
         assert_eq!(last_error.as_deref(), expected_error, "{id}");
     }
+    drop(conn);
+
+    let recovered = store
+        .claim_next("retry-worker", 60)
+        .expect("claim requeued failed embed")
+        .expect("requeued failed embed item");
+    assert_eq!(recovered.id, failed_embed);
 }
 
 /// Verifies concurrent enqueue doesn't deadlock or starve.
