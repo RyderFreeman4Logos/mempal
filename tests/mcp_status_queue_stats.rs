@@ -13,7 +13,7 @@ use common::harness::McpStdio;
 use mempal::core::compaction::merge_cluster;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
-use mempal::core::queue::{PendingMessageStore, QueueConfig};
+use mempal::core::queue::{PendingMessageStore, QueueConfig, QueueFailureDisposition};
 use mempal::core::types::{BootstrapEvidenceArgs, CompactionStrategy, Drawer, SourceType};
 use mempal::mcp::MempalMcpServer;
 #[cfg(feature = "integration")]
@@ -162,7 +162,9 @@ async fn test_mcp_status_headline_reflects_failed_queue() {
         .claim_next("worker-failed", 60)
         .expect("claim")
         .expect("failed row");
-    store.mark_failed(&failed.id, "boom").expect("mark failed");
+    store
+        .mark_failed_with_disposition(&failed.id, "boom", QueueFailureDisposition::Terminal)
+        .expect("mark terminal failed");
 
     let server = MempalMcpServer::new(db_path, config);
     let response = server.mempal_status().await.expect("status").0;

@@ -6460,7 +6460,13 @@ mod tests {
             .claim_next("status-worker", 60)
             .expect("claim failed fixture")
             .expect("failed fixture row");
-        store.mark_failed(&failed.id, "boom").expect("mark failed");
+        store
+            .mark_failed_with_disposition(
+                &failed.id,
+                "boom",
+                crate::core::queue::QueueFailureDisposition::Terminal,
+            )
+            .expect("mark terminal failed");
 
         let status = server.mempal_status().await.expect("status").0;
         let json = serde_json::to_value(&status).expect("serialize compact status");
