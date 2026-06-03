@@ -518,7 +518,7 @@ async fn test_reindex_stale_drawer_id_targets_single_stale_vector() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_reindex_stale_drawer_id_rebuilds_l2_table_without_full_reindex() {
+async fn test_reindex_stale_drawer_id_refuses_on_stale_layout_table() {
     let _guard = test_guard().await;
     let (addr, handle) = start_mock(0).await.expect("start mock");
     let env = TestHome::new(&reindex_config(
@@ -533,6 +533,16 @@ async fn test_reindex_stale_drawer_id_rebuilds_l2_table_without_full_reindex() {
     );
     seed_drawers(&env.db_path, 6, 4);
     replace_vectors_with_metricless_l2(&env.db_path, 6, 4);
+    let db = Database::open(&env.db_path).expect("open db");
+    let before_metric = db
+        .vector_table_distance_metric()
+        .expect("read vector metric before targeted stale reindex");
+    let before_count = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count vectors before targeted stale reindex");
 
     let output = run_reindex(
         &env.home,
@@ -540,40 +550,49 @@ async fn test_reindex_stale_drawer_id_rebuilds_l2_table_without_full_reindex() {
         &[],
     );
     assert!(
-        output.status.success(),
+        !output.status.success(),
         "stdout={}\nstderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires a full rebuild"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("mempal reindex --from-config --stale"),
+        "stderr: {stderr}"
+    );
     assert_eq!(
         handle.request_count(),
-        1,
-        "targeted stale reindex should not re-embed the full l2 table"
+        0,
+        "refused targeted stale reindex should not call the embedder"
     );
 
     ConfigHandle::bootstrap(&env.config_path).expect("bootstrap reindex config");
-    let db = Database::open(&env.db_path).expect("open db");
     assert_eq!(
         db.vector_table_distance_metric()
-            .expect("read vector metric")
-            .as_deref(),
-        Some(VECTOR_DISTANCE_METRIC)
+            .expect("read vector metric after targeted stale reindex"),
+        before_metric,
+        "targeted stale reindex must leave the legacy table layout intact"
     );
-    let count = db
+    let after_count = db
         .conn()
         .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| {
             row.get::<_, i64>(0)
         })
         .expect("count vectors");
-    assert_eq!(count, 1);
+    assert_eq!(after_count, before_count);
     let target = db
         .drawer_vector_details("drawer-04")
         .expect("load target vector details");
-    assert!(!target.stale, "{target:?}");
+    assert!(target.has_vector, "{target:?}");
+    assert!(target.stale, "{target:?}");
     let untouched = db
         .drawer_vector_details("drawer-01")
         .expect("load untouched vector details");
-    assert!(!untouched.has_vector, "{untouched:?}");
+    assert!(untouched.has_vector, "{untouched:?}");
     assert!(untouched.stale, "{untouched:?}");
 
     handle.shutdown().await;

@@ -181,6 +181,13 @@ impl ReindexVectorTarget {
             && self.room.is_none()
             && self.limit.is_none()
     }
+
+    fn has_scope_filter(&self) -> bool {
+        !self.drawer_ids.is_empty()
+            || self.project_id.is_some()
+            || self.wing.is_some()
+            || self.room.is_some()
+    }
 }
 
 struct RollbackCommandOptions<'a> {
@@ -5181,6 +5188,19 @@ async fn reindex_command_by_embedder(
     } else {
         resume_checkpoint.is_none() || !table_layout_is_current
     };
+    if stale_only
+        && should_recreate_table
+        && reindex_target_narrows_store(db, &target)
+            .context("failed to evaluate targeted stale reindex safety")?
+    {
+        bail!(
+            "vector table layout is stale (metric/dim mismatch) and requires a full rebuild; \
+             a targeted reindex (--drawer-id/--project/--wing/--room/--limit) cannot rebuild \
+             the table without dropping non-target vectors. Re-run a full \
+             `mempal reindex --from-config --stale` (no target filters) to rebuild and \
+             re-embed the whole store."
+        );
+    }
     if should_recreate_table {
         if resume_checkpoint.is_some() {
             println!(
@@ -5279,6 +5299,26 @@ async fn reindex_command_by_embedder(
     }
     println!("reindex complete: {total} drawers, {new_dim}d vectors");
     Ok(())
+}
+
+fn reindex_target_narrows_store(db: &Database, target: &ReindexVectorTarget) -> Result<bool> {
+    if target.has_scope_filter() {
+        return Ok(true);
+    }
+    let Some(limit) = target.limit else {
+        return Ok(false);
+    };
+    let active_drawer_count = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count active drawers")?;
+    let active_drawer_count =
+        usize::try_from(active_drawer_count).context("active drawer count is invalid")?;
+    Ok(limit < active_drawer_count)
 }
 
 async fn reindex_stale_batches(
