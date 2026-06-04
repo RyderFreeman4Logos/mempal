@@ -20,6 +20,13 @@ pub enum FailMode {
     Timeout,
     Http500,
     RateLimit429,
+    /// 200 OK whose body cannot be decoded as the OpenAI embeddings
+    /// response, producing a non-retryable `EmbedError::DecodeResponse`
+    /// on the client. Mirrors the issue #301 failure (a timeout surfacing
+    /// as "failed to decode embedding response"), which is classified
+    /// non-retryable — so it exercises the reindex bounded retry's
+    /// error-class-agnostic behavior.
+    MalformedBody,
 }
 
 struct Inner {
@@ -27,6 +34,14 @@ struct Inner {
     paused: AtomicBool,
     pause_notify: Notify,
     fail_mode: Mutex<FailMode>,
+    /// When armed, the first `fail_first_n` requests fail (with `fail_mode`)
+    /// and the counter decrements; once it reaches 0 the server recovers.
+    /// Models a transient blip that resolves on retry.
+    fail_first_n: AtomicU32,
+    fail_first_n_armed: AtomicBool,
+    /// When set, only requests whose input contains this marker fail (with
+    /// `fail_mode`). Models one persistently-failing batch among healthy ones.
+    fail_if_contains: Mutex<Option<String>>,
     per_item_dims: Mutex<Option<Vec<u32>>>,
     request_count: AtomicU32,
     request_times: Mutex<Vec<Duration>>,
@@ -57,6 +72,20 @@ impl MockEmbedHandle {
         *self.inner.fail_mode.lock().await = mode;
     }
 
+    /// Fail the next `n` requests (using the configured `fail_mode`), then
+    /// recover. Used to model a transient batch failure absorbed by retry.
+    pub fn set_fail_first_n(&self, n: u32) {
+        self.inner.fail_first_n.store(n, Ordering::SeqCst);
+        self.inner.fail_first_n_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Fail every request whose input array contains `marker` (using the
+    /// configured `fail_mode`). Used to model one persistently-failing batch
+    /// while the rest succeed. Pass `None` to clear.
+    pub async fn set_fail_if_input_contains(&self, marker: Option<String>) {
+        *self.inner.fail_if_contains.lock().await = marker;
+    }
+
     pub fn request_count(&self) -> u32 {
         self.inner.request_count.load(Ordering::SeqCst)
     }
@@ -82,6 +111,9 @@ pub async fn start(port: u16) -> Result<(SocketAddr, MockEmbedHandle)> {
         paused: AtomicBool::new(false),
         pause_notify: Notify::new(),
         fail_mode: Mutex::new(FailMode::Ok),
+        fail_first_n: AtomicU32::new(0),
+        fail_first_n_armed: AtomicBool::new(false),
+        fail_if_contains: Mutex::new(None),
         per_item_dims: Mutex::new(None),
         request_count: AtomicU32::new(0),
         request_times: Mutex::new(Vec::new()),
@@ -142,33 +174,72 @@ async fn handle_request(
         inner.pause_notify.notified().await;
     }
 
-    match *inner.fail_mode.lock().await {
-        FailMode::Ok => {}
-        FailMode::Timeout => {
-            std::future::pending::<()>().await;
-            unreachable!();
-        }
-        FailMode::Http500 => {
-            return Ok(response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": "mock 500"}),
-            ));
-        }
-        FailMode::RateLimit429 => {
-            return Ok(response(
-                StatusCode::TOO_MANY_REQUESTS,
-                json!({"error": "mock 429"}),
-            ));
-        }
-    }
-
+    // Read the request body once: it is needed both for content-scoped
+    // failure injection and for echoing the right number of vectors.
     let body = to_bytes(request.into_body()).await.unwrap_or_default();
     let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    let inputs: Vec<String> = match payload.get("input") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect(),
+        Some(Value::String(text)) => vec![text.clone()],
+        _ => Vec::new(),
+    };
     let count = match payload.get("input") {
         Some(Value::Array(values)) => values.len(),
         Some(_) => 1,
         None => 1,
     };
+
+    // Failure decision: content marker takes precedence over the first-N
+    // counter, which takes precedence over the legacy global fail mode.
+    let mode = *inner.fail_mode.lock().await;
+    if mode != FailMode::Ok {
+        let triggered = if let Some(marker) = inner.fail_if_contains.lock().await.as_deref() {
+            inputs.iter().any(|text| text.contains(marker))
+        } else if inner.fail_first_n_armed.load(Ordering::SeqCst) {
+            let remaining = inner.fail_first_n.load(Ordering::SeqCst);
+            if remaining > 0 {
+                inner.fail_first_n.store(remaining - 1, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        if triggered {
+            match mode {
+                FailMode::Ok => {}
+                FailMode::Timeout => {
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                }
+                FailMode::Http500 => {
+                    return Ok(response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": "mock 500"}),
+                    ));
+                }
+                FailMode::RateLimit429 => {
+                    return Ok(response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        json!({"error": "mock 429"}),
+                    ));
+                }
+                FailMode::MalformedBody => {
+                    // 200 OK, but the body has no `data` field, so the client
+                    // cannot decode it -> non-retryable DecodeResponse.
+                    return Ok(response(
+                        StatusCode::OK,
+                        json!({"error": "mock malformed embedding response"}),
+                    ));
+                }
+            }
+        }
+    }
+
     let default_dim = inner.dim.load(Ordering::SeqCst) as usize;
     let per_item_dims = inner.per_item_dims.lock().await.clone();
     let data = (0..count)
