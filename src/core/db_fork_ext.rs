@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 17;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 18;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
@@ -52,6 +52,11 @@ pub const FORK_EXT_V17_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_reindex_source_identity_active
     ON drawers(project_id, source_root, source_file, wing, room, normalize_version)
     WHERE deleted_at IS NULL;
+"#;
+
+pub const FORK_EXT_V18_SCHEMA_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_ctv_embedder_metadata
+    ON conversation_turn_vectors(embedder_fingerprint, dim, index_version);
 "#;
 
 pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
@@ -364,6 +369,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 17,
             up: apply_v17,
         },
+        Migration {
+            version: 18,
+            up: apply_v18,
+        },
     ]
 }
 
@@ -480,6 +489,18 @@ fn apply_v16(conn: &Connection) -> rusqlite::Result<()> {
 fn apply_v17(conn: &Connection) -> rusqlite::Result<()> {
     ensure_nullable_column(conn, "drawers", "source_root", "TEXT")?;
     conn.execute_batch(FORK_EXT_V17_SCHEMA_SQL)
+}
+
+fn apply_v18(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_nullable_column(
+        conn,
+        "conversation_turn_vectors",
+        "embedder_fingerprint",
+        "TEXT",
+    )?;
+    ensure_nullable_column(conn, "conversation_turn_vectors", "dim", "INTEGER")?;
+    ensure_nullable_column(conn, "conversation_turn_vectors", "index_version", "TEXT")?;
+    conn.execute_batch(FORK_EXT_V18_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {

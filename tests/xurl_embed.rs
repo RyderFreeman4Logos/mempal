@@ -1,14 +1,19 @@
-use mempal::core::db::Database;
+use mempal::core::db::{CURRENT_VECTOR_INDEX_VERSION, Database};
 use mempal::embed::Embedder;
 use mempal::xurl::embed;
-use rusqlite::params;
+use mempal::xurl::model::{Provenance, RawTurn, Role, Tool};
+use mempal::xurl::store;
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
 struct TestDb {
     _dir: TempDir,
+    path: PathBuf,
     inner: Database,
 }
 
@@ -24,6 +29,7 @@ fn open_temp_db_at_fork_ext(_version: u32) -> TestDb {
     let db = Database::open(&path).expect("open db");
     TestDb {
         _dir: dir,
+        path,
         inner: db,
     }
 }
@@ -127,6 +133,102 @@ impl Embedder for CountingEmbedder {
     }
 }
 
+struct ValueEmbedder {
+    dim: usize,
+    value: f32,
+    total_inputs: std::sync::atomic::AtomicUsize,
+}
+
+struct UpdatingEmbedder {
+    dim: usize,
+    old_value: f32,
+    unchanged_value: f32,
+    db_path: PathBuf,
+    updated_turn: RawTurn,
+    updated: std::sync::atomic::AtomicBool,
+}
+
+impl UpdatingEmbedder {
+    fn new(
+        dim: usize,
+        old_value: f32,
+        unchanged_value: f32,
+        db_path: PathBuf,
+        updated_turn: RawTurn,
+    ) -> Self {
+        Self {
+            dim,
+            old_value,
+            unchanged_value,
+            db_path,
+            updated_turn,
+            updated: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedder for UpdatingEmbedder {
+    async fn embed(&self, texts: &[&str]) -> mempal::embed::Result<Vec<Vec<f32>>> {
+        if !self.updated.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let db = Database::open(&self.db_path).expect("open db during embed");
+            store::insert_turns(db.conn(), std::slice::from_ref(&self.updated_turn))
+                .expect("simulate concurrent content update");
+        }
+
+        Ok(texts
+            .iter()
+            .map(|text| {
+                let value = if *text == "old content" {
+                    self.old_value
+                } else {
+                    self.unchanged_value
+                };
+                vec![value; self.dim]
+            })
+            .collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dim
+    }
+
+    fn name(&self) -> &str {
+        "updating"
+    }
+}
+
+impl ValueEmbedder {
+    fn new(dim: usize, value: f32) -> Self {
+        Self {
+            dim,
+            value,
+            total_inputs: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn total_inputs(&self) -> usize {
+        self.total_inputs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedder for ValueEmbedder {
+    async fn embed(&self, texts: &[&str]) -> mempal::embed::Result<Vec<Vec<f32>>> {
+        self.total_inputs
+            .fetch_add(texts.len(), std::sync::atomic::Ordering::Relaxed);
+        Ok(texts.iter().map(|_| vec![self.value; self.dim]).collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dim
+    }
+
+    fn name(&self) -> &str {
+        "value"
+    }
+}
+
 /// Minimal description of a turn row for test fixtures.
 struct TurnRow<'a> {
     id: &'a str,
@@ -167,6 +269,92 @@ fn vector_count(conn: &rusqlite::Connection) -> i64 {
         |row| row.get(0),
     )
     .expect("count vectors")
+}
+
+fn vector_blob(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn seed_vector(
+    conn: &rusqlite::Connection,
+    turn_id: &str,
+    values: &[f32],
+    fingerprint: &str,
+    index_version: &str,
+) {
+    conn.execute(
+        "INSERT INTO conversation_turn_vectors \
+         (turn_id, chunk_index, vector, embedder_fingerprint, dim, index_version) \
+         VALUES (?1, 0, ?2, ?3, ?4, ?5)",
+        params![
+            turn_id,
+            vector_blob(values),
+            fingerprint,
+            values.len() as i64,
+            index_version
+        ],
+    )
+    .expect("seed vector");
+}
+
+fn make_raw_turn(session_id: &str, turn_index: u32, content: &str) -> RawTurn {
+    RawTurn {
+        session_id: session_id.to_string(),
+        tool: Tool::Cc,
+        role: Role::User,
+        content: content.to_string(),
+        timestamp_epoch: 1_000.0 + f64::from(turn_index),
+        project_path: None,
+        git_branch: None,
+        is_csa_delegated: false,
+        provenance: Provenance::Human,
+        turn_index,
+    }
+}
+
+fn vector_metadata(conn: &rusqlite::Connection) -> HashMap<String, (String, i64, String)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT turn_id, embedder_fingerprint, dim, index_version \
+             FROM conversation_turn_vectors \
+             ORDER BY turn_id",
+        )
+        .expect("prepare metadata query");
+    stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ),
+        ))
+    })
+    .expect("query metadata")
+    .collect::<Result<HashMap<_, _>, _>>()
+    .expect("collect metadata")
+}
+
+fn vector_bytes(conn: &rusqlite::Connection, turn_id: &str) -> Vec<u8> {
+    conn.query_row(
+        "SELECT vector FROM conversation_turn_vectors WHERE turn_id = ?1 AND chunk_index = 0",
+        params![turn_id],
+        |row| row.get(0),
+    )
+    .expect("read vector bytes")
+}
+
+fn maybe_vector_bytes(conn: &rusqlite::Connection, turn_id: &str) -> Option<Vec<u8>> {
+    conn.query_row(
+        "SELECT vector FROM conversation_turn_vectors WHERE turn_id = ?1 AND chunk_index = 0",
+        params![turn_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .expect("read optional vector bytes")
 }
 
 #[tokio::test]
@@ -529,6 +717,327 @@ async fn test_reindex_path_drains_all_unindexed() {
 
     let after = mempal::xurl::store::count_unindexed_turns(db.conn()).unwrap();
     assert_eq!(after, 0, "reindex must drain the entire backlog");
+}
+
+#[tokio::test]
+async fn test_xurl_reindex_stale_reembeds_only_stale_fingerprint_turns() {
+    let db = open_temp_db_at_fork_ext(18);
+    for (idx, turn_id) in ["turn-a1", "turn-a2", "turn-b1"].iter().enumerate() {
+        insert_raw_turn_row(
+            db.conn(),
+            TurnRow {
+                id: turn_id,
+                session: "sess-stale",
+                tool: "cc",
+                turn_index: idx as i64,
+                role: "user",
+                content: &format!("stale switch turn {idx}"),
+                timestamp: idx as f64,
+                token_count: None,
+            },
+        );
+    }
+    seed_vector(
+        db.conn(),
+        "turn-a1",
+        &[1.0, 1.0],
+        "fp-a",
+        CURRENT_VECTOR_INDEX_VERSION,
+    );
+    seed_vector(
+        db.conn(),
+        "turn-a2",
+        &[1.0, 1.0],
+        "fp-a",
+        CURRENT_VECTOR_INDEX_VERSION,
+    );
+    seed_vector(
+        db.conn(),
+        "turn-b1",
+        &[9.0, 9.0, 9.0],
+        "fp-b",
+        CURRENT_VECTOR_INDEX_VERSION,
+    );
+    let before_b = vector_bytes(db.conn(), "turn-b1");
+
+    let embedder = ValueEmbedder::new(3, 2.0);
+    let stats = embed::embed_stale_turns(&db.inner, &embedder, "fp-b", None)
+        .await
+        .expect("stale reindex should succeed");
+
+    assert_eq!(stats.turns_processed, 2);
+    assert_eq!(stats.embedded, 2);
+    assert_eq!(
+        embedder.total_inputs(),
+        2,
+        "only the stale A-fingerprint turns should be embedded"
+    );
+    let metadata = vector_metadata(db.conn());
+    assert_eq!(
+        metadata.get("turn-a1"),
+        Some(&(
+            "fp-b".to_string(),
+            3,
+            CURRENT_VECTOR_INDEX_VERSION.to_string()
+        ))
+    );
+    assert_eq!(
+        metadata.get("turn-a2"),
+        Some(&(
+            "fp-b".to_string(),
+            3,
+            CURRENT_VECTOR_INDEX_VERSION.to_string()
+        ))
+    );
+    assert_eq!(
+        metadata.get("turn-b1"),
+        Some(&(
+            "fp-b".to_string(),
+            3,
+            CURRENT_VECTOR_INDEX_VERSION.to_string()
+        ))
+    );
+    assert_eq!(
+        vector_bytes(db.conn(), "turn-b1"),
+        before_b,
+        "fresh B-fingerprint vector must not be rewritten by --stale"
+    );
+}
+
+#[tokio::test]
+async fn test_xurl_reindex_force_rebuilds_all_turn_vectors() {
+    let db = open_temp_db_at_fork_ext(18);
+    for (idx, turn_id) in ["turn-force-a", "turn-force-b", "turn-force-c"]
+        .iter()
+        .enumerate()
+    {
+        insert_raw_turn_row(
+            db.conn(),
+            TurnRow {
+                id: turn_id,
+                session: "sess-force",
+                tool: "cc",
+                turn_index: idx as i64,
+                role: "user",
+                content: &format!("force turn {idx}"),
+                timestamp: idx as f64,
+                token_count: None,
+            },
+        );
+    }
+    seed_vector(
+        db.conn(),
+        "turn-force-a",
+        &[1.0, 1.0],
+        "fp-a",
+        CURRENT_VECTOR_INDEX_VERSION,
+    );
+    seed_vector(
+        db.conn(),
+        "turn-force-b",
+        &[9.0, 9.0, 9.0],
+        "fp-b",
+        CURRENT_VECTOR_INDEX_VERSION,
+    );
+
+    let embedder = ValueEmbedder::new(3, 4.0);
+    let stats = embed::embed_all_turns(&db.inner, &embedder, "fp-b", None)
+        .await
+        .expect("force reindex should succeed");
+
+    assert_eq!(stats.turns_processed, 3);
+    assert_eq!(stats.embedded, 3);
+    assert_eq!(stats.skipped_stale_content, 0);
+    assert_eq!(embedder.total_inputs(), 3);
+    let metadata = vector_metadata(db.conn());
+    for turn_id in ["turn-force-a", "turn-force-b", "turn-force-c"] {
+        assert_eq!(
+            metadata.get(turn_id),
+            Some(&(
+                "fp-b".to_string(),
+                3,
+                CURRENT_VECTOR_INDEX_VERSION.to_string()
+            ))
+        );
+        assert_eq!(
+            vector_bytes(db.conn(), turn_id),
+            vector_blob(&[4.0, 4.0, 4.0])
+        );
+    }
+}
+
+#[tokio::test]
+async fn force_reindex_skips_vector_write_when_content_changes_after_collection() {
+    let db = open_temp_db_at_fork_ext(18);
+    let changed = make_raw_turn("sess-race", 0, "old content");
+    let changed_id = store::turn_id_for(&changed);
+    let unchanged = make_raw_turn("sess-race", 1, "unchanged content");
+    let unchanged_id = store::turn_id_for(&unchanged);
+    store::insert_turns(db.conn(), &[changed, unchanged]).expect("seed turns");
+    seed_vector(
+        db.conn(),
+        &changed_id,
+        &[0.5, 0.5, 0.5],
+        "fp-current",
+        CURRENT_VECTOR_INDEX_VERSION,
+    );
+    seed_vector(
+        db.conn(),
+        &unchanged_id,
+        &[0.5, 0.5, 0.5],
+        "fp-current",
+        CURRENT_VECTOR_INDEX_VERSION,
+    );
+
+    let updated = make_raw_turn("sess-race", 0, "new content");
+    let embedder = UpdatingEmbedder::new(3, 1.0, 2.0, db.path.clone(), updated);
+    let stats = embed::embed_all_turns(&db.inner, &embedder, "fp-current", None)
+        .await
+        .expect("force reindex should succeed");
+
+    assert_eq!(stats.turns_processed, 2);
+    assert_eq!(stats.skipped_stale_content, 1);
+    assert_eq!(
+        maybe_vector_bytes(db.conn(), &changed_id),
+        None,
+        "old-content vector write must be skipped after the turn content changes"
+    );
+    assert_eq!(
+        vector_bytes(db.conn(), &unchanged_id),
+        vector_blob(&[2.0, 2.0, 2.0]),
+        "unchanged peer turn must still be rewritten normally"
+    );
+}
+
+#[tokio::test]
+async fn test_xurl_reindex_stale_noops_for_current_embedder_metadata() {
+    let db = open_temp_db_at_fork_ext(18);
+    insert_raw_turn_row(
+        db.conn(),
+        TurnRow {
+            id: "turn-current",
+            session: "sess-current",
+            tool: "cc",
+            turn_index: 0,
+            role: "user",
+            content: "already current",
+            timestamp: 1.0,
+            token_count: None,
+        },
+    );
+    seed_vector(
+        db.conn(),
+        "turn-current",
+        &[7.0, 7.0, 7.0],
+        "fp-current",
+        CURRENT_VECTOR_INDEX_VERSION,
+    );
+
+    let embedder = ValueEmbedder::new(3, 8.0);
+    let stats = embed::embed_stale_turns(&db.inner, &embedder, "fp-current", None)
+        .await
+        .expect("stale reindex should succeed");
+
+    assert_eq!(stats.turns_processed, 0);
+    assert_eq!(stats.embedded, 0);
+    assert_eq!(embedder.total_inputs(), 0);
+    assert_eq!(
+        vector_bytes(db.conn(), "turn-current"),
+        vector_blob(&[7.0, 7.0, 7.0])
+    );
+}
+
+#[tokio::test]
+async fn content_update_invalidates_vectors_for_scoped_missing_embed() {
+    let db = open_temp_db_at_fork_ext(18);
+    let original = make_raw_turn("sess-update", 0, "old content");
+    let turn_id = store::turn_id_for(&original);
+    let insert_stats = store::insert_turns(db.conn(), std::slice::from_ref(&original))
+        .expect("insert original turn");
+    assert_eq!(insert_stats.inserted, 1);
+
+    seed_vector(
+        db.conn(),
+        &turn_id,
+        &[1.0, 1.0, 1.0],
+        "fp-current",
+        CURRENT_VECTOR_INDEX_VERSION,
+    );
+    let old_vector = vector_bytes(db.conn(), &turn_id);
+
+    let updated = make_raw_turn("sess-update", 0, "new content");
+    let update_stats =
+        store::insert_turns(db.conn(), &[updated]).expect("update changed turn content");
+    assert_eq!(update_stats.updated, 1);
+
+    let embedder = ValueEmbedder::new(3, 2.0);
+    let embed_stats = embed::embed_unindexed_turns_scoped_with_fingerprint(
+        &db.inner,
+        &embedder,
+        std::slice::from_ref(&turn_id),
+        "fp-current",
+        None,
+    )
+    .await
+    .expect("scoped missing embed should rebuild invalidated vector");
+
+    assert_eq!(embed_stats.turns_processed, 1);
+    assert_eq!(embed_stats.embedded, 1);
+    assert_eq!(embedder.total_inputs(), 1);
+    assert_ne!(
+        vector_bytes(db.conn(), &turn_id),
+        old_vector,
+        "changed content must not retain the old-content vector"
+    );
+    assert_eq!(
+        vector_bytes(db.conn(), &turn_id),
+        vector_blob(&[2.0, 2.0, 2.0])
+    );
+
+    let stale_stats = embed::embed_stale_turns(&db.inner, &embedder, "fp-current", None)
+        .await
+        .expect("stale reindex should see the rebuilt vector as current");
+    assert_eq!(stale_stats.turns_processed, 0);
+}
+
+#[tokio::test]
+async fn identical_reingest_keeps_existing_vector_without_churn() {
+    let db = open_temp_db_at_fork_ext(18);
+    let turn = make_raw_turn("sess-no-churn", 0, "same content");
+    let turn_id = store::turn_id_for(&turn);
+    store::insert_turns(db.conn(), std::slice::from_ref(&turn)).expect("insert original turn");
+    seed_vector(
+        db.conn(),
+        &turn_id,
+        &[3.0, 3.0, 3.0],
+        "fp-current",
+        CURRENT_VECTOR_INDEX_VERSION,
+    );
+    let before = vector_bytes(db.conn(), &turn_id);
+
+    let reingest_stats =
+        store::insert_turns(db.conn(), std::slice::from_ref(&turn)).expect("reingest same turn");
+    assert_eq!(reingest_stats.skipped, 1);
+
+    let embedder = ValueEmbedder::new(3, 4.0);
+    let embed_stats = embed::embed_unindexed_turns_scoped_with_fingerprint(
+        &db.inner,
+        &embedder,
+        std::slice::from_ref(&turn_id),
+        "fp-current",
+        None,
+    )
+    .await
+    .expect("scoped missing embed should skip unchanged vector");
+
+    assert_eq!(embed_stats.turns_processed, 0);
+    assert_eq!(embed_stats.embedded, 0);
+    assert_eq!(embedder.total_inputs(), 0);
+    assert_eq!(
+        vector_bytes(db.conn(), &turn_id),
+        before,
+        "identical reingest must not delete or rebuild vectors"
+    );
 }
 
 #[test]

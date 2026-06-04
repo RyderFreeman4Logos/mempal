@@ -1150,6 +1150,12 @@ enum XurlCommands {
     },
     /// Embed all turns that still lack a vector (drains the historical backlog).
     Reindex {
+        /// Re-embed only turns whose vector metadata is missing or stale.
+        #[arg(long)]
+        stale: bool,
+        /// Rebuild vectors for all turns.
+        #[arg(long)]
+        force: bool,
         /// Show how many threads/turns would be embedded without writing vectors.
         #[arg(long)]
         dry_run: bool,
@@ -8940,6 +8946,9 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             json,
         } => {
             let embedder = build_embedder(config).await?;
+            let vector_fingerprint = config
+                .embed
+                .current_vector_embedder_fingerprint(embedder.dimensions());
             let parse_cb = |name: &str, turns: usize| {
                 if json {
                     eprintln!(
@@ -8963,23 +8972,27 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             let stats = if let Some(p) = path {
                 let t =
                     tool.ok_or_else(|| anyhow::anyhow!("--tool is required when --path is given"))?;
-                mempal::xurl::ingest::ingest_file(
+                mempal::xurl::ingest::ingest_file_with_vector_fingerprint(
                     db,
                     embedder.as_ref(),
                     &p,
                     t.into(),
                     session_id.as_deref(),
-                    Some(&parse_cb),
-                    Some(&embed_cb),
+                    &vector_fingerprint,
+                    mempal::xurl::ingest::IngestCallbacks {
+                        on_file_parsed: Some(&parse_cb),
+                        on_embed_progress: Some(&embed_cb),
+                    },
                 )
                 .await
                 .context("xurl ingest failed")?
             } else {
                 let cfg = mempal::xurl::ingest::AutoScanConfig::default();
-                mempal::xurl::ingest::ingest_all(
+                mempal::xurl::ingest::ingest_all_with_vector_fingerprint(
                     db,
                     embedder.as_ref(),
                     &cfg,
+                    &vector_fingerprint,
                     Some(&parse_cb),
                     Some(&embed_cb),
                 )
@@ -9163,21 +9176,56 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             Ok(())
         }
 
-        XurlCommands::Reindex { dry_run, json } => {
+        XurlCommands::Reindex {
+            stale,
+            force,
+            dry_run,
+            json,
+        } => {
+            if stale && force {
+                bail!("--stale and --force are mutually exclusive");
+            }
             if dry_run {
-                let summary = mempal::xurl::store::summarize_unindexed_turns(db.conn())
-                    .context("xurl reindex dry-run query failed")?;
+                let (mode, summary) = if force {
+                    (
+                        "force",
+                        mempal::xurl::embed::summarize_all_turns(db.conn())
+                            .context("xurl force reindex dry-run query failed")?,
+                    )
+                } else if stale {
+                    let embedder = build_embedder(config).await?;
+                    let vector_fingerprint = config
+                        .embed
+                        .current_vector_embedder_fingerprint(embedder.dimensions());
+                    (
+                        "stale",
+                        mempal::xurl::embed::summarize_stale_turns(
+                            db.conn(),
+                            &vector_fingerprint,
+                            embedder.dimensions(),
+                        )
+                        .context("xurl stale reindex dry-run query failed")?,
+                    )
+                } else {
+                    (
+                        "missing",
+                        mempal::xurl::store::summarize_unindexed_turns(db.conn())
+                            .context("xurl reindex dry-run query failed")?,
+                    )
+                };
                 if json {
                     println!(
                         "{}",
                         serde_json::json!({
                             "dry_run": true,
+                            "mode": mode,
                             "threads_would_process": summary.threads,
                             "turns_would_process": summary.turns,
                         })
                     );
                 } else {
                     println!("dry-run: true");
+                    println!("mode: {mode}");
                     println!("threads would process: {}", summary.threads);
                     println!("turns would process:   {}", summary.turns);
                     println!("vectors written:       0");
@@ -9185,6 +9233,9 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 return Ok(());
             }
             let embedder = build_embedder(config).await?;
+            let vector_fingerprint = config
+                .embed
+                .current_vector_embedder_fingerprint(embedder.dimensions());
             let embed_cb = |done: usize, total: usize| {
                 if json {
                     eprintln!(
@@ -9195,23 +9246,60 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                     eprintln!("[embed] {done}/{total} turns vectorized");
                 }
             };
-            let stats =
-                mempal::xurl::embed::embed_unindexed_turns(db, embedder.as_ref(), Some(&embed_cb))
+            let (mode, stats) = if force {
+                (
+                    "force",
+                    mempal::xurl::embed::embed_all_turns(
+                        db,
+                        embedder.as_ref(),
+                        &vector_fingerprint,
+                        Some(&embed_cb),
+                    )
                     .await
-                    .context("xurl reindex failed")?;
+                    .context("xurl force reindex failed")?,
+                )
+            } else if stale {
+                (
+                    "stale",
+                    mempal::xurl::embed::embed_stale_turns(
+                        db,
+                        embedder.as_ref(),
+                        &vector_fingerprint,
+                        Some(&embed_cb),
+                    )
+                    .await
+                    .context("xurl stale reindex failed")?,
+                )
+            } else {
+                (
+                    "missing",
+                    mempal::xurl::embed::embed_unindexed_turns_with_fingerprint(
+                        db,
+                        embedder.as_ref(),
+                        &vector_fingerprint,
+                        Some(&embed_cb),
+                    )
+                    .await
+                    .context("xurl reindex failed")?,
+                )
+            };
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
+                        "mode": mode,
                         "turns_processed": stats.turns_processed,
                         "chunks_total": stats.chunks_total,
                         "vectors_created": stats.embedded,
+                        "skipped_stale_content": stats.skipped_stale_content,
                     })
                 );
             } else {
+                println!("mode: {mode}");
                 println!("turns processed: {}", stats.turns_processed);
                 println!("chunks total:    {}", stats.chunks_total);
                 println!("vectors created: {}", stats.embedded);
+                println!("skipped stale content: {}", stats.skipped_stale_content);
             }
             Ok(())
         }
