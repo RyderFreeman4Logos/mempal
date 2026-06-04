@@ -8530,6 +8530,11 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         .context("failed to query daemon heartbeat")?;
     println!("schema_version: {schema_version}");
     println!("fork_ext_version: {fork_ext_version}");
+    println!(
+        "vector_index_stale: {}",
+        db.vector_index_is_stale()
+            .context("failed to check vector index metric")?
+    );
     println!("search_decay_mode: {}", config.search.decay.mode);
     println!("drawer_count: {drawer_count}");
     match project_breakdown {
