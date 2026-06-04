@@ -488,6 +488,11 @@ enum Commands {
         /// With --embedder/--from-config --stale: stop after this many candidate drawers.
         #[arg(long)]
         limit: Option<usize>,
+        /// With --embedder/--from-config --stale: max retries for a single batch's
+        /// embed call before the batch is skipped (it stays stale for a later
+        /// `--stale` re-run) and the run continues. Default: 15.
+        #[arg(long)]
+        max_batch_retries: Option<usize>,
         /// Return failed embed-queue messages to pending for daemon retry.
         #[arg(long, default_value_t = false)]
         failed: bool,
@@ -2547,6 +2552,7 @@ fn run() -> Result<()> {
             wing,
             room,
             limit,
+            max_batch_retries,
             failed,
             recompute_importance,
             only_zero,
@@ -2576,6 +2582,7 @@ fn run() -> Result<()> {
                     || force
                     || dry_run
                     || batch_size.is_some()
+                    || max_batch_retries.is_some()
                     || !vector_target.is_empty()
                     || recompute_importance
                     || only_zero
@@ -2613,6 +2620,9 @@ fn run() -> Result<()> {
                         "--drawer-id/--project/--wing/--room/--limit require --embedder or --from-config with --stale"
                     );
                 }
+                if max_batch_retries.is_some() && !stale {
+                    bail!("--max-batch-retries requires --stale");
+                }
                 if !vector_target.is_empty() && resume {
                     bail!("--resume cannot be combined with targeted stale reindex filters");
                 }
@@ -2630,13 +2640,17 @@ fn run() -> Result<()> {
                     &backend,
                     resume,
                     stale,
-                    batch_size.unwrap_or(1000),
+                    StaleBatchTuning {
+                        batch_size: batch_size.unwrap_or(1000),
+                        max_batch_retries: max_batch_retries.unwrap_or(DEFAULT_MAX_BATCH_RETRIES),
+                    },
                     vector_target,
                 ))
             } else {
-                if batch_size.is_some() || !vector_target.is_empty() {
+                if batch_size.is_some() || max_batch_retries.is_some() || !vector_target.is_empty()
+                {
                     bail!(
-                        "--batch-size/--drawer-id/--project/--wing/--room/--limit require --embedder or --from-config with --stale"
+                        "--batch-size/--max-batch-retries/--drawer-id/--project/--wing/--room/--limit require --embedder or --from-config with --stale"
                     );
                 }
                 block_on_result(reindex_command_sources(
@@ -5157,7 +5171,7 @@ async fn reindex_command_by_embedder(
     embedder_name: &str,
     resume: bool,
     stale_only: bool,
-    batch_size: usize,
+    batch: StaleBatchTuning,
     target: ReindexVectorTarget,
 ) -> Result<()> {
     let embedder = build_specific_embedder(config, embedder_name).await?;
@@ -5223,13 +5237,18 @@ async fn reindex_command_by_embedder(
         println!("resume checkpoint found; preserving existing drawer_vectors table");
     }
     if stale_only && resume_checkpoint.is_none() {
+        let policy = BatchRetryPolicy {
+            interval: std::time::Duration::from_secs(config.embed.retry.interval_secs),
+            max_retries: batch.max_batch_retries,
+        };
         return reindex_stale_batches(
             db,
             embedder.as_ref(),
             embedder_name,
             &target_fingerprint,
-            batch_size,
+            batch.batch_size,
             target,
+            policy,
         )
         .await;
     }
@@ -5327,6 +5346,74 @@ fn reindex_target_narrows_store(db: &Database, target: &ReindexVectorTarget) -> 
     Ok(limit < active_drawer_count)
 }
 
+/// Default number of retries for a single stale-reindex batch's embed call
+/// before the batch is skipped. With the default `[embed.retry].interval_secs`
+/// of 2s this absorbs blips up to ~30s while still bounding the run.
+const DEFAULT_MAX_BATCH_RETRIES: usize = 15;
+
+/// Bounded retry policy for stale-batch reindex embed calls.
+///
+/// The ingest path retries embeds *indefinitely* so NEW data is never lost.
+/// Reindex is different: it rebuilds an index over data already stored raw, so
+/// it MUST terminate. A batch that keeps failing is therefore retried a bounded
+/// number of times, then skipped (its drawers stay stale and are picked up by a
+/// later `mempal reindex --stale` re-run) rather than blocking the whole run.
+#[derive(Debug, Clone, Copy)]
+struct BatchRetryPolicy {
+    /// Fixed delay between attempts; mirrors `[embed.retry].interval_secs`
+    /// (no backoff), matching the ingest path's retry cadence.
+    interval: std::time::Duration,
+    /// Retries after the first attempt before a batch is skipped.
+    max_retries: usize,
+}
+
+/// CLI-supplied tuning for the stale-batch reindex loop (`reindex --stale`).
+/// Bundled so the embedder reindex entry point stays within a sane arity.
+#[derive(Debug, Clone, Copy)]
+struct StaleBatchTuning {
+    /// Drawers re-embedded per batch (`--batch-size`, default 1000).
+    batch_size: usize,
+    /// Max retries for a batch's embed call before it is skipped
+    /// (`--max-batch-retries`, default `DEFAULT_MAX_BATCH_RETRIES`).
+    max_batch_retries: usize,
+}
+
+/// Embed one stale batch, retrying at the policy's fixed interval (no backoff,
+/// mirroring the ingest path) up to `policy.max_retries` before giving up.
+///
+/// Retries on ANY error — including ones `EmbedError::is_retryable` classifies
+/// as terminal (e.g. a read timeout surfacing as `DecodeResponse`, the #301
+/// failure) — because a reindex batch must survive blips regardless of error
+/// class; a genuinely persistent failure is bounded by the cap and skipped by
+/// the caller. A vector-count mismatch is treated the same way (retry, then
+/// skip). Returns the embedded vectors, or the last error once the cap is
+/// exhausted so the caller can skip-and-continue.
+async fn embed_stale_batch_with_retry(
+    embedder: &dyn Embedder,
+    texts: &[&str],
+    expected_len: usize,
+    policy: BatchRetryPolicy,
+) -> Result<Vec<Vec<f32>>> {
+    let mut attempt = 0usize;
+    loop {
+        let retry_error = match embedder.embed(texts).await {
+            Ok(vectors) if vectors.len() == expected_len => return Ok(vectors),
+            Ok(vectors) => anyhow::anyhow!(
+                "embedder returned {} vectors for {expected_len} stale drawers",
+                vectors.len()
+            ),
+            Err(error) => {
+                anyhow::Error::new(error).context("embedding failed during stale batch reindex")
+            }
+        };
+        if attempt >= policy.max_retries {
+            return Err(retry_error);
+        }
+        attempt += 1;
+        tokio::time::sleep(policy.interval).await;
+    }
+}
+
 async fn reindex_stale_batches(
     db: &Database,
     embedder: &dyn Embedder,
@@ -5334,6 +5421,7 @@ async fn reindex_stale_batches(
     target_fingerprint: &str,
     batch_size: usize,
     target: ReindexVectorTarget,
+    policy: BatchRetryPolicy,
 ) -> Result<()> {
     if batch_size == 0 {
         bail!("--batch-size must be greater than 0");
@@ -5359,6 +5447,13 @@ async fn reindex_stale_batches(
     }
     let mut processed = 0usize;
     let mut skipped_concurrent_update = 0usize;
+    let mut skipped_failed_batches = 0usize;
+    let mut skipped_failed_drawers = 0usize;
+    // Drawers from batches that failed past the retry cap. They keep no fresh
+    // vector (stay stale), so they MUST be excluded from later batch queries:
+    // the stale selection re-runs every iteration, and without exclusion it
+    // would keep re-selecting them and the loop would never terminate.
+    let mut skipped_ids: Vec<String> = Vec::new();
     let mut batch_index = 0usize;
     let mut remaining = target.limit;
     loop {
@@ -5366,32 +5461,50 @@ async fn reindex_stale_batches(
         if effective_batch_size == 0 {
             break;
         }
-        let rows = reindex_stale_batch_rows(db, target_fingerprint, effective_batch_size, &target)
-            .context("failed to load stale reindex batch")?;
+        let rows = reindex_stale_batch_rows(
+            db,
+            target_fingerprint,
+            effective_batch_size,
+            &target,
+            &skipped_ids,
+        )
+        .context("failed to load stale reindex batch")?;
         if rows.is_empty() {
             break;
         }
         if let Some(value) = remaining.as_mut() {
             *value = value.saturating_sub(rows.len());
         }
+        batch_index += 1;
         let texts = rows
             .iter()
             .map(|row| row.content.as_str())
             .collect::<Vec<_>>();
-        let vectors = embedder
-            .embed(&texts)
-            .await
-            .context("embedding failed during stale batch reindex")?;
-        if vectors.len() != rows.len() {
-            bail!(
-                "embedder returned {} vectors for {} stale drawers",
-                vectors.len(),
-                rows.len()
-            );
-        }
+        let vectors = match embed_stale_batch_with_retry(embedder, &texts, rows.len(), policy).await
+        {
+            Ok(vectors) => vectors,
+            Err(error) => {
+                // Skip-and-continue: a batch still failing after the bounded
+                // retry is logged and skipped so the run can finish every other
+                // batch. Unlike ingest (which blocks forever to never lose NEW
+                // data), reindex rebuilds an index over data already stored raw,
+                // so it must terminate; the skipped drawers stay stale and a
+                // later `mempal reindex --stale` re-run retries them.
+                eprintln!(
+                    "warning: batch {batch_index}: embed failed after {} attempt(s); \
+                     skipping {} drawer(s) (they stay stale — re-run \
+                     `mempal reindex --stale` to retry): {error:#}",
+                    policy.max_retries + 1,
+                    rows.len()
+                );
+                skipped_failed_batches += 1;
+                skipped_failed_drawers += rows.len();
+                skipped_ids.extend(rows.iter().map(|row| row.id.clone()));
+                continue;
+            }
+        };
         let stats = write_reindex_vector_batch(db, &rows, &vectors, target_fingerprint)
             .context("failed to write stale reindex batch")?;
-        batch_index += 1;
         processed += stats.reindexed;
         skipped_concurrent_update += stats.skipped_concurrent_update;
         if stats.skipped_concurrent_update == 0 {
@@ -5419,6 +5532,12 @@ async fn reindex_stale_batches(
             "stale reindex complete: {processed} drawers ({skipped_concurrent_update} skipped due to concurrent updates)"
         );
     }
+    // Surface failed-batch skips (mirrors the #297 `skipped_stale_content`
+    // counter): always reported so an operator can see them. Skips are NOT
+    // fatal — the run still exits 0 on completion because the skipped drawers
+    // remain stale and are picked up by a later `mempal reindex --stale`.
+    println!("skipped failed batches: {skipped_failed_batches}");
+    println!("skipped failed drawers: {skipped_failed_drawers}");
     Ok(())
 }
 
@@ -9435,11 +9554,41 @@ fn append_reindex_target_filters(
     }
 }
 
+/// Append an `AND <alias>id NOT IN (...)` clause excluding `exclude_ids`.
+/// Used to drop drawers whose batch already failed past the retry cap this run,
+/// so the stale selection does not re-select them on every iteration.
+fn append_exclude_ids(
+    sql: &mut String,
+    values: &mut Vec<rusqlite::types::Value>,
+    exclude_ids: &[String],
+    alias: &str,
+) {
+    if exclude_ids.is_empty() {
+        return;
+    }
+    let prefix = if alias.is_empty() {
+        String::new()
+    } else {
+        format!("{alias}.")
+    };
+    let placeholders = std::iter::repeat_n("?", exclude_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.push_str(&format!(" AND {prefix}id NOT IN ({placeholders})"));
+    values.extend(
+        exclude_ids
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::Text),
+    );
+}
+
 fn reindex_stale_batch_rows(
     db: &Database,
     target_fingerprint: &str,
     batch_size: usize,
     target: &ReindexVectorTarget,
+    exclude_ids: &[String],
 ) -> Result<Vec<ReindexRow>> {
     let limit = i64::try_from(batch_size).context("batch size is too large")?;
     let vectors_exist = db
@@ -9479,6 +9628,7 @@ fn reindex_stale_batch_rows(
             rusqlite::types::Value::Text(target_fingerprint.to_string()),
         ];
         append_reindex_target_filters(&mut sql, &mut values, target, "d");
+        append_exclude_ids(&mut sql, &mut values, exclude_ids, "d");
         sql.push_str(
             r#"
                 ORDER BY source_path ASC, chunk_index ASC, d.id ASC
@@ -9517,6 +9667,7 @@ fn reindex_stale_batch_rows(
         .to_string();
         let mut values = Vec::new();
         append_reindex_target_filters(&mut sql, &mut values, target, "");
+        append_exclude_ids(&mut sql, &mut values, exclude_ids, "");
         sql.push_str(
             r#"
                 ORDER BY source_path ASC, chunk_index ASC, id ASC

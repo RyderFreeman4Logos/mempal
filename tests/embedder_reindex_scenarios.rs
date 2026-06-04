@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::harness::FailMode;
 use common::harness::start as start_mock;
 use mempal::core::config::{Config, ConfigHandle, DEFAULT_MODEL2VEC_FINGERPRINT_MODEL};
 use mempal::core::db::{Database, VECTOR_DISTANCE_METRIC};
@@ -449,6 +450,246 @@ async fn test_reindex_stale_only() {
         "stdout: {}",
         String::from_utf8_lossy(&second.stdout)
     );
+
+    handle.shutdown().await;
+}
+
+/// #301: a transient batch embed failure must be absorbed by a bounded retry
+/// instead of aborting the entire stale reindex. The mock returns an
+/// undecodable body for the first two embed attempts of the stale batch, then
+/// recovers. Because that failure class (`DecodeResponse`) is non-retryable,
+/// this also proves the reindex retry is error-class-agnostic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_absorbs_transient_batch_failure() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-retry-transient.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        false,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, false),
+    );
+    seed_drawers(&env.db_path, 4, 2);
+
+    // Full reindex builds dim-4 vectors plus per-drawer fingerprint metadata.
+    let full = run_reindex(&env.home, &["--from-config"], &[]);
+    assert!(
+        full.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+    assert_eq!(handle.request_count(), 4);
+
+    // Mark two drawers stale so the stale path embeds them in a single batch.
+    let db = Database::open(&env.db_path).expect("open db");
+    for id in ["drawer-01", "drawer-02"] {
+        db.conn()
+            .execute(
+                "UPDATE fork_ext_meta SET value = 'old' WHERE key = ?1",
+                [format!("reindex:{id}:index_version")],
+            )
+            .expect("mark index stale");
+    }
+
+    // The first two embed attempts of the stale batch fail with an undecodable
+    // body; the server then recovers. The bounded retry must absorb the blip.
+    handle.set_fail_mode(FailMode::MalformedBody).await;
+    handle.set_fail_first_n(2);
+
+    let stale = run_reindex(&env.home, &["--from-config", "--stale"], &[]);
+    assert!(
+        stale.status.success(),
+        "transient blip must not abort reindex; stdout={} stderr={}",
+        String::from_utf8_lossy(&stale.stdout),
+        String::from_utf8_lossy(&stale.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&stale.stdout);
+    assert!(
+        stdout.contains("skipped failed batches: 0"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("skipped failed drawers: 0"),
+        "stdout: {stdout}"
+    );
+
+    // 4 full + 2 failed retries + 1 success = 7 embed requests.
+    assert_eq!(
+        handle.request_count(),
+        7,
+        "expected two retries followed by success"
+    );
+
+    // Both previously-stale drawers are now freshly embedded.
+    ConfigHandle::bootstrap(&env.config_path).expect("bootstrap config");
+    for id in ["drawer-01", "drawer-02"] {
+        let details = db.drawer_vector_details(id).expect("vector details");
+        assert!(!details.stale, "{id} should be re-embedded: {details:?}");
+    }
+
+    handle.shutdown().await;
+}
+
+/// #301: a batch that fails persistently (past the retry cap) must be logged,
+/// skipped, and the run must continue and finish every other batch. The
+/// skipped drawer stays stale so a later `mempal reindex --stale` retries it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_batch_failure_skips_and_continues() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-persistent-skip.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        false,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, false),
+    );
+    seed_drawers(&env.db_path, 4, 2);
+
+    let full = run_reindex(&env.home, &["--from-config"], &[]);
+    assert!(
+        full.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+
+    // Mark all four drawers stale; batch-size 1 makes each its own batch.
+    let db = Database::open(&env.db_path).expect("open db");
+    for index in 0..4 {
+        db.conn()
+            .execute(
+                "UPDATE fork_ext_meta SET value = 'old' WHERE key = ?1",
+                [format!("reindex:drawer-{index:02}:index_version")],
+            )
+            .expect("mark index stale");
+    }
+
+    // drawer-02's batch always fails; the other three succeed.
+    handle.set_fail_mode(FailMode::MalformedBody).await;
+    handle
+        .set_fail_if_input_contains(Some("drawer content 2".to_string()))
+        .await;
+
+    let stale = run_reindex(
+        &env.home,
+        &[
+            "--from-config",
+            "--stale",
+            "--batch-size",
+            "1",
+            "--max-batch-retries",
+            "1",
+        ],
+        &[],
+    );
+    assert!(
+        stale.status.success(),
+        "persistent failure must skip-and-continue with exit 0; stdout={} stderr={}",
+        String::from_utf8_lossy(&stale.stdout),
+        String::from_utf8_lossy(&stale.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&stale.stdout);
+    assert!(
+        stdout.contains("skipped failed batches: 1"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("skipped failed drawers: 1"),
+        "stdout: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&stale.stderr);
+    assert!(
+        stderr.contains("skipping") && stderr.contains("drawer"),
+        "expected a skip warning on stderr: {stderr}",
+    );
+
+    // The three healthy drawers are freshly embedded; the poisoned one stays
+    // stale so a later `--stale` re-run will select it again.
+    ConfigHandle::bootstrap(&env.config_path).expect("bootstrap config");
+    for index in [0, 1, 3] {
+        let id = format!("drawer-{index:02}");
+        let details = db.drawer_vector_details(&id).expect("vector details");
+        assert!(!details.stale, "{id} should be embedded: {details:?}");
+    }
+    let poisoned = db
+        .drawer_vector_details("drawer-02")
+        .expect("vector details");
+    assert!(
+        poisoned.stale,
+        "drawer-02 must remain stale for a later re-run: {poisoned:?}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// #301 regression: with no failures, reindex behaves exactly as before and
+/// reports zero skips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_reindex_no_skips_regression() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-clean-noskip.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        false,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, false),
+    );
+    seed_drawers(&env.db_path, 4, 2);
+
+    let full = run_reindex(&env.home, &["--from-config"], &[]);
+    assert!(
+        full.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+
+    let db = Database::open(&env.db_path).expect("open db");
+    for id in ["drawer-01", "drawer-02"] {
+        db.conn()
+            .execute(
+                "UPDATE fork_ext_meta SET value = 'old' WHERE key = ?1",
+                [format!("reindex:{id}:index_version")],
+            )
+            .expect("mark index stale");
+    }
+
+    let stale = run_reindex(&env.home, &["--from-config", "--stale"], &[]);
+    assert!(
+        stale.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&stale.stdout);
+    assert!(
+        stdout.contains("batch 1: re-embedded 2 stale/new drawers"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("skipped failed batches: 0"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("skipped failed drawers: 0"),
+        "stdout: {stdout}"
+    );
+    assert_eq!(handle.request_count(), 5, "4 full + 1 stale batch");
+
+    ConfigHandle::bootstrap(&env.config_path).expect("bootstrap config");
+    for id in ["drawer-01", "drawer-02"] {
+        let details = db.drawer_vector_details(id).expect("vector details");
+        assert!(!details.stale, "{id} should be embedded: {details:?}");
+    }
 
     handle.shutdown().await;
 }
