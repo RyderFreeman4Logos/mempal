@@ -1763,6 +1763,15 @@ pub struct StatusResponse {
     pub stale_drawer_count: u64,
     /// True when drawer_vectors still uses the legacy l2 metric and needs reindex.
     pub vector_index_stale: bool,
+    /// Number of rows in the `drawer_vectors` index (issue #302). Composes with
+    /// `vector_index_stale`: the metric-only staleness check reports `false` for
+    /// an empty-but-correct-metric table, so this row count exposes an index
+    /// that was emptied by a failed recreate-reindex.
+    pub vector_rows: i64,
+    /// True when the vector index is empty (`vector_rows == 0`) while drawers
+    /// exist — semantic recall is silently degraded to BM25-only until a reindex
+    /// repopulates it (issue #302).
+    pub vector_index_empty: bool,
     pub search_decay_mode: String,
     pub drawer_count: i64,
     pub total_compacted_drawers: u64,

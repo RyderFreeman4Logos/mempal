@@ -1297,3 +1297,159 @@ async fn test_mixed_dim_batch_aborts_before_begin_immediate() {
 
     handle.shutdown().await;
 }
+
+/// #302 regression: a metric/dim-change reindex whose embed phase fails on
+/// EVERY batch (embedder fully down) must leave the OLD `drawer_vectors`
+/// table intact (NOT emptied), and report failure rather than silently
+/// installing an empty table. Fails red against pre-#302 code, which recreates
+/// the table up front and then leaves it empty when no batch embeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_recreate_preserves_old_vectors() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-302-preserve.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        false,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, false),
+    );
+    seed_drawers(&env.db_path, 6, 4);
+    // Reproduce the pre-#287 state: a populated legacy l2 table. The l2 -> cosine
+    // metric change forces `mempal reindex` to drop and recreate the table.
+    replace_vectors_with_metricless_l2(&env.db_path, 6, 4);
+
+    let db = Database::open(&env.db_path).expect("open db");
+    let before_metric = db
+        .vector_table_distance_metric()
+        .expect("read vector metric before failed reindex");
+    let before_count = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count vectors before failed reindex");
+    assert_eq!(before_count, 6);
+
+    // The embedder is fully down: every batch fails persistently (no recovery).
+    handle.set_fail_mode(FailMode::Http500).await;
+
+    let output = run_reindex(
+        &env.home,
+        &[
+            "--from-config",
+            "--stale",
+            "--batch-size",
+            "2",
+            "--max-batch-retries",
+            "1",
+        ],
+        &[],
+    );
+    // Zero vectors embedded on a table-recreating reindex MUST be reported as a
+    // failure (non-zero exit) instead of a silent exit-0 that leaves the index
+    // empty.
+    assert!(
+        !output.status.success(),
+        "zero-embedded recreate must fail; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // The OLD l2 vectors must still be present and unchanged.
+    ConfigHandle::bootstrap(&env.config_path).expect("bootstrap reindex config");
+    let after_count = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count vectors after failed reindex");
+    assert_eq!(
+        after_count, 6,
+        "old vectors must be preserved when no batch embeds"
+    );
+    assert_eq!(
+        db.vector_table_distance_metric()
+            .expect("read vector metric after failed reindex"),
+        before_metric,
+        "failed reindex must leave the legacy table layout intact"
+    );
+    assert!(
+        handle.request_count() >= 3,
+        "each of the three 2-row batches must be attempted at least once before giving up; got {}",
+        handle.request_count(),
+    );
+
+    handle.shutdown().await;
+}
+
+/// #302 happy-path regression: a successful metric-change reindex installs the
+/// new populated cosine table, drops the old one, and `mempal status` shows the
+/// index as non-empty (`vector_index_empty: false`, `vector_rows: 6`). Guards
+/// against the atomicity work breaking the clean recreate-and-swap path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_recreate_swaps_atomically_regression() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-302-clean.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        false,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, false),
+    );
+    seed_drawers(&env.db_path, 6, 4);
+    // Legacy l2 layout forces a full recreate during reindex.
+    replace_vectors_with_metricless_l2(&env.db_path, 6, 4);
+
+    // Embedder healthy: every batch succeeds.
+    let output = run_reindex(
+        &env.home,
+        &["--from-config", "--stale", "--batch-size", "2"],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "clean recreate must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let db = Database::open(&env.db_path).expect("open db");
+    // New cosine table installed, old dropped, fully repopulated.
+    assert_eq!(
+        db.vector_table_distance_metric()
+            .expect("read vector metric")
+            .as_deref(),
+        Some(VECTOR_DISTANCE_METRIC),
+    );
+    let count = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count vectors after clean reindex");
+    assert_eq!(count, 6);
+
+    // `mempal status` must surface a healthy (non-empty) vector index.
+    let status = Command::new(mempal_bin())
+        .arg("status")
+        .env("HOME", &env.home)
+        .output()
+        .expect("run mempal status");
+    assert!(status.status.success(), "{status:?}");
+    let stdout = String::from_utf8(status.stdout).expect("status stdout utf8");
+    assert!(
+        stdout.contains("vector_index_empty: false"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("vector_rows: 6"), "stdout: {stdout}");
+
+    handle.shutdown().await;
+}

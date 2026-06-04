@@ -362,6 +362,34 @@ fn test_status_command_shows_vector_index_stale_flag() {
     assert!(stdout.contains("vector_index_stale: true"), "{stdout}");
 }
 
+/// #302 regression: an empty-but-correct-metric `drawer_vectors` table (0 rows,
+/// cosine, with drawers present) is silently healthy to the #295 metric-only
+/// staleness check. `mempal status` MUST surface the empty state via
+/// `vector_index_empty: true` / `vector_rows: 0` while still reporting
+/// `vector_index_stale: false` (the cosine metric is correct). Fails red
+/// against pre-#302 code, which has no empty/row-count signal.
+#[test]
+fn test_status_command_flags_empty_vector_table() {
+    let (home, db_path) = setup_home();
+    insert_status_drawer(&db_path, "drawer-empty-1", SourceType::AgentInference);
+    // Correct (cosine) metric but zero rows: the post-recreate empty-table state.
+    recreate_vectors_with_metric(&db_path, "cosine");
+
+    let output = Command::new(mempal_bin())
+        .arg("status")
+        .env("HOME", home.path())
+        .output()
+        .expect("run mempal status");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
+    // #295 metric check is unchanged: cosine table is not "stale".
+    assert!(stdout.contains("vector_index_stale: false"), "{stdout}");
+    // #302 adds the row-count dimension so the empty index is non-silent.
+    assert!(stdout.contains("vector_index_empty: true"), "{stdout}");
+    assert!(stdout.contains("vector_rows: 0"), "{stdout}");
+}
+
 #[test]
 fn test_reindex_failed_requeues_only_failed_embed_queue_items() {
     let (home, db_path) = setup_home();

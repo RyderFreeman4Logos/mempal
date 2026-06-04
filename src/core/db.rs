@@ -254,6 +254,51 @@ fn register_math_functions(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Name of the transient table that holds the pre-recreate `drawer_vectors`
+/// rows during a metric/dim-change reindex (issue #302). It is a connection
+/// `TEMP` table, so a process crash mid-reindex drops it automatically and
+/// leaves no leftover artifact in the database file.
+const REINDEX_VECTOR_STASH_TABLE: &str = "drawer_vectors_reindex_stash";
+
+/// A snapshot of the `drawer_vectors` rows captured immediately before a
+/// destructive reindex recreate, used to roll the table back if the reindex
+/// embeds ZERO vectors (a total embedder outage) instead of leaving an empty
+/// index behind (issue #302).
+///
+/// sqlite-vec 0.1.9's `vec0` virtual table does not implement `xRename`, so
+/// `ALTER TABLE ... RENAME` is rejected (upstream asg017/sqlite-vec#43). The
+/// textbook strategy-A atomic swap (embed into a staging table, then rename it
+/// over the original) is therefore not achievable directly; instead the same
+/// temp-table copy primitive `db_fork_ext` already uses for the `project_id`
+/// migration stages the OLD rows aside so they can be restored on failure.
+#[derive(Debug, Clone)]
+pub struct ReindexVectorStash {
+    old_dim: usize,
+    old_metric: String,
+    had_project_id: bool,
+    row_count: i64,
+}
+
+impl ReindexVectorStash {
+    /// Number of rows preserved in the stash (the pre-recreate vector count).
+    pub fn row_count(&self) -> i64 {
+        self.row_count
+    }
+}
+
+/// Whitelist a vec0 distance metric before interpolating it into DDL. The value
+/// provably originates from [`Database::vector_table_distance_metric`] (only
+/// ever `cosine` or `l2`), so this is defense-in-depth against a corrupted
+/// stored schema rather than untrusted input.
+fn validate_vector_metric(metric: &str) -> Result<&str, DbError> {
+    match metric {
+        "cosine" | "l2" => Ok(metric),
+        other => Err(DbError::InvalidDrawerMetadata(format!(
+            "unexpected vec0 distance metric: {other}"
+        ))),
+    }
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         Self::open_with_mode(path, OpenMode::ReadWrite)
@@ -3512,6 +3557,127 @@ impl Database {
                 embedding FLOAT[{dim}] distance_metric={VECTOR_DISTANCE_METRIC}{project_column}
             );
             "#
+        ))?;
+        Ok(())
+    }
+
+    /// Number of rows currently in the `drawer_vectors` vec0 table, returning 0
+    /// when the table is absent. Counting the vec0 virtual table directly is
+    /// valid because every `Database` connection registers the sqlite-vec
+    /// extension (a plain sqlite connection would fail with `no such module:
+    /// vec0`). This is the row-count source of truth for the `mempal status`
+    /// empty-index signal and the reindex atomicity checkpoint (issue #302).
+    pub fn vector_row_count(&self) -> Result<i64, DbError> {
+        if !self.table_exists("drawer_vectors")? {
+            return Ok(0);
+        }
+        let count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        Ok(count)
+    }
+
+    /// Detect whether the live `drawer_vectors` table declares the `+project_id`
+    /// auxiliary column (present once `fork_ext_version >= 5`). Read from the
+    /// stored DDL so the stash restores the table's exact original shape.
+    fn vector_table_has_project_id(&self) -> Result<bool, DbError> {
+        let sql: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drawer_vectors'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(sql.is_some_and(|sql| sql.contains("project_id")))
+    }
+
+    /// Stage the current `drawer_vectors` rows into a transient `TEMP` table
+    /// before a metric/dim-change recreate so they can be restored if the
+    /// reindex embeds zero vectors (issue #302). Returns `Ok(None)` when there
+    /// is nothing worth protecting (no table, or an already-empty table) — the
+    /// caller then proceeds without rollback bookkeeping.
+    ///
+    /// Strategy note: vec0 has no `ALTER TABLE RENAME` (sqlite-vec 0.1.9
+    /// xRename=0), so rather than embedding into a staging table and renaming it
+    /// over the original, this stages the OLD rows aside (the proven
+    /// `db_fork_ext` copy primitive) while the embed phase keeps writing
+    /// `drawer_vectors` in place. On a zero-embedded failure
+    /// [`Self::restore_vectors_from_stash`] copies the rows back unchanged.
+    pub fn stash_vectors_before_recreate(&self) -> Result<Option<ReindexVectorStash>, DbError> {
+        let Some(old_metric) = self.vector_table_distance_metric()? else {
+            return Ok(None); // no table -> nothing to protect
+        };
+        let Some(old_dim) = self.embedding_dim()? else {
+            return Ok(None); // table exists but is empty -> nothing to restore
+        };
+        let row_count = self.vector_row_count()?;
+        if row_count == 0 {
+            return Ok(None);
+        }
+        let had_project_id = self.vector_table_has_project_id()?;
+        let table = REINDEX_VECTOR_STASH_TABLE;
+        let project_col = if had_project_id { ", project_id" } else { "" };
+        let project_col_def = if had_project_id {
+            ", project_id TEXT"
+        } else {
+            ""
+        };
+        self.conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {table};
+             CREATE TEMP TABLE {table} (
+                 id TEXT PRIMARY KEY,
+                 embedding BLOB NOT NULL{project_col_def}
+             );
+             INSERT INTO {table} (id, embedding{project_col})
+                 SELECT id, embedding{project_col} FROM drawer_vectors;"
+        ))?;
+        Ok(Some(ReindexVectorStash {
+            old_dim,
+            old_metric,
+            had_project_id,
+            row_count,
+        }))
+    }
+
+    /// Drop the reindex stash after a successful (>= 1 embedded) reindex.
+    pub fn discard_reindex_stash(&self) -> Result<(), DbError> {
+        let table = REINDEX_VECTOR_STASH_TABLE;
+        self.conn
+            .execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
+        Ok(())
+    }
+
+    /// Restore the pre-recreate `drawer_vectors` rows from the stash, recreating
+    /// the table with its original dimension, distance metric, and `project_id`
+    /// column. Called when a recreate-reindex embeds zero vectors so the store
+    /// is left exactly as it started (issue #302) rather than with an empty
+    /// index. Consumes the stash table at the end.
+    pub fn restore_vectors_from_stash(&self, stash: &ReindexVectorStash) -> Result<(), DbError> {
+        let metric = validate_vector_metric(&stash.old_metric)?;
+        let dim = stash.old_dim;
+        let table = REINDEX_VECTOR_STASH_TABLE;
+        let project_col = if stash.had_project_id {
+            ", project_id"
+        } else {
+            ""
+        };
+        let project_col_def = if stash.had_project_id {
+            ", +project_id TEXT"
+        } else {
+            ""
+        };
+        self.conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS drawer_vectors;
+             CREATE VIRTUAL TABLE drawer_vectors USING vec0(
+                 id TEXT PRIMARY KEY,
+                 embedding FLOAT[{dim}] distance_metric={metric}{project_col_def}
+             );
+             INSERT INTO drawer_vectors (id, embedding{project_col})
+                 SELECT id, embedding{project_col} FROM {table};
+             DROP TABLE IF EXISTS {table};"
         ))?;
         Ok(())
     }

@@ -1330,6 +1330,10 @@ impl MempalMcpServer {
         // This sqlite_master read is once per request so external reindex clears the warning immediately.
         let vector_index_stale = db.vector_index_is_stale().unwrap_or(false);
         let drawer_count = db.drawer_count().map_err(db_error)?;
+        // #302: row count exposes a vector table emptied by a failed
+        // recreate-reindex, which the metric-only staleness check above misses.
+        let vector_rows = db.vector_row_count().map_err(db_error)?;
+        let vector_index_empty = vector_rows == 0 && drawer_count > 0;
         let consolidation_stats = db.consolidation_stats().map_err(db_error)?;
         let pending_card_count = db
             .pending_auto_generated_knowledge_card_count()
@@ -1379,6 +1383,15 @@ impl MempalMcpServer {
         if let Some(warning) = stale_index_warning_from_bool(vector_index_stale) {
             system_warnings.push(warning);
         }
+        if vector_index_empty {
+            system_warnings.push(SystemWarning {
+                level: "warn".to_string(),
+                message: format!(
+                    "drawer_vectors index is empty ({vector_rows} vectors for {drawer_count} drawers); vector recall is disabled (BM25-only) until `mempal reindex --from-config` repopulates it"
+                ),
+                source: "vector_index".to_string(),
+            });
+        }
         if unresolved_project_scope && config.search.strict_project_isolation {
             system_warnings.push(SystemWarning {
                 level: "warn".to_string(),
@@ -1396,6 +1409,8 @@ impl MempalMcpServer {
             normalize_version_current: CURRENT_NORMALIZE_VERSION,
             stale_drawer_count,
             vector_index_stale,
+            vector_rows,
+            vector_index_empty,
             search_decay_mode: config.search.decay.mode.to_string(),
             drawer_count,
             total_compacted_drawers: consolidation_stats.total_compacted_drawers,

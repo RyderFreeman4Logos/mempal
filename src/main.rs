@@ -20,8 +20,8 @@ use mempal::core::{
     compaction::merge_cluster,
     config::{CompiledPrivacyConfig, Config, ConfigHandle, default_config_path},
     db::{
-        CURRENT_VECTOR_INDEX_VERSION, Database, VECTOR_DISTANCE_METRIC, find_similar_clusters,
-        vector_metadata_key,
+        CURRENT_VECTOR_INDEX_VERSION, Database, ReindexVectorStash, VECTOR_DISTANCE_METRIC,
+        find_similar_clusters, vector_metadata_key,
     },
     phase3::{
         CardContextDefaultProposalReport, CardContextRollbackControlReport, EvaluatorAdviceInput,
@@ -5221,21 +5221,36 @@ async fn reindex_command_by_embedder(
              re-embed the whole store."
         );
     }
-    if should_recreate_table {
+    // #302 atomicity: a metric/dim-change reindex DROPs the old drawer_vectors
+    // up front, then embeds. If every batch then fails (embedder fully down),
+    // the table is left empty and search silently degrades to BM25-only. Stash
+    // the old rows aside BEFORE the recreate so a reindex that embeds ZERO
+    // vectors can roll them back (see finalize_reindex_atomicity below). vec0
+    // has no ALTER TABLE RENAME (sqlite-vec 0.1.9 xRename=0,
+    // asg017/sqlite-vec#43), so this strategy-A "stage the old data aside" uses
+    // a temp-table copy rather than embed-into-staging + rename.
+    let reindex_stash = if should_recreate_table {
         if resume_checkpoint.is_some() {
             println!(
                 "resume checkpoint ignored because drawer_vectors metric or dimension is stale"
             );
             resume_checkpoint = None;
         }
+        let stash = db
+            .stash_vectors_before_recreate()
+            .context("failed to stash existing vectors before recreate")?;
         println!("recreating drawer_vectors with {new_dim} dimensions...");
         db.recreate_vectors_table(new_dim)
             .context("failed to recreate vectors table")?;
+        stash
     } else if stale_only {
         println!("stale-only reindex preserving existing drawer_vectors table");
+        None
     } else {
         println!("resume checkpoint found; preserving existing drawer_vectors table");
-    }
+        None
+    };
+    let embed_result: Result<()> = async move {
     if stale_only && resume_checkpoint.is_none() {
         let policy = BatchRetryPolicy {
             interval: std::time::Duration::from_secs(config.embed.retry.interval_secs),
@@ -5324,6 +5339,55 @@ async fn reindex_command_by_embedder(
     }
     println!("reindex complete: {total} drawers, {new_dim}d vectors");
     Ok(())
+    }
+    .await;
+
+    finalize_reindex_atomicity(db, reindex_stash, embed_result)
+}
+
+/// Decide the fate of a recreate-reindex's staged old vectors (#302 atomicity).
+///
+/// `stash` is `Some` only when the reindex recreated `drawer_vectors` (a
+/// metric/dim change). The post-#301 skip-continue loop can finish "successfully"
+/// having embedded anywhere from zero to all batches, so the swap decision is by
+/// row count, not exit status:
+/// - at least one vector embedded: keep the freshly populated table, drop the
+///   stash, and pass the embed result through (partial progress from #301 skips
+///   is retained).
+/// - zero vectors embedded (total embedder outage): restore the old rows so the
+///   store is left exactly as it started, and report failure so an empty index
+///   is never silently installed.
+///
+/// When `stash` is `None` (no recreate happened) the embed result passes through
+/// unchanged.
+fn finalize_reindex_atomicity(
+    db: &Database,
+    stash: Option<ReindexVectorStash>,
+    embed_result: Result<()>,
+) -> Result<()> {
+    let Some(stash) = stash else {
+        return embed_result;
+    };
+    let embedded = db
+        .vector_row_count()
+        .context("failed to count embedded vectors after reindex")?;
+    if embedded == 0 {
+        let preserved = stash.row_count();
+        db.restore_vectors_from_stash(&stash)
+            .context("failed to restore previous vectors after empty reindex")?;
+        let message = format!(
+            "reindex embedded 0 vectors (embedder unavailable); restored the previous \
+             {preserved}-row drawer_vectors table unchanged. Re-run `mempal reindex` once the \
+             embedder is reachable."
+        );
+        return Err(match embed_result {
+            Err(error) => error.context(message),
+            Ok(()) => anyhow::anyhow!("{message}"),
+        });
+    }
+    db.discard_reindex_stash()
+        .context("failed to discard reindex stash after successful reindex")?;
+    embed_result
 }
 
 fn reindex_target_narrows_store(db: &Database, target: &ReindexVectorTarget) -> Result<bool> {
@@ -8659,6 +8723,17 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         "vector_index_stale: {}",
         db.vector_index_is_stale()
             .context("failed to check vector index metric")?
+    );
+    // #302: the metric-only staleness check above reports false for an
+    // empty-but-correct-metric table, so surface the raw vector row count and an
+    // explicit empty flag (rows == 0 while drawers exist) next to it.
+    let vector_rows = db
+        .vector_row_count()
+        .context("failed to count vector index rows")?;
+    println!("vector_rows: {vector_rows}");
+    println!(
+        "vector_index_empty: {}",
+        vector_rows == 0 && drawer_count > 0
     );
     println!("search_decay_mode: {}", config.search.decay.mode);
     println!("drawer_count: {drawer_count}");
