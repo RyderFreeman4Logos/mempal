@@ -1327,6 +1327,8 @@ impl MempalMcpServer {
         let stale_drawer_count = db
             .stale_drawer_count(CURRENT_NORMALIZE_VERSION)
             .map_err(db_error)? as u64;
+        // This sqlite_master read is once per request so external reindex clears the warning immediately.
+        let vector_index_stale = db.vector_index_is_stale().unwrap_or(false);
         let drawer_count = db.drawer_count().map_err(db_error)?;
         let consolidation_stats = db.consolidation_stats().map_err(db_error)?;
         let pending_card_count = db
@@ -1374,6 +1376,9 @@ impl MempalMcpServer {
                 source: "project_isolation".to_string(),
             });
         }
+        if let Some(warning) = stale_index_warning_from_bool(vector_index_stale) {
+            system_warnings.push(warning);
+        }
         if unresolved_project_scope && config.search.strict_project_isolation {
             system_warnings.push(SystemWarning {
                 level: "warn".to_string(),
@@ -1390,6 +1395,7 @@ impl MempalMcpServer {
             fork_ext_version,
             normalize_version_current: CURRENT_NORMALIZE_VERSION,
             stale_drawer_count,
+            vector_index_stale,
             search_decay_mode: config.search.decay.mode.to_string(),
             drawer_count,
             total_compacted_drawers: consolidation_stats.total_compacted_drawers,
@@ -1701,6 +1707,9 @@ impl MempalMcpServer {
 
         let mut system_warnings = current_system_warnings();
         system_warnings.extend(extra_warnings);
+        if let Some(warning) = stale_index_warning(&db) {
+            system_warnings.push(warning);
+        }
         if unresolved_scope && config.search.strict_project_isolation {
             system_warnings.push(SystemWarning {
                 level: "warn".to_string(),
@@ -2361,6 +2370,12 @@ impl MempalMcpServer {
             config.scrub_content_with_compiled(&request.content, compiled_privacy.as_ref());
         let room = request.room.as_deref();
         let db = self.open_db()?;
+        // Snapshot the request-wide warnings once so every early-return path reports a
+        // consistent set from a single `sqlite_master` read. A mid-request embed transition
+        // to degraded is not lost: the synchronous degraded-write guard below
+        // (`should_block_writes`) re-reads fresh status via `degraded_write_error()` and
+        // rejects before any success response that would carry this snapshot is built.
+        let request_system_warnings = system_warnings_with_stale_index(&db);
         let dry_run = request.dry_run.unwrap_or(false);
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
@@ -2376,7 +2391,7 @@ impl MempalMcpServer {
                 lock_wait_ms: None,
                 superseded_drawer_id: None,
                 fact_check_warnings: Vec::new(),
-                system_warnings: current_system_warnings(),
+                system_warnings: request_system_warnings,
             }));
         }
         let drawer_importance = raw_turn_importance(&request.wing, room, &config.turns)
@@ -2469,7 +2484,7 @@ impl MempalMcpServer {
                 lock_wait_ms: None,
                 superseded_drawer_id,
                 fact_check_warnings: Vec::new(),
-                system_warnings: current_system_warnings(),
+                system_warnings: request_system_warnings.clone(),
             }));
         }
 
@@ -2500,7 +2515,7 @@ impl MempalMcpServer {
                 lock_wait_ms: None,
                 superseded_drawer_id: superseded_response_id,
                 fact_check_warnings: Vec::new(),
-                system_warnings: current_system_warnings(),
+                system_warnings: request_system_warnings.clone(),
             }));
         }
 
@@ -2533,7 +2548,7 @@ impl MempalMcpServer {
                 lock_wait_ms: None,
                 superseded_drawer_id: None,
                 fact_check_warnings: Vec::new(),
-                system_warnings: current_system_warnings(),
+                system_warnings: request_system_warnings.clone(),
             }));
         }
 
@@ -2636,7 +2651,7 @@ impl MempalMcpServer {
                 lock_wait_ms,
                 superseded_drawer_id: None,
                 fact_check_warnings: Vec::new(),
-                system_warnings: current_system_warnings(),
+                system_warnings: request_system_warnings.clone(),
             }));
         }
         if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
@@ -2680,7 +2695,7 @@ impl MempalMcpServer {
                     lock_wait_ms,
                     superseded_drawer_id: None,
                     fact_check_warnings,
-                    system_warnings: current_system_warnings(),
+                    system_warnings: request_system_warnings.clone(),
                 }));
             }
         }
@@ -3137,7 +3152,7 @@ impl MempalMcpServer {
             lock_wait_ms,
             superseded_drawer_id: superseded_response_id,
             fact_check_warnings,
-            system_warnings: current_system_warnings(),
+            system_warnings: request_system_warnings,
         }))
     }
 
@@ -6066,6 +6081,26 @@ pub(super) fn current_system_warnings() -> Vec<SystemWarning> {
     warnings
 }
 
+fn stale_index_warning_from_bool(is_stale: bool) -> Option<SystemWarning> {
+    is_stale.then(|| SystemWarning {
+        level: "warn".to_string(),
+        message: "drawer_vectors index is stale (metric mismatch: l2, expected cosine); vector recall is degraded; run `mempal reindex --from-config --stale` to rebuild".to_string(),
+        source: "vector_index".to_string(),
+    })
+}
+
+fn stale_index_warning(db: &Database) -> Option<SystemWarning> {
+    stale_index_warning_from_bool(db.vector_index_is_stale().unwrap_or(false))
+}
+
+fn system_warnings_with_stale_index(db: &Database) -> Vec<SystemWarning> {
+    let mut warnings = current_system_warnings();
+    if let Some(warning) = stale_index_warning(db) {
+        warnings.push(warning);
+    }
+    warnings
+}
+
 fn intelligence_llm_state(config: &crate::core::config::Config, reachable: bool) -> String {
     if !config.memory_intelligence.mode.uses_llm() {
         return "disabled".to_string();
@@ -6401,6 +6436,35 @@ mod tests {
             .expect("insert vector");
     }
 
+    fn recreate_vectors_with_metric(db_path: &Path, metric: &str) {
+        let db = Database::open(db_path).expect("open db");
+        db.conn()
+            .execute_batch(&format!(
+                r#"
+                DROP TABLE IF EXISTS drawer_vectors;
+                CREATE VIRTUAL TABLE drawer_vectors USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding FLOAT[3] distance_metric={metric},
+                    +project_id TEXT
+                );
+                "#
+            ))
+            .expect("recreate vector table");
+    }
+
+    fn insert_test_vector(db_path: &Path, id: &str) {
+        let db = Database::open(db_path).expect("open db");
+        db.insert_vector_with_project(id, &[0.1, 0.2, 0.3], None)
+            .expect("insert test vector");
+    }
+
+    fn has_vector_index_warning(warnings: &[SystemWarning]) -> bool {
+        warnings.iter().any(|warning| {
+            warning.source == "vector_index"
+                && warning.message.contains("reindex --from-config --stale")
+        })
+    }
+
     fn insert_drawer_with_project(
         db_path: &Path,
         id: &str,
@@ -6603,6 +6667,28 @@ mod tests {
                 .contains(&("project-b-wing".to_string(), Some("status".to_string()))),
             "detail=full defaults to the CLI --full all-scope breakdown"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mempal_status_warns_when_vector_index_metric_is_stale() {
+        let (_tempdir, db_path, server) = setup_server();
+        recreate_vectors_with_metric(&db_path, "l2");
+
+        let status = server.mempal_status().await.expect("status").0;
+
+        assert!(status.vector_index_stale);
+        assert!(has_vector_index_warning(&status.system_warnings));
+    }
+
+    #[tokio::test]
+    async fn test_mempal_status_omits_vector_index_warning_when_metric_is_cosine() {
+        let (_tempdir, db_path, server) = setup_server();
+        recreate_vectors_with_metric(&db_path, "cosine");
+
+        let status = server.mempal_status().await.expect("status").0;
+
+        assert!(!status.vector_index_stale);
+        assert!(!has_vector_index_warning(&status.system_warnings));
     }
 
     fn insert_knowledge_drawer(
@@ -6879,6 +6965,45 @@ mod tests {
         let response = run_search(&server, "state", Some("other-wing"), None, 5).await;
 
         assert!(response.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mempal_search_warns_when_vector_index_metric_is_stale() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "drawer-1",
+            "stale vector metric search fixture",
+            "mempal",
+            Some("signals"),
+            "/tmp/stale.md",
+            4,
+        );
+        recreate_vectors_with_metric(&db_path, "l2");
+        insert_test_vector(&db_path, "drawer-1");
+
+        let response = run_search(&server, "stale vector metric", None, None, 5).await;
+
+        assert_eq!(response.search_mode, "hybrid");
+        assert!(has_vector_index_warning(&response.system_warnings));
+    }
+
+    #[tokio::test]
+    async fn test_mempal_search_omits_vector_index_warning_when_metric_is_cosine() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "drawer-1",
+            "fresh vector metric search fixture",
+            "mempal",
+            Some("signals"),
+            "/tmp/fresh.md",
+            4,
+        );
+
+        let response = run_search(&server, "fresh vector metric", None, None, 5).await;
+
+        assert!(!has_vector_index_warning(&response.system_warnings));
     }
 
     #[tokio::test]
@@ -8607,6 +8732,24 @@ mod tests {
         assert_eq!(second.drawer_ids, vec![first.drawer_id.clone()]);
         let db = Database::open(&db_path).expect("open db");
         assert_eq!(db.drawer_count().expect("drawer count"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_warns_but_succeeds_when_vector_index_metric_is_stale() {
+        let (_tempdir, db_path, server) = setup_server();
+        recreate_vectors_with_metric(&db_path, "l2");
+
+        let response = ingest_manual(
+            &server,
+            "stale metric ingest still succeeds",
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!response.drawer_id.is_empty());
+        assert!(has_vector_index_warning(&response.system_warnings));
     }
 
     #[tokio::test]

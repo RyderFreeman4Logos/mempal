@@ -1761,6 +1761,8 @@ pub struct StatusResponse {
     pub fork_ext_version: u32,
     pub normalize_version_current: u32,
     pub stale_drawer_count: u64,
+    /// True when drawer_vectors still uses the legacy l2 metric and needs reindex.
+    pub vector_index_stale: bool,
     pub search_decay_mode: String,
     pub drawer_count: i64,
     pub total_compacted_drawers: u64,

@@ -69,6 +69,22 @@ fn insert_status_drawer(db_path: &Path, id: &str, source_type: SourceType) {
     db.insert_drawer(&drawer).expect("insert status drawer");
 }
 
+fn recreate_vectors_with_metric(db_path: &Path, metric: &str) {
+    let db = Database::open(db_path).expect("open db for vector table");
+    db.conn()
+        .execute_batch(&format!(
+            r#"
+            DROP TABLE IF EXISTS drawer_vectors;
+            CREATE VIRTUAL TABLE drawer_vectors USING vec0(
+                id TEXT PRIMARY KEY,
+                embedding FLOAT[3] distance_metric={metric},
+                +project_id TEXT
+            );
+            "#
+        ))
+        .expect("recreate vector table");
+}
+
 #[cfg(feature = "integration")]
 fn setup_home_with_status_endpoints(base_url: &str) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("tempdir");
@@ -328,6 +344,22 @@ fn test_status_command_shows_queue_stats() {
     assert!(stdout.contains("oldest_pending_age_secs:"), "{stdout}");
     assert!(stdout.contains("Source Types:"), "{stdout}");
     assert!(stdout.contains("user_explicit: 1"), "{stdout}");
+}
+
+#[test]
+fn test_status_command_shows_vector_index_stale_flag() {
+    let (home, db_path) = setup_home();
+    recreate_vectors_with_metric(&db_path, "l2");
+
+    let output = Command::new(mempal_bin())
+        .arg("status")
+        .env("HOME", home.path())
+        .output()
+        .expect("run mempal status");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
+    assert!(stdout.contains("vector_index_stale: true"), "{stdout}");
 }
 
 #[test]

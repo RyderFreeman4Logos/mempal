@@ -1029,6 +1029,18 @@ impl Database {
         }
     }
 
+    /// True when the `drawer_vectors` table exists but declares the legacy `l2`
+    /// distance metric instead of `cosine`. In that state broad sqlite-vec KNN
+    /// ranks in the wrong metric space and semantic recall is silently degraded
+    /// until `mempal reindex --from-config --stale` rebuilds the table. False
+    /// when the table is absent (empty store) or already `cosine`.
+    pub fn vector_index_is_stale(&self) -> Result<bool, DbError> {
+        Ok(matches!(
+            self.vector_table_distance_metric()?.as_deref(),
+            Some("l2")
+        ))
+    }
+
     pub fn current_vector_embedder_fingerprint(dim: usize) -> String {
         let config = super::config::ConfigHandle::current();
         config.embed.current_vector_embedder_fingerprint(dim)
@@ -6024,6 +6036,64 @@ mod tests {
             .expect("insert drawer");
         db.insert_vector_with_project(id, &[1.0_f32, 0.0, 0.0], project_id)
             .expect("insert vector");
+    }
+
+    fn recreate_vectors_with_metric(db: &Database, metric_fragment: &str) {
+        db.conn()
+            .execute_batch(&format!(
+                r#"
+                DROP TABLE IF EXISTS drawer_vectors;
+                CREATE VIRTUAL TABLE drawer_vectors USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding FLOAT[3] {metric_fragment}
+                );
+                "#
+            ))
+            .expect("recreate vector table");
+    }
+
+    #[test]
+    fn vector_index_is_stale_detects_l2_metric_tables() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+
+        recreate_vectors_with_metric(&db, "distance_metric=l2");
+
+        assert!(
+            db.vector_index_is_stale()
+                .expect("detect stale vector index")
+        );
+    }
+
+    #[test]
+    fn vector_index_is_stale_ignores_cosine_metric_tables() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+
+        recreate_vectors_with_metric(&db, "distance_metric=cosine");
+
+        assert!(
+            !db.vector_index_is_stale()
+                .expect("detect fresh vector index")
+        );
+    }
+
+    #[test]
+    fn vector_index_is_stale_ignores_missing_vector_table() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+
+        db.conn()
+            .execute_batch("DROP TABLE IF EXISTS drawer_vectors;")
+            .expect("drop vector table");
+
+        assert!(
+            !db.vector_index_is_stale()
+                .expect("detect missing vector index")
+        );
     }
 
     fn active_drawer_project_id(db: &Database, id: &str) -> Option<Option<String>> {
