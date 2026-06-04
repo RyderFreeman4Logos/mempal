@@ -5516,8 +5516,15 @@ async fn reindex_stale_batches(
     // Drawers from batches that failed past the retry cap. They keep no fresh
     // vector (stay stale), so they MUST be excluded from later batch queries:
     // the stale selection re-runs every iteration, and without exclusion it
-    // would keep re-selecting them and the loop would never terminate.
-    let mut skipped_ids: Vec<String> = Vec::new();
+    // would keep re-selecting them and the loop would never terminate. They are
+    // staged in a connection-local TEMP table (excluded via a subquery) instead
+    // of an in-memory list expanded into `NOT IN (?, ?, ...)` placeholders,
+    // whose bind-variable count would overflow SQLITE_MAX_VARIABLE_NUMBER
+    // (32766) on a pathological run and crash the skip-continue (issue #304).
+    ensure_reindex_skipped_table(db).context("failed to create reindex skip table")?;
+    db.conn()
+        .execute_batch(&format!("DELETE FROM {REINDEX_SKIPPED_TABLE};"))
+        .context("failed to reset reindex skip table")?;
     let mut batch_index = 0usize;
     let mut remaining = target.limit;
     loop {
@@ -5525,14 +5532,8 @@ async fn reindex_stale_batches(
         if effective_batch_size == 0 {
             break;
         }
-        let rows = reindex_stale_batch_rows(
-            db,
-            target_fingerprint,
-            effective_batch_size,
-            &target,
-            &skipped_ids,
-        )
-        .context("failed to load stale reindex batch")?;
+        let rows = reindex_stale_batch_rows(db, target_fingerprint, effective_batch_size, &target)
+            .context("failed to load stale reindex batch")?;
         if rows.is_empty() {
             break;
         }
@@ -5563,7 +5564,9 @@ async fn reindex_stale_batches(
                 );
                 skipped_failed_batches += 1;
                 skipped_failed_drawers += rows.len();
-                skipped_ids.extend(rows.iter().map(|row| row.id.clone()));
+                let failed_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+                stage_reindex_skipped_ids(db, &failed_ids)
+                    .context("failed to record skipped drawer ids")?;
                 continue;
             }
         };
@@ -9629,33 +9632,69 @@ fn append_reindex_target_filters(
     }
 }
 
-/// Append an `AND <alias>id NOT IN (...)` clause excluding `exclude_ids`.
-/// Used to drop drawers whose batch already failed past the retry cap this run,
-/// so the stale selection does not re-select them on every iteration.
-fn append_exclude_ids(
-    sql: &mut String,
-    values: &mut Vec<rusqlite::types::Value>,
-    exclude_ids: &[String],
-    alias: &str,
-) {
-    if exclude_ids.is_empty() {
-        return;
+/// Connection-local TEMP table staging the IDs of drawers whose batch failed
+/// past the retry cap during a `reindex --stale` run. They stay stale and MUST
+/// be excluded from every later batch query, or the stale selection (which
+/// re-runs each iteration) would re-select them and loop forever.
+///
+/// Excluding them via a subquery against this TEMP table keeps the stale
+/// query's bind-variable count constant regardless of how many drawers are
+/// skipped. The previous `NOT IN (?, ?, ...)` placeholder expansion grew one
+/// bind variable per skipped drawer, so a pathological run (more than
+/// `SQLITE_MAX_VARIABLE_NUMBER` = 32766 skipped IDs) overflowed the limit and
+/// crashed the graceful skip-continue with "too many SQL variables" — the exact
+/// failure the skip-continue was meant to prevent (issue #304). The table lives
+/// on the reindex loop's connection, so it persists across iterations and is
+/// auto-dropped when the connection closes.
+const REINDEX_SKIPPED_TABLE: &str = "tmp_reindex_skipped";
+
+/// Create the reindex skip TEMP table if absent. Idempotent, so any staging or
+/// query call may invoke it without coordinating with the loop.
+fn ensure_reindex_skipped_table(db: &Database) -> Result<()> {
+    db.conn()
+        .execute_batch(&format!(
+            "CREATE TEMP TABLE IF NOT EXISTS {REINDEX_SKIPPED_TABLE} (id TEXT PRIMARY KEY);"
+        ))
+        .context("failed to create reindex skip table")?;
+    Ok(())
+}
+
+/// Stage drawer IDs into the skip TEMP table (idempotent upsert). Inserts
+/// row-by-row inside a single transaction so the statement's bind-variable
+/// count stays constant no matter how many IDs are staged — a multi-row
+/// `VALUES (?), (?), ...` insert would re-introduce the variable-limit failure
+/// this mechanism exists to avoid (issue #304).
+fn stage_reindex_skipped_ids(db: &Database, ids: &[String]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
     }
-    let prefix = if alias.is_empty() {
-        String::new()
-    } else {
-        format!("{alias}.")
-    };
-    let placeholders = std::iter::repeat_n("?", exclude_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    sql.push_str(&format!(" AND {prefix}id NOT IN ({placeholders})"));
-    values.extend(
-        exclude_ids
-            .iter()
-            .cloned()
-            .map(rusqlite::types::Value::Text),
-    );
+    ensure_reindex_skipped_table(db)?;
+    let conn = db.conn();
+    conn.execute_batch("BEGIN;")
+        .context("failed to begin reindex skip staging")?;
+    let result = (|| -> Result<()> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "INSERT OR IGNORE INTO {REINDEX_SKIPPED_TABLE} (id) VALUES (?1)"
+            ))
+            .context("failed to prepare reindex skip insert")?;
+        for id in ids {
+            stmt.execute([id])
+                .context("failed to stage skipped drawer id")?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")
+                .context("failed to commit reindex skip staging")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
 }
 
 fn reindex_stale_batch_rows(
@@ -9663,9 +9702,12 @@ fn reindex_stale_batch_rows(
     target_fingerprint: &str,
     batch_size: usize,
     target: &ReindexVectorTarget,
-    exclude_ids: &[String],
 ) -> Result<Vec<ReindexRow>> {
     let limit = i64::try_from(batch_size).context("batch size is too large")?;
+    // The skip-exclusion subquery below references this connection-local TEMP
+    // table; create it lazily so the query never fails with "no such table"
+    // even when no batch has been skipped yet (issue #304).
+    ensure_reindex_skipped_table(db)?;
     let vectors_exist = db
         .conn()
         .query_row(
@@ -9703,7 +9745,9 @@ fn reindex_stale_batch_rows(
             rusqlite::types::Value::Text(target_fingerprint.to_string()),
         ];
         append_reindex_target_filters(&mut sql, &mut values, target, "d");
-        append_exclude_ids(&mut sql, &mut values, exclude_ids, "d");
+        sql.push_str(&format!(
+            " AND d.id NOT IN (SELECT id FROM {REINDEX_SKIPPED_TABLE})"
+        ));
         sql.push_str(
             r#"
                 ORDER BY source_path ASC, chunk_index ASC, d.id ASC
@@ -9742,7 +9786,9 @@ fn reindex_stale_batch_rows(
         .to_string();
         let mut values = Vec::new();
         append_reindex_target_filters(&mut sql, &mut values, target, "");
-        append_exclude_ids(&mut sql, &mut values, exclude_ids, "");
+        sql.push_str(&format!(
+            " AND id NOT IN (SELECT id FROM {REINDEX_SKIPPED_TABLE})"
+        ));
         sql.push_str(
             r#"
                 ORDER BY source_path ASC, chunk_index ASC, id ASC
@@ -11210,5 +11256,113 @@ mod tests {
     fn char_safe_preview_returns_input_unchanged_when_short() {
         let content = "短文本"; // 3 chars, well under the limit
         assert_eq!(char_safe_preview(content, 300), content);
+    }
+
+    /// Issue #304: failed-batch drawer IDs were expanded into
+    /// `NOT IN (?, ?, ...)` placeholders, so a `reindex --stale` run that
+    /// skipped more than SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (32766) drawers'
+    /// worth of IDs blew the bind-variable limit and crashed the graceful
+    /// skip-continue with "too many SQL variables". The TEMP-table exclusion
+    /// uses a subquery (zero bind variables for the skip set), so an arbitrarily
+    /// large skip set must now query cleanly. This drives the with-vectors
+    /// (`d.` alias) branch of the stale selection.
+    #[test]
+    fn reindex_stale_skip_exclusion_survives_more_than_sqlite_var_limit() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+
+        // A live drawer that already has a vector but no reindex metadata, so it
+        // is stale for any target fingerprint and must be re-selected after the
+        // skipped IDs are excluded.
+        db.insert_drawer_with_project(
+            &Drawer {
+                id: "live-1".to_string(),
+                content: "keep me".to_string(),
+                wing: "test".to_string(),
+                room: Some("reindex".to_string()),
+                source_file: Some("fixtures/source.txt".to_string()),
+                source_type: SourceType::AgentInference,
+                added_at: "1713000000".to_string(),
+                chunk_index: Some(0),
+                ..Drawer::default()
+            },
+            Some("default"),
+        )
+        .expect("insert live drawer");
+        db.insert_vector_with_project("live-1", &[0.1_f32; 8], Some("default"))
+            .expect("insert live vector");
+
+        // Stage comfortably more skipped IDs than SQLite's default
+        // SQLITE_MAX_VARIABLE_NUMBER (32766). The old `NOT IN (?, ?, ...)`
+        // expansion emitted one bind variable per skipped ID, so this many IDs
+        // overflowed the limit and aborted the query with "too many SQL
+        // variables"; the TEMP-table subquery binds nothing for the skip set.
+        let over_limit: usize = 32_766 + 8_000;
+        let skipped: Vec<String> = (0..over_limit).map(|i| format!("skip-{i}")).collect();
+        stage_reindex_skipped_ids(&db, &skipped).expect("stage skipped ids");
+
+        let target = ReindexVectorTarget {
+            drawer_ids: Vec::new(),
+            project_id: None,
+            wing: None,
+            room: None,
+            limit: None,
+        };
+
+        // Must NOT error with "too many SQL variables".
+        let rows = reindex_stale_batch_rows(&db, "target-fingerprint", 512, &target)
+            .expect("stale batch query must not hit the SQLite variable limit");
+
+        assert!(
+            rows.iter().any(|row| row.id == "live-1"),
+            "the live stale drawer must still be selected"
+        );
+        assert!(
+            rows.iter().all(|row| !row.id.starts_with("skip-")),
+            "skipped drawers must remain excluded for the rest of the run"
+        );
+    }
+
+    /// A clean `reindex --stale` (zero skipped drawers) must select every stale
+    /// drawer — the #304 TEMP-table exclusion must not change clean-run output.
+    /// This drives the no-vectors branch of the stale selection.
+    #[test]
+    fn reindex_stale_batch_rows_returns_all_when_nothing_skipped() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        for i in 0i64..3 {
+            db.insert_drawer_with_project(
+                &Drawer {
+                    id: format!("d-{i}"),
+                    content: format!("content {i}"),
+                    wing: "test".to_string(),
+                    room: Some("reindex".to_string()),
+                    source_file: Some("fixtures/source.txt".to_string()),
+                    source_type: SourceType::AgentInference,
+                    added_at: format!("171300000{i}"),
+                    chunk_index: Some(i),
+                    ..Drawer::default()
+                },
+                Some("default"),
+            )
+            .expect("insert drawer");
+        }
+
+        let target = ReindexVectorTarget {
+            drawer_ids: Vec::new(),
+            project_id: None,
+            wing: None,
+            room: None,
+            limit: None,
+        };
+
+        let rows = reindex_stale_batch_rows(&db, "target-fingerprint", 512, &target)
+            .expect("clean stale batch query");
+
+        assert_eq!(
+            rows.len(),
+            3,
+            "all stale drawers must be selected when nothing is skipped"
+        );
     }
 }
