@@ -141,6 +141,57 @@ fn test_fork_ext_v16_to_v17_adds_drawers_source_root_idempotently() {
 }
 
 #[test]
+fn test_fork_ext_v17_to_v18_adds_xurl_vector_metadata_idempotently() {
+    let conn = Connection::open_in_memory().expect("open sqlite connection");
+    let schema_version = current_schema_version();
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE fork_ext_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO fork_ext_meta (key, value) VALUES ('fork_ext_version', '17');
+        CREATE TABLE conversation_turns (
+            id TEXT PRIMARY KEY
+        );
+        CREATE TABLE conversation_turn_vectors (
+            turn_id     TEXT NOT NULL REFERENCES conversation_turns(id),
+            chunk_index INTEGER NOT NULL DEFAULT 0,
+            vector      BLOB NOT NULL,
+            PRIMARY KEY (turn_id, chunk_index)
+        );
+        PRAGMA user_version = {schema_version};
+        "#
+    ))
+    .expect("create v17 xurl vector schema");
+
+    apply_fork_ext_migrations_to(&conn, 18).expect("first v18 migration");
+    apply_fork_ext_migrations_to(&conn, 18).expect("second v18 migration");
+
+    let columns = table_columns(&conn, "conversation_turn_vectors");
+    assert!(has_column(&columns, "embedder_fingerprint", "TEXT"));
+    assert!(has_column(&columns, "dim", "INTEGER"));
+    assert!(has_column(&columns, "index_version", "TEXT"));
+    assert_eq!(
+        columns
+            .iter()
+            .filter(|(name, _)| name == "embedder_fingerprint")
+            .count(),
+        1
+    );
+    assert_eq!(columns.iter().filter(|(name, _)| name == "dim").count(), 1);
+    assert_eq!(
+        columns
+            .iter()
+            .filter(|(name, _)| name == "index_version")
+            .count(),
+        1
+    );
+    let version = read_fork_ext_version(&conn).expect("read fork-ext version");
+    assert_eq!(version, 18);
+}
+
+#[test]
 fn test_fork_ext_meta_table_exists_after_init() {
     let (_tmp, _db_path, db) = new_test_db();
 

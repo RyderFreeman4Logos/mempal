@@ -1,9 +1,12 @@
-use rusqlite::{Connection, params};
+use std::collections::{HashMap, HashSet};
+
+use rusqlite::{Connection, OptionalExtension, Params, Statement, params};
 
 use crate::core::config::ChunkerConfig;
-use crate::core::db::Database;
+use crate::core::db::{CURRENT_VECTOR_INDEX_VERSION, Database};
 use crate::embed::Embedder;
 use crate::ingest::chunk::chunk_text_token_aware;
+use crate::xurl::store::UnindexedTurnSummary;
 use crate::xurl::{XurlError, XurlResult};
 
 /// Number of turns collected per outer window before issuing the embed pass.
@@ -26,15 +29,46 @@ pub struct EmbedStats {
     pub turns_processed: usize,
     pub embedded: usize,
     pub chunks_total: usize,
+    pub skipped_stale_content: usize,
 }
 
 /// Which unindexed turns an embed pass should cover.
 enum EmbedScope<'a> {
     /// Every turn in the table that still lacks a vector (bulk / backlog drain).
-    All,
+    MissingAll { fingerprint: Option<&'a str> },
     /// Only turns whose id is in this set and that still lack a vector
     /// (e.g. the turns from a single freshly-ingested file).
-    TurnIds(&'a [String]),
+    MissingTurnIds {
+        ids: &'a [String],
+        fingerprint: Option<&'a str>,
+    },
+    /// Every turn whose vector metadata does not match the current embedder.
+    StaleAll { fingerprint: &'a str },
+    /// Every turn, regardless of existing vector state.
+    ForceAll { fingerprint: &'a str },
+}
+
+#[derive(Clone, Copy)]
+enum WriteMode {
+    InsertMissing,
+    ReplaceExisting,
+}
+
+#[derive(Clone, Copy)]
+struct VectorMetadata<'a> {
+    fingerprint: Option<&'a str>,
+    dim: Option<usize>,
+    index_version: Option<&'a str>,
+}
+
+struct TurnCandidate {
+    id: String,
+    content: String,
+}
+
+#[derive(Debug, Default)]
+struct VectorWriteStats {
+    skipped_stale_content: usize,
 }
 
 /// Serialize a float vector as little-endian bytes for BLOB storage.
@@ -57,7 +91,31 @@ pub async fn embed_unindexed_turns<E: Embedder + ?Sized>(
     embedder: &E,
     progress_fn: Option<&dyn Fn(usize, usize)>,
 ) -> XurlResult<EmbedStats> {
-    embed_turns(db, embedder, EmbedScope::All, progress_fn).await
+    embed_turns(
+        db,
+        embedder,
+        EmbedScope::MissingAll { fingerprint: None },
+        progress_fn,
+    )
+    .await
+}
+
+/// Embed every turn that lacks a vector and stamp current vector metadata.
+pub async fn embed_unindexed_turns_with_fingerprint<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    fingerprint: &str,
+    progress_fn: Option<&dyn Fn(usize, usize)>,
+) -> XurlResult<EmbedStats> {
+    embed_turns(
+        db,
+        embedder,
+        EmbedScope::MissingAll {
+            fingerprint: Some(fingerprint),
+        },
+        progress_fn,
+    )
+    .await
 }
 
 /// Embed only the turns in `turn_ids` that still lack a vector.
@@ -71,7 +129,69 @@ pub async fn embed_unindexed_turns_scoped<E: Embedder + ?Sized>(
     turn_ids: &[String],
     progress_fn: Option<&dyn Fn(usize, usize)>,
 ) -> XurlResult<EmbedStats> {
-    embed_turns(db, embedder, EmbedScope::TurnIds(turn_ids), progress_fn).await
+    embed_turns(
+        db,
+        embedder,
+        EmbedScope::MissingTurnIds {
+            ids: turn_ids,
+            fingerprint: None,
+        },
+        progress_fn,
+    )
+    .await
+}
+
+/// Embed only the scoped turns lacking vectors and stamp current vector metadata.
+pub async fn embed_unindexed_turns_scoped_with_fingerprint<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    turn_ids: &[String],
+    fingerprint: &str,
+    progress_fn: Option<&dyn Fn(usize, usize)>,
+) -> XurlResult<EmbedStats> {
+    embed_turns(
+        db,
+        embedder,
+        EmbedScope::MissingTurnIds {
+            ids: turn_ids,
+            fingerprint: Some(fingerprint),
+        },
+        progress_fn,
+    )
+    .await
+}
+
+/// Re-embed turns whose stored vector metadata does not match `fingerprint`,
+/// the embedder dimension, and the current xurl vector index version.
+pub async fn embed_stale_turns<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    fingerprint: &str,
+    progress_fn: Option<&dyn Fn(usize, usize)>,
+) -> XurlResult<EmbedStats> {
+    embed_turns(
+        db,
+        embedder,
+        EmbedScope::StaleAll { fingerprint },
+        progress_fn,
+    )
+    .await
+}
+
+/// Rebuild vectors for every stored turn.
+pub async fn embed_all_turns<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    fingerprint: &str,
+    progress_fn: Option<&dyn Fn(usize, usize)>,
+) -> XurlResult<EmbedStats> {
+    embed_turns(
+        db,
+        embedder,
+        EmbedScope::ForceAll { fingerprint },
+        progress_fn,
+    )
+    .await
 }
 
 /// Shared embed driver: collect the unindexed turns in `scope`, then embed and
@@ -87,42 +207,75 @@ async fn embed_turns<E: Embedder + ?Sized>(
     conn.execute_batch("PRAGMA busy_timeout = 5000;")
         .map_err(XurlError::Database)?;
 
-    let unindexed = match scope {
-        EmbedScope::All => collect_unindexed_all(conn)?,
-        EmbedScope::TurnIds(ids) => collect_unindexed_scoped(conn, ids)?,
+    let dim = embedder.dimensions();
+    let candidates = match scope {
+        EmbedScope::MissingAll { .. } => collect_unindexed_all(conn)?,
+        EmbedScope::MissingTurnIds { ids, .. } => collect_unindexed_scoped(conn, ids)?,
+        EmbedScope::StaleAll { fingerprint } => collect_stale_all(conn, fingerprint, dim)?,
+        EmbedScope::ForceAll { .. } => collect_all_turns(conn)?,
     };
 
-    if unindexed.is_empty() {
+    if candidates.is_empty() {
         return Ok(EmbedStats::default());
     }
 
-    let total = unindexed.len();
+    let total = candidates.len();
     let config = ChunkerConfig::default();
     let mut stats = EmbedStats::default();
+    let metadata = match scope {
+        EmbedScope::MissingAll { fingerprint } | EmbedScope::MissingTurnIds { fingerprint, .. } => {
+            match fingerprint {
+                Some(fingerprint) => VectorMetadata {
+                    fingerprint: Some(fingerprint),
+                    dim: Some(dim),
+                    index_version: Some(CURRENT_VECTOR_INDEX_VERSION),
+                },
+                None => VectorMetadata {
+                    fingerprint: None,
+                    dim: None,
+                    index_version: None,
+                },
+            }
+        }
+        EmbedScope::StaleAll { fingerprint } | EmbedScope::ForceAll { fingerprint } => {
+            VectorMetadata {
+                fingerprint: Some(fingerprint),
+                dim: Some(dim),
+                index_version: Some(CURRENT_VECTOR_INDEX_VERSION),
+            }
+        }
+    };
+    let write_mode = match scope {
+        EmbedScope::MissingAll { .. } | EmbedScope::MissingTurnIds { .. } => {
+            WriteMode::InsertMissing
+        }
+        EmbedScope::StaleAll { .. } | EmbedScope::ForceAll { .. } => WriteMode::ReplaceExisting,
+    };
 
-    for batch in unindexed.chunks(EMBED_BATCH_SIZE) {
+    for batch in candidates.chunks(EMBED_BATCH_SIZE) {
         // Phase 1: embed the whole window with no write transaction open.
         let rows = embed_batch_turns(embedder, batch, &config, &mut stats).await?;
 
         // Phase 2: bulk-insert all collected vectors under a single short transaction.
-        conn.execute_batch("BEGIN").map_err(XurlError::Database)?;
-        let insert_result = (|| -> XurlResult<()> {
-            for (turn_id, chunk_index, blob) in &rows {
-                conn.execute(
-                    "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) \
-                     VALUES (?1, ?2, ?3) \
-                     ON CONFLICT(turn_id, chunk_index) DO NOTHING",
-                    params![turn_id, *chunk_index as i64, blob],
-                )
-                .map_err(XurlError::Database)?;
-            }
+        // BEGIN IMMEDIATE pairs the content recheck with vector replacement under SQLite's
+        // write lock. If ingest commits first, the re-SELECT below sees new content and skips
+        // the old vector; if this commit wins first, the later ingest update deletes it and
+        // the missing-vector embed path rebuilds from fresh content.
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(XurlError::Database)?;
+        let insert_result = (|| -> XurlResult<VectorWriteStats> {
+            let write_stats = write_vector_rows(conn, batch, &rows, write_mode, metadata)?;
             conn.execute_batch("COMMIT").map_err(XurlError::Database)?;
-            Ok(())
+            Ok(write_stats)
         })();
-        if let Err(e) = insert_result {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
-        }
+        let write_stats = match insert_result {
+            Ok(write_stats) => write_stats,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        };
+        stats.skipped_stale_content += write_stats.skipped_stale_content;
 
         if let Some(f) = progress_fn {
             f(stats.turns_processed, total);
@@ -132,8 +285,44 @@ async fn embed_turns<E: Embedder + ?Sized>(
     Ok(stats)
 }
 
+pub fn summarize_stale_turns(
+    conn: &Connection,
+    fingerprint: &str,
+    dim: usize,
+) -> XurlResult<UnindexedTurnSummary> {
+    let dim = dim as i64;
+    summarize_candidates(
+        conn,
+        stale_where_clause(),
+        &[&dim, &fingerprint, &CURRENT_VECTOR_INDEX_VERSION],
+    )
+}
+
+pub fn summarize_all_turns(conn: &Connection) -> XurlResult<UnindexedTurnSummary> {
+    summarize_candidates(conn, "1 = 1", &[])
+}
+
+fn summarize_candidates(
+    conn: &Connection,
+    where_clause: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> XurlResult<UnindexedTurnSummary> {
+    let sql = format!(
+        "SELECT COUNT(DISTINCT ct.session_id), COUNT(*) \
+         FROM conversation_turns ct \
+         WHERE {where_clause}"
+    );
+    conn.query_row(&sql, params, |row| {
+        Ok(UnindexedTurnSummary {
+            threads: row.get(0)?,
+            turns: row.get(1)?,
+        })
+    })
+    .map_err(XurlError::Database)
+}
+
 /// Collect `(id, content)` for every turn lacking a vector.
-fn collect_unindexed_all(conn: &Connection) -> XurlResult<Vec<(String, String)>> {
+fn collect_unindexed_all(conn: &Connection) -> XurlResult<Vec<TurnCandidate>> {
     let mut stmt = conn
         .prepare(
             "SELECT ct.id, ct.content \
@@ -145,7 +334,10 @@ fn collect_unindexed_all(conn: &Connection) -> XurlResult<Vec<(String, String)>>
 
     let rows = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok(TurnCandidate {
+                id: row.get(0)?,
+                content: row.get(1)?,
+            })
         })
         .map_err(XurlError::Database)?;
 
@@ -156,6 +348,165 @@ fn collect_unindexed_all(conn: &Connection) -> XurlResult<Vec<(String, String)>>
     Ok(out)
 }
 
+fn collect_all_turns(conn: &Connection) -> XurlResult<Vec<TurnCandidate>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ct.id, ct.content \
+             FROM conversation_turns ct \
+             ORDER BY ct.timestamp_epoch ASC, ct.id ASC",
+        )
+        .map_err(XurlError::Database)?;
+
+    collect_turn_rows(&mut stmt, [])
+}
+
+fn collect_stale_all(
+    conn: &Connection,
+    fingerprint: &str,
+    dim: usize,
+) -> XurlResult<Vec<TurnCandidate>> {
+    let sql = format!(
+        "SELECT ct.id, ct.content \
+         FROM conversation_turns ct \
+         WHERE {} \
+         ORDER BY ct.timestamp_epoch ASC, ct.id ASC",
+        stale_where_clause()
+    );
+    let mut stmt = conn.prepare(&sql).map_err(XurlError::Database)?;
+    collect_turn_rows(
+        &mut stmt,
+        params![dim as i64, fingerprint, CURRENT_VECTOR_INDEX_VERSION],
+    )
+}
+
+fn stale_where_clause() -> &'static str {
+    "NOT EXISTS ( \
+         SELECT 1 FROM conversation_turn_vectors ctv_any \
+         WHERE ctv_any.turn_id = ct.id \
+     ) \
+     OR EXISTS ( \
+         SELECT 1 FROM conversation_turn_vectors ctv_stale \
+         WHERE ctv_stale.turn_id = ct.id \
+           AND ( \
+               ctv_stale.dim IS NULL \
+               OR ctv_stale.dim != ?1 \
+               OR ctv_stale.embedder_fingerprint IS NULL \
+               OR ctv_stale.embedder_fingerprint != ?2 \
+               OR ctv_stale.index_version IS NULL \
+               OR ctv_stale.index_version != ?3 \
+           ) \
+     )"
+}
+
+fn collect_turn_rows<P>(stmt: &mut Statement<'_>, params: P) -> XurlResult<Vec<TurnCandidate>>
+where
+    P: Params,
+{
+    let rows = stmt
+        .query_map(params, |row| {
+            Ok(TurnCandidate {
+                id: row.get(0)?,
+                content: row.get(1)?,
+            })
+        })
+        .map_err(XurlError::Database)?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(XurlError::Database)?);
+    }
+    Ok(out)
+}
+
+fn write_vector_rows(
+    conn: &Connection,
+    candidates: &[TurnCandidate],
+    rows: &[(String, usize, Vec<u8>)],
+    mode: WriteMode,
+    metadata: VectorMetadata<'_>,
+) -> XurlResult<VectorWriteStats> {
+    let expected_content_by_turn: HashMap<&str, &str> = candidates
+        .iter()
+        .map(|candidate| (candidate.id.as_str(), candidate.content.as_str()))
+        .collect();
+    let mut verified_turns = HashSet::new();
+    let mut skipped_turns = HashSet::new();
+    let mut stats = VectorWriteStats::default();
+    for (turn_id, chunk_index, blob) in rows {
+        if skipped_turns.contains(turn_id) {
+            continue;
+        }
+        if verified_turns.insert(turn_id.clone()) {
+            let Some(expected_content) = expected_content_by_turn.get(turn_id.as_str()) else {
+                return Err(XurlError::Parse(format!(
+                    "missing collected content token for turn {turn_id}"
+                )));
+            };
+            if !turn_content_is_current(conn, turn_id, expected_content)? {
+                skipped_turns.insert(turn_id.clone());
+                stats.skipped_stale_content += 1;
+                continue;
+            }
+            if matches!(mode, WriteMode::ReplaceExisting) {
+                conn.execute(
+                    "DELETE FROM conversation_turn_vectors WHERE turn_id = ?1",
+                    params![turn_id],
+                )
+                .map_err(XurlError::Database)?;
+            }
+        }
+
+        let dim = metadata.dim.map(|value| value as i64);
+        let sql = match mode {
+            WriteMode::InsertMissing => {
+                "INSERT INTO conversation_turn_vectors \
+                 (turn_id, chunk_index, vector, embedder_fingerprint, dim, index_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(turn_id, chunk_index) DO NOTHING"
+            }
+            WriteMode::ReplaceExisting => {
+                "INSERT INTO conversation_turn_vectors \
+                 (turn_id, chunk_index, vector, embedder_fingerprint, dim, index_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(turn_id, chunk_index) DO UPDATE SET \
+                    vector = excluded.vector, \
+                    embedder_fingerprint = excluded.embedder_fingerprint, \
+                    dim = excluded.dim, \
+                    index_version = excluded.index_version"
+            }
+        };
+        conn.execute(
+            sql,
+            params![
+                turn_id,
+                *chunk_index as i64,
+                blob,
+                metadata.fingerprint,
+                dim,
+                metadata.index_version
+            ],
+        )
+        .map_err(XurlError::Database)?;
+    }
+    Ok(stats)
+}
+
+fn turn_content_is_current(
+    conn: &Connection,
+    turn_id: &str,
+    expected_content: &str,
+) -> XurlResult<bool> {
+    let current = conn
+        .query_row(
+            "SELECT content FROM conversation_turns WHERE id = ?1",
+            params![turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(XurlError::Database)?;
+    Ok(current.as_deref() == Some(expected_content))
+}
+
 /// Collect `(id, content)` for the turns in `turn_ids` that lack a vector.
 ///
 /// IDs are bound in batches of `SCOPE_ID_BATCH` to stay under SQLite's
@@ -163,7 +514,7 @@ fn collect_unindexed_all(conn: &Connection) -> XurlResult<Vec<(String, String)>>
 fn collect_unindexed_scoped(
     conn: &Connection,
     turn_ids: &[String],
-) -> XurlResult<Vec<(String, String)>> {
+) -> XurlResult<Vec<TurnCandidate>> {
     let mut out = Vec::new();
     for id_batch in turn_ids.chunks(SCOPE_ID_BATCH) {
         let placeholders = vec!["?"; id_batch.len()].join(",");
@@ -178,7 +529,10 @@ fn collect_unindexed_scoped(
             id_batch.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let rows = stmt
             .query_map(param_refs.as_slice(), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok(TurnCandidate {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                })
             })
             .map_err(XurlError::Database)?;
         for row in rows {
@@ -198,7 +552,7 @@ fn collect_unindexed_scoped(
 /// used here; the caller writes the returned rows inside a transaction.
 async fn embed_batch_turns<E: Embedder + ?Sized>(
     embedder: &E,
-    batch: &[(String, String)],
+    batch: &[TurnCandidate],
     config: &ChunkerConfig,
     stats: &mut EmbedStats,
 ) -> XurlResult<Vec<(String, usize, Vec<u8>)>> {
@@ -207,12 +561,13 @@ async fn embed_batch_turns<E: Embedder + ?Sized>(
     let mut all_chunks: Vec<String> = Vec::new();
     let mut chunk_map: Vec<(String, usize)> = Vec::new();
 
-    for (turn_id, content) in batch {
-        let chunks = chunk_text_token_aware(content, config, embedder, Some(turn_id));
+    for candidate in batch {
+        let chunks =
+            chunk_text_token_aware(&candidate.content, config, embedder, Some(&candidate.id));
         stats.chunks_total += chunks.len();
         stats.turns_processed += 1;
         for (chunk_index, chunk) in chunks.into_iter().enumerate() {
-            chunk_map.push((turn_id.clone(), chunk_index));
+            chunk_map.push((candidate.id.clone(), chunk_index));
             all_chunks.push(chunk);
         }
     }

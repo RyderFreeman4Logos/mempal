@@ -197,68 +197,86 @@ fn parse_provenance(s: &str) -> Provenance {
 pub fn insert_turns(conn: &Connection, turns: &[RawTurn]) -> XurlResult<InsertStats> {
     let mut stats = InsertStats::default();
 
-    for turn in turns {
-        let tool = turn.tool.as_str();
-        let existing: Option<(String, String)> = conn
-            .query_row(
-                "SELECT id, content FROM conversation_turns \
-                 WHERE session_id=?1 AND tool=?2 AND turn_index=?3",
-                params![&turn.session_id, tool, turn.turn_index],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(XurlError::Database)?;
+    conn.execute_batch("SAVEPOINT xurl_insert_turns")
+        .map_err(XurlError::Database)?;
+    let insert_result = (|| -> XurlResult<()> {
+        for turn in turns {
+            let tool = turn.tool.as_str();
+            let existing: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT id, content FROM conversation_turns \
+                     WHERE session_id=?1 AND tool=?2 AND turn_index=?3",
+                    params![&turn.session_id, tool, turn.turn_index],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(XurlError::Database)?;
 
-        match existing {
-            None => {
-                let id = generate_turn_id(&turn.session_id, tool, turn.turn_index);
-                conn.execute(
-                    "INSERT INTO conversation_turns \
-                     (id, session_id, tool, turn_index, role, content, timestamp_epoch, \
-                      token_count, project_path, git_branch, is_csa_delegated, provenance) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                    params![
-                        id,
-                        &turn.session_id,
-                        tool,
-                        turn.turn_index,
-                        turn.role.as_str(),
-                        &turn.content,
-                        turn.timestamp_epoch,
-                        Option::<i64>::None,
-                        &turn.project_path,
-                        &turn.git_branch,
-                        turn.is_csa_delegated as i64,
-                        turn.provenance.as_str(),
-                    ],
-                )
-                .map_err(XurlError::Database)?;
-                stats.inserted += 1;
-            }
-            Some((_, ref existing_content)) if existing_content == &turn.content => {
-                stats.skipped += 1;
-            }
-            Some((existing_id, _)) => {
-                conn.execute(
-                    "UPDATE conversation_turns SET \
-                     content=?2, timestamp_epoch=?3, token_count=?4, \
-                     project_path=?5, git_branch=?6, is_csa_delegated=?7, provenance=?8 \
-                     WHERE id=?1",
-                    params![
-                        existing_id,
-                        &turn.content,
-                        turn.timestamp_epoch,
-                        Option::<i64>::None,
-                        &turn.project_path,
-                        &turn.git_branch,
-                        turn.is_csa_delegated as i64,
-                        turn.provenance.as_str(),
-                    ],
-                )
-                .map_err(XurlError::Database)?;
-                stats.updated += 1;
+            match existing {
+                None => {
+                    let id = generate_turn_id(&turn.session_id, tool, turn.turn_index);
+                    conn.execute(
+                        "INSERT INTO conversation_turns \
+                         (id, session_id, tool, turn_index, role, content, timestamp_epoch, \
+                          token_count, project_path, git_branch, is_csa_delegated, provenance) \
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                        params![
+                            id,
+                            &turn.session_id,
+                            tool,
+                            turn.turn_index,
+                            turn.role.as_str(),
+                            &turn.content,
+                            turn.timestamp_epoch,
+                            Option::<i64>::None,
+                            &turn.project_path,
+                            &turn.git_branch,
+                            turn.is_csa_delegated as i64,
+                            turn.provenance.as_str(),
+                        ],
+                    )
+                    .map_err(XurlError::Database)?;
+                    stats.inserted += 1;
+                }
+                Some((_, ref existing_content)) if existing_content == &turn.content => {
+                    stats.skipped += 1;
+                }
+                Some((existing_id, _)) => {
+                    conn.execute(
+                        "UPDATE conversation_turns SET \
+                         content=?2, timestamp_epoch=?3, token_count=?4, \
+                         project_path=?5, git_branch=?6, is_csa_delegated=?7, provenance=?8 \
+                         WHERE id=?1",
+                        params![
+                            existing_id,
+                            &turn.content,
+                            turn.timestamp_epoch,
+                            Option::<i64>::None,
+                            &turn.project_path,
+                            &turn.git_branch,
+                            turn.is_csa_delegated as i64,
+                            turn.provenance.as_str(),
+                        ],
+                    )
+                    .map_err(XurlError::Database)?;
+                    conn.execute(
+                        "DELETE FROM conversation_turn_vectors WHERE turn_id = ?1",
+                        params![existing_id],
+                    )
+                    .map_err(XurlError::Database)?;
+                    stats.updated += 1;
+                }
             }
         }
+
+        conn.execute_batch("RELEASE xurl_insert_turns")
+            .map_err(XurlError::Database)?;
+        Ok(())
+    })();
+
+    if let Err(err) = insert_result {
+        let _ = conn.execute_batch("ROLLBACK TO xurl_insert_turns; RELEASE xurl_insert_turns;");
+        return Err(err);
     }
 
     Ok(stats)

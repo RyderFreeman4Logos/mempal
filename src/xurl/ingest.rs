@@ -16,6 +16,11 @@ type ParsedCb<'a> = Option<&'a dyn Fn(&str, usize)>;
 /// Callback invoked after each embed batch: `(done, total)`.
 type EmbedCb<'a> = Option<&'a dyn Fn(usize, usize)>;
 
+pub struct IngestCallbacks<'a> {
+    pub on_file_parsed: ParsedCb<'a>,
+    pub on_embed_progress: EmbedCb<'a>,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct IngestStats {
     pub turns_parsed: usize,
@@ -122,15 +127,79 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
     on_file_parsed: ParsedCb<'_>,
     on_embed_progress: EmbedCb<'_>,
 ) -> XurlResult<IngestStats> {
+    ingest_file_inner(
+        db,
+        embedder,
+        path,
+        tool,
+        session_id_override,
+        None,
+        IngestCallbacks {
+            on_file_parsed,
+            on_embed_progress,
+        },
+    )
+    .await
+}
+
+pub async fn ingest_file_with_vector_fingerprint<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    path: &Path,
+    tool: Tool,
+    session_id_override: Option<&str>,
+    vector_fingerprint: &str,
+    callbacks: IngestCallbacks<'_>,
+) -> XurlResult<IngestStats> {
+    ingest_file_inner(
+        db,
+        embedder,
+        path,
+        tool,
+        session_id_override,
+        Some(vector_fingerprint),
+        callbacks,
+    )
+    .await
+}
+
+async fn ingest_file_inner<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    path: &Path,
+    tool: Tool,
+    session_id_override: Option<&str>,
+    vector_fingerprint: Option<&str>,
+    callbacks: IngestCallbacks<'_>,
+) -> XurlResult<IngestStats> {
     let (filename, turns_parsed, insert_stats, turn_ids) =
         parse_and_store_file(db, path, tool, session_id_override)?;
-    if let Some(f) = on_file_parsed {
+    if let Some(f) = callbacks.on_file_parsed {
         f(&filename, turns_parsed);
     }
     // Scope the embed pass to just this file's turns so a single-file ingest
     // returns promptly instead of draining the entire historical backlog.
-    let embed_stats =
-        embed::embed_unindexed_turns_scoped(db, embedder, &turn_ids, on_embed_progress).await?;
+    let embed_stats = match vector_fingerprint {
+        Some(fingerprint) => {
+            embed::embed_unindexed_turns_scoped_with_fingerprint(
+                db,
+                embedder,
+                &turn_ids,
+                fingerprint,
+                callbacks.on_embed_progress,
+            )
+            .await?
+        }
+        None => {
+            embed::embed_unindexed_turns_scoped(
+                db,
+                embedder,
+                &turn_ids,
+                callbacks.on_embed_progress,
+            )
+            .await?
+        }
+    };
 
     Ok(IngestStats {
         turns_parsed,
@@ -153,6 +222,36 @@ pub async fn ingest_all<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,
     cfg: &AutoScanConfig,
+    on_file_parsed: ParsedCb<'_>,
+    on_embed_progress: EmbedCb<'_>,
+) -> XurlResult<IngestStats> {
+    ingest_all_inner(db, embedder, cfg, None, on_file_parsed, on_embed_progress).await
+}
+
+pub async fn ingest_all_with_vector_fingerprint<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    cfg: &AutoScanConfig,
+    vector_fingerprint: &str,
+    on_file_parsed: ParsedCb<'_>,
+    on_embed_progress: EmbedCb<'_>,
+) -> XurlResult<IngestStats> {
+    ingest_all_inner(
+        db,
+        embedder,
+        cfg,
+        Some(vector_fingerprint),
+        on_file_parsed,
+        on_embed_progress,
+    )
+    .await
+}
+
+async fn ingest_all_inner<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    cfg: &AutoScanConfig,
+    vector_fingerprint: Option<&str>,
     on_file_parsed: ParsedCb<'_>,
     on_embed_progress: EmbedCb<'_>,
 ) -> XurlResult<IngestStats> {
@@ -208,7 +307,18 @@ pub async fn ingest_all<E: Embedder + ?Sized>(
     }
 
     // Phase 2: embed all unindexed turns in one batched pass.
-    let embed_stats = embed::embed_unindexed_turns(db, embedder, on_embed_progress).await?;
+    let embed_stats = match vector_fingerprint {
+        Some(fingerprint) => {
+            embed::embed_unindexed_turns_with_fingerprint(
+                db,
+                embedder,
+                fingerprint,
+                on_embed_progress,
+            )
+            .await?
+        }
+        None => embed::embed_unindexed_turns(db, embedder, on_embed_progress).await?,
+    };
     total.vectors_created += embed_stats.embedded;
 
     Ok(total)
