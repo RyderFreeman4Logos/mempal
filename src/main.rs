@@ -9701,7 +9701,7 @@ fn ensure_reindex_pending_table(db: &Database) -> Result<()> {
     db.conn()
         .execute_batch(&format!(
             "CREATE TEMP TABLE IF NOT EXISTS {REINDEX_PENDING_TABLE} (
-                id TEXT,
+                id TEXT PRIMARY KEY,
                 source_path TEXT,
                 chunk_index INTEGER
             );"
@@ -9805,6 +9805,7 @@ fn pull_reindex_pending_batch(db: &Database, batch_size: usize) -> Result<Vec<Re
                        d.project_id
                 FROM {REINDEX_PENDING_TABLE} p
                 JOIN drawers d ON d.id = p.id
+                ORDER BY p.rowid ASC
                 LIMIT ?
                 "#
         ))
@@ -9829,18 +9830,23 @@ fn delete_reindex_pending_ids(db: &Database, ids: &[String]) -> Result<usize> {
         return Ok(0);
     }
     ensure_reindex_pending_table(db)?;
-    let placeholders = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("DELETE FROM {REINDEX_PENDING_TABLE} WHERE id IN ({placeholders})");
-    let values = ids
-        .iter()
-        .cloned()
-        .map(rusqlite::types::Value::Text)
-        .collect::<Vec<_>>();
-    db.conn()
-        .execute(&sql, rusqlite::params_from_iter(values.iter()))
-        .context("failed to delete stale reindex pending ids")
+    let mut deleted = 0usize;
+    for chunk in ids.chunks(999) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE FROM {REINDEX_PENDING_TABLE} WHERE id IN ({placeholders})");
+        let values = chunk
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::Text)
+            .collect::<Vec<_>>();
+        deleted += db
+            .conn()
+            .execute(&sql, rusqlite::params_from_iter(values.iter()))
+            .context("failed to delete stale reindex pending ids")?;
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -11700,6 +11706,71 @@ mod tests {
         assert!(
             rows.iter().all(|row| !row.id.starts_with("skip-")),
             "skipped drawers must remain excluded for the rest of the run"
+        );
+    }
+
+    #[test]
+    fn reindex_pending_delete_chunks_more_than_999_ids() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        for i in 0i64..1_500 {
+            insert_reindex_test_drawer(
+                &db,
+                &format!("d-{i:04}"),
+                &format!("content {i}"),
+                "fixtures/source.txt",
+                i,
+            );
+        }
+
+        let inserted = build_reindex_stale_pending_rows(
+            &db,
+            "target-fingerprint",
+            &empty_reindex_target(None),
+        )
+        .expect("build stale pending rows");
+        let ids = reindex_pending_ids(&db).expect("pending ids");
+        let deleted = delete_reindex_pending_ids(&db, &ids)
+            .expect("chunked delete must not hit SQLite variable limit");
+
+        assert_eq!(inserted, 1_500);
+        assert_eq!(ids.len(), 1_500);
+        assert_eq!(deleted, 1_500);
+        assert_eq!(
+            reindex_pending_count(&db).expect("pending count"),
+            0,
+            "chunked delete removes every pending row"
+        );
+    }
+
+    #[test]
+    fn reindex_pending_pull_preserves_snapshot_order() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_reindex_test_drawer(&db, "b-0", "b content", "fixtures/b.txt", 0);
+        insert_reindex_test_drawer(&db, "a-2", "a2 content", "fixtures/a.txt", 2);
+        insert_reindex_test_drawer(&db, "a-1b", "a1b content", "fixtures/a.txt", 1);
+        insert_reindex_test_drawer(&db, "a-1a", "a1a content", "fixtures/a.txt", 1);
+
+        let inserted = build_reindex_stale_pending_rows(
+            &db,
+            "target-fingerprint",
+            &empty_reindex_target(None),
+        )
+        .expect("build stale pending rows");
+        let rows = pull_reindex_pending_batch(&db, 10).expect("pull pending rows");
+        let ids = rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+
+        assert_eq!(inserted, 4);
+        assert_eq!(
+            ids,
+            vec![
+                "a-1a".to_string(),
+                "a-1b".to_string(),
+                "a-2".to_string(),
+                "b-0".to_string()
+            ],
+            "pull order follows the source_path, chunk_index, id snapshot order"
         );
     }
 
