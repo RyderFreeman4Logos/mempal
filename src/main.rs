@@ -5525,20 +5525,14 @@ async fn reindex_stale_batches(
     db.conn()
         .execute_batch(&format!("DELETE FROM {REINDEX_SKIPPED_TABLE};"))
         .context("failed to reset reindex skip table")?;
+    build_reindex_stale_pending_rows(db, target_fingerprint, &target)
+        .context("failed to snapshot stale reindex work list")?;
     let mut batch_index = 0usize;
-    let mut remaining = target.limit;
     loop {
-        let effective_batch_size = remaining.map_or(batch_size, |value| value.min(batch_size));
-        if effective_batch_size == 0 {
-            break;
-        }
-        let rows = reindex_stale_batch_rows(db, target_fingerprint, effective_batch_size, &target)
+        let rows = pull_reindex_pending_batch(db, batch_size)
             .context("failed to load stale reindex batch")?;
         if rows.is_empty() {
             break;
-        }
-        if let Some(value) = remaining.as_mut() {
-            *value = value.saturating_sub(rows.len());
         }
         batch_index += 1;
         let texts = rows
@@ -5567,11 +5561,16 @@ async fn reindex_stale_batches(
                 let failed_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
                 stage_reindex_skipped_ids(db, &failed_ids)
                     .context("failed to record skipped drawer ids")?;
+                delete_reindex_pending_ids(db, &failed_ids)
+                    .context("failed to delete skipped stale reindex work")?;
                 continue;
             }
         };
         let stats = write_reindex_vector_batch(db, &rows, &vectors, target_fingerprint)
             .context("failed to write stale reindex batch")?;
+        let pulled_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        delete_reindex_pending_ids(db, &pulled_ids)
+            .context("failed to delete completed stale reindex work")?;
         processed += stats.reindexed;
         skipped_concurrent_update += stats.skipped_concurrent_update;
         if stats.skipped_concurrent_update == 0 {
@@ -9647,6 +9646,7 @@ fn append_reindex_target_filters(
 /// on the reindex loop's connection, so it persists across iterations and is
 /// auto-dropped when the connection closes.
 const REINDEX_SKIPPED_TABLE: &str = "tmp_reindex_skipped";
+const REINDEX_PENDING_TABLE: &str = "tmp_reindex_pending";
 
 /// Create the reindex skip TEMP table if absent. Idempotent, so any staging or
 /// query call may invoke it without coordinating with the loop.
@@ -9697,33 +9697,56 @@ fn stage_reindex_skipped_ids(db: &Database, ids: &[String]) -> Result<()> {
     }
 }
 
-fn reindex_stale_batch_rows(
-    db: &Database,
-    target_fingerprint: &str,
-    batch_size: usize,
-    target: &ReindexVectorTarget,
-) -> Result<Vec<ReindexRow>> {
-    let limit = i64::try_from(batch_size).context("batch size is too large")?;
-    // The skip-exclusion subquery below references this connection-local TEMP
-    // table; create it lazily so the query never fails with "no such table"
-    // even when no batch has been skipped yet (issue #304).
-    ensure_reindex_skipped_table(db)?;
-    let vectors_exist = db
-        .conn()
+fn ensure_reindex_pending_table(db: &Database) -> Result<()> {
+    db.conn()
+        .execute_batch(&format!(
+            "CREATE TEMP TABLE IF NOT EXISTS {REINDEX_PENDING_TABLE} (
+                id TEXT,
+                source_path TEXT,
+                chunk_index INTEGER
+            );"
+        ))
+        .context("failed to create reindex pending table")?;
+    Ok(())
+}
+
+fn reindex_vectors_exist(db: &Database) -> Result<bool> {
+    db.conn()
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
             [],
             |row| row.get::<_, bool>(0),
         )
-        .context("failed to query vector table presence")?;
-    let rows = if vectors_exist {
-        let mut sql = r#"
+        .context("failed to query vector table presence")
+}
+
+fn build_reindex_stale_pending_rows(
+    db: &Database,
+    target_fingerprint: &str,
+    target: &ReindexVectorTarget,
+) -> Result<usize> {
+    // The skip-exclusion subquery below references this connection-local TEMP
+    // table; create it lazily so the query never fails with "no such table"
+    // even when no batch has been skipped yet (issue #304).
+    ensure_reindex_skipped_table(db)?;
+    ensure_reindex_pending_table(db)?;
+    db.conn()
+        .execute_batch(&format!("DELETE FROM {REINDEX_PENDING_TABLE};"))
+        .context("failed to reset reindex pending table")?;
+
+    let vectors_exist = reindex_vectors_exist(db)?;
+    let mut values = Vec::new();
+    let mut sql = if vectors_exist {
+        values.push(rusqlite::types::Value::Text(
+            CURRENT_VECTOR_INDEX_VERSION.to_string(),
+        ));
+        values.push(rusqlite::types::Value::Text(target_fingerprint.to_string()));
+        format!(
+            r#"
+                INSERT INTO {REINDEX_PENDING_TABLE} (id, source_path, chunk_index)
                 SELECT d.id,
-                       d.content,
-                       d.content_hash,
                        COALESCE(d.source_file, d.id) AS source_path,
-                       COALESCE(d.chunk_index, 0) AS chunk_index,
-                       d.project_id
+                       COALESCE(d.chunk_index, 0) AS chunk_index
                 FROM drawers d
                 LEFT JOIN drawer_vectors v ON v.id = d.id
                 LEFT JOIN fork_ext_meta idx
@@ -9739,82 +9762,154 @@ fn reindex_stale_batch_rows(
                       OR COALESCE(fp.value, '') != ?
                   )
                 "#
-        .to_string();
-        let mut values = vec![
-            rusqlite::types::Value::Text(CURRENT_VECTOR_INDEX_VERSION.to_string()),
-            rusqlite::types::Value::Text(target_fingerprint.to_string()),
-        ];
-        append_reindex_target_filters(&mut sql, &mut values, target, "d");
-        sql.push_str(&format!(
-            " AND d.id NOT IN (SELECT id FROM {REINDEX_SKIPPED_TABLE})"
-        ));
-        sql.push_str(
-            r#"
-                ORDER BY source_path ASC, chunk_index ASC, d.id ASC
-                LIMIT ?
-                "#,
-        );
-        values.push(rusqlite::types::Value::Integer(limit));
-        let mut stmt = db
-            .conn()
-            .prepare(&sql)
-            .context("failed to prepare stale vector batch query")?;
-        stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
-            Ok(ReindexRow {
-                id: row.get(0)?,
-                content: row.get(1)?,
-                content_hash: row.get(2)?,
-                source_path: row.get(3)?,
-                chunk_index: row.get(4)?,
-                project_id: row.get(5)?,
-            })
-        })
-        .context("failed to query stale vector batch")?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to collect stale vector batch")?
+        )
     } else {
-        let mut sql = r#"
-                SELECT id,
-                       content,
-                       content_hash,
-                       COALESCE(source_file, id) AS source_path,
-                       COALESCE(chunk_index, 0) AS chunk_index,
-                       project_id
-                FROM drawers
-                WHERE deleted_at IS NULL
-                "#
-        .to_string();
-        let mut values = Vec::new();
-        append_reindex_target_filters(&mut sql, &mut values, target, "");
-        sql.push_str(&format!(
-            " AND id NOT IN (SELECT id FROM {REINDEX_SKIPPED_TABLE})"
-        ));
-        sql.push_str(
+        format!(
             r#"
-                ORDER BY source_path ASC, chunk_index ASC, id ASC
-                LIMIT ?
-                "#,
-        );
-        values.push(rusqlite::types::Value::Integer(limit));
-        let mut stmt = db
-            .conn()
-            .prepare(&sql)
-            .context("failed to prepare missing-vector batch query")?;
-        stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
-            Ok(ReindexRow {
-                id: row.get(0)?,
-                content: row.get(1)?,
-                content_hash: row.get(2)?,
-                source_path: row.get(3)?,
-                chunk_index: row.get(4)?,
-                project_id: row.get(5)?,
-            })
-        })
-        .context("failed to query missing-vector batch")?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to collect missing-vector batch")?
+                INSERT INTO {REINDEX_PENDING_TABLE} (id, source_path, chunk_index)
+                SELECT d.id,
+                       COALESCE(d.source_file, d.id) AS source_path,
+                       COALESCE(d.chunk_index, 0) AS chunk_index
+                FROM drawers d
+                WHERE d.deleted_at IS NULL
+                "#
+        )
     };
-    Ok(rows)
+    append_reindex_target_filters(&mut sql, &mut values, target, "d");
+    sql.push_str(&format!(
+        " AND d.id NOT IN (SELECT id FROM {REINDEX_SKIPPED_TABLE})"
+    ));
+    sql.push_str(" ORDER BY 2 ASC, 3 ASC, 1 ASC");
+    if let Some(limit) = target.limit {
+        let limit = i64::try_from(limit).context("target limit is too large")?;
+        sql.push_str(" LIMIT ?");
+        values.push(rusqlite::types::Value::Integer(limit));
+    }
+    db.conn()
+        .execute(&sql, rusqlite::params_from_iter(values.iter()))
+        .context("failed to build stale reindex pending rows")
+}
+
+fn pull_reindex_pending_batch(db: &Database, batch_size: usize) -> Result<Vec<ReindexRow>> {
+    let limit = i64::try_from(batch_size).context("batch size is too large")?;
+    ensure_reindex_pending_table(db)?;
+    let mut stmt = db
+        .conn()
+        .prepare(&format!(
+            r#"
+                SELECT p.id,
+                       d.content,
+                       d.content_hash,
+                       p.source_path,
+                       p.chunk_index,
+                       d.project_id
+                FROM {REINDEX_PENDING_TABLE} p
+                JOIN drawers d ON d.id = p.id
+                LIMIT ?
+                "#
+        ))
+        .context("failed to prepare stale reindex pending batch query")?;
+    stmt.query_map([limit], |row| {
+        Ok(ReindexRow {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            content_hash: row.get(2)?,
+            source_path: row.get(3)?,
+            chunk_index: row.get(4)?,
+            project_id: row.get(5)?,
+        })
+    })
+    .context("failed to query stale reindex pending batch")?
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .context("failed to collect stale reindex pending batch")
+}
+
+fn delete_reindex_pending_ids(db: &Database, ids: &[String]) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    ensure_reindex_pending_table(db)?;
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("DELETE FROM {REINDEX_PENDING_TABLE} WHERE id IN ({placeholders})");
+    let values = ids
+        .iter()
+        .cloned()
+        .map(rusqlite::types::Value::Text)
+        .collect::<Vec<_>>();
+    db.conn()
+        .execute(&sql, rusqlite::params_from_iter(values.iter()))
+        .context("failed to delete stale reindex pending ids")
+}
+
+#[cfg(test)]
+fn reindex_pending_count(db: &Database) -> Result<i64> {
+    ensure_reindex_pending_table(db)?;
+    db.conn()
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {REINDEX_PENDING_TABLE}"),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count stale reindex pending rows")
+}
+
+#[cfg(test)]
+fn reindex_skipped_count(db: &Database) -> Result<i64> {
+    ensure_reindex_skipped_table(db)?;
+    db.conn()
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {REINDEX_SKIPPED_TABLE}"),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count skipped stale reindex rows")
+}
+
+#[cfg(test)]
+fn reindex_pending_ids(db: &Database) -> Result<Vec<String>> {
+    ensure_reindex_pending_table(db)?;
+    let mut stmt = db
+        .conn()
+        .prepare(&format!(
+            "SELECT id FROM {REINDEX_PENDING_TABLE} ORDER BY rowid ASC"
+        ))
+        .context("failed to prepare stale reindex pending ids query")?;
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .context("failed to query stale reindex pending ids")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect stale reindex pending ids")
+}
+
+#[cfg(test)]
+fn reindex_skipped_ids(db: &Database) -> Result<Vec<String>> {
+    ensure_reindex_skipped_table(db)?;
+    let mut stmt = db
+        .conn()
+        .prepare(&format!(
+            "SELECT id FROM {REINDEX_SKIPPED_TABLE} ORDER BY id ASC"
+        ))
+        .context("failed to prepare stale reindex skipped ids query")?;
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .context("failed to query stale reindex skipped ids")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect stale reindex skipped ids")
+}
+
+#[cfg(test)]
+fn reindex_vector_ids(db: &Database) -> Result<Vec<String>> {
+    if !reindex_vectors_exist(db)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT id FROM drawer_vectors ORDER BY id ASC")
+        .context("failed to prepare vector ids query")?;
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .context("failed to query vector ids")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect vector ids")
 }
 
 fn write_reindex_vector_batch(
@@ -11228,6 +11323,116 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    const TEST_TARGET_FINGERPRINT: &str = "test-embedder:8:target";
+
+    #[derive(Default)]
+    struct RecordingEmbedder {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingEmbedder {
+        fn seen_texts(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .expect("recording embedder mutex poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for RecordingEmbedder {
+        async fn embed(
+            &self,
+            texts: &[&str],
+        ) -> std::result::Result<Vec<Vec<f32>>, mempal::embed::EmbedError> {
+            self.seen
+                .lock()
+                .expect("recording embedder mutex poisoned")
+                .extend(texts.iter().map(|text| (*text).to_string()));
+            Ok(texts.iter().map(|text| test_vector(text)).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        fn name(&self) -> &str {
+            "recording-test"
+        }
+    }
+
+    #[derive(Default)]
+    struct FailFirstBatchEmbedder {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for FailFirstBatchEmbedder {
+        async fn embed(
+            &self,
+            texts: &[&str],
+        ) -> std::result::Result<Vec<Vec<f32>>, mempal::embed::EmbedError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Err(mempal::embed::EmbedError::Runtime(
+                    "forced test batch failure".to_string(),
+                ));
+            }
+            Ok(texts.iter().map(|text| test_vector(text)).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        fn name(&self) -> &str {
+            "fail-first-test"
+        }
+    }
+
+    fn test_vector(text: &str) -> Vec<f32> {
+        vec![text.len() as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    }
+
+    fn empty_reindex_target(limit: Option<usize>) -> ReindexVectorTarget {
+        ReindexVectorTarget {
+            drawer_ids: Vec::new(),
+            project_id: None,
+            wing: None,
+            room: None,
+            limit,
+        }
+    }
+
+    fn insert_reindex_test_drawer(
+        db: &Database,
+        id: &str,
+        content: &str,
+        source_file: &str,
+        chunk_index: i64,
+    ) {
+        db.insert_drawer_with_project(
+            &Drawer {
+                id: id.to_string(),
+                content: content.to_string(),
+                wing: "test".to_string(),
+                room: Some("reindex".to_string()),
+                source_file: Some(source_file.to_string()),
+                source_type: SourceType::AgentInference,
+                added_at: format!("171300000{chunk_index}"),
+                chunk_index: Some(chunk_index),
+                ..Drawer::default()
+            },
+            Some("default"),
+        )
+        .expect("insert reindex test drawer");
+    }
 
     /// Regression for issue #249: `mempal xurl timeline` aborted with
     /// "byte index 300 is not a char boundary" when a turn's content had a
@@ -11258,6 +11463,197 @@ mod tests {
         assert_eq!(char_safe_preview(content, 300), content);
     }
 
+    #[tokio::test]
+    async fn reindex_stale_batches_processes_snapshot_once_and_drains_pending() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        db.recreate_vectors_table(8).expect("create vector table");
+        for i in 0i64..5 {
+            insert_reindex_test_drawer(
+                &db,
+                &format!("d-{i}"),
+                &format!("content {i}"),
+                "fixtures/source.txt",
+                i,
+            );
+        }
+
+        let embedder = RecordingEmbedder::default();
+        reindex_stale_batches(
+            &db,
+            &embedder,
+            "recording-test",
+            TEST_TARGET_FINGERPRINT,
+            2,
+            empty_reindex_target(None),
+            BatchRetryPolicy {
+                interval: std::time::Duration::from_millis(0),
+                max_retries: 0,
+            },
+        )
+        .await
+        .expect("stale reindex batches");
+
+        let seen = embedder.seen_texts();
+        let unique_seen = seen.iter().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(seen.len(), 5, "all stale drawers are embedded once");
+        assert_eq!(unique_seen.len(), 5, "no stale drawer is embedded twice");
+        assert_eq!(
+            reindex_pending_count(&db).expect("pending count"),
+            0,
+            "pending work list is drained"
+        );
+        assert_eq!(
+            db.vector_row_count().expect("vector count"),
+            5,
+            "all stale drawers receive vectors"
+        );
+        for i in 0..5 {
+            assert_eq!(
+                load_reindex_metadata(&db, &format!("d-{i}"), "embedder_fingerprint")
+                    .expect("load fingerprint")
+                    .as_deref(),
+                Some(TEST_TARGET_FINGERPRINT)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reindex_stale_batches_skips_failed_batch_and_finishes_later_batches() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        db.recreate_vectors_table(8).expect("create vector table");
+        for i in 0i64..4 {
+            insert_reindex_test_drawer(
+                &db,
+                &format!("d-{i}"),
+                &format!("content {i}"),
+                "fixtures/source.txt",
+                i,
+            );
+        }
+
+        let embedder = FailFirstBatchEmbedder::default();
+        reindex_stale_batches(
+            &db,
+            &embedder,
+            "fail-first-test",
+            TEST_TARGET_FINGERPRINT,
+            2,
+            empty_reindex_target(None),
+            BatchRetryPolicy {
+                interval: std::time::Duration::from_millis(0),
+                max_retries: 0,
+            },
+        )
+        .await
+        .expect("stale reindex with skipped first batch");
+
+        assert_eq!(
+            embedder.calls.load(Ordering::SeqCst),
+            2,
+            "failed batch is not retried when max_retries is zero"
+        );
+        assert_eq!(
+            reindex_pending_count(&db).expect("pending count"),
+            0,
+            "failed and successful batches are both removed from pending"
+        );
+        assert_eq!(
+            reindex_skipped_count(&db).expect("skipped count"),
+            2,
+            "failed batch ids are reported through the skip table"
+        );
+        assert_eq!(
+            reindex_skipped_ids(&db).expect("skipped ids"),
+            vec!["d-0".to_string(), "d-1".to_string()]
+        );
+        assert_eq!(
+            reindex_vector_ids(&db).expect("vector ids"),
+            vec!["d-2".to_string(), "d-3".to_string()],
+            "later batches still complete"
+        );
+    }
+
+    #[test]
+    fn reindex_stale_pending_snapshot_excludes_current_fingerprint() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_reindex_test_drawer(&db, "fresh", "fresh content", "fixtures/source.txt", 0);
+        insert_reindex_test_drawer(&db, "stale", "stale content", "fixtures/source.txt", 1);
+        db.insert_vector_with_project("fresh", &[0.1_f32; 8], Some("default"))
+            .expect("insert fresh vector");
+        record_reindex_metadata(
+            &db,
+            "fresh",
+            CURRENT_VECTOR_INDEX_VERSION,
+            TEST_TARGET_FINGERPRINT,
+        )
+        .expect("record fresh metadata");
+
+        let inserted = build_reindex_stale_pending_rows(
+            &db,
+            TEST_TARGET_FINGERPRINT,
+            &empty_reindex_target(None),
+        )
+        .expect("build stale pending rows");
+
+        assert_eq!(inserted, 1);
+        assert_eq!(
+            reindex_pending_ids(&db).expect("pending ids"),
+            vec!["stale".to_string()],
+            "drawer with current fingerprint is excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_stale_batches_limit_caps_snapshot() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        db.recreate_vectors_table(8).expect("create vector table");
+        for i in 0i64..5 {
+            insert_reindex_test_drawer(
+                &db,
+                &format!("d-{i}"),
+                &format!("content {i}"),
+                "fixtures/source.txt",
+                i,
+            );
+        }
+
+        let embedder = RecordingEmbedder::default();
+        reindex_stale_batches(
+            &db,
+            &embedder,
+            "recording-test",
+            TEST_TARGET_FINGERPRINT,
+            2,
+            empty_reindex_target(Some(3)),
+            BatchRetryPolicy {
+                interval: std::time::Duration::from_millis(0),
+                max_retries: 0,
+            },
+        )
+        .await
+        .expect("limited stale reindex");
+
+        assert_eq!(
+            embedder.seen_texts().len(),
+            3,
+            "--limit caps the snapshot size"
+        );
+        assert_eq!(
+            db.vector_row_count().expect("vector count"),
+            3,
+            "only the limited snapshot is re-embedded"
+        );
+        assert_eq!(
+            reindex_pending_count(&db).expect("pending count"),
+            0,
+            "limited pending work list is drained"
+        );
+    }
+
     /// Issue #304: failed-batch drawer IDs were expanded into
     /// `NOT IN (?, ?, ...)` placeholders, so a `reindex --stale` run that
     /// skipped more than SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (32766) drawers'
@@ -11274,21 +11670,7 @@ mod tests {
         // A live drawer that already has a vector but no reindex metadata, so it
         // is stale for any target fingerprint and must be re-selected after the
         // skipped IDs are excluded.
-        db.insert_drawer_with_project(
-            &Drawer {
-                id: "live-1".to_string(),
-                content: "keep me".to_string(),
-                wing: "test".to_string(),
-                room: Some("reindex".to_string()),
-                source_file: Some("fixtures/source.txt".to_string()),
-                source_type: SourceType::AgentInference,
-                added_at: "1713000000".to_string(),
-                chunk_index: Some(0),
-                ..Drawer::default()
-            },
-            Some("default"),
-        )
-        .expect("insert live drawer");
+        insert_reindex_test_drawer(&db, "live-1", "keep me", "fixtures/source.txt", 0);
         db.insert_vector_with_project("live-1", &[0.1_f32; 8], Some("default"))
             .expect("insert live vector");
 
@@ -11301,18 +11683,16 @@ mod tests {
         let skipped: Vec<String> = (0..over_limit).map(|i| format!("skip-{i}")).collect();
         stage_reindex_skipped_ids(&db, &skipped).expect("stage skipped ids");
 
-        let target = ReindexVectorTarget {
-            drawer_ids: Vec::new(),
-            project_id: None,
-            wing: None,
-            room: None,
-            limit: None,
-        };
-
         // Must NOT error with "too many SQL variables".
-        let rows = reindex_stale_batch_rows(&db, "target-fingerprint", 512, &target)
-            .expect("stale batch query must not hit the SQLite variable limit");
+        let inserted = build_reindex_stale_pending_rows(
+            &db,
+            "target-fingerprint",
+            &empty_reindex_target(None),
+        )
+        .expect("stale snapshot must not hit the SQLite variable limit");
+        let rows = pull_reindex_pending_batch(&db, 512).expect("pull stale pending batch");
 
+        assert_eq!(inserted, 1, "only the live stale drawer is snapshotted");
         assert!(
             rows.iter().any(|row| row.id == "live-1"),
             "the live stale drawer must still be selected"
@@ -11327,38 +11707,28 @@ mod tests {
     /// drawer — the #304 TEMP-table exclusion must not change clean-run output.
     /// This drives the no-vectors branch of the stale selection.
     #[test]
-    fn reindex_stale_batch_rows_returns_all_when_nothing_skipped() {
+    fn reindex_stale_pending_snapshot_returns_all_when_nothing_skipped() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
         for i in 0i64..3 {
-            db.insert_drawer_with_project(
-                &Drawer {
-                    id: format!("d-{i}"),
-                    content: format!("content {i}"),
-                    wing: "test".to_string(),
-                    room: Some("reindex".to_string()),
-                    source_file: Some("fixtures/source.txt".to_string()),
-                    source_type: SourceType::AgentInference,
-                    added_at: format!("171300000{i}"),
-                    chunk_index: Some(i),
-                    ..Drawer::default()
-                },
-                Some("default"),
-            )
-            .expect("insert drawer");
+            insert_reindex_test_drawer(
+                &db,
+                &format!("d-{i}"),
+                &format!("content {i}"),
+                "fixtures/source.txt",
+                i,
+            );
         }
 
-        let target = ReindexVectorTarget {
-            drawer_ids: Vec::new(),
-            project_id: None,
-            wing: None,
-            room: None,
-            limit: None,
-        };
+        let inserted = build_reindex_stale_pending_rows(
+            &db,
+            "target-fingerprint",
+            &empty_reindex_target(None),
+        )
+        .expect("clean stale snapshot");
+        let rows = pull_reindex_pending_batch(&db, 512).expect("pull clean stale pending rows");
 
-        let rows = reindex_stale_batch_rows(&db, "target-fingerprint", 512, &target)
-            .expect("clean stale batch query");
-
+        assert_eq!(inserted, 3);
         assert_eq!(
             rows.len(),
             3,

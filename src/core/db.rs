@@ -43,6 +43,14 @@ use crate::ingest::novelty::NoveltyAction;
 pub const CURRENT_SCHEMA_VERSION: u32 = 17;
 pub const CURRENT_VECTOR_INDEX_VERSION: &str = "v2";
 pub const VECTOR_DISTANCE_METRIC: &str = "cosine";
+/// SQLite page cache budget for issue #311's large-DB stale reindex path.
+///
+/// Negative `PRAGMA cache_size` values are KiB, so `-262144` is 256 MiB.
+/// That is enough to avoid the default 2 MiB cache thrash on ~10 GiB stores,
+/// while staying far below the 4 GiB peak-memory cap. The reindex speedup is
+/// still the O(n) snapshot work-list; do not replace it with multi-GiB cache or
+/// `mmap_size`.
+pub(crate) const SQLITE_CACHE_SIZE_KIB_256_MIB: i64 = -262_144;
 const GATING_DROP_TOTAL_KEY: &str = "gating.dropped.total";
 const AUDIT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -340,6 +348,7 @@ impl Database {
             OpenMode::ReadWrite => Connection::open(path)?,
         };
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_256_MIB)?;
         register_math_functions(&conn)?;
         if mode.allows_write() {
             conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -6207,6 +6216,24 @@ mod tests {
     fn insert_test_drawer(db: &Database, id: &str, content: &str, project_id: Option<&str>) {
         db.insert_drawer_with_project(&test_drawer(id, content), project_id)
             .expect("insert drawer");
+    }
+
+    #[test]
+    fn database_connection_uses_256mib_cache_without_mmap() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+
+        let cache_size = db
+            .conn()
+            .query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))
+            .expect("query cache_size");
+        let mmap_size = db
+            .conn()
+            .query_row("PRAGMA mmap_size", [], |row| row.get::<_, i64>(0))
+            .expect("query mmap_size");
+
+        assert_eq!(cache_size, SQLITE_CACHE_SIZE_KIB_256_MIB);
+        assert_eq!(mmap_size, 0, "issue #311 must not add multi-GiB mmap");
     }
 
     fn insert_test_source_drawer_with_vector(
