@@ -6,9 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR bumps introduce new features, PATCH bumps are bug-fix only).
 
-## [0.6.0] — 2026-06-05
+## [Unreleased] — absorbed from upstream (fork remains 0.4.0)
 
-Feature release. **P106: a read-only "distill signal" in mind-model context.**
+This fork's package version remains `0.4.0`. The notes below record upstream
+0.5.x/0.6.0 material absorbed during the 2026-06-05 sync; they are not released
+versions of this fork.
+
+### Upstream 0.6.0 material — 2026-06-05
+
+Upstream feature release material. **P106: a read-only "distill signal" in
+mind-model context.**
 
 ### Added
 
@@ -33,11 +40,11 @@ Feature release. **P106: a read-only "distill signal" in mind-model context.**
   explicit `mempal_knowledge_distill` plus the deterministic gate (governance per
   P77/P80 unchanged). It never alters the assembled tier sections.
 
-## [0.5.4] — 2026-05-30
+### Upstream 0.5.4 material — 2026-05-30
 
-Bug-fix release. **`purge_deleted` could silently drop triple provenance when a
-hard delete was blocked by another foreign key** (a non-atomic edge case left by
-0.5.3's FK fix).
+Upstream bug-fix release material. **`purge_deleted` could silently drop triple
+provenance when a hard delete was blocked by another foreign key** (a non-atomic
+edge case left by 0.5.3's FK fix).
 
 ### Fixed
 
@@ -52,10 +59,11 @@ hard delete was blocked by another foreign key** (a non-atomic edge case left by
   transactional and unaffected. Adds a regression test that blocks a purge with
   an evidence link and asserts the triple provenance survives.
 
-## [0.5.3] — 2026-05-29
+### Upstream 0.5.3 material — 2026-05-29
 
-Bug-fix release. **Reindex/purge crashed when deleting a drawer referenced by a
-KG triple** (surfaced while self-healing the 0.5.2 duplicate cleanup).
+Upstream bug-fix release material. **Reindex/purge crashed when deleting a
+drawer referenced by a KG triple** (surfaced while self-healing the 0.5.2
+duplicate cleanup).
 
 ### Fixed
 
@@ -69,10 +77,10 @@ KG triple** (surfaced while self-healing the 0.5.2 duplicate cleanup).
   its stale provenance link is dropped. Adds a regression test. Without this,
   `mempal reindex --stale` could not finish cleaning the 0.5.2-era duplicates.
 
-## [0.5.2] — 2026-05-29
+### Upstream 0.5.2 material — 2026-05-29
 
-Bug-fix release. **`reindex` left duplicate drawers when a source re-routed to
-a different room.**
+Upstream bug-fix release material. **`reindex` left duplicate drawers when a
+source re-routed to a different room.**
 
 ### Fixed
 
@@ -90,9 +98,10 @@ a different room.**
   delete and the room-scoped contrast. After upgrading, run `mempal reindex
   --stale` once to self-heal any duplicates left by an earlier version.
 
-## [0.5.1] — 2026-05-29
+### Upstream 0.5.1 material — 2026-05-29
 
-Bug-fix release. **0.5.0's MCP tool list failed to load in strict clients.**
+Upstream bug-fix release material. **0.5.0's MCP tool list failed to load in
+strict clients.**
 
 ### Fixed
 
@@ -106,12 +115,13 @@ Bug-fix release. **0.5.0's MCP tool list failed to load in strict clients.**
   `schema_with` helper, and a regression test asserts they never revert to a
   boolean schema. CLI behavior is unchanged.
 
-## [0.5.0] — 2026-05-29
+### Upstream 0.5.0 material — 2026-05-29
 
-Large feature release covering P10–P105: the mind-model knowledge layer,
-Phase-2 knowledge cards, Phase-3 runtime adoption evidence, the multi-agent
-cowork bus, release/ops tooling, and the first Chinese mdBook. Schema advances
-to **v9**. No breaking CLI removals; existing commands keep their semantics.
+Upstream large feature release material covering P10–P105: the mind-model
+knowledge layer, Phase-2 knowledge cards, Phase-3 runtime adoption evidence,
+the multi-agent cowork bus, release/ops tooling, and the first Chinese mdBook.
+Schema advances to **v9**. No breaking CLI removals; existing commands keep
+their semantics.
 
 ### Added
 
@@ -298,12 +308,7 @@ P8) on top of hybrid search and the knowledge graph.
 Earlier releases (0.1.x, 0.2.x) are tracked only in Git history. Run
 `git log --oneline` on the repository to inspect them.
 
-[0.6.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.6.0
-[0.5.4]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.4
-[0.5.3]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.3
-[0.5.2]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.2
-[0.5.1]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.1
-[0.5.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.0
+[Unreleased]: https://github.com/RyderFreeman4Logos/mempal/compare/v0.4.0...HEAD
 [0.4.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.4.0
 [0.3.1]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.3.1
 [0.3.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.3.0
