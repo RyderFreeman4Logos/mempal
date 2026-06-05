@@ -100,9 +100,13 @@ const DRAWER_SELECT_COLUMNS: &str = r#"
     -- COALESCE alone substitutes only on NULL, but ingest can land a literal 0.0
     -- that would otherwise sink the drawer below every ei>0 row in the importance
     -- rerank, making it unrecallable (GitHub #309). NULLIF(...,0.0) maps the 0.0
-    -- sentinel to NULL so the fallback fires. A drawer that legitimately decays to
-    -- exactly 0.0 also falls back to importance here — an acceptable safe floor.
-    COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL)) as effective_importance,
+    -- sentinel to NULL so the fallback fires. The fallback term carries the persisted
+    -- stale penalty (COALESCE(stale_penalty_applied, 1.0); default 1.0 for a
+    -- never-penalized row) so a legacy 0.0 row that fact-check down-ranked still ranks
+    -- at importance*penalty, not full importance — preserving the P13 stale-fact
+    -- contract without re-burying never-penalized rows. A drawer that legitimately
+    -- decays to exactly 0.0 also falls back here — an acceptable safe floor.
+    COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL) * COALESCE(stale_penalty_applied, 1.0)) as effective_importance,
     compacted_into
 "#;
 
@@ -3909,6 +3913,13 @@ impl Database {
     /// Apply stale penalty: persist the multiplier in `stale_penalty_applied` and
     /// immediately reduce `effective_importance` for a specific drawer.
     /// `stale_penalty_applied` survives `recompute_all_effective_importance`.
+    ///
+    /// The `effective_importance` update derives the pre-penalty value from
+    /// `NULLIF(effective_importance, 0.0)` falling back to base importance, so a
+    /// legacy row stuck at the 0.0 sentinel (GitHub #309) persists a non-zero
+    /// `importance * penalty` instead of `0.0 * penalty = 0.0` — which would
+    /// otherwise bypass the stale down-rank and surface outdated memory at full
+    /// importance via the read fallback.
     pub fn apply_stale_penalty_to_drawer(
         &self,
         drawer_id: &str,
@@ -3917,7 +3928,7 @@ impl Database {
         self.conn.execute(
             r#"UPDATE drawers SET
                 stale_penalty_applied = COALESCE(stale_penalty_applied, 1.0) * ?1,
-                effective_importance = effective_importance * ?1
+                effective_importance = COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL)) * ?1
             WHERE id = ?2 AND deleted_at IS NULL"#,
             rusqlite::params![stale_penalty, drawer_id],
         )?;
