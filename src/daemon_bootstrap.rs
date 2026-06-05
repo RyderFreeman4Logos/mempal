@@ -182,6 +182,13 @@ fn bootstrap_inner(
     let mempal_home = mempal_home_from_db(&db_path);
     fs::create_dir_all(&mempal_home)
         .with_context(|| format!("failed to create {}", mempal_home.display()))?;
+    let daemon_db_env_path = daemon_db_env_path(&db_path)?;
+    // SAFETY: daemon bootstrap is still single-threaded here; the Tokio
+    // runtime, config watcher, database connection, and worker tasks have not
+    // been created yet, so no concurrent environment access is introduced.
+    unsafe {
+        env::set_var("MEMPAL_DB_PATH", &daemon_db_env_path);
+    }
     let log_path = expand_home_path(&bootstrap_config.daemon.log_path);
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)
@@ -347,6 +354,19 @@ fn expand_home_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn daemon_db_env_path(db_path: &Path) -> Result<PathBuf> {
+    if let Ok(canonical) = fs::canonicalize(db_path) {
+        return Ok(canonical);
+    }
+
+    if db_path.is_absolute() {
+        return Ok(db_path.to_path_buf());
+    }
+
+    let cwd = env::current_dir().context("failed to read current working directory")?;
+    Ok(cwd.join(db_path))
+}
+
 fn emit_bootstrap_event(
     bootstrap_events: Option<&mpsc::Sender<BootstrapEvent>>,
     event: BootstrapEvent,
@@ -432,5 +452,16 @@ mod tests {
         observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
 
         assert_eq!(observer.stall_diagnostic(&store, now), None);
+    }
+
+    #[test]
+    fn test_daemon_db_env_path_resolves_missing_relative_path_against_current_dir() -> Result<()> {
+        let cwd = std::env::current_dir().context("read current working directory")?;
+        let relative = PathBuf::from("tmp-mempal-daemon-db-path.db");
+        let resolved = daemon_db_env_path(&relative)?;
+
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, cwd.join(&relative));
+        Ok(())
     }
 }

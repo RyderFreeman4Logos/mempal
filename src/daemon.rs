@@ -38,6 +38,10 @@ use crate::session_review::{
 
 const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 
+/// Budget given to LLM workers to finish in-flight tasks during graceful shutdown.
+/// Coupled to the orphan reaper grace period in `src/main.rs`.
+pub const DAEMON_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
     run_command_with_bootstrap_events(config_path, foreground, None)
 }
@@ -262,12 +266,11 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         }
     }
 
-    // Give LLM workers a 30s window to finish their current tasks, then abort.
+    // Give LLM workers a window to finish their current tasks, then abort.
     let drain_start = tokio::time::Instant::now();
-    let drain_budget = Duration::from_secs(30);
     for handle in llm_worker_handles {
         let elapsed = drain_start.elapsed();
-        let remaining = drain_budget.saturating_sub(elapsed);
+        let remaining = DAEMON_DRAIN_BUDGET.saturating_sub(elapsed);
         if remaining.is_zero() {
             handle.abort();
             let _ = handle.await;
