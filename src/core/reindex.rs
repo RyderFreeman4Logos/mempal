@@ -4,6 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
+use super::db::SQLITE_CACHE_SIZE_KIB_256_MIB;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReindexProgressRow {
     pub source_path: String,
@@ -142,7 +144,9 @@ impl ReindexProgressStore {
     }
 
     fn open_connection(&self) -> Result<Connection> {
-        Ok(Connection::open(&self.db_path)?)
+        let conn = Connection::open(&self.db_path)?;
+        conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_256_MIB)?;
+        Ok(conn)
     }
 }
 
