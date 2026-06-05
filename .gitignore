@@ -35,3 +35,9 @@ skills/rust-skills/
 # Python bytecode cache (contrib/ plugins)
 __pycache__/
 *.py[cod]
+
+# mdBook generated output
+books/*/book/
+
+# Browser verification artifacts
+.playwright-mcp/

@@ -36,17 +36,8 @@ jobs:
       - name: cargo build --workspace --release --all-features
         run: cargo build --workspace --release --all-features
 
-      - name: Package crates in publish order
-        run: |
-          set -euxo pipefail
-          cargo package -p mempal-core --locked
-          cargo package -p mempal-embed --locked
-          cargo package -p mempal-search --locked
-          cargo package -p mempal-ingest --locked
-          cargo package -p mempal-aaak --locked
-          cargo package -p mempal-mcp --locked
-          cargo package -p mempal-api --locked
-          cargo package -p mempal-cli --locked
+      - name: Package crate
+        run: cargo package --locked
 
       - name: Collect release binary
         run: |

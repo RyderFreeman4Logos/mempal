@@ -239,6 +239,7 @@ struct ContextCommandArgs {
     include_cards: bool,
     max_items: usize,
     dao_tian_limit: usize,
+    no_distill_suggestions: bool,
     trigger: Option<String>,
 }
 
@@ -387,6 +388,8 @@ enum Commands {
         max_items: usize,
         #[arg(long = "dao-tian-limit", default_value_t = 1)]
         dao_tian_limit: usize,
+        #[arg(long = "no-distill-suggestions")]
+        no_distill_suggestions: bool,
         /// Tiered retrieval trigger: session_start (default), on_demand, repair.
         #[arg(long)]
         trigger: Option<String>,
@@ -2480,6 +2483,7 @@ fn run() -> Result<()> {
             max_items,
             dao_tian_limit,
             trigger,
+            no_distill_suggestions,
         } => {
             let effective_include_cards = if no_include_cards {
                 false
@@ -2502,6 +2506,7 @@ fn run() -> Result<()> {
                     max_items,
                     dao_tian_limit,
                     trigger,
+                    no_distill_suggestions,
                 },
             ))
         }
@@ -3130,6 +3135,7 @@ async fn ingest_command(
         is_pinned: options.is_pinned,
         confidence: Some(confidence),
         replace_existing_source: false,
+        replace_across_rooms: false,
         no_strip_noise: options.no_strip_noise,
         diary_rollup: options.diary_rollup,
         diary_rollup_day: None,
@@ -3166,6 +3172,7 @@ async fn ingest_command(
             is_pinned: options.is_pinned,
             confidence: Some(confidence),
             replace_existing_source: false,
+            replace_across_rooms: false,
             no_strip_noise: options.no_strip_noise,
             diary_rollup: options.diary_rollup,
             diary_rollup_day: None,
@@ -4145,6 +4152,7 @@ async fn context_command(db: &Database, config: &Config, args: ContextCommandArg
             project_id: config.project.id.clone(),
             trigger,
             context_cfg_override: None,
+            include_distill_suggestions: !args.no_distill_suggestions,
         },
     )
     .await?;
@@ -4173,7 +4181,6 @@ fn parse_domain(value: &str) -> Result<MemoryDomain> {
 fn print_context_plain(pack: &ContextPack) {
     if pack.sections.is_empty() {
         println!("no context");
-        return;
     }
     for section in &pack.sections {
         println!("## {}", section.name);
@@ -4214,6 +4221,22 @@ fn print_context_plain(pack: &ContextPack) {
             }
         }
         println!();
+    }
+
+    if !pack.distill_suggestions.is_empty() {
+        println!("## distill_suggestions");
+        for suggestion in &pack.distill_suggestions {
+            println!(
+                "- field={} evidence_count={} suggested_tier={}",
+                suggestion.field, suggestion.evidence_count, suggestion.suggested_tier
+            );
+            if !suggestion.sample_evidence_drawer_ids.is_empty() {
+                println!(
+                    "  samples: {}",
+                    suggestion.sample_evidence_drawer_ids.join(",")
+                );
+            }
+        }
     }
 }
 

@@ -125,6 +125,9 @@ pub async fn assemble_brief<E: Embedder + ?Sized>(
             project_id: None,
             trigger: None,
             context_cfg_override: None,
+            // brief is a separate surface; the P106 distill signal is scoped to
+            // mempal context / mempal_context only.
+            include_distill_suggestions: false,
         },
     )
     .await?;

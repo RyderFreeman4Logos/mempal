@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - 'docs/site/**'
+      - 'books/zh-CN/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,13 +27,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install mdBook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: '0.4.52'
+
+      - name: Assemble site (landing page + zh-CN book)
+        run: |
+          set -euxo pipefail
+          rm -rf _site
+          mkdir -p _site
+          # Keep the existing multilingual landing page at the site root.
+          cp -r docs/site/. _site/
+          # Build the zh-CN mdBook into /book/zh-CN/. The book uses committed
+          # local Mermaid JS assets (additional-js in book.toml), so no
+          # preprocessor is needed and mdbook copies them into the output.
+          mdbook build books/zh-CN --dest-dir "$GITHUB_WORKSPACE/_site/book/zh-CN"
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: 'docs/site'
+          path: '_site'
 
       - name: Deploy to GitHub Pages
         id: deployment
