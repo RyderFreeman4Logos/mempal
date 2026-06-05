@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::core::config::{
     AutoFactCheckConfig, Config, EmbeddingClassifierConfig, GatingRuleConfig, IngestGatingConfig,
@@ -9,7 +9,7 @@ use crate::factcheck::{self, FactIssue};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::OnceCell;
+use tokio::{sync::OnceCell, task::JoinHandle};
 
 const MIN_SIGNAL_BYTES: usize = 12;
 const MAX_PROTOTYPE_COUNT: usize = 64;
@@ -202,16 +202,66 @@ impl GatingRuntime {
         Ok(())
     }
 
+    pub fn validate_config_shape(&self) -> Result<(), GatingInitError> {
+        validate_classifier_config(&self.config.ingest_gating.embedding_classifier)
+    }
+
     pub async fn initialize_from_config(&self) -> Result<(), GatingInitError> {
-        let classifier = compile_classifier_from_config(&self.config).await?;
+        self.validate_config_shape()?;
+        if !tier2_enabled(&self.config.ingest_gating) {
+            return Ok(());
+        }
+        let embedder = self
+            .factory
+            .build()
+            .await
+            .map_err(GatingInitError::BuildEmbedder)?;
+        let classifier = compile_classifier(
+            &self.config.ingest_gating.embedding_classifier,
+            embedder.as_ref(),
+        )
+        .await?;
         let _ = self.classifier.set(classifier);
         Ok(())
+    }
+
+    pub async fn initialize_from_config_with_deadline(
+        &self,
+        deadline: Duration,
+    ) -> Result<(), GatingInitError> {
+        self.validate_config_shape()?;
+        match tokio::time::timeout(deadline, self.initialize_from_config()).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    deadline_secs = deadline.as_secs_f32(),
+                    "gating prototype initialization exceeded deadline; deferring to lazy classifier init"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    pub fn spawn_initialize_from_config(self: &Arc<Self>, deadline: Duration) -> JoinHandle<()> {
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = runtime.initialize_from_config_with_deadline(deadline).await {
+                tracing::warn!(
+                    error = %error,
+                    "gating prototype initialization failed; deferring to lazy classifier init"
+                );
+            }
+        })
     }
 
     pub async fn classifier(&self) -> Result<Option<PrototypeClassifier>, GatingInitError> {
         let classifier = self
             .classifier
             .get_or_try_init(|| async {
+                if !tier2_enabled(&self.config.ingest_gating) {
+                    return Ok(None);
+                }
+                self.validate_config_shape()?;
                 let embedder = self
                     .factory
                     .build()
@@ -536,6 +586,33 @@ async fn compile_classifier<E: Embedder + ?Sized>(
     Prototypes::load(config, embedder).await
 }
 
+fn validate_classifier_config(config: &EmbeddingClassifierConfig) -> Result<(), GatingInitError> {
+    if !config.enabled || config.prototypes.is_empty() {
+        return Ok(());
+    }
+
+    if config.prototypes.len() > MAX_PROTOTYPE_COUNT {
+        return Err(GatingInitError::PrototypeCountLimit {
+            actual: config.prototypes.len(),
+            limit: MAX_PROTOTYPE_COUNT,
+        });
+    }
+
+    for (index, raw_label) in config.prototypes.iter().enumerate() {
+        let label = prototype_display_label(index, raw_label);
+        let actual_bytes = raw_label.len();
+        if actual_bytes > MAX_PROTOTYPE_LEN_BYTES {
+            return Err(GatingInitError::PrototypeTooLong {
+                label,
+                actual_bytes,
+                limit_bytes: MAX_PROTOTYPE_LEN_BYTES,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 impl Prototypes {
     async fn load<E: Embedder + ?Sized>(
         config: &EmbeddingClassifierConfig,
@@ -545,47 +622,44 @@ impl Prototypes {
             return Ok(None);
         }
 
-        if config.prototypes.len() > MAX_PROTOTYPE_COUNT {
-            return Err(GatingInitError::PrototypeCountLimit {
-                actual: config.prototypes.len(),
-                limit: MAX_PROTOTYPE_COUNT,
-            });
-        }
+        validate_classifier_config(config)?;
 
+        let labels = config
+            .prototypes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let vectors =
+            embedder
+                .embed(&labels)
+                .await
+                .map_err(|source| GatingInitError::PrototypeEmbed {
+                    label: prototype_embed_error_label(&config.prototypes),
+                    source,
+                })?;
+        let expected = embedder.dimensions();
         let mut prototypes = Vec::with_capacity(config.prototypes.len());
         for (index, raw_label) in config.prototypes.iter().enumerate() {
             let label = prototype_display_label(index, raw_label);
-            let actual_bytes = raw_label.len();
-            if actual_bytes > MAX_PROTOTYPE_LEN_BYTES {
-                return Err(GatingInitError::PrototypeTooLong {
-                    label,
-                    actual_bytes,
-                    limit_bytes: MAX_PROTOTYPE_LEN_BYTES,
-                });
-            }
-
-            let vectors = embedder
-                .embed(&[raw_label.as_str()])
-                .await
-                .map_err(|source| GatingInitError::PrototypeEmbed {
+            let vector = vectors.get(index).cloned().ok_or_else(|| {
+                GatingInitError::PrototypeDimMismatch {
                     label: label.clone(),
-                    source,
-                })?;
-            if let Some(vector) = vectors.into_iter().next() {
-                let actual = vector.len();
-                let expected = embedder.dimensions();
-                if actual != expected {
-                    return Err(GatingInitError::PrototypeDimMismatch {
-                        label,
-                        expected,
-                        actual,
-                    });
+                    expected,
+                    actual: 0,
                 }
-                prototypes.push(EmbeddedPrototype {
-                    label: raw_label.clone(),
-                    vector,
+            })?;
+            let actual = vector.len();
+            if actual != expected {
+                return Err(GatingInitError::PrototypeDimMismatch {
+                    label,
+                    expected,
+                    actual,
                 });
             }
+            prototypes.push(EmbeddedPrototype {
+                label: raw_label.clone(),
+                vector,
+            });
         }
 
         Ok(Some(PrototypeClassifier { prototypes }))
@@ -774,4 +848,16 @@ fn prototype_display_label(index: usize, raw_label: &str) -> String {
         return trimmed.to_string();
     }
     format!("prototype#{}", index + 1)
+}
+
+fn prototype_embed_error_label(raw_labels: &[String]) -> String {
+    match raw_labels {
+        [raw_label] => prototype_display_label(0, raw_label),
+        [first, ..] => format!(
+            "{}..{}",
+            prototype_display_label(0, first),
+            raw_labels.len()
+        ),
+        [] => "prototype#0".to_string(),
+    }
 }

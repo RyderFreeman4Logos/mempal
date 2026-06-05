@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::harness::AlwaysFailMigrationHook;
@@ -81,6 +81,31 @@ struct DeterministicEmbedder {
     fail_on: Arc<Vec<String>>,
 }
 
+#[derive(Clone)]
+struct CountingEmbedderFactory {
+    vectors: Arc<HashMap<String, Vec<f32>>>,
+    default_vector: Vec<f32>,
+    build_count: Arc<AtomicUsize>,
+    call_count: Arc<AtomicUsize>,
+    batch_sizes: Arc<Mutex<Vec<usize>>>,
+    delay: Duration,
+}
+
+struct CountingEmbedder {
+    vectors: Arc<HashMap<String, Vec<f32>>>,
+    default_vector: Vec<f32>,
+    call_count: Arc<AtomicUsize>,
+    batch_sizes: Arc<Mutex<Vec<usize>>>,
+    delay: Duration,
+}
+
+type CountingFactoryWithBuildCount = (
+    Arc<CountingEmbedderFactory>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<usize>>>,
+);
+
 #[async_trait]
 impl EmbedderFactory for DeterministicEmbedderFactory {
     async fn build(&self) -> Result<Box<dyn Embedder>, EmbedError> {
@@ -119,6 +144,51 @@ impl Embedder for DeterministicEmbedder {
 
     fn name(&self) -> &str {
         "deterministic"
+    }
+}
+
+#[async_trait]
+impl EmbedderFactory for CountingEmbedderFactory {
+    async fn build(&self) -> Result<Box<dyn Embedder>, EmbedError> {
+        self.build_count.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(CountingEmbedder {
+            vectors: Arc::clone(&self.vectors),
+            default_vector: self.default_vector.clone(),
+            call_count: Arc::clone(&self.call_count),
+            batch_sizes: Arc::clone(&self.batch_sizes),
+            delay: self.delay,
+        }))
+    }
+}
+
+#[async_trait]
+impl Embedder for CountingEmbedder {
+    async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.batch_sizes
+            .lock()
+            .expect("batch sizes lock")
+            .push(texts.len());
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        Ok(texts
+            .iter()
+            .map(|text| {
+                self.vectors
+                    .get(*text)
+                    .cloned()
+                    .unwrap_or_else(|| self.default_vector.clone())
+            })
+            .collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        self.default_vector.len()
+    }
+
+    fn name(&self) -> &str {
+        "counting"
     }
 }
 
@@ -208,6 +278,44 @@ fn deterministic_factory(
         default_vector,
         fail_on: Arc::new(fail_on.iter().map(|text| (*text).to_string()).collect()),
     })
+}
+
+fn counting_factory(
+    vectors: &[(&str, Vec<f32>)],
+    default_vector: Vec<f32>,
+    delay: Duration,
+) -> (
+    Arc<CountingEmbedderFactory>,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<usize>>>,
+) {
+    let (factory, _build_count, call_count, batch_sizes) =
+        counting_factory_with_build_count(vectors, default_vector, delay);
+    (factory, call_count, batch_sizes)
+}
+
+fn counting_factory_with_build_count(
+    vectors: &[(&str, Vec<f32>)],
+    default_vector: Vec<f32>,
+    delay: Duration,
+) -> CountingFactoryWithBuildCount {
+    let build_count = Arc::new(AtomicUsize::new(0));
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(CountingEmbedderFactory {
+        vectors: Arc::new(
+            vectors
+                .iter()
+                .map(|(text, vector)| ((*text).to_string(), vector.clone()))
+                .collect(),
+        ),
+        default_vector,
+        build_count: Arc::clone(&build_count),
+        call_count: Arc::clone(&call_count),
+        batch_sizes: Arc::clone(&batch_sizes),
+        delay,
+    });
+    (factory, build_count, call_count, batch_sizes)
 }
 
 fn run_mempal(home: &Path, args: &[&str]) -> std::process::Output {
@@ -458,6 +566,143 @@ prototypes = ["valuable"]
     assert_eq!(outcome.decision.tier, 0);
     assert_eq!(outcome.decision.label.as_deref(), Some("embedder_error"));
     assert!(outcome.vector.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prototype_init_batches_labels_once() {
+    let _guard = test_guard().await;
+    let config = Config::parse(
+        r#"
+[config_hot_reload]
+enabled = false
+
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.4
+prototypes = ["valuable", "noise", "decision"]
+"#,
+    )
+    .expect("parse config");
+    let (factory, call_count, batch_sizes) = counting_factory(
+        &[
+            ("valuable", vec![1.0, 0.0]),
+            ("noise", vec![0.0, 1.0]),
+            ("decision", vec![0.5, 0.5]),
+        ],
+        vec![0.2, 0.2],
+        Duration::ZERO,
+    );
+    let embedder = factory.build().await.expect("build embedder");
+
+    let classifier = compile_classifier_from_embedder(embedder.as_ref(), &config.ingest_gating)
+        .await
+        .expect("compile classifier");
+
+    assert!(classifier.is_some());
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *batch_sizes.lock().expect("batch sizes lock"),
+        vec![3],
+        "prototype labels must be embedded in one batch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_gating_init_deadline_defers_slow_embedder() {
+    let _guard = test_guard().await;
+    let config = Config::parse(
+        r#"
+[config_hot_reload]
+enabled = false
+
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.4
+prototypes = ["valuable", "noise"]
+"#,
+    )
+    .expect("parse config");
+    let (factory, call_count, batch_sizes) = counting_factory(
+        &[("valuable", vec![1.0, 0.0]), ("noise", vec![0.0, 1.0])],
+        vec![0.2, 0.2],
+        Duration::from_millis(250),
+    );
+    let runtime = GatingRuntime::new(config, factory);
+    let started = Instant::now();
+
+    runtime
+        .initialize_from_config_with_deadline(Duration::from_millis(25))
+        .await
+        .expect("deadline init should fail open");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "deadline init blocked for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *batch_sizes.lock().expect("batch sizes lock"),
+        vec![2],
+        "startup prewarm should still issue one batched prototype embed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_gating_disabled_skips_startup_and_lazy_embedder_build() {
+    let _guard = test_guard().await;
+    let config = Config::parse(
+        r#"
+[config_hot_reload]
+enabled = false
+
+[ingest_gating]
+enabled = false
+
+[ingest_gating.embedding_classifier]
+enabled = true
+threshold = 0.4
+prototypes = ["valuable", "noise"]
+"#,
+    )
+    .expect("parse config");
+    let (factory, build_count, call_count, batch_sizes) = counting_factory_with_build_count(
+        &[("valuable", vec![1.0, 0.0]), ("noise", vec![0.0, 1.0])],
+        vec![0.2, 0.2],
+        Duration::ZERO,
+    );
+    let runtime = GatingRuntime::new(config, factory);
+
+    runtime
+        .initialize_from_config()
+        .await
+        .expect("disabled gating init should be a no-op");
+
+    assert_eq!(build_count.load(Ordering::SeqCst), 0);
+    assert_eq!(call_count.load(Ordering::SeqCst), 0);
+    assert!(
+        batch_sizes.lock().expect("batch sizes lock").is_empty(),
+        "disabled startup init must not embed prototypes"
+    );
+
+    let classifier = runtime
+        .classifier()
+        .await
+        .expect("disabled lazy classifier should be a no-op");
+
+    assert!(classifier.is_none());
+    assert_eq!(build_count.load(Ordering::SeqCst), 0);
+    assert_eq!(call_count.load(Ordering::SeqCst), 0);
+    assert!(
+        batch_sizes.lock().expect("batch sizes lock").is_empty(),
+        "disabled lazy classifier must not embed prototypes"
+    );
 }
 
 #[test]
