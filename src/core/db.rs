@@ -96,7 +96,17 @@ const DRAWER_SELECT_COLUMNS: &str = r#"
     COALESCE(is_pinned, 0) as is_pinned,
     pin_order,
     supersedes,
-    COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) as effective_importance,
+    -- Treat a persisted 0.0 as "not computed" and fall back to base importance.
+    -- COALESCE alone substitutes only on NULL, but ingest can land a literal 0.0
+    -- that would otherwise sink the drawer below every ei>0 row in the importance
+    -- rerank, making it unrecallable (GitHub #309). NULLIF(...,0.0) maps the 0.0
+    -- sentinel to NULL so the fallback fires. The fallback term carries the persisted
+    -- stale penalty (COALESCE(stale_penalty_applied, 1.0); default 1.0 for a
+    -- never-penalized row) so a legacy 0.0 row that fact-check down-ranked still ranks
+    -- at importance*penalty, not full importance — preserving the P13 stale-fact
+    -- contract without re-burying never-penalized rows. A drawer that legitimately
+    -- decays to exactly 0.0 also falls back here — an acceptable safe floor.
+    COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL) * COALESCE(stale_penalty_applied, 1.0)) as effective_importance,
     compacted_into
 "#;
 
@@ -377,6 +387,17 @@ impl Database {
         anchor::validate_anchor_domain(&drawer.domain, &drawer.anchor_kind)
             .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
 
+        // Persist effective_importance explicitly so a new drawer is never
+        // stranded at the column DEFAULT 0.0 — a literal 0.0 sinks below every
+        // ei>0 row in the importance rerank and is effectively unrecallable
+        // (GitHub #309). Seed from base importance when the constructor left the
+        // field at the 0.0 sentinel, mirroring the read-time NULLIF(...,0.0) guard.
+        let seeded_effective_importance = if drawer.effective_importance == 0.0 {
+            f64::from(drawer.importance)
+        } else {
+            drawer.effective_importance
+        };
+
         self.conn.execute(
             r#"
             INSERT OR IGNORE INTO drawers (
@@ -414,9 +435,10 @@ impl Database {
                 pin_order,
                 supersedes,
                 valid_from,
-                valid_until
+                valid_until,
+                effective_importance
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)
             "#,
             params![
                 drawer.id.as_str(),
@@ -454,6 +476,7 @@ impl Database {
                 drawer.supersedes.as_deref(),
                 valid_from.unwrap_or(drawer.added_at.as_str()),
                 valid_until,
+                seeded_effective_importance,
             ],
         )?;
 
@@ -3890,6 +3913,21 @@ impl Database {
     /// Apply stale penalty: persist the multiplier in `stale_penalty_applied` and
     /// immediately reduce `effective_importance` for a specific drawer.
     /// `stale_penalty_applied` survives `recompute_all_effective_importance`.
+    ///
+    /// The `effective_importance` update derives the pre-penalty value from
+    /// `NULLIF(effective_importance, 0.0)` falling back to
+    /// `importance * COALESCE(stale_penalty_applied, 1.0)` — the same cumulative
+    /// expression the read fallback uses. So a legacy row stuck at the 0.0
+    /// sentinel (GitHub #309) re-penalizes coherently: a row already carrying
+    /// `stale_penalty_applied = 0.5` composes to `importance * 0.5 * new_penalty`
+    /// rather than dropping the prior penalty and yielding `importance *
+    /// new_penalty`. SQLite resolves every `SET` right-hand side against the
+    /// row's pre-UPDATE values, so the `stale_penalty_applied` read here is the
+    /// OLD multiplier, not the newly-assigned one on the line above. This keeps
+    /// the cumulative stale penalty order-independent and persists a non-zero
+    /// value instead of `0.0 * penalty = 0.0` — which would otherwise bypass the
+    /// stale down-rank and surface outdated memory at full importance via the
+    /// read fallback.
     pub fn apply_stale_penalty_to_drawer(
         &self,
         drawer_id: &str,
@@ -3898,7 +3936,7 @@ impl Database {
         self.conn.execute(
             r#"UPDATE drawers SET
                 stale_penalty_applied = COALESCE(stale_penalty_applied, 1.0) * ?1,
-                effective_importance = effective_importance * ?1
+                effective_importance = COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL) * COALESCE(stale_penalty_applied, 1.0)) * ?1
             WHERE id = ?2 AND deleted_at IS NULL"#,
             rusqlite::params![stale_penalty, drawer_id],
         )?;

@@ -576,10 +576,14 @@ fn apply_consistent_effective_importance(db: &Database, results: &mut [SearchRes
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(", ");
-    // Mirror `get_drawer`'s COALESCE so the snapshot value matches what the
-    // per-result hydrate would have produced absent a concurrent write.
+    // Mirror `get_drawer`'s NULLIF(...,0.0) guard so the snapshot value matches
+    // what the per-result hydrate would have produced absent a concurrent write.
+    // A persisted 0.0 is the "not computed" sentinel and must fall back to base
+    // importance, else the drawer sinks in the importance rerank (GitHub #309).
+    // The fallback carries the persisted stale penalty (default 1.0) so a legacy
+    // 0.0 row that was fact-check down-ranked ranks at importance*penalty.
     let sql = format!(
-        "SELECT id, COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) \
+        "SELECT id, COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL) * COALESCE(stale_penalty_applied, 1.0)) \
          FROM drawers WHERE id IN ({placeholders})"
     );
     let snapshot: std::collections::HashMap<String, f64> = match db.conn().prepare(&sql) {
@@ -2381,6 +2385,304 @@ mod tests {
         assert!(
             sims[0] > sims[1] && sims[1] > sims[2],
             "similarity must strictly decrease along the ranking: {sims:?}"
+        );
+    }
+
+    /// Regression for GitHub #309: a freshly-ingested high-importance drawer must
+    /// not be buried in the importance rerank by a persisted `effective_importance`
+    /// of 0.0. Pre-fix, the INSERT omitted the column (so it took the column
+    /// DEFAULT 0.0) and the read fallback used a NULL-only `COALESCE`, so
+    /// `rerank_by_effective_importance` sorted the fresh drawer last and
+    /// `truncate(top_k)` dropped it. This drives the real BM25 rerank pipeline
+    /// (`apply_consistent_effective_importance` -> `rerank_by_effective_importance`
+    /// -> `truncate`) with no embedder; under the default `DecayMode::None` it is
+    /// fully deterministic.
+    #[test]
+    fn fresh_high_importance_drawer_not_buried_by_zero_effective_importance() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        // Fresh, high-importance drawer ingested through the real INSERT path with
+        // the constructor's 0.0 sentinel left in place. Fix (B) must seed its
+        // persisted effective_importance from `importance` (4.0); pre-fix it would
+        // land at the column DEFAULT 0.0.
+        let mut fresh = make_drawer("fresh-309", "alpha", "decision");
+        fresh.content = "needle three zero nine".to_string();
+        fresh.importance = 4;
+        db.insert_drawer_with_project_validity(&fresh, None, None, None, None)
+            .expect("insert fresh");
+
+        // Older rival with a positive effective_importance (as the v10 migration
+        // backfill would have produced). Pre-fix this outranks the 0.0 fresh drawer
+        // and, at top_k = 1, evicts it entirely.
+        let mut rival = make_drawer("rival-low", "alpha", "decision");
+        rival.content = "needle rival".to_string();
+        rival.importance = 1;
+        db.insert_drawer_with_project_validity(&rival, None, None, None, None)
+            .expect("insert rival");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 2.0 WHERE id = ?1",
+                ["rival-low"],
+            )
+            .expect("force rival effective_importance");
+
+        let results = search_bm25_only_with_options(
+            &db,
+            "needle",
+            route(),
+            &ProjectSearchScope::all_projects(),
+            SearchOptions::default(),
+            1,
+        )
+        .expect("search");
+
+        assert_eq!(
+            results.first().map(|result| result.drawer_id.as_str()),
+            Some("fresh-309"),
+            "fresh importance-4 drawer must rank #1 over the importance-2 rival, not \
+             be buried by a persisted effective_importance of 0.0 (GitHub #309)"
+        );
+    }
+
+    /// Regression for GitHub #309 (read-time guard): a row whose
+    /// `effective_importance` column holds a literal 0.0 (e.g. ingested before the
+    /// seed fix) must read back as its base `importance` via
+    /// `NULLIF(effective_importance, 0.0)`, not as 0.0. Exercises the shared
+    /// `DRAWER_SELECT_COLUMNS` fallback through `get_drawer`.
+    #[test]
+    fn persisted_zero_effective_importance_reads_back_as_importance() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        let mut drawer = make_drawer("legacy-zero", "alpha", "decision");
+        drawer.importance = 3;
+        db.insert_drawer_with_project_validity(&drawer, None, None, None, None)
+            .expect("insert drawer");
+        // Simulate a legacy row that persisted the 0.0 sentinel directly.
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0 WHERE id = ?1",
+                ["legacy-zero"],
+            )
+            .expect("force legacy 0.0");
+
+        let fetched = db
+            .get_drawer("legacy-zero")
+            .expect("get_drawer")
+            .expect("drawer exists");
+        assert_eq!(
+            fetched.effective_importance, 3.0,
+            "persisted 0.0 must fall back to base importance (3.0) via NULLIF, not stay 0.0"
+        );
+    }
+
+    /// Regression for the #309 follow-up (stale-penalty persistence): applying a
+    /// stale penalty to a legacy row stuck at the `effective_importance` 0.0
+    /// sentinel must persist `importance * penalty` (non-zero), not
+    /// `0.0 * penalty = 0.0`. Otherwise the row stays at 0.0 and the read fallback
+    /// would surface it at full base importance, bypassing the P13 stale down-rank.
+    #[test]
+    fn apply_stale_penalty_to_legacy_zero_ei_persists_importance_times_penalty() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        let mut drawer = make_drawer("legacy-stale", "alpha", "decision");
+        drawer.importance = 3;
+        db.insert_drawer_with_project_validity(&drawer, None, None, None, None)
+            .expect("insert drawer");
+        // Force the legacy 0.0 sentinel that #309 left behind.
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0 WHERE id = ?1",
+                ["legacy-stale"],
+            )
+            .expect("force legacy 0.0");
+
+        // Default stale penalty (0.5), as the fact-check path applies it.
+        db.apply_stale_penalty_to_drawer("legacy-stale", 0.5)
+            .expect("apply stale penalty");
+
+        let fetched = db
+            .get_drawer("legacy-stale")
+            .expect("get_drawer")
+            .expect("drawer exists");
+        assert_eq!(
+            fetched.effective_importance, 1.5,
+            "stale penalty on a legacy 0.0 row must persist importance*penalty \
+             (3 * 0.5 = 1.5), not stay at 0.0 * 0.5 = 0.0"
+        );
+    }
+
+    /// Regression for the #309 round-3 finding (cumulative stale-penalty in the
+    /// persist path): re-penalizing a legacy row that is BOTH stuck at the
+    /// `effective_importance` 0.0 sentinel AND already carries a prior
+    /// `stale_penalty_applied` must compound the penalties, not drop the old one.
+    /// The persist-path fallback derives the pre-penalty value as
+    /// `importance * COALESCE(stale_penalty_applied, 1.0)` — SQLite resolves every
+    /// `SET` right-hand side against the row's pre-UPDATE values, so the penalty
+    /// read here is the OLD multiplier. Applying 0.5 to a row with importance=3,
+    /// stale_penalty_applied=0.5 must yield effective_importance = 3 * 0.5 * 0.5 =
+    /// 0.75 and stale_penalty_applied = 0.5 * 0.5 = 0.25 — coherent with the read
+    /// fallback. Pre-fix the fallback ignored the old penalty and persisted
+    /// 3 * 0.5 = 1.5, which (being non-zero) also disabled the read fallback,
+    /// leaving the stale row over-ranked until a later recompute.
+    #[test]
+    fn repenalizing_legacy_zero_ei_compounds_cumulative_stale_penalty() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        let mut drawer = make_drawer("legacy-recompound", "alpha", "decision");
+        drawer.importance = 3;
+        db.insert_drawer_with_project_validity(&drawer, None, None, None, None)
+            .expect("insert drawer");
+        // Already-penalized legacy row: 0.0 sentinel + a prior 0.5 stale penalty.
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0, stale_penalty_applied = 0.5 \
+                 WHERE id = ?1",
+                ["legacy-recompound"],
+            )
+            .expect("force legacy stale 0.0");
+
+        // Apply the default stale penalty again (fact-check path re-penalizing).
+        db.apply_stale_penalty_to_drawer("legacy-recompound", 0.5)
+            .expect("apply stale penalty");
+
+        let fetched = db
+            .get_drawer("legacy-recompound")
+            .expect("get_drawer")
+            .expect("drawer exists");
+        assert_eq!(
+            fetched.effective_importance, 0.75,
+            "re-penalizing a legacy 0.0 row must compound the prior penalty: \
+             3 * 0.5 (old) * 0.5 (new) = 0.75, not 3 * 0.5 = 1.5"
+        );
+
+        let persisted_penalty: f64 = db
+            .conn()
+            .query_row(
+                "SELECT stale_penalty_applied FROM drawers WHERE id = ?1",
+                ["legacy-recompound"],
+                |row| row.get(0),
+            )
+            .expect("read stale_penalty_applied");
+        assert_eq!(
+            persisted_penalty, 0.25,
+            "cumulative stale penalty must compound: 0.5 (old) * 0.5 (new) = 0.25"
+        );
+    }
+
+    /// Regression for the #309 follow-up (penalty-aware read fallback): a legacy
+    /// row stale-penalized *before* the persistence fix is stuck at
+    /// `effective_importance = 0.0` with `stale_penalty_applied < 1.0`. The read
+    /// fallback must rank it at `importance * penalty`, not full base importance, so
+    /// fact-check down-ranks survive (P13). A never-penalized 0.0 row (penalty
+    /// default 1.0) must still fall back to full importance — no re-burial.
+    #[test]
+    fn read_fallback_applies_stale_penalty_for_legacy_zero_ei() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        // Stale-penalized legacy row stuck at the 0.0 sentinel.
+        let mut stale = make_drawer("legacy-stale-read", "alpha", "decision");
+        stale.importance = 3;
+        db.insert_drawer_with_project_validity(&stale, None, None, None, None)
+            .expect("insert stale");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0, stale_penalty_applied = 0.5 \
+                 WHERE id = ?1",
+                ["legacy-stale-read"],
+            )
+            .expect("force legacy stale 0.0");
+
+        // Never-penalized legacy row (stale_penalty_applied defaults to 1.0).
+        let mut fresh = make_drawer("legacy-fresh-read", "alpha", "decision");
+        fresh.importance = 4;
+        db.insert_drawer_with_project_validity(&fresh, None, None, None, None)
+            .expect("insert fresh");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0 WHERE id = ?1",
+                ["legacy-fresh-read"],
+            )
+            .expect("force legacy 0.0");
+
+        let stale_fetched = db
+            .get_drawer("legacy-stale-read")
+            .expect("get_drawer")
+            .expect("stale exists");
+        assert_eq!(
+            stale_fetched.effective_importance, 1.5,
+            "stale-penalized 0.0 row must read back as importance*penalty \
+             (3 * 0.5 = 1.5) via the fallback"
+        );
+
+        let fresh_fetched = db
+            .get_drawer("legacy-fresh-read")
+            .expect("get_drawer")
+            .expect("fresh exists");
+        assert_eq!(
+            fresh_fetched.effective_importance, 4.0,
+            "never-penalized 0.0 row must read back at full importance (4.0); the \
+             penalty multiplier defaults to 1.0 and must not collapse it (no #309 re-burial)"
+        );
+    }
+
+    /// Regression for the #309 follow-up (search ranking): a stale-penalized legacy
+    /// row stuck at `effective_importance = 0.0` must be ranked by
+    /// `importance * penalty` in the search rerank, not full importance. The stale
+    /// importance-4 row (penalty 0.5 -> effective 2.0) must lose top_k=1 to an
+    /// importance-1 rival with a real effective_importance of 2.5. Pre-fix the
+    /// penalty was ignored, the stale row computed 4.0 and wrongly evicted the rival.
+    /// Exercises the consistent-snapshot fallback (`search/mod.rs`) ->
+    /// `rerank_by_effective_importance`; deterministic under `DecayMode::None`.
+    #[test]
+    fn stale_penalized_zero_ei_ranks_below_real_rival_in_search() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        let mut stale = make_drawer("stale-hi", "alpha", "decision");
+        stale.content = "needle stale".to_string();
+        stale.importance = 4;
+        db.insert_drawer_with_project_validity(&stale, None, None, None, None)
+            .expect("insert stale");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0, stale_penalty_applied = 0.5 \
+                 WHERE id = ?1",
+                ["stale-hi"],
+            )
+            .expect("force stale 0.0");
+
+        let mut rival = make_drawer("rival-mid", "alpha", "decision");
+        rival.content = "needle rival".to_string();
+        rival.importance = 1;
+        db.insert_drawer_with_project_validity(&rival, None, None, None, None)
+            .expect("insert rival");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 2.5 WHERE id = ?1",
+                ["rival-mid"],
+            )
+            .expect("force rival effective_importance");
+
+        let results = search_bm25_only_with_options(
+            &db,
+            "needle",
+            route(),
+            &ProjectSearchScope::all_projects(),
+            SearchOptions::default(),
+            1,
+        )
+        .expect("search");
+
+        assert_eq!(
+            results.first().map(|result| result.drawer_id.as_str()),
+            Some("rival-mid"),
+            "stale importance-4 row (effective 4 * 0.5 = 2.0) must rank below the rival's \
+             real effective_importance 2.5; pre-fix the ignored penalty let it compute 4.0 and win"
         );
     }
 }
