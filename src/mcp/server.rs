@@ -164,9 +164,17 @@ impl MempalMcpServer {
         crate::mcp::logging::init_stdio_log_sink(ConfigHandle::current().as_ref())
             .context("failed to initialize MCP log sink")?;
         self.gating_runtime
-            .initialize_from_config()
-            .await
-            .context("failed to initialize ingest gating")?;
+            .validate_config_shape()
+            .context("failed to validate ingest gating config")?;
+        let _gating_init_task =
+            self.gating_runtime
+                .spawn_initialize_from_config(Duration::from_secs(
+                    ConfigHandle::current()
+                        .as_ref()
+                        .embed
+                        .retry
+                        .search_deadline_secs,
+                ));
         self.serve(rmcp::transport::stdio())
             .await
             .context("failed to initialize MCP stdio transport")
