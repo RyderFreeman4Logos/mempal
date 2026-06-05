@@ -3915,11 +3915,19 @@ impl Database {
     /// `stale_penalty_applied` survives `recompute_all_effective_importance`.
     ///
     /// The `effective_importance` update derives the pre-penalty value from
-    /// `NULLIF(effective_importance, 0.0)` falling back to base importance, so a
-    /// legacy row stuck at the 0.0 sentinel (GitHub #309) persists a non-zero
-    /// `importance * penalty` instead of `0.0 * penalty = 0.0` — which would
-    /// otherwise bypass the stale down-rank and surface outdated memory at full
-    /// importance via the read fallback.
+    /// `NULLIF(effective_importance, 0.0)` falling back to
+    /// `importance * COALESCE(stale_penalty_applied, 1.0)` — the same cumulative
+    /// expression the read fallback uses. So a legacy row stuck at the 0.0
+    /// sentinel (GitHub #309) re-penalizes coherently: a row already carrying
+    /// `stale_penalty_applied = 0.5` composes to `importance * 0.5 * new_penalty`
+    /// rather than dropping the prior penalty and yielding `importance *
+    /// new_penalty`. SQLite resolves every `SET` right-hand side against the
+    /// row's pre-UPDATE values, so the `stale_penalty_applied` read here is the
+    /// OLD multiplier, not the newly-assigned one on the line above. This keeps
+    /// the cumulative stale penalty order-independent and persists a non-zero
+    /// value instead of `0.0 * penalty = 0.0` — which would otherwise bypass the
+    /// stale down-rank and surface outdated memory at full importance via the
+    /// read fallback.
     pub fn apply_stale_penalty_to_drawer(
         &self,
         drawer_id: &str,
@@ -3928,7 +3936,7 @@ impl Database {
         self.conn.execute(
             r#"UPDATE drawers SET
                 stale_penalty_applied = COALESCE(stale_penalty_applied, 1.0) * ?1,
-                effective_importance = COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL)) * ?1
+                effective_importance = COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL) * COALESCE(stale_penalty_applied, 1.0)) * ?1
             WHERE id = ?2 AND deleted_at IS NULL"#,
             rusqlite::params![stale_penalty, drawer_id],
         )?;

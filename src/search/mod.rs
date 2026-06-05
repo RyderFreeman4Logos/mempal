@@ -2514,6 +2514,65 @@ mod tests {
         );
     }
 
+    /// Regression for the #309 round-3 finding (cumulative stale-penalty in the
+    /// persist path): re-penalizing a legacy row that is BOTH stuck at the
+    /// `effective_importance` 0.0 sentinel AND already carries a prior
+    /// `stale_penalty_applied` must compound the penalties, not drop the old one.
+    /// The persist-path fallback derives the pre-penalty value as
+    /// `importance * COALESCE(stale_penalty_applied, 1.0)` — SQLite resolves every
+    /// `SET` right-hand side against the row's pre-UPDATE values, so the penalty
+    /// read here is the OLD multiplier. Applying 0.5 to a row with importance=3,
+    /// stale_penalty_applied=0.5 must yield effective_importance = 3 * 0.5 * 0.5 =
+    /// 0.75 and stale_penalty_applied = 0.5 * 0.5 = 0.25 — coherent with the read
+    /// fallback. Pre-fix the fallback ignored the old penalty and persisted
+    /// 3 * 0.5 = 1.5, which (being non-zero) also disabled the read fallback,
+    /// leaving the stale row over-ranked until a later recompute.
+    #[test]
+    fn repenalizing_legacy_zero_ei_compounds_cumulative_stale_penalty() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        let mut drawer = make_drawer("legacy-recompound", "alpha", "decision");
+        drawer.importance = 3;
+        db.insert_drawer_with_project_validity(&drawer, None, None, None, None)
+            .expect("insert drawer");
+        // Already-penalized legacy row: 0.0 sentinel + a prior 0.5 stale penalty.
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0, stale_penalty_applied = 0.5 \
+                 WHERE id = ?1",
+                ["legacy-recompound"],
+            )
+            .expect("force legacy stale 0.0");
+
+        // Apply the default stale penalty again (fact-check path re-penalizing).
+        db.apply_stale_penalty_to_drawer("legacy-recompound", 0.5)
+            .expect("apply stale penalty");
+
+        let fetched = db
+            .get_drawer("legacy-recompound")
+            .expect("get_drawer")
+            .expect("drawer exists");
+        assert_eq!(
+            fetched.effective_importance, 0.75,
+            "re-penalizing a legacy 0.0 row must compound the prior penalty: \
+             3 * 0.5 (old) * 0.5 (new) = 0.75, not 3 * 0.5 = 1.5"
+        );
+
+        let persisted_penalty: f64 = db
+            .conn()
+            .query_row(
+                "SELECT stale_penalty_applied FROM drawers WHERE id = ?1",
+                ["legacy-recompound"],
+                |row| row.get(0),
+            )
+            .expect("read stale_penalty_applied");
+        assert_eq!(
+            persisted_penalty, 0.25,
+            "cumulative stale penalty must compound: 0.5 (old) * 0.5 (new) = 0.25"
+        );
+    }
+
     /// Regression for the #309 follow-up (penalty-aware read fallback): a legacy
     /// row stale-penalized *before* the persistence fix is stuck at
     /// `effective_importance = 0.0` with `stale_penalty_applied < 1.0`. The read
