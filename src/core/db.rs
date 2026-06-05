@@ -1605,11 +1605,11 @@ impl Database {
     ) -> Result<Vec<ReindexSource>, DbError> {
         let mut statement = self.conn.prepare(
             r#"
-            SELECT source_root, source_file, project_id, wing, room, COUNT(*)
+            SELECT source_root, source_file, project_id, wing, NULL AS room, COUNT(*)
             FROM drawers
             WHERE deleted_at IS NULL AND normalize_version < ?1
-            GROUP BY project_id, source_root, source_file, wing, room
-            ORDER BY project_id, source_root, source_file, wing, room
+            GROUP BY project_id, source_root, source_file, wing
+            ORDER BY project_id, source_root, source_file, wing
             "#,
         )?;
         let rows = statement
@@ -1629,13 +1629,13 @@ impl Database {
             r#"
             SELECT COALESCE(SUM(drawer_count), 0), COUNT(*)
             FROM (
-                SELECT source_root, source_file, project_id, wing, room, COUNT(*) AS drawer_count
+                SELECT COUNT(*) AS drawer_count
                 FROM drawers
                 WHERE deleted_at IS NULL
                   AND normalize_version < ?1
                   AND project_id IS NOT NULL
                   AND source_root IS NULL
-                GROUP BY project_id, source_root, source_file, wing, room
+                GROUP BY project_id, source_root, source_file, wing
             )
             "#,
         )?;
@@ -1649,11 +1649,11 @@ impl Database {
     pub fn reindex_sources_force(&self) -> Result<Vec<ReindexSource>, DbError> {
         let mut statement = self.conn.prepare(
             r#"
-            SELECT source_root, source_file, project_id, wing, room, COUNT(*)
+            SELECT source_root, source_file, project_id, wing, NULL AS room, COUNT(*)
             FROM drawers
             WHERE deleted_at IS NULL
-            GROUP BY project_id, source_root, source_file, wing, room
-            ORDER BY project_id, source_root, source_file, wing, room
+            GROUP BY project_id, source_root, source_file, wing
+            ORDER BY project_id, source_root, source_file, wing
             "#,
         )?;
         let rows = statement
@@ -1669,12 +1669,12 @@ impl Database {
             r#"
             SELECT COALESCE(SUM(drawer_count), 0), COUNT(*)
             FROM (
-                SELECT source_root, source_file, project_id, wing, room, COUNT(*) AS drawer_count
+                SELECT COUNT(*) AS drawer_count
                 FROM drawers
                 WHERE deleted_at IS NULL
                   AND project_id IS NOT NULL
                   AND source_root IS NULL
-                GROUP BY project_id, source_root, source_file, wing, room
+                GROUP BY project_id, source_root, source_file, wing
             )
             "#,
         )?;
@@ -1980,6 +1980,42 @@ impl Database {
     /// active promoted-or-canonical knowledge drawers, grouped by `field`.
     /// Read-only; performs no writes.
     pub fn distill_field_counts(&self) -> Result<Vec<(String, i64, i64)>, DbError> {
+        self.distill_field_counts_scoped(None)
+    }
+
+    /// Project-scoped variant of [`Self::distill_field_counts`].
+    ///
+    /// When `project_id` is `None`, this preserves the historical all-projects
+    /// behavior used before project isolation was threaded into context assembly.
+    pub fn distill_field_counts_scoped(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<(String, i64, i64)>, DbError> {
+        if let Some(project_id) = project_id {
+            let mut statement = self.conn.prepare(
+                r#"
+                SELECT field,
+                       SUM(CASE WHEN memory_kind = 'evidence' THEN 1 ELSE 0 END) AS evidence_count,
+                       SUM(CASE WHEN memory_kind = 'knowledge'
+                                 AND status IN ('promoted', 'canonical') THEN 1 ELSE 0 END) AS promoted_count
+                FROM drawers
+                WHERE deleted_at IS NULL
+                  AND project_id = ?1
+                GROUP BY field
+                "#,
+            )?;
+            let rows = statement
+                .query_map([project_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            return Ok(rows);
+        }
+
         let mut statement = self.conn.prepare(
             r#"
             SELECT field,
@@ -2010,6 +2046,40 @@ impl Database {
         field: &str,
         limit: usize,
     ) -> Result<Vec<String>, DbError> {
+        self.sample_evidence_drawer_ids_scoped(field, limit, None)
+    }
+
+    /// Project-scoped variant of [`Self::sample_evidence_drawer_ids`].
+    ///
+    /// When `project_id` is `None`, this preserves the historical all-projects
+    /// behavior used before project isolation was threaded into context assembly.
+    pub fn sample_evidence_drawer_ids_scoped(
+        &self,
+        field: &str,
+        limit: usize,
+        project_id: Option<&str>,
+    ) -> Result<Vec<String>, DbError> {
+        if let Some(project_id) = project_id {
+            let mut statement = self.conn.prepare(
+                r#"
+                SELECT id
+                FROM drawers
+                WHERE deleted_at IS NULL
+                  AND memory_kind = 'evidence'
+                  AND field = ?1
+                  AND project_id = ?3
+                ORDER BY rowid
+                LIMIT ?2
+                "#,
+            )?;
+            let rows = statement
+                .query_map(params![field, limit as i64, project_id], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            return Ok(rows);
+        }
+
         let mut statement = self.conn.prepare(
             r#"
             SELECT id

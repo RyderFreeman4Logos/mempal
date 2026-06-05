@@ -347,7 +347,7 @@ fn assemble_tiered(
     let recurring_themes = load_recurring_themes(db, project_id);
     let repair_warnings = load_repair_warnings(db, project_id);
     let distill_suggestions = if request.include_distill_suggestions {
-        detect_distill_suggestions(db)?
+        detect_distill_suggestions(db, project_id)?
     } else {
         Vec::new()
     };
@@ -679,7 +679,7 @@ fn assemble_flat(
         &crate::core::config::ConfigHandle::current().skills,
     );
     let distill_suggestions = if request.include_distill_suggestions {
-        detect_distill_suggestions(db)?
+        detect_distill_suggestions(db, request.project_id.as_deref())?
     } else {
         Vec::new()
     };
@@ -779,9 +779,12 @@ fn load_recurring_themes(db: &Database, project_id: Option<&str>) -> Vec<Pattern
 /// active promoted-or-canonical knowledge. Returns at most
 /// `DISTILL_SIGNAL_MAX_SUGGESTIONS`, ordered by descending evidence count then
 /// ascending field. Performs no database writes and no LLM call.
-fn detect_distill_suggestions(db: &Database) -> Result<Vec<DistillSuggestion>> {
+fn detect_distill_suggestions(
+    db: &Database,
+    project_id: Option<&str>,
+) -> Result<Vec<DistillSuggestion>> {
     let mut qualifying: Vec<(String, i64)> = db
-        .distill_field_counts()
+        .distill_field_counts_scoped(project_id)
         .map_err(ContextError::LoadDrawer)?
         .into_iter()
         .filter(|(_, evidence_count, promoted_count)| {
@@ -796,7 +799,7 @@ fn detect_distill_suggestions(db: &Database) -> Result<Vec<DistillSuggestion>> {
     let mut suggestions = Vec::with_capacity(qualifying.len());
     for (field, evidence_count) in qualifying {
         let sample_evidence_drawer_ids = db
-            .sample_evidence_drawer_ids(&field, DISTILL_SIGNAL_SAMPLE_LIMIT)
+            .sample_evidence_drawer_ids_scoped(&field, DISTILL_SIGNAL_SAMPLE_LIMIT, project_id)
             .map_err(ContextError::LoadDrawer)?;
         suggestions.push(DistillSuggestion {
             field,

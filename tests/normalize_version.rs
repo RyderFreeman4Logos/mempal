@@ -257,6 +257,34 @@ fn active_drawer_rows_for_source(
         .expect("collect active drawer rows")
 }
 
+fn active_content_room_versions_for_source(
+    db: &Database,
+    source_file: &str,
+) -> Vec<(String, Option<String>, u32)> {
+    let mut statement = db
+        .conn()
+        .prepare(
+            r#"
+            SELECT content, room, normalize_version
+            FROM drawers
+            WHERE deleted_at IS NULL AND source_file = ?1
+            ORDER BY id
+            "#,
+        )
+        .expect("prepare active content room versions");
+    statement
+        .query_map([source_file], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
+        })
+        .expect("query active content room versions")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect active content room versions")
+}
+
 fn active_vector_project_ids_for_source(
     db: &Database,
     source_file: &str,
@@ -973,6 +1001,29 @@ fn insert_source_drawer(db: &Database, id: &str, source_file: &str, room: Option
     db.insert_drawer(&drawer).expect("insert source drawer");
 }
 
+fn insert_stale_source_drawer(
+    db: &Database,
+    id: &str,
+    source_file: &str,
+    room: Option<&str>,
+    content: &str,
+) {
+    let mut drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: content.to_string(),
+        wing: "mempal".to_string(),
+        room: room.map(|value| value.to_string()),
+        source_file: Some(source_file.to_string()),
+        source_type: SourceType::AgentInference,
+        added_at: "1710000000".to_string(),
+        chunk_index: Some(0),
+        importance: 0,
+    });
+    drawer.normalize_version = 0;
+    db.insert_drawer(&drawer)
+        .expect("insert stale source drawer");
+}
+
 fn active_count_for_source(db: &Database, source_file: &str) -> i64 {
     db.conn()
         .query_row(
@@ -981,6 +1032,55 @@ fn active_count_for_source(db: &Database, source_file: &str) -> i64 {
             |row| row.get(0),
         )
         .expect("count source drawers")
+}
+
+#[tokio::test]
+async fn test_reindex_stale_source_dedupes_across_rooms() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let source = tmp.path().join("multi-room.md");
+    std::fs::write(&source, "fresh multi-room source").expect("write source");
+    let source_file = source.to_string_lossy().to_string();
+    insert_stale_source_drawer(
+        &db,
+        "drawer_multi_room_alpha",
+        &source_file,
+        Some("alpha"),
+        "old alpha",
+    );
+    insert_stale_source_drawer(
+        &db,
+        "drawer_multi_room_beta",
+        &source_file,
+        Some("beta"),
+        "old beta",
+    );
+
+    let report = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Stale,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("stale source reindex across rooms");
+
+    assert_eq!(report.candidate_drawers, 2);
+    assert_eq!(report.candidate_sources, 1);
+    assert_eq!(report.processed_sources, 1);
+    assert_eq!(report.reingested_files, 1);
+    assert_eq!(report.reingested_chunks, 1);
+    assert_eq!(
+        active_content_room_versions_for_source(&db, &source_file),
+        vec![(
+            "fresh multi-room source".to_string(),
+            Some("default".to_string()),
+            CURRENT_NORMALIZE_VERSION,
+        )]
+    );
+    assert_eq!(stale_drawer_count_raw(&db), 0);
 }
 
 // Regression: reindex re-routes a source to a different room, so a room-scoped

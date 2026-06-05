@@ -258,6 +258,13 @@ fn insert_fixture(db: &Database, drawer: &Drawer) {
         .expect("insert vector");
 }
 
+fn insert_project_fixture(db: &Database, drawer: &Drawer, project_id: &str) {
+    db.insert_drawer_with_project(drawer, Some(project_id))
+        .expect("insert project drawer");
+    db.insert_vector_with_project(&drawer.id, &vector(), Some(project_id))
+        .expect("insert project vector");
+}
+
 fn start_openai_embedding_stub(
     expected_query: &str,
     vector: Vec<f32>,
@@ -1218,6 +1225,60 @@ async fn test_context_distill_signal_suggests_dense_field() {
     assert_eq!(suggestion.evidence_count, 5);
     assert_eq!(suggestion.suggested_tier, "dao_ren");
     assert!(!suggestion.sample_evidence_drawer_ids.is_empty());
+}
+
+#[tokio::test]
+async fn test_context_distill_signal_respects_project_scope() {
+    let (tmp, db) = new_db();
+    for index in 0..5 {
+        insert_project_fixture(
+            &db,
+            &evidence_in_field(&format!("drawer_project_a_auth_{index}"), "auth"),
+            "project-a",
+        );
+        insert_project_fixture(
+            &db,
+            &evidence_in_field(&format!("drawer_project_b_auth_{index}"), "auth"),
+            "project-b",
+        );
+    }
+    insert_project_fixture(
+        &db,
+        &promoted_knowledge_in_field("drawer_project_b_auth_k", "auth"),
+        "project-b",
+    );
+
+    let mut project_a_request = distill_request(tmp.path());
+    project_a_request.project_id = Some("project-a".to_string());
+    let project_a_pack = assemble_context(&db, &embedder(), project_a_request)
+        .await
+        .expect("assemble project-a context");
+    let project_a_suggestion = project_a_pack
+        .distill_suggestions
+        .iter()
+        .find(|s| s.field == "auth")
+        .expect("project-a auth distill suggestion");
+    assert_eq!(project_a_suggestion.evidence_count, 5);
+    assert!(
+        project_a_suggestion
+            .sample_evidence_drawer_ids
+            .iter()
+            .all(|id| id.starts_with("drawer_project_a_auth_")),
+        "project-a samples must not include another project's drawer ids"
+    );
+
+    let mut project_b_request = distill_request(tmp.path());
+    project_b_request.project_id = Some("project-b".to_string());
+    let project_b_pack = assemble_context(&db, &embedder(), project_b_request)
+        .await
+        .expect("assemble project-b context");
+    assert!(
+        !project_b_pack
+            .distill_suggestions
+            .iter()
+            .any(|suggestion| suggestion.field == "auth"),
+        "project-b promoted knowledge suppresses only project-b distill suggestions"
+    );
 }
 
 #[tokio::test]
