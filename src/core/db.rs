@@ -96,7 +96,13 @@ const DRAWER_SELECT_COLUMNS: &str = r#"
     COALESCE(is_pinned, 0) as is_pinned,
     pin_order,
     supersedes,
-    COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) as effective_importance,
+    -- Treat a persisted 0.0 as "not computed" and fall back to base importance.
+    -- COALESCE alone substitutes only on NULL, but ingest can land a literal 0.0
+    -- that would otherwise sink the drawer below every ei>0 row in the importance
+    -- rerank, making it unrecallable (GitHub #309). NULLIF(...,0.0) maps the 0.0
+    -- sentinel to NULL so the fallback fires. A drawer that legitimately decays to
+    -- exactly 0.0 also falls back to importance here — an acceptable safe floor.
+    COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL)) as effective_importance,
     compacted_into
 "#;
 
@@ -377,6 +383,17 @@ impl Database {
         anchor::validate_anchor_domain(&drawer.domain, &drawer.anchor_kind)
             .map_err(|message| DbError::InvalidDrawerMetadata(message.to_string()))?;
 
+        // Persist effective_importance explicitly so a new drawer is never
+        // stranded at the column DEFAULT 0.0 — a literal 0.0 sinks below every
+        // ei>0 row in the importance rerank and is effectively unrecallable
+        // (GitHub #309). Seed from base importance when the constructor left the
+        // field at the 0.0 sentinel, mirroring the read-time NULLIF(...,0.0) guard.
+        let seeded_effective_importance = if drawer.effective_importance == 0.0 {
+            f64::from(drawer.importance)
+        } else {
+            drawer.effective_importance
+        };
+
         self.conn.execute(
             r#"
             INSERT OR IGNORE INTO drawers (
@@ -414,9 +431,10 @@ impl Database {
                 pin_order,
                 supersedes,
                 valid_from,
-                valid_until
+                valid_until,
+                effective_importance
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)
             "#,
             params![
                 drawer.id.as_str(),
@@ -454,6 +472,7 @@ impl Database {
                 drawer.supersedes.as_deref(),
                 valid_from.unwrap_or(drawer.added_at.as_str()),
                 valid_until,
+                seeded_effective_importance,
             ],
         )?;
 

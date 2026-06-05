@@ -576,10 +576,12 @@ fn apply_consistent_effective_importance(db: &Database, results: &mut [SearchRes
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(", ");
-    // Mirror `get_drawer`'s COALESCE so the snapshot value matches what the
-    // per-result hydrate would have produced absent a concurrent write.
+    // Mirror `get_drawer`'s NULLIF(...,0.0) guard so the snapshot value matches
+    // what the per-result hydrate would have produced absent a concurrent write.
+    // A persisted 0.0 is the "not computed" sentinel and must fall back to base
+    // importance, else the drawer sinks in the importance rerank (GitHub #309).
     let sql = format!(
-        "SELECT id, COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) \
+        "SELECT id, COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL)) \
          FROM drawers WHERE id IN ({placeholders})"
     );
     let snapshot: std::collections::HashMap<String, f64> = match db.conn().prepare(&sql) {
@@ -2381,6 +2383,95 @@ mod tests {
         assert!(
             sims[0] > sims[1] && sims[1] > sims[2],
             "similarity must strictly decrease along the ranking: {sims:?}"
+        );
+    }
+
+    /// Regression for GitHub #309: a freshly-ingested high-importance drawer must
+    /// not be buried in the importance rerank by a persisted `effective_importance`
+    /// of 0.0. Pre-fix, the INSERT omitted the column (so it took the column
+    /// DEFAULT 0.0) and the read fallback used a NULL-only `COALESCE`, so
+    /// `rerank_by_effective_importance` sorted the fresh drawer last and
+    /// `truncate(top_k)` dropped it. This drives the real BM25 rerank pipeline
+    /// (`apply_consistent_effective_importance` -> `rerank_by_effective_importance`
+    /// -> `truncate`) with no embedder; under the default `DecayMode::None` it is
+    /// fully deterministic.
+    #[test]
+    fn fresh_high_importance_drawer_not_buried_by_zero_effective_importance() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        // Fresh, high-importance drawer ingested through the real INSERT path with
+        // the constructor's 0.0 sentinel left in place. Fix (B) must seed its
+        // persisted effective_importance from `importance` (4.0); pre-fix it would
+        // land at the column DEFAULT 0.0.
+        let mut fresh = make_drawer("fresh-309", "alpha", "decision");
+        fresh.content = "needle three zero nine".to_string();
+        fresh.importance = 4;
+        db.insert_drawer_with_project_validity(&fresh, None, None, None, None)
+            .expect("insert fresh");
+
+        // Older rival with a positive effective_importance (as the v10 migration
+        // backfill would have produced). Pre-fix this outranks the 0.0 fresh drawer
+        // and, at top_k = 1, evicts it entirely.
+        let mut rival = make_drawer("rival-low", "alpha", "decision");
+        rival.content = "needle rival".to_string();
+        rival.importance = 1;
+        db.insert_drawer_with_project_validity(&rival, None, None, None, None)
+            .expect("insert rival");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 2.0 WHERE id = ?1",
+                ["rival-low"],
+            )
+            .expect("force rival effective_importance");
+
+        let results = search_bm25_only_with_options(
+            &db,
+            "needle",
+            route(),
+            &ProjectSearchScope::all_projects(),
+            SearchOptions::default(),
+            1,
+        )
+        .expect("search");
+
+        assert_eq!(
+            results.first().map(|result| result.drawer_id.as_str()),
+            Some("fresh-309"),
+            "fresh importance-4 drawer must rank #1 over the importance-2 rival, not \
+             be buried by a persisted effective_importance of 0.0 (GitHub #309)"
+        );
+    }
+
+    /// Regression for GitHub #309 (read-time guard): a row whose
+    /// `effective_importance` column holds a literal 0.0 (e.g. ingested before the
+    /// seed fix) must read back as its base `importance` via
+    /// `NULLIF(effective_importance, 0.0)`, not as 0.0. Exercises the shared
+    /// `DRAWER_SELECT_COLUMNS` fallback through `get_drawer`.
+    #[test]
+    fn persisted_zero_effective_importance_reads_back_as_importance() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+
+        let mut drawer = make_drawer("legacy-zero", "alpha", "decision");
+        drawer.importance = 3;
+        db.insert_drawer_with_project_validity(&drawer, None, None, None, None)
+            .expect("insert drawer");
+        // Simulate a legacy row that persisted the 0.0 sentinel directly.
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0 WHERE id = ?1",
+                ["legacy-zero"],
+            )
+            .expect("force legacy 0.0");
+
+        let fetched = db
+            .get_drawer("legacy-zero")
+            .expect("get_drawer")
+            .expect("drawer exists");
+        assert_eq!(
+            fetched.effective_importance, 3.0,
+            "persisted 0.0 must fall back to base importance (3.0) via NULLIF, not stay 0.0"
         );
     }
 }

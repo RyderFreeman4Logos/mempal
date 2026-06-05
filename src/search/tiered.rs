@@ -138,14 +138,16 @@ pub fn fetch_t1(db: &Database, params: T1Params<'_>) -> Result<Vec<TieredItem>, 
 
     let sql = format!(
         r#"
+        -- NULLIF(...,0.0) maps the persisted 0.0 sentinel to NULL so it falls back
+        -- to base importance instead of ranking last (GitHub #309).
         SELECT id, content, room, source_file, added_at,
-               COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL))
+               COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL))
         FROM drawers
         WHERE deleted_at IS NULL
           AND room IN ('decision', 'feedback', 'rule')
           AND COALESCE(importance, 0) >= ?1
           AND {project_clause}
-        ORDER BY COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL)) DESC,
+        ORDER BY COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL)) DESC,
                  CAST(added_at AS INTEGER) DESC
         "#,
     );
@@ -239,8 +241,9 @@ pub fn fetch_t3(db: &Database, params: T3Params<'_>) -> Result<Vec<TieredItem>, 
 
     let sql = format!(
         r#"
+        -- NULLIF(...,0.0): persisted 0.0 sentinel falls back to importance (GitHub #309).
         SELECT id, content, room, source_file, added_at,
-               COALESCE(effective_importance, CAST(COALESCE(importance, 0) AS REAL))
+               COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL))
         FROM drawers
         WHERE deleted_at IS NULL
           AND CAST(added_at AS INTEGER) >= ?1
