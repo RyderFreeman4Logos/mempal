@@ -1,0 +1,12 @@
+[book]
+title = "mempal 之书"
+authors = ["mempal contributors"]
+description = "Coding Agent 的记忆、协作与自进化基础设施"
+language = "zh-CN"
+multilingual = false
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/ZhangHanDong/mempal"
+edit-url-template = "https://github.com/ZhangHanDong/mempal/edit/main/books/zh-CN/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]

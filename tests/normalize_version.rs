@@ -257,6 +257,34 @@ fn active_drawer_rows_for_source(
         .expect("collect active drawer rows")
 }
 
+fn active_content_room_versions_for_source(
+    db: &Database,
+    source_file: &str,
+) -> Vec<(String, Option<String>, u32)> {
+    let mut statement = db
+        .conn()
+        .prepare(
+            r#"
+            SELECT content, room, normalize_version
+            FROM drawers
+            WHERE deleted_at IS NULL AND source_file = ?1
+            ORDER BY id
+            "#,
+        )
+        .expect("prepare active content room versions");
+    statement
+        .query_map([source_file], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
+        })
+        .expect("query active content room versions")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect active content room versions")
+}
+
 fn active_vector_project_ids_for_source(
     db: &Database,
     source_file: &str,
@@ -956,4 +984,281 @@ fn test_reindex_respects_per_source_lock() {
     assert_eq!(report.processed_sources, 1);
     let db = Database::open(&db_path).expect("reopen db");
     assert_eq!(stale_drawer_count_raw(&db), 0);
+}
+
+fn insert_source_drawer(db: &Database, id: &str, source_file: &str, room: Option<&str>) {
+    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: format!("content for {id}"),
+        wing: "mempal".to_string(),
+        room: room.map(|value| value.to_string()),
+        source_file: Some(source_file.to_string()),
+        source_type: SourceType::AgentInference,
+        added_at: "1710000000".to_string(),
+        chunk_index: Some(0),
+        importance: 0,
+    });
+    db.insert_drawer(&drawer).expect("insert source drawer");
+}
+
+fn insert_stale_source_drawer(
+    db: &Database,
+    id: &str,
+    source_file: &str,
+    room: Option<&str>,
+    content: &str,
+) {
+    let mut drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: content.to_string(),
+        wing: "mempal".to_string(),
+        room: room.map(|value| value.to_string()),
+        source_file: Some(source_file.to_string()),
+        source_type: SourceType::AgentInference,
+        added_at: "1710000000".to_string(),
+        chunk_index: Some(0),
+        importance: 0,
+    });
+    drawer.normalize_version = 0;
+    db.insert_drawer(&drawer)
+        .expect("insert stale source drawer");
+}
+
+fn active_count_for_source(db: &Database, source_file: &str) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL AND source_file = ?1",
+            [source_file],
+            |row| row.get(0),
+        )
+        .expect("count source drawers")
+}
+
+#[tokio::test]
+async fn test_reindex_stale_source_dedupes_across_rooms() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    let source = tmp.path().join("multi-room.md");
+    std::fs::write(&source, "fresh multi-room source").expect("write source");
+    let source_file = source.to_string_lossy().to_string();
+    insert_stale_source_drawer(
+        &db,
+        "drawer_multi_room_alpha",
+        &source_file,
+        Some("alpha"),
+        "old alpha",
+    );
+    insert_stale_source_drawer(
+        &db,
+        "drawer_multi_room_beta",
+        &source_file,
+        Some("beta"),
+        "old beta",
+    );
+
+    let report = reindex_sources(
+        &db,
+        &StubEmbedder,
+        ReindexOptions {
+            mode: ReindexMode::Stale,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("stale source reindex across rooms");
+
+    assert_eq!(report.candidate_drawers, 2);
+    assert_eq!(report.candidate_sources, 1);
+    assert_eq!(report.processed_sources, 1);
+    assert_eq!(report.reingested_files, 1);
+    assert_eq!(report.reingested_chunks, 1);
+    assert_eq!(
+        active_content_room_versions_for_source(&db, &source_file),
+        vec![(
+            "fresh multi-room source".to_string(),
+            Some("default".to_string()),
+            CURRENT_NORMALIZE_VERSION,
+        )]
+    );
+    assert_eq!(stale_drawer_count_raw(&db), 0);
+}
+
+// Regression: reindex re-routes a source to a different room, so a room-scoped
+// replace would miss the stale drawers in the old room and leave duplicates.
+// The across-rooms variant must delete every prior drawer for the source.
+#[test]
+fn test_replace_across_rooms_deletes_every_room_for_source() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    insert_source_drawer(&db, "drawer_old_nullroom", "docs/x.md", None);
+    insert_source_drawer(&db, "drawer_new_coreroom", "docs/x.md", Some("mempal-core"));
+    assert_eq!(active_count_for_source(&db, "docs/x.md"), 2);
+
+    let deleted = db
+        .replace_active_source_drawers_across_rooms("docs/x.md", "mempal", None, None)
+        .expect("replace across rooms");
+    assert_eq!(
+        deleted, 2,
+        "across-rooms replace must delete the source's drawers in every room"
+    );
+    assert_eq!(
+        active_count_for_source(&db, "docs/x.md"),
+        0,
+        "no stale drawer may survive in any room after across-rooms replace"
+    );
+}
+
+// Demonstrates the original bug surface the across-rooms variant fixes: a
+// room-scoped replace only clears the matching room and leaves the source's
+// drawers behind in any other room it was previously routed into.
+#[test]
+fn test_room_scoped_replace_leaves_other_rooms_behind() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    insert_source_drawer(&db, "drawer_old_nullroom", "docs/x.md", None);
+    insert_source_drawer(&db, "drawer_new_coreroom", "docs/x.md", Some("mempal-core"));
+
+    let deleted = db
+        .replace_active_source_drawers("docs/x.md", "mempal", Some("mempal-core"), None, None)
+        .expect("room-scoped replace");
+    assert_eq!(
+        deleted, 1,
+        "room-scoped replace only touches the matching room"
+    );
+    assert_eq!(
+        active_count_for_source(&db, "docs/x.md"),
+        1,
+        "room-scoped replace leaves the other room's stale drawer behind"
+    );
+}
+
+// Regression: triples.source_drawer is a FK (RESTRICT) to drawers(id) and
+// mempal opens connections with foreign_keys=ON. Hard-deleting a drawer that a
+// KG triple references must not fail with a FOREIGN KEY constraint error; the
+// replace path clears the stale source pointer first and keeps the triple.
+#[test]
+fn test_replace_clears_triple_source_drawer_fk() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+    insert_source_drawer(&db, "drawer_referenced", "docs/y.md", None);
+    db.insert_triple(&mempal::core::types::Triple {
+        id: "triple_ref".to_string(),
+        subject: "drawer_referenced".to_string(),
+        predicate: "elaborates".to_string(),
+        object: "something_else".to_string(),
+        valid_from: None,
+        valid_to: None,
+        confidence: 1.0,
+        source_drawer: Some("drawer_referenced".to_string()),
+    })
+    .expect("insert triple referencing the drawer");
+
+    let deleted = db
+        .replace_active_source_drawers_across_rooms("docs/y.md", "mempal", None, None)
+        .expect("replace must not fail on FK-referenced drawer");
+    assert_eq!(deleted, 1);
+    assert_eq!(active_count_for_source(&db, "docs/y.md"), 0);
+
+    // The KG fact survives; only its dangling source pointer is cleared.
+    let source_drawer: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT source_drawer FROM triples WHERE id = ?1",
+            ["triple_ref"],
+            |row| row.get(0),
+        )
+        .expect("triple still exists");
+    assert_eq!(
+        source_drawer, None,
+        "source_drawer must be cleared after the referenced drawer is deleted"
+    );
+}
+
+// Regression: `purge_deleted` clears triples.source_drawer before the hard
+// delete, but another RESTRICT FK (knowledge_evidence_links.evidence_drawer_id)
+// can block the drawer delete. The purge must be atomic — a blocked delete must
+// roll back the source_drawer NULL, never silently dropping provenance for a
+// drawer that was not actually purged.
+#[test]
+fn test_purge_blocked_by_evidence_link_keeps_triple_source_drawer() {
+    use mempal::core::types::{
+        AnchorKind, KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole, KnowledgeStatus,
+        KnowledgeTier, MemoryDomain, Triple,
+    };
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+
+    insert_source_drawer(&db, "drawer_evidence", "docs/z.md", None);
+    db.insert_triple(&Triple {
+        id: "triple_prov".to_string(),
+        subject: "drawer_evidence".to_string(),
+        predicate: "supports".to_string(),
+        object: "claim".to_string(),
+        valid_from: None,
+        valid_to: None,
+        confidence: 1.0,
+        source_drawer: Some("drawer_evidence".to_string()),
+    })
+    .expect("insert triple");
+
+    db.insert_knowledge_card(&KnowledgeCard {
+        id: "card_x".to_string(),
+        statement: "stmt".to_string(),
+        content: "content".to_string(),
+        tier: KnowledgeTier::Qi,
+        status: KnowledgeStatus::Candidate,
+        domain: MemoryDomain::Project,
+        field: "general".to_string(),
+        anchor_kind: AnchorKind::Repo,
+        anchor_id: "repo://test".to_string(),
+        parent_anchor_id: None,
+        scope_constraints: None,
+        trigger_hints: None,
+        auto_generated: false,
+        crystallization_score: None,
+        source_drawer_ids: Vec::new(),
+        created_at: "1710000000".to_string(),
+        updated_at: "1710000000".to_string(),
+    })
+    .expect("insert card");
+    // Link the card to the drawer: this installs the RESTRICT FK that will block
+    // a later hard delete of the drawer. Must happen while the drawer is active.
+    db.insert_knowledge_evidence_link(&KnowledgeEvidenceLink {
+        id: "link_x".to_string(),
+        card_id: "card_x".to_string(),
+        evidence_drawer_id: "drawer_evidence".to_string(),
+        role: KnowledgeEvidenceRole::Supporting,
+        note: None,
+        created_at: "1710000000".to_string(),
+    })
+    .expect("insert evidence link");
+
+    assert!(
+        db.soft_delete_drawer("drawer_evidence")
+            .expect("soft delete"),
+        "drawer should be soft-deleted so it becomes a purge candidate"
+    );
+
+    // purge must fail because the evidence link FK (RESTRICT) blocks the delete.
+    let purge = db.purge_deleted(None);
+    assert!(
+        purge.is_err(),
+        "purge must fail when an evidence link blocks the hard delete"
+    );
+
+    // Atomicity: the blocked delete must have rolled back the source_drawer NULL.
+    let source_drawer: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT source_drawer FROM triples WHERE id = ?1",
+            ["triple_prov"],
+            |row| row.get(0),
+        )
+        .expect("triple still exists");
+    assert_eq!(
+        source_drawer,
+        Some("drawer_evidence".to_string()),
+        "a blocked purge must not strip triple provenance (transaction must roll back)"
+    );
 }

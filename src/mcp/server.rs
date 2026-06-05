@@ -1967,6 +1967,7 @@ impl MempalMcpServer {
                 project_id: config.project.id.clone(),
                 trigger,
                 context_cfg_override: None,
+                include_distill_suggestions: request.include_distill_suggestions.unwrap_or(true),
             },
             &query_vector,
         )
@@ -3884,6 +3885,7 @@ impl MempalMcpServer {
                 project_id: None,
                 trigger: None,
                 context_cfg_override: None,
+                include_distill_suggestions: false,
             },
             &query_vector,
         )

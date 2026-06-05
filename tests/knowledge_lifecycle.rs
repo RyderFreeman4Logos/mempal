@@ -273,6 +273,7 @@ async fn default_context_ids(db: &Database, cwd: &Path, query: &str) -> Vec<Stri
             project_id: None,
             trigger: None,
             context_cfg_override: None,
+            include_distill_suggestions: false,
         },
     )
     .await

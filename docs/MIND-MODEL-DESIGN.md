@@ -2184,3 +2184,22 @@ That is the intended meaning of this design:
 - `shu` is operational method
 - `qi` is executable capability
 - evidence is the substrate from which all of them must be justified
+
+## P106: Context Distill Signal (read-only detector)
+
+`mempal context` / `mempal_context` carry a read-only `distill_suggestions`
+field. When assembling context, a deterministic detector groups active drawers
+by `field` and flags each field where active **evidence** count is at least 5
+AND there are zero active **promoted-or-canonical** knowledge drawers. It
+returns at most 3 suggestions, ordered by descending evidence count then
+ascending field; each carries `field`, `evidence_count`, up to 3
+`sample_evidence_drawer_ids`, and `suggested_tier="dao_ren"`.
+
+This is the "detector" layer of agent-driven mind-model construction: it makes
+"this is worth distilling" a client-agnostic, pull-based signal that appears
+where agents already look. It is purely observational — it performs no database
+write, no LLM call, no auto-distill, and no auto-promotion. Acting on a
+suggestion stays the agent's explicit `mempal_knowledge_distill` plus the
+deterministic gate (governance per P77/P80 unchanged). The signal is on by
+default (`include_distill_suggestions`, disable with
+`--no-distill-suggestions`) and never alters the assembled tier sections.

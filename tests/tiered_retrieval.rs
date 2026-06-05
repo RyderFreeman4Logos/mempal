@@ -86,6 +86,7 @@ fn request_with_cfg(cwd: &Path, cfg: ContextConfig) -> ContextRequest {
         project_id: None,
         trigger: None,
         context_cfg_override: Some(cfg),
+        include_distill_suggestions: false,
     }
 }
 

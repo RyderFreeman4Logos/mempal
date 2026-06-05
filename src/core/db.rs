@@ -1605,11 +1605,11 @@ impl Database {
     ) -> Result<Vec<ReindexSource>, DbError> {
         let mut statement = self.conn.prepare(
             r#"
-            SELECT source_root, source_file, project_id, wing, room, COUNT(*)
+            SELECT source_root, source_file, project_id, wing, NULL AS room, COUNT(*)
             FROM drawers
             WHERE deleted_at IS NULL AND normalize_version < ?1
-            GROUP BY project_id, source_root, source_file, wing, room
-            ORDER BY project_id, source_root, source_file, wing, room
+            GROUP BY project_id, source_root, source_file, wing
+            ORDER BY project_id, source_root, source_file, wing
             "#,
         )?;
         let rows = statement
@@ -1629,13 +1629,13 @@ impl Database {
             r#"
             SELECT COALESCE(SUM(drawer_count), 0), COUNT(*)
             FROM (
-                SELECT source_root, source_file, project_id, wing, room, COUNT(*) AS drawer_count
+                SELECT COUNT(*) AS drawer_count
                 FROM drawers
                 WHERE deleted_at IS NULL
                   AND normalize_version < ?1
                   AND project_id IS NOT NULL
                   AND source_root IS NULL
-                GROUP BY project_id, source_root, source_file, wing, room
+                GROUP BY project_id, source_root, source_file, wing
             )
             "#,
         )?;
@@ -1649,11 +1649,11 @@ impl Database {
     pub fn reindex_sources_force(&self) -> Result<Vec<ReindexSource>, DbError> {
         let mut statement = self.conn.prepare(
             r#"
-            SELECT source_root, source_file, project_id, wing, room, COUNT(*)
+            SELECT source_root, source_file, project_id, wing, NULL AS room, COUNT(*)
             FROM drawers
             WHERE deleted_at IS NULL
-            GROUP BY project_id, source_root, source_file, wing, room
-            ORDER BY project_id, source_root, source_file, wing, room
+            GROUP BY project_id, source_root, source_file, wing
+            ORDER BY project_id, source_root, source_file, wing
             "#,
         )?;
         let rows = statement
@@ -1669,12 +1669,12 @@ impl Database {
             r#"
             SELECT COALESCE(SUM(drawer_count), 0), COUNT(*)
             FROM (
-                SELECT source_root, source_file, project_id, wing, room, COUNT(*) AS drawer_count
+                SELECT COUNT(*) AS drawer_count
                 FROM drawers
                 WHERE deleted_at IS NULL
                   AND project_id IS NOT NULL
                   AND source_root IS NULL
-                GROUP BY project_id, source_root, source_file, wing, room
+                GROUP BY project_id, source_root, source_file, wing
             )
             "#,
         )?;
@@ -1682,6 +1682,14 @@ impl Database {
         Ok(summary)
     }
 
+    /// Hard-delete the active drawers for a source scoped to a specific room
+    /// (NULL room matches NULL room), removing their FTS and vector rows too.
+    ///
+    /// Use this when the caller knows the exact room the drawers live in.
+    /// For reindex, prefer [`replace_active_source_drawers_across_rooms`]:
+    /// re-ingesting a physical source may re-route it to a different room, and
+    /// a room-scoped delete would miss the stale drawers in the old room and
+    /// leave duplicates behind.
     pub fn replace_active_source_drawers(
         &self,
         source_file: &str,
@@ -1714,6 +1722,58 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
 
+        self.delete_source_drawer_rows(rows, project_id, source_root)
+    }
+
+    /// Hard-delete the active drawers for a source across ALL rooms in a scope.
+    ///
+    /// This is the correct replace semantics for reindex: a physical source
+    /// file maps to one logical source, so re-indexing it should keep only the
+    /// freshly produced drawers regardless of which room each previous version
+    /// was routed into. The fork still scopes the delete by project/source_root,
+    /// so cross-room replacement cannot delete another project or source root.
+    pub fn replace_active_source_drawers_across_rooms(
+        &self,
+        source_file: &str,
+        wing: &str,
+        project_id: Option<&str>,
+        source_root: Option<&str>,
+    ) -> Result<u64, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT rowid, id, content
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND source_file = ?1
+              AND wing = ?2
+              AND ((?3 IS NULL AND project_id IS NULL) OR project_id = ?3)
+              AND ((?4 IS NULL AND source_root IS NULL) OR source_root = ?4)
+            ORDER BY rowid
+            "#,
+        )?;
+        let rows = statement
+            .query_map((source_file, wing, project_id, source_root), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        self.delete_source_drawer_rows(rows, project_id, source_root)
+    }
+
+    /// Transactionally hard-delete the given (rowid, id, content) drawer rows
+    /// along with their FTS and vector entries. Shared by the room-scoped and
+    /// across-rooms source replacement paths.
+    fn delete_source_drawer_rows(
+        &self,
+        rows: Vec<(i64, String, String)>,
+        project_id: Option<&str>,
+        source_root: Option<&str>,
+    ) -> Result<u64, DbError> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -1749,6 +1809,15 @@ impl Database {
                         params![id, project_id, rowid, source_root],
                     )?;
                 }
+                // triples.source_drawer is a FK to drawers(id) (RESTRICT). Drop
+                // the dangling provenance link before the hard delete, otherwise
+                // deleting a drawer referenced by a KG triple fails with a
+                // FOREIGN KEY constraint error. The triple (a KG fact) is kept;
+                // only its stale source pointer is cleared.
+                self.conn.execute(
+                    "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
+                    [id],
+                )?;
                 self.conn.execute(
                     r#"
                     DELETE FROM drawers
@@ -1903,6 +1972,125 @@ impl Database {
                     ))
                 },
             )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Per-field counts for the P106 distill signal: active evidence drawers and
+    /// active promoted-or-canonical knowledge drawers, grouped by `field`.
+    /// Read-only; performs no writes.
+    pub fn distill_field_counts(&self) -> Result<Vec<(String, i64, i64)>, DbError> {
+        self.distill_field_counts_scoped(None)
+    }
+
+    /// Project-scoped variant of [`Self::distill_field_counts`].
+    ///
+    /// When `project_id` is `None`, this preserves the historical all-projects
+    /// behavior used before project isolation was threaded into context assembly.
+    pub fn distill_field_counts_scoped(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<(String, i64, i64)>, DbError> {
+        if let Some(project_id) = project_id {
+            let mut statement = self.conn.prepare(
+                r#"
+                SELECT field,
+                       SUM(CASE WHEN memory_kind = 'evidence' THEN 1 ELSE 0 END) AS evidence_count,
+                       SUM(CASE WHEN memory_kind = 'knowledge'
+                                 AND status IN ('promoted', 'canonical') THEN 1 ELSE 0 END) AS promoted_count
+                FROM drawers
+                WHERE deleted_at IS NULL
+                  AND project_id = ?1
+                GROUP BY field
+                "#,
+            )?;
+            let rows = statement
+                .query_map([project_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            return Ok(rows);
+        }
+
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT field,
+                   SUM(CASE WHEN memory_kind = 'evidence' THEN 1 ELSE 0 END) AS evidence_count,
+                   SUM(CASE WHEN memory_kind = 'knowledge'
+                             AND status IN ('promoted', 'canonical') THEN 1 ELSE 0 END) AS promoted_count
+            FROM drawers
+            WHERE deleted_at IS NULL
+            GROUP BY field
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Up to `limit` active evidence drawer ids for a `field`, ordered by rowid
+    /// for deterministic sampling. Read-only; performs no writes.
+    pub fn sample_evidence_drawer_ids(
+        &self,
+        field: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, DbError> {
+        self.sample_evidence_drawer_ids_scoped(field, limit, None)
+    }
+
+    /// Project-scoped variant of [`Self::sample_evidence_drawer_ids`].
+    ///
+    /// When `project_id` is `None`, this preserves the historical all-projects
+    /// behavior used before project isolation was threaded into context assembly.
+    pub fn sample_evidence_drawer_ids_scoped(
+        &self,
+        field: &str,
+        limit: usize,
+        project_id: Option<&str>,
+    ) -> Result<Vec<String>, DbError> {
+        if let Some(project_id) = project_id {
+            let mut statement = self.conn.prepare(
+                r#"
+                SELECT id
+                FROM drawers
+                WHERE deleted_at IS NULL
+                  AND memory_kind = 'evidence'
+                  AND field = ?1
+                  AND project_id = ?3
+                ORDER BY rowid
+                LIMIT ?2
+                "#,
+            )?;
+            let rows = statement
+                .query_map(params![field, limit as i64, project_id], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            return Ok(rows);
+        }
+
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id
+            FROM drawers
+            WHERE deleted_at IS NULL AND memory_kind = 'evidence' AND field = ?1
+            ORDER BY rowid
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement
+            .query_map(params![field, limit as i64], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -3018,16 +3206,42 @@ impl Database {
             |row| row.get(0),
         )?;
 
-        for id in &ids {
-            if vectors_exist {
+        // Wrap the purge in a single transaction. Clearing the
+        // triples.source_drawer FK and deleting the drawer must be atomic:
+        // another RESTRICT FK (e.g. knowledge_evidence_links.evidence_drawer_id)
+        // can block `DELETE FROM drawers`, and without a transaction the prior
+        // `UPDATE triples SET source_drawer = NULL` would have already committed
+        // — silently dropping provenance for a drawer that was not purged.
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<u64, DbError> {
+            for id in &ids {
+                if vectors_exist {
+                    self.conn
+                        .execute("DELETE FROM drawer_vectors WHERE id = ?1", [id])?;
+                }
+                // Clear the triples.source_drawer FK (RESTRICT) before the hard
+                // delete so purging a soft-deleted drawer referenced by a KG
+                // triple does not fail with a FOREIGN KEY constraint error.
+                self.conn.execute(
+                    "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
+                    [id],
+                )?;
                 self.conn
-                    .execute("DELETE FROM drawer_vectors WHERE id = ?1", [id])?;
+                    .execute("DELETE FROM drawers WHERE id = ?1", [id])?;
             }
-            self.conn
-                .execute("DELETE FROM drawers WHERE id = ?1", [id])?;
-        }
+            Ok(ids.len() as u64)
+        })();
 
-        Ok(ids.len() as u64)
+        match result {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(count)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
     }
 
     pub fn deleted_drawer_count(&self) -> Result<i64, DbError> {

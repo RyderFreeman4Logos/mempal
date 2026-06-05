@@ -431,6 +431,7 @@ async fn test_active_skill_injected_in_t1() {
         project_id: None,
         trigger: None,
         context_cfg_override: None,
+        include_distill_suggestions: false,
     };
 
     let pack = assemble_context(&db, &embedder, request)
@@ -489,6 +490,7 @@ async fn test_probationary_skill_excluded_from_context() {
         project_id: None,
         trigger: None,
         context_cfg_override: None,
+        include_distill_suggestions: false,
     };
 
     let pack = assemble_context(&db, &embedder, request)

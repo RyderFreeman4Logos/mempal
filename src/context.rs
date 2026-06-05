@@ -65,6 +65,9 @@ pub struct ContextRequest {
     pub trigger: Option<ContextTrigger>,
     /// Override for context assembly config; None → use global ConfigHandle.
     pub context_cfg_override: Option<ContextConfig>,
+    /// P106: include the read-only `distill_suggestions` signal. Defaults to
+    /// true at the CLI/MCP surfaces; never changes the assembled sections.
+    pub include_distill_suggestions: bool,
 }
 
 /// T1/T2/T3 tiered assembly result (P14).
@@ -78,6 +81,11 @@ pub struct TieredAssembly {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_skills: Vec<SkillForContext>,
 }
+
+/// P106 distill-signal thresholds. Fixed constants in v1 (not config-tunable).
+pub const DISTILL_SIGNAL_MIN_EVIDENCE: i64 = 5;
+pub const DISTILL_SIGNAL_MAX_SUGGESTIONS: usize = 3;
+pub const DISTILL_SIGNAL_SAMPLE_LIMIT: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContextAnchor {
@@ -103,6 +111,20 @@ pub struct ContextPack {
     /// Active skills injected at T1 head priority (P15 skill crystallization).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_skills: Vec<SkillForContext>,
+    /// P106: read-only signal flagging fields where evidence is dense but no
+    /// promoted knowledge exists yet. Empty when disabled or nothing qualifies.
+    /// Never alters `sections`.
+    pub distill_suggestions: Vec<DistillSuggestion>,
+}
+
+/// P106: a read-only suggestion that a `field` is worth distilling. The agent
+/// MAY act on it via the explicit distill -> gate lifecycle; mempal never acts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DistillSuggestion {
+    pub field: String,
+    pub evidence_count: usize,
+    pub sample_evidence_drawer_ids: Vec<String>,
+    pub suggested_tier: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -324,6 +346,11 @@ fn assemble_tiered(
     let anchors = context_anchors(&request)?;
     let recurring_themes = load_recurring_themes(db, project_id);
     let repair_warnings = load_repair_warnings(db, project_id);
+    let distill_suggestions = if request.include_distill_suggestions {
+        detect_distill_suggestions(db, project_id)?
+    } else {
+        Vec::new()
+    };
 
     Ok(ContextPack {
         query: request.query,
@@ -341,6 +368,7 @@ fn assemble_tiered(
         tiered: Some(tiered),
         repair_warnings,
         active_skills,
+        distill_suggestions,
     })
 }
 
@@ -650,6 +678,11 @@ fn assemble_flat(
         query_vector,
         &crate::core::config::ConfigHandle::current().skills,
     );
+    let distill_suggestions = if request.include_distill_suggestions {
+        detect_distill_suggestions(db, request.project_id.as_deref())?
+    } else {
+        Vec::new()
+    };
 
     Ok(ContextPack {
         query: request.query,
@@ -667,6 +700,7 @@ fn assemble_flat(
         tiered: None,
         repair_warnings,
         active_skills,
+        distill_suggestions,
     })
 }
 
@@ -738,6 +772,43 @@ fn load_recurring_themes(db: &Database, project_id: Option<&str>) -> Vec<Pattern
             vec![]
         }
     }
+}
+
+/// P106 detector: deterministic, read-only. Flags each `field` whose active
+/// evidence count is at least `DISTILL_SIGNAL_MIN_EVIDENCE` AND which has zero
+/// active promoted-or-canonical knowledge. Returns at most
+/// `DISTILL_SIGNAL_MAX_SUGGESTIONS`, ordered by descending evidence count then
+/// ascending field. Performs no database writes and no LLM call.
+fn detect_distill_suggestions(
+    db: &Database,
+    project_id: Option<&str>,
+) -> Result<Vec<DistillSuggestion>> {
+    let mut qualifying: Vec<(String, i64)> = db
+        .distill_field_counts_scoped(project_id)
+        .map_err(ContextError::LoadDrawer)?
+        .into_iter()
+        .filter(|(_, evidence_count, promoted_count)| {
+            *evidence_count >= DISTILL_SIGNAL_MIN_EVIDENCE && *promoted_count == 0
+        })
+        .map(|(field, evidence_count, _)| (field, evidence_count))
+        .collect();
+
+    qualifying.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    qualifying.truncate(DISTILL_SIGNAL_MAX_SUGGESTIONS);
+
+    let mut suggestions = Vec::with_capacity(qualifying.len());
+    for (field, evidence_count) in qualifying {
+        let sample_evidence_drawer_ids = db
+            .sample_evidence_drawer_ids_scoped(&field, DISTILL_SIGNAL_SAMPLE_LIMIT, project_id)
+            .map_err(ContextError::LoadDrawer)?;
+        suggestions.push(DistillSuggestion {
+            field,
+            evidence_count: evidence_count as usize,
+            sample_evidence_drawer_ids,
+            suggested_tier: "dao_ren".to_string(),
+        });
+    }
+    Ok(suggestions)
 }
 
 fn context_anchors(request: &ContextRequest) -> Result<Vec<AnchorCandidate>> {

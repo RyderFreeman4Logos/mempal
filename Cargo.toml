@@ -22,6 +22,7 @@ exclude = [
     "hooks/**",       # legacy project-level hooks; not part of mempal runtime
     "specs/**",       # internal agent-spec Task Contracts (README links redirected to GitHub)
     "docs/plans/**",  # internal implementation plans (README links redirected to GitHub)
+    "books/**",       # mdBook manuscript + 2.5MB local Mermaid asset; repo/docs only, not runtime
 ]
 
 [[bin]]
