@@ -1078,6 +1078,7 @@ impl MempalMcpServer {
                     .unwrap_or(self.config.context.include_cards_default),
                 max_items,
                 dao_tian_limit,
+                include_distill_suggestions: request.include_distill_suggestions.unwrap_or(true),
             },
             &query_vector,
         )
@@ -1174,6 +1175,8 @@ impl MempalMcpServer {
                 include_cards: true,
                 max_items,
                 dao_tian_limit: request.dao_tian_limit.unwrap_or(1),
+                // brief surface: P106 distill signal is scoped to context only.
+                include_distill_suggestions: false,
             },
             &query_vector,
         )

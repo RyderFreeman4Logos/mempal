@@ -160,6 +160,7 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 | `specs/p103-adoption-analytics.spec.md` | 完成 | P103 adoption analytics：`phase3 adoption analytics` / MCP `analytics` 按 track+feature 汇总 runtime adoption evidence |
 | `specs/p104-release-readiness-checklist.spec.md` | 完成 | P104 release readiness checklist：`mempal release-readiness` 只读检查 package/docs/spec-plan/runbook/doctor/schema 发布准备状态 |
 | `specs/p105-mempal-book-zh-cn.spec.md` | 完成 | P105 mempal book zh-CN：中文 mdBook + Mermaid 渲染 + 每章 agent-spec 写作合约/计划 + 扩展正文，从决策到架构到实际使用 |
+| `specs/p106-context-distill-signal.spec.md` | 完成 | P106 context distill signal：`mempal context` / `mempal_context` 只读 `distill_suggestions`——确定性检测 evidence 密集但无 promoted 知识的 field（≥5 evidence 且 0 promoted），给出 distill 建议；不写库、不自动 distill/promote，写入仍走显式 gate |
 
 ### 当前 Spec（草稿，未实现）
 
@@ -270,6 +271,7 @@ mempal 借鉴 MemPalace 的设计理念（verbatim 存储、Wing/Room 结构、A
 - `docs/plans/2026-05-26-p103-adoption-analytics.md` — P103 adoption analytics（已完成）
 - `docs/plans/2026-05-26-p104-release-readiness-checklist.md` — P104 release readiness checklist（已完成）
 - `docs/plans/2026-05-28-p105-mempal-book-zh-cn.md` — P105 mempal book zh-CN（已完成）
+- `docs/plans/2026-06-04-p106-context-distill-signal.md` — P106 context distill signal（已完成）
 
 ### Spec 使用方式
 

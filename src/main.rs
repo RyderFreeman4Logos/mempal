@@ -161,6 +161,8 @@ enum Commands {
         max_items: usize,
         #[arg(long = "dao-tian-limit", default_value_t = 1)]
         dao_tian_limit: usize,
+        #[arg(long = "no-distill-suggestions")]
+        no_distill_suggestions: bool,
     },
     Brief {
         query: String,
@@ -1503,6 +1505,7 @@ async fn run() -> Result<()> {
             no_include_cards,
             max_items,
             dao_tian_limit,
+            no_distill_suggestions,
         } => {
             context_command(
                 &db,
@@ -1518,6 +1521,7 @@ async fn run() -> Result<()> {
                     no_include_cards,
                     max_items,
                     dao_tian_limit,
+                    no_distill_suggestions,
                 },
             )
             .await
@@ -1623,6 +1627,7 @@ struct ContextCommandArgs {
     no_include_cards: bool,
     max_items: usize,
     dao_tian_limit: usize,
+    no_distill_suggestions: bool,
 }
 
 struct BriefCommandArgs {
@@ -2222,6 +2227,7 @@ async fn context_command(db: &Database, config: &Config, args: ContextCommandArg
             include_cards,
             max_items: args.max_items,
             dao_tian_limit: args.dao_tian_limit,
+            include_distill_suggestions: !args.no_distill_suggestions,
         },
     )
     .await?;
@@ -2296,7 +2302,6 @@ fn parse_domain(value: &str) -> Result<MemoryDomain> {
 fn print_context_plain(pack: &ContextPack) {
     if pack.sections.is_empty() {
         println!("no context");
-        return;
     }
 
     for section in &pack.sections {
@@ -2338,6 +2343,22 @@ fn print_context_plain(pack: &ContextPack) {
             }
         }
         println!();
+    }
+
+    if !pack.distill_suggestions.is_empty() {
+        println!("## distill_suggestions");
+        for suggestion in &pack.distill_suggestions {
+            println!(
+                "- field={} evidence_count={} suggested_tier={}",
+                suggestion.field, suggestion.evidence_count, suggestion.suggested_tier
+            );
+            if !suggestion.sample_evidence_drawer_ids.is_empty() {
+                println!(
+                    "  samples: {}",
+                    suggestion.sample_evidence_drawer_ids.join(",")
+                );
+            }
+        }
     }
 }
 

@@ -6,6 +6,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR bumps introduce new features, PATCH bumps are bug-fix only).
 
+## [0.6.0] — 2026-06-05
+
+Feature release. **P106: a read-only "distill signal" in mind-model context.**
+
+### Added
+
+- **`mempal context` / `mempal_context` now carry `distill_suggestions`** — a
+  read-only, deterministic signal that flags fields worth crystallizing into
+  knowledge. The detector groups active drawers by `field` and surfaces a
+  suggestion for each field with at least 5 active evidence drawers AND zero
+  active promoted-or-canonical knowledge. It returns at most 3 suggestions
+  (descending evidence count, then ascending field); each carries `field`,
+  `evidence_count`, up to 3 `sample_evidence_drawer_ids`, and
+  `suggested_tier="dao_ren"`. This is the "detector" layer of agent-driven
+  mind-model construction: it makes "this is worth distilling" a client-agnostic,
+  pull-based signal that appears where agents already look.
+- On by default; disable per call with the CLI `--no-distill-suggestions` flag
+  or the MCP `include_distill_suggestions=false` request field. `mempal brief`
+  does not carry the signal.
+
+### Notes
+
+- Purely observational: the detector performs no database write, no LLM call, no
+  auto-distill, and no auto-promotion. Acting on a suggestion stays the agent's
+  explicit `mempal_knowledge_distill` plus the deterministic gate (governance per
+  P77/P80 unchanged). It never alters the assembled tier sections.
+
 ## [0.5.4] — 2026-05-30
 
 Bug-fix release. **`purge_deleted` could silently drop triple provenance when a
@@ -271,6 +298,7 @@ P8) on top of hybrid search and the knowledge graph.
 Earlier releases (0.1.x, 0.2.x) are tracked only in Git history. Run
 `git log --oneline` on the repository to inspect them.
 
+[0.6.0]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.6.0
 [0.5.4]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.4
 [0.5.3]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.3
 [0.5.2]: https://github.com/ZhangHanDong/mempal/releases/tag/v0.5.2

@@ -3,7 +3,7 @@ use crate::brief::{
     BriefCard, BriefCitation, BriefEvidence, BriefEvidenceCitation, BriefFact, BriefSummary,
     BriefUncertainty, BriefUnresolvedItem, CognitiveBrief,
 };
-use crate::context::{ContextItem, ContextPack, ContextSection};
+use crate::context::{ContextItem, ContextPack, ContextSection, DistillSuggestion};
 use crate::core::phase3::{
     Phase3ReadinessReport, ResearchCandidateInsightPlan, ResearchEvidenceDrawerPlan,
     ResearchIngestPlanReport, RuntimeAdoptionCheckedRecordReport, RuntimeAdoptionGuidance,
@@ -91,6 +91,9 @@ pub struct ContextRequest {
     /// Maximum number of `dao_tian` items to include. Defaults to 1; 0 disables
     /// the `dao_tian` section while preserving lower-tier context.
     pub dao_tian_limit: Option<usize>,
+    /// P106: include the read-only `distill_suggestions` signal. Defaults to
+    /// true; set false to omit it. Never changes the assembled sections.
+    pub include_distill_suggestions: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -100,6 +103,28 @@ pub struct ContextResponse {
     pub field: String,
     pub anchors: Vec<ContextAnchorDto>,
     pub sections: Vec<ContextSectionDto>,
+    /// P106: read-only signal flagging fields with dense evidence but no
+    /// promoted knowledge yet. Empty when disabled or nothing qualifies.
+    pub distill_suggestions: Vec<DistillSuggestionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DistillSuggestionDto {
+    pub field: String,
+    pub evidence_count: usize,
+    pub sample_evidence_drawer_ids: Vec<String>,
+    pub suggested_tier: String,
+}
+
+impl From<DistillSuggestion> for DistillSuggestionDto {
+    fn from(value: DistillSuggestion) -> Self {
+        Self {
+            field: value.field,
+            evidence_count: value.evidence_count,
+            sample_evidence_drawer_ids: value.sample_evidence_drawer_ids,
+            suggested_tier: value.suggested_tier,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default, JsonSchema)]
@@ -2040,6 +2065,11 @@ impl From<ContextPack> for ContextResponse {
                 .sections
                 .into_iter()
                 .map(ContextSectionDto::from)
+                .collect(),
+            distill_suggestions: value
+                .distill_suggestions
+                .into_iter()
+                .map(DistillSuggestionDto::from)
                 .collect(),
         }
     }

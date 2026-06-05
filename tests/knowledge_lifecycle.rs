@@ -258,6 +258,7 @@ async fn default_context_ids(db: &Database, cwd: &Path, query: &str) -> Vec<Stri
             include_cards: false,
             max_items: 12,
             dao_tian_limit: 1,
+            include_distill_suggestions: false,
         },
     )
     .await

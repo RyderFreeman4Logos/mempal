@@ -719,6 +719,55 @@ impl Database {
         Ok(rows)
     }
 
+    /// Per-field counts for the P106 distill signal: active evidence drawers and
+    /// active promoted-or-canonical knowledge drawers, grouped by `field`.
+    /// Read-only; performs no writes.
+    pub fn distill_field_counts(&self) -> Result<Vec<(String, i64, i64)>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT field,
+                   SUM(CASE WHEN memory_kind = 'evidence' THEN 1 ELSE 0 END) AS evidence_count,
+                   SUM(CASE WHEN memory_kind = 'knowledge'
+                             AND status IN ('promoted', 'canonical') THEN 1 ELSE 0 END) AS promoted_count
+            FROM drawers
+            WHERE deleted_at IS NULL
+            GROUP BY field
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Up to `limit` active evidence drawer ids for a `field`, ordered by rowid
+    /// for deterministic sampling. Read-only; performs no writes.
+    pub fn sample_evidence_drawer_ids(
+        &self,
+        field: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT id
+            FROM drawers
+            WHERE deleted_at IS NULL AND memory_kind = 'evidence' AND field = ?1
+            ORDER BY rowid
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement
+            .query_map(params![field, limit as i64], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn get_drawer(&self, drawer_id: &str) -> Result<Option<Drawer>, DbError> {
         let mut statement = self.conn.prepare(&format!(
             r#"

@@ -47,7 +47,15 @@ pub struct ContextRequest {
     pub include_cards: bool,
     pub max_items: usize,
     pub dao_tian_limit: usize,
+    /// P106: include the read-only `distill_suggestions` signal. Defaults to
+    /// true at the CLI/MCP surfaces; never changes the assembled sections.
+    pub include_distill_suggestions: bool,
 }
+
+/// P106 distill-signal thresholds. Fixed constants in v1 (not config-tunable).
+pub const DISTILL_SIGNAL_MIN_EVIDENCE: i64 = 5;
+pub const DISTILL_SIGNAL_MAX_SUGGESTIONS: usize = 3;
+pub const DISTILL_SIGNAL_SAMPLE_LIMIT: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContextAnchor {
@@ -62,6 +70,20 @@ pub struct ContextPack {
     pub field: String,
     pub anchors: Vec<ContextAnchor>,
     pub sections: Vec<ContextSection>,
+    /// P106: read-only signal flagging fields where evidence is dense but no
+    /// promoted knowledge exists yet. Empty when disabled or nothing qualifies.
+    /// Never alters `sections`.
+    pub distill_suggestions: Vec<DistillSuggestion>,
+}
+
+/// P106: a read-only suggestion that a `field` is worth distilling. The agent
+/// MAY act on it via the explicit distill -> gate lifecycle; mempal never acts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DistillSuggestion {
+    pub field: String,
+    pub evidence_count: usize,
+    pub sample_evidence_drawer_ids: Vec<String>,
+    pub suggested_tier: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,6 +307,12 @@ pub fn assemble_context_with_vector(
         }
     }
 
+    let distill_suggestions = if request.include_distill_suggestions {
+        detect_distill_suggestions(db)?
+    } else {
+        Vec::new()
+    };
+
     Ok(ContextPack {
         query: request.query,
         domain: request.domain,
@@ -297,7 +325,42 @@ pub fn assemble_context_with_vector(
             })
             .collect(),
         sections,
+        distill_suggestions,
     })
+}
+
+/// P106 detector: deterministic, read-only. Flags each `field` whose active
+/// evidence count is at least `DISTILL_SIGNAL_MIN_EVIDENCE` AND which has zero
+/// active promoted-or-canonical knowledge. Returns at most
+/// `DISTILL_SIGNAL_MAX_SUGGESTIONS`, ordered by descending evidence count then
+/// ascending field. Performs no database writes and no LLM call.
+fn detect_distill_suggestions(db: &Database) -> Result<Vec<DistillSuggestion>> {
+    let mut qualifying: Vec<(String, i64)> = db
+        .distill_field_counts()
+        .map_err(ContextError::LoadDrawer)?
+        .into_iter()
+        .filter(|(_, evidence_count, promoted_count)| {
+            *evidence_count >= DISTILL_SIGNAL_MIN_EVIDENCE && *promoted_count == 0
+        })
+        .map(|(field, evidence_count, _)| (field, evidence_count))
+        .collect();
+
+    qualifying.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    qualifying.truncate(DISTILL_SIGNAL_MAX_SUGGESTIONS);
+
+    let mut suggestions = Vec::with_capacity(qualifying.len());
+    for (field, evidence_count) in qualifying {
+        let sample_evidence_drawer_ids = db
+            .sample_evidence_drawer_ids(&field, DISTILL_SIGNAL_SAMPLE_LIMIT)
+            .map_err(ContextError::LoadDrawer)?;
+        suggestions.push(DistillSuggestion {
+            field,
+            evidence_count: evidence_count as usize,
+            sample_evidence_drawer_ids,
+            suggested_tier: "dao_ren".to_string(),
+        });
+    }
+    Ok(suggestions)
 }
 
 fn context_anchors(request: &ContextRequest) -> Result<Vec<AnchorCandidate>> {

@@ -5,6 +5,8 @@ use std::path::Path;
 use std::process::Command;
 use std::thread;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use mempal::context::{ContextRequest, assemble_context};
 use mempal::core::anchor;
@@ -13,9 +15,51 @@ use mempal::core::types::{
     AnchorKind, Drawer, KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole,
     KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance, SourceType, TriggerHints,
 };
-use mempal::embed::Embedder;
+use mempal::embed::{Embedder, EmbedderFactory};
+use mempal::mcp::MempalMcpServer;
 use serde_json::{Value, json};
 use tempfile::TempDir;
+
+struct StubEmbedderFactory;
+
+#[async_trait]
+impl EmbedderFactory for StubEmbedderFactory {
+    async fn build(&self) -> mempal::embed::Result<Box<dyn Embedder>> {
+        Ok(Box::new(StubEmbedder { vector: vector() }))
+    }
+}
+
+fn setup_mcp_server() -> (TempDir, Database, MempalMcpServer) {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("open db");
+    let server = MempalMcpServer::new_with_factory(db_path, Arc::new(StubEmbedderFactory));
+    (tmp, db, server)
+}
+
+fn evidence_in_field(id: &str, field: &str) -> Drawer {
+    let mut drawer = evidence_drawer(id, "evidence content");
+    drawer.field = field.to_string();
+    drawer
+}
+
+fn promoted_knowledge_in_field(id: &str, field: &str) -> Drawer {
+    let mut drawer = knowledge_drawer(
+        id,
+        KnowledgeTier::DaoRen,
+        KnowledgeStatus::Promoted,
+        "promoted statement",
+        "promoted content",
+    );
+    drawer.field = field.to_string();
+    drawer
+}
+
+fn distill_request(cwd: &Path) -> ContextRequest {
+    let mut request = default_request("debug", cwd);
+    request.include_distill_suggestions = true;
+    request
+}
 
 struct StubEmbedder {
     vector: Vec<f32>,
@@ -72,6 +116,7 @@ fn default_request(query: &str, cwd: &Path) -> ContextRequest {
         include_cards: false,
         max_items: 12,
         dao_tian_limit: 1,
+        include_distill_suggestions: false,
     }
 }
 
@@ -1123,4 +1168,176 @@ fn table_names(db: &Database) -> Vec<String> {
         .expect("query table names")
         .collect::<Result<Vec<_>, _>>()
         .expect("collect table names")
+}
+
+// ---- P106 context distill signal ----
+
+fn active_drawer_total(db: &Database) -> i64 {
+    db.scope_counts()
+        .expect("scope counts")
+        .into_iter()
+        .map(|(_, _, count)| count)
+        .sum()
+}
+
+#[tokio::test]
+async fn test_context_distill_signal_suggests_dense_field() {
+    let (tmp, db) = new_db();
+    for index in 0..5 {
+        db.insert_drawer(&evidence_in_field(&format!("drawer_auth_{index}"), "auth"))
+            .expect("insert evidence");
+    }
+    let pack = assemble_context(&db, &embedder(), distill_request(tmp.path()))
+        .await
+        .expect("assemble context");
+    let suggestion = pack
+        .distill_suggestions
+        .iter()
+        .find(|s| s.field == "auth")
+        .expect("auth distill suggestion");
+    assert_eq!(suggestion.evidence_count, 5);
+    assert_eq!(suggestion.suggested_tier, "dao_ren");
+    assert!(!suggestion.sample_evidence_drawer_ids.is_empty());
+}
+
+#[tokio::test]
+async fn test_context_distill_signal_skips_promoted_field() {
+    let (tmp, db) = new_db();
+    for index in 0..5 {
+        db.insert_drawer(&evidence_in_field(&format!("drawer_auth_{index}"), "auth"))
+            .expect("insert evidence");
+    }
+    db.insert_drawer(&promoted_knowledge_in_field("drawer_auth_k", "auth"))
+        .expect("insert promoted knowledge");
+    let pack = assemble_context(&db, &embedder(), distill_request(tmp.path()))
+        .await
+        .expect("assemble context");
+    assert!(
+        !pack.distill_suggestions.iter().any(|s| s.field == "auth"),
+        "field with promoted knowledge must not be suggested"
+    );
+}
+
+#[tokio::test]
+async fn test_context_distill_signal_below_threshold() {
+    let (tmp, db) = new_db();
+    for index in 0..4 {
+        db.insert_drawer(&evidence_in_field(&format!("drawer_auth_{index}"), "auth"))
+            .expect("insert evidence");
+    }
+    let pack = assemble_context(&db, &embedder(), distill_request(tmp.path()))
+        .await
+        .expect("assemble context");
+    assert!(pack.distill_suggestions.is_empty());
+}
+
+#[tokio::test]
+async fn test_context_distill_signal_is_read_only() {
+    let (tmp, db) = new_db();
+    for index in 0..6 {
+        db.insert_drawer(&evidence_in_field(&format!("drawer_auth_{index}"), "auth"))
+            .expect("insert evidence");
+    }
+    let schema_before = db.schema_version().expect("schema version");
+    let count_before = active_drawer_total(&db);
+
+    let pack = assemble_context(&db, &embedder(), distill_request(tmp.path()))
+        .await
+        .expect("assemble context");
+    assert!(!pack.distill_suggestions.is_empty());
+
+    assert_eq!(db.schema_version().expect("schema version"), schema_before);
+    assert_eq!(active_drawer_total(&db), count_before);
+}
+
+#[tokio::test]
+async fn test_context_distill_signal_caps_and_orders() {
+    let (tmp, db) = new_db();
+    // Five distinct fields with strictly descending evidence counts 9..5.
+    for (field, n) in [("f9", 9), ("f8", 8), ("f7", 7), ("f6", 6), ("f5", 5)] {
+        for index in 0..n {
+            db.insert_drawer(&evidence_in_field(
+                &format!("drawer_{field}_{index}"),
+                field,
+            ))
+            .expect("insert evidence");
+        }
+    }
+    let pack = assemble_context(&db, &embedder(), distill_request(tmp.path()))
+        .await
+        .expect("assemble context");
+    assert_eq!(pack.distill_suggestions.len(), 3);
+    let counts: Vec<usize> = pack
+        .distill_suggestions
+        .iter()
+        .map(|s| s.evidence_count)
+        .collect();
+    assert_eq!(counts, vec![9, 8, 7]);
+    assert_eq!(pack.distill_suggestions[0].field, "f9");
+}
+
+#[tokio::test]
+async fn test_context_distill_signal_disabled() {
+    let (tmp, db) = new_db();
+    for index in 0..6 {
+        db.insert_drawer(&evidence_in_field(&format!("drawer_auth_{index}"), "auth"))
+            .expect("insert evidence");
+    }
+    let enabled = assemble_context(&db, &embedder(), distill_request(tmp.path()))
+        .await
+        .expect("assemble context enabled");
+    let disabled = assemble_context(&db, &embedder(), default_request("debug", tmp.path()))
+        .await
+        .expect("assemble context disabled");
+    assert!(disabled.distill_suggestions.is_empty());
+    assert_eq!(disabled.sections.len(), enabled.sections.len());
+}
+
+#[tokio::test]
+async fn test_context_distill_signal_empty_db_no_error() {
+    let (tmp, db) = new_db();
+    let pack = assemble_context(&db, &embedder(), distill_request(tmp.path()))
+        .await
+        .expect("assemble context on empty db");
+    assert!(pack.distill_suggestions.is_empty());
+}
+
+#[test]
+fn test_cli_context_json_includes_distill_suggestions() {
+    let (home, db) = setup_cli_home();
+    for index in 0..5 {
+        db.insert_drawer(&evidence_in_field(&format!("drawer_auth_{index}"), "auth"))
+            .expect("insert evidence");
+    }
+    let json = run_context_json(home.path(), "debug", &[]);
+    let suggestions = json
+        .get("distill_suggestions")
+        .and_then(|value| value.as_array())
+        .expect("distill_suggestions array");
+    assert!(
+        suggestions
+            .iter()
+            .any(|s| s.get("field").and_then(|f| f.as_str()) == Some("auth")),
+        "CLI JSON must expose the auth distill suggestion"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_context_response_includes_distill_suggestions() {
+    let (_tmp, db, server) = setup_mcp_server();
+    for index in 0..5 {
+        db.insert_drawer(&evidence_in_field(&format!("drawer_auth_{index}"), "auth"))
+            .expect("insert evidence");
+    }
+    let response = server
+        .context_json_for_test(json!({ "query": "debug" }))
+        .await
+        .expect("mcp context");
+    assert!(
+        response
+            .distill_suggestions
+            .iter()
+            .any(|s| s.field == "auth"),
+        "MCP ContextResponse must expose the auth distill suggestion"
+    );
 }

@@ -122,6 +122,9 @@ pub async fn assemble_brief<E: Embedder + ?Sized>(
             include_cards: true,
             max_items: request.max_items,
             dao_tian_limit: request.dao_tian_limit,
+            // brief is a separate surface; the P106 distill signal is scoped to
+            // mempal context / mempal_context only.
+            include_distill_suggestions: false,
         },
     )
     .await?;
