@@ -267,6 +267,7 @@ impl MempalMcpServer {
     ) -> anyhow::Result<()> {
         let prepared: PreparedIngestOperation = serde_json::from_str(&claim.payload)
             .with_context(|| format!("failed to decode ingest operation {}", claim.id))?;
+        let queue_wait_ms = queue_wait_ms(claim.created_at, claim.claimed_at);
 
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let heartbeat_queue = queue.clone();
@@ -306,7 +307,7 @@ impl MempalMcpServer {
                 } else {
                     IngestOperationState::Completed
                 };
-                let finalized = finalize_ingest_response(
+                let mut finalized = finalize_ingest_response(
                     claim.id.clone(),
                     claim.created_at,
                     response,
@@ -314,6 +315,9 @@ impl MempalMcpServer {
                     rejected_reason.clone(),
                     None,
                 );
+                finalized
+                    .timings
+                    .insert("queue_wait_ms".to_string(), queue_wait_ms);
                 let result_json = serde_json::to_string(&finalized)
                     .context("failed to serialize completed ingest response")?;
                 let result_drawer_id = if finalized.drawer_id.is_empty() {
@@ -336,11 +340,14 @@ impl MempalMcpServer {
             }
             Err(error) => {
                 let detail = error.to_string();
-                let finalized = finalize_failed_ingest_response(
+                let mut finalized = finalize_failed_ingest_response(
                     claim.id.clone(),
                     claim.created_at,
                     detail.clone(),
                 );
+                finalized
+                    .timings
+                    .insert("queue_wait_ms".to_string(), queue_wait_ms);
                 let result_json = serde_json::to_string(&finalized)
                     .context("failed to serialize failed ingest response")?;
                 queue
@@ -2896,6 +2903,7 @@ impl MempalMcpServer {
         let source_type = parse_source_type_param(request.source_type.as_deref())?;
         let confidence = resolve_confidence_param(source_type, request.confidence)?;
         let metadata = validate_ingest_request(&request, &source_type)?;
+        let mut timings = BTreeMap::new();
 
         if !dry_run && global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
@@ -3018,6 +3026,7 @@ impl MempalMcpServer {
             }));
         }
 
+        let gating_started = Instant::now();
         let candidate = IngestCandidate {
             content: scrubbed_content.clone(),
             event: None,
@@ -3202,6 +3211,12 @@ impl MempalMcpServer {
             }
         }
 
+        timings.insert(
+            "gating_ms".to_string(),
+            gating_started.elapsed().as_millis() as u64,
+        );
+
+        let embedding_started = Instant::now();
         let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();
         let vectors = if first_vector.is_some() && chunks.len() == 1 {
             vec![first_vector.take().expect("checked Some")]
@@ -3235,8 +3250,13 @@ impl MempalMcpServer {
         if let Some(v) = vectors.first() {
             ensure_vector_dim_matches(&db, v.len())?;
         }
+        timings.insert(
+            "embedding_ms".to_string(),
+            embedding_started.elapsed().as_millis() as u64,
+        );
 
         let first_vector_ref = &vectors[0];
+        let novelty_started = Instant::now();
         let duplicate_warning = check_semantic_duplicate(&db, first_vector_ref, first_chunk);
         let novelty_candidate = NoveltyCandidate {
             wing: request.wing.clone(),
@@ -3256,6 +3276,10 @@ impl MempalMcpServer {
                 &config.ingest_gating.novelty,
             )
         };
+        timings.insert(
+            "novelty_ms".to_string(),
+            novelty_started.elapsed().as_millis() as u64,
+        );
         let mut response_drawer_id = drawer_id.clone();
         let (novelty_action, near_drawer_id);
 
@@ -3264,6 +3288,7 @@ impl MempalMcpServer {
         // drawers found by hash) must NOT appear here, so LLM reject cannot soft-delete them.
         let mut newly_created_drawer_ids: Vec<String> = Vec::new();
 
+        let db_write_started = Instant::now();
         match novelty.action {
             NoveltyAction::Insert => {
                 if novelty.should_audit {
@@ -3505,6 +3530,11 @@ impl MempalMcpServer {
             }
         }
 
+        timings.insert(
+            "db_write_ms".to_string(),
+            db_write_started.elapsed().as_millis() as u64,
+        );
+
         if let Some(old_id) = superseded_drawer_id.as_deref()
             && let Some(replacement_id) = inserted_drawer_ids.first()
         {
@@ -3654,6 +3684,7 @@ impl MempalMcpServer {
             lock_wait_ms,
             superseded_drawer_id: superseded_response_id,
             fact_check_warnings,
+            timings,
             system_warnings: request_system_warnings,
             ..Default::default()
         }))
@@ -6611,6 +6642,13 @@ fn operation_record_accepted_at_secs(record: &crate::core::queue::PendingOperati
     } else {
         record.created_at
     }
+}
+
+fn queue_wait_ms(created_at_secs: i64, claimed_at_secs: i64) -> u64 {
+    claimed_at_secs
+        .saturating_sub(created_at_secs)
+        .max(0)
+        .saturating_mul(1_000) as u64
 }
 
 fn rfc3339_from_secs(secs: i64) -> String {
@@ -9795,6 +9833,20 @@ mod tests {
         assert_eq!(response.state, Some(IngestOperationState::Completed));
         assert!(!response.drawer_id.is_empty());
         assert!(!response.timed_out);
+
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        let completed_status = server
+            .operation_status_json_for_test(operation_id)
+            .await
+            .expect("completed status");
+        assert!(
+            completed_status.timings.contains_key("embedding_ms"),
+            "completed status must include embedding_ms timing"
+        );
+        assert!(
+            completed_status.timings.contains_key("db_write_ms"),
+            "completed status must include db_write_ms timing"
+        );
     }
 
     #[tokio::test]
