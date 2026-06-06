@@ -97,7 +97,9 @@ use mempal::knowledge_gate::{
 use mempal::knowledge_lifecycle::{
     DemoteRequest, PromoteRequest, demote_knowledge, promote_knowledge,
 };
-use mempal::mcp::MempalMcpServer;
+use mempal::mcp::{
+    IngestOperationState, IngestRequest, IngestResponse, MempalMcpServer, OperationStatusRequest,
+};
 use mempal::observability;
 use mempal::search::{SearchFilters, SearchOptions, search_with_all_options};
 use mempal::sleep::{
@@ -152,6 +154,8 @@ struct IngestCommandOptions<'a> {
     json: bool,
     no_strip_noise: bool,
     diary_rollup: bool,
+    wait: bool,
+    wait_timeout_secs: Option<u64>,
     source_type: Option<&'a str>,
     memory_kind: Option<&'a str>,
     domain: Option<&'a str>,
@@ -284,6 +288,10 @@ enum Commands {
         dry_run: bool,
         #[arg(long)]
         json: bool,
+        #[arg(long, default_value_t = false)]
+        wait: bool,
+        #[arg(long = "wait-timeout-secs")]
+        wait_timeout_secs: Option<u64>,
         #[arg(long)]
         no_strip_noise: bool,
         #[arg(long)]
@@ -308,6 +316,11 @@ enum Commands {
         valid_from: Option<String>,
         #[arg(long = "valid-until")]
         valid_until: Option<String>,
+    },
+    /// Inspect or wait for a receipt-backed ingest operation.
+    Operation {
+        #[command(subcommand)]
+        command: OperationCommands,
     },
     /// Index a Claude Code session JSONL transcript as searchable conversation memory.
     /// Wing is always "conversation"; room defaults to the sessionId field or filename stem.
@@ -1001,6 +1014,18 @@ enum Commands {
         query: String,
         #[arg(long, default_value = "plain")]
         format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum OperationCommands {
+    /// Print the current status of a receipt-backed ingest operation.
+    Status { operation_id: String },
+    /// Block until a receipt-backed ingest operation reaches a terminal state.
+    Wait {
+        operation_id: String,
+        #[arg(long = "timeout-secs", default_value_t = 30)]
+        timeout_secs: u64,
     },
 }
 
@@ -2387,6 +2412,8 @@ fn run() -> Result<()> {
             no_gate,
             dry_run,
             json,
+            wait,
+            wait_timeout_secs,
             no_strip_noise,
             diary_rollup,
             source_type,
@@ -2412,6 +2439,8 @@ fn run() -> Result<()> {
                 no_gate,
                 dry_run,
                 json,
+                wait,
+                wait_timeout_secs,
                 no_strip_noise,
                 diary_rollup,
                 source_type: source_type.as_deref(),
@@ -2426,6 +2455,9 @@ fn run() -> Result<()> {
                 valid_until: valid_until.as_deref(),
             },
         )),
+        Commands::Operation { command } => {
+            block_on_result(operation_command(&db, config.as_ref(), command))
+        }
         Commands::IngestConversation { .. } => {
             eprintln!(
                 "error: `mempal ingest-conversation` was removed in P16.\n\
@@ -3472,6 +3504,78 @@ async fn ingest_stdin_command(
         return Ok(());
     }
 
+    if options.wait {
+        let wait_request = IngestRequest {
+            content: content.clone(),
+            wing: wing.to_string(),
+            room: room.map(ToOwned::to_owned),
+            source: record.source.clone(),
+            source_type: Some(source_type.to_string()),
+            confidence: Some(confidence),
+            project_id: project.map(ToOwned::to_owned),
+            supersedes: supersedes.map(ToOwned::to_owned),
+            replace_text: replace_text.map(ToOwned::to_owned),
+            valid_from: valid_from.map(ToOwned::to_owned),
+            valid_until: valid_until.map(ToOwned::to_owned),
+            dry_run: Some(false),
+            wait: Some(true),
+            wait_timeout_secs: Some(options.wait_timeout_secs.unwrap_or(30)),
+            diary_rollup: Some(false),
+            importance: Some(drawer_importance),
+            memory_kind: Some(memory_kind_slug(&memory_kind).to_string()),
+            domain: Some(domain_slug(&domain).to_string()),
+            field: Some(field.to_string()),
+            is_pinned: Some(is_pinned),
+            provenance: None,
+            statement: None,
+            tier: None,
+            status: None,
+            supporting_refs: None,
+            counterexample_refs: None,
+            teaching_refs: None,
+            verification_refs: None,
+            scope_constraints: None,
+            trigger_hints: None,
+            anchor_kind: None,
+            anchor_id: None,
+            parent_anchor_id: None,
+            cwd: env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string()),
+        };
+        let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone());
+        let response = server
+            .mempal_ingest(rmcp::handler::server::wrapper::Parameters(wait_request))
+            .await
+            .map(|response| response.0)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        print_operation_response(&response)?;
+        if response.timed_out {
+            bail!(
+                "timed out waiting for ingest operation {}",
+                response.operation_id.as_deref().unwrap_or("")
+            );
+        }
+        match response.state {
+            Some(IngestOperationState::Completed) => return Ok(()),
+            Some(IngestOperationState::Rejected) => {
+                bail!(
+                    "ingest operation {} was rejected: {}",
+                    response.operation_id.as_deref().unwrap_or(""),
+                    response.rejected_reason.as_deref().unwrap_or("rejected")
+                );
+            }
+            Some(IngestOperationState::Failed) => {
+                bail!(
+                    "ingest operation {} failed: {}",
+                    response.operation_id.as_deref().unwrap_or(""),
+                    response.failure_detail.as_deref().unwrap_or("failed")
+                );
+            }
+            _ => return Ok(()),
+        }
+    }
+
     if exact_duplicate.is_some() {
         if is_pinned {
             db.pin_drawer(&drawer_id, None)
@@ -3695,6 +3799,143 @@ fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> 
 fn print_fact_check_warnings(warnings: &[String]) {
     for warning in warnings {
         eprintln!("{warning}");
+    }
+}
+
+fn print_operation_response(response: &IngestResponse) -> Result<()> {
+    println!(
+        "operation_id={}",
+        response.operation_id.as_deref().unwrap_or("")
+    );
+    println!(
+        "state={}",
+        response.state.map(|state| state.as_str()).unwrap_or("")
+    );
+    println!("timed_out={}", response.timed_out);
+    println!("drawer_id={}", response.drawer_id);
+    if !response.drawer_ids.is_empty() {
+        println!("drawer_ids={}", response.drawer_ids.join(","));
+    }
+    println!("chunk_count={}", response.chunk_count);
+    println!("dropped={}", response.dropped);
+    if let Some(accepted_at) = response.accepted_at.as_deref() {
+        println!("accepted_at={accepted_at}");
+    }
+    if let Some(rejected_reason) = response.rejected_reason.as_deref() {
+        println!("rejected_reason={rejected_reason}");
+    }
+    if let Some(failure_detail) = response.failure_detail.as_deref() {
+        println!("failure_detail={failure_detail}");
+    }
+    println!(
+        "timings={}",
+        serde_json::to_string(&response.timings).context("failed to serialize timings")?
+    );
+    Ok(())
+}
+
+async fn wait_for_operation_status_with_progress(
+    server: &MempalMcpServer,
+    operation_id: &str,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<Option<IngestResponse>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let response = server
+            .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
+                OperationStatusRequest {
+                    operation_id: operation_id.to_string(),
+                },
+            ))
+            .await
+            .context("failed to load operation status")?
+            .0;
+        if response
+            .state
+            .map(IngestOperationState::is_terminal)
+            .unwrap_or(false)
+        {
+            return Ok(Some(response));
+        }
+        if timeout.is_zero() || std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        eprintln!(
+            "waiting operation_id={} state={}",
+            operation_id,
+            response
+                .state
+                .map(|state| state.as_str())
+                .unwrap_or("unknown")
+        );
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn operation_command(
+    db: &Database,
+    config: &Config,
+    command: OperationCommands,
+) -> Result<()> {
+    let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone());
+    match command {
+        OperationCommands::Status { operation_id } => {
+            let response = server
+                .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
+                    OperationStatusRequest { operation_id },
+                ))
+                .await
+                .context("failed to load operation status")?
+                .0;
+            print_operation_response(&response)?;
+            Ok(())
+        }
+        OperationCommands::Wait {
+            operation_id,
+            timeout_secs,
+        } => {
+            eprintln!(
+                "waiting for operation_id={} timeout_secs={timeout_secs}",
+                operation_id
+            );
+            match wait_for_operation_status_with_progress(
+                &server,
+                &operation_id,
+                std::time::Duration::from_secs(timeout_secs),
+                std::time::Duration::from_millis(150),
+            )
+            .await?
+            {
+                Some(response) => {
+                    print_operation_response(&response)?;
+                    match response.state {
+                        Some(IngestOperationState::Completed) => Ok(()),
+                        Some(IngestOperationState::Rejected) => {
+                            bail!("operation {operation_id} was rejected")
+                        }
+                        Some(IngestOperationState::Failed) => {
+                            bail!("operation {operation_id} failed")
+                        }
+                        _ => Ok(()),
+                    }
+                }
+                None => {
+                    let mut response = server
+                        .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
+                            OperationStatusRequest {
+                                operation_id: operation_id.clone(),
+                            },
+                        ))
+                        .await
+                        .context("failed to load timed-out operation status")?
+                        .0;
+                    response.timed_out = true;
+                    print_operation_response(&response)?;
+                    bail!("timed out waiting for operation {operation_id}")
+                }
+            }
+        }
     }
 }
 
