@@ -1599,9 +1599,6 @@ pub struct IngestRequest {
     /// If true, return the drawer_id that WOULD be created without actually
     /// writing to the database. Use this to preview before committing.
     pub dry_run: Option<bool>,
-    /// If true, bypass ingest gating and fact-checking for this request.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub no_gate: Option<bool>,
 
     /// If true, wait for the durable ingest operation to reach a terminal
     /// state before returning. Defaults to false.
@@ -1610,11 +1607,6 @@ pub struct IngestRequest {
     /// Maximum number of seconds to wait for `wait=true` before returning
     /// the queued receipt with `timed_out=true`. Defaults to 30.
     pub wait_timeout_secs: Option<u64>,
-
-    /// Internal override used by stdin `--wait` ingest to preserve the same
-    /// novelty behavior as the non-wait stdin path.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub bypass_novelty: bool,
 
     /// If true, append this entry to one agent-diary drawer for the current
     /// UTC day. Requires wing="agent-diary" and an explicit room.
@@ -1651,6 +1643,14 @@ pub struct IngestRequest {
     pub anchor_id: Option<String>,
     pub parent_anchor_id: Option<String>,
     pub cwd: Option<String>,
+}
+
+/// Internal ingest overrides used by trusted local callers.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IngestControls {
+    pub no_gate: bool,
+    pub bypass_novelty: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]

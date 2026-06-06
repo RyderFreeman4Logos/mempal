@@ -160,6 +160,10 @@ fn prepared_ingest_payload(content: &str, wing: &str, room: Option<&str>) -> Str
             "parent_anchor_id": null,
             "cwd": null
         },
+        "controls": {
+            "no_gate": false,
+            "bypass_novelty": false
+        },
         "project_id": null,
         "scrubbed_content": content,
         "source_type": "user_explicit",

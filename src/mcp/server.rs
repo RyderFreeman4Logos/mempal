@@ -92,7 +92,7 @@ use super::tools::{
     CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DoctorMcpDto,
     DoctorRequest, DoctorResponse, DoctorToolDto, DuplicateWarning, EmbedStatusDto,
     EndpointHealthDto, FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto,
-    FieldTaxonomyResponse, IngestOperationState, IngestRequest, IngestResponse,
+    FieldTaxonomyResponse, IngestControls, IngestOperationState, IngestRequest, IngestResponse,
     IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto, KnowledgeCardDto,
     KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse, KnowledgeDemoteRequest,
     KnowledgeDemoteResponse, KnowledgeDistillRequest, KnowledgeDistillResponse,
@@ -290,7 +290,7 @@ impl MempalMcpServer {
         });
 
         let outcome = self
-            .mempal_ingest_sync(Parameters(prepared.request.clone()))
+            .mempal_ingest_sync(prepared.request.clone(), prepared.controls)
             .await;
 
         let _ = stop_tx.send(());
@@ -945,6 +945,8 @@ fn validate_ingest_request(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PreparedIngestOperation {
     request: IngestRequest,
+    #[serde(default)]
+    controls: IngestControls,
     project_id: Option<String>,
     scrubbed_content: String,
     source_type: SourceType,
@@ -2680,6 +2682,16 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<IngestRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        self.mempal_ingest_with_controls(request, IngestControls::default())
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn mempal_ingest_with_controls(
+        &self,
+        request: IngestRequest,
+        controls: IngestControls,
+    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         self.spawn_ingest_drain_worker();
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let room = request.room.as_deref();
@@ -2718,7 +2730,7 @@ impl MempalMcpServer {
             }));
         }
         if dry_run {
-            return self.mempal_ingest_sync(Parameters(request)).await;
+            return self.mempal_ingest_sync(request, controls).await;
         }
         if global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
@@ -2728,6 +2740,7 @@ impl MempalMcpServer {
             .await?;
         let prepared = self.prepare_async_ingest_operation(
             &request,
+            controls,
             config.as_ref(),
             compiled_privacy.as_ref(),
             &db,
@@ -2796,6 +2809,7 @@ impl MempalMcpServer {
     fn prepare_async_ingest_operation(
         &self,
         request: &IngestRequest,
+        controls: IngestControls,
         config: &crate::core::config::Config,
         compiled_privacy: &crate::core::config::CompiledPrivacyConfig,
         db: &Database,
@@ -2839,6 +2853,7 @@ impl MempalMcpServer {
 
         Ok(PreparedIngestOperation {
             request,
+            controls,
             project_id,
             scrubbed_content,
             source_type,
@@ -2852,7 +2867,8 @@ impl MempalMcpServer {
 
     async fn mempal_ingest_sync(
         &self,
-        Parameters(request): Parameters<IngestRequest>,
+        request: IngestRequest,
+        controls: IngestControls,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let project_id = self
@@ -2869,7 +2885,8 @@ impl MempalMcpServer {
         // rejects before any success response that would carry this snapshot is built.
         let request_system_warnings = system_warnings_with_stale_index(&db);
         let dry_run = request.dry_run.unwrap_or(false);
-        let no_gate = request.no_gate.unwrap_or(false);
+        let no_gate = controls.no_gate;
+        let bypass_novelty = controls.bypass_novelty;
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
             return Ok(Json(IngestResponse {
@@ -3262,7 +3279,7 @@ impl MempalMcpServer {
             room: request.room.clone(),
             project_id: project_id.clone(),
         };
-        let novelty = if superseded_drawer_id.is_some() || request.bypass_novelty {
+        let novelty = if superseded_drawer_id.is_some() || bypass_novelty {
             crate::ingest::novelty::NoveltyDecision {
                 should_audit: false,
                 ..crate::ingest::novelty::NoveltyDecision::insert()
@@ -8082,6 +8099,12 @@ mod tests {
                 "mempal_ingest must expose {field} in tools/list"
             );
         }
+        for field in ["no_gate", "bypass_novelty"] {
+            assert!(
+                props.get(field).is_none(),
+                "mempal_ingest must not expose {field} in tools/list"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10008,6 +10031,7 @@ enabled = true
         let prepared = server
             .prepare_async_ingest_operation(
                 &request,
+                IngestControls::default(),
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 &db,
@@ -10033,6 +10057,7 @@ enabled = true
         );
         assert_eq!(decoded.scrubbed_content, expected_content);
         assert_eq!(decoded.request.content, decoded.scrubbed_content);
+        assert_eq!(decoded.controls, IngestControls::default());
         assert!(
             !payload.contains(raw_secret),
             "raw secret leaked into payload"
@@ -10067,6 +10092,7 @@ enabled = true
         let prepared = server
             .prepare_async_ingest_operation(
                 &request,
+                IngestControls::default(),
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 &db,
@@ -10210,7 +10236,6 @@ reject_on_contradiction = true
                     confidence: None,
                     importance: None,
                     dry_run: None,
-                    no_gate: None,
                     diary_rollup: None,
                     supersedes: None,
                     replace_text: None,
@@ -10237,7 +10262,6 @@ reject_on_contradiction = true
                     project_id: None,
                     wait: None,
                     wait_timeout_secs: None,
-                    bypass_novelty: false,
                 })
                 .expect("serialize ingest request"),
             )
@@ -10254,6 +10278,80 @@ reject_on_contradiction = true
             json.get("lock_wait_ms").is_some(),
             "JSON must expose lock_wait_ms"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_public_handler_forces_internal_controls_off() {
+        let _tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = _tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let _config_guard = ConfigOverrideGuard::install(&format!(
+            r#"
+db_path = "{}"
+
+[privacy]
+enabled = false
+
+[ingest_gating]
+enabled = false
+"#,
+            db_path.display()
+        ));
+        let gate = Arc::new(Notify::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(BlockingEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+                call_count: Arc::clone(&call_count),
+                gate: Arc::clone(&gate),
+            }),
+        );
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "public handler control test".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("review".to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("ingest should queue")
+            .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while call_count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should reach embed");
+        let db = Database::open(&db_path).expect("open db");
+        let payload: String = db
+            .conn()
+            .query_row(
+                "SELECT payload FROM pending_messages WHERE id = ?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .expect("read queued ingest payload");
+        let decoded: PreparedIngestOperation =
+            serde_json::from_str(&payload).expect("decode queued ingest payload");
+
+        assert_eq!(decoded.controls, IngestControls::default());
+        assert!(!decoded.controls.no_gate);
+        assert!(!decoded.controls.bypass_novelty);
+
+        gate.notify_one();
+
+        let completed = server
+            .wait_for_operation_completion(operation_id)
+            .await
+            .expect("cleanup ingest completion");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
     }
 
     // =========================================================================

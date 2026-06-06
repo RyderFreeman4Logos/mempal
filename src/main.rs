@@ -98,7 +98,8 @@ use mempal::knowledge_lifecycle::{
     DemoteRequest, PromoteRequest, demote_knowledge, promote_knowledge,
 };
 use mempal::mcp::{
-    IngestOperationState, IngestRequest, IngestResponse, MempalMcpServer, OperationStatusRequest,
+    IngestControls, IngestOperationState, IngestRequest, IngestResponse, MempalMcpServer,
+    OperationStatusRequest,
 };
 use mempal::observability;
 use mempal::search::{SearchFilters, SearchOptions, search_with_all_options};
@@ -3338,7 +3339,6 @@ impl ResolvedStdinIngest {
             valid_from: self.valid_from.clone(),
             valid_until: self.valid_until.clone(),
             dry_run: Some(false),
-            no_gate: Some(self.no_gate),
             wait: Some(true),
             wait_timeout_secs: Some(wait_timeout_secs),
             diary_rollup: Some(false),
@@ -3360,7 +3360,6 @@ impl ResolvedStdinIngest {
             anchor_kind: None,
             anchor_id: None,
             parent_anchor_id: None,
-            bypass_novelty: self.bypass_novelty,
             cwd: self.cwd.as_ref().map(|path| path.display().to_string()),
         }
     }
@@ -3696,9 +3695,13 @@ async fn ingest_stdin_command(
 
     if options.wait {
         let wait_request = resolved.wait_request(options.wait_timeout_secs.unwrap_or(30));
+        let controls = IngestControls {
+            no_gate: resolved.no_gate,
+            bypass_novelty: resolved.bypass_novelty,
+        };
         let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone());
         let response = server
-            .mempal_ingest(rmcp::handler::server::wrapper::Parameters(wait_request))
+            .mempal_ingest_with_controls(wait_request, controls)
             .await
             .map(|response| response.0)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
