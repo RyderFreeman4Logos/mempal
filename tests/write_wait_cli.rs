@@ -15,6 +15,7 @@ use mempal::core::types::Triple;
 use mempal::core::utils::build_triple_id;
 use mempal::mcp::{IngestOperationState, IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
+use rusqlite::Connection;
 use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
@@ -211,6 +212,16 @@ fn print_lines(output: &Output) -> (String, String) {
     )
 }
 
+fn novelty_audit_count(home: &Path) -> i64 {
+    let db_path = home.join(".mempal/palace.db");
+    Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row("SELECT COUNT(*) FROM novelty_audit", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count novelty audit")
+}
+
 fn assert_bootstrap_stderr(output: &Output) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut lines = stderr.lines();
@@ -315,6 +326,7 @@ async fn test_ingest_wait_matches_non_wait_plain_output() {
     let wait_home = setup_home();
     let direct_home = setup_home();
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    handle.set_embedding_fill(1.0).await;
     let _wait_config = write_config(wait_home.path(), &format!("http://{addr}/v1"));
     let _direct_config = write_config(direct_home.path(), &format!("http://{addr}/v1"));
     let wait_timeout = u64::MAX.to_string();
@@ -473,6 +485,125 @@ async fn test_ingest_wait_json_matches_non_wait_json_output() {
     assert!(
         drawer_ids.iter().all(|value| value.as_str().is_some()),
         "drawer_ids must contain strings"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_wait_matches_non_wait_when_novelty_is_enabled() {
+    let wait_home = setup_home();
+    let direct_home = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    let _wait_config = write_config(wait_home.path(), &format!("http://{addr}/v1"));
+    let _direct_config = write_config(direct_home.path(), &format!("http://{addr}/v1"));
+
+    {
+        use std::io::Write as _;
+
+        for home in [wait_home.path(), direct_home.path()] {
+            let config_path = home.join(".mempal/config.toml");
+            let mut config = fs::OpenOptions::new()
+                .append(true)
+                .open(&config_path)
+                .expect("open config");
+            writeln!(config, "\n[ingest_gating.novelty]\nenabled = true")
+                .expect("append novelty config");
+        }
+    }
+
+    let seed_payload = br#"{"content":"novelty seed content"}"#;
+    let seed_args = [
+        "ingest",
+        "--stdin",
+        "--wing",
+        "cli-wing",
+        "--source-type",
+        "user_explicit",
+        "--no-gate",
+    ];
+    let seed_wait_output = run_cli_with_stdin(wait_home.path(), &seed_args, seed_payload);
+    let seed_direct_output = run_cli_with_stdin(direct_home.path(), &seed_args, seed_payload);
+    assert!(
+        seed_wait_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&seed_wait_output.stdout),
+        String::from_utf8_lossy(&seed_wait_output.stderr)
+    );
+    assert!(
+        seed_direct_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&seed_direct_output.stdout),
+        String::from_utf8_lossy(&seed_direct_output.stderr)
+    );
+
+    let wait_timeout = u64::MAX.to_string();
+    let payload = br#"{"content":"novelty candidate content"}"#;
+
+    let direct_output = run_cli_with_stdin(
+        direct_home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "cli-wing",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--json",
+        ],
+        payload,
+    );
+    let wait_output = run_cli_with_stdin(
+        wait_home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "cli-wing",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            wait_timeout.as_str(),
+            "--json",
+        ],
+        payload,
+    );
+    handle.shutdown().await;
+
+    assert!(
+        direct_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&direct_output.stdout),
+        String::from_utf8_lossy(&direct_output.stderr)
+    );
+    assert!(
+        wait_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&wait_output.stdout),
+        String::from_utf8_lossy(&wait_output.stderr)
+    );
+
+    let direct_json: Value =
+        serde_json::from_slice(&direct_output.stdout).expect("parse direct ingest JSON");
+    let wait_json: Value = serde_json::from_slice(&wait_output.stdout).expect("parse wait JSON");
+    assert_eq!(
+        wait_json["stats"], direct_json["stats"],
+        "wait stats must match direct stats when novelty is enabled"
+    );
+    let drawer_ids = wait_json["drawer_ids"]
+        .as_array()
+        .expect("drawer_ids array");
+    assert!(!drawer_ids.is_empty(), "drawer_ids must be non-empty");
+    assert_eq!(
+        novelty_audit_count(wait_home.path()),
+        0,
+        "wait stdin ingest must not write novelty audits when non-wait stdin would not"
+    );
+    assert_eq!(
+        novelty_audit_count(direct_home.path()),
+        0,
+        "direct stdin ingest must not write novelty audits"
     );
 }
 

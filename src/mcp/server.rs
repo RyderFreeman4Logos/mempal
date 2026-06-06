@@ -3262,7 +3262,7 @@ impl MempalMcpServer {
             room: request.room.clone(),
             project_id: project_id.clone(),
         };
-        let novelty = if superseded_drawer_id.is_some() {
+        let novelty = if superseded_drawer_id.is_some() || request.bypass_novelty {
             crate::ingest::novelty::NoveltyDecision {
                 should_audit: false,
                 ..crate::ingest::novelty::NoveltyDecision::insert()
@@ -10237,6 +10237,7 @@ reject_on_contradiction = true
                     project_id: None,
                     wait: None,
                     wait_timeout_secs: None,
+                    bypass_novelty: false,
                 })
                 .expect("serialize ingest request"),
             )

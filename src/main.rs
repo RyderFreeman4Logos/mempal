@@ -3311,6 +3311,7 @@ struct ResolvedStdinIngest {
     raw_turn: bool,
     drawer_importance: i32,
     cwd: Option<PathBuf>,
+    bypass_novelty: bool,
 }
 
 impl ResolvedStdinIngest {
@@ -3359,6 +3360,7 @@ impl ResolvedStdinIngest {
             anchor_kind: None,
             anchor_id: None,
             parent_anchor_id: None,
+            bypass_novelty: self.bypass_novelty,
             cwd: self.cwd.as_ref().map(|path| path.display().to_string()),
         }
     }
@@ -3521,6 +3523,7 @@ fn resolve_stdin_ingest(
         raw_turn,
         drawer_importance,
         cwd,
+        bypass_novelty: true,
     })
 }
 

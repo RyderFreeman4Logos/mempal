@@ -1611,6 +1611,11 @@ pub struct IngestRequest {
     /// the queued receipt with `timed_out=true`. Defaults to 30.
     pub wait_timeout_secs: Option<u64>,
 
+    /// Internal override used by stdin `--wait` ingest to preserve the same
+    /// novelty behavior as the non-wait stdin path.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bypass_novelty: bool,
+
     /// If true, append this entry to one agent-diary drawer for the current
     /// UTC day. Requires wing="agent-diary" and an explicit room.
     pub diary_rollup: Option<bool>,
