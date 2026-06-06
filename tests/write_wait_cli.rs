@@ -12,6 +12,7 @@ use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
 use mempal::mcp::{IngestOperationState, IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
+use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -280,6 +281,76 @@ async fn test_ingest_wait_returns_drawer_id() {
     assert_completed_status(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("drawer_id="), "{stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_wait_preserves_stdin_semantics_and_audit() {
+    let home = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    let config_path = write_config(home.path(), &format!("http://{addr}/v1"));
+    {
+        use std::io::Write as _;
+
+        let mut config = fs::OpenOptions::new()
+            .append(true)
+            .open(&config_path)
+            .expect("open config");
+        writeln!(config, "\n[ingest_gating]\nenabled = true").expect("append gating config");
+    }
+
+    let payload = serde_json::json!({
+        "content": "hi",
+        "wing": "cli-wing",
+        "room": "audit-room",
+        "source": "csa-session",
+        "source_file": "csa://session/99",
+        "source_type": "user_explicit"
+    })
+    .to_string();
+
+    let output = run_cli_with_stdin(
+        home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "cli-wing",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            "30",
+        ],
+        payload.as_bytes(),
+    );
+    handle.shutdown().await;
+
+    assert_completed_status(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("drawer_id="), "{stdout}");
+
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    let drawer_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("drawer_id="))
+        .expect("drawer id line");
+    let drawer = db
+        .get_drawer(drawer_id)
+        .expect("get drawer")
+        .expect("drawer exists");
+    assert_eq!(drawer.source_file.as_deref(), Some("csa://session/99"));
+    assert_eq!(drawer.wing, "cli-wing");
+
+    let audit_path = home.path().join(".mempal").join("audit.jsonl");
+    let audit = fs::read_to_string(&audit_path).expect("read audit log");
+    let entry: Value = serde_json::from_str(audit.lines().last().expect("audit entry"))
+        .expect("parse audit entry");
+    assert_eq!(entry["mode"], "stdin");
+    assert_eq!(entry["source"], "csa-session");
+    assert_eq!(entry["source_file"], "csa://session/99");
+    assert_eq!(entry["dry_run"], false);
+    assert_eq!(entry["dropped_by_gate"], 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

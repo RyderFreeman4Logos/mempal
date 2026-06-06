@@ -1578,6 +1578,8 @@ pub struct IngestRequest {
     pub wing: String,
     pub room: Option<String>,
     pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
     pub source_type: Option<String>,
     pub confidence: Option<f64>,
     pub project_id: Option<String>,
@@ -1597,6 +1599,9 @@ pub struct IngestRequest {
     /// If true, return the drawer_id that WOULD be created without actually
     /// writing to the database. Use this to preview before committing.
     pub dry_run: Option<bool>,
+    /// If true, bypass ingest gating and fact-checking for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_gate: Option<bool>,
 
     /// If true, wait for the durable ingest operation to reach a terminal
     /// state before returning. Defaults to false.

@@ -1093,7 +1093,7 @@ fn drawer_from_ingest_metadata(
         )),
         MemoryKind::Evidence | MemoryKind::ProfileFact => Some(source_file_or_synthetic(
             drawer_id,
-            request.source.as_deref(),
+            request.source_file.as_deref().or(request.source.as_deref()),
         )),
     };
 
@@ -2824,6 +2824,14 @@ impl MempalMcpServer {
     ) -> std::result::Result<PreparedIngestOperation, ErrorData> {
         let scrubbed_content =
             config.scrub_content_with_compiled(&request.content, compiled_privacy);
+        let scrubbed_source = request
+            .source
+            .as_deref()
+            .map(|value| config.scrub_content_with_compiled(value, compiled_privacy));
+        let scrubbed_source_file = request
+            .source_file
+            .as_deref()
+            .map(|value| config.scrub_content_with_compiled(value, compiled_privacy));
         let room = request.room.as_deref();
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
         let drawer_importance = raw_turn_importance(&request.wing, room, &config.turns)
@@ -2846,6 +2854,8 @@ impl MempalMcpServer {
             .map_err(replacement_db_error)?;
         let mut request = request.clone();
         request.content = scrubbed_content.clone();
+        request.source = scrubbed_source;
+        request.source_file = scrubbed_source_file;
         request.replace_text = scrubbed_replace_text;
 
         Ok(PreparedIngestOperation {
@@ -2880,6 +2890,7 @@ impl MempalMcpServer {
         // rejects before any success response that would carry this snapshot is built.
         let request_system_warnings = system_warnings_with_stale_index(&db);
         let dry_run = request.dry_run.unwrap_or(false);
+        let no_gate = request.no_gate.unwrap_or(false);
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
             return Ok(Json(IngestResponse {
@@ -3039,32 +3050,133 @@ impl MempalMcpServer {
             tool_name: None,
             exit_code: None,
         };
-        let mut gating_decision = evaluate_tier1(&candidate, &config.ingest_gating);
-        if let Some(decision) = gating_decision.as_ref()
-            && decision.is_rejected()
-        {
-            db.record_gating_audit(
-                &drawer_id,
-                decision,
-                project_id.as_deref(),
-                Some(&candidate.content),
-            )
-            .map_err(db_error)?;
-            return Ok(Json(IngestResponse {
-                drawer_id,
-                drawer_ids: Vec::new(),
-                chunk_count: 0,
-                dropped: true,
-                gating_decision,
-                novelty_action: None,
-                near_drawer_id: None,
-                duplicate_warning: None,
-                lock_wait_ms: None,
-                superseded_drawer_id: None,
-                fact_check_warnings: Vec::new(),
-                system_warnings: request_system_warnings.clone(),
-                ..Default::default()
-            }));
+        let mut gating_decision: Option<GatingDecision> = None;
+        let mut fact_check_warnings = Vec::new();
+        let mut should_enqueue_llm_task = false;
+        let mut first_vector = None;
+        if !no_gate {
+            let mut gating_audit_recorded = false;
+            gating_decision = evaluate_tier1(&candidate, &config.ingest_gating);
+            if let Some(decision) = gating_decision.as_ref()
+                && decision.is_rejected()
+            {
+                db.record_gating_audit(
+                    &drawer_id,
+                    decision,
+                    project_id.as_deref(),
+                    Some(&candidate.content),
+                )
+                .map_err(db_error)?;
+                return Ok(Json(IngestResponse {
+                    drawer_id,
+                    drawer_ids: Vec::new(),
+                    chunk_count: 0,
+                    dropped: true,
+                    gating_decision,
+                    novelty_action: None,
+                    near_drawer_id: None,
+                    duplicate_warning: None,
+                    lock_wait_ms: None,
+                    superseded_drawer_id: None,
+                    fact_check_warnings: Vec::new(),
+                    system_warnings: request_system_warnings.clone(),
+                    ..Default::default()
+                }));
+            }
+
+            if gating_decision.is_none() {
+                let tier2_classifier = if config.ingest_gating.enabled
+                    && config.ingest_gating.embedding_classifier.enabled
+                {
+                    self.gating_runtime
+                        .classifier()
+                        .await
+                        .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
+                } else {
+                    None
+                };
+                if let Some(classifier) = tier2_classifier.as_ref() {
+                    let tier2 = evaluate_tier2(
+                        &candidate,
+                        classifier,
+                        embedder.as_ref(),
+                        config.ingest_gating.embedding_classifier.threshold,
+                    )
+                    .await;
+                    first_vector = tier2.vector;
+                    // Tier 3: intercept uncertain Tier 2 results ("prototype_below_threshold")
+                    // and route to LLM judge when enabled (fail-open: store now, judge async).
+                    let llm_judge_active = superseded_drawer_id.is_none()
+                        && config.llm.enabled
+                        && config.llm.enabled_for.contains(&"gating".to_string())
+                        && config
+                            .ingest_gating
+                            .llm_judge
+                            .as_ref()
+                            .is_some_and(|j| j.enabled);
+                    let is_unclassified = tier2.decision.gating_reason.as_deref()
+                        == Some("prototype_below_threshold");
+                    if llm_judge_active && is_unclassified {
+                        let llm_decision =
+                            GatingDecision::accepted(0, Some("llm_pending".to_string()), None);
+                        db.record_gating_audit(
+                            &drawer_id,
+                            &llm_decision,
+                            project_id.as_deref(),
+                            Some(&candidate.content),
+                        )
+                        .map_err(db_error)?;
+                        gating_audit_recorded = true;
+                        gating_decision = Some(llm_decision);
+                        should_enqueue_llm_task = true;
+                    } else {
+                        db.record_gating_audit(
+                            &drawer_id,
+                            &tier2.decision,
+                            project_id.as_deref(),
+                            Some(&candidate.content),
+                        )
+                        .map_err(db_error)?;
+                        gating_audit_recorded = true;
+                        gating_decision = Some(tier2.decision);
+                    }
+                } else if config.ingest_gating.enabled {
+                    gating_decision = Some(GatingDecision::accepted(
+                        0,
+                        Some("tier2_disabled".to_string()),
+                        None,
+                    ));
+                }
+            }
+
+            if let Some(decision) = gating_decision.as_ref()
+                && decision.is_rejected()
+            {
+                return Ok(Json(IngestResponse {
+                    drawer_id,
+                    drawer_ids: Vec::new(),
+                    chunk_count: 0,
+                    dropped: true,
+                    gating_decision,
+                    novelty_action: None,
+                    near_drawer_id: None,
+                    duplicate_warning: None,
+                    lock_wait_ms: None,
+                    superseded_drawer_id: None,
+                    fact_check_warnings: Vec::new(),
+                    system_warnings: request_system_warnings.clone(),
+                    ..Default::default()
+                }));
+            }
+            if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
+                db.record_gating_audit(
+                    &drawer_id,
+                    decision,
+                    project_id.as_deref(),
+                    Some(&candidate.content),
+                )
+                .map_err(db_error)?;
+            }
         }
 
         let mut db = db;
@@ -3083,105 +3195,8 @@ impl MempalMcpServer {
         let lock_wait_ms = Some(lock_guard.wait_duration().as_millis() as u64);
 
         let first_chunk = chunks.first().map(|c| c.as_str()).unwrap_or("");
-        let mut first_vector = None;
-        let mut gating_audit_recorded = false;
-        let mut should_enqueue_llm_task = false;
-        if gating_decision.is_none() {
-            let tier2_classifier = if config.ingest_gating.enabled
-                && config.ingest_gating.embedding_classifier.enabled
-            {
-                self.gating_runtime
-                    .classifier()
-                    .await
-                    .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
-            } else {
-                None
-            };
-            if let Some(classifier) = tier2_classifier.as_ref() {
-                let tier2 = evaluate_tier2(
-                    &candidate,
-                    classifier,
-                    embedder.as_ref(),
-                    config.ingest_gating.embedding_classifier.threshold,
-                )
-                .await;
-                first_vector = tier2.vector;
-                // Tier 3: intercept uncertain Tier 2 results ("prototype_below_threshold")
-                // and route to LLM judge when enabled (fail-open: store now, judge async).
-                let llm_judge_active = superseded_drawer_id.is_none()
-                    && config.llm.enabled
-                    && config.llm.enabled_for.contains(&"gating".to_string())
-                    && config
-                        .ingest_gating
-                        .llm_judge
-                        .as_ref()
-                        .is_some_and(|j| j.enabled);
-                let is_unclassified =
-                    tier2.decision.gating_reason.as_deref() == Some("prototype_below_threshold");
-                if llm_judge_active && is_unclassified {
-                    let llm_decision =
-                        GatingDecision::accepted(0, Some("llm_pending".to_string()), None);
-                    db.record_gating_audit(
-                        &drawer_id,
-                        &llm_decision,
-                        project_id.as_deref(),
-                        Some(&candidate.content),
-                    )
-                    .map_err(db_error)?;
-                    gating_audit_recorded = true;
-                    gating_decision = Some(llm_decision);
-                    should_enqueue_llm_task = true;
-                } else {
-                    db.record_gating_audit(
-                        &drawer_id,
-                        &tier2.decision,
-                        project_id.as_deref(),
-                        Some(&candidate.content),
-                    )
-                    .map_err(db_error)?;
-                    gating_audit_recorded = true;
-                    gating_decision = Some(tier2.decision);
-                }
-            } else if config.ingest_gating.enabled {
-                gating_decision = Some(GatingDecision::accepted(
-                    0,
-                    Some("tier2_disabled".to_string()),
-                    None,
-                ));
-            }
-        }
-        if let Some(decision) = gating_decision.as_ref()
-            && decision.is_rejected()
-        {
-            drop(lock_guard);
-            return Ok(Json(IngestResponse {
-                drawer_id,
-                drawer_ids: Vec::new(),
-                chunk_count: 0,
-                dropped: true,
-                gating_decision,
-                novelty_action: None,
-                near_drawer_id: None,
-                duplicate_warning: None,
-                lock_wait_ms,
-                superseded_drawer_id: None,
-                fact_check_warnings: Vec::new(),
-                system_warnings: request_system_warnings.clone(),
-                ..Default::default()
-            }));
-        }
-        if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
-            db.record_gating_audit(
-                &drawer_id,
-                decision,
-                project_id.as_deref(),
-                Some(&candidate.content),
-            )
-            .map_err(db_error)?;
-        }
-
-        let mut fact_check_warnings = Vec::new();
-        if !raw_turn
+        if !no_gate
+            && !raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
                 &drawer_id,
                 &candidate.content,
@@ -3216,7 +3231,6 @@ impl MempalMcpServer {
                 }));
             }
         }
-
         timings.insert(
             "gating_ms".to_string(),
             gating_started.elapsed().as_millis() as u64,
@@ -9909,8 +9923,12 @@ enabled = true
         let raw_secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCD";
         let raw_content = format!("queued content {raw_secret}");
         let raw_replace_text = format!("replace target {raw_secret}");
+        let raw_source = format!("source {raw_secret}");
+        let raw_source_file = format!("source-file {raw_secret}");
         let expected_content = ConfigHandle::scrub_content(&raw_content);
         let expected_replace_text = ConfigHandle::scrub_content(&raw_replace_text);
+        let expected_source = ConfigHandle::scrub_content(&raw_source);
+        let expected_source_file = ConfigHandle::scrub_content(&raw_source_file);
 
         insert_drawer(
             &db_path,
@@ -9926,6 +9944,8 @@ enabled = true
             content: raw_content,
             wing: "mcp".to_string(),
             room: Some("scrub".to_string()),
+            source: Some(raw_source),
+            source_file: Some(raw_source_file),
             replace_text: Some(raw_replace_text),
             dry_run: Some(false),
             ..IngestRequest::default()
@@ -9954,6 +9974,14 @@ enabled = true
         assert_eq!(
             decoded.request.replace_text.as_deref(),
             Some(expected_replace_text.as_str())
+        );
+        assert_eq!(
+            decoded.request.source.as_deref(),
+            Some(expected_source.as_str())
+        );
+        assert_eq!(
+            decoded.request.source_file.as_deref(),
+            Some(expected_source_file.as_str())
         );
         assert_eq!(decoded.scrubbed_content, expected_content);
         assert_eq!(decoded.request.content, decoded.scrubbed_content);
@@ -10063,10 +10091,12 @@ enabled = true
                     wing: "mempal".to_string(),
                     room: Some("review".to_string()),
                     source: None,
+                    source_file: None,
                     source_type: None,
                     confidence: None,
                     importance: None,
                     dry_run: None,
+                    no_gate: None,
                     diary_rollup: None,
                     supersedes: None,
                     replace_text: None,

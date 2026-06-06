@@ -3510,6 +3510,7 @@ async fn ingest_stdin_command(
             wing: wing.to_string(),
             room: room.map(ToOwned::to_owned),
             source: record.source.clone(),
+            source_file: record.source_file.clone(),
             source_type: Some(source_type.to_string()),
             confidence: Some(confidence),
             project_id: project.map(ToOwned::to_owned),
@@ -3518,6 +3519,7 @@ async fn ingest_stdin_command(
             valid_from: valid_from.map(ToOwned::to_owned),
             valid_until: valid_until.map(ToOwned::to_owned),
             dry_run: Some(false),
+            no_gate: Some(options.no_gate),
             wait: Some(true),
             wait_timeout_secs: Some(options.wait_timeout_secs.unwrap_or(30)),
             diary_rollup: Some(false),
@@ -3549,16 +3551,26 @@ async fn ingest_stdin_command(
             .await
             .map(|response| response.0)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        print_operation_response(&response)?;
         if response.timed_out {
+            print_operation_response(&response)?;
             bail!(
                 "timed out waiting for ingest operation {}",
                 response.operation_id.as_deref().unwrap_or("")
             );
         }
+
+        let wait_stats = ingest_stdin_wait_stats_from_response(&response);
         match response.state {
-            Some(IngestOperationState::Completed) => return Ok(()),
+            Some(IngestOperationState::Completed) => {
+                append_ingest_stdin_audit_log(db, wing, false, &record, &wait_stats)
+                    .context("failed to append ingest audit log")?;
+                print_operation_response(&response)?;
+                return Ok(());
+            }
             Some(IngestOperationState::Rejected) => {
+                append_ingest_stdin_audit_log(db, wing, false, &record, &wait_stats)
+                    .context("failed to append ingest audit log")?;
+                print_operation_response(&response)?;
                 bail!(
                     "ingest operation {} was rejected: {}",
                     response.operation_id.as_deref().unwrap_or(""),
@@ -3566,13 +3578,17 @@ async fn ingest_stdin_command(
                 );
             }
             Some(IngestOperationState::Failed) => {
+                print_operation_response(&response)?;
                 bail!(
                     "ingest operation {} failed: {}",
                     response.operation_id.as_deref().unwrap_or(""),
                     response.failure_detail.as_deref().unwrap_or("failed")
                 );
             }
-            _ => return Ok(()),
+            _ => {
+                print_operation_response(&response)?;
+                return Ok(());
+            }
         }
     }
 
@@ -3832,6 +3848,27 @@ fn print_operation_response(response: &IngestResponse) -> Result<()> {
         serde_json::to_string(&response.timings).context("failed to serialize timings")?
     );
     Ok(())
+}
+
+fn ingest_stdin_wait_stats_from_response(response: &IngestResponse) -> IngestStats {
+    let mut stats = IngestStats {
+        files: 1,
+        chunks: if response.dropped {
+            0
+        } else {
+            response.chunk_count
+        },
+        dropped_by_gate: if response.dropped { 1 } else { 0 },
+        ..IngestStats::default()
+    };
+    stats.drawer_ids = if response.drawer_ids.is_empty() && !response.drawer_id.is_empty() {
+        vec![response.drawer_id.clone()]
+    } else {
+        response.drawer_ids.clone()
+    };
+    stats.fact_check_warnings = response.fact_check_warnings.clone();
+    stats.superseded_drawer_id = response.superseded_drawer_id.clone();
+    stats
 }
 
 async fn wait_for_operation_status_with_progress(
