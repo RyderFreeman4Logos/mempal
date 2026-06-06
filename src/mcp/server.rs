@@ -198,8 +198,41 @@ impl MempalMcpServer {
 
         let worker = self.clone();
         handle.spawn(async move {
-            worker.run_ingest_drain_worker().await;
+            let _started_guard =
+                IngestDrainWorkerStartedGuard::new(Arc::clone(&worker.ingest_worker_started));
+            worker.supervise_ingest_drain_worker().await;
         });
+    }
+
+    async fn supervise_ingest_drain_worker(self) {
+        let mut restart_backoff_ms = INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS;
+        loop {
+            let worker = self.clone();
+            let join_handle = tokio::spawn(async move {
+                worker.run_ingest_drain_worker().await;
+            });
+
+            match join_handle.await {
+                Ok(()) => {
+                    tracing::error!(
+                        db_path = %self.db_path.display(),
+                        "async ingest worker exited unexpectedly; restarting"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        db_path = %self.db_path.display(),
+                        error = %error,
+                        "async ingest worker stopped unexpectedly; restarting"
+                    );
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(restart_backoff_ms)).await;
+            restart_backoff_ms = restart_backoff_ms
+                .saturating_mul(2)
+                .min(INGEST_DRAIN_RESTART_BACKOFF_MAX_MS);
+        }
     }
 
     async fn run_ingest_drain_worker(self) {
@@ -915,6 +948,24 @@ const INGEST_ASYNC_KIND: &str = "ingest_async";
 const INGEST_CLAIM_TTL_SECS: i64 = 300;
 const INGEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const INGEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS: u64 = 250;
+const INGEST_DRAIN_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
+
+struct IngestDrainWorkerStartedGuard {
+    started: Arc<AtomicBool>,
+}
+
+impl IngestDrainWorkerStartedGuard {
+    fn new(started: Arc<AtomicBool>) -> Self {
+        Self { started }
+    }
+}
+
+impl Drop for IngestDrainWorkerStartedGuard {
+    fn drop(&mut self) {
+        self.started.store(false, Ordering::Release);
+    }
+}
 
 fn validate_temporal_param(name: &str, value: Option<&str>) -> std::result::Result<(), ErrorData> {
     if let Some(raw) = value
@@ -2733,9 +2784,12 @@ impl MempalMcpServer {
                 project_id.as_deref(),
             )
             .map_err(replacement_db_error)?;
+        let mut request = request.clone();
+        request.content = scrubbed_content.clone();
+        request.replace_text = scrubbed_replace_text;
 
         Ok(PreparedIngestOperation {
-            request: request.clone(),
+            request,
             project_id,
             scrubbed_content,
             source_type,
@@ -9634,6 +9688,78 @@ mod tests {
             .expect("ingest completion");
         assert_eq!(completed.state, Some(IngestOperationState::Completed));
         assert!(!completed.drawer_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_async_ingest_queue_payload_is_scrubbed() {
+        let config_home = tempfile::tempdir().expect("config tempdir");
+        let config_db_path = config_home.path().join("palace.db");
+        let _config_guard = ConfigOverrideGuard::install(&format!(
+            r#"
+db_path = "{}"
+
+[privacy]
+enabled = true
+"#,
+            config_db_path.display()
+        ));
+
+        let (_tempdir, db_path, server) = setup_server();
+        let raw_secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCD";
+        let raw_content = format!("queued content {raw_secret}");
+        let raw_replace_text = format!("replace target {raw_secret}");
+        let expected_content = ConfigHandle::scrub_content(&raw_content);
+        let expected_replace_text = ConfigHandle::scrub_content(&raw_replace_text);
+
+        insert_drawer(
+            &db_path,
+            "drawer_async_scrub_replace_target",
+            &expected_replace_text,
+            "mcp",
+            Some("scrub"),
+            "/tmp/mcp-async-scrub.md",
+            1,
+        );
+
+        let request = IngestRequest {
+            content: raw_content,
+            wing: "mcp".to_string(),
+            room: Some("scrub".to_string()),
+            replace_text: Some(raw_replace_text),
+            dry_run: Some(false),
+            ..IngestRequest::default()
+        };
+
+        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let db = server.open_db().expect("open db");
+        let project_id = server
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await
+            .expect("resolve project");
+        let prepared = server
+            .prepare_async_ingest_operation(
+                &request,
+                config.as_ref(),
+                compiled_privacy.as_ref(),
+                &db,
+                project_id,
+            )
+            .expect("prepare async ingest");
+        let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
+        let decoded: PreparedIngestOperation =
+            serde_json::from_str(&payload).expect("decode prepared ingest payload");
+
+        assert_eq!(decoded.request.content, expected_content);
+        assert_eq!(
+            decoded.request.replace_text.as_deref(),
+            Some(expected_replace_text.as_str())
+        );
+        assert_eq!(decoded.scrubbed_content, expected_content);
+        assert_eq!(decoded.request.content, decoded.scrubbed_content);
+        assert!(
+            !payload.contains(raw_secret),
+            "raw secret leaked into payload"
+        );
     }
 
     #[tokio::test]
