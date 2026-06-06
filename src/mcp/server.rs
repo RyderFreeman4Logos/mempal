@@ -10,7 +10,7 @@ use crate::context::assemble_context_with_vector;
 use crate::core::{
     anchor::{self, DerivedAnchor},
     config::ConfigHandle,
-    db::{Database, read_fork_ext_version},
+    db::{CURRENT_VECTOR_INDEX_VERSION, Database, VECTOR_DISTANCE_METRIC, read_fork_ext_version},
     phase3::{
         EvaluatorAdviceInput, RuntimeAdoptionCaptureInput, RuntimeAdoptionCheckedRecordReport,
         RuntimeAdoptionRecordPlanInput, RuntimeAdoptionReviewFilters,
@@ -22,6 +22,7 @@ use crate::core::{
         runtime_adoption_instrumentation_policy, should_write_checked_record,
     },
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
+    reindex::ReindexProgressStore,
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
         AnchorKind, BootstrapIdentityParts, Drawer, ExplicitTunnel, KnowledgeCardFilter,
@@ -79,6 +80,7 @@ use rmcp::{
     service::Peer,
     tool, tool_handler, tool_router,
 };
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -171,6 +173,23 @@ impl MempalMcpServer {
         self.gating_runtime
             .validate_config_shape()
             .context("failed to validate ingest gating config")?;
+        match self.reconcile_reindex_progress() {
+            Ok(0) => {}
+            Ok(updated) => {
+                tracing::info!(
+                    db_path = %self.db_path.display(),
+                    updated,
+                    "reconciled orphan reindex progress rows on startup"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    db_path = %self.db_path.display(),
+                    error = %error,
+                    "failed to reconcile orphan reindex progress rows on startup"
+                );
+            }
+        }
         self.spawn_ingest_drain_worker();
         let _gating_init_task =
             self.gating_runtime
@@ -184,6 +203,35 @@ impl MempalMcpServer {
         self.serve(rmcp::transport::stdio())
             .await
             .context("failed to initialize MCP stdio transport")
+    }
+
+    fn reconcile_reindex_progress(&self) -> anyhow::Result<usize> {
+        let db = Database::open(&self.db_path)
+            .context("failed to open database for reindex progress reconciliation")?;
+        if db.vector_table_distance_metric()?.as_deref() != Some(VECTOR_DISTANCE_METRIC) {
+            return Ok(0);
+        }
+        let Some(dim) = Self::current_vector_dim(&db)? else {
+            return Ok(0);
+        };
+        let target_fingerprint = Database::current_vector_embedder_fingerprint(dim);
+        ReindexProgressStore::new(&self.db_path)
+            .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, &target_fingerprint)
+            .context("failed to finalize orphan reindex progress rows")
+    }
+
+    fn current_vector_dim(db: &Database) -> anyhow::Result<Option<usize>> {
+        let dim = db
+            .conn()
+            .query_row(
+                "SELECT vec_length(embedding) FROM drawer_vectors LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .context("failed to read current vector dimension")?
+            .map(|value| value as usize);
+        Ok(dim)
     }
 
     fn spawn_ingest_drain_worker(&self) {

@@ -5977,6 +5977,9 @@ async fn reindex_stale_batches(
     let mut skipped_concurrent_update = 0usize;
     let mut skipped_failed_batches = 0usize;
     let mut skipped_failed_drawers = 0usize;
+    let progress_store = ReindexProgressStore::new(db.path());
+    let mut active_source: Option<String> = None;
+    let mut last_processed: Option<(String, i64)> = None;
     // Drawers from batches that failed past the retry cap. They keep no fresh
     // vector (stay stale), so they MUST be excluded from later batch queries:
     // the stale selection re-runs every iteration, and without exclusion it
@@ -6048,12 +6051,35 @@ async fn reindex_stale_batches(
                 stats.reindexed, stats.skipped_concurrent_update
             );
         }
-        let progress_store = ReindexProgressStore::new(db.path());
-        if let Some(last) = rows.last() {
+        let mut row_index = 0usize;
+        while row_index < rows.len() {
+            let source_path = rows[row_index].source_path.clone();
+            let mut last_chunk = rows[row_index].chunk_index;
+            row_index += 1;
+            while row_index < rows.len() && rows[row_index].source_path == source_path {
+                last_chunk = rows[row_index].chunk_index;
+                row_index += 1;
+            }
+
+            if active_source.as_deref() != Some(source_path.as_str()) {
+                if let Some((previous_source, previous_chunk)) = last_processed.as_ref() {
+                    progress_store
+                        .mark_done(previous_source, Some(*previous_chunk), embedder_name)
+                        .context("failed to finalize completed reindex source")?;
+                }
+                active_source = Some(source_path.clone());
+            }
+
             progress_store
-                .upsert_running(&last.source_path, Some(last.chunk_index), embedder_name)
+                .upsert_running(&source_path, Some(last_chunk), embedder_name)
                 .context("failed to persist reindex checkpoint")?;
+            last_processed = Some((source_path, last_chunk));
         }
+    }
+    if let Some((source_path, chunk_index)) = last_processed.as_ref() {
+        progress_store
+            .mark_done(source_path, Some(*chunk_index), embedder_name)
+            .context("failed to finalize reindex checkpoint")?;
     }
     if skipped_concurrent_update == 0 {
         println!("stale reindex complete: {processed} drawers");

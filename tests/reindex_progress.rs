@@ -7,8 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
+use mempal::core::db::CURRENT_VECTOR_INDEX_VERSION;
 use mempal::core::db::Database;
+use mempal::core::reindex::ReindexProgressStore;
 use mempal::core::types::{Drawer, SourceType};
+use serde_json::Value;
 use tempfile::TempDir;
 
 fn mempal_bin() -> String {
@@ -48,9 +51,25 @@ impl MockEmbeddingServer {
                     continue;
                 };
                 let mut buffer = [0_u8; 4096];
-                let _ = stream.read(&mut buffer);
+                let bytes_read = stream.read(&mut buffer).unwrap_or(0);
                 requests_clone.fetch_add(1, Ordering::SeqCst);
-                let body = r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#;
+                let request_text = String::from_utf8_lossy(&buffer[..bytes_read]);
+                let body_start = request_text.find("\r\n\r\n").map_or(0, |index| index + 4);
+                let input_count = serde_json::from_str::<Value>(&request_text[body_start..])
+                    .ok()
+                    .and_then(|json| {
+                        json.get("input").map(|input| match input {
+                            Value::Array(items) => items.len(),
+                            Value::Null => 1,
+                            _ => 1,
+                        })
+                    })
+                    .unwrap_or(1);
+                let data = (0..input_count)
+                    .map(|_| r#"{"embedding":[0.1,0.2,0.3]}"#)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let body = format!(r#"{{"data":[{data}]}}"#);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     body.len(),
@@ -137,13 +156,21 @@ fn seed_db(db_path: &Path) {
     }
 }
 
-fn run_reindex(home: &Path, stop_after: Option<usize>, resume: bool) -> std::process::Output {
+fn run_reindex(
+    home: &Path,
+    stop_after: Option<usize>,
+    resume: bool,
+    stale: bool,
+) -> std::process::Output {
     let mut command = Command::new(mempal_bin());
     command
         .env("HOME", home)
         .arg("reindex")
         .arg("--embedder")
         .arg("openai_compat");
+    if stale {
+        command.arg("--stale");
+    }
     if let Some(limit) = stop_after {
         command.env("MEMPAL_TEST_REINDEX_STOP_AFTER", limit.to_string());
     }
@@ -164,7 +191,7 @@ async fn test_reindex_resume_from_checkpoint() {
     write_config(&home, &db_path, &server.base_url);
     seed_db(&db_path);
 
-    let first = run_reindex(&home, Some(20), false);
+    let first = run_reindex(&home, Some(20), false, false);
     assert!(!first.status.success());
     assert!(String::from_utf8_lossy(&first.stderr).contains("interrupted for test"));
     assert_eq!(server.request_count(), 20);
@@ -180,7 +207,7 @@ async fn test_reindex_resume_from_checkpoint() {
         .expect("read paused checkpoint");
     assert_eq!(paused, (19, "paused".to_string()));
 
-    let second = run_reindex(&home, None, true);
+    let second = run_reindex(&home, None, true, false);
     assert!(
         second.status.success(),
         "resume stderr: {}",
@@ -206,4 +233,91 @@ async fn test_reindex_resume_from_checkpoint() {
         })
         .expect("count vectors");
     assert_eq!(vector_count, 50);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_reindex_stale_finalizes_progress() {
+    let _guard = test_guard().await;
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    let db_path = home.join(".mempal").join("palace.db");
+    let server = MockEmbeddingServer::start();
+
+    write_config(&home, &db_path, &server.base_url);
+    seed_db(&db_path);
+
+    let output = run_reindex(&home, None, false, true);
+    assert!(
+        output.status.success(),
+        "reindex stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.request_count(), 1);
+
+    let db = Database::open(&db_path).expect("open db after stale reindex");
+    let state = db
+        .conn()
+        .query_row(
+            "SELECT last_processed_chunk_id, status FROM reindex_progress WHERE source_path = 'fixtures/source.txt'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("read stale checkpoint");
+    assert_eq!(state, (49, "done".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_reindex_progress_reconciliation_finalizes_orphan_running_row() {
+    let _guard = test_guard().await;
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    let db_path = home.join(".mempal").join("palace.db");
+    let server = MockEmbeddingServer::start();
+
+    write_config(&home, &db_path, &server.base_url);
+    seed_db(&db_path);
+
+    let output = run_reindex(&home, None, false, true);
+    assert!(
+        output.status.success(),
+        "stale reindex stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.request_count(), 1);
+
+    let db = Database::open(&db_path).expect("open db after stale reindex");
+    let progress = ReindexProgressStore::new(&db_path);
+    progress
+        .upsert_running("fixtures/source.txt", Some(49), "openai_compat")
+        .expect("insert orphan running row");
+
+    let running = db
+        .conn()
+        .query_row(
+            "SELECT status FROM reindex_progress WHERE source_path = 'fixtures/source.txt'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read running checkpoint");
+    assert_eq!(running, "running");
+
+    let target_fingerprint = format!(
+        "openai_compat:Qwen/Qwen3-Embedding-8B:{}:{}",
+        server.base_url.trim_end_matches('/'),
+        3
+    );
+    let reconciled = progress
+        .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, &target_fingerprint)
+        .expect("reconcile orphan running row");
+    assert_eq!(reconciled, 1);
+
+    let state = db
+        .conn()
+        .query_row(
+            "SELECT last_processed_chunk_id, status FROM reindex_progress WHERE source_path = 'fixtures/source.txt'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("read reconciled checkpoint");
+    assert_eq!(state, (49, "done".to_string()));
 }
