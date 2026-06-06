@@ -16,7 +16,6 @@ use mempal::embed::openai_compat::OpenAiCompatibleEmbedder;
 use mempal::embed::retry::retry_embed_operation;
 use mempal::embed::{EmbedError, Embedder, global_embed_status};
 use mempal::mcp::{IngestRequest, MempalMcpServer};
-use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -458,21 +457,29 @@ async fn test_dim_mismatch_fail_fast() {
     let config = Config::parse(&config_text(&db_path, &format!("http://{addr}/v1"), ""))
         .expect("parse config");
     let server = MempalMcpServer::new(db_path, config);
-    let error = match server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "new drawer".to_string(),
-            wing: "test".to_string(),
-            room: Some("room".to_string()),
-            dry_run: Some(false),
-            ..IngestRequest::default()
-        }))
+    let response = server
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "new drawer".to_string(),
+                wing: "test".to_string(),
+                room: Some("room".to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-    {
-        Ok(_) => panic!("dim mismatch should fail"),
-        Err(error) => error,
-    };
+        .expect("ingest should complete");
 
-    let rendered = error.message.to_string();
+    assert_eq!(
+        response.state,
+        Some(mempal::mcp::IngestOperationState::Failed)
+    );
+    let rendered = response
+        .failure_detail
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
     assert!(rendered.contains("dimension mismatch"));
     assert!(rendered.contains("mempal reindex"));
 }

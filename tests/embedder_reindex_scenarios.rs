@@ -337,16 +337,18 @@ async fn test_search_and_ingest_during_partial_reindex() {
     assert!(!search.results.is_empty());
 
     let ingest = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "ingest during partial reindex".to_string(),
-            wing: "test".to_string(),
-            room: Some("reindex".to_string()),
-            dry_run: Some(false),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "ingest during partial reindex".to_string(),
+                wing: "test".to_string(),
+                room: Some("reindex".to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("ingest during reindex")
-        .0;
+        .expect("ingest during reindex");
     assert!(!ingest.drawer_id.is_empty());
 
     handle.resume();
@@ -1210,26 +1212,41 @@ async fn test_embed_degraded_allows_writes_when_not_configured() {
     status.record_failure(&"synthetic 1");
     status.record_failure(&"synthetic 2");
 
-    let task = tokio::spawn(async move {
-        let server = MempalMcpServer::new(env.db_path.clone(), config);
-        server
-            .mempal_ingest(Parameters(IngestRequest {
-                content: "allowed after recovery".to_string(),
-                wing: "test".to_string(),
-                room: Some("room".to_string()),
-                dry_run: Some(false),
-                ..IngestRequest::default()
-            }))
-            .await
-    });
-    tokio::task::yield_now().await;
-    assert!(
-        !task.is_finished(),
-        "ingest should block while embedder is paused"
+    let server = MempalMcpServer::new(env.db_path.clone(), config.clone());
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        server.mempal_ingest(Parameters(IngestRequest {
+            content: "allowed after recovery".to_string(),
+            wing: "test".to_string(),
+            room: Some("room".to_string()),
+            dry_run: Some(false),
+            ..IngestRequest::default()
+        })),
+    )
+    .await
+    .expect("receipt timeout")
+    .expect("ingest response")
+    .0;
+    assert!(response.operation_id.is_some());
+    assert_eq!(
+        response.state,
+        Some(mempal::mcp::IngestOperationState::Queued)
     );
+
     handle.resume();
-    let response = task.await.expect("join task").expect("ingest response").0;
-    assert!(!response.drawer_id.is_empty());
+    let operation_id = response
+        .operation_id
+        .clone()
+        .expect("queued ingest should carry an operation id");
+    let completed = server
+        .wait_for_operation_completion(&operation_id)
+        .await
+        .expect("ingest completion");
+    assert_eq!(
+        completed.state,
+        Some(mempal::mcp::IngestOperationState::Completed)
+    );
+    assert!(!completed.drawer_id.is_empty());
     handle.shutdown().await;
 }
 

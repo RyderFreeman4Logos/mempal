@@ -25,7 +25,6 @@ use mempal::core::patterns::{
 use mempal::core::types::{Drawer, SourceType};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::mcp::{IngestRequest, MempalMcpServer};
-use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -220,13 +219,16 @@ impl TestEnv {
 
 async fn do_ingest(server: &MempalMcpServer, content: &str, source: &str) {
     server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: content.to_string(),
-            wing: "test".to_string(),
-            source: Some(source.to_string()),
-            dry_run: Some(false),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: content.to_string(),
+                wing: "test".to_string(),
+                source: Some(source.to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
         .expect("ingest");
 }

@@ -610,21 +610,23 @@ async fn test_linked_drawer_ids_rejects_manual_hooks_raw_with_external_source() 
 
     let ingested = env
         .server()
-        .mempal_ingest(Parameters(IngestRequest {
-            content: serde_json::json!({
-                "event": HookEvent::PostToolUse.display_name(),
-                "preview": "tool=Bash"
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: serde_json::json!({
+                    "event": HookEvent::PostToolUse.display_name(),
+                    "preview": "tool=Bash"
+                })
+                .to_string(),
+                wing: "hooks-raw".to_string(),
+                room: Some("Bash".to_string()),
+                source: Some(forged_path.display().to_string()),
+                project_id: Some("project-alpha".to_string()),
+                ..IngestRequest::default()
             })
-            .to_string(),
-            wing: "hooks-raw".to_string(),
-            room: Some("Bash".to_string()),
-            source: Some(forged_path.display().to_string()),
-            project_id: Some("project-alpha".to_string()),
-            ..IngestRequest::default()
-        }))
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("manual hooks-raw ingest")
-        .0;
+        .expect("manual hooks-raw ingest");
 
     let assistant = format!(
         "{} Manual hooks-raw drawers must not be trusted as same-session evidence.",
@@ -665,21 +667,23 @@ async fn test_linked_drawer_ids_does_not_read_external_filesystem() {
 
     let ingested = env
         .server()
-        .mempal_ingest(Parameters(IngestRequest {
-            content: serde_json::json!({
-                "event": HookEvent::PostToolUse.display_name(),
-                "preview": "tool=Bash"
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: serde_json::json!({
+                    "event": HookEvent::PostToolUse.display_name(),
+                    "preview": "tool=Bash"
+                })
+                .to_string(),
+                wing: "hooks-raw".to_string(),
+                room: Some("Bash".to_string()),
+                source: Some(missing_path.display().to_string()),
+                project_id: Some("project-alpha".to_string()),
+                ..IngestRequest::default()
             })
-            .to_string(),
-            wing: "hooks-raw".to_string(),
-            room: Some("Bash".to_string()),
-            source: Some(missing_path.display().to_string()),
-            project_id: Some("project-alpha".to_string()),
-            ..IngestRequest::default()
-        }))
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("manual hooks-raw ingest")
-        .0;
+        .expect("manual hooks-raw ingest");
 
     let assistant = format!(
         "{} Validation must not open attacker-chosen external files.",

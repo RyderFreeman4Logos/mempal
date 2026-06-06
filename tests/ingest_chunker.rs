@@ -163,16 +163,18 @@ async fn test_mcp_ingest_short_content_single_chunk() {
 
     let content = make_content(10);
     let response = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content,
-            wing: "test".to_string(),
-            room: Some("chunker".to_string()),
-            dry_run: Some(false),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content,
+                wing: "test".to_string(),
+                room: Some("chunker".to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("mcp ingest")
-        .0;
+        .expect("mcp ingest");
 
     assert!(!response.dropped, "should not be dropped");
     assert_eq!(response.chunk_count, 1, "short content = 1 chunk");
@@ -198,16 +200,18 @@ async fn test_mcp_ingest_large_content_multi_chunk() {
 
     let content = make_content(100);
     let response = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: content.clone(),
-            wing: "test".to_string(),
-            room: Some("chunker".to_string()),
-            dry_run: Some(false),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: content.clone(),
+                wing: "test".to_string(),
+                room: Some("chunker".to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("mcp ingest")
-        .0;
+        .expect("mcp ingest");
 
     assert!(!response.dropped, "should not be dropped");
     assert!(

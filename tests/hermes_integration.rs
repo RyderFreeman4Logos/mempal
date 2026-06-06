@@ -318,18 +318,20 @@ async fn ingest(
     project_id: Option<&str>,
 ) -> mempal::mcp::IngestResponse {
     server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: content.to_string(),
-            wing: "hermes".to_string(),
-            room: Some("facts".to_string()),
-            source: Some("tests://hermes/ingest".to_string()),
-            project_id: project_id.map(str::to_string),
-            importance: Some(3),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: content.to_string(),
+                wing: "hermes".to_string(),
+                room: Some("facts".to_string()),
+                source: Some("tests://hermes/ingest".to_string()),
+                project_id: project_id.map(str::to_string),
+                importance: Some(3),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
         .expect("ingest")
-        .0
 }
 
 async fn search_ids(server: &MempalMcpServer, query: &str) -> Vec<String> {
@@ -370,17 +372,19 @@ async fn test_replace_supersedes_old() {
     let old = ingest(&server, "Hermes old provider fact", None).await;
 
     let new = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "Hermes new provider fact".to_string(),
-            wing: "hermes".to_string(),
-            room: Some("facts".to_string()),
-            supersedes: Some(old.drawer_id.clone()),
-            importance: Some(4),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "Hermes new provider fact".to_string(),
+                wing: "hermes".to_string(),
+                room: Some("facts".to_string()),
+                supersedes: Some(old.drawer_id.clone()),
+                importance: Some(4),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("superseding ingest")
-        .0;
+        .expect("superseding ingest");
 
     assert_eq!(
         new.superseded_drawer_id.as_deref(),
@@ -638,16 +642,18 @@ async fn test_supersession_chain_end_to_end() {
     let server = env.server();
     let old = ingest(&server, "Hermes supersession chain old", None).await;
     let new = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "Hermes supersession chain new".to_string(),
-            wing: "hermes".to_string(),
-            room: Some("facts".to_string()),
-            supersedes: Some(old.drawer_id.clone()),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "Hermes supersession chain new".to_string(),
+                wing: "hermes".to_string(),
+                room: Some("facts".to_string()),
+                supersedes: Some(old.drawer_id.clone()),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("superseding ingest")
-        .0;
+        .expect("superseding ingest");
 
     let ids = search_ids(&server, "Hermes supersession chain").await;
 

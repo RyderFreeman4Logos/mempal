@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 18;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 19;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
@@ -57,6 +57,20 @@ CREATE INDEX IF NOT EXISTS idx_drawers_reindex_source_identity_active
 pub const FORK_EXT_V18_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_ctv_embedder_metadata
     ON conversation_turn_vectors(embedder_fingerprint, dim, index_version);
+"#;
+
+pub const FORK_EXT_V19_SCHEMA_SQL: &str = r#"
+ALTER TABLE pending_messages ADD COLUMN result_drawer_id TEXT;
+ALTER TABLE pending_messages ADD COLUMN op_state TEXT NOT NULL DEFAULT 'queued' CHECK(op_state IN ('queued', 'running', 'completed', 'rejected', 'failed'));
+ALTER TABLE pending_messages ADD COLUMN rejected_reason TEXT;
+ALTER TABLE pending_messages ADD COLUMN failure_detail TEXT;
+ALTER TABLE pending_messages ADD COLUMN result_json TEXT;
+
+ALTER TABLE pending_message_completions ADD COLUMN result_drawer_id TEXT;
+ALTER TABLE pending_message_completions ADD COLUMN op_state TEXT NOT NULL DEFAULT 'queued' CHECK(op_state IN ('queued', 'running', 'completed', 'rejected', 'failed'));
+ALTER TABLE pending_message_completions ADD COLUMN rejected_reason TEXT;
+ALTER TABLE pending_message_completions ADD COLUMN failure_detail TEXT;
+ALTER TABLE pending_message_completions ADD COLUMN result_json TEXT;
 "#;
 
 pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
@@ -373,6 +387,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 18,
             up: apply_v18,
         },
+        Migration {
+            version: 19,
+            up: apply_v19,
+        },
     ]
 }
 
@@ -501,6 +519,56 @@ fn apply_v18(conn: &Connection) -> rusqlite::Result<()> {
     ensure_nullable_column(conn, "conversation_turn_vectors", "dim", "INTEGER")?;
     ensure_nullable_column(conn, "conversation_turn_vectors", "index_version", "TEXT")?;
     conn.execute_batch(FORK_EXT_V18_SCHEMA_SQL)
+}
+
+fn apply_v19(conn: &Connection) -> rusqlite::Result<()> {
+    let _ = FORK_EXT_V19_SCHEMA_SQL;
+
+    if !table_has_column(conn, "pending_messages", "result_drawer_id")? {
+        conn.execute_batch("ALTER TABLE pending_messages ADD COLUMN result_drawer_id TEXT;")?;
+    }
+    if !table_has_column(conn, "pending_messages", "op_state")? {
+        conn.execute_batch(
+            "ALTER TABLE pending_messages ADD COLUMN op_state TEXT NOT NULL DEFAULT 'queued' CHECK(op_state IN ('queued', 'running', 'completed', 'rejected', 'failed'));",
+        )?;
+    }
+    if !table_has_column(conn, "pending_messages", "rejected_reason")? {
+        conn.execute_batch("ALTER TABLE pending_messages ADD COLUMN rejected_reason TEXT;")?;
+    }
+    if !table_has_column(conn, "pending_messages", "failure_detail")? {
+        conn.execute_batch("ALTER TABLE pending_messages ADD COLUMN failure_detail TEXT;")?;
+    }
+    if !table_has_column(conn, "pending_messages", "result_json")? {
+        conn.execute_batch("ALTER TABLE pending_messages ADD COLUMN result_json TEXT;")?;
+    }
+
+    if !table_has_column(conn, "pending_message_completions", "result_drawer_id")? {
+        conn.execute_batch(
+            "ALTER TABLE pending_message_completions ADD COLUMN result_drawer_id TEXT;",
+        )?;
+    }
+    if !table_has_column(conn, "pending_message_completions", "op_state")? {
+        conn.execute_batch(
+            "ALTER TABLE pending_message_completions ADD COLUMN op_state TEXT NOT NULL DEFAULT 'queued' CHECK(op_state IN ('queued', 'running', 'completed', 'rejected', 'failed'));",
+        )?;
+    }
+    if !table_has_column(conn, "pending_message_completions", "rejected_reason")? {
+        conn.execute_batch(
+            "ALTER TABLE pending_message_completions ADD COLUMN rejected_reason TEXT;",
+        )?;
+    }
+    if !table_has_column(conn, "pending_message_completions", "failure_detail")? {
+        conn.execute_batch(
+            "ALTER TABLE pending_message_completions ADD COLUMN failure_detail TEXT;",
+        )?;
+    }
+    if !table_has_column(conn, "pending_message_completions", "result_json")? {
+        conn.execute_batch(
+            "ALTER TABLE pending_message_completions ADD COLUMN result_json TEXT;",
+        )?;
+    }
+
+    Ok(())
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {

@@ -1409,6 +1409,8 @@ mod tests {
             retry_count: 0,
             claim_token: "worker:claim".to_string(),
             source_hash: "hash".to_string(),
+            created_at: 0,
+            claimed_at: 0,
         }
     }
 

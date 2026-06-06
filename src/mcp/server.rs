@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::adoption_analytics::build_runtime_adoption_analytics;
 use crate::brief::brief_from_context;
@@ -78,6 +79,7 @@ use rmcp::{
     service::Peer,
     tool, tool_handler, tool_router,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::timeline::{TimelineRequest, TimelineResponse};
@@ -90,16 +92,17 @@ use super::tools::{
     CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DoctorMcpDto,
     DoctorRequest, DoctorResponse, DoctorToolDto, DuplicateWarning, EmbedStatusDto,
     EndpointHealthDto, FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto,
-    FieldTaxonomyResponse, IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest,
-    KgResponse, KgStatsDto, KnowledgeCardDto, KnowledgeCardEventDto, KnowledgeCardsRequest,
-    KnowledgeCardsResponse, KnowledgeDemoteRequest, KnowledgeDemoteResponse,
-    KnowledgeDistillRequest, KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse,
-    KnowledgePolicyResponse, KnowledgePromoteRequest, KnowledgePromoteResponse,
-    KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest,
-    LeaseResponse, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS,
-    PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
-    Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
-    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
+    FieldTaxonomyResponse, IngestOperationState, IngestRequest, IngestResponse,
+    IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto, KnowledgeCardDto,
+    KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse, KnowledgeDemoteRequest,
+    KnowledgeDemoteResponse, KnowledgeDistillRequest, KnowledgeDistillResponse,
+    KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse, KnowledgePromoteRequest,
+    KnowledgePromoteResponse, KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse,
+    LeaseInfoDto, LeaseRequest, LeaseResponse, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT,
+    MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest, PeekMessageDto, PeekPartnerRequest,
+    PeekPartnerResponse, Phase3GateDto, Phase3Request, Phase3Response, PinnedFactDto,
+    PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse, QueueStatsDto,
+    ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
     ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto, RollbackRequest,
     RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto,
     SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
@@ -122,6 +125,7 @@ pub struct MempalMcpServer {
     /// Per-session drawer IDs that were returned by `mempal_search`.
     /// Flushed and boosted on the next `mempal_ingest` call (P13).
     session_hit_drawers: Arc<Mutex<HashSet<String>>>,
+    ingest_worker_started: Arc<AtomicBool>,
 }
 
 impl MempalMcpServer {
@@ -155,6 +159,7 @@ impl MempalMcpServer {
             client_project_id: Arc::new(Mutex::new(None)),
             client_peer: Arc::new(Mutex::new(None)),
             session_hit_drawers: Arc::new(Mutex::new(HashSet::new())),
+            ingest_worker_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -166,6 +171,7 @@ impl MempalMcpServer {
         self.gating_runtime
             .validate_config_shape()
             .context("failed to validate ingest gating config")?;
+        self.spawn_ingest_drain_worker();
         let _gating_init_task =
             self.gating_runtime
                 .spawn_initialize_from_config(Duration::from_secs(
@@ -178,6 +184,181 @@ impl MempalMcpServer {
         self.serve(rmcp::transport::stdio())
             .await
             .context("failed to initialize MCP stdio transport")
+    }
+
+    fn spawn_ingest_drain_worker(&self) {
+        if self.ingest_worker_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.ingest_worker_started.store(false, Ordering::Release);
+            return;
+        };
+
+        let worker = self.clone();
+        handle.spawn(async move {
+            let _started_guard =
+                IngestDrainWorkerStartedGuard::new(Arc::clone(&worker.ingest_worker_started));
+            worker.supervise_ingest_drain_worker().await;
+        });
+    }
+
+    async fn supervise_ingest_drain_worker(self) {
+        let mut restart_backoff_ms = INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS;
+        loop {
+            let worker = self.clone();
+            let join_handle = tokio::spawn(async move {
+                worker.run_ingest_drain_worker().await;
+            });
+
+            match join_handle.await {
+                Ok(()) => {
+                    tracing::error!(
+                        db_path = %self.db_path.display(),
+                        "async ingest worker exited unexpectedly; restarting"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        db_path = %self.db_path.display(),
+                        error = %error,
+                        "async ingest worker stopped unexpectedly; restarting"
+                    );
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(restart_backoff_ms)).await;
+            restart_backoff_ms = restart_backoff_ms
+                .saturating_mul(2)
+                .min(INGEST_DRAIN_RESTART_BACKOFF_MAX_MS);
+        }
+    }
+
+    async fn run_ingest_drain_worker(self) {
+        let worker_id = format!(
+            "mcp-ingest-worker-{:x}-{:x}",
+            std::process::id(),
+            Arc::as_ptr(&self.ingest_worker_started) as usize
+        );
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&self.db_path);
+
+        loop {
+            match queue.claim_next_by_kind(&worker_id, INGEST_CLAIM_TTL_SECS, INGEST_ASYNC_KIND) {
+                Ok(Some(claim)) => {
+                    if let Err(error) = self.process_ingest_claim(&queue, &worker_id, claim).await {
+                        tracing::warn!(error = %error, "async ingest worker failed to process op");
+                    }
+                }
+                Ok(None) => tokio::time::sleep(INGEST_POLL_INTERVAL).await,
+                Err(error) => {
+                    tracing::warn!(error = %error, "async ingest worker claim failed");
+                    tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+                }
+            }
+        }
+    }
+
+    async fn process_ingest_claim(
+        &self,
+        queue: &crate::core::queue::PendingMessageStore,
+        worker_id: &str,
+        claim: crate::core::queue::ClaimedMessage,
+    ) -> anyhow::Result<()> {
+        let prepared: PreparedIngestOperation = serde_json::from_str(&claim.payload)
+            .with_context(|| format!("failed to decode ingest operation {}", claim.id))?;
+
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let heartbeat_queue = queue.clone();
+        let heartbeat_id = claim.id.clone();
+        let heartbeat_worker_id = worker_id.to_string();
+        let heartbeat = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(INGEST_HEARTBEAT_INTERVAL);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(error) = heartbeat_queue.refresh_heartbeat(&heartbeat_id, &heartbeat_worker_id) {
+                            tracing::warn!(error = %error, claim_id = %heartbeat_id, "failed to refresh async ingest heartbeat");
+                            break;
+                        }
+                    }
+                    _ = &mut stop_rx => break,
+                }
+            }
+        });
+
+        let outcome = self
+            .mempal_ingest_sync(Parameters(prepared.request.clone()))
+            .await;
+
+        let _ = stop_tx.send(());
+        let _ = heartbeat.await;
+
+        match outcome {
+            Ok(Json(response)) => {
+                let rejected_reason = response
+                    .gating_decision
+                    .as_ref()
+                    .and_then(|decision| decision.drop_reason().map(ToOwned::to_owned));
+                let state = if response.dropped && rejected_reason.is_some() {
+                    IngestOperationState::Rejected
+                } else {
+                    IngestOperationState::Completed
+                };
+                let finalized = finalize_ingest_response(
+                    claim.id.clone(),
+                    claim.created_at,
+                    response,
+                    state,
+                    rejected_reason.clone(),
+                    None,
+                );
+                let result_json = serde_json::to_string(&finalized)
+                    .context("failed to serialize completed ingest response")?;
+                let result_drawer_id = if finalized.drawer_id.is_empty() {
+                    None
+                } else {
+                    Some(finalized.drawer_id.as_str())
+                };
+                queue
+                    .complete_operation(
+                        &claim.id,
+                        state.as_str(),
+                        result_drawer_id,
+                        rejected_reason.as_deref(),
+                        None,
+                        Some(&result_json),
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to store async ingest result: {error}")
+                    })?;
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                let finalized = finalize_failed_ingest_response(
+                    claim.id.clone(),
+                    claim.created_at,
+                    detail.clone(),
+                );
+                let result_json = serde_json::to_string(&finalized)
+                    .context("failed to serialize failed ingest response")?;
+                queue
+                    .complete_operation(
+                        &claim.id,
+                        IngestOperationState::Failed.as_str(),
+                        None,
+                        None,
+                        Some(&detail),
+                        Some(&result_json),
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to store async ingest failure: {error}")
+                    })?;
+            }
+        }
+
+        Ok(())
     }
 
     pub(super) fn open_db(&self) -> std::result::Result<Database, ErrorData> {
@@ -232,9 +413,49 @@ impl MempalMcpServer {
     ) -> std::result::Result<IngestResponse, ErrorData> {
         let request = serde_json::from_value(value)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
-        self.mempal_ingest(Parameters(request))
+        let response = self
+            .mempal_ingest(Parameters(request))
             .await
-            .map(|response| response.0)
+            .map(|response| response.0)?;
+        match response.operation_id.as_deref() {
+            Some(operation_id) => self.wait_for_operation_completion(operation_id).await,
+            None => Ok(response),
+        }
+    }
+
+    pub async fn operation_status_json_for_test(
+        &self,
+        operation_id: &str,
+    ) -> std::result::Result<IngestResponse, ErrorData> {
+        self.mempal_operation_status(Parameters(OperationStatusRequest {
+            operation_id: operation_id.to_string(),
+        }))
+        .await
+        .map(|response| response.0)
+    }
+
+    pub async fn wait_for_operation_completion(
+        &self,
+        operation_id: &str,
+    ) -> std::result::Result<IngestResponse, ErrorData> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = self.operation_status_json_for_test(operation_id).await?;
+            if response
+                .state
+                .map(IngestOperationState::is_terminal)
+                .unwrap_or(false)
+            {
+                return Ok(response);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ErrorData::internal_error(
+                    format!("timed out waiting for ingest operation {operation_id}"),
+                    None,
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     pub async fn search_json_for_test(
@@ -348,6 +569,32 @@ impl MempalMcpServer {
         request: StatusRequest,
     ) -> std::result::Result<Json<StatusResponse>, ErrorData> {
         self.mempal_status_tool(Parameters(request)).await
+    }
+
+    #[tool(
+        name = "mempal_operation_status",
+        description = "Return the current status of an asynchronous ingest operation, including the queue state and any stored drawer_id, rejection reason, or failure detail. Use this to confirm a receipt-based write landed."
+    )]
+    pub async fn mempal_operation_status(
+        &self,
+        Parameters(request): Parameters<OperationStatusRequest>,
+    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        let db = self.open_db()?;
+        let store = crate::core::queue::PendingMessageStore::new_without_reclaim(db.path());
+        let system_warnings = system_warnings_with_stale_index(&db);
+        let record = store
+            .operation_status(&request.operation_id)
+            .map_err(|error| {
+                ErrorData::internal_error(format!("queue lookup failed: {error}"), None)
+            })?
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("operation not found: {}", request.operation_id),
+                    None,
+                )
+            })?;
+
+        Ok(Json(operation_record_to_response(record, system_warnings)))
     }
 
     pub async fn pinned_facts_json_for_test(
@@ -502,7 +749,7 @@ impl MempalMcpServer {
 // =========================================================================
 
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ValidatedIngestMetadata {
     memory_kind: MemoryKind,
     domain: MemoryDomain,
@@ -681,6 +928,42 @@ fn validate_ingest_request(
                 trigger_hints,
             })
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PreparedIngestOperation {
+    request: IngestRequest,
+    project_id: Option<String>,
+    scrubbed_content: String,
+    source_type: SourceType,
+    confidence: f64,
+    metadata: ValidatedIngestMetadata,
+    superseded_drawer_id: Option<String>,
+    raw_turn: bool,
+    drawer_importance: i32,
+}
+
+const INGEST_ASYNC_KIND: &str = "ingest_async";
+const INGEST_CLAIM_TTL_SECS: i64 = 300;
+const INGEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const INGEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS: u64 = 250;
+const INGEST_DRAIN_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
+
+struct IngestDrainWorkerStartedGuard {
+    started: Arc<AtomicBool>,
+}
+
+impl IngestDrainWorkerStartedGuard {
+    fn new(started: Arc<AtomicBool>) -> Self {
+        Self { started }
+    }
+}
+
+impl Drop for IngestDrainWorkerStartedGuard {
+    fn drop(&mut self) {
+        self.started.store(false, Ordering::Release);
     }
 }
 
@@ -2386,6 +2669,142 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<IngestRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        self.spawn_ingest_drain_worker();
+        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let room = request.room.as_deref();
+        let db = self.open_db()?;
+        // Snapshot the request-wide warnings once so every early-return path reports a
+        // consistent set from a single `sqlite_master` read. A mid-request embed transition
+        // to degraded is not lost: the synchronous degraded-write guard below
+        // (`should_block_writes`) re-reads fresh status via `degraded_write_error()` and
+        // rejects before any success response that would carry this snapshot is built.
+        let request_system_warnings = system_warnings_with_stale_index(&db);
+        let dry_run = request.dry_run.unwrap_or(false);
+        let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
+        if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
+            return Ok(Json(IngestResponse {
+                operation_id: None,
+                accepted_at: None,
+                state: None,
+                drawer_id: String::new(),
+                drawer_ids: Vec::new(),
+                chunk_count: 0,
+                dropped: false,
+                gating_decision: None,
+                novelty_action: None,
+                near_drawer_id: None,
+                duplicate_warning: None,
+                lock_wait_ms: None,
+                superseded_drawer_id: None,
+                rejected_reason: None,
+                failure_detail: None,
+                fact_check_warnings: Vec::new(),
+                system_warnings: request_system_warnings,
+            }));
+        }
+        if dry_run {
+            return self.mempal_ingest_sync(Parameters(request)).await;
+        }
+        if global_embed_status().should_block_writes() {
+            return Err(degraded_write_error());
+        }
+        let project_id = self
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await?;
+        let prepared = self.prepare_async_ingest_operation(
+            &request,
+            config.as_ref(),
+            compiled_privacy.as_ref(),
+            &db,
+            project_id,
+        )?;
+        let payload = serde_json::to_string(&prepared).map_err(|error| {
+            ErrorData::internal_error(format!("failed to serialize ingest request: {error}"), None)
+        })?;
+        let queue = crate::core::queue::PendingMessageStore::new(db.path()).map_err(|error| {
+            ErrorData::internal_error(format!("failed to open ingest queue: {error}"), None)
+        })?;
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, &payload)
+            .map_err(|error| {
+                ErrorData::internal_error(
+                    format!("failed to enqueue ingest operation: {error}"),
+                    None,
+                )
+            })?;
+
+        Ok(Json(IngestResponse {
+            operation_id: Some(operation_id),
+            accepted_at: Some(crate::core::utils::iso_timestamp()),
+            state: Some(IngestOperationState::Queued),
+            drawer_id: String::new(),
+            drawer_ids: Vec::new(),
+            chunk_count: 0,
+            dropped: false,
+            gating_decision: None,
+            novelty_action: None,
+            near_drawer_id: None,
+            duplicate_warning: None,
+            lock_wait_ms: None,
+            superseded_drawer_id: None,
+            rejected_reason: None,
+            failure_detail: None,
+            fact_check_warnings: Vec::new(),
+            system_warnings: request_system_warnings,
+        }))
+    }
+
+    fn prepare_async_ingest_operation(
+        &self,
+        request: &IngestRequest,
+        config: &crate::core::config::Config,
+        compiled_privacy: &crate::core::config::CompiledPrivacyConfig,
+        db: &Database,
+        project_id: Option<String>,
+    ) -> std::result::Result<PreparedIngestOperation, ErrorData> {
+        let scrubbed_content =
+            config.scrub_content_with_compiled(&request.content, compiled_privacy);
+        let room = request.room.as_deref();
+        let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
+        let drawer_importance = raw_turn_importance(&request.wing, room, &config.turns)
+            .unwrap_or_else(|| request.importance.unwrap_or(0));
+        let source_type = parse_source_type_param(request.source_type.as_deref())?;
+        let confidence = resolve_confidence_param(source_type, request.confidence)?;
+        let metadata = validate_ingest_request(request, &source_type)?;
+        let scrubbed_replace_text = request
+            .replace_text
+            .as_deref()
+            .map(|text| config.scrub_content_with_compiled(text, compiled_privacy));
+        let replacement_target = db
+            .resolve_replacement_target(
+                request.supersedes.as_deref(),
+                scrubbed_replace_text.as_deref(),
+                &request.wing,
+                room,
+                project_id.as_deref(),
+            )
+            .map_err(replacement_db_error)?;
+        let mut request = request.clone();
+        request.content = scrubbed_content.clone();
+        request.replace_text = scrubbed_replace_text;
+
+        Ok(PreparedIngestOperation {
+            request,
+            project_id,
+            scrubbed_content,
+            source_type,
+            confidence,
+            metadata,
+            superseded_drawer_id: replacement_target.map(|summary| summary.id),
+            raw_turn,
+            drawer_importance,
+        })
+    }
+
+    async fn mempal_ingest_sync(
+        &self,
+        Parameters(request): Parameters<IngestRequest>,
+    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let project_id = self
             .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
@@ -2404,6 +2823,9 @@ impl MempalMcpServer {
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
             return Ok(Json(IngestResponse {
+                operation_id: None,
+                accepted_at: None,
+                state: None,
                 drawer_id: String::new(),
                 drawer_ids: Vec::new(),
                 chunk_count: 0,
@@ -2414,6 +2836,8 @@ impl MempalMcpServer {
                 duplicate_warning: None,
                 lock_wait_ms: None,
                 superseded_drawer_id: None,
+                rejected_reason: None,
+                failure_detail: None,
                 fact_check_warnings: Vec::new(),
                 system_warnings: request_system_warnings,
             }));
@@ -2509,6 +2933,7 @@ impl MempalMcpServer {
                 superseded_drawer_id,
                 fact_check_warnings: Vec::new(),
                 system_warnings: request_system_warnings.clone(),
+                ..Default::default()
             }));
         }
 
@@ -2540,6 +2965,7 @@ impl MempalMcpServer {
                 superseded_drawer_id: superseded_response_id,
                 fact_check_warnings: Vec::new(),
                 system_warnings: request_system_warnings.clone(),
+                ..Default::default()
             }));
         }
 
@@ -2573,6 +2999,7 @@ impl MempalMcpServer {
                 superseded_drawer_id: None,
                 fact_check_warnings: Vec::new(),
                 system_warnings: request_system_warnings.clone(),
+                ..Default::default()
             }));
         }
 
@@ -2676,6 +3103,7 @@ impl MempalMcpServer {
                 superseded_drawer_id: None,
                 fact_check_warnings: Vec::new(),
                 system_warnings: request_system_warnings.clone(),
+                ..Default::default()
             }));
         }
         if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
@@ -2720,6 +3148,7 @@ impl MempalMcpServer {
                     superseded_drawer_id: None,
                     fact_check_warnings,
                     system_warnings: request_system_warnings.clone(),
+                    ..Default::default()
                 }));
             }
         }
@@ -3177,6 +3606,7 @@ impl MempalMcpServer {
             superseded_drawer_id: superseded_response_id,
             fact_check_warnings,
             system_warnings: request_system_warnings,
+            ..Default::default()
         }))
     }
 
@@ -6126,6 +6556,113 @@ fn system_warnings_with_stale_index(db: &Database) -> Vec<SystemWarning> {
     warnings
 }
 
+fn operation_record_accepted_at_secs(record: &crate::core::queue::PendingOperationRecord) -> i64 {
+    if record.completed_at.is_some() {
+        record.created_at.div_euclid(1_000)
+    } else {
+        record.created_at
+    }
+}
+
+fn rfc3339_from_secs(secs: i64) -> String {
+    crate::cowork::peek::format_rfc3339(UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64))
+}
+
+fn finalize_ingest_response(
+    operation_id: String,
+    accepted_at_secs: i64,
+    mut response: IngestResponse,
+    state: IngestOperationState,
+    rejected_reason: Option<String>,
+    failure_detail: Option<String>,
+) -> IngestResponse {
+    response.operation_id = Some(operation_id);
+    response.accepted_at = Some(rfc3339_from_secs(accepted_at_secs));
+    response.state = Some(state);
+    response.rejected_reason = rejected_reason;
+    response.failure_detail = failure_detail;
+    response
+}
+
+fn finalize_failed_ingest_response(
+    operation_id: String,
+    accepted_at_secs: i64,
+    failure_detail: String,
+) -> IngestResponse {
+    finalize_ingest_response(
+        operation_id,
+        accepted_at_secs,
+        IngestResponse {
+            operation_id: None,
+            accepted_at: None,
+            state: None,
+            drawer_id: String::new(),
+            drawer_ids: Vec::new(),
+            chunk_count: 0,
+            dropped: false,
+            gating_decision: None,
+            novelty_action: None,
+            near_drawer_id: None,
+            duplicate_warning: None,
+            lock_wait_ms: None,
+            superseded_drawer_id: None,
+            rejected_reason: None,
+            failure_detail: None,
+            fact_check_warnings: Vec::new(),
+            system_warnings: current_system_warnings(),
+        },
+        IngestOperationState::Failed,
+        None,
+        Some(failure_detail),
+    )
+}
+
+fn operation_record_to_response(
+    record: crate::core::queue::PendingOperationRecord,
+    system_warnings: Vec<SystemWarning>,
+) -> IngestResponse {
+    let accepted_at = Some(rfc3339_from_secs(operation_record_accepted_at_secs(
+        &record,
+    )));
+    let state = record
+        .op_state
+        .parse::<IngestOperationState>()
+        .unwrap_or(IngestOperationState::Failed);
+
+    if let Some(result_json) = record.result_json.as_deref()
+        && let Ok(mut response) = serde_json::from_str::<IngestResponse>(result_json)
+    {
+        response.operation_id = Some(record.id);
+        response.accepted_at = accepted_at;
+        response.state = Some(state);
+        response.dropped = matches!(state, IngestOperationState::Rejected);
+        response.rejected_reason = record.rejected_reason.or(response.rejected_reason);
+        response.failure_detail = record.failure_detail.or(response.failure_detail);
+        response.system_warnings = system_warnings;
+        return response;
+    }
+
+    IngestResponse {
+        operation_id: Some(record.id),
+        accepted_at,
+        state: Some(state),
+        drawer_id: record.result_drawer_id.unwrap_or_default(),
+        drawer_ids: Vec::new(),
+        chunk_count: 0,
+        dropped: matches!(state, IngestOperationState::Rejected),
+        gating_decision: None,
+        novelty_action: None,
+        near_drawer_id: None,
+        duplicate_warning: None,
+        lock_wait_ms: None,
+        superseded_drawer_id: None,
+        rejected_reason: record.rejected_reason,
+        failure_detail: record.failure_detail,
+        fact_check_warnings: Vec::new(),
+        system_warnings,
+    }
+}
+
 fn intelligence_llm_state(config: &crate::core::config::Config, reachable: bool) -> String {
     if !config.memory_intelligence.mode.uses_llm() {
         return "disabled".to_string();
@@ -6276,10 +6813,12 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use rusqlite::params;
     use tempfile::TempDir;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::core::db::read_fork_ext_version;
@@ -6294,6 +6833,19 @@ mod tests {
 
     struct StubEmbedder {
         vector: Vec<f32>,
+    }
+
+    #[derive(Clone)]
+    struct BlockingEmbedderFactory {
+        vector: Vec<f32>,
+        call_count: Arc<AtomicUsize>,
+        gate: Arc<Notify>,
+    }
+
+    struct BlockingEmbedder {
+        vector: Vec<f32>,
+        call_count: Arc<AtomicUsize>,
+        gate: Arc<Notify>,
     }
 
     #[derive(Default)]
@@ -6332,6 +6884,34 @@ mod tests {
 
         fn name(&self) -> &str {
             "stub"
+        }
+    }
+
+    #[async_trait]
+    impl crate::embed::EmbedderFactory for BlockingEmbedderFactory {
+        async fn build(&self) -> crate::embed::Result<Box<dyn Embedder>> {
+            Ok(Box::new(BlockingEmbedder {
+                vector: self.vector.clone(),
+                call_count: Arc::clone(&self.call_count),
+                gate: Arc::clone(&self.gate),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for BlockingEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.gate.notified().await;
+            Ok(texts.iter().map(|_| self.vector.clone()).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            self.vector.len()
+        }
+
+        fn name(&self) -> &str {
+            "blocking-stub"
         }
     }
 
@@ -8731,19 +9311,19 @@ mod tests {
         supersedes: Option<&str>,
         replace_text: Option<&str>,
     ) -> IngestResponse {
+        let request = IngestRequest {
+            content: content.to_string(),
+            wing: "mempal".to_string(),
+            room: Some("replace".to_string()),
+            project_id: project_id.map(ToOwned::to_owned),
+            supersedes: supersedes.map(ToOwned::to_owned),
+            replace_text: replace_text.map(ToOwned::to_owned),
+            ..IngestRequest::default()
+        };
         server
-            .mempal_ingest(Parameters(IngestRequest {
-                content: content.to_string(),
-                wing: "mempal".to_string(),
-                room: Some("replace".to_string()),
-                project_id: project_id.map(ToOwned::to_owned),
-                supersedes: supersedes.map(ToOwned::to_owned),
-                replace_text: replace_text.map(ToOwned::to_owned),
-                ..IngestRequest::default()
-            }))
+            .ingest_json_for_test(serde_json::to_value(request).expect("serialize ingest request"))
             .await
             .expect("ingest should succeed")
-            .0
     }
 
     #[tokio::test]
@@ -8781,16 +9361,18 @@ mod tests {
     async fn test_mcp_ingest_valid_until_is_respected_by_search_include_expired() {
         let (_tempdir, _db_path, server) = setup_server();
         let ingested = server
-            .mempal_ingest(Parameters(IngestRequest {
-                content: "temporal expired fact".to_string(),
-                wing: "mempal".to_string(),
-                room: Some("temporal".to_string()),
-                valid_until: Some("1".to_string()),
-                ..IngestRequest::default()
-            }))
+            .ingest_json_for_test(
+                serde_json::to_value(IngestRequest {
+                    content: "temporal expired fact".to_string(),
+                    wing: "mempal".to_string(),
+                    room: Some("temporal".to_string()),
+                    valid_until: Some("1".to_string()),
+                    ..IngestRequest::default()
+                })
+                .expect("serialize ingest request"),
+            )
             .await
-            .expect("ingest should succeed")
-            .0;
+            .expect("ingest should succeed");
 
         let hidden = run_search(
             &server,
@@ -8867,21 +9449,28 @@ mod tests {
         let (_tempdir, db_path, server) = setup_server();
         let old = ingest_manual(&server, "empty replacement old fact", None, None, None).await;
 
-        let error = match server
-            .mempal_ingest(Parameters(IngestRequest {
-                content: "   \n\t  ".to_string(),
-                wing: "mempal".to_string(),
-                room: Some("replace".to_string()),
-                supersedes: Some(old.drawer_id.clone()),
-                ..IngestRequest::default()
-            }))
+        let response = server
+            .ingest_json_for_test(
+                serde_json::to_value(IngestRequest {
+                    content: "   \n\t  ".to_string(),
+                    wing: "mempal".to_string(),
+                    room: Some("replace".to_string()),
+                    supersedes: Some(old.drawer_id.clone()),
+                    ..IngestRequest::default()
+                })
+                .expect("serialize ingest request"),
+            )
             .await
-        {
-            Ok(_) => panic!("empty replacement should fail"),
-            Err(error) => error,
-        };
+            .expect("ingest should complete");
 
-        assert!(error.to_string().contains("content produced no chunks"));
+        assert_eq!(response.state, Some(IngestOperationState::Failed));
+        assert!(
+            response
+                .failure_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("content produced no chunks")
+        );
         let db = Database::open(&db_path).expect("open db");
         assert!(db.get_drawer(&old.drawer_id).expect("old lookup").is_some());
         assert_eq!(db.drawer_count().expect("drawer count"), 1);
@@ -9043,47 +9632,269 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mcp_ingest_returns_receipt_before_embedder_runs() {
+        let db_path = PathBuf::from("/tmp/mempal-async-receipt.db");
+        Database::open(&db_path).expect("open db");
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Notify::new());
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(BlockingEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+                call_count: Arc::clone(&call_count),
+                gate: Arc::clone(&gate),
+            }),
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.mempal_ingest(Parameters(IngestRequest {
+                content: "receipt path should be non-blocking".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("receipt".to_string()),
+                project_id: Some("project-async".to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })),
+        )
+        .await
+        .expect("receipt timeout")
+        .expect("receipt response")
+        .0;
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        let operation_id = response.operation_id.clone().expect("operation id");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "embedder must not be called before the receipt is returned"
+        );
+
+        let db = server.open_db().expect("open db");
+        let op_state: String = db
+            .conn()
+            .query_row(
+                "SELECT op_state FROM pending_messages WHERE id = ?1",
+                [&operation_id],
+                |row| row.get(0),
+            )
+            .expect("read queued op_state");
+        assert_eq!(op_state, "queued");
+
+        gate.notify_one();
+        let completed = server
+            .wait_for_operation_completion(&operation_id)
+            .await
+            .expect("ingest completion");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
+        assert!(!completed.drawer_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_async_ingest_queue_payload_is_scrubbed() {
+        let config_home = tempfile::tempdir().expect("config tempdir");
+        let config_db_path = config_home.path().join("palace.db");
+        let _config_guard = ConfigOverrideGuard::install(&format!(
+            r#"
+db_path = "{}"
+
+[privacy]
+enabled = true
+"#,
+            config_db_path.display()
+        ));
+
+        let (_tempdir, db_path, server) = setup_server();
+        let raw_secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCD";
+        let raw_content = format!("queued content {raw_secret}");
+        let raw_replace_text = format!("replace target {raw_secret}");
+        let expected_content = ConfigHandle::scrub_content(&raw_content);
+        let expected_replace_text = ConfigHandle::scrub_content(&raw_replace_text);
+
+        insert_drawer(
+            &db_path,
+            "drawer_async_scrub_replace_target",
+            &expected_replace_text,
+            "mcp",
+            Some("scrub"),
+            "/tmp/mcp-async-scrub.md",
+            1,
+        );
+
+        let request = IngestRequest {
+            content: raw_content,
+            wing: "mcp".to_string(),
+            room: Some("scrub".to_string()),
+            replace_text: Some(raw_replace_text),
+            dry_run: Some(false),
+            ..IngestRequest::default()
+        };
+
+        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let db = server.open_db().expect("open db");
+        let project_id = server
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await
+            .expect("resolve project");
+        let prepared = server
+            .prepare_async_ingest_operation(
+                &request,
+                config.as_ref(),
+                compiled_privacy.as_ref(),
+                &db,
+                project_id,
+            )
+            .expect("prepare async ingest");
+        let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
+        let decoded: PreparedIngestOperation =
+            serde_json::from_str(&payload).expect("decode prepared ingest payload");
+
+        assert_eq!(decoded.request.content, expected_content);
+        assert_eq!(
+            decoded.request.replace_text.as_deref(),
+            Some(expected_replace_text.as_str())
+        );
+        assert_eq!(decoded.scrubbed_content, expected_content);
+        assert_eq!(decoded.request.content, decoded.scrubbed_content);
+        assert!(
+            !payload.contains(raw_secret),
+            "raw secret leaked into payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_operation_status_tracks_reclaim_and_completion() {
+        let db_path = PathBuf::from("/tmp/mempal-async-status.db");
+        Database::open(&db_path).expect("open db");
+
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.4, 0.5, 0.6],
+            }),
+        );
+        let db = server.open_db().expect("open db");
+        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let request = IngestRequest {
+            content: "status tool async ingest".to_string(),
+            wing: "mcp".to_string(),
+            room: Some("status".to_string()),
+            project_id: Some("project-async".to_string()),
+            dry_run: Some(false),
+            ..IngestRequest::default()
+        };
+        let project_id = server
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await
+            .expect("resolve project");
+        let prepared = server
+            .prepare_async_ingest_operation(
+                &request,
+                config.as_ref(),
+                compiled_privacy.as_ref(),
+                &db,
+                project_id,
+            )
+            .expect("prepare async ingest");
+        let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, &payload)
+            .expect("enqueue async ingest");
+
+        let queued = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("queued status");
+        assert_eq!(queued.state, Some(IngestOperationState::Queued));
+        assert!(queued.drawer_id.is_empty());
+
+        let claim = queue
+            .claim_next_by_kind("worker-a", 60, INGEST_ASYNC_KIND)
+            .expect("claim queued op")
+            .expect("claimed queued op");
+        db.conn()
+            .execute(
+                "UPDATE pending_messages SET claimed_at = ?2, heartbeat_at = ?2 WHERE id = ?1",
+                params![claim.id, 1_i64],
+            )
+            .expect("stale heartbeat");
+        assert_eq!(queue.reclaim_stale(60).expect("reclaim stale"), 1);
+
+        let reclaimed = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("reclaimed status");
+        assert_eq!(reclaimed.state, Some(IngestOperationState::Queued));
+
+        let reclaimed_claim = queue
+            .claim_next_by_kind("worker-b", 60, INGEST_ASYNC_KIND)
+            .expect("reclaim claim")
+            .expect("reclaimed queued op");
+        server
+            .process_ingest_claim(&queue, "worker-b", reclaimed_claim)
+            .await
+            .expect("process reclaimed op");
+
+        let completed = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("completed status");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
+        assert!(!completed.drawer_id.is_empty());
+
+        let final_status = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("final status");
+        assert_eq!(final_status.state, Some(IngestOperationState::Completed));
+        assert_eq!(final_status.drawer_id, completed.drawer_id);
+    }
+
+    #[tokio::test]
     async fn test_mcp_ingest_response_exposes_lock_wait() {
         let (_tempdir, _db_path, server) = setup_server();
 
         let response = server
-            .mempal_ingest(Parameters(IngestRequest {
-                content: "same content for lock contention".to_string(),
-                wing: "mempal".to_string(),
-                room: Some("review".to_string()),
-                source: None,
-                source_type: None,
-                confidence: None,
-                importance: None,
-                dry_run: None,
-                diary_rollup: None,
-                supersedes: None,
-                replace_text: None,
-                valid_from: None,
-                valid_until: None,
-                memory_kind: None,
-                domain: None,
-                field: None,
-                is_pinned: None,
-                provenance: None,
-                statement: None,
-                tier: None,
-                status: None,
-                supporting_refs: None,
-                counterexample_refs: None,
-                teaching_refs: None,
-                verification_refs: None,
-                scope_constraints: None,
-                trigger_hints: None,
-                anchor_kind: None,
-                anchor_id: None,
-                parent_anchor_id: None,
-                cwd: None,
-                project_id: None,
-            }))
+            .ingest_json_for_test(
+                serde_json::to_value(IngestRequest {
+                    content: "same content for lock contention".to_string(),
+                    wing: "mempal".to_string(),
+                    room: Some("review".to_string()),
+                    source: None,
+                    source_type: None,
+                    confidence: None,
+                    importance: None,
+                    dry_run: None,
+                    diary_rollup: None,
+                    supersedes: None,
+                    replace_text: None,
+                    valid_from: None,
+                    valid_until: None,
+                    memory_kind: None,
+                    domain: None,
+                    field: None,
+                    is_pinned: None,
+                    provenance: None,
+                    statement: None,
+                    tier: None,
+                    status: None,
+                    supporting_refs: None,
+                    counterexample_refs: None,
+                    teaching_refs: None,
+                    verification_refs: None,
+                    scope_constraints: None,
+                    trigger_hints: None,
+                    anchor_kind: None,
+                    anchor_id: None,
+                    parent_anchor_id: None,
+                    cwd: None,
+                    project_id: None,
+                })
+                .expect("serialize ingest request"),
+            )
             .await
-            .expect("ingest should succeed")
-            .0;
+            .expect("ingest should succeed");
 
         assert!(
             response.lock_wait_ms.is_some(),

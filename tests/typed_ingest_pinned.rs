@@ -155,20 +155,22 @@ async fn test_typed_ingest_preserves_kind() {
     let server = env.server();
 
     let response = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "Prefer CLI dashboards over web dashboards.".to_string(),
-            wing: "profile".to_string(),
-            room: Some("facts".to_string()),
-            source: Some("typed-test".to_string()),
-            memory_kind: Some("profile_fact".to_string()),
-            domain: Some("user".to_string()),
-            field: Some("preferences".to_string()),
-            is_pinned: Some(true),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "Prefer CLI dashboards over web dashboards.".to_string(),
+                wing: "profile".to_string(),
+                room: Some("facts".to_string()),
+                source: Some("typed-test".to_string()),
+                memory_kind: Some("profile_fact".to_string()),
+                domain: Some("user".to_string()),
+                field: Some("preferences".to_string()),
+                is_pinned: Some(true),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("typed ingest")
-        .0;
+        .expect("typed ingest");
 
     let db = env.db();
     let drawer = db
@@ -244,29 +246,33 @@ async fn test_supersedes_chain() {
     let env = TestEnv::new();
     let server = env.server();
     let old = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "Old canonical fact.".to_string(),
-            wing: "profile".to_string(),
-            room: Some("facts".to_string()),
-            source: Some("typed-test-old".to_string()),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "Old canonical fact.".to_string(),
+                wing: "profile".to_string(),
+                room: Some("facts".to_string()),
+                source: Some("typed-test-old".to_string()),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("old ingest")
-        .0;
+        .expect("old ingest");
 
     let new = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "New canonical fact.".to_string(),
-            wing: "profile".to_string(),
-            room: Some("facts".to_string()),
-            source: Some("typed-test-new".to_string()),
-            supersedes: Some(old.drawer_id.clone()),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "New canonical fact.".to_string(),
+                wing: "profile".to_string(),
+                room: Some("facts".to_string()),
+                source: Some("typed-test-new".to_string()),
+                supersedes: Some(old.drawer_id.clone()),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("new ingest")
-        .0;
+        .expect("new ingest");
 
     let db = env.db();
     let new_drawer = db
@@ -295,16 +301,18 @@ async fn test_default_ingest_unchanged() {
     let server = env.server();
 
     let response = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "Plain evidence still uses old defaults.".to_string(),
-            wing: "project".to_string(),
-            room: Some("notes".to_string()),
-            source: Some("typed-test-default".to_string()),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "Plain evidence still uses old defaults.".to_string(),
+                wing: "project".to_string(),
+                room: Some("notes".to_string()),
+                source: Some("typed-test-default".to_string()),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("default ingest")
-        .0;
+        .expect("default ingest");
 
     let db = env.db();
     let drawer = db

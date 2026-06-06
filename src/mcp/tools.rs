@@ -1572,7 +1572,7 @@ pub struct PinnedFactDto {
     pub supersedes: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct IngestRequest {
     pub content: String,
     pub wing: String,
@@ -1633,6 +1633,11 @@ pub struct IngestRequest {
     pub anchor_id: Option<String>,
     pub parent_anchor_id: Option<String>,
     pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct OperationStatusRequest {
+    pub operation_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -1732,18 +1737,72 @@ pub struct LeaseResponse {
     pub system_warnings: Vec<SystemWarning>,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestOperationState {
+    Queued,
+    Running,
+    Completed,
+    Rejected,
+    Failed,
+}
+
+impl IngestOperationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Rejected | Self::Failed)
+    }
+}
+
+impl std::str::FromStr for IngestOperationState {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "rejected" => Ok(Self::Rejected),
+            "failed" => Ok(Self::Failed),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct IngestResponse {
-    /// ID of the first (or only) drawer created. For backward compatibility,
-    /// callers that only read `drawer_id` continue to work unchanged.
+    /// Operation receipt/result ID. Present for queued and finalized
+    /// non-dry-run ingests; omitted for dry-run previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// RFC3339 timestamp when the ingest was accepted into the queue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_at: Option<String>,
+    /// Current operation state. Present for queued and finalized non-dry-run
+    /// ingests; omitted for dry-run previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<IngestOperationState>,
+    /// ID of the first (or only) drawer created once the ingest completes.
+    /// Empty while queued/running and for rejection/failure outcomes without
+    /// stored drawers.
     pub drawer_id: String,
     /// All drawer IDs created by this ingest (one per chunk). When content
     /// fits in a single chunk, this contains exactly one element matching
-    /// `drawer_id`. Empty when `dropped` is true.
+    /// `drawer_id`. Empty while queued/running and when `dropped` is true.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drawer_ids: Vec<String>,
     /// Number of chunks the content was split into. Always >= 1 for
-    /// successful ingests; 0 when `dropped` is true.
+    /// successful ingests; 0 while queued/running, during dry-run previews,
+    /// and when `dropped` is true.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub chunk_count: usize,
     #[serde(default)]
@@ -1763,6 +1822,10 @@ pub struct IngestResponse {
     pub lock_wait_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_drawer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fact_check_warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1773,7 +1836,7 @@ fn is_zero(v: &usize) -> bool {
     *v == 0
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct DuplicateWarning {
     pub similar_drawer_id: String,
     pub similarity: f32,

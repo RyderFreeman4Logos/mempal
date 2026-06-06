@@ -249,7 +249,7 @@ async fn ingest_with_config(db_path: PathBuf, config: Config) -> Result<serde_js
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_ingest_blocks_but_not_rejected_when_block_writes_false() {
+async fn test_ingest_returns_receipt_when_block_writes_false() {
     let _guard = test_guard().await;
     let (addr, handle) = start_mock(0).await.expect("start embed mock");
     handle.pause();
@@ -269,19 +269,34 @@ async fn test_ingest_blocks_but_not_rejected_when_block_writes_false() {
     status.record_failure(&"synthetic failure 1");
     status.record_failure(&"synthetic failure 2");
 
-    let task = tokio::spawn(ingest_with_config(env.db_path.clone(), config));
-    tokio::task::yield_now().await;
-    assert!(
-        !task.is_finished(),
-        "ingest should block while embedder is paused"
+    let payload = tokio::time::timeout(
+        Duration::from_secs(2),
+        ingest_with_config(env.db_path.clone(), config.clone()),
+    )
+    .await
+    .expect("receipt timeout")
+    .expect("ingest succeeds");
+    assert!(payload.get("operation_id").is_some());
+    assert_eq!(
+        payload.get("state").and_then(|value| value.as_str()),
+        Some("queued")
     );
 
     handle.resume();
-    let payload = task
+    let operation_id = payload
+        .get("operation_id")
+        .and_then(|value| value.as_str())
+        .expect("operation id");
+    let status_server = MempalMcpServer::new(env.db_path.clone(), config);
+    let completed = status_server
+        .wait_for_operation_completion(operation_id)
         .await
-        .expect("join ingest task")
-        .expect("ingest succeeds");
-    assert!(payload.get("drawer_id").is_some());
+        .expect("ingest completion");
+    assert_eq!(
+        completed.state,
+        Some(mempal::mcp::IngestOperationState::Completed)
+    );
+    assert!(!completed.drawer_id.is_empty());
 
     handle.shutdown().await;
 }
