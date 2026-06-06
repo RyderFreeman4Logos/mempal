@@ -16,7 +16,6 @@ use mempal::core::db::{CURRENT_FORK_EXT_VERSION, Database};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::ingest::gating::{IngestCandidate, evaluate_tier1};
 use mempal::mcp::{IngestRequest, MempalMcpServer};
-use rmcp::handler::server::wrapper::Parameters;
 #[cfg(feature = "integration")]
 use rmcp::{model::CallToolRequestParams, serve_client};
 use tempfile::TempDir;
@@ -266,15 +265,17 @@ enabled = false"#
 
 async fn ingest(server: &MempalMcpServer, content: &str) -> String {
     let response = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: content.to_string(),
-            wing: "mempal".to_string(),
-            room: Some("config-hot-reload".to_string()),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: content.to_string(),
+                wing: "mempal".to_string(),
+                room: Some("config-hot-reload".to_string()),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("ingest should succeed")
-        .0;
+        .expect("ingest should succeed");
     response.drawer_id
 }
 
@@ -360,15 +361,17 @@ async fn test_ingest_gating_hot_reload_applies_without_server_restart() {
     wait_for_version_change(&previous);
 
     let response = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "tiny".to_string(),
-            wing: "mempal".to_string(),
-            room: Some("config-hot-reload".to_string()),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "tiny".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("config-hot-reload".to_string()),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("ingest should return structured reject")
-        .0;
+        .expect("ingest should return structured reject");
 
     let decision = response.gating_decision.expect("tier-1 decision");
     assert_eq!(decision.decision, "rejected");

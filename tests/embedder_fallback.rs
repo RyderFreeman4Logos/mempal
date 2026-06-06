@@ -6,7 +6,6 @@ use std::sync::{Arc, OnceLock};
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::embed::global_embed_status;
 use mempal::mcp::{IngestRequest, MempalMcpServer};
-use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
 async fn test_guard() -> tokio::sync::OwnedMutexGuard<()> {
@@ -68,16 +67,18 @@ async fn test_embedder_fallback_to_model2vec_when_lan_unreachable() {
 
     let server = MempalMcpServer::new(db_path, config);
     let response = server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "fallback path should still embed".to_string(),
-            wing: "test".to_string(),
-            room: Some("fallback".to_string()),
-            dry_run: Some(false),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "fallback path should still embed".to_string(),
+                wing: "test".to_string(),
+                room: Some("fallback".to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-        .expect("fallback ingest should succeed")
-        .0;
+        .expect("fallback ingest should succeed");
 
     assert!(
         response

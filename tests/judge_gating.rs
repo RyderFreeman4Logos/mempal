@@ -27,7 +27,6 @@ use mempal::ingest::gating::{
 use mempal::llm::client::LlmClient;
 use mempal::llm::status::LlmStatus;
 use mempal::mcp::{IngestRequest, MempalMcpServer};
-use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -329,16 +328,18 @@ fn run_mempal(home: &Path, args: &[&str]) -> std::process::Output {
 
 async fn ingest_mcp(server: &MempalMcpServer, content: &str) -> mempal::mcp::IngestResponse {
     server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: content.to_string(),
-            wing: "code-memory".to_string(),
-            room: Some("gating".to_string()),
-            dry_run: Some(false),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: content.to_string(),
+                wing: "code-memory".to_string(),
+                room: Some("gating".to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
         .expect("mcp ingest")
-        .0
 }
 
 fn gating_rows(db: &Database) -> Vec<GatingAuditRow> {

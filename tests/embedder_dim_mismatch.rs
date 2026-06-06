@@ -6,7 +6,6 @@ use mempal::core::types::{Drawer, SourceType};
 use mempal::embed::global_embed_status;
 use mempal::mcp::{IngestRequest, MempalMcpServer};
 use mockito::{Matcher, Server};
-use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
 async fn test_guard() -> tokio::sync::OwnedMutexGuard<()> {
@@ -68,21 +67,25 @@ request_timeout_secs = 5
     global_embed_status().reset_for_tests();
 
     let service = MempalMcpServer::new(db_path, config);
-    let error = match service
-        .mempal_ingest(Parameters(IngestRequest {
-            content: "new drawer".to_string(),
-            wing: "test".to_string(),
-            room: Some("room".to_string()),
-            dry_run: Some(false),
-            ..IngestRequest::default()
-        }))
+    let response = service
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: "new drawer".to_string(),
+                wing: "test".to_string(),
+                room: Some("room".to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
-    {
-        Ok(_) => panic!("ingest should fail on dim mismatch"),
-        Err(error) => error,
-    };
+        .expect("ingest should complete");
 
-    let rendered = format!("{error:?}");
+    assert_eq!(
+        response.state,
+        Some(mempal::mcp::IngestOperationState::Failed)
+    );
+    let rendered = format!("{response:?}");
     assert!(rendered.contains("dimension mismatch"));
     assert!(rendered.contains("mempal reindex"));
     global_embed_status().reset_for_tests();

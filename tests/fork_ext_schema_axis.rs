@@ -192,6 +192,94 @@ fn test_fork_ext_v17_to_v18_adds_xurl_vector_metadata_idempotently() {
 }
 
 #[test]
+fn test_new_database_has_async_ingest_columns_after_v19() {
+    let (_tmp, _db_path, db) = new_test_db();
+
+    let pending_columns = table_columns(db.conn(), "pending_messages");
+    assert!(has_column(&pending_columns, "result_drawer_id", "TEXT"));
+    assert!(has_column(&pending_columns, "op_state", "TEXT"));
+    assert!(has_column(&pending_columns, "rejected_reason", "TEXT"));
+    assert!(has_column(&pending_columns, "failure_detail", "TEXT"));
+    assert!(has_column(&pending_columns, "result_json", "TEXT"));
+
+    let completion_columns = table_columns(db.conn(), "pending_message_completions");
+    assert!(has_column(&completion_columns, "result_drawer_id", "TEXT"));
+    assert!(has_column(&completion_columns, "op_state", "TEXT"));
+    assert!(has_column(&completion_columns, "rejected_reason", "TEXT"));
+    assert!(has_column(&completion_columns, "failure_detail", "TEXT"));
+    assert!(has_column(&completion_columns, "result_json", "TEXT"));
+
+    let version = read_fork_ext_version(db.conn()).expect("read fork-ext version");
+    assert_eq!(version, CURRENT_FORK_EXT_VERSION);
+}
+
+#[test]
+fn test_fork_ext_v18_to_v19_adds_async_ingest_columns_idempotently() {
+    let conn = Connection::open_in_memory().expect("open sqlite connection");
+    let schema_version = current_schema_version();
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE fork_ext_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO fork_ext_meta (key, value) VALUES ('fork_ext_version', '18');
+
+        CREATE TABLE pending_messages (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            claim_token TEXT,
+            claimed_at INTEGER,
+            heartbeat_at INTEGER,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            retry_backoff_ms INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'claimed', 'done', 'failed')),
+            payload TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_error TEXT
+        );
+
+        CREATE TABLE pending_message_completions (
+            message_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            claimed_at INTEGER,
+            completed_at INTEGER NOT NULL,
+            processing_ms INTEGER
+        );
+
+        PRAGMA user_version = {schema_version};
+        "#
+    ))
+    .expect("create v18 schema");
+
+    apply_fork_ext_migrations_to(&conn, 19).expect("first v19 migration");
+    apply_fork_ext_migrations_to(&conn, 19).expect("second v19 migration");
+
+    let pending_columns = table_columns(&conn, "pending_messages");
+    assert!(has_column(&pending_columns, "result_drawer_id", "TEXT"));
+    assert!(has_column(&pending_columns, "op_state", "TEXT"));
+    assert!(has_column(&pending_columns, "rejected_reason", "TEXT"));
+    assert!(has_column(&pending_columns, "failure_detail", "TEXT"));
+    assert!(has_column(&pending_columns, "result_json", "TEXT"));
+
+    let completion_columns = table_columns(&conn, "pending_message_completions");
+    assert!(has_column(&completion_columns, "result_drawer_id", "TEXT"));
+    assert!(has_column(&completion_columns, "op_state", "TEXT"));
+    assert!(has_column(&completion_columns, "rejected_reason", "TEXT"));
+    assert!(has_column(&completion_columns, "failure_detail", "TEXT"));
+    assert!(has_column(&completion_columns, "result_json", "TEXT"));
+
+    assert_eq!(read_fork_ext_version(&conn).expect("read version"), 19);
+    let user_version = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        .expect("read user_version");
+    assert_eq!(user_version, schema_version);
+}
+
+#[test]
 fn test_fork_ext_meta_table_exists_after_init() {
     let (_tmp, _db_path, db) = new_test_db();
 

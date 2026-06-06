@@ -14,7 +14,6 @@ use mempal::core::db::{
 use mempal::core::types::{Drawer, SourceType, Triple};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::mcp::{IngestRequest, IngestResponse, MempalMcpServer};
-use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::{Connection, OptionalExtension, params};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -230,17 +229,19 @@ async fn ingest(
     project_id: Option<&str>,
 ) -> IngestResponse {
     server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: content.to_string(),
-            wing: wing.to_string(),
-            room: Some(room.to_string()),
-            project_id: project_id.map(ToOwned::to_owned),
-            dry_run: Some(false),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: content.to_string(),
+                wing: wing.to_string(),
+                room: Some(room.to_string()),
+                project_id: project_id.map(ToOwned::to_owned),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
         .expect("ingest response")
-        .0
 }
 
 fn novelty_rows(db_path: &Path) -> Vec<NoveltyAuditRow> {

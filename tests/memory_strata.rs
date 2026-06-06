@@ -112,16 +112,18 @@ async fn ingest(
     importance: i32,
 ) -> mempal::mcp::IngestResponse {
     server
-        .mempal_ingest(Parameters(IngestRequest {
-            content: content.to_string(),
-            wing: wing.to_string(),
-            room: Some(room.to_string()),
-            importance: Some(importance),
-            ..IngestRequest::default()
-        }))
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: content.to_string(),
+                wing: wing.to_string(),
+                room: Some(room.to_string()),
+                importance: Some(importance),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
         .await
         .expect("ingest")
-        .0
 }
 
 #[tokio::test]
