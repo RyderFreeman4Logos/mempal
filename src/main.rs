@@ -3564,13 +3564,13 @@ async fn ingest_stdin_command(
             Some(IngestOperationState::Completed) => {
                 append_ingest_stdin_audit_log(db, wing, false, &record, &wait_stats)
                     .context("failed to append ingest audit log")?;
-                print_operation_response(&response)?;
+                print_stdin_ingest_output(options.json, false, &wait_stats)?;
                 return Ok(());
             }
             Some(IngestOperationState::Rejected) => {
                 append_ingest_stdin_audit_log(db, wing, false, &record, &wait_stats)
                     .context("failed to append ingest audit log")?;
-                print_operation_response(&response)?;
+                print_stdin_ingest_output(options.json, false, &wait_stats)?;
                 bail!(
                     "ingest operation {} was rejected: {}",
                     response.operation_id.as_deref().unwrap_or(""),
@@ -3578,7 +3578,7 @@ async fn ingest_stdin_command(
                 );
             }
             Some(IngestOperationState::Failed) => {
-                print_operation_response(&response)?;
+                print_stdin_ingest_output(options.json, false, &wait_stats)?;
                 bail!(
                     "ingest operation {} failed: {}",
                     response.operation_id.as_deref().unwrap_or(""),

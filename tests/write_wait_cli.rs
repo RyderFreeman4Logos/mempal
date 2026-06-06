@@ -1,5 +1,6 @@
 mod common;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -254,14 +255,30 @@ fn start_worker(server: MempalMcpServer) -> tokio::task::JoinHandle<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_ingest_wait_returns_drawer_id() {
-    let home = setup_home();
+async fn test_ingest_wait_matches_non_wait_plain_output() {
+    let wait_home = setup_home();
+    let direct_home = setup_home();
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
-    let _config_path = write_config(home.path(), &format!("http://{addr}/v1"));
+    let _wait_config = write_config(wait_home.path(), &format!("http://{addr}/v1"));
+    let _direct_config = write_config(direct_home.path(), &format!("http://{addr}/v1"));
     let wait_timeout = u64::MAX.to_string();
+    let payload = br#"{"content":"cli wait content"}"#;
 
-    let output = run_cli_with_stdin(
-        home.path(),
+    let direct_output = run_cli_with_stdin(
+        direct_home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "cli-wing",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+        ],
+        payload,
+    );
+    let wait_output = run_cli_with_stdin(
+        wait_home.path(),
         &[
             "ingest",
             "--stdin",
@@ -274,13 +291,133 @@ async fn test_ingest_wait_returns_drawer_id() {
             "--wait-timeout-secs",
             wait_timeout.as_str(),
         ],
-        br#"{"content":"cli wait content"}"#,
+        payload,
     );
     handle.shutdown().await;
 
-    assert_completed_status(&output);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("drawer_id="), "{stdout}");
+    assert!(
+        direct_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&direct_output.stdout),
+        String::from_utf8_lossy(&direct_output.stderr)
+    );
+    assert!(
+        wait_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&wait_output.stdout),
+        String::from_utf8_lossy(&wait_output.stderr)
+    );
+
+    let direct_stdout = String::from_utf8_lossy(&direct_output.stdout);
+    let wait_stdout = String::from_utf8_lossy(&wait_output.stdout);
+    assert_eq!(
+        wait_stdout, direct_stdout,
+        "wait stdout must match direct stdout"
+    );
+    assert!(wait_stdout.contains("dry_run=false"), "{wait_stdout}");
+    assert!(wait_stdout.contains("files=1"), "{wait_stdout}");
+    assert!(wait_stdout.contains("chunks=1"), "{wait_stdout}");
+    assert!(wait_stdout.contains("skipped=0"), "{wait_stdout}");
+    assert!(wait_stdout.contains("dropped_by_gate=0"), "{wait_stdout}");
+    assert!(
+        wait_stdout.contains("superseded_drawer_id="),
+        "{wait_stdout}"
+    );
+    assert!(
+        !wait_stdout
+            .lines()
+            .any(|line| line.starts_with("drawer_id=")),
+        "{wait_stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_wait_json_matches_non_wait_json_output() {
+    let wait_home = setup_home();
+    let direct_home = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    let _wait_config = write_config(wait_home.path(), &format!("http://{addr}/v1"));
+    let _direct_config = write_config(direct_home.path(), &format!("http://{addr}/v1"));
+    let wait_timeout = u64::MAX.to_string();
+    let payload = br#"{"content":"cli wait json content"}"#;
+
+    let direct_output = run_cli_with_stdin(
+        direct_home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "cli-wing",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--json",
+        ],
+        payload,
+    );
+    let wait_output = run_cli_with_stdin(
+        wait_home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "cli-wing",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            wait_timeout.as_str(),
+            "--json",
+        ],
+        payload,
+    );
+    handle.shutdown().await;
+
+    assert!(
+        direct_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&direct_output.stdout),
+        String::from_utf8_lossy(&direct_output.stderr)
+    );
+    assert!(
+        wait_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&wait_output.stdout),
+        String::from_utf8_lossy(&wait_output.stderr)
+    );
+
+    let direct_json: Value =
+        serde_json::from_slice(&direct_output.stdout).expect("parse direct ingest JSON");
+    let wait_json: Value = serde_json::from_slice(&wait_output.stdout).expect("parse wait JSON");
+    let direct_keys: BTreeSet<String> = direct_json
+        .as_object()
+        .expect("direct JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    let wait_keys: BTreeSet<String> = wait_json
+        .as_object()
+        .expect("wait JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        wait_keys, direct_keys,
+        "wait JSON keys must match direct JSON keys"
+    );
+    assert_eq!(
+        wait_json["stats"], direct_json["stats"],
+        "wait stats must match direct stats"
+    );
+    let drawer_ids = wait_json["drawer_ids"]
+        .as_array()
+        .expect("drawer_ids array");
+    assert!(!drawer_ids.is_empty(), "drawer_ids must be non-empty");
+    assert!(
+        drawer_ids.iter().all(|value| value.as_str().is_some()),
+        "drawer_ids must contain strings"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -326,17 +463,34 @@ async fn test_ingest_wait_preserves_stdin_semantics_and_audit() {
     );
     handle.shutdown().await;
 
-    assert_completed_status(&output);
+    assert!(
+        output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("drawer_id="), "{stdout}");
+    assert!(stdout.contains("dry_run=false"), "{stdout}");
+    assert!(stdout.contains("files=1"), "{stdout}");
+    assert!(stdout.contains("chunks=1"), "{stdout}");
+    assert!(stdout.contains("skipped=0"), "{stdout}");
+    assert!(stdout.contains("dropped_by_gate=0"), "{stdout}");
+    assert!(stdout.contains("superseded_drawer_id="), "{stdout}");
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("drawer_id=")),
+        "{stdout}"
+    );
 
     let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
-    let drawer_id = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("drawer_id="))
-        .expect("drawer id line");
+    let drawer_id = db
+        .find_active_drawers_by_content("hi", "cli-wing", Some("audit-room"), None)
+        .expect("find drawer by content")
+        .into_iter()
+        .next()
+        .expect("drawer entry")
+        .id;
     let drawer = db
-        .get_drawer(drawer_id)
+        .get_drawer(&drawer_id)
         .expect("get drawer")
         .expect("drawer exists");
     assert_eq!(drawer.source_file.as_deref(), Some("csa://session/99"));
