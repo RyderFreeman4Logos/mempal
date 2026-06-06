@@ -1061,6 +1061,8 @@ enum DaemonSubcommand {
     Stop,
     /// Stop and restart the daemon.
     Restart,
+    /// Reap duplicate daemon processes while keeping one singleton alive.
+    Reap,
     /// Show daemon status, PID, and queue stats.
     Status,
 }
@@ -2118,13 +2120,17 @@ fn run() -> Result<()> {
         } => {
             let cfg_path = default_config_path();
             return match command.as_ref() {
-                None => mempal::daemon::run_command(cfg_path, *foreground),
+                None => run_daemon_start(cfg_path, *foreground),
                 Some(DaemonSubcommand::Start { foreground: fg }) => run_daemon_start(cfg_path, *fg),
                 Some(DaemonSubcommand::Stop) => {
                     let db_path = daemon_config_db_path(&cfg_path)?;
                     run_daemon_stop(&db_path)
                 }
                 Some(DaemonSubcommand::Restart) => run_daemon_restart(cfg_path),
+                Some(DaemonSubcommand::Reap) => {
+                    let db_path = daemon_config_db_path(&cfg_path)?;
+                    run_daemon_reap(&db_path)
+                }
                 Some(DaemonSubcommand::Status) => {
                     let db_path = daemon_config_db_path(&cfg_path)?;
                     run_daemon_status(&db_path)
@@ -10108,8 +10114,219 @@ fn daemon_home_from_db_path(db_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+#[cfg(unix)]
+const DAEMON_TERM_CLEANUP_BUFFER: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(unix)]
+const DAEMON_TERM_GRACE: std::time::Duration =
+    mempal::daemon::DAEMON_DRAIN_BUDGET.saturating_add(DAEMON_TERM_CLEANUP_BUFFER);
+#[cfg(unix)]
+const DAEMON_TERM_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[cfg(unix)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DaemonTerminateOutcome {
+    signaled: Vec<i32>,
+    killed: Vec<i32>,
+}
+
+#[cfg(unix)]
+trait DaemonProcessOps {
+    fn signal(&mut self, pid: i32, signal: i32) -> Result<()>;
+    fn is_running(&mut self, pid: i32) -> Result<bool>;
+    fn sleep(&mut self, duration: std::time::Duration);
+}
+
+#[cfg(unix)]
+struct RealDaemonProcessOps;
+
+#[cfg(unix)]
+impl DaemonProcessOps for RealDaemonProcessOps {
+    fn signal(&mut self, pid: i32, signal: i32) -> Result<()> {
+        // SAFETY: kill(2) sends a signal to a specific PID selected by exact
+        // daemon argv matching. ESRCH means the process exited after planning.
+        let rc = unsafe { libc::kill(pid, signal) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(error).with_context(|| format!("failed to signal daemon pid {pid}"))
+    }
+
+    fn is_running(&mut self, pid: i32) -> Result<bool> {
+        process_is_running(pid)
+    }
+
+    fn sleep(&mut self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+#[cfg(unix)]
+fn collect_daemon_candidates(db_path: &Path) -> Result<(Vec<i32>, Option<i32>)> {
+    collect_daemon_candidates_with_scan(db_path, mempal::daemon_singleton::enumerate_daemon_pids)
+}
+
+#[cfg(unix)]
+fn collect_daemon_candidates_with_scan(
+    db_path: &Path,
+    enumerate_daemon_pids: impl Fn(&str, &Path) -> Vec<i32>,
+) -> Result<(Vec<i32>, Option<i32>)> {
+    let binary =
+        mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
+    let mut candidates = enumerate_daemon_pids(&binary, db_path);
+
+    let pidfile_pid = match read_daemon_pid(db_path)? {
+        Some(pid) if process_is_running(pid)? => {
+            if !candidates.contains(&pid) {
+                candidates.push(pid);
+            }
+            Some(pid)
+        }
+        _ => None,
+    };
+
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    Ok((candidates, pidfile_pid))
+}
+
+#[cfg(unix)]
+fn terminate_daemon_targets_with_ops(
+    targets: &[i32],
+    ops: &mut impl DaemonProcessOps,
+    grace: std::time::Duration,
+    poll: std::time::Duration,
+) -> Result<DaemonTerminateOutcome> {
+    let mut outcome = DaemonTerminateOutcome::default();
+    let mut remaining = Vec::new();
+    let mut errors = Vec::new();
+
+    for pid in targets {
+        if let Err(error) = ops.signal(*pid, libc::SIGTERM) {
+            errors.push(format!("SIGTERM pid {pid} failed: {error}"));
+        } else {
+            outcome.signaled.push(*pid);
+        }
+        remaining.push(*pid);
+    }
+
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        let mut live = Vec::new();
+        for pid in remaining {
+            match ops.is_running(pid) {
+                Ok(true) => live.push(pid),
+                Ok(false) => {}
+                Err(error) => {
+                    errors.push(format!("SIGTERM status pid {pid} failed: {error}"));
+                }
+            }
+        }
+        if live.is_empty() {
+            if errors.is_empty() {
+                return Ok(outcome);
+            }
+            return Err(anyhow::anyhow!(
+                "daemon termination encountered errors: {}",
+                errors.join("; "),
+            ));
+        }
+        remaining = live;
+        ops.sleep(poll);
+    }
+
+    for pid in remaining {
+        match ops.is_running(pid) {
+            Ok(true) => {
+                if let Err(error) = ops.signal(pid, libc::SIGKILL) {
+                    errors.push(format!("SIGKILL pid {pid} failed: {error}"));
+                } else {
+                    outcome.killed.push(pid);
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                errors.push(format!("SIGKILL status pid {pid} failed: {error}"));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(outcome)
+    } else {
+        Err(anyhow::anyhow!(
+            "daemon termination encountered errors: {}",
+            errors.join("; "),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn terminate_daemon_targets(targets: &[i32]) -> Result<DaemonTerminateOutcome> {
+    let mut ops = RealDaemonProcessOps;
+    terminate_daemon_targets_with_ops(targets, &mut ops, DAEMON_TERM_GRACE, DAEMON_TERM_POLL)
+}
+
+#[cfg(unix)]
+fn reap_daemon_orphans(
+    db_path: &Path,
+    verbose: bool,
+) -> Result<mempal::daemon_singleton::DaemonReapPlan> {
+    let (candidates, pidfile_pid) = collect_daemon_candidates(db_path)?;
+    let plan = mempal::daemon_singleton::plan_daemon_reap(&candidates, pidfile_pid);
+
+    if plan.targets.is_empty() {
+        if verbose {
+            match plan.keeper {
+                Some(pid) => println!("daemon reap: keeping pid {pid}; no duplicate daemons found"),
+                None => println!("daemon reap: no live daemon processes found"),
+            }
+        }
+        return Ok(plan);
+    }
+
+    let outcome = terminate_daemon_targets(&plan.targets)?;
+    if verbose {
+        match plan.keeper {
+            Some(pid) => println!("daemon reap: keeping pid {pid}"),
+            None => println!("daemon reap: no keeper elected"),
+        }
+        println!(
+            "daemon reap: SIGTERM sent to {}",
+            format_pid_list(&outcome.signaled)
+        );
+        if !outcome.killed.is_empty() {
+            println!(
+                "daemon reap: SIGKILL sent to {}",
+                format_pid_list(&outcome.killed)
+            );
+        }
+    }
+
+    Ok(plan)
+}
+
+#[cfg(unix)]
+fn format_pid_list(pids: &[i32]) -> String {
+    pids.iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn run_daemon_start(config_path: PathBuf, foreground: bool) -> Result<()> {
     let db_path = daemon_config_db_path(&config_path)?;
+    #[cfg(unix)]
+    {
+        let plan = reap_daemon_orphans(&db_path, false)?;
+        if let Some(pid) = plan.keeper {
+            bail!("daemon already running (pid {pid}); stop with `mempal daemon stop`");
+        }
+    }
     if let Some(pid) = read_daemon_pid(&db_path)? {
         if process_is_running(pid)? {
             bail!("daemon already running (pid {pid}); stop with `mempal daemon stop`");
@@ -10124,24 +10341,8 @@ fn run_daemon_start(config_path: PathBuf, foreground: bool) -> Result<()> {
 
 #[cfg(unix)]
 fn run_daemon_stop(db_path: &Path) -> Result<()> {
-    use std::time::{Duration, Instant};
-
-    // Reap EVERY live `mempal daemon` sibling, not just the pidfile PID (#257).
-    // Orphans (e.g. a race-duplicate that outlived its pidfile) are only
-    // visible through a /proc enumeration of the daemon's own argv.
-    let binary =
-        mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
     let mempal_home = daemon_home_from_db_path(db_path);
-    let mut targets = mempal::daemon_singleton::enumerate_daemon_pids(&binary, &mempal_home);
-
-    // Defensively include the pidfile PID if it is live but escaped the scan
-    // (e.g. a transient /proc read race), so stop never misses it.
-    if let Some(pid) = read_daemon_pid(db_path)?
-        && process_is_running(pid)?
-        && !targets.contains(&pid)
-    {
-        targets.push(pid);
-    }
+    let (targets, _pidfile_pid) = collect_daemon_candidates(db_path)?;
 
     if targets.is_empty() {
         let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
@@ -10149,41 +10350,19 @@ fn run_daemon_stop(db_path: &Path) -> Result<()> {
     }
 
     let reaped = targets.len();
-    for pid in &targets {
-        // SAFETY: kill(2) with SIGTERM only writes the signal number. ESRCH
-        // (the process already exited between enumeration and now) is benign.
-        let rc = unsafe { libc::kill(*pid, libc::SIGTERM) };
-        if rc != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                bail!("failed to send SIGTERM to daemon (pid {pid}): {error}");
-            }
-        }
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut remaining = targets.clone();
-    while Instant::now() < deadline {
-        remaining.retain(|pid| process_is_running(*pid).unwrap_or(false));
-        if remaining.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    if !remaining.is_empty() {
-        let pids = remaining
-            .iter()
-            .map(i32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!("daemon(s) did not exit within 30s: {pids}");
-    }
+    let outcome = terminate_daemon_targets(&targets)?;
 
     let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
     if reaped > 1 {
         println!("daemon stopped ({reaped} processes reaped)");
     } else {
         println!("daemon stopped");
+    }
+    if !outcome.killed.is_empty() {
+        println!(
+            "daemon SIGKILL escalated for {}",
+            format_pid_list(&outcome.killed)
+        );
     }
     Ok(())
 }
@@ -10203,6 +10382,158 @@ fn run_daemon_restart(config_path: PathBuf) -> Result<()> {
     mempal::daemon::run_command(config_path, false)
 }
 
+#[cfg(unix)]
+fn run_daemon_reap(db_path: &Path) -> Result<()> {
+    let mempal_home = daemon_home_from_db_path(db_path);
+    let plan = reap_daemon_orphans(db_path, true)?;
+    if plan.keeper.is_none() {
+        let _ = std::fs::remove_file(mempal_home.join("daemon.pid"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_daemon_reap(_db_path: &Path) -> Result<()> {
+    bail!("daemon reap is only supported on Unix")
+}
+
+#[cfg(all(test, unix))]
+mod daemon_reap_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Write;
+    use std::path::Path;
+
+    #[derive(Default)]
+    struct FakeProcessOps {
+        running: BTreeMap<i32, bool>,
+        signals: Vec<(i32, i32)>,
+        failed_signals: BTreeSet<(i32, i32)>,
+        term_ignored: BTreeSet<i32>,
+    }
+
+    impl DaemonProcessOps for FakeProcessOps {
+        fn signal(&mut self, pid: i32, signal: i32) -> Result<()> {
+            self.signals.push((pid, signal));
+            if self.failed_signals.contains(&(pid, signal)) {
+                return Err(anyhow::anyhow!("simulated signal failure for pid {pid}"));
+            }
+            if signal == libc::SIGKILL
+                || (signal == libc::SIGTERM && !self.term_ignored.contains(&pid))
+            {
+                self.running.insert(pid, false);
+            }
+            Ok(())
+        }
+
+        fn is_running(&mut self, pid: i32) -> Result<bool> {
+            Ok(self.running.get(&pid).copied().unwrap_or(false))
+        }
+
+        fn sleep(&mut self, _duration: std::time::Duration) {}
+    }
+
+    #[cfg(test)]
+    fn write_pid(path: &Path, pid: i32) -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .context("failed to write pidfile")?;
+        writeln!(file, "{pid}").context("failed to write pid")
+    }
+
+    #[test]
+    fn test_collect_daemon_candidates_includes_running_pidfile_when_scan_is_empty() -> Result<()> {
+        let tmp = tempfile::tempdir().context("tempdir")?;
+        let db_path = tmp.path().join("palace.db");
+        let pid_path = tmp.path().join("daemon.pid");
+        let mut child = std::process::Command::new("sleep").args(["120"]).spawn()?;
+        write_pid(&pid_path, child.id() as i32)?;
+
+        let (candidates, pidfile_pid) =
+            collect_daemon_candidates_with_scan(&db_path, |_binary, _db_path| Vec::new())?;
+
+        assert_eq!(candidates, vec![child.id() as i32]);
+        assert_eq!(pidfile_pid, Some(child.id() as i32));
+
+        child.kill()?;
+        child.wait()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_terminate_daemon_targets_aggregates_errors_and_continues() {
+        let mut ops = FakeProcessOps::default();
+        ops.running.insert(11, true);
+        ops.running.insert(22, true);
+        ops.term_ignored.insert(22);
+        ops.failed_signals.insert((11, libc::SIGTERM));
+        ops.failed_signals.insert((22, libc::SIGKILL));
+
+        let error = terminate_daemon_targets_with_ops(
+            &[11, 22],
+            &mut ops,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1),
+        )
+        .expect_err("termination should aggregate signal failures");
+
+        assert_eq!(
+            ops.signals,
+            vec![
+                (11, libc::SIGTERM),
+                (22, libc::SIGTERM),
+                (11, libc::SIGKILL),
+                (22, libc::SIGKILL),
+            ]
+        );
+        assert!(ops.signals.contains(&(22, libc::SIGKILL)));
+        let error = error.to_string();
+        assert!(error.contains("SIGTERM pid 11 failed"));
+        assert!(error.contains("SIGKILL pid 22 failed"));
+    }
+
+    #[test]
+    fn test_terminate_daemon_targets_escalates_sigkill_after_grace() {
+        let mut ops = FakeProcessOps::default();
+        ops.running.insert(42, true);
+        ops.term_ignored.insert(42);
+
+        let outcome = terminate_daemon_targets_with_ops(
+            &[42],
+            &mut ops,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1),
+        )
+        .expect("terminate targets");
+
+        assert_eq!(outcome.signaled, vec![42]);
+        assert_eq!(outcome.killed, vec![42]);
+        assert_eq!(ops.signals, vec![(42, libc::SIGTERM), (42, libc::SIGKILL)]);
+        assert!(!ops.is_running(42).expect("running state"));
+    }
+
+    #[test]
+    fn test_terminate_daemon_targets_does_not_kill_after_sigterm_exit() {
+        let mut ops = FakeProcessOps::default();
+        ops.running.insert(7, true);
+
+        let outcome = terminate_daemon_targets_with_ops(
+            &[7],
+            &mut ops,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+        )
+        .expect("terminate targets");
+
+        assert_eq!(outcome.signaled, vec![7]);
+        assert!(outcome.killed.is_empty());
+        assert_eq!(ops.signals, vec![(7, libc::SIGTERM)]);
+    }
+}
+
 fn run_daemon_status(db_path: &Path) -> Result<()> {
     // Enumerate ALL live `mempal daemon` siblings so status reports the true
     // process count and can warn on duplicates the single pidfile PID hides
@@ -10210,7 +10541,7 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
     let binary =
         mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
     let mempal_home = daemon_home_from_db_path(db_path);
-    let siblings = mempal::daemon_singleton::enumerate_daemon_pids(&binary, &mempal_home);
+    let siblings = mempal::daemon_singleton::enumerate_daemon_pids(&binary, db_path);
 
     match read_daemon_pid(db_path)? {
         None => {
@@ -11359,6 +11690,28 @@ mod tests {
     };
 
     const TEST_TARGET_FINGERPRINT: &str = "test-embedder:8:target";
+
+    #[test]
+    #[cfg(unix)]
+    fn test_daemon_reaper_grace_covers_drain_budget() {
+        // Finding 1 fix: verify that the reaper grace is >= the daemon's drain budget
+        // plus a small cleanup buffer, ensuring we don't SIGKILL a healthy draining daemon.
+        assert_eq!(
+            DAEMON_TERM_GRACE,
+            mempal::daemon::DAEMON_DRAIN_BUDGET.saturating_add(DAEMON_TERM_CLEANUP_BUFFER),
+            "reaper grace must stay coupled to the daemon drain budget plus cleanup buffer"
+        );
+        assert!(
+            DAEMON_TERM_GRACE >= mempal::daemon::DAEMON_DRAIN_BUDGET,
+            "reaper grace ({:?}) must be >= daemon drain budget ({:?})",
+            DAEMON_TERM_GRACE,
+            mempal::daemon::DAEMON_DRAIN_BUDGET
+        );
+        assert!(
+            DAEMON_TERM_GRACE >= mempal::daemon::DAEMON_DRAIN_BUDGET + DAEMON_TERM_CLEANUP_BUFFER,
+            "reaper grace should include a safety buffer over the drain budget"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingEmbedder {

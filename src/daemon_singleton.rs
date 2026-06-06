@@ -11,11 +11,11 @@
 //!      this: two `serve --mcp` ensure-checks could both observe "no live
 //!      daemon" and both daemonize, converging on duplicate orphans.
 //!
-//!   2. **Sibling enumeration** — `daemon status` / `daemon stop` scan
-//!      `/proc/<pid>/cmdline` for every live `<binary> daemon …` invocation, then
-//!      keep only processes that hold this home's `daemon.lock` fd. That home
-//!      filter keeps stop/status isolated when multiple mempal homes run on the
-//!      same host.
+//!   2. **Sibling enumeration** — `daemon status` / `daemon stop` / `daemon reap`
+//!      scan `/proc/<pid>/cmdline` for every live daemon invocation using the
+//!      same database. This is intentionally argv/database-based instead of
+//!      lock-based so a deleted-inode daemon from an older binary that never
+//!      acquired `daemon.lock` can still be found and reaped.
 //!
 //! The `flock` primitive mirrors the proven inline-extern pattern in
 //! `src/ingest/lock.rs` (no libc dep on Unix; Windows no-op fallback). The
@@ -24,6 +24,8 @@
 //! and is released automatically when the process dies — even on `SIGKILL`,
 //! which is precisely how an orphaned daemon's lock frees up for its successor.
 
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,7 @@ use thiserror::Error;
 
 /// Lock file name, written next to `daemon.pid` inside `mempal_home`.
 pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
+const MEMPAL_DB_PATH_ENV: &[u8] = b"MEMPAL_DB_PATH=";
 
 /// Sentinel error meaning a healthy daemon already holds the singleton lock.
 ///
@@ -131,47 +134,93 @@ pub fn parse_proc_cmdline(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Precise predicate: is `argv` a `<binary_name> daemon …` invocation?
+/// Precise predicate: is `argv` a daemon process invocation?
 ///
-/// Matches only when argv[0]'s basename equals `binary_name` AND argv[1] is
-/// exactly `daemon`. This intentionally excludes `mempal serve --mcp`
-/// (argv[1] = `serve`), `mempal status` (argv[1] = `status`), and unrelated
-/// programs such as `claude -p …` (different basename). Pure and unit-testable;
-/// the `/proc` scan in [`enumerate_daemon_pids`] feeds parsed argv through it
-/// before checking the candidate's lock fd.
+/// Matches only argv shapes that can become the long-lived daemon after
+/// `DaemonContext::bootstrap` daemonizes the current process:
+/// `<binary> daemon`, `<binary> daemon --foreground`,
+/// `<binary> daemon start [--foreground]`, and `<binary> daemon restart`.
+/// This intentionally excludes `mempal serve --mcp`, top-level CLI commands,
+/// and daemon management commands that do not call daemon bootstrap.
 pub fn is_daemon_argv<S: AsRef<str>>(argv: &[S], binary_name: &str) -> bool {
     let Some(program) = argv.first() else {
-        return false;
-    };
-    let Some(subcommand) = argv.get(1) else {
         return false;
     };
     let program_base = Path::new(program.as_ref())
         .file_name()
         .and_then(|name| name.to_str());
-    program_base == Some(binary_name) && subcommand.as_ref() == "daemon"
+    if program_base != Some(binary_name) {
+        return false;
+    }
+
+    let Some((subcommand_index, subcommand)) = first_cli_subcommand(argv) else {
+        return false;
+    };
+    if subcommand != "daemon" {
+        return false;
+    }
+
+    match argv.get(subcommand_index + 1).map(AsRef::as_ref) {
+        None | Some("--foreground") => true,
+        Some("start") => matches!(
+            argv.get(subcommand_index + 2).map(AsRef::as_ref),
+            None | Some("--foreground")
+        ),
+        Some("restart") => argv.get(subcommand_index + 2).is_none(),
+        Some(_) => false,
+    }
 }
 
-/// Enumerate the PIDs of every live `<binary_name> daemon …` process for
-/// `mempal_home`, excluding the calling process itself.
+fn first_cli_subcommand<S: AsRef<str>>(argv: &[S]) -> Option<(usize, &str)> {
+    let mut skip_next = false;
+    for (index, arg) in argv.iter().enumerate().skip(1) {
+        let arg = arg.as_ref();
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--" {
+            return argv.get(index + 1).map(|next| (index + 1, next.as_ref()));
+        }
+        if arg.starts_with("--") {
+            if global_flag_takes_value(arg) {
+                skip_next = true;
+            }
+            continue;
+        }
+        return Some((index, arg));
+    }
+    None
+}
+
+fn global_flag_takes_value(arg: &str) -> bool {
+    // Keep this list aligned with clap global flag parsing so every value-taking
+    // global option is skipped when locating the first subcommand.
+    const CLI_GLOBAL_VALUE_FLAGS: &[&str] = &["--config", "--config-path"];
+
+    !arg.contains('=') && CLI_GLOBAL_VALUE_FLAGS.contains(&arg)
+}
+
+/// Enumerate the PIDs of every live daemon process, excluding this process.
 ///
-/// Linux: scans `/proc/<pid>/cmdline`. Non-Linux: returns empty (the pidfile
-/// path still applies; robust sibling reaping is a Linux-only refinement).
+/// Linux: scans `/proc/<pid>/cmdline`, `/proc/<pid>/fd`, and
+/// `/proc/<pid>/environ`. Non-Linux: returns empty (the pidfile path still
+/// applies; robust sibling reaping is a Linux-only refinement).
 #[cfg(target_os = "linux")]
-pub fn enumerate_daemon_pids(binary_name: &str, mempal_home: &Path) -> Vec<i32> {
+pub fn enumerate_daemon_pids(binary_name: &str, db_path: &Path) -> Vec<i32> {
     let self_pid = std::process::id() as i32;
-    enumerate_daemon_pids_in_proc(binary_name, mempal_home, Path::new("/proc"), self_pid)
+    enumerate_daemon_pids_in_proc(binary_name, db_path, Path::new("/proc"), self_pid)
 }
 
 #[cfg(target_os = "linux")]
 fn enumerate_daemon_pids_in_proc(
     binary_name: &str,
-    mempal_home: &Path,
+    db_path: &Path,
     proc_root: &Path,
     self_pid: i32,
 ) -> Vec<i32> {
     let mut pids = Vec::new();
-    let Some(lock_path) = canonical_daemon_lock_path(mempal_home) else {
+    let Some(db_identity) = DbPathIdentity::from_db_path(db_path) else {
         return pids;
     };
     let Ok(entries) = std::fs::read_dir(proc_root) else {
@@ -196,7 +245,8 @@ fn enumerate_daemon_pids_in_proc(
             continue; // kernel threads expose an empty cmdline
         }
         let argv = parse_proc_cmdline(&raw);
-        if is_daemon_argv(&argv, binary_name) && process_holds_lock_file(&entry.path(), &lock_path)
+        if is_daemon_argv(&argv, binary_name)
+            && process_matches_db_path(&entry.path(), &db_identity)
         {
             pids.push(pid);
         }
@@ -206,26 +256,123 @@ fn enumerate_daemon_pids_in_proc(
 }
 
 #[cfg(target_os = "linux")]
-fn canonical_daemon_lock_path(mempal_home: &Path) -> Option<PathBuf> {
-    std::fs::canonicalize(mempal_home.join(DAEMON_LOCK_FILE)).ok()
+fn process_matches_db_path(proc_pid_dir: &Path, db_identity: &DbPathIdentity) -> bool {
+    process_has_db_fd(proc_pid_dir, db_identity)
+        || process_env_matches_db_path(proc_pid_dir, db_identity.db_path())
 }
 
 #[cfg(target_os = "linux")]
-fn process_holds_lock_file(proc_pid_dir: &Path, lock_path: &Path) -> bool {
+#[derive(Debug, Clone)]
+struct DbPathIdentity {
+    db_path: PathBuf,
+    fd_targets: BTreeSet<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl DbPathIdentity {
+    fn from_db_path(db_path: &Path) -> Option<Self> {
+        let db_path = std::fs::canonicalize(db_path).ok()?;
+        let mut fd_targets = BTreeSet::new();
+        fd_targets.insert(db_path.clone());
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = append_os_suffix(&db_path, suffix);
+            fd_targets.insert(canonicalize_if_present(&sidecar));
+        }
+        Some(Self {
+            db_path,
+            fd_targets,
+        })
+    }
+
+    fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    fn matches_fd_target(&self, fd_target: &Path) -> bool {
+        self.fd_targets.contains(fd_target)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn append_os_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = OsString::from(path.as_os_str());
+    os.push(OsStr::new(suffix));
+    PathBuf::from(os)
+}
+
+#[cfg(target_os = "linux")]
+fn canonicalize_if_present(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn process_has_db_fd(proc_pid_dir: &Path, db_identity: &DbPathIdentity) -> bool {
     let Ok(entries) = std::fs::read_dir(proc_pid_dir.join("fd")) else {
         return false;
     };
 
     entries.flatten().any(|entry| {
-        std::fs::read_link(entry.path())
-            .map(|target| target == lock_path)
-            .unwrap_or(false)
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            return false;
+        };
+        let Ok(canonical_target) = std::fs::canonicalize(target) else {
+            return false;
+        };
+        db_identity.matches_fd_target(&canonical_target)
     })
 }
 
+#[cfg(target_os = "linux")]
+fn process_env_matches_db_path(proc_pid_dir: &Path, expected_db_path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(raw) = std::fs::read(proc_pid_dir.join("environ")) else {
+        return false;
+    };
+
+    raw.split(|byte| *byte == 0)
+        .filter_map(|part| part.strip_prefix(MEMPAL_DB_PATH_ENV))
+        .map(OsStr::from_bytes)
+        .any(|path| env_db_path_matches(path, expected_db_path))
+}
+
+#[cfg(target_os = "linux")]
+fn env_db_path_matches(path: &OsStr, expected_db_path: &Path) -> bool {
+    let path = Path::new(path);
+    path == expected_db_path
+        || std::fs::canonicalize(path).is_ok_and(|canonical| canonical == expected_db_path)
+}
+
 #[cfg(not(target_os = "linux"))]
-pub fn enumerate_daemon_pids(_binary_name: &str, _mempal_home: &Path) -> Vec<i32> {
+pub fn enumerate_daemon_pids(_binary_name: &str, _db_path: &Path) -> Vec<i32> {
     Vec::new()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonReapPlan {
+    pub keeper: Option<i32>,
+    pub targets: Vec<i32>,
+}
+
+/// Build an idempotent orphan-reap plan from exact daemon argv matches.
+///
+/// The pidfile daemon wins when it is still among the live candidates. If the
+/// pidfile is stale or absent, the lowest PID is elected as the singleton to
+/// keep. Every other daemon is a reap target.
+pub fn plan_daemon_reap(candidates: &[i32], pidfile_pid: Option<i32>) -> DaemonReapPlan {
+    let mut live = candidates.to_vec();
+    live.sort_unstable();
+    live.dedup();
+
+    let keeper = pidfile_pid
+        .filter(|pid| live.contains(pid))
+        .or_else(|| live.first().copied());
+    let targets = live
+        .into_iter()
+        .filter(|pid| Some(*pid) != keeper)
+        .collect();
+
+    DaemonReapPlan { keeper, targets }
 }
 
 #[cfg(unix)]
@@ -315,42 +462,50 @@ mod tests {
 
     #[test]
     fn test_is_daemon_argv_matches_daemon_and_rejects_siblings() {
-        // Matches the daemon's own invocations (bare path and absolute path,
-        // with and without a subcommand).
-        assert!(is_daemon_argv(
-            &argv(&["mempal", "daemon", "--foreground"]),
-            "mempal"
-        ));
-        assert!(is_daemon_argv(&argv(&["mempal", "daemon"]), "mempal"));
-        assert!(is_daemon_argv(
-            &argv(&["/usr/local/bin/mempal", "daemon", "start", "--foreground"]),
-            "mempal"
-        ));
-        assert!(is_daemon_argv(
-            &argv(&["target/release/mempal", "daemon", "restart"]),
-            "mempal"
-        ));
+        let cases = [
+            (vec!["mempal", "daemon", "--foreground"], true),
+            (vec!["mempal", "daemon"], true),
+            (
+                vec!["/usr/local/bin/mempal", "daemon", "start", "--foreground"],
+                true,
+            ),
+            (vec!["target/release/mempal", "daemon", "restart"], true),
+            (vec!["mempal", "--verbose", "daemon"], true),
+            (
+                vec!["mempal", "--config", "/tmp/config.toml", "daemon"],
+                true,
+            ),
+            (vec!["mempal", "--config=/tmp/config.toml", "daemon"], true),
+            (vec!["mempal", "serve", "--mcp"], false),
+            (vec!["mempal", "reindex"], false),
+            (vec!["mempal", "search", "daemon"], false),
+            (vec!["mempal", "daemon", "stop"], false),
+            (vec!["mempal", "daemon", "status"], false),
+            (vec!["mempal", "daemon", "reap"], false),
+            (vec!["mempal", "daemon", "restart", "--foreground"], false),
+            (vec!["claude", "-p", "mempal daemon --foreground"], false),
+            (vec!["/usr/bin/python3", "daemon.py"], false),
+            (vec!["mempal"], false),
+            (vec!["other-tool", "daemon"], false),
+        ];
 
-        // Must NOT match the MCP server, the top-level status command, the stop
-        // command's own argv pattern aside, or unrelated programs.
-        assert!(!is_daemon_argv(
-            &argv(&["mempal", "serve", "--mcp"]),
-            "mempal"
-        ));
-        assert!(!is_daemon_argv(&argv(&["mempal", "status"]), "mempal"));
-        assert!(!is_daemon_argv(
-            &argv(&["claude", "-p", "mempal daemon --foreground"]),
-            "mempal"
-        ));
-        assert!(!is_daemon_argv(
-            &argv(&["/usr/bin/python3", "daemon.py"]),
-            "mempal"
-        ));
-
-        // Defensive edges: too-short argv and a different binary name.
-        assert!(!is_daemon_argv(&argv(&["mempal"]), "mempal"));
+        for (parts, expected) in cases {
+            assert_eq!(
+                is_daemon_argv(&argv(&parts), "mempal"),
+                expected,
+                "argv={parts:?}"
+            );
+        }
         assert!(!is_daemon_argv::<&str>(&[], "mempal"));
-        assert!(!is_daemon_argv(&argv(&["other-tool", "daemon"]), "mempal"));
+    }
+
+    #[test]
+    fn test_first_cli_subcommand_skips_global_value_flags() {
+        let parts = ["mempal", "--config", "/tmp/config.toml", "daemon", "status"];
+        assert_eq!(first_cli_subcommand(&argv(&parts)), Some((3, "daemon")));
+
+        let eq_parts = ["mempal", "--config=/tmp/config.toml", "daemon", "status"];
+        assert_eq!(first_cli_subcommand(&argv(&eq_parts)), Some((2, "daemon")));
     }
 
     #[test]
@@ -380,43 +535,214 @@ mod tests {
         let self_pid = std::process::id() as i32;
         let name = current_binary_name().unwrap_or_else(|| "mempal".to_string());
         let tmp = tempfile::tempdir().expect("tempdir");
-        File::create(tmp.path().join(DAEMON_LOCK_FILE)).expect("lock file");
-        assert!(!enumerate_daemon_pids(&name, tmp.path()).contains(&self_pid));
+        let db_path = tmp.path().join("palace.db");
+        File::create(&db_path).expect("db file");
+        assert!(!enumerate_daemon_pids(&name, &db_path).contains(&self_pid));
         // Sanity: a binary name that cannot match anything yields no PIDs.
-        assert!(enumerate_daemon_pids("\0no-such-binary", tmp.path()).is_empty());
+        assert!(enumerate_daemon_pids("\0no-such-binary", &db_path).is_empty());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_enumerate_filters_daemons_by_matching_home_lock_fd() {
-        use std::os::unix::fs::symlink;
-
+    fn test_enumerate_proc_scan_matches_daemon_argv_by_db_identity() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let home_a = tmp.path().join("home-a");
-        let home_b = tmp.path().join("home-b");
+        let db_path = tmp.path().join(".mempal").join("palace.db");
+        let other_db_path = tmp.path().join("other").join("palace.db");
         let proc_root = tmp.path().join("proc");
-        std::fs::create_dir_all(&home_a).expect("home a");
-        std::fs::create_dir_all(&home_b).expect("home b");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("mempal home");
+        std::fs::create_dir_all(other_db_path.parent().expect("other db parent"))
+            .expect("other db parent");
         std::fs::create_dir_all(&proc_root).expect("proc root");
-        let lock_a = home_a.join(DAEMON_LOCK_FILE);
-        let lock_b = home_b.join(DAEMON_LOCK_FILE);
-        File::create(&lock_a).expect("lock a");
-        File::create(&lock_b).expect("lock b");
+        File::create(&db_path).expect("db file");
+        File::create(&other_db_path).expect("other db file");
 
-        write_fake_proc_daemon(&proc_root, 101, &lock_a);
-        write_fake_proc_daemon(&proc_root, 202, &lock_b);
+        write_fake_proc(
+            &proc_root,
+            101,
+            b"mempal\0daemon\0--foreground\0",
+            Some(&db_path),
+            Some(&db_path),
+        );
+        write_fake_proc(
+            &proc_root,
+            202,
+            b"mempal\0serve\0--mcp\0",
+            Some(&db_path),
+            Some(&db_path),
+        );
+        write_fake_proc(
+            &proc_root,
+            303,
+            b"mempal\0daemon\0stop\0",
+            Some(&db_path),
+            Some(&db_path),
+        );
+        write_fake_proc(
+            &proc_root,
+            404,
+            b"other\0daemon\0",
+            Some(&db_path),
+            Some(&db_path),
+        );
+        write_fake_proc(
+            &proc_root,
+            505,
+            b"mempal\0daemon\0--foreground\0",
+            Some(&other_db_path),
+            Some(&other_db_path),
+        );
 
-        let pids = enumerate_daemon_pids_in_proc("mempal", &home_a, &proc_root, 0);
+        let pids = enumerate_daemon_pids_in_proc("mempal", &db_path, &proc_root, 0);
 
         assert_eq!(pids, vec![101]);
+    }
 
-        fn write_fake_proc_daemon(proc_root: &Path, pid: i32, lock_path: &Path) {
-            let pid_dir = proc_root.join(pid.to_string());
-            let fd_dir = pid_dir.join("fd");
-            std::fs::create_dir_all(&fd_dir).expect("fd dir");
-            std::fs::write(pid_dir.join("cmdline"), b"mempal\0daemon\0--foreground\0")
-                .expect("cmdline");
-            symlink(lock_path, fd_dir.join("3")).expect("lock fd symlink");
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_enumerate_proc_scan_matches_custom_db_outside_home_by_fd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let custom_db = tmp.path().join("var-lib-mempal").join("palace.db");
+        let proc_root = tmp.path().join("proc");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(custom_db.parent().expect("custom db parent"))
+            .expect("custom db parent");
+        std::fs::create_dir_all(&proc_root).expect("proc root");
+        File::create(&custom_db).expect("custom db");
+
+        write_fake_proc(
+            &proc_root,
+            707,
+            b"mempal\0daemon\0--foreground\0",
+            Some(&custom_db),
+            None,
+        );
+
+        let pids = enumerate_daemon_pids_in_proc("mempal", &custom_db, &proc_root, 0);
+
+        assert_eq!(pids, vec![707]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_enumerate_proc_scan_rejects_daemon_argv_for_different_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("ours").join("palace.db");
+        let other_db_path = tmp.path().join("other").join("palace.db");
+        let proc_root = tmp.path().join("proc");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("db parent");
+        std::fs::create_dir_all(other_db_path.parent().expect("other db parent"))
+            .expect("other db parent");
+        std::fs::create_dir_all(&proc_root).expect("proc root");
+        File::create(&db_path).expect("db file");
+        File::create(&other_db_path).expect("other db file");
+
+        write_fake_proc(
+            &proc_root,
+            808,
+            b"mempal\0daemon\0--foreground\0",
+            Some(&other_db_path),
+            Some(&other_db_path),
+        );
+
+        let pids = enumerate_daemon_pids_in_proc("mempal", &db_path, &proc_root, 0);
+
+        assert!(pids.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_fake_proc(
+        proc_root: &Path,
+        pid: i32,
+        cmdline: &[u8],
+        fd_db_path: Option<&Path>,
+        env_db_path: Option<&Path>,
+    ) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(pid_dir.join("fd")).expect("pid fd dir");
+        std::fs::write(pid_dir.join("cmdline"), cmdline).expect("cmdline");
+
+        let mut environ = Vec::new();
+        if let Some(path) = env_db_path {
+            environ.extend_from_slice(MEMPAL_DB_PATH_ENV);
+            environ.extend_from_slice(path.as_os_str().as_bytes());
+            environ.push(0);
         }
+        std::fs::write(pid_dir.join("environ"), environ).expect("environ");
+
+        if let Some(path) = fd_db_path {
+            std::os::unix::fs::symlink(path, pid_dir.join("fd").join("3")).expect("fd symlink");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_enumerate_proc_scan_matches_non_utf8_db_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let proc_root = temp.path().join("proc");
+        let db_root = temp.path().join("db");
+        std::fs::create_dir_all(&db_root).expect("db dir");
+
+        // Create a non-UTF8 path: 0xFF is invalid UTF-8.
+        let non_utf8_name = Vec::from_iter([b'm', b'y', 0xff, b'.', b'd', b'b']);
+        let db_name = OsString::from_vec(non_utf8_name);
+        let db_path = db_root.join(db_name);
+        std::fs::File::create(&db_path).expect("db file");
+        let db_path = std::fs::canonicalize(db_path).expect("canonicalize");
+
+        let other_non_utf8_name =
+            Vec::from_iter([b'o', b't', b'h', b'e', b'r', 0xfe, b'.', b'd', b'b']);
+        let other_db_name = OsString::from_vec(other_non_utf8_name);
+        let other_db_path = db_root.join(other_db_name);
+        std::fs::File::create(&other_db_path).expect("other db file");
+        let other_db_path = std::fs::canonicalize(other_db_path).expect("canonicalize other db");
+
+        write_fake_proc(
+            &proc_root,
+            101,
+            b"mempal\0daemon\0--foreground\0",
+            None,
+            Some(&db_path),
+        );
+        write_fake_proc(
+            &proc_root,
+            202,
+            b"mempal\0daemon\0--foreground\0",
+            None,
+            Some(&other_db_path),
+        );
+
+        let pids = enumerate_daemon_pids_in_proc("mempal", &db_path, &proc_root, 999);
+        assert_eq!(pids, vec![101]);
+    }
+
+    #[test]
+    fn test_plan_daemon_reap_keeps_pidfile_daemon_when_live() {
+        let plan = plan_daemon_reap(&[303, 101, 202], Some(202));
+
+        assert_eq!(
+            plan,
+            DaemonReapPlan {
+                keeper: Some(202),
+                targets: vec![101, 303],
+            }
+        );
+    }
+
+    #[test]
+    fn test_plan_daemon_reap_elects_lowest_pid_when_pidfile_stale() {
+        let plan = plan_daemon_reap(&[303, 101, 202], Some(999));
+
+        assert_eq!(
+            plan,
+            DaemonReapPlan {
+                keeper: Some(101),
+                targets: vec![202, 303],
+            }
+        );
     }
 }
