@@ -599,7 +599,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_operation_status",
-        description = "Return the current status of an asynchronous ingest operation, including the queue state and any stored drawer_id, rejection reason, or failure detail. Use this to confirm a receipt-based write landed."
+        description = "Return the current status of an asynchronous ingest operation, including the queue state, stored drawer_id, rejection reason, failure detail, and persisted per-stage timings. Use this to confirm a receipt-based write landed."
     )]
     pub async fn mempal_operation_status(
         &self,
@@ -2689,7 +2689,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_ingest",
-        description = "Persist a decision, bug fix, design insight, profile fact, or typed knowledge/evidence drawer to project memory. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, `statement`, `tier`, `status`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, and dry_run preview."
+        description = "Persist a decision, bug fix, design insight, profile fact, or typed knowledge/evidence drawer to project memory. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, `statement`, `tier`, `status`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, dry_run preview, and receipt-based waiting via `wait`/`wait_timeout_secs` (wait=true blocks to a terminal state or returns a timed_out receipt you can poll with `mempal_operation_status`)."
     )]
     pub async fn mempal_ingest(
         &self,
