@@ -297,7 +297,7 @@ impl MempalMcpServer {
         let _ = heartbeat.await;
 
         match outcome {
-            Ok(Json(response)) => {
+            Ok(Json(mut response)) => {
                 let rejected_reason = response
                     .gating_decision
                     .as_ref()
@@ -307,6 +307,10 @@ impl MempalMcpServer {
                 } else {
                     IngestOperationState::Completed
                 };
+                if matches!(state, IngestOperationState::Rejected) {
+                    response.drawer_id.clear();
+                    response.drawer_ids.clear();
+                }
                 let mut finalized = finalize_ingest_response(
                     claim.id.clone(),
                     claim.created_at,
@@ -320,10 +324,11 @@ impl MempalMcpServer {
                     .insert("queue_wait_ms".to_string(), queue_wait_ms);
                 let result_json = serde_json::to_string(&finalized)
                     .context("failed to serialize completed ingest response")?;
-                let result_drawer_id = if finalized.drawer_id.is_empty() {
-                    None
-                } else {
-                    Some(finalized.drawer_id.as_str())
+                let result_drawer_id = match state {
+                    IngestOperationState::Completed if !finalized.drawer_id.is_empty() => {
+                        Some(finalized.drawer_id.as_str())
+                    }
+                    _ => None,
                 };
                 queue
                     .complete_operation(
@@ -6745,6 +6750,10 @@ fn operation_record_to_response(
         response.accepted_at = accepted_at;
         response.state = Some(state);
         response.dropped = matches!(state, IngestOperationState::Rejected);
+        if !matches!(state, IngestOperationState::Completed) {
+            response.drawer_id.clear();
+            response.drawer_ids.clear();
+        }
         response.rejected_reason = record.rejected_reason.or(response.rejected_reason);
         response.failure_detail = record.failure_detail.or(response.failure_detail);
         response.system_warnings = system_warnings;
@@ -6756,7 +6765,11 @@ fn operation_record_to_response(
         accepted_at,
         state: Some(state),
         timed_out: false,
-        drawer_id: record.result_drawer_id.unwrap_or_default(),
+        drawer_id: if matches!(state, IngestOperationState::Completed) {
+            record.result_drawer_id.unwrap_or_default()
+        } else {
+            String::new()
+        },
         drawer_ids: Vec::new(),
         chunk_count: 0,
         dropped: matches!(state, IngestOperationState::Rejected),
@@ -10107,12 +10120,78 @@ enabled = true
         assert_eq!(completed.state, Some(IngestOperationState::Completed));
         assert!(!completed.drawer_id.is_empty());
 
+        let completed_record =
+            crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path)
+                .operation_status(&operation_id)
+                .expect("load completed operation record")
+                .expect("completed operation record exists");
+        assert_eq!(
+            completed_record.result_drawer_id.as_deref(),
+            Some(completed.drawer_id.as_str())
+        );
+        assert_eq!(completed_record.rejected_reason.as_deref(), None);
+
         let final_status = server
             .operation_status_json_for_test(&operation_id)
             .await
             .expect("final status");
         assert_eq!(final_status.state, Some(IngestOperationState::Completed));
         assert_eq!(final_status.drawer_id, completed.drawer_id);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_operation_status_rejected_has_no_result_drawer_id() {
+        let (_tempdir, db_path, server) = setup_server();
+        let _config_guard = ConfigOverrideGuard::install(&format!(
+            r#"
+db_path = "{}"
+
+[privacy]
+enabled = false
+
+[ingest_gating.fact_check]
+enabled = true
+reject_on_contradiction = true
+"#,
+            db_path.display()
+        ));
+        insert_triple(
+            &db_path,
+            "Bob",
+            "husband_of",
+            "Alice",
+            Some("1700000000"),
+            None,
+        );
+
+        let response = server
+            .ingest_json_for_test(
+                serde_json::to_value(IngestRequest {
+                    content: "Bob is Alice's brother.".to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("status".to_string()),
+                    project_id: Some("project-async".to_string()),
+                    wait: Some(true),
+                    ..IngestRequest::default()
+                })
+                .expect("serialize ingest request"),
+            )
+            .await
+            .expect("rejected ingest should complete");
+
+        assert_eq!(response.state, Some(IngestOperationState::Rejected));
+        assert!(response.drawer_id.is_empty());
+        assert!(response.drawer_ids.is_empty());
+        assert!(response.rejected_reason.is_some());
+
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        let rejected_record =
+            crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path)
+                .operation_status(operation_id)
+                .expect("load rejected operation record")
+                .expect("rejected operation record exists");
+        assert_eq!(rejected_record.result_drawer_id, None);
+        assert!(rejected_record.rejected_reason.is_some());
     }
 
     #[tokio::test]
