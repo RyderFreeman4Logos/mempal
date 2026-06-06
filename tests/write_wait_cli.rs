@@ -11,6 +11,8 @@ use common::harness::embed_mock::start as start_embed_mock;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
+use mempal::core::types::Triple;
+use mempal::core::utils::build_triple_id;
 use mempal::mcp::{IngestOperationState, IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
@@ -207,6 +209,60 @@ fn print_lines(output: &Output) -> (String, String) {
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+fn assert_bootstrap_stderr(output: &Output) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut lines = stderr.lines();
+    let bootstrap = lines.next().expect("stderr must contain bootstrap line");
+    assert!(
+        bootstrap.starts_with("config hot-reload: bootstrapped version "),
+        "unexpected stderr bootstrap line: {stderr}"
+    );
+    for line in lines {
+        assert!(
+            line.starts_with("fact_check."),
+            "unexpected stderr noise: {stderr}"
+        );
+    }
+}
+
+fn last_audit_entry(home: &Path) -> Value {
+    let audit_path = home.join(".mempal").join("audit.jsonl");
+    let audit = fs::read_to_string(&audit_path).expect("read audit log");
+    serde_json::from_str(audit.lines().last().expect("audit entry")).expect("parse audit entry")
+}
+
+fn assert_stdin_audit_entry(
+    entry: &Value,
+    expected_source: &str,
+    expected_source_file: &str,
+    expected_chunks: u64,
+    expected_skipped: u64,
+    expected_dropped_by_gate: u64,
+) {
+    assert_eq!(entry["mode"], "stdin");
+    assert_eq!(entry["source"], expected_source);
+    assert_eq!(entry["source_file"], expected_source_file);
+    assert_eq!(entry["files"], 1);
+    assert_eq!(entry["chunks"], expected_chunks);
+    assert_eq!(entry["skipped"], expected_skipped);
+    assert_eq!(entry["dropped_by_gate"], expected_dropped_by_gate);
+}
+
+fn insert_fact_check_contradiction(home: &Path) {
+    let db = Database::open(&home.join(".mempal/palace.db")).expect("open db");
+    let triple = Triple {
+        id: build_triple_id("Bob", "husband_of", "Alice"),
+        subject: "Bob".to_string(),
+        predicate: "husband_of".to_string(),
+        object: "Alice".to_string(),
+        valid_from: Some("1700000000".to_string()),
+        valid_to: None,
+        confidence: 1.0,
+        source_drawer: None,
+    };
+    db.insert_triple(&triple).expect("insert triple");
 }
 
 fn assert_completed_status(output: &Output) {
@@ -505,6 +561,249 @@ async fn test_ingest_wait_preserves_stdin_semantics_and_audit() {
     assert_eq!(entry["source_file"], "csa://session/99");
     assert_eq!(entry["dry_run"], false);
     assert_eq!(entry["dropped_by_gate"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_wait_exact_duplicate_matches_non_wait_plain_and_json_output() {
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+
+    for json in [false, true] {
+        let wait_home = setup_home();
+        let direct_home = setup_home();
+        let _wait_config = write_config(wait_home.path(), &format!("http://{addr}/v1"));
+        let _direct_config = write_config(direct_home.path(), &format!("http://{addr}/v1"));
+
+        let payload = serde_json::json!({
+            "content": "duplicate wait content",
+            "wing": "cli-wing",
+            "room": "duplicate-room",
+            "project": "duplicate-project",
+            "source": "csa-session",
+            "source_file": "csa://session/duplicate",
+            "source_type": "user_explicit",
+            "confidence": 0.82
+        })
+        .to_string();
+
+        let seed_args = if json {
+            vec!["ingest", "--stdin", "--no-gate", "--json"]
+        } else {
+            vec!["ingest", "--stdin", "--no-gate"]
+        };
+        let seed_wait = run_cli_with_stdin(wait_home.path(), &seed_args, payload.as_bytes());
+        let seed_direct = run_cli_with_stdin(direct_home.path(), &seed_args, payload.as_bytes());
+        assert!(
+            seed_wait.status.success() && seed_direct.status.success(),
+            "seeding duplicate fixture must succeed"
+        );
+
+        let wait_timeout = u64::MAX.to_string();
+        let mut direct_args = vec![
+            "ingest",
+            "--stdin",
+            "--wing",
+            "cli-wing",
+            "--source-type",
+            "user_explicit",
+        ];
+        let mut wait_args = vec![
+            "ingest",
+            "--stdin",
+            "--wing",
+            "cli-wing",
+            "--source-type",
+            "user_explicit",
+            "--wait",
+            "--wait-timeout-secs",
+            wait_timeout.as_str(),
+        ];
+        if json {
+            direct_args.push("--json");
+            wait_args.push("--json");
+        }
+
+        let direct_output =
+            run_cli_with_stdin(direct_home.path(), &direct_args, payload.as_bytes());
+        let wait_output = run_cli_with_stdin(wait_home.path(), &wait_args, payload.as_bytes());
+
+        assert!(
+            direct_output.status.success(),
+            "stdout={}, stderr={}",
+            String::from_utf8_lossy(&direct_output.stdout),
+            String::from_utf8_lossy(&direct_output.stderr)
+        );
+        assert!(
+            wait_output.status.success(),
+            "stdout={}, stderr={}",
+            String::from_utf8_lossy(&wait_output.stdout),
+            String::from_utf8_lossy(&wait_output.stderr)
+        );
+        assert_bootstrap_stderr(&direct_output);
+        assert_bootstrap_stderr(&wait_output);
+
+        if json {
+            let direct_json: Value =
+                serde_json::from_slice(&direct_output.stdout).expect("parse direct duplicate JSON");
+            let wait_json: Value =
+                serde_json::from_slice(&wait_output.stdout).expect("parse wait duplicate JSON");
+            assert_eq!(
+                wait_json, direct_json,
+                "wait JSON output must match direct duplicate output"
+            );
+            assert_eq!(direct_json["stats"]["files"], 1);
+            assert_eq!(direct_json["stats"]["chunks"], 0);
+            assert_eq!(direct_json["stats"]["skipped"], 1);
+            assert_eq!(direct_json["stats"]["dropped_by_gate"], 0);
+            assert_eq!(
+                direct_json["drawer_ids"]
+                    .as_array()
+                    .expect("drawer ids")
+                    .len(),
+                1
+            );
+        } else {
+            assert_eq!(
+                String::from_utf8_lossy(&wait_output.stdout),
+                String::from_utf8_lossy(&direct_output.stdout),
+                "wait plain output must match direct duplicate output"
+            );
+            let stdout = String::from_utf8_lossy(&direct_output.stdout);
+            assert!(stdout.contains("files=1"), "{stdout}");
+            assert!(stdout.contains("chunks=0"), "{stdout}");
+            assert!(stdout.contains("skipped=1"), "{stdout}");
+            assert!(stdout.contains("dropped_by_gate=0"), "{stdout}");
+        }
+
+        let direct_audit = last_audit_entry(direct_home.path());
+        let wait_audit = last_audit_entry(wait_home.path());
+        assert_eq!(direct_audit["command"], "ingest");
+        assert_eq!(wait_audit["command"], "ingest");
+        assert_stdin_audit_entry(
+            &direct_audit,
+            "csa-session",
+            "csa://session/duplicate",
+            0,
+            1,
+            0,
+        );
+        assert_stdin_audit_entry(
+            &wait_audit,
+            "csa-session",
+            "csa://session/duplicate",
+            0,
+            1,
+            0,
+        );
+        assert!(direct_audit["superseded_drawer_id"].is_null());
+        assert!(wait_audit["superseded_drawer_id"].is_null());
+    }
+
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_wait_rejected_matches_non_wait_output_and_audit() {
+    let wait_home = setup_home();
+    let direct_home = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    let wait_config = write_config(wait_home.path(), &format!("http://{addr}/v1"));
+    let direct_config = write_config(direct_home.path(), &format!("http://{addr}/v1"));
+    {
+        use std::io::Write as _;
+
+        for config_path in [&wait_config, &direct_config] {
+            let mut config = fs::OpenOptions::new()
+                .append(true)
+                .open(config_path)
+                .expect("open config for append");
+            writeln!(
+                config,
+                "\n[ingest_gating]\nenabled = true\n\n[ingest_gating.fact_check]\nenabled = true\nreject_on_contradiction = true"
+            )
+            .expect("append gating config");
+        }
+    }
+    insert_fact_check_contradiction(wait_home.path());
+    insert_fact_check_contradiction(direct_home.path());
+
+    let payload = serde_json::json!({
+        "content": "Bob is Alice's brother.",
+        "wing": "cli-wing",
+        "room": "reject-room",
+        "project": "reject-project",
+        "source": "csa-session",
+        "source_file": "csa://session/reject",
+        "source_type": "user_explicit",
+        "confidence": 0.8
+    })
+    .to_string();
+
+    let direct_output = run_cli_with_stdin(
+        direct_home.path(),
+        &["ingest", "--stdin", "--json"],
+        payload.as_bytes(),
+    );
+    let wait_output = run_cli_with_stdin(
+        wait_home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wait",
+            "--wait-timeout-secs",
+            "30",
+            "--json",
+        ],
+        payload.as_bytes(),
+    );
+
+    assert!(
+        direct_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&direct_output.stdout),
+        String::from_utf8_lossy(&direct_output.stderr)
+    );
+    assert!(
+        wait_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&wait_output.stdout),
+        String::from_utf8_lossy(&wait_output.stderr)
+    );
+    assert_bootstrap_stderr(&direct_output);
+    assert_bootstrap_stderr(&wait_output);
+
+    let direct_json: Value = serde_json::from_slice(&direct_output.stdout).expect("direct json");
+    let wait_json: Value = serde_json::from_slice(&wait_output.stdout).expect("wait json");
+    assert_eq!(
+        wait_json, direct_json,
+        "wait rejection JSON must match direct rejection JSON"
+    );
+    assert_eq!(direct_json["stats"]["files"], 1);
+    assert_eq!(direct_json["stats"]["chunks"], 0);
+    assert_eq!(direct_json["stats"]["skipped"], 0);
+    assert_eq!(direct_json["stats"]["dropped_by_gate"], 1);
+    assert!(
+        direct_json["drawer_ids"]
+            .as_array()
+            .expect("drawer ids")
+            .is_empty(),
+        "rejected ingest must not report drawer ids"
+    );
+
+    let direct_audit = last_audit_entry(direct_home.path());
+    let wait_audit = last_audit_entry(wait_home.path());
+    assert_stdin_audit_entry(
+        &direct_audit,
+        "csa-session",
+        "csa://session/reject",
+        0,
+        0,
+        1,
+    );
+    assert_stdin_audit_entry(&wait_audit, "csa-session", "csa://session/reject", 0, 0, 1);
+    assert!(direct_audit["superseded_drawer_id"].is_null());
+    assert!(wait_audit["superseded_drawer_id"].is_null());
+
+    handle.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

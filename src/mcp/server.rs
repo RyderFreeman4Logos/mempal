@@ -597,32 +597,6 @@ impl MempalMcpServer {
         self.mempal_status_tool(Parameters(request)).await
     }
 
-    #[tool(
-        name = "mempal_operation_status",
-        description = "Return the current status of an asynchronous ingest operation, including the queue state, stored drawer_id, rejection reason, failure detail, and persisted per-stage timings. Use this to confirm a receipt-based write landed."
-    )]
-    pub async fn mempal_operation_status(
-        &self,
-        Parameters(request): Parameters<OperationStatusRequest>,
-    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        let db = self.open_db()?;
-        let store = crate::core::queue::PendingMessageStore::new_without_reclaim(db.path());
-        let system_warnings = system_warnings_with_stale_index(&db);
-        let record = store
-            .operation_status(&request.operation_id)
-            .map_err(|error| {
-                ErrorData::internal_error(format!("queue lookup failed: {error}"), None)
-            })?
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!("operation not found: {}", request.operation_id),
-                    None,
-                )
-            })?;
-
-        Ok(Json(operation_record_to_response(record, system_warnings)))
-    }
-
     pub async fn pinned_facts_json_for_test(
         &self,
         value: Value,
@@ -3708,6 +3682,32 @@ impl MempalMcpServer {
             system_warnings: request_system_warnings,
             ..Default::default()
         }))
+    }
+
+    #[tool(
+        name = "mempal_operation_status",
+        description = "Return the current status of an asynchronous ingest operation, including the queue state, stored drawer_id, rejection reason, failure detail, and persisted per-stage timings. Use this to confirm a receipt-based write landed."
+    )]
+    pub async fn mempal_operation_status(
+        &self,
+        Parameters(request): Parameters<OperationStatusRequest>,
+    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        let db = self.open_db()?;
+        let store = crate::core::queue::PendingMessageStore::new_without_reclaim(db.path());
+        let system_warnings = system_warnings_with_stale_index(&db);
+        let record = store
+            .operation_status(&request.operation_id)
+            .map_err(|error| {
+                ErrorData::internal_error(format!("queue lookup failed: {error}"), None)
+            })?
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("operation not found: {}", request.operation_id),
+                    None,
+                )
+            })?;
+
+        Ok(Json(operation_record_to_response(record, system_warnings)))
     }
 
     #[tool(
@@ -8034,6 +8034,41 @@ mod tests {
                 .unwrap_or_default()
                 .contains("dao_tian -> dao_ren -> shu -> qi")
         );
+    }
+
+    #[test]
+    fn test_mcp_tool_registry_includes_operation_status_and_ingest_wait_fields() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let tools = server.tool_router.list_all();
+
+        let operation_tool = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_operation_status")
+            .expect("mempal_operation_status tool exists");
+        assert!(
+            operation_tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("receipt-based write landed")
+        );
+
+        let ingest_tool = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_ingest")
+            .expect("mempal_ingest tool exists");
+        let props = ingest_tool
+            .input_schema
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .expect("mempal_ingest must have a properties object");
+
+        for field in ["wait", "wait_timeout_secs"] {
+            assert!(
+                props.get(field).is_some(),
+                "mempal_ingest must expose {field} in tools/list"
+            );
+        }
     }
 
     #[tokio::test]

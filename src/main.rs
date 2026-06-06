@@ -3323,6 +3323,45 @@ fn exact_duplicate_drawer_id(
         .map(|summary| summary.id))
 }
 
+struct ExactDuplicateStdinIngest<'a> {
+    db: &'a Database,
+    wing: &'a str,
+    json: bool,
+    record: &'a StdinIngestRecord,
+    stats: &'a mut IngestStats,
+    drawer_id: &'a str,
+    is_pinned: bool,
+    superseded_drawer_id: Option<&'a str>,
+}
+
+fn finalize_exact_duplicate_stdin_ingest(ctx: ExactDuplicateStdinIngest<'_>) -> Result<()> {
+    let ExactDuplicateStdinIngest {
+        db,
+        wing,
+        json,
+        record,
+        stats,
+        drawer_id,
+        is_pinned,
+        superseded_drawer_id,
+    } = ctx;
+    if is_pinned {
+        db.pin_drawer(drawer_id, None)
+            .with_context(|| format!("failed to pin duplicate drawer {drawer_id}"))?;
+    }
+    stats.skipped = 1;
+    stats.drawer_ids = vec![drawer_id.to_string()];
+    if let Some(old_id) = superseded_drawer_id {
+        db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
+            .with_context(|| format!("failed to supersede drawer {old_id}"))?;
+        stats.superseded_drawer_id = Some(old_id.to_string());
+    }
+    append_ingest_stdin_audit_log(db, wing, false, record, stats)
+        .context("failed to append ingest audit log")?;
+    print_stdin_ingest_output(json, false, stats)?;
+    Ok(())
+}
+
 fn validate_temporal_bound<'a>(field: &str, value: Option<&'a str>) -> Result<Option<&'a str>> {
     if let Some(raw) = value {
         if mempal::core::decay::parse_temporal_timestamp_secs(raw).is_none() {
@@ -3504,6 +3543,23 @@ async fn ingest_stdin_command(
         return Ok(());
     }
 
+    // Exact duplicates are a local no-op. Keep `--wait` on the same
+    // terminal stats/audit path as the direct stdin ingest instead of
+    // queueing a receipt that would report different skip semantics.
+    if options.wait && exact_duplicate.is_some() {
+        finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
+            db,
+            wing,
+            json: options.json,
+            record: &record,
+            stats: &mut stats,
+            drawer_id: &drawer_id,
+            is_pinned,
+            superseded_drawer_id: superseded_drawer_id.as_deref(),
+        })?;
+        return Ok(());
+    }
+
     if options.wait {
         let wait_request = IngestRequest {
             content: content.clone(),
@@ -3559,7 +3615,7 @@ async fn ingest_stdin_command(
             );
         }
 
-        let wait_stats = ingest_stdin_wait_stats_from_response(&response);
+        let mut wait_stats = ingest_stdin_wait_stats_from_response(&response);
         match response.state {
             Some(IngestOperationState::Completed) => {
                 append_ingest_stdin_audit_log(db, wing, false, &record, &wait_stats)
@@ -3568,14 +3624,11 @@ async fn ingest_stdin_command(
                 return Ok(());
             }
             Some(IngestOperationState::Rejected) => {
+                wait_stats.drawer_ids.clear();
                 append_ingest_stdin_audit_log(db, wing, false, &record, &wait_stats)
                     .context("failed to append ingest audit log")?;
                 print_stdin_ingest_output(options.json, false, &wait_stats)?;
-                bail!(
-                    "ingest operation {} was rejected: {}",
-                    response.operation_id.as_deref().unwrap_or(""),
-                    response.rejected_reason.as_deref().unwrap_or("rejected")
-                );
+                return Ok(());
             }
             Some(IngestOperationState::Failed) => {
                 print_stdin_ingest_output(options.json, false, &wait_stats)?;
@@ -3593,20 +3646,16 @@ async fn ingest_stdin_command(
     }
 
     if exact_duplicate.is_some() {
-        if is_pinned {
-            db.pin_drawer(&drawer_id, None)
-                .with_context(|| format!("failed to pin duplicate drawer {drawer_id}"))?;
-        }
-        stats.skipped = 1;
-        stats.drawer_ids.push(drawer_id.clone());
-        if let Some(old_id) = superseded_drawer_id.as_deref() {
-            db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
-                .with_context(|| format!("failed to supersede drawer {old_id}"))?;
-            stats.superseded_drawer_id = Some(old_id.to_string());
-        }
-        append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
-            .context("failed to append ingest audit log")?;
-        print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
+        finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
+            db,
+            wing,
+            json: options.json,
+            record: &record,
+            stats: &mut stats,
+            drawer_id: &drawer_id,
+            is_pinned,
+            superseded_drawer_id: superseded_drawer_id.as_deref(),
+        })?;
         return Ok(());
     }
 
@@ -3645,6 +3694,7 @@ async fn ingest_stdin_command(
                 .with_context(|| format!("failed to record gating audit for {drawer_id}"))?;
             if decision.is_rejected() {
                 stats.dropped_by_gate = 1;
+                stats.drawer_ids.clear();
                 append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
                     .context("failed to append ingest audit log")?;
                 print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
@@ -3666,6 +3716,7 @@ async fn ingest_stdin_command(
             stats.fact_check_warnings.extend(outcome.warnings);
             if outcome.decision.is_rejected() {
                 stats.dropped_by_gate = 1;
+                stats.drawer_ids.clear();
                 append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
                     .context("failed to append ingest audit log")?;
                 print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
