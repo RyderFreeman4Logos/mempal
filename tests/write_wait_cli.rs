@@ -538,8 +538,18 @@ async fn test_ingest_wait_preserves_stdin_semantics_and_audit() {
     );
 
     let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    let expected_project = mempal::core::project::infer_project_id_from_path(
+        &std::env::current_dir().expect("current dir"),
+    )
+    .expect("infer project id from cwd")
+    .expect("expected project id from cwd");
     let drawer_id = db
-        .find_active_drawers_by_content("hi", "cli-wing", Some("audit-room"), None)
+        .find_active_drawers_by_content(
+            "hi",
+            "cli-wing",
+            Some("audit-room"),
+            Some(expected_project.as_str()),
+        )
         .expect("find drawer by content")
         .into_iter()
         .next()
