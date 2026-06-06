@@ -447,7 +447,7 @@ impl MempalMcpServer {
         timeout: Duration,
         poll_interval: Duration,
     ) -> std::result::Result<Option<IngestResponse>, ErrorData> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + clamp_wait_timeout(timeout);
         loop {
             let response = self.operation_status_json_for_test(operation_id).await?;
             if response
@@ -818,6 +818,12 @@ impl ValidatedIngestMetadata {
             trigger_hints: self.trigger_hints.as_ref(),
         }
     }
+}
+
+const MAX_WAIT_TIMEOUT_SECS: u64 = 86_400;
+
+fn clamp_wait_timeout(timeout: Duration) -> Duration {
+    timeout.min(Duration::from_secs(MAX_WAIT_TIMEOUT_SECS))
 }
 
 #[allow(dead_code)]

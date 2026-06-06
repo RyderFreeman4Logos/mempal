@@ -257,6 +257,7 @@ async fn test_ingest_wait_returns_drawer_id() {
     let home = setup_home();
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     let _config_path = write_config(home.path(), &format!("http://{addr}/v1"));
+    let wait_timeout = u64::MAX.to_string();
 
     let output = run_cli_with_stdin(
         home.path(),
@@ -270,7 +271,7 @@ async fn test_ingest_wait_returns_drawer_id() {
             "--no-gate",
             "--wait",
             "--wait-timeout-secs",
-            "30",
+            wait_timeout.as_str(),
         ],
         br#"{"content":"cli wait content"}"#,
     );
@@ -333,11 +334,18 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
 
     let operation_id =
         enqueue_prepared_operation(&db_path, "wait cli content", "mcp", Some("wait"));
+    let wait_timeout = u64::MAX.to_string();
 
     handle.pause();
     let child = spawn_cli(
         home.path(),
-        &["operation", "wait", &operation_id, "--timeout-secs", "30"],
+        &[
+            "operation",
+            "wait",
+            &operation_id,
+            "--timeout-secs",
+            wait_timeout.as_str(),
+        ],
     );
     tokio::time::sleep(Duration::from_millis(150)).await;
 

@@ -3840,7 +3840,7 @@ async fn wait_for_operation_status_with_progress(
     timeout: std::time::Duration,
     poll_interval: std::time::Duration,
 ) -> Result<Option<IngestResponse>> {
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = std::time::Instant::now() + clamp_wait_timeout(timeout);
     loop {
         let response = server
             .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
@@ -3871,6 +3871,12 @@ async fn wait_for_operation_status_with_progress(
         );
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+const MAX_WAIT_TIMEOUT_SECS: u64 = 86_400;
+
+fn clamp_wait_timeout(timeout: std::time::Duration) -> std::time::Duration {
+    timeout.min(std::time::Duration::from_secs(MAX_WAIT_TIMEOUT_SECS))
 }
 
 async fn operation_command(
