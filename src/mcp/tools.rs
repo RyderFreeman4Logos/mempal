@@ -1578,6 +1578,8 @@ pub struct IngestRequest {
     pub wing: String,
     pub room: Option<String>,
     pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
     pub source_type: Option<String>,
     pub confidence: Option<f64>,
     pub project_id: Option<String>,
@@ -1597,6 +1599,14 @@ pub struct IngestRequest {
     /// If true, return the drawer_id that WOULD be created without actually
     /// writing to the database. Use this to preview before committing.
     pub dry_run: Option<bool>,
+
+    /// If true, wait for the durable ingest operation to reach a terminal
+    /// state before returning. Defaults to false.
+    pub wait: Option<bool>,
+
+    /// Maximum number of seconds to wait for `wait=true` before returning
+    /// the queued receipt with `timed_out=true`. Defaults to 30.
+    pub wait_timeout_secs: Option<u64>,
 
     /// If true, append this entry to one agent-diary drawer for the current
     /// UTC day. Requires wing="agent-diary" and an explicit room.
@@ -1633,6 +1643,14 @@ pub struct IngestRequest {
     pub anchor_id: Option<String>,
     pub parent_anchor_id: Option<String>,
     pub cwd: Option<String>,
+}
+
+/// Internal ingest overrides used by trusted local callers.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IngestControls {
+    pub no_gate: bool,
+    pub bypass_novelty: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -1791,6 +1809,11 @@ pub struct IngestResponse {
     /// ingests; omitted for dry-run previews.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<IngestOperationState>,
+    /// True when `wait=true` timed out before the operation reached a
+    /// terminal state. The queued receipt remains pollable via
+    /// `mempal_operation_status`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_out: bool,
     /// ID of the first (or only) drawer created once the ingest completes.
     /// Empty while queued/running and for rejection/failure outcomes without
     /// stored drawers.
@@ -1826,6 +1849,10 @@ pub struct IngestResponse {
     pub rejected_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_detail: Option<String>,
+    /// Per-stage elapsed milliseconds captured by the async ingest pipeline.
+    /// Present on completed receipt-backed writes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub timings: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fact_check_warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1834,6 +1861,10 @@ pub struct IngestResponse {
 
 fn is_zero(v: &usize) -> bool {
     *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

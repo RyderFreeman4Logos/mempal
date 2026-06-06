@@ -97,7 +97,10 @@ use mempal::knowledge_gate::{
 use mempal::knowledge_lifecycle::{
     DemoteRequest, PromoteRequest, demote_knowledge, promote_knowledge,
 };
-use mempal::mcp::MempalMcpServer;
+use mempal::mcp::{
+    IngestControls, IngestOperationState, IngestRequest, IngestResponse, MempalMcpServer,
+    OperationStatusRequest,
+};
 use mempal::observability;
 use mempal::search::{SearchFilters, SearchOptions, search_with_all_options};
 use mempal::sleep::{
@@ -152,6 +155,8 @@ struct IngestCommandOptions<'a> {
     json: bool,
     no_strip_noise: bool,
     diary_rollup: bool,
+    wait: bool,
+    wait_timeout_secs: Option<u64>,
     source_type: Option<&'a str>,
     memory_kind: Option<&'a str>,
     domain: Option<&'a str>,
@@ -284,6 +289,10 @@ enum Commands {
         dry_run: bool,
         #[arg(long)]
         json: bool,
+        #[arg(long, default_value_t = false)]
+        wait: bool,
+        #[arg(long = "wait-timeout-secs")]
+        wait_timeout_secs: Option<u64>,
         #[arg(long)]
         no_strip_noise: bool,
         #[arg(long)]
@@ -308,6 +317,11 @@ enum Commands {
         valid_from: Option<String>,
         #[arg(long = "valid-until")]
         valid_until: Option<String>,
+    },
+    /// Inspect or wait for a receipt-backed ingest operation.
+    Operation {
+        #[command(subcommand)]
+        command: OperationCommands,
     },
     /// Index a Claude Code session JSONL transcript as searchable conversation memory.
     /// Wing is always "conversation"; room defaults to the sessionId field or filename stem.
@@ -1001,6 +1015,18 @@ enum Commands {
         query: String,
         #[arg(long, default_value = "plain")]
         format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum OperationCommands {
+    /// Print the current status of a receipt-backed ingest operation.
+    Status { operation_id: String },
+    /// Block until a receipt-backed ingest operation reaches a terminal state.
+    Wait {
+        operation_id: String,
+        #[arg(long = "timeout-secs", default_value_t = 30)]
+        timeout_secs: u64,
     },
 }
 
@@ -2387,6 +2413,8 @@ fn run() -> Result<()> {
             no_gate,
             dry_run,
             json,
+            wait,
+            wait_timeout_secs,
             no_strip_noise,
             diary_rollup,
             source_type,
@@ -2412,6 +2440,8 @@ fn run() -> Result<()> {
                 no_gate,
                 dry_run,
                 json,
+                wait,
+                wait_timeout_secs,
                 no_strip_noise,
                 diary_rollup,
                 source_type: source_type.as_deref(),
@@ -2426,6 +2456,9 @@ fn run() -> Result<()> {
                 valid_until: valid_until.as_deref(),
             },
         )),
+        Commands::Operation { command } => {
+            block_on_result(operation_command(&db, config.as_ref(), command))
+        }
         Commands::IngestConversation { .. } => {
             eprintln!(
                 "error: `mempal ingest-conversation` was removed in P16.\n\
@@ -3257,6 +3290,81 @@ struct StdinIngestRecord {
 
 const MAX_STDIN_INGEST_BYTES: usize = 10 * 1024 * 1024;
 
+#[derive(Debug)]
+struct ResolvedStdinIngest {
+    content: String,
+    wing: String,
+    room: Option<String>,
+    source: Option<String>,
+    source_file: Option<String>,
+    project_id: Option<String>,
+    source_type: SourceType,
+    confidence: f64,
+    supersedes: Option<String>,
+    replace_text: Option<String>,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+    memory_kind: MemoryKind,
+    domain: MemoryDomain,
+    field: String,
+    is_pinned: bool,
+    no_gate: bool,
+    raw_turn: bool,
+    drawer_importance: i32,
+    cwd: Option<PathBuf>,
+    bypass_novelty: bool,
+}
+
+impl ResolvedStdinIngest {
+    fn source_hint(&self) -> Option<&str> {
+        self.source_file.as_deref().or(self.source.as_deref())
+    }
+
+    fn source_file_for_drawer(drawer_id: &str, source_hint: Option<&str>) -> String {
+        source_file_or_synthetic(drawer_id, source_hint)
+    }
+
+    fn wait_request(&self, wait_timeout_secs: u64) -> IngestRequest {
+        IngestRequest {
+            content: self.content.clone(),
+            wing: self.wing.clone(),
+            room: self.room.clone(),
+            source: self.source.clone(),
+            source_file: self.source_file.clone(),
+            source_type: Some(self.source_type.to_string()),
+            confidence: Some(self.confidence),
+            project_id: self.project_id.clone(),
+            supersedes: self.supersedes.clone(),
+            replace_text: self.replace_text.clone(),
+            valid_from: self.valid_from.clone(),
+            valid_until: self.valid_until.clone(),
+            dry_run: Some(false),
+            wait: Some(true),
+            wait_timeout_secs: Some(wait_timeout_secs),
+            diary_rollup: Some(false),
+            importance: Some(self.drawer_importance),
+            memory_kind: Some(memory_kind_slug(&self.memory_kind).to_string()),
+            domain: Some(domain_slug(&self.domain).to_string()),
+            field: Some(self.field.clone()),
+            is_pinned: Some(self.is_pinned),
+            provenance: None,
+            statement: None,
+            tier: None,
+            status: None,
+            supporting_refs: None,
+            counterexample_refs: None,
+            teaching_refs: None,
+            verification_refs: None,
+            scope_constraints: None,
+            trigger_hints: None,
+            anchor_kind: None,
+            anchor_id: None,
+            parent_anchor_id: None,
+            cwd: self.cwd.as_ref().map(|path| path.display().to_string()),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct StdinIngestJsonOutput<'a> {
     drawer_ids: &'a [String],
@@ -3289,6 +3397,133 @@ fn exact_duplicate_drawer_id(
         .into_iter()
         .find(|summary| Some(summary.id.as_str()) != excluded_drawer_id)
         .map(|summary| summary.id))
+}
+
+struct ExactDuplicateStdinIngest<'a> {
+    db: &'a Database,
+    wing: &'a str,
+    json: bool,
+    record: &'a StdinIngestRecord,
+    stats: &'a mut IngestStats,
+    drawer_id: &'a str,
+    is_pinned: bool,
+    superseded_drawer_id: Option<&'a str>,
+}
+
+fn finalize_exact_duplicate_stdin_ingest(ctx: ExactDuplicateStdinIngest<'_>) -> Result<()> {
+    let ExactDuplicateStdinIngest {
+        db,
+        wing,
+        json,
+        record,
+        stats,
+        drawer_id,
+        is_pinned,
+        superseded_drawer_id,
+    } = ctx;
+    if is_pinned {
+        db.pin_drawer(drawer_id, None)
+            .with_context(|| format!("failed to pin duplicate drawer {drawer_id}"))?;
+    }
+    stats.skipped = 1;
+    stats.drawer_ids = vec![drawer_id.to_string()];
+    if let Some(old_id) = superseded_drawer_id {
+        db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
+            .with_context(|| format!("failed to supersede drawer {old_id}"))?;
+        stats.superseded_drawer_id = Some(old_id.to_string());
+    }
+    append_ingest_stdin_audit_log(db, wing, false, record, stats)
+        .context("failed to append ingest audit log")?;
+    print_stdin_ingest_output(json, false, stats)?;
+    Ok(())
+}
+
+fn resolve_stdin_ingest(
+    config: &Config,
+    options: &IngestCommandOptions<'_>,
+    record: &StdinIngestRecord,
+    content: String,
+    wing: String,
+    room: Option<String>,
+) -> Result<ResolvedStdinIngest> {
+    let source = record.source.clone();
+    let source_file = record.source_file.clone();
+    let project = options.project.or(record.project.as_deref());
+    let supersedes = options
+        .supersedes
+        .or(record.supersedes.as_deref())
+        .map(ToOwned::to_owned);
+    let replace_text = options
+        .replace_text
+        .or(record.replace_text.as_deref())
+        .map(ToOwned::to_owned);
+    let source_type = parse_source_type_bound(
+        "source_type",
+        options.source_type.or(record.source_type.as_deref()),
+    )?
+    .unwrap_or(SourceType::AgentInference);
+    let memory_kind = parse_memory_kind_bound(
+        "memory_kind",
+        options.memory_kind.or(record.memory_kind.as_deref()),
+    )?
+    .unwrap_or(MemoryKind::Evidence);
+    let domain = options
+        .domain
+        .or(record.domain.as_deref())
+        .map(parse_domain)
+        .transpose()
+        .context("failed to parse stdin ingest domain")?
+        .unwrap_or(MemoryDomain::Project);
+    let field = options
+        .field
+        .or(record.field.as_deref())
+        .unwrap_or("general")
+        .to_string();
+    let is_pinned = options.is_pinned || record.is_pinned.unwrap_or(false);
+    let confidence = resolve_confidence_bound(
+        "confidence",
+        source_type,
+        options.confidence.or(record.confidence),
+    )?;
+    let valid_from = validate_temporal_bound(
+        "valid_from",
+        options.valid_from.or(record.valid_from.as_deref()),
+    )?
+    .map(ToOwned::to_owned);
+    let valid_until = validate_temporal_bound(
+        "valid_until",
+        options.valid_until.or(record.valid_until.as_deref()),
+    )?
+    .map(ToOwned::to_owned);
+    let cwd = env::current_dir().ok();
+    let project_id = resolve_project_id(project, config, cwd.as_deref())
+        .context("failed to resolve stdin ingest project id")?;
+    let raw_turn = is_raw_turn(&wing, room.as_deref(), &config.turns);
+    let drawer_importance = raw_turn_importance(&wing, room.as_deref(), &config.turns).unwrap_or(0);
+
+    Ok(ResolvedStdinIngest {
+        content,
+        wing,
+        room,
+        source,
+        source_file,
+        project_id,
+        source_type,
+        confidence,
+        supersedes,
+        replace_text,
+        valid_from,
+        valid_until,
+        memory_kind,
+        domain,
+        field,
+        is_pinned,
+        no_gate: options.no_gate,
+        raw_turn,
+        drawer_importance,
+        cwd,
+        bypass_novelty: true,
+    })
 }
 
 fn validate_temporal_bound<'a>(field: &str, value: Option<&'a str>) -> Result<Option<&'a str>> {
@@ -3376,71 +3611,35 @@ async fn ingest_stdin_command(
     let wing = options
         .wing
         .or(record.wing.as_deref())
-        .context("stdin ingest requires --wing or JSON `wing`")?;
-    let room = options.room.or(record.room.as_deref());
-    let project = options.project.or(record.project.as_deref());
-    let supersedes = options.supersedes.or(record.supersedes.as_deref());
-    let replace_text = options.replace_text.or(record.replace_text.as_deref());
-    let source_type = parse_source_type_bound(
-        "source_type",
-        options.source_type.or(record.source_type.as_deref()),
-    )?
-    .unwrap_or(SourceType::AgentInference);
-    let memory_kind = parse_memory_kind_bound(
-        "memory_kind",
-        options.memory_kind.or(record.memory_kind.as_deref()),
-    )?
-    .unwrap_or(MemoryKind::Evidence);
-    let domain = options
-        .domain
-        .or(record.domain.as_deref())
-        .map(parse_domain)
-        .transpose()
-        .context("failed to parse stdin ingest domain")?
-        .unwrap_or(MemoryDomain::Project);
-    let field = options
-        .field
-        .or(record.field.as_deref())
-        .unwrap_or("general");
-    let is_pinned = options.is_pinned || record.is_pinned.unwrap_or(false);
-    let confidence = resolve_confidence_bound(
-        "confidence",
-        source_type,
-        options.confidence.or(record.confidence),
-    )?;
-    let valid_from = validate_temporal_bound(
-        "valid_from",
-        options.valid_from.or(record.valid_from.as_deref()),
-    )?;
-    let valid_until = validate_temporal_bound(
-        "valid_until",
-        options.valid_until.or(record.valid_until.as_deref()),
-    )?;
-    let raw_turn = is_raw_turn(wing, room, &config.turns);
+        .context("stdin ingest requires --wing or JSON `wing`")?
+        .to_string();
+    let room = options
+        .room
+        .or(record.room.as_deref())
+        .map(ToOwned::to_owned);
+    let resolved = resolve_stdin_ingest(config, &options, &record, content, wing, room)?;
     let mut stats = IngestStats {
         files: 1,
         ..IngestStats::default()
     };
-    if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
+    if resolved.raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
         stats.skipped = 1;
         print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
         return Ok(());
     }
-    let drawer_importance = raw_turn_importance(wing, room, &config.turns).unwrap_or(0);
     let (privacy_config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
-    let scrubbed_replace_text = replace_text
+    let scrubbed_replace_text = resolved
+        .replace_text
+        .as_deref()
         .map(|text| privacy_config.scrub_content_with_compiled(text, compiled_privacy.as_ref()));
-    let cwd = env::current_dir().ok();
-    let project_id = resolve_project_id(project, config, cwd.as_deref())
-        .context("failed to resolve stdin ingest project id")?;
 
     let replacement_target = db
         .resolve_replacement_target(
-            supersedes,
+            resolved.supersedes.as_deref(),
             scrubbed_replace_text.as_deref(),
-            wing,
-            room,
-            project_id.as_deref(),
+            &resolved.wing,
+            resolved.room.as_deref(),
+            resolved.project_id.as_deref(),
         )
         .context("failed to resolve replacement target")?;
     let superseded_drawer_id = replacement_target
@@ -3449,48 +3648,116 @@ async fn ingest_stdin_command(
     let superseded_drawer_id_ref = superseded_drawer_id.as_deref();
     let exact_duplicate = exact_duplicate_drawer_id(
         db,
-        &content,
-        wing,
-        room,
-        project_id.as_deref(),
+        &resolved.content,
+        &resolved.wing,
+        resolved.room.as_deref(),
+        resolved.project_id.as_deref(),
         superseded_drawer_id_ref,
     )
     .context("failed to check exact duplicate")?;
     let drawer_id = if let Some(existing_id) = exact_duplicate.as_ref() {
         existing_id.clone()
     } else {
-        let preferred_id = build_bootstrap_evidence_drawer_id(wing, room, &content, &source_type);
+        let preferred_id = build_bootstrap_evidence_drawer_id(
+            &resolved.wing,
+            resolved.room.as_deref(),
+            &resolved.content,
+            &resolved.source_type,
+        );
         db.resolve_available_drawer_id(&preferred_id)
             .with_context(|| format!("failed to resolve drawer id for {preferred_id}"))?
     };
     if options.dry_run {
         stats.chunks = 1;
         stats.drawer_ids.push(drawer_id.clone());
-        append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
+        append_ingest_stdin_audit_log(db, &resolved.wing, options.dry_run, &record, &stats)
             .context("failed to append ingest audit log")?;
         print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
         return Ok(());
+    }
+
+    // Exact duplicates are a local no-op. Keep `--wait` on the same
+    // terminal stats/audit path as the direct stdin ingest instead of
+    // queueing a receipt that would report different skip semantics.
+    if options.wait && exact_duplicate.is_some() {
+        finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
+            db,
+            wing: &resolved.wing,
+            json: options.json,
+            record: &record,
+            stats: &mut stats,
+            drawer_id: &drawer_id,
+            is_pinned: resolved.is_pinned,
+            superseded_drawer_id: superseded_drawer_id.as_deref(),
+        })?;
+        return Ok(());
+    }
+
+    if options.wait {
+        let wait_request = resolved.wait_request(options.wait_timeout_secs.unwrap_or(30));
+        let controls = IngestControls {
+            no_gate: resolved.no_gate,
+            bypass_novelty: resolved.bypass_novelty,
+        };
+        let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone());
+        let response = server
+            .mempal_ingest_with_controls(wait_request, controls)
+            .await
+            .map(|response| response.0)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if response.timed_out {
+            print_operation_response(&response)?;
+            bail!(
+                "timed out waiting for ingest operation {}",
+                response.operation_id.as_deref().unwrap_or("")
+            );
+        }
+
+        let mut wait_stats = ingest_stdin_wait_stats_from_response(&response);
+        match response.state {
+            Some(IngestOperationState::Completed) => {
+                append_ingest_stdin_audit_log(db, &resolved.wing, false, &record, &wait_stats)
+                    .context("failed to append ingest audit log")?;
+                print_stdin_ingest_output(options.json, false, &wait_stats)?;
+                return Ok(());
+            }
+            Some(IngestOperationState::Rejected) => {
+                wait_stats.drawer_ids.clear();
+                append_ingest_stdin_audit_log(db, &resolved.wing, false, &record, &wait_stats)
+                    .context("failed to append ingest audit log")?;
+                print_stdin_ingest_output(options.json, false, &wait_stats)?;
+                return Ok(());
+            }
+            Some(IngestOperationState::Failed) => {
+                print_stdin_ingest_output(options.json, false, &wait_stats)?;
+                bail!(
+                    "ingest operation {} failed: {}",
+                    response.operation_id.as_deref().unwrap_or(""),
+                    response.failure_detail.as_deref().unwrap_or("failed")
+                );
+            }
+            _ => {
+                print_operation_response(&response)?;
+                return Ok(());
+            }
+        }
     }
 
     if exact_duplicate.is_some() {
-        if is_pinned {
-            db.pin_drawer(&drawer_id, None)
-                .with_context(|| format!("failed to pin duplicate drawer {drawer_id}"))?;
-        }
-        stats.skipped = 1;
-        stats.drawer_ids.push(drawer_id.clone());
-        if let Some(old_id) = superseded_drawer_id.as_deref() {
-            db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
-                .with_context(|| format!("failed to supersede drawer {old_id}"))?;
-            stats.superseded_drawer_id = Some(old_id.to_string());
-        }
-        append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
-            .context("failed to append ingest audit log")?;
-        print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
+        finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
+            db,
+            wing: &resolved.wing,
+            json: options.json,
+            record: &record,
+            stats: &mut stats,
+            drawer_id: &drawer_id,
+            is_pinned: resolved.is_pinned,
+            superseded_drawer_id: superseded_drawer_id.as_deref(),
+        })?;
         return Ok(());
     }
 
-    let prototype_classifier = if config.ingest_gating.enabled && !options.no_gate {
+    let prototype_classifier = if config.ingest_gating.enabled && !resolved.no_gate {
         compile_classifier_from_config(config)
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))
@@ -3500,9 +3767,9 @@ async fn ingest_stdin_command(
     };
     let embedder = build_embedder(config).await?;
 
-    if !options.no_gate {
+    if !resolved.no_gate {
         let candidate = IngestCandidate {
-            content: content.clone(),
+            content: resolved.content.clone(),
             event: None,
             tool_name: None,
             exit_code: None,
@@ -3521,32 +3788,39 @@ async fn ingest_stdin_command(
             gating_decision = Some(tier2.decision);
         }
         if let Some(decision) = gating_decision.as_ref() {
-            db.record_gating_audit(&drawer_id, decision, project_id.as_deref(), Some(&content))
-                .with_context(|| format!("failed to record gating audit for {drawer_id}"))?;
+            db.record_gating_audit(
+                &drawer_id,
+                decision,
+                resolved.project_id.as_deref(),
+                Some(&resolved.content),
+            )
+            .with_context(|| format!("failed to record gating audit for {drawer_id}"))?;
             if decision.is_rejected() {
                 stats.dropped_by_gate = 1;
-                append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
+                stats.drawer_ids.clear();
+                append_ingest_stdin_audit_log(db, &resolved.wing, options.dry_run, &record, &stats)
                     .context("failed to append ingest audit log")?;
                 print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
                 return Ok(());
             }
         }
 
-        if !raw_turn
+        if !resolved.raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
                 &drawer_id,
-                &content,
+                &resolved.content,
                 db,
-                project_id.as_deref(),
+                resolved.project_id.as_deref(),
                 &config.ingest_gating.fact_check,
-                confidence,
+                resolved.confidence,
             )
             .with_context(|| format!("failed to record fact-check gate audit for {drawer_id}"))?
         {
             stats.fact_check_warnings.extend(outcome.warnings);
             if outcome.decision.is_rejected() {
                 stats.dropped_by_gate = 1;
-                append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
+                stats.drawer_ids.clear();
+                append_ingest_stdin_audit_log(db, &resolved.wing, options.dry_run, &record, &stats)
                     .context("failed to append ingest audit log")?;
                 print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
                 return Ok(());
@@ -3554,7 +3828,7 @@ async fn ingest_stdin_command(
         }
     }
 
-    let texts = [content.as_str()];
+    let texts = [resolved.content.as_str()];
     let vectors = embedder
         .embed(&texts)
         .await
@@ -3565,47 +3839,44 @@ async fn ingest_stdin_command(
         .context("embedder returned no vector for stdin content")?;
     let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
     let scrub = |s: &str| config.scrub_content_with_compiled(s, compiled_privacy.as_ref());
-    let source_hint = record
-        .source_file
-        .as_deref()
-        .or(record.source.as_deref())
-        .map(&scrub);
-    let source_file = source_file_or_synthetic(&drawer_id, source_hint.as_deref());
+    let source_hint = resolved.source_hint().map(&scrub);
+    let source_file =
+        ResolvedStdinIngest::source_file_for_drawer(&drawer_id, source_hint.as_deref());
 
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: drawer_id.clone(),
-        content,
-        wing: wing.to_string(),
-        room: room.map(ToOwned::to_owned),
+        content: resolved.content,
+        wing: resolved.wing.clone(),
+        room: resolved.room.clone(),
         source_file: Some(source_file),
-        source_type,
+        source_type: resolved.source_type,
         added_at: iso_timestamp(),
         chunk_index: Some(0),
-        importance: drawer_importance,
+        importance: resolved.drawer_importance,
     });
     let drawer = Drawer {
-        confidence,
+        confidence: resolved.confidence,
         normalize_version: CURRENT_NORMALIZE_VERSION,
         ..drawer
     };
     let mut drawer = drawer;
-    drawer.memory_kind = memory_kind;
-    drawer.domain = domain;
-    drawer.field = field.to_string();
-    drawer.is_pinned = is_pinned;
+    drawer.memory_kind = resolved.memory_kind;
+    drawer.domain = resolved.domain;
+    drawer.field = resolved.field;
+    drawer.is_pinned = resolved.is_pinned;
     if let Some(old_id) = superseded_drawer_id.as_deref() {
         link_superseded_drawer(&mut drawer, old_id);
     }
 
     db.insert_drawer_with_project_validity(
         &drawer,
-        project_id.as_deref(),
+        resolved.project_id.as_deref(),
         None,
-        valid_from,
-        valid_until,
+        resolved.valid_from.as_deref(),
+        resolved.valid_until.as_deref(),
     )
     .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
-    db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
+    db.insert_vector_with_project(&drawer_id, &vector, resolved.project_id.as_deref())
         .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
 
     if let Some(old_id) = superseded_drawer_id.as_deref() {
@@ -3622,9 +3893,9 @@ async fn ingest_stdin_command(
                 db.path(),
                 &drawer_id,
                 &drawer.content,
-                wing,
-                room,
-                project_id.as_deref(),
+                &resolved.wing,
+                resolved.room.as_deref(),
+                resolved.project_id.as_deref(),
                 &config_snap.repair,
             );
         }
@@ -3632,7 +3903,7 @@ async fn ingest_stdin_command(
 
     stats.chunks = 1;
     stats.drawer_ids.push(drawer_id);
-    append_ingest_stdin_audit_log(db, wing, options.dry_run, &record, &stats)
+    append_ingest_stdin_audit_log(db, &resolved.wing, options.dry_run, &record, &stats)
         .context("failed to append ingest audit log")?;
     print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
     Ok(())
@@ -3695,6 +3966,170 @@ fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> 
 fn print_fact_check_warnings(warnings: &[String]) {
     for warning in warnings {
         eprintln!("{warning}");
+    }
+}
+
+fn print_operation_response(response: &IngestResponse) -> Result<()> {
+    println!(
+        "operation_id={}",
+        response.operation_id.as_deref().unwrap_or("")
+    );
+    println!(
+        "state={}",
+        response.state.map(|state| state.as_str()).unwrap_or("")
+    );
+    println!("timed_out={}", response.timed_out);
+    println!("drawer_id={}", response.drawer_id);
+    if !response.drawer_ids.is_empty() {
+        println!("drawer_ids={}", response.drawer_ids.join(","));
+    }
+    println!("chunk_count={}", response.chunk_count);
+    println!("dropped={}", response.dropped);
+    if let Some(accepted_at) = response.accepted_at.as_deref() {
+        println!("accepted_at={accepted_at}");
+    }
+    if let Some(rejected_reason) = response.rejected_reason.as_deref() {
+        println!("rejected_reason={rejected_reason}");
+    }
+    if let Some(failure_detail) = response.failure_detail.as_deref() {
+        println!("failure_detail={failure_detail}");
+    }
+    println!(
+        "timings={}",
+        serde_json::to_string(&response.timings).context("failed to serialize timings")?
+    );
+    Ok(())
+}
+
+fn ingest_stdin_wait_stats_from_response(response: &IngestResponse) -> IngestStats {
+    let mut stats = IngestStats {
+        files: 1,
+        chunks: if response.dropped {
+            0
+        } else {
+            response.chunk_count
+        },
+        dropped_by_gate: if response.dropped { 1 } else { 0 },
+        ..IngestStats::default()
+    };
+    stats.drawer_ids = if response.drawer_ids.is_empty() && !response.drawer_id.is_empty() {
+        vec![response.drawer_id.clone()]
+    } else {
+        response.drawer_ids.clone()
+    };
+    stats.fact_check_warnings = response.fact_check_warnings.clone();
+    stats.superseded_drawer_id = response.superseded_drawer_id.clone();
+    stats
+}
+
+async fn wait_for_operation_status_with_progress(
+    server: &MempalMcpServer,
+    operation_id: &str,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<Option<IngestResponse>> {
+    let deadline = std::time::Instant::now() + clamp_wait_timeout(timeout);
+    loop {
+        let response = server
+            .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
+                OperationStatusRequest {
+                    operation_id: operation_id.to_string(),
+                },
+            ))
+            .await
+            .context("failed to load operation status")?
+            .0;
+        if response
+            .state
+            .map(IngestOperationState::is_terminal)
+            .unwrap_or(false)
+        {
+            return Ok(Some(response));
+        }
+        if timeout.is_zero() || std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        eprintln!(
+            "waiting operation_id={} state={}",
+            operation_id,
+            response
+                .state
+                .map(|state| state.as_str())
+                .unwrap_or("unknown")
+        );
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+const MAX_WAIT_TIMEOUT_SECS: u64 = 86_400;
+
+fn clamp_wait_timeout(timeout: std::time::Duration) -> std::time::Duration {
+    timeout.min(std::time::Duration::from_secs(MAX_WAIT_TIMEOUT_SECS))
+}
+
+async fn operation_command(
+    db: &Database,
+    config: &Config,
+    command: OperationCommands,
+) -> Result<()> {
+    let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone());
+    match command {
+        OperationCommands::Status { operation_id } => {
+            let response = server
+                .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
+                    OperationStatusRequest { operation_id },
+                ))
+                .await
+                .context("failed to load operation status")?
+                .0;
+            print_operation_response(&response)?;
+            Ok(())
+        }
+        OperationCommands::Wait {
+            operation_id,
+            timeout_secs,
+        } => {
+            eprintln!(
+                "waiting for operation_id={} timeout_secs={timeout_secs}",
+                operation_id
+            );
+            match wait_for_operation_status_with_progress(
+                &server,
+                &operation_id,
+                std::time::Duration::from_secs(timeout_secs),
+                std::time::Duration::from_millis(150),
+            )
+            .await?
+            {
+                Some(response) => {
+                    print_operation_response(&response)?;
+                    match response.state {
+                        Some(IngestOperationState::Completed) => Ok(()),
+                        Some(IngestOperationState::Rejected) => {
+                            bail!("operation {operation_id} was rejected")
+                        }
+                        Some(IngestOperationState::Failed) => {
+                            bail!("operation {operation_id} failed")
+                        }
+                        _ => Ok(()),
+                    }
+                }
+                None => {
+                    let mut response = server
+                        .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
+                            OperationStatusRequest {
+                                operation_id: operation_id.clone(),
+                            },
+                        ))
+                        .await
+                        .context("failed to load timed-out operation status")?
+                        .0;
+                    response.timed_out = true;
+                    print_operation_response(&response)?;
+                    bail!("timed out waiting for operation {operation_id}")
+                }
+            }
+        }
     }
 }
 

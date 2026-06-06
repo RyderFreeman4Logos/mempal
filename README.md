@@ -97,15 +97,16 @@ api_model = "nomic-embed-text"
 
 > **Heads-up — two different `xurl`s.** `mempal xurl` is a mempal subcommand: an `ingest` / `search` / `timeline` / `stats` / `reindex` / `backfill` pipeline over agent session transcripts. It is **not** the standalone `xurl` CLI (Xuanwo's "Resolve and read code-agent threads", invoked as `xurl …` with `agents://` URIs). The two are independent projects that happen to share a name — neither is an alias for the other.
 
-## MCP Server (10 tools)
+## MCP Server (11 tools)
 
 `mempal serve --mcp` exposes these tools via Model Context Protocol:
 
 | Tool | Purpose |
 |------|---------|
 | `mempal_status` | State + protocol + AAAK spec (teaches agent on first call) |
+| `mempal_operation_status` | Poll a receipt-backed ingest op; returns drawer_id / rejection / failure and timing breakdowns when available |
 | `mempal_search` | Hybrid search with tunnel hints, citations, and AAAK-derived structured signals |
-| `mempal_ingest` | Store memories with optional importance (0-5) and dry_run; reports `lock_wait_ms` when concurrent ingest was observed |
+| `mempal_ingest` | Store memories with optional importance (0-5), dry_run, and receipt-based `wait` / `wait_timeout_secs`; reports `lock_wait_ms` when concurrent ingest was observed and can be polled via `mempal_operation_status` |
 | `mempal_delete` | Soft-delete with audit trail |
 | `mempal_taxonomy` | List or edit routing keywords |
 | `mempal_kg` | Knowledge graph: add/query/invalidate/timeline/stats |
@@ -115,6 +116,13 @@ api_model = "nomic-embed-text"
 | `mempal_fact_check` | Offline contradiction detection vs KG triples + known entities (similar-name, relation mismatch, stale facts) |
 
 The server embeds MEMORY_PROTOCOL (11 behavioral rules) in the MCP `initialize.instructions` field. Any MCP client learns the workflow automatically.
+
+## Write Guidance
+
+- Passive or low-risk diary writes: use `mempal_ingest` with the default fire-and-forget receipt path, or `mempal ingest --stdin` without `--wait`.
+- Load-bearing decisions: use `mempal_ingest` with `wait=true` or CLI `mempal ingest --stdin --wait [--wait-timeout-secs N]` so you block until the write is terminal.
+- User-facing capture: always surface rejected or failed reasons instead of only returning a queued receipt.
+- Receipt polling: use `mempal_operation_status` or CLI `mempal operation status <operation_id>`; both include `timings` when the ingest has completed.
 
 ## Memory Protocol
 

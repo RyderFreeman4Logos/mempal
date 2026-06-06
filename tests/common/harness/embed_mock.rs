@@ -42,6 +42,7 @@ struct Inner {
     /// When set, only requests whose input contains this marker fail (with
     /// `fail_mode`). Models one persistently-failing batch among healthy ones.
     fail_if_contains: Mutex<Option<String>>,
+    embedding_fill: Mutex<f32>,
     per_item_dims: Mutex<Option<Vec<u32>>>,
     request_count: AtomicU32,
     request_times: Mutex<Vec<Duration>>,
@@ -86,6 +87,12 @@ impl MockEmbedHandle {
         *self.inner.fail_if_contains.lock().await = marker;
     }
 
+    /// Set the constant value used to populate every embedding element.
+    /// Defaults to `0.0`, which preserves the previous zero-vector mock.
+    pub async fn set_embedding_fill(&self, value: f32) {
+        *self.inner.embedding_fill.lock().await = value;
+    }
+
     pub fn request_count(&self) -> u32 {
         self.inner.request_count.load(Ordering::SeqCst)
     }
@@ -114,6 +121,7 @@ pub async fn start(port: u16) -> Result<(SocketAddr, MockEmbedHandle)> {
         fail_first_n: AtomicU32::new(0),
         fail_first_n_armed: AtomicBool::new(false),
         fail_if_contains: Mutex::new(None),
+        embedding_fill: Mutex::new(0.0),
         per_item_dims: Mutex::new(None),
         request_count: AtomicU32::new(0),
         request_times: Mutex::new(Vec::new()),
@@ -241,6 +249,7 @@ async fn handle_request(
     }
 
     let default_dim = inner.dim.load(Ordering::SeqCst) as usize;
+    let embedding_fill = *inner.embedding_fill.lock().await;
     let per_item_dims = inner.per_item_dims.lock().await.clone();
     let data = (0..count)
         .map(|index| {
@@ -248,7 +257,7 @@ async fn handle_request(
                 .as_ref()
                 .and_then(|dims| dims.get(index).copied())
                 .unwrap_or(default_dim as u32) as usize;
-            let embedding = vec![0.0_f32; dim];
+            let embedding = vec![embedding_fill; dim];
             json!({
                 "index": index,
                 "embedding": embedding,

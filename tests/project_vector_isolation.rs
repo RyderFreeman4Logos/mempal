@@ -346,6 +346,27 @@ fn run_mempal_in_dir(home: &Path, cwd: &Path, args: &[&str]) -> Output {
         .expect("run mempal")
 }
 
+fn run_mempal_in_dir_with_stdin(home: &Path, cwd: &Path, args: &[&str], payload: &[u8]) -> Output {
+    use std::io::Write as _;
+
+    let mut child = Command::new(mempal_bin())
+        .args(args)
+        .env("HOME", home)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mempal");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload)
+        .expect("write stdin");
+    child.wait_with_output().expect("wait mempal")
+}
+
 fn expected_project_id(path: &Path) -> String {
     expected_project_id_for_path(path).expect("expected project id from path")
 }
@@ -355,6 +376,17 @@ fn expected_project_id_for_path(path: &Path) -> Option<String> {
     canonical
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
+}
+
+fn latest_drawer_project_id(db_path: &Path) -> Option<String> {
+    let db = Database::open(db_path).expect("open db");
+    db.conn()
+        .query_row(
+            "SELECT project_id FROM drawers ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("read stored project id")
 }
 
 fn drawer_project_ids(conn: &Connection, table: &str) -> Vec<Option<String>> {
@@ -2251,6 +2283,96 @@ async fn test_ingest_with_project_id_persists() {
         .expect("read stored project");
     assert_eq!(stored.as_deref(), Some("foo"));
     handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_wait_stores_project_id_from_cwd() {
+    let direct_tmp = TempDir::new().expect("tempdir");
+    let wait_tmp = TempDir::new().expect("tempdir");
+    let direct_home = install_cli_home(&direct_tmp);
+    let wait_home = install_cli_home(&wait_tmp);
+    let direct_db_path = direct_home.join(".mempal").join("palace.db");
+    let wait_db_path = wait_home.join(".mempal").join("palace.db");
+    let direct_project_dir = direct_tmp.path().join("workspace").join("delta");
+    let wait_project_dir = wait_tmp.path().join("workspace").join("delta");
+    fs::create_dir_all(&direct_project_dir).expect("create direct project dir");
+    fs::create_dir_all(&wait_project_dir).expect("create wait project dir");
+    let expected = expected_project_id(&direct_project_dir);
+    let payload = serde_json::json!({
+        "content": "ingest wait project scope",
+        "source": "csa-session",
+        "source_file": "csa://session/project-scope",
+        "source_type": "user_explicit"
+    })
+    .to_string();
+
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    for db_path in [&direct_db_path, &wait_db_path] {
+        write_config_atomic(
+            &db_path.parent().expect("db parent").join("config.toml"),
+            &cli_embed_config(db_path, &format!("http://{addr}/v1"), None),
+        );
+    }
+
+    let direct_output = run_mempal_in_dir_with_stdin(
+        &direct_home,
+        &direct_project_dir,
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "code",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+        ],
+        payload.as_bytes(),
+    );
+    let wait_timeout = u64::MAX.to_string();
+    let wait_output = run_mempal_in_dir_with_stdin(
+        &wait_home,
+        &wait_project_dir,
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "code",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            wait_timeout.as_str(),
+        ],
+        payload.as_bytes(),
+    );
+
+    handle.shutdown().await;
+
+    assert!(
+        direct_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&direct_output.stdout),
+        String::from_utf8_lossy(&direct_output.stderr)
+    );
+    assert!(
+        wait_output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&wait_output.stdout),
+        String::from_utf8_lossy(&wait_output.stderr)
+    );
+
+    let direct_project_id = latest_drawer_project_id(&direct_db_path);
+    let wait_project_id = latest_drawer_project_id(&wait_db_path);
+    assert_eq!(
+        direct_project_id.as_deref(),
+        Some(expected.as_str()),
+        "non-wait ingest must inherit the cwd project"
+    );
+    assert_eq!(
+        wait_project_id, direct_project_id,
+        "--wait ingest must land in the same resolved project as non-wait ingest"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
