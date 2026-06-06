@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::adoption_analytics::build_runtime_adoption_analytics;
 use crate::brief::brief_from_context;
@@ -434,11 +434,13 @@ impl MempalMcpServer {
         .map(|response| response.0)
     }
 
-    pub async fn wait_for_operation_completion(
+    pub async fn wait_for_operation_status(
         &self,
         operation_id: &str,
-    ) -> std::result::Result<IngestResponse, ErrorData> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> std::result::Result<Option<IngestResponse>, ErrorData> {
+        let deadline = Instant::now() + timeout;
         loop {
             let response = self.operation_status_json_for_test(operation_id).await?;
             if response
@@ -446,15 +448,32 @@ impl MempalMcpServer {
                 .map(IngestOperationState::is_terminal)
                 .unwrap_or(false)
             {
-                return Ok(response);
+                return Ok(Some(response));
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(ErrorData::internal_error(
-                    format!("timed out waiting for ingest operation {operation_id}"),
-                    None,
-                ));
+            if timeout.is_zero() || Instant::now() >= deadline {
+                return Ok(None);
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    pub async fn wait_for_operation_completion(
+        &self,
+        operation_id: &str,
+    ) -> std::result::Result<IngestResponse, ErrorData> {
+        match self
+            .wait_for_operation_status(
+                operation_id,
+                Duration::from_secs(30),
+                Duration::from_millis(150),
+            )
+            .await?
+        {
+            Some(response) => Ok(response),
+            None => Err(ErrorData::internal_error(
+                format!("timed out waiting for ingest operation {operation_id}"),
+                None,
+            )),
         }
     }
 
@@ -2680,12 +2699,15 @@ impl MempalMcpServer {
         // rejects before any success response that would carry this snapshot is built.
         let request_system_warnings = system_warnings_with_stale_index(&db);
         let dry_run = request.dry_run.unwrap_or(false);
+        let wait = request.wait.unwrap_or(false);
+        let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
             return Ok(Json(IngestResponse {
                 operation_id: None,
                 accepted_at: None,
                 state: None,
+                timed_out: false,
                 drawer_id: String::new(),
                 drawer_ids: Vec::new(),
                 chunk_count: 0,
@@ -2698,6 +2720,7 @@ impl MempalMcpServer {
                 superseded_drawer_id: None,
                 rejected_reason: None,
                 failure_detail: None,
+                timings: BTreeMap::new(),
                 fact_check_warnings: Vec::new(),
                 system_warnings: request_system_warnings,
             }));
@@ -2733,10 +2756,11 @@ impl MempalMcpServer {
                 )
             })?;
 
-        Ok(Json(IngestResponse {
+        let queued_response = IngestResponse {
             operation_id: Some(operation_id),
             accepted_at: Some(crate::core::utils::iso_timestamp()),
             state: Some(IngestOperationState::Queued),
+            timed_out: false,
             drawer_id: String::new(),
             drawer_ids: Vec::new(),
             chunk_count: 0,
@@ -2749,9 +2773,32 @@ impl MempalMcpServer {
             superseded_drawer_id: None,
             rejected_reason: None,
             failure_detail: None,
+            timings: BTreeMap::new(),
             fact_check_warnings: Vec::new(),
             system_warnings: request_system_warnings,
-        }))
+        };
+
+        if wait {
+            if let Some(final_response) = self
+                .wait_for_operation_status(
+                    queued_response
+                        .operation_id
+                        .as_deref()
+                        .expect("queued receipt must include operation id"),
+                    Duration::from_secs(wait_timeout_secs),
+                    Duration::from_millis(150),
+                )
+                .await?
+            {
+                return Ok(Json(final_response));
+            }
+
+            let mut timed_out_response = queued_response;
+            timed_out_response.timed_out = true;
+            return Ok(Json(timed_out_response));
+        }
+
+        Ok(Json(queued_response))
     }
 
     fn prepare_async_ingest_operation(
@@ -2826,6 +2873,7 @@ impl MempalMcpServer {
                 operation_id: None,
                 accepted_at: None,
                 state: None,
+                timed_out: false,
                 drawer_id: String::new(),
                 drawer_ids: Vec::new(),
                 chunk_count: 0,
@@ -2838,6 +2886,7 @@ impl MempalMcpServer {
                 superseded_drawer_id: None,
                 rejected_reason: None,
                 failure_detail: None,
+                timings: BTreeMap::new(),
                 fact_check_warnings: Vec::new(),
                 system_warnings: request_system_warnings,
             }));
@@ -6596,6 +6645,7 @@ fn finalize_failed_ingest_response(
             operation_id: None,
             accepted_at: None,
             state: None,
+            timed_out: false,
             drawer_id: String::new(),
             drawer_ids: Vec::new(),
             chunk_count: 0,
@@ -6608,6 +6658,7 @@ fn finalize_failed_ingest_response(
             superseded_drawer_id: None,
             rejected_reason: None,
             failure_detail: None,
+            timings: BTreeMap::new(),
             fact_check_warnings: Vec::new(),
             system_warnings: current_system_warnings(),
         },
@@ -6646,6 +6697,7 @@ fn operation_record_to_response(
         operation_id: Some(record.id),
         accepted_at,
         state: Some(state),
+        timed_out: false,
         drawer_id: record.result_drawer_id.unwrap_or_default(),
         drawer_ids: Vec::new(),
         chunk_count: 0,
@@ -6658,6 +6710,7 @@ fn operation_record_to_response(
         superseded_drawer_id: None,
         rejected_reason: record.rejected_reason,
         failure_detail: record.failure_detail,
+        timings: BTreeMap::new(),
         fact_check_warnings: Vec::new(),
         system_warnings,
     }
@@ -6814,6 +6867,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use rusqlite::params;
@@ -9691,6 +9745,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mcp_ingest_wait_returns_terminal_result() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Notify::new());
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(BlockingEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+                call_count: Arc::clone(&call_count),
+                gate: Arc::clone(&gate),
+            }),
+        );
+
+        let request = IngestRequest {
+            content: "wait path should return the final ingest result".to_string(),
+            wing: "mcp".to_string(),
+            room: Some("wait".to_string()),
+            project_id: Some("project-async".to_string()),
+            dry_run: Some(false),
+            wait: Some(true),
+            wait_timeout_secs: Some(30),
+            ..IngestRequest::default()
+        };
+        let ingest = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .mempal_ingest(Parameters(request))
+                    .await
+                    .expect("wait ingest should succeed")
+                    .0
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while call_count.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("embedder should start before timeout");
+        gate.notify_one();
+
+        let response = ingest.await.expect("join wait ingest");
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(!response.drawer_id.is_empty());
+        assert!(!response.timed_out);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_wait_timeout_returns_receipt() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+
+        let gate = Arc::new(Notify::new());
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(BlockingEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+                call_count: Arc::new(AtomicUsize::new(0)),
+                gate: Arc::clone(&gate),
+            }),
+        );
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "timeout should return a receipt".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("timeout".to_string()),
+                project_id: Some("project-async".to_string()),
+                dry_run: Some(false),
+                wait: Some(true),
+                wait_timeout_secs: Some(0),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("timeout ingest response")
+            .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.timed_out);
+        assert!(response.operation_id.is_some());
+    }
+
+    #[tokio::test]
     async fn test_mcp_async_ingest_queue_payload_is_scrubbed() {
         let config_home = tempfile::tempdir().expect("config tempdir");
         let config_db_path = config_home.path().join("palace.db");
@@ -9890,6 +10033,8 @@ enabled = true
                     parent_anchor_id: None,
                     cwd: None,
                     project_id: None,
+                    wait: None,
+                    wait_timeout_secs: None,
                 })
                 .expect("serialize ingest request"),
             )
