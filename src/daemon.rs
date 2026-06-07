@@ -934,33 +934,6 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         .await?;
     }
 
-    if should_enqueue_llm_gating(context.daemon.config, &gating_decision) {
-        let system_prompt = context
-            .daemon
-            .config
-            .ingest_gating
-            .llm_judge
-            .as_ref()
-            .and_then(|j| j.system_prompt.clone());
-        let payload = serde_json::to_string(&crate::llm::LlmTaskPayload {
-            task_type: "gating".to_string(),
-            drawer_id: drawer_id.clone(),
-            drawer_ids: vec![drawer_id.clone()],
-            content: analysis_content(&record.content).to_string(),
-            system_prompt,
-        })
-        .context("failed to serialize LLM gating payload")?;
-        if let Err(error) = context.store.enqueue("llm_task", &payload) {
-            tracing::warn!(
-                ?error,
-                "failed to enqueue LLM gating task for {}",
-                drawer_id
-            );
-        } else {
-            tracing::info!("enqueued LLM gating task for {}", drawer_id);
-        }
-    }
-
     let vector = match vector {
         Some(vector) => vector,
         None => {
@@ -975,6 +948,15 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     if record.bypass_novelty {
         insert_drawer_with_vector_async(context.db, &drawer_id, record.clone(), vector.clone())
             .await?;
+        enqueue_llm_gating_after_durable_insert(
+            context.db,
+            context.store,
+            context.daemon.config,
+            &gating_decision,
+            &drawer_id,
+            &candidate.content,
+        )
+        .await?;
         return Ok(drawer_id);
     }
 
@@ -1007,6 +989,15 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             }
             insert_drawer_with_vector_async(context.db, &drawer_id, record.clone(), vector.clone())
                 .await?;
+            enqueue_llm_gating_after_durable_insert(
+                context.db,
+                context.store,
+                context.daemon.config,
+                &gating_decision,
+                &drawer_id,
+                &candidate.content,
+            )
+            .await?;
             Ok(drawer_id)
         }
         NoveltyAction::Drop => {
@@ -1091,6 +1082,15 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                     vector.clone(),
                 )
                 .await?;
+                enqueue_llm_gating_after_durable_insert(
+                    context.db,
+                    context.store,
+                    context.daemon.config,
+                    &gating_decision,
+                    &drawer_id,
+                    &candidate.content,
+                )
+                .await?;
                 Ok(drawer_id)
             } else {
                 let merged_vector = match embed_text_with_heartbeat(
@@ -1123,6 +1123,15 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                             &drawer_id,
                             record.clone(),
                             vector.clone(),
+                        )
+                        .await?;
+                        enqueue_llm_gating_after_durable_insert(
+                            context.db,
+                            context.store,
+                            context.daemon.config,
+                            &gating_decision,
+                            &drawer_id,
+                            &candidate.content,
                         )
                         .await?;
                         return Ok(drawer_id);
@@ -1162,6 +1171,48 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             }
         }
     }
+}
+
+async fn enqueue_llm_gating_after_durable_insert(
+    db: &AsyncDb,
+    store: &PendingMessageStore,
+    config: &crate::core::config::Config,
+    gating_decision: &Option<GatingDecision>,
+    drawer_id: &str,
+    content: &str,
+) -> Result<()> {
+    if !should_enqueue_llm_gating(config, gating_decision) {
+        return Ok(());
+    }
+
+    let system_prompt = config
+        .ingest_gating
+        .llm_judge
+        .as_ref()
+        .and_then(|j| j.system_prompt.clone());
+    let payload = serde_json::to_string(&crate::llm::LlmTaskPayload {
+        task_type: "gating".to_string(),
+        drawer_id: drawer_id.to_string(),
+        drawer_ids: vec![drawer_id.to_string()],
+        content: content.to_string(),
+        system_prompt,
+    })
+    .context("failed to serialize LLM gating payload")?;
+    let store = store.clone();
+    let drawer_id = drawer_id.to_string();
+    db.run_write_anyhow(move |_db| {
+        if let Err(error) = store.enqueue("llm_task", &payload) {
+            tracing::warn!(
+                ?error,
+                "failed to enqueue LLM gating task for {}",
+                drawer_id
+            );
+        } else {
+            tracing::info!("enqueued LLM gating task for {}", drawer_id);
+        }
+        Ok(())
+    })
+    .await
 }
 
 async fn record_gating_audit_async(
@@ -1463,11 +1514,11 @@ mod tests {
 
     use crate::core::{
         AsyncDb,
-        config::{Config, TurnStorageMode},
+        config::{Config, LlmJudgeConfig, TurnStorageMode},
         db::Database,
         queue::{ClaimedMessage, PendingMessageStore, QueueError},
     };
-    use crate::embed::Embedder;
+    use crate::embed::{EmbedError, Embedder};
     use crate::hook::{CapturedHookEnvelope, HookEvent};
 
     use super::{
@@ -1563,6 +1614,35 @@ mod tests {
         }
     }
 
+    struct LlmClaimRaceProbeEmbedder {
+        store: PendingMessageStore,
+        embed_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for LlmClaimRaceProbeEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            self.embed_calls.fetch_add(1, Ordering::SeqCst);
+            let claim = self
+                .store
+                .claim_next_by_kind("llm-race-probe", 60, "llm_task")
+                .map_err(|error| EmbedError::Runtime(format!("claim llm task failed: {error}")))?;
+            assert!(
+                claim.is_none(),
+                "LLM gating task must not be claimable before drawer/vector insert completes"
+            );
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "llm-race-probe"
+        }
+    }
+
     #[tokio::test]
     async fn test_daemon_uses_envelope_captured_at_for_drawer_added_at() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -1628,6 +1708,94 @@ mod tests {
         assert_eq!(added_at, captured_at);
         assert_eq!(source_type, "system_generated");
         assert!((confidence - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_daemon_enqueues_llm_gating_after_drawer_vector_is_durable() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "printf race",
+            "output": "durable before llm",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        let queued_id = store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("llm-race-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+        assert_eq!(message.id, queued_id);
+
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+        let embedder = LlmClaimRaceProbeEmbedder {
+            store: store.clone(),
+            embed_calls: AtomicUsize::new(0),
+        };
+        let drawer_id = process_claimed_message_with_embedder(
+            &async_db,
+            &store,
+            "llm-race-worker",
+            &message,
+            &embedder,
+            DaemonIngestContext {
+                prototype_classifier: None,
+                config: &config,
+                mempal_home: tmp.path(),
+            },
+        )
+        .await
+        .expect("process hook envelope");
+
+        assert_eq!(embedder.embed_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            db.drawer_exists(&drawer_id).expect("drawer exists query"),
+            "drawer must exist before LLM task is claimable"
+        );
+        let vector_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawer_vectors WHERE id = ?1",
+                [drawer_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("query vector");
+        assert_eq!(
+            vector_count, 1,
+            "vector must exist before LLM task is claimable"
+        );
+
+        let llm_task = store
+            .claim_next_by_kind("llm-race-final", 60, "llm_task")
+            .expect("claim llm task")
+            .expect("llm task should be queued after durable insert");
+        let task: crate::llm::LlmTaskPayload =
+            serde_json::from_str(&llm_task.payload).expect("decode llm task");
+        assert_eq!(task.drawer_id, drawer_id);
     }
 
     #[test]
