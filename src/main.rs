@@ -5714,6 +5714,8 @@ async fn reindex_command_by_embedder(
         println!("resume checkpoint found; preserving existing drawer_vectors table");
         None
     };
+    let progress_store_for_reindex = progress_store.clone();
+    let target_fingerprint_for_reindex = target_fingerprint.clone();
     let embed_result: Result<()> = async move {
     if stale_only && resume_checkpoint.is_none() {
         let policy = BatchRetryPolicy {
@@ -5724,7 +5726,7 @@ async fn reindex_command_by_embedder(
             db,
             embedder.as_ref(),
             embedder_name,
-            &target_fingerprint,
+            &target_fingerprint_for_reindex,
             batch.batch_size,
             target,
             policy,
@@ -5733,7 +5735,9 @@ async fn reindex_command_by_embedder(
     }
     let mut drawers = reindex_rows(db).context("failed to load active drawers for reindex")?;
     if stale_only {
-        drawers.retain(|row| reindex_row_is_stale(db, row, &target_fingerprint).unwrap_or(true));
+        drawers.retain(|row| {
+            reindex_row_is_stale(db, row, &target_fingerprint_for_reindex).unwrap_or(true)
+        });
     }
     let total = drawers.len();
     println!("re-embedding {total} drawers...");
@@ -5759,14 +5763,14 @@ async fn reindex_command_by_embedder(
             && let Some((sp, ci)) = last_processed.as_ref()
             && sp == prev_src
         {
-            progress_store
+            progress_store_for_reindex
                 .mark_done(sp, Some(*ci), embedder_name)
                 .context("failed to mark completed reindex source")?;
         }
         active_source = Some(row.source_path.clone());
         let single_input = [row.content.as_str()];
         let embed_future = embedder.embed(&single_input);
-        let vectors = tokio::select! { _ = tokio::signal::ctrl_c() => { if let Some((sp, ci)) = last_processed.as_ref() { progress_store.mark_paused(sp, Some(*ci), embedder_name).context("failed to persist paused reindex checkpoint")?; } bail!("reindex interrupted; resume with `mempal reindex --embedder {embedder_name} --resume`"); } result = embed_future => result.context("embedding failed during reindex")? };
+        let vectors = tokio::select! { _ = tokio::signal::ctrl_c() => { if let Some((sp, ci)) = last_processed.as_ref() { progress_store_for_reindex.mark_paused(sp, Some(*ci), embedder_name).context("failed to persist paused reindex checkpoint")?; } bail!("reindex interrupted; resume with `mempal reindex --embedder {embedder_name} --resume`"); } result = embed_future => result.context("embedding failed during reindex")? };
         let vector = vectors
             .into_iter()
             .next()
@@ -5780,24 +5784,24 @@ async fn reindex_command_by_embedder(
             db,
             &row.id,
             CURRENT_VECTOR_INDEX_VERSION,
-            &target_fingerprint,
+            &target_fingerprint_for_reindex,
         )
         .with_context(|| format!("failed to record reindex metadata for {}", row.id))?;
-        progress_store
+        progress_store_for_reindex
             .upsert_running(&row.source_path, Some(row.chunk_index), embedder_name)
             .context("failed to persist reindex checkpoint")?;
         done += 1;
         last_processed = Some((row.source_path.clone(), row.chunk_index));
         println!("  {done}/{total}");
         if test_stop_after.is_some_and(|limit| done >= limit) {
-            progress_store
+            progress_store_for_reindex
                 .mark_paused(&row.source_path, Some(row.chunk_index), embedder_name)
                 .context("failed to persist paused reindex checkpoint")?;
             bail!("reindex interrupted for test after {done} drawers");
         }
     }
     if let Some((sp, ci)) = last_processed.as_ref() {
-        progress_store
+        progress_store_for_reindex
             .mark_done(sp, Some(*ci), embedder_name)
             .context("failed to finalize reindex checkpoint")?;
     }
@@ -5806,7 +5810,19 @@ async fn reindex_command_by_embedder(
     }
     .await;
 
-    finalize_reindex_atomicity(db, reindex_stash, embed_result)
+    match finalize_reindex_atomicity(db, reindex_stash, embed_result) {
+        Ok(()) => {
+            // Safety net: successful embedder/vector reindex runs should settle
+            // any still-running checkpoints to `done`, but only for rows that
+            // are already current. This preserves the #325 invariant: promote
+            // `running` -> `done` only, and never resurrect `failed` rows.
+            progress_store
+                .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, &target_fingerprint)
+                .context("failed to finalize completed reindex checkpoints")?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Decide the fate of a recreate-reindex's staged old vectors (#302 atomicity).
