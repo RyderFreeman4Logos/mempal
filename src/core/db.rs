@@ -226,6 +226,13 @@ pub enum DbError {
     CompactionClusterEmpty,
     #[error("compaction drawer {drawer_id} was not found, inactive, or already compacted")]
     CompactionDrawerNotFound { drawer_id: String },
+    #[error(
+        "drawer {drawer_id} changed during novelty merge: expected merge_count {expected_merge_count}"
+    )]
+    DrawerMergeConflict {
+        drawer_id: String,
+        expected_merge_count: u32,
+    },
     #[error("LLM compaction not yet implemented")]
     LlmCompactionNotImplemented,
     #[error("off-runtime database task failed to complete: {0}")]
@@ -761,13 +768,14 @@ impl Database {
         merged_content: &str,
         updated_at: &str,
         vector: &[f32],
+        expected_merge_count: u32,
     ) -> Result<(), DbError> {
         self.ensure_vectors_table(vector.len())?;
         let vector_json = serde_json::to_string(vector)?;
         let content_hash = content_hash_hex(merged_content);
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<(), DbError> {
-            self.conn.execute(
+            let updated = self.conn.execute(
                 r#"
                 UPDATE drawers
                 SET content = ?2,
@@ -775,9 +783,23 @@ impl Database {
                     content_hash = ?4,
                     merge_count = COALESCE(merge_count, 0) + 1
                 WHERE id = ?1
+                  AND deleted_at IS NULL
+                  AND COALESCE(merge_count, 0) = ?5
                 "#,
-                params![drawer_id, merged_content, updated_at, content_hash],
+                params![
+                    drawer_id,
+                    merged_content,
+                    updated_at,
+                    content_hash,
+                    expected_merge_count
+                ],
             )?;
+            if updated == 0 {
+                return Err(DbError::DrawerMergeConflict {
+                    drawer_id: drawer_id.to_string(),
+                    expected_merge_count,
+                });
+            }
             self.conn
                 .execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])?;
             let project_id = self.conn.query_row(

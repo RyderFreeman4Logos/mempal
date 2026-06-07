@@ -10,7 +10,7 @@ use std::{future::Future, pin::Pin};
 use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
     AsyncDb,
-    db::Database,
+    db::{Database, DbError},
     project::resolve_project_id,
     queue::{ClaimedMessage, PendingMessageStore, QueueFailureDisposition},
     strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
@@ -1273,9 +1273,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                             &merged_content,
                             &merged_at,
                             &merged_vector,
+                            merge_count,
                         )
-                        .with_context(|| {
-                            format!("failed to merge hook drawer {}", target_id_for_merge)
+                        .map_err(|error| match error {
+                            DbError::DrawerMergeConflict { .. } => anyhow::Error::new(error),
+                            error => anyhow::Error::new(error).context(format!(
+                                "failed to merge hook drawer {}",
+                                target_id_for_merge
+                            )),
                         })?;
                         Ok(())
                     })
@@ -1623,8 +1628,8 @@ impl Embedder for DaemonEmbedder {
 mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::core::{
@@ -1632,6 +1637,7 @@ mod tests {
         config::{Config, LlmJudgeConfig, TurnStorageMode},
         db::Database,
         queue::{ClaimedMessage, PendingMessageStore, QueueError},
+        types::{Drawer, SourceType},
     };
     use crate::embed::{EmbedError, Embedder};
     use crate::hook::{CapturedHookEnvelope, HookEvent};
@@ -1777,6 +1783,43 @@ mod tests {
         }
     }
 
+    struct MergeConflictProbeEmbedder {
+        db_path: PathBuf,
+        injected: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for MergeConflictProbeEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            if texts.iter().any(|text| text.contains("SUPPLEMENTARY"))
+                && self
+                    .injected
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                let db = Database::open(&self.db_path)
+                    .map_err(|error| EmbedError::Runtime(format!("open db failed: {error}")))?;
+                db.update_drawer_after_merge(
+                    "existing-target",
+                    "original target\n---\nSUPPLEMENTARY (other):\nother supplement",
+                    "1713000001",
+                    &[0.8, 0.2, 0.0],
+                    0,
+                )
+                .map_err(|error| EmbedError::Runtime(format!("inject merge failed: {error}")))?;
+            }
+            Ok(texts.iter().map(|_| vec![0.9, 0.435_889_9, 0.0]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "merge-conflict-probe"
+        }
+    }
+
     #[tokio::test]
     async fn test_bounded_hook_worker_heartbeats_with_claim_worker_id() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -1853,6 +1896,127 @@ mod tests {
             message,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_hook_worker_retries_stale_novelty_merge_without_overwrite() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+        let db = Database::open(&db_path).expect("open db");
+        let project_id = Some("merge-conflict-project");
+        db.insert_drawer_with_project(
+            &Drawer {
+                id: "existing-target".to_string(),
+                content: "original target".to_string(),
+                wing: "hooks-raw".to_string(),
+                room: Some("Bash".to_string()),
+                source_file: Some("existing-target.md".to_string()),
+                source_type: SourceType::SystemGenerated,
+                added_at: "1713000000".to_string(),
+                chunk_index: Some(0),
+                ..Drawer::default()
+            },
+            project_id,
+        )
+        .expect("insert target drawer");
+        db.insert_vector_with_project("existing-target", &[1.0, 0.0, 0.0], project_id)
+            .expect("insert target vector");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(&db_path).expect("store");
+
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "printf candidate",
+            "output": "candidate supplement",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        let queued_id = store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("merge-conflict-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+        assert_eq!(message.id, queued_id);
+
+        let mut config = Config::default();
+        config.project.id = project_id.map(ToOwned::to_owned);
+        config.ingest_gating.novelty.enabled = true;
+        config.ingest_gating.novelty.merge_threshold = 0.85;
+        config.ingest_gating.novelty.duplicate_threshold = 0.95;
+        assert!(
+            !config.llm.enabled,
+            "test runtime config must keep LLM disabled"
+        );
+        let injected = Arc::new(AtomicBool::new(false));
+        super::process_hook_worker_message(
+            HookWorkerState {
+                async_db,
+                store: store.clone(),
+                worker_id: "merge-conflict-worker".to_string(),
+                embedder: Arc::new(DaemonEmbedder {
+                    primary: Box::new(MergeConflictProbeEmbedder {
+                        db_path: db_path.clone(),
+                        injected: Arc::clone(&injected),
+                    }),
+                    fallback: None,
+                }),
+                prototype_classifier: Arc::new(None),
+                config: Arc::new(config),
+                mempal_home,
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+            },
+            message,
+        )
+        .await;
+        assert!(
+            injected.load(Ordering::SeqCst),
+            "test embedder must inject a concurrent merge during re-embed"
+        );
+
+        let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
+        let (status, retry_count, last_error): (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, retry_count, last_error FROM pending_messages WHERE id = ?1",
+                [queued_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query queue row");
+        assert_eq!(status, "pending");
+        assert_eq!(retry_count, 1);
+        assert!(
+            last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed during novelty merge")),
+            "last_error={last_error:?}"
+        );
+
+        let (content, merge_count): (String, i64) = conn
+            .query_row(
+                "SELECT content, merge_count FROM drawers WHERE id = 'existing-target'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query target drawer");
+        assert!(content.contains("other supplement"));
+        assert!(!content.contains("candidate supplement"));
+        assert_eq!(merge_count, 1);
     }
 
     struct LlmClaimRaceProbeEmbedder {

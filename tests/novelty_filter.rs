@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use async_trait::async_trait;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::{
-    Database, FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL,
+    Database, DbError, FORK_EXT_META_DDL, FORK_EXT_V1_SCHEMA_SQL, FORK_EXT_V2_SCHEMA_SQL,
     FORK_EXT_V3_SCHEMA_SQL, apply_fork_ext_migrations_to, read_fork_ext_version,
     set_fork_ext_version,
 };
@@ -685,6 +685,55 @@ async fn test_medium_similarity_candidate_merged() {
     assert_eq!(audits.len(), 1);
     assert_eq!(audits[0].decision, "merge");
     assert_eq!(audits[0].near_drawer_id.as_deref(), Some("existing"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_stale_novelty_merge_version_cannot_overwrite_supplement() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(true);
+    insert_drawer(
+        &env.db_path,
+        DrawerSeed {
+            id: "existing",
+            content: "Decision: keep raw content",
+            wing: DEFAULT_WING,
+            room: DEFAULT_ROOM,
+            project_id: None,
+        },
+        &[1.0, 0.0],
+    );
+
+    let db = env.db();
+    let (original_content, observed_merge_count) = db
+        .drawer_merge_state("existing")
+        .expect("load merge state")
+        .expect("merge target exists");
+    assert_eq!(observed_merge_count, 0);
+
+    let first_content =
+        format!("{original_content}\n---\nSUPPLEMENTARY (first):\nfirst supplement");
+    db.update_drawer_after_merge("existing", &first_content, "1713000001", &[0.9, 0.1], 0)
+        .expect("first merge succeeds");
+
+    let stale_content =
+        format!("{original_content}\n---\nSUPPLEMENTARY (stale):\nstale supplement");
+    let error = db
+        .update_drawer_after_merge("existing", &stale_content, "1713000002", &[0.1, 0.9], 0)
+        .expect_err("stale merge must conflict");
+    assert!(matches!(
+        error,
+        DbError::DrawerMergeConflict {
+            drawer_id,
+            expected_merge_count: 0,
+        } if drawer_id == "existing"
+    ));
+
+    let content = drawer_content(&env.db_path, "existing");
+    assert!(content.contains("first supplement"));
+    assert!(!content.contains("stale supplement"));
+    let (merge_count, updated_at) = merge_state(&env.db_path, "existing");
+    assert_eq!(merge_count, 1);
+    assert_eq!(updated_at.as_deref(), Some("1713000001"));
 }
 
 #[tokio::test(flavor = "current_thread")]

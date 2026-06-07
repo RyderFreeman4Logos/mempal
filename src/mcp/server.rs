@@ -3534,6 +3534,7 @@ impl MempalMcpServer {
                                     &merged_content,
                                     &merged_at,
                                     &merged_vector,
+                                    merge_count,
                                 )
                                 .map_err(db_error)?;
                                 db.record_novelty_audit(

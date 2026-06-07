@@ -1066,6 +1066,7 @@ async fn test_stale_reindex_skips_concurrent_real_merge_update() {
         "drawer content 0\n\nSUPPLEMENTARY (test): merged while stale embed was in flight",
         "1713009999",
         &fresh_vector,
+        0,
     )
     .expect("simulate concurrent novelty merge update");
 
