@@ -93,18 +93,18 @@ use super::tools::{
     CoworkBusResponse, CoworkBusSessionDto, CoworkBusTmuxPeekDto, CoworkBusTmuxProbeDto,
     CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DoctorMcpDto,
     DoctorRequest, DoctorResponse, DoctorToolDto, DuplicateWarning, EmbedStatusDto,
-    EndpointHealthDto, FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto,
-    FieldTaxonomyResponse, IngestControls, IngestOperationState, IngestRequest, IngestResponse,
-    IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto, KnowledgeCardDto,
-    KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse, KnowledgeDemoteRequest,
-    KnowledgeDemoteResponse, KnowledgeDistillRequest, KnowledgeDistillResponse,
-    KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse, KnowledgePromoteRequest,
-    KnowledgePromoteResponse, KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse,
-    LeaseInfoDto, LeaseRequest, LeaseResponse, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT,
-    MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest, PeekMessageDto, PeekPartnerRequest,
-    PeekPartnerResponse, Phase3GateDto, Phase3Request, Phase3Response, PinnedFactDto,
-    PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse, QueueStatsDto,
-    ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
+    EmbedderCircuitDto, EndpointHealthDto, FactCheckRequest, FactCheckResponse,
+    FieldTaxonomyEntryDto, FieldTaxonomyResponse, IngestControls, IngestOperationState,
+    IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto,
+    KnowledgeCardDto, KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse,
+    KnowledgeDemoteRequest, KnowledgeDemoteResponse, KnowledgeDistillRequest,
+    KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse,
+    KnowledgePromoteRequest, KnowledgePromoteResponse, KnowledgePublishAnchorRequest,
+    KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest, LeaseResponse, LlmStatusDto,
+    MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest,
+    PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
+    Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
+    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
     ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto, RollbackRequest,
     RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto,
     SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
@@ -1811,6 +1811,18 @@ impl MempalMcpServer {
                 last_error: embed_snapshot.last_error,
                 last_success_at_unix_ms: embed_snapshot.last_success_at_unix_ms,
             },
+            embedder_circuit: EmbedderCircuitDto {
+                open: embed_snapshot.degraded,
+                failure_count: embed_snapshot.fail_count,
+                failure_threshold: config.embed.degradation.degrade_after_n_failures,
+                bm25_fallback_enabled: config.search.bm25_fallback,
+                search_deadline_secs: config.embed.retry.search_deadline_secs,
+                vector_search_mode: if config.search.bm25_fallback && embed_snapshot.degraded {
+                    SearchMode::Bm25Only.as_str().to_string()
+                } else {
+                    SearchMode::Hybrid.as_str().to_string()
+                },
+            },
             queue_stats: QueueStatsDto {
                 pending: queue_stats.pending,
                 claimed: queue_stats.claimed,
@@ -1926,9 +1938,10 @@ impl MempalMcpServer {
         let mut extra_warnings = Vec::new();
         let mut search_mode = SearchMode::Hybrid;
         let mut response_warnings = Vec::new();
-        let results = if config.search.bm25_fallback && global_embed_status().is_degraded() {
+        let embed_snapshot = global_embed_status().snapshot();
+        let results = if config.search.bm25_fallback && embed_snapshot.degraded {
             search_mode = SearchMode::Bm25Only;
-            let warning = "embedding backend is degraded; using BM25-only search".to_string();
+            let warning = bm25_fallback_warning_degraded(embed_snapshot.fail_count);
             response_warnings.push(warning.clone());
             extra_warnings.push(SystemWarning {
                 level: "warn".to_string(),
@@ -1952,7 +1965,7 @@ impl MempalMcpServer {
                 Err(error) if config.search.bm25_fallback => {
                     search_mode = SearchMode::Bm25Only;
                     let warning = format!(
-                        "embedding unavailable; using BM25-only search: {}",
+                        "embedding unavailable; using BM25-only search: {} (retry may help)",
                         crate::core::config::scrub_sensitive_text(&error.to_string())
                     );
                     response_warnings.push(warning.clone());
@@ -1996,7 +2009,9 @@ impl MempalMcpServer {
                     }
                     Ok(Err(error)) => {
                         search_mode = SearchMode::Bm25Only;
-                        let warning = "vector unavailable, BM25 fallback".to_string();
+                        let warning = bm25_fallback_warning_embed_error(
+                            &crate::core::config::scrub_sensitive_text(&error.to_string()),
+                        );
                         response_warnings.push(warning.clone());
                         extra_warnings.push(SystemWarning {
                             level: "warn".to_string(),
@@ -2022,7 +2037,8 @@ impl MempalMcpServer {
                     }
                     Err(_) => {
                         search_mode = SearchMode::Bm25Only;
-                        let warning = "vector unavailable, BM25 fallback".to_string();
+                        let warning =
+                            bm25_fallback_warning_timeout(config.embed.retry.search_deadline_secs);
                         response_warnings.push(warning.clone());
                         extra_warnings.push(SystemWarning {
                             level: "warn".to_string(),
@@ -6704,6 +6720,22 @@ pub(super) fn current_system_warnings() -> Vec<SystemWarning> {
             }),
     );
     warnings
+}
+
+fn bm25_fallback_warning_degraded(fail_count: u64) -> String {
+    format!(
+        "embedding backend is degraded after {fail_count} failures; using BM25-only search until recovery (retry unlikely to help)"
+    )
+}
+
+fn bm25_fallback_warning_embed_error(error: &str) -> String {
+    format!("embedding unavailable; using BM25-only search: {error} (retry may help)")
+}
+
+fn bm25_fallback_warning_timeout(deadline_secs: u64) -> String {
+    format!(
+        "embedding deadline exceeded after {deadline_secs}s; using BM25-only search (retry may help)"
+    )
 }
 
 fn stale_index_warning_from_bool(is_stale: bool) -> Option<SystemWarning> {

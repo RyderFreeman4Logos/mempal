@@ -1917,6 +1917,8 @@ pub struct StatusResponse {
     pub memory_protocol: String,
     pub endpoint_health: EndpointHealthDto,
     pub embed_status: EmbedStatusDto,
+    /// Sticky embedder circuit plus the current vector-search fallback policy.
+    pub embedder_circuit: EmbedderCircuitDto,
     pub queue_stats: QueueStatsDto,
     pub scrub_stats: ScrubStatsDto,
     pub chunker_stats: ChunkerStatsDto,
@@ -1957,6 +1959,25 @@ pub struct EndpointHealthDto {
     pub llm_reachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct EmbedderCircuitDto {
+    /// True when the sticky embedder circuit is open and vector-search falls
+    /// back to BM25 unless the caller disables fallback entirely.
+    pub open: bool,
+    /// Consecutive embed failures since the last success, used to open the
+    /// circuit.
+    pub failure_count: u64,
+    /// Sticky-failure threshold that opens the circuit.
+    pub failure_threshold: u64,
+    /// Whether BM25 fallback is enabled at all.
+    pub bm25_fallback_enabled: bool,
+    /// Per-query vector-embedding deadline that can still trigger BM25
+    /// fallback even when the embedding endpoint itself is reachable.
+    pub search_deadline_secs: u64,
+    /// Current sticky vector-search mode derived from the circuit state.
+    pub vector_search_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
