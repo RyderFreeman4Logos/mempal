@@ -5977,6 +5977,8 @@ async fn reindex_stale_batches(
     let mut skipped_concurrent_update = 0usize;
     let mut skipped_failed_batches = 0usize;
     let mut skipped_failed_drawers = 0usize;
+    let progress_store = ReindexProgressStore::new(db.path());
+    let mut failed_sources = std::collections::HashSet::new();
     // Drawers from batches that failed past the retry cap. They keep no fresh
     // vector (stay stale), so they MUST be excluded from later batch queries:
     // the stale selection re-runs every iteration, and without exclusion it
@@ -6027,6 +6029,12 @@ async fn reindex_stale_batches(
                     .context("failed to record skipped drawer ids")?;
                 delete_reindex_pending_ids(db, &failed_ids)
                     .context("failed to delete skipped stale reindex work")?;
+                for (source_path, chunk_index) in reindex_source_checkpoints(&rows) {
+                    progress_store
+                        .mark_failed(&source_path, Some(chunk_index), embedder_name)
+                        .context("failed to record failed reindex checkpoint")?;
+                    failed_sources.insert(source_path);
+                }
                 continue;
             }
         };
@@ -6048,13 +6056,18 @@ async fn reindex_stale_batches(
                 stats.reindexed, stats.skipped_concurrent_update
             );
         }
-        let progress_store = ReindexProgressStore::new(db.path());
-        if let Some(last) = rows.last() {
-            progress_store
-                .upsert_running(&last.source_path, Some(last.chunk_index), embedder_name)
-                .context("failed to persist reindex checkpoint")?;
+        for (source_path, chunk_index) in reindex_source_checkpoints(&rows) {
+            let checkpoint = if failed_sources.contains(source_path.as_str()) {
+                progress_store.mark_failed(&source_path, Some(chunk_index), embedder_name)
+            } else {
+                progress_store.upsert_running(&source_path, Some(chunk_index), embedder_name)
+            };
+            checkpoint.context("failed to persist reindex checkpoint")?;
         }
     }
+    progress_store
+        .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, target_fingerprint)
+        .context("failed to finalize completed reindex sources")?;
     if skipped_concurrent_update == 0 {
         println!("stale reindex complete: {processed} drawers");
     } else {
@@ -10311,6 +10324,22 @@ fn delete_reindex_pending_ids(db: &Database, ids: &[String]) -> Result<usize> {
             .context("failed to delete stale reindex pending ids")?;
     }
     Ok(deleted)
+}
+
+fn reindex_source_checkpoints(rows: &[ReindexRow]) -> Vec<(String, i64)> {
+    let mut checkpoints = Vec::new();
+    let mut row_index = 0usize;
+    while row_index < rows.len() {
+        let source_path = rows[row_index].source_path.clone();
+        let mut last_chunk = rows[row_index].chunk_index;
+        row_index += 1;
+        while row_index < rows.len() && rows[row_index].source_path == source_path {
+            last_chunk = rows[row_index].chunk_index;
+            row_index += 1;
+        }
+        checkpoints.push((source_path, last_chunk));
+    }
+    checkpoints
 }
 
 #[cfg(test)]

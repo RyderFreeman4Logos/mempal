@@ -193,6 +193,16 @@ fn read_vector(db: &Database, drawer_id: &str) -> Vec<f32> {
     serde_json::from_str(&json).expect("parse vector json")
 }
 
+fn read_reindex_progress_state(db: &Database, source_path: &str) -> (i64, String) {
+    db.conn()
+        .query_row(
+            "SELECT last_processed_chunk_id, status FROM reindex_progress WHERE source_path = ?1",
+            [source_path],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("read reindex progress state")
+}
+
 async fn wait_for_request_count(handle: &common::harness::MockEmbedHandle, expected: u32) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
@@ -554,6 +564,19 @@ async fn persistent_batch_failure_skips_and_continues() {
         &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, false),
     );
     seed_drawers(&env.db_path, 4, 2);
+    let db = Database::open(&env.db_path).expect("open db");
+    db.conn()
+        .execute(
+            "UPDATE drawers SET source_file = 'fixtures/a-failed.txt' WHERE id = 'drawer-00'",
+            [],
+        )
+        .expect("split failed source");
+    db.conn()
+        .execute(
+            "UPDATE drawers SET source_file = 'fixtures/b-healthy.txt' WHERE id != 'drawer-00'",
+            [],
+        )
+        .expect("split healthy source");
 
     let full = run_reindex(&env.home, &["--from-config"], &[]);
     assert!(
@@ -573,10 +596,10 @@ async fn persistent_batch_failure_skips_and_continues() {
             .expect("mark index stale");
     }
 
-    // drawer-02's batch always fails; the other three succeed.
+    // drawer-00's batch always fails; the other three succeed.
     handle.set_fail_mode(FailMode::MalformedBody).await;
     handle
-        .set_fail_if_input_contains(Some("drawer content 2".to_string()))
+        .set_fail_if_input_contains(Some("drawer content 0".to_string()))
         .await;
 
     let stale = run_reindex(
@@ -612,20 +635,94 @@ async fn persistent_batch_failure_skips_and_continues() {
         "expected a skip warning on stderr: {stderr}",
     );
 
-    // The three healthy drawers are freshly embedded; the poisoned one stays
-    // stale so a later `--stale` re-run will select it again.
+    let failed_state = read_reindex_progress_state(&db, "fixtures/a-failed.txt");
+    assert_eq!(
+        failed_state,
+        (0, "failed".to_string()),
+        "failed source must stay failed after the final reconciliation"
+    );
+
+    let healthy_state = read_reindex_progress_state(&db, "fixtures/b-healthy.txt");
+    assert_eq!(
+        healthy_state,
+        (3, "done".to_string()),
+        "healthy source should still finalize to done"
+    );
+
+    // The healthy drawers are freshly embedded; the poisoned one stays stale
+    // so a later `--stale` re-run will select it again.
     ConfigHandle::bootstrap(&env.config_path).expect("bootstrap config");
-    for index in [0, 1, 3] {
+    for index in [1, 2, 3] {
         let id = format!("drawer-{index:02}");
         let details = db.drawer_vector_details(&id).expect("vector details");
         assert!(!details.stale, "{id} should be embedded: {details:?}");
     }
     let poisoned = db
-        .drawer_vector_details("drawer-02")
+        .drawer_vector_details("drawer-00")
         .expect("vector details");
     assert!(
         poisoned.stale,
-        "drawer-02 must remain stale for a later re-run: {poisoned:?}"
+        "drawer-00 must remain stale for a later re-run: {poisoned:?}"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_limit_leaves_source_running_until_all_chunks_are_reembedded() {
+    let _guard = test_guard().await;
+    let (addr, handle) = start_mock(0).await.expect("start mock");
+    let env = TestHome::new(&reindex_config(
+        Path::new("/tmp/mempal-limit-partial.db"),
+        &format!("http://{addr}/v1"),
+        4,
+        false,
+    ));
+    write_config(
+        &env.config_path,
+        &reindex_config(&env.db_path, &format!("http://{addr}/v1"), 4, false),
+    );
+    seed_drawers(&env.db_path, 5, 4);
+
+    let db = Database::open(&env.db_path).expect("open db");
+    for index in 0..5 {
+        db.conn()
+            .execute(
+                "UPDATE fork_ext_meta SET value = 'old' WHERE key = ?1",
+                [format!("reindex:drawer-{index:02}:index_version")],
+            )
+            .expect("mark index stale");
+    }
+
+    let output = run_reindex(
+        &env.home,
+        &[
+            "--from-config",
+            "--stale",
+            "--batch-size",
+            "2",
+            "--limit",
+            "3",
+        ],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "limit reindex must finish cleanly; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        handle.request_count(),
+        2,
+        "limit should only embed three stale drawers"
+    );
+
+    let state = read_reindex_progress_state(&db, "fixtures/source.txt");
+    assert_eq!(
+        state,
+        (2, "running".to_string()),
+        "partially reembedded source must remain resumable rather than done"
     );
 
     handle.shutdown().await;

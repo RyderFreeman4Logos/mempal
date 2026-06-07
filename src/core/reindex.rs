@@ -73,6 +73,76 @@ impl ReindexProgressStore {
         self.upsert(source_path, last_processed_chunk_id, embedder_name, "done")
     }
 
+    pub fn mark_failed(
+        &self,
+        source_path: &str,
+        last_processed_chunk_id: Option<i64>,
+        embedder_name: &str,
+    ) -> Result<()> {
+        self.upsert(
+            source_path,
+            last_processed_chunk_id,
+            embedder_name,
+            "failed",
+        )
+    }
+
+    /// Finalize orphan `running` rows whose source drawers are already fully
+    /// current for the active vector index.
+    ///
+    /// This is intentionally conservative: only sources with at least one
+    /// drawer and zero stale drawers are promoted to `done`, so a partially
+    /// reindexed source remains resumable.
+    pub fn finalize_completed_running_rows(
+        &self,
+        current_index_version: &str,
+        target_fingerprint: &str,
+    ) -> Result<usize> {
+        let now = now_secs();
+        let conn = self.open_connection()?;
+        // Aggregate each source once, then join the summary back to running rows.
+        let updated = conn.execute(
+            r#"
+            WITH source_summary AS (
+                SELECT
+                    COALESCE(d.source_file, d.id) AS source_path,
+                    COUNT(*) AS drawer_count,
+                    MAX(COALESCE(d.chunk_index, 0)) AS last_processed_chunk_id,
+                    SUM(
+                        CASE
+                            WHEN v.id IS NULL
+                              OR COALESCE(idx.value, legacy_idx.value, '') != ?1
+                              OR COALESCE(fp.value, '') != ?2
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS stale_drawer_count
+                FROM drawers AS d
+                LEFT JOIN drawer_vectors AS v ON v.id = d.id
+                LEFT JOIN fork_ext_meta AS idx
+                  ON idx.key = 'reindex:' || d.id || ':index_version'
+                LEFT JOIN fork_ext_meta AS legacy_idx
+                  ON legacy_idx.key = 'reindex:' || d.id || ':normalize_version'
+                LEFT JOIN fork_ext_meta AS fp
+                  ON fp.key = 'reindex:' || d.id || ':embedder_fingerprint'
+                WHERE d.deleted_at IS NULL
+                GROUP BY COALESCE(d.source_file, d.id)
+            )
+            UPDATE reindex_progress
+            SET last_processed_chunk_id = source_summary.last_processed_chunk_id,
+                updated_at = ?3,
+                status = 'done'
+            FROM source_summary
+            WHERE reindex_progress.status = 'running'
+              AND reindex_progress.source_path = source_summary.source_path
+              AND source_summary.drawer_count > 0
+              AND source_summary.stale_drawer_count = 0
+            "#,
+            params![current_index_version, target_fingerprint, now],
+        )?;
+        Ok(updated)
+    }
+
     pub fn latest_resumable(
         &self,
         embedder_name: Option<&str>,
