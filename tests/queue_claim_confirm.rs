@@ -6,6 +6,7 @@ use mempal::core::db::Database;
 use mempal::core::queue::{
     LAST_ERROR_MAX_BYTES, PendingMessageStore, QueueConfig, QueueFailureDisposition,
 };
+use mempal::llm::worker::confirm_llm_task;
 use rusqlite::Connection;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
@@ -93,6 +94,29 @@ fn test_confirm_deletes_row() {
         )
         .expect("read completion op_state");
     assert_eq!(completion_op_state, "completed");
+}
+
+#[test]
+fn test_confirm_llm_task_missing_row_is_benign() {
+    let (_tmp, db_path, store) = new_store();
+    let id = store
+        .enqueue(
+            "llm_task",
+            r#"{"task_type":"gating","drawer_id":"drawer-1","drawer_ids":[],"content":"content","system_prompt":null}"#,
+        )
+        .expect("enqueue llm task");
+    let claimed = store
+        .claim_next_by_kind("worker-a", 60, "llm_task")
+        .expect("claim llm task")
+        .expect("claimed message");
+    assert_eq!(claimed.id, id);
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute("DELETE FROM pending_messages WHERE id = ?1", [&id])
+        .expect("delete claimed row");
+    drop(conn);
+
+    confirm_llm_task(&store, &id).expect("confirm missing LLM task");
 }
 
 #[test]

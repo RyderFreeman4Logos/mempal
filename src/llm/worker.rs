@@ -134,9 +134,7 @@ pub async fn run_llm_worker(
         match task_result {
             Some(Ok(())) => {
                 tracing::info!("LLM task {message_id} completed in {latency_ms}ms");
-                store
-                    .confirm(&message_id)
-                    .with_context(|| format!("failed to confirm LLM task {message_id}"))?;
+                confirm_llm_task(&store, &message_id)?;
                 write_observer.record_successful_write();
             }
             Some(Err(error)) => {
@@ -165,6 +163,23 @@ pub async fn run_llm_worker(
         }
     }
 
+    Ok(())
+}
+
+/// Confirm a completed LLM task in the pending-message store.
+pub fn confirm_llm_task(store: &PendingMessageStore, message_id: &str) -> Result<()> {
+    match store.confirm(message_id) {
+        Ok(()) => {}
+        Err(crate::core::queue::QueueError::MessageNotFound(_)) => {
+            tracing::warn!(
+                message_id,
+                "LLM task already removed before confirm; continuing"
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to confirm LLM task {message_id}"));
+        }
+    }
     Ok(())
 }
 
