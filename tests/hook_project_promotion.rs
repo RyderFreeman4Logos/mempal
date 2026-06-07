@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use mempal::core::AsyncDb;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
-use mempal::core::queue::PendingMessageStore;
+use mempal::core::queue::{AsyncPendingMessageStore, PendingMessageStore};
 use mempal::core::types::TaxonomyEntry;
 use mempal::daemon::{DaemonIngestContext, process_claimed_message_with_embedder};
 use mempal::embed::{EmbedError, Embedder};
@@ -141,9 +141,10 @@ enabled = false
             .expect("claim next")
             .expect("claimed message");
         let async_db = AsyncDb::open(&self.db_path, 4).expect("open async db");
+        let async_store = AsyncPendingMessageStore::from_store(self.store.clone());
         process_claimed_message_with_embedder(
             &async_db,
-            &self.store,
+            &async_store,
             "hook-project-promotion-test",
             &claimed,
             &StaticEmbedder,
@@ -361,9 +362,10 @@ enabled = false
             .expect("claim next")
             .expect("claimed message");
         let async_db = AsyncDb::open(&self.db_path, 4).expect("open async db");
+        let async_store = AsyncPendingMessageStore::from_store(self.store.clone());
         process_claimed_message_with_embedder(
             &async_db,
-            &self.store,
+            &async_store,
             "wing-routing-test",
             &claimed,
             &StaticEmbedder,

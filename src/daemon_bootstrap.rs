@@ -12,7 +12,7 @@ use crate::core::{
     AsyncDb,
     config::{Config, ConfigHandle},
     db::Database,
-    queue::PendingMessageStore,
+    queue::AsyncPendingMessageStore,
 };
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -46,7 +46,7 @@ pub struct DaemonContext {
     pub runtime: tokio::runtime::Runtime,
     pub db: SharedDatabase,
     pub async_db: AsyncDb,
-    pub store: PendingMessageStore,
+    pub store: AsyncPendingMessageStore,
     pub write_observer: DaemonWriteObserver,
     pub config: std::sync::Arc<crate::core::config::Config>,
     pub mempal_home: PathBuf,
@@ -87,9 +87,9 @@ impl DaemonWriteObserver {
         }
     }
 
-    pub fn maybe_log_stall(&self, store: &PendingMessageStore) {
+    pub async fn maybe_log_stall(&self, store: &AsyncPendingMessageStore) {
         let now = unix_secs();
-        let Some(diagnostic) = self.stall_diagnostic(store, now) else {
+        let Some(diagnostic) = self.stall_diagnostic(store, now).await else {
             return;
         };
         let last_log = self.inner.last_stall_log_secs.load(Ordering::Relaxed);
@@ -114,12 +114,12 @@ impl DaemonWriteObserver {
         );
     }
 
-    fn stall_diagnostic(
+    async fn stall_diagnostic(
         &self,
-        store: &PendingMessageStore,
+        store: &AsyncPendingMessageStore,
         now_secs: u64,
     ) -> Option<DaemonStallDiagnostic> {
-        let stats = match store.stats() {
+        let stats = match store.stats().await {
             Ok(stats) => stats,
             Err(error) => {
                 tracing::warn!(?error, "daemon stall detector failed to read queue stats");
@@ -242,7 +242,7 @@ fn bootstrap_inner(
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::DbOpen);
     let db = Database::open(&db_path).context("failed to open daemon database")?;
     let async_db = AsyncDb::open(&db_path, 4).context("failed to open daemon async database")?;
-    let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
+    let store = AsyncPendingMessageStore::new(db.path()).context("failed to open pending queue")?;
     let db = Arc::new(AsyncMutex::new(db));
     let write_observer = DaemonWriteObserver::new();
 
@@ -425,16 +425,18 @@ fn redirect_stdin_to_dev_null() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::queue::PendingMessageStore;
 
-    #[test]
-    fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes() {
+    #[tokio::test]
+    async fn write_observer_reports_stall_when_queue_has_work_and_no_recent_writes() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         Database::open(&db_path).expect("open db");
-        let store = PendingMessageStore::new(&db_path).expect("open queue");
-        store
+        let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+        sync_store
             .enqueue("hook:user-prompt-submit", "{}")
             .expect("enqueue pending message");
+        let store = AsyncPendingMessageStore::from_store(sync_store);
 
         let observer = DaemonWriteObserver::new();
         let now = unix_secs();
@@ -443,24 +445,26 @@ mod tests {
 
         let diagnostic = observer
             .stall_diagnostic(&store, now)
+            .await
             .expect("stall diagnostic");
         assert_eq!(diagnostic.queued_count, 1);
         assert!(diagnostic.seconds_since_successful_write >= DAEMON_STALL_SECONDS);
         assert_eq!(diagnostic.last_error, "failed to merge drawer");
     }
 
-    #[test]
-    fn write_observer_ignores_empty_queue() {
+    #[tokio::test]
+    async fn write_observer_ignores_empty_queue() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         Database::open(&db_path).expect("open db");
-        let store = PendingMessageStore::new(&db_path).expect("open queue");
+        let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+        let store = AsyncPendingMessageStore::from_store(sync_store);
 
         let observer = DaemonWriteObserver::new();
         let now = unix_secs();
         observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
 
-        assert_eq!(observer.stall_diagnostic(&store, now), None);
+        assert_eq!(observer.stall_diagnostic(&store, now).await, None);
     }
 
     #[test]

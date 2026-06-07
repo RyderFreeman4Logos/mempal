@@ -6,7 +6,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use mempal::core::{AsyncDb, db::Database, queue::PendingMessageStore};
+use mempal::core::{
+    AsyncDb,
+    db::Database,
+    queue::{AsyncPendingMessageStore, PendingMessageStore},
+};
 use mempal::daemon::{DaemonIngestContext, process_claimed_message_with_embedder};
 use mempal::embed::{EmbedError, Embedder};
 use mempal::hook::{CapturedHookEnvelope, HookEvent};
@@ -104,9 +108,10 @@ async fn test_daemon_heartbeat_fires_during_embed_retry() {
 
     let config = mempal::core::config::Config::default();
     let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+    let async_store = AsyncPendingMessageStore::from_store(store.clone());
     process_claimed_message_with_embedder(
         &async_db,
-        &store,
+        &async_store,
         "worker-heartbeat",
         &claimed,
         &embedder,
@@ -212,9 +217,10 @@ enabled = true
     };
 
     let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+    let async_store = AsyncPendingMessageStore::from_store(store.clone());
     let drawer_id = process_claimed_message_with_embedder(
         &async_db,
-        &store,
+        &async_store,
         "worker-hotpatch-project",
         &claimed,
         &embedder,

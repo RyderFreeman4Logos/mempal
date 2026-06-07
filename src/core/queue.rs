@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 use super::config::scrub_sensitive_text;
 
@@ -21,6 +23,8 @@ pub enum QueueError {
     MessageNotFound(String),
     #[error("retry count does not fit in u32 for message {id}")]
     RetryCountOverflow { id: String },
+    #[error("blocking queue task failed: {0}")]
+    BlockingTaskFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, QueueError>;
@@ -94,6 +98,164 @@ impl Default for QueueConfig {
 pub struct PendingMessageStore {
     db_path: PathBuf,
     config: QueueConfig,
+}
+
+/// Bounded async facade for [`PendingMessageStore`].
+///
+/// The queue store intentionally remains a synchronous SQLite API for CLI and
+/// test callers. Daemon and MCP async tasks must use this facade so claim,
+/// confirm, retry, release, heartbeat, and stats calls run on Tokio's blocking
+/// pool instead of occupying runtime worker threads.
+#[derive(Debug, Clone)]
+pub struct AsyncPendingMessageStore {
+    inner: PendingMessageStore,
+    permits: Arc<Semaphore>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    blocking_delay: Option<Duration>,
+}
+
+impl AsyncPendingMessageStore {
+    const DEFAULT_BLOCKING_PERMITS: usize = 4;
+
+    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        PendingMessageStore::new(path).map(Self::from_store)
+    }
+
+    pub fn new_without_reclaim(path: impl AsRef<Path>) -> Self {
+        Self::from_store(PendingMessageStore::new_without_reclaim(path))
+    }
+
+    pub fn from_store(inner: PendingMessageStore) -> Self {
+        Self {
+            inner,
+            permits: Arc::new(Semaphore::new(Self::DEFAULT_BLOCKING_PERMITS)),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            blocking_delay: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_blocking_delay(mut self, delay: Duration) -> Self {
+        self.blocking_delay = Some(delay);
+        self
+    }
+
+    pub async fn enqueue(&self, kind: String, payload: String) -> Result<String> {
+        self.run(move |store| store.enqueue(&kind, &payload)).await
+    }
+
+    pub async fn claim_next(
+        &self,
+        worker_id: String,
+        claim_ttl_secs: i64,
+    ) -> Result<Option<ClaimedMessage>> {
+        self.run(move |store| store.claim_next(&worker_id, claim_ttl_secs))
+            .await
+    }
+
+    pub async fn claim_next_by_kind(
+        &self,
+        worker_id: String,
+        claim_ttl_secs: i64,
+        kind_filter: String,
+    ) -> Result<Option<ClaimedMessage>> {
+        self.run(move |store| store.claim_next_by_kind(&worker_id, claim_ttl_secs, &kind_filter))
+            .await
+    }
+
+    pub async fn confirm(&self, id: String) -> Result<()> {
+        self.run(move |store| store.confirm(&id)).await
+    }
+
+    pub async fn complete_operation(
+        &self,
+        id: String,
+        op_state: String,
+        result_drawer_id: Option<String>,
+        rejected_reason: Option<String>,
+        failure_detail: Option<String>,
+        result_json: Option<String>,
+    ) -> Result<()> {
+        self.run(move |store| {
+            store.complete_operation(
+                &id,
+                &op_state,
+                result_drawer_id.as_deref(),
+                rejected_reason.as_deref(),
+                failure_detail.as_deref(),
+                result_json.as_deref(),
+            )
+        })
+        .await
+    }
+
+    pub async fn operation_status(&self, id: String) -> Result<Option<PendingOperationRecord>> {
+        self.run(move |store| store.operation_status(&id)).await
+    }
+
+    pub async fn mark_failed(&self, id: String, error: String) -> Result<()> {
+        self.run(move |store| store.mark_failed(&id, &error)).await
+    }
+
+    pub async fn mark_failed_with_disposition(
+        &self,
+        id: String,
+        error: String,
+        disposition: QueueFailureDisposition,
+    ) -> Result<()> {
+        self.run(move |store| store.mark_failed_with_disposition(&id, &error, disposition))
+            .await
+    }
+
+    pub async fn release_claim(&self, id: String) -> Result<()> {
+        self.run(move |store| store.release_claim(&id)).await
+    }
+
+    pub async fn refresh_heartbeat(&self, id: String, worker_id: String) -> Result<()> {
+        self.run(move |store| store.refresh_heartbeat(&id, &worker_id))
+            .await
+    }
+
+    pub async fn reclaim_stale(&self, stale_secs: i64) -> Result<u64> {
+        self.run(move |store| store.reclaim_stale(stale_secs)).await
+    }
+
+    pub async fn stats(&self) -> Result<QueueStats> {
+        self.run(|store| store.stats()).await
+    }
+
+    async fn run<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(PendingMessageStore) -> Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let permit =
+            self.permits.clone().acquire_owned().await.map_err(|_| {
+                QueueError::BlockingTaskFailed("queue semaphore closed".to_string())
+            })?;
+        let store = self.inner.clone();
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.blocking_delay;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay: Option<Duration> = None;
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let join = tokio::task::spawn_blocking(move || {
+            let permit = permit;
+            tracing::dispatcher::with_default(&dispatch, || {
+                if let Some(delay) = delay {
+                    std::thread::sleep(delay);
+                }
+                let out = f(store);
+                drop(permit);
+                out
+            })
+        })
+        .await;
+        match join {
+            Ok(out) => out,
+            Err(error) => Err(QueueError::BlockingTaskFailed(error.to_string())),
+        }
+    }
 }
 
 impl PendingMessageStore {
@@ -920,4 +1082,51 @@ fn truncate_to_byte_limit(mut value: String, max_bytes: usize) -> String {
     }
     value.truncate(truncate_at);
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::db::Database;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_claim_confirm_run_off_runtime() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let sync_store = PendingMessageStore::new(&db_path).expect("open queue");
+        sync_store
+            .enqueue("hook_user_prompt", "{\"event\":\"UserPromptSubmit\"}")
+            .expect("enqueue");
+        let store = AsyncPendingMessageStore::from_store(sync_store)
+            .with_blocking_delay(Duration::from_millis(300));
+
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticks_bg = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks_bg.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let claimed = store
+            .claim_next("worker-a".to_string(), 60)
+            .await
+            .expect("claim")
+            .expect("claimed message");
+        store
+            .confirm(claimed.id)
+            .await
+            .expect("confirm off runtime");
+        ticker.abort();
+
+        let observed = ticks.load(Ordering::SeqCst);
+        assert!(
+            observed >= 5,
+            "ticker advanced {observed} times while delayed claim/confirm ran; \
+             queue SQLite must run off the Tokio worker"
+        );
+    }
 }

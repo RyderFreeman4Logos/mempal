@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use mempal::core::AsyncDb;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
-use mempal::core::queue::PendingMessageStore;
+use mempal::core::queue::{AsyncPendingMessageStore, PendingMessageStore};
 use mempal::core::types::{Drawer, SourceType};
 use mempal::daemon::{DaemonIngestContext, process_claimed_message_with_embedder};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
@@ -203,9 +203,10 @@ preview_chars = 48
             .claim_next("worker-session-review", 120)?
             .expect("claimed message");
         let db = AsyncDb::open(&self.db_path, 4)?;
+        let async_store = AsyncPendingMessageStore::from_store(self.store.clone());
         process_claimed_message_with_embedder(
             &db,
-            &self.store,
+            &async_store,
             "worker-session-review",
             &claimed,
             embedder,

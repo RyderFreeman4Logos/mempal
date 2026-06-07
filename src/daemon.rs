@@ -12,7 +12,7 @@ use crate::core::{
     AsyncDb,
     db::{Database, DbError},
     project::resolve_project_id,
-    queue::{ClaimedMessage, PendingMessageStore, QueueFailureDisposition},
+    queue::{AsyncPendingMessageStore, ClaimedMessage, QueueFailureDisposition},
     strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{BootstrapEvidenceArgs, Drawer, SourceType},
     utils::{current_timestamp, route_room_from_taxonomy, synthetic_source_file},
@@ -164,6 +164,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     let reclaimed = context
         .store
         .reclaim_stale(claim_ttl_secs)
+        .await
         .context("failed to reclaim stale daemon claims")?;
     tracing::info!("daemon startup reclaim_stale reclaimed={reclaimed}");
     let stall_watchdog_handle = spawn_stall_watchdog(
@@ -213,7 +214,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
 
     let mut hook_workers = JoinSet::new();
     loop {
-        context.write_observer.maybe_log_stall(&context.store);
+        context.write_observer.maybe_log_stall(&context.store).await;
         drain_finished_hook_workers(&mut hook_workers);
 
         if shutdown_requested() {
@@ -280,10 +281,14 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     let _ = stall_watchdog_handle.await;
 
     // Release any tasks still claimed by workers that were aborted or did not finish.
-    let released = context.store.reclaim_stale(0).unwrap_or_else(|error| {
-        tracing::warn!(?error, "failed to release claimed messages on shutdown");
-        0
-    });
+    let released = context
+        .store
+        .reclaim_stale(0)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(?error, "failed to release claimed messages on shutdown");
+            0
+        });
     if released > 0 {
         tracing::info!("released {released} claimed messages back to pending on shutdown");
     }
@@ -293,7 +298,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
 
 struct HookWorkerState {
     async_db: AsyncDb,
-    store: PendingMessageStore,
+    store: AsyncPendingMessageStore,
     worker_id: String,
     embedder: Arc<DaemonEmbedder>,
     prototype_classifier: Arc<Option<PrototypeClassifier>>,
@@ -330,7 +335,7 @@ async fn process_hook_worker_message(state: HookWorkerState, message: ClaimedMes
 
     match result {
         Ok(_) => {
-            if let Err(error) = state.store.confirm(&message_id) {
+            if let Err(error) = state.store.confirm(message_id.clone()).await {
                 tracing::error!(?error, "failed to confirm {message_id}");
                 state
                     .write_observer
@@ -343,11 +348,11 @@ async fn process_hook_worker_message(state: HookWorkerState, message: ClaimedMes
             tracing::error!("daemon message {message_id} failed: {error}");
             state.write_observer.record_error(error.to_string());
             let disposition = queue_failure_disposition(&error);
-            if let Err(mark_error) = state.store.mark_failed_with_disposition(
-                &message_id,
-                &error.to_string(),
-                disposition,
-            ) {
+            if let Err(mark_error) = state
+                .store
+                .mark_failed_with_disposition(message_id.clone(), error.to_string(), disposition)
+                .await
+            {
                 tracing::error!(?mark_error, "failed to mark_failed {message_id}");
                 state
                     .write_observer
@@ -414,7 +419,7 @@ fn handle_hook_worker_join(result: std::result::Result<(), tokio::task::JoinErro
 
 fn spawn_stall_watchdog(
     observer: crate::daemon_bootstrap::DaemonWriteObserver,
-    store: PendingMessageStore,
+    store: AsyncPendingMessageStore,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -425,26 +430,27 @@ fn spawn_stall_watchdog(
             if shutdown_requested() {
                 break;
             }
-            observer.maybe_log_stall(&store);
+            observer.maybe_log_stall(&store).await;
         }
     })
 }
 
 trait ClaimNextSource {
-    fn claim_next(
-        &self,
-        worker_id: &str,
+    fn claim_next<'a>(
+        &'a self,
+        worker_id: &'a str,
         claim_ttl_secs: i64,
-    ) -> crate::core::queue::Result<Option<ClaimedMessage>>;
+    ) -> Pin<Box<dyn Future<Output = crate::core::queue::Result<Option<ClaimedMessage>>> + Send + 'a>>;
 }
 
-impl ClaimNextSource for PendingMessageStore {
-    fn claim_next(
-        &self,
-        worker_id: &str,
+impl ClaimNextSource for AsyncPendingMessageStore {
+    fn claim_next<'a>(
+        &'a self,
+        worker_id: &'a str,
         claim_ttl_secs: i64,
-    ) -> crate::core::queue::Result<Option<ClaimedMessage>> {
-        PendingMessageStore::claim_next(self, worker_id, claim_ttl_secs)
+    ) -> Pin<Box<dyn Future<Output = crate::core::queue::Result<Option<ClaimedMessage>>> + Send + 'a>>
+    {
+        Box::pin(async move { self.claim_next(worker_id.to_string(), claim_ttl_secs).await })
     }
 }
 
@@ -464,7 +470,7 @@ pub struct DaemonIngestContext<'a> {
 
 struct DrawerIngestContext<'a, E: Embedder + ?Sized> {
     db: &'a AsyncDb,
-    store: &'a PendingMessageStore,
+    store: &'a AsyncPendingMessageStore,
     worker_id: &'a str,
     message: &'a ClaimedMessage,
     embedder: &'a E,
@@ -481,7 +487,7 @@ async fn poll_claim_next<'a, S>(
 where
     S: Fn(Duration) -> SleepFuture<'a>,
 {
-    match store.claim_next(worker_id, claim_ttl_secs) {
+    match store.claim_next(worker_id, claim_ttl_secs).await {
         Ok(Some(message)) => ClaimPollResult::Claimed(message),
         Ok(None) => ClaimPollResult::Idle,
         Err(error) => {
@@ -494,7 +500,7 @@ where
 
 pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
     db: &AsyncDb,
-    store: &PendingMessageStore,
+    store: &AsyncPendingMessageStore,
     worker_id: &str,
     message: &ClaimedMessage,
     embedder: &E,
@@ -995,9 +1001,18 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     let heartbeat_message_id = context.message.id.clone();
     let heartbeat_worker_id = context.worker_id.to_string();
     let heartbeat = move || -> crate::embed::Result<()> {
-        heartbeat_store
-            .refresh_heartbeat(&heartbeat_message_id, &heartbeat_worker_id)
-            .map_err(|error| EmbedError::Runtime(format!("refresh heartbeat failed: {error}")))?;
+        let store = heartbeat_store.clone();
+        let message_id = heartbeat_message_id.clone();
+        let worker_id = heartbeat_worker_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
+                tracing::warn!(
+                    ?error,
+                    message_id,
+                    "failed to refresh daemon ingest heartbeat"
+                );
+            }
+        });
         Ok(())
     };
 
@@ -1292,8 +1307,8 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
 }
 
 async fn enqueue_llm_gating_after_durable_insert(
-    db: &AsyncDb,
-    store: &PendingMessageStore,
+    _db: &AsyncDb,
+    store: &AsyncPendingMessageStore,
     config: &crate::core::config::Config,
     gating_decision: &Option<GatingDecision>,
     drawer_id: &str,
@@ -1316,21 +1331,17 @@ async fn enqueue_llm_gating_after_durable_insert(
         system_prompt,
     })
     .context("failed to serialize LLM gating payload")?;
-    let store = store.clone();
     let drawer_id = drawer_id.to_string();
-    db.run_write_anyhow(move |_db| {
-        if let Err(error) = store.enqueue("llm_task", &payload) {
-            tracing::warn!(
-                ?error,
-                "failed to enqueue LLM gating task for {}",
-                drawer_id
-            );
-        } else {
-            tracing::info!("enqueued LLM gating task for {}", drawer_id);
-        }
-        Ok(())
-    })
-    .await
+    if let Err(error) = store.enqueue("llm_task".to_string(), payload).await {
+        tracing::warn!(
+            ?error,
+            "failed to enqueue LLM gating task for {}",
+            drawer_id
+        );
+    } else {
+        tracing::info!("enqueued LLM gating task for {}", drawer_id);
+    }
+    Ok(())
 }
 
 async fn record_gating_audit_async(
@@ -1636,11 +1647,12 @@ mod tests {
         AsyncDb,
         config::{Config, LlmJudgeConfig, TurnStorageMode},
         db::Database,
-        queue::{ClaimedMessage, PendingMessageStore, QueueError},
+        queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore, QueueError},
         types::{Drawer, SourceType},
     };
     use crate::embed::{EmbedError, Embedder};
     use crate::hook::{CapturedHookEnvelope, HookEvent};
+    use std::pin::Pin;
 
     use super::{
         ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext, HookWorkerState,
@@ -1661,16 +1673,22 @@ mod tests {
     }
 
     impl ClaimNextSource for StubClaimSource {
-        fn claim_next(
-            &self,
-            _worker_id: &str,
+        fn claim_next<'a>(
+            &'a self,
+            _worker_id: &'a str,
             _claim_ttl_secs: i64,
-        ) -> crate::core::queue::Result<Option<ClaimedMessage>> {
-            self.responses
-                .lock()
-                .expect("responses mutex")
-                .pop_front()
-                .expect("stub response")
+        ) -> Pin<
+            Box<
+                dyn Future<Output = crate::core::queue::Result<Option<ClaimedMessage>>> + Send + 'a,
+            >,
+        > {
+            Box::pin(std::future::ready(
+                self.responses
+                    .lock()
+                    .expect("responses mutex")
+                    .pop_front()
+                    .expect("stub response"),
+            ))
         }
     }
 
@@ -1829,6 +1847,7 @@ mod tests {
         Database::open(&db_path).expect("open db");
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
         let store = PendingMessageStore::new(&db_path).expect("store");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
 
         let hook_payload = serde_json::json!({
             "tool_name": "Bash",
@@ -1877,7 +1896,7 @@ mod tests {
         super::process_hook_worker_message(
             HookWorkerState {
                 async_db,
-                store,
+                store: async_store,
                 worker_id: worker_id.to_string(),
                 embedder: std::sync::Arc::new(DaemonEmbedder {
                     primary: Box::new(HeartbeatProbeEmbedder {
@@ -1925,6 +1944,7 @@ mod tests {
             .expect("insert target vector");
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
         let store = PendingMessageStore::new(&db_path).expect("store");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
 
         let hook_payload = serde_json::json!({
             "tool_name": "Bash",
@@ -1968,7 +1988,7 @@ mod tests {
         super::process_hook_worker_message(
             HookWorkerState {
                 async_db,
-                store: store.clone(),
+                store: async_store,
                 worker_id: "merge-conflict-worker".to_string(),
                 embedder: Arc::new(DaemonEmbedder {
                     primary: Box::new(MergeConflictProbeEmbedder {
@@ -2055,6 +2075,7 @@ mod tests {
         let db = Database::open(&db_path).expect("open db");
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
         let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
         let captured_at = "2026-05-01T12:34:56Z";
         let hook_payload = serde_json::json!({
             "tool_name": "Bash",
@@ -2089,7 +2110,7 @@ mod tests {
         config.project.id = Some("timestamp-test".to_string());
         process_claimed_message_with_embedder(
             &async_db,
-            &store,
+            &async_store,
             "timestamp-test-worker",
             &message,
             &StaticEmbedder,
@@ -2122,6 +2143,7 @@ mod tests {
         let db = Database::open(&db_path).expect("open db");
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
         let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
         let hook_payload = serde_json::json!({
             "tool_name": "Bash",
             "input": "printf race",
@@ -2163,7 +2185,7 @@ mod tests {
         };
         let drawer_id = process_claimed_message_with_embedder(
             &async_db,
-            &store,
+            &async_store,
             "llm-race-worker",
             &message,
             &embedder,
