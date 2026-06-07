@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 19;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 20;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
@@ -71,6 +71,30 @@ ALTER TABLE pending_message_completions ADD COLUMN op_state TEXT NOT NULL DEFAUL
 ALTER TABLE pending_message_completions ADD COLUMN rejected_reason TEXT;
 ALTER TABLE pending_message_completions ADD COLUMN failure_detail TEXT;
 ALTER TABLE pending_message_completions ADD COLUMN result_json TEXT;
+"#;
+
+pub const FORK_EXT_V20_SCHEMA_SQL: &str = r#"
+UPDATE pending_messages
+SET op_state = CASE status
+    WHEN 'pending' THEN 'queued'
+    WHEN 'claimed' THEN 'running'
+    WHEN 'done' THEN 'completed'
+    WHEN 'failed' THEN 'failed'
+    ELSE op_state
+END
+WHERE op_state = 'queued';
+
+UPDATE pending_message_completions
+SET op_state = CASE
+    WHEN failure_detail IS NOT NULL THEN 'failed'
+    WHEN rejected_reason IS NOT NULL THEN 'rejected'
+    ELSE 'completed'
+END
+WHERE op_state = 'queued';
+
+UPDATE pending_message_completions
+SET created_at = CAST(created_at / 1000 AS INTEGER)
+WHERE created_at BETWEEN 1000000000000000 AND 9999999999999999;
 "#;
 
 pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
@@ -391,6 +415,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 19,
             up: apply_v19,
         },
+        Migration {
+            version: 20,
+            up: apply_v20,
+        },
     ]
 }
 
@@ -569,6 +597,10 @@ fn apply_v19(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     Ok(())
+}
+
+fn apply_v20(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V20_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {
