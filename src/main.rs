@@ -2654,9 +2654,9 @@ fn run() -> Result<()> {
                 }
                 recompute_importance_command(&db, only_zero)
             } else if embedder.is_some() || from_config {
-                if dry_run {
+                if dry_run && !stale {
                     bail!(
-                        "--dry-run is only supported by source reindex (`mempal reindex --stale --dry-run`)"
+                        "--dry-run on embedder/vector reindex requires --stale; add --stale or use `mempal reindex --stale --dry-run`"
                     );
                 }
                 if !vector_target.is_empty() && !stale {
@@ -2682,8 +2682,11 @@ fn run() -> Result<()> {
                     &db,
                     config.as_ref(),
                     &backend,
-                    resume,
-                    stale,
+                    ReindexEmbedderMode {
+                        resume,
+                        stale_only: stale,
+                        dry_run,
+                    },
                     StaleBatchTuning {
                         batch_size: batch_size.unwrap_or(1000),
                         max_batch_retries: max_batch_retries.unwrap_or(DEFAULT_MAX_BATCH_RETRIES),
@@ -5633,11 +5636,23 @@ async fn reindex_command_by_embedder(
     db: &Database,
     config: &Config,
     embedder_name: &str,
-    resume: bool,
-    stale_only: bool,
+    mode: ReindexEmbedderMode,
     batch: StaleBatchTuning,
     target: ReindexVectorTarget,
 ) -> Result<()> {
+    if mode.dry_run && !mode.stale_only {
+        bail!(
+            "--dry-run on embedder/vector reindex requires --stale; add --stale or use `mempal reindex --stale --dry-run`"
+        );
+    }
+    if mode.dry_run {
+        let stale_count = preview_reindex_stale_vector_work(db, config, embedder_name, target)
+            .await
+            .context("failed to plan stale vector reindex")?;
+        println!("would re-embed {stale_count} stale drawers");
+        println!("dry-run: no vectors were written");
+        return Ok(());
+    }
     let embedder = build_specific_embedder(config, embedder_name).await?;
     let new_dim = embedder.dimensions();
     let current_dim = current_vector_dim(db).context("failed to read embedding dim")?;
@@ -5648,7 +5663,7 @@ async fn reindex_command_by_embedder(
     let target_fingerprint = config
         .embed
         .vector_embedder_fingerprint(embedder_name, new_dim);
-    let mut resume_checkpoint = if resume {
+    let mut resume_checkpoint = if mode.resume {
         progress_store
             .latest_resumable(Some(embedder_name))
             .context("failed to load reindex checkpoint")?
@@ -5667,12 +5682,12 @@ async fn reindex_command_by_embedder(
     );
     let metric_is_current = current_metric.as_deref() == Some(VECTOR_DISTANCE_METRIC);
     let table_layout_is_current = current_dim == Some(new_dim) && metric_is_current;
-    let should_recreate_table = if stale_only {
+    let should_recreate_table = if mode.stale_only {
         !table_layout_is_current
     } else {
         resume_checkpoint.is_none() || !table_layout_is_current
     };
-    if stale_only
+    if mode.stale_only
         && should_recreate_table
         && reindex_target_narrows_store(db, &target)
             .context("failed to evaluate targeted stale reindex safety")?
@@ -5707,7 +5722,7 @@ async fn reindex_command_by_embedder(
         db.recreate_vectors_table(new_dim)
             .context("failed to recreate vectors table")?;
         stash
-    } else if stale_only {
+    } else if mode.stale_only {
         println!("stale-only reindex preserving existing drawer_vectors table");
         None
     } else {
@@ -5717,7 +5732,7 @@ async fn reindex_command_by_embedder(
     let progress_store_for_reindex = progress_store.clone();
     let target_fingerprint_for_reindex = target_fingerprint.clone();
     let embed_result: Result<()> = async move {
-    if stale_only && resume_checkpoint.is_none() {
+    if mode.stale_only && resume_checkpoint.is_none() {
         let policy = BatchRetryPolicy {
             interval: std::time::Duration::from_secs(config.embed.retry.interval_secs),
             max_retries: batch.max_batch_retries,
@@ -5734,7 +5749,7 @@ async fn reindex_command_by_embedder(
         .await;
     }
     let mut drawers = reindex_rows(db).context("failed to load active drawers for reindex")?;
-    if stale_only {
+    if mode.stale_only {
         drawers.retain(|row| {
             reindex_row_is_stale(db, row, &target_fingerprint_for_reindex).unwrap_or(true)
         });
@@ -5823,6 +5838,20 @@ async fn reindex_command_by_embedder(
         }
         Err(error) => Err(error),
     }
+}
+
+async fn preview_reindex_stale_vector_work(
+    db: &Database,
+    config: &Config,
+    embedder_name: &str,
+    target: ReindexVectorTarget,
+) -> Result<usize> {
+    let embedder = build_specific_embedder(config, embedder_name).await?;
+    let target_fingerprint = config
+        .embed
+        .vector_embedder_fingerprint(embedder_name, embedder.dimensions());
+    build_reindex_stale_pending_rows(db, &target_fingerprint, &target)
+        .context("failed to snapshot stale reindex work list")
 }
 
 /// Decide the fate of a recreate-reindex's staged old vectors (#302 atomicity).
@@ -5920,6 +5949,13 @@ struct StaleBatchTuning {
     /// Max retries for a batch's embed call before it is skipped
     /// (`--max-batch-retries`, default `DEFAULT_MAX_BATCH_RETRIES`).
     max_batch_retries: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReindexEmbedderMode {
+    resume: bool,
+    stale_only: bool,
+    dry_run: bool,
 }
 
 /// Embed one stale batch, retrying at the policy's fixed interval (no backoff,
@@ -12175,7 +12211,13 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "model2vec")]
+    use safetensors::tensor::TensorView;
+    #[cfg(feature = "model2vec")]
+    use safetensors::{Dtype, serialize_to_file};
     use std::collections::BTreeSet;
+    #[cfg(feature = "model2vec")]
+    use std::path::Path;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -12282,6 +12324,57 @@ mod tests {
             room: None,
             limit,
         }
+    }
+
+    #[cfg(feature = "model2vec")]
+    fn model2vec_dry_run_config() -> Config {
+        let mut config = Config::default();
+        config.embed.backend = "model2vec".to_string();
+        config
+    }
+
+    #[cfg(feature = "model2vec")]
+    fn write_model2vec_fixture(model_dir: &Path, dimensions: usize) {
+        std::fs::create_dir_all(model_dir).expect("create model2vec fixture dir");
+
+        let tokenizer = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "[UNK]": 0
+                },
+                "unk_token": "[UNK]"
+            }
+        });
+        std::fs::write(
+            model_dir.join("tokenizer.json"),
+            serde_json::to_vec(&tokenizer).expect("serialize tokenizer"),
+        )
+        .expect("write tokenizer.json");
+
+        let embedding_bytes = vec![1.0_f32; dimensions]
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let tensor = TensorView::new(Dtype::F32, vec![1, dimensions], &embedding_bytes)
+            .expect("create embeddings tensor");
+        serialize_to_file(
+            [(String::from("embeddings"), tensor)],
+            &None,
+            &model_dir.join("model.safetensors"),
+        )
+        .expect("write model.safetensors");
+
+        std::fs::write(model_dir.join("config.json"), r#"{"normalize":true}"#)
+            .expect("write config.json");
     }
 
     fn insert_reindex_test_drawer(
@@ -12477,6 +12570,93 @@ mod tests {
             reindex_pending_ids(&db).expect("pending ids"),
             vec!["stale".to_string()],
             "drawer with current fingerprint is excluded"
+        );
+    }
+
+    #[cfg(feature = "model2vec")]
+    #[tokio::test]
+    async fn reindex_embedder_dry_run_snapshots_stale_rows_without_writes() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let model_dir = tmp.path().join("model2vec-fixture");
+        write_model2vec_fixture(&model_dir, 1024);
+        let mut config = model2vec_dry_run_config();
+        config.embed.model = Some(model_dir.display().to_string());
+        let embedder = build_specific_embedder(&config, "model2vec")
+            .await
+            .expect("build local model2vec embedder");
+        let dim = embedder.dimensions();
+        db.recreate_vectors_table(dim).expect("create vector table");
+
+        insert_reindex_test_drawer(&db, "fresh", "fresh content", "fixtures/source.txt", 0);
+        insert_reindex_test_drawer(&db, "stale", "stale content", "fixtures/source.txt", 1);
+
+        let target_fingerprint = config.embed.vector_embedder_fingerprint("model2vec", dim);
+        let fresh_vector = vec![0.1_f32; dim];
+        let stale_vector = vec![0.2_f32; dim];
+        db.insert_vector_with_project("fresh", &fresh_vector, Some("default"))
+            .expect("insert fresh vector");
+        db.insert_vector_with_project("stale", &stale_vector, Some("default"))
+            .expect("insert stale vector");
+        record_reindex_metadata(
+            &db,
+            "fresh",
+            CURRENT_VECTOR_INDEX_VERSION,
+            &target_fingerprint,
+        )
+        .expect("record fresh fingerprint");
+
+        let before_vectors = db.vector_row_count().expect("vector count before");
+        let inserted = preview_reindex_stale_vector_work(
+            &db,
+            &config,
+            "model2vec",
+            empty_reindex_target(None),
+        )
+        .await
+        .expect("dry-run stale snapshot");
+
+        assert_eq!(inserted, 1);
+        assert_eq!(
+            reindex_pending_ids(&db).expect("pending ids"),
+            vec!["stale".to_string()]
+        );
+        assert_eq!(
+            db.vector_row_count().expect("vector count after"),
+            before_vectors,
+            "dry-run must not mutate drawer_vectors"
+        );
+    }
+
+    #[cfg(feature = "model2vec")]
+    #[tokio::test]
+    async fn reindex_embedder_dry_run_without_stale_is_rejected() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let config = model2vec_dry_run_config();
+
+        let error = reindex_command_by_embedder(
+            &db,
+            &config,
+            "model2vec",
+            ReindexEmbedderMode {
+                resume: false,
+                stale_only: false,
+                dry_run: true,
+            },
+            StaleBatchTuning {
+                batch_size: 2,
+                max_batch_retries: 0,
+            },
+            empty_reindex_target(None),
+        )
+        .await
+        .expect_err("dry-run without stale must fail");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("--stale"),
+            "error should tell the user to add --stale, got: {message}"
         );
     }
 
