@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -28,6 +29,7 @@ use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evalua
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::daemon_bootstrap::DaemonContext;
 use crate::hook::CapturedHookEnvelope;
@@ -42,6 +44,7 @@ const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 /// Budget given to LLM workers to finish in-flight tasks during graceful shutdown.
 /// Coupled to the orphan reaper grace period in `src/main.rs`.
 pub const DAEMON_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+const DAEMON_HOOK_WORKER_LIMIT: usize = 4;
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
     run_command_with_bootstrap_events(config_path, foreground, None)
@@ -144,14 +147,17 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         return Ok(());
     }
 
-    let embedder = DaemonEmbedder::from_config(context.config.as_ref())
-        .await
-        .context("failed to build daemon embedder")?;
-    let prototype_classifier =
-        compile_classifier_from_embedder(&embedder, &context.config.ingest_gating)
+    let embedder = Arc::new(
+        DaemonEmbedder::from_config(context.config.as_ref())
+            .await
+            .context("failed to build daemon embedder")?,
+    );
+    let prototype_classifier = Arc::new(
+        compile_classifier_from_embedder(embedder.as_ref(), &context.config.ingest_gating)
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))
-            .context("gating prototype init failed")?;
+            .context("gating prototype init failed")?,
+    );
     let worker_id = format!("mempal-daemon-{}", std::process::id());
     let claim_ttl_secs = context.config.hooks.daemon_claim_ttl_secs as i64;
     let poll_interval = Duration::from_millis(context.config.hooks.daemon_poll_interval_ms);
@@ -205,12 +211,21 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         vec![]
     };
 
+    let mut hook_workers = JoinSet::new();
+    let mut hook_worker_seq: u64 = 0;
+
     loop {
         context.write_observer.maybe_log_stall(&context.store);
+        drain_finished_hook_workers(&mut hook_workers);
 
         if shutdown_requested() {
             tracing::info!("shutdown requested; stopping daemon loop");
             break;
+        }
+
+        if hook_workers.len() >= DAEMON_HOOK_WORKER_LIMIT {
+            wait_for_hook_worker_or_tick(&mut hook_workers, poll_interval).await;
+            continue;
         }
 
         match poll_claim_next(&context.store, &worker_id, claim_ttl_secs, |duration| {
@@ -219,50 +234,30 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .await
         {
             ClaimPollResult::Claimed(message) => {
-                let message_id = message.id.clone();
-                let result = process_claimed_message_with_embedder(
-                    &context.async_db,
-                    &context.store,
-                    &worker_id,
-                    &message,
-                    &embedder,
-                    DaemonIngestContext {
-                        prototype_classifier: prototype_classifier.as_ref(),
-                        config: context.config.as_ref(),
-                        mempal_home: &context.mempal_home,
+                hook_worker_seq = hook_worker_seq.saturating_add(1);
+                spawn_hook_worker(
+                    &mut hook_workers,
+                    HookWorkerState {
+                        async_db: context.async_db.clone(),
+                        store: context.store.clone(),
+                        worker_id: format!("{worker_id}-hook-{hook_worker_seq}"),
+                        embedder: Arc::clone(&embedder),
+                        prototype_classifier: Arc::clone(&prototype_classifier),
+                        config: Arc::clone(&context.config),
+                        mempal_home: context.mempal_home.clone(),
+                        write_observer: context.write_observer.clone(),
                     },
-                )
-                .await;
-
-                match result {
-                    Ok(_) => {
-                        context
-                            .store
-                            .confirm(&message_id)
-                            .with_context(|| format!("failed to confirm {message_id}"))?;
-                        context.write_observer.record_successful_write();
-                    }
-                    Err(error) => {
-                        tracing::error!("daemon message {message_id} failed: {error}");
-                        context.write_observer.record_error(error.to_string());
-                        let disposition = queue_failure_disposition(&error);
-                        context
-                            .store
-                            .mark_failed_with_disposition(
-                                &message_id,
-                                &error.to_string(),
-                                disposition,
-                            )
-                            .with_context(|| format!("failed to mark_failed {message_id}"))?;
-                    }
-                }
+                    message,
+                );
             }
             ClaimPollResult::Idle => {
-                tokio::time::sleep(poll_interval).await;
+                wait_for_hook_worker_or_tick(&mut hook_workers, poll_interval).await;
             }
             ClaimPollResult::RetryAfterError => continue,
         }
     }
+
+    drain_hook_workers_with_budget(&mut hook_workers, DAEMON_DRAIN_BUDGET).await;
 
     // Give LLM workers a window to finish their current tasks, then abort.
     let drain_start = tokio::time::Instant::now();
@@ -297,6 +292,127 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+struct HookWorkerState {
+    async_db: AsyncDb,
+    store: PendingMessageStore,
+    worker_id: String,
+    embedder: Arc<DaemonEmbedder>,
+    prototype_classifier: Arc<Option<PrototypeClassifier>>,
+    config: Arc<crate::core::config::Config>,
+    mempal_home: PathBuf,
+    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+}
+
+fn spawn_hook_worker(
+    hook_workers: &mut JoinSet<()>,
+    state: HookWorkerState,
+    message: ClaimedMessage,
+) {
+    hook_workers.spawn(async move {
+        process_hook_worker_message(state, message).await;
+    });
+}
+
+async fn process_hook_worker_message(state: HookWorkerState, message: ClaimedMessage) {
+    let message_id = message.id.clone();
+    let result = process_claimed_message_with_embedder(
+        &state.async_db,
+        &state.store,
+        &state.worker_id,
+        &message,
+        state.embedder.as_ref(),
+        DaemonIngestContext {
+            prototype_classifier: state.prototype_classifier.as_ref().as_ref(),
+            config: state.config.as_ref(),
+            mempal_home: &state.mempal_home,
+        },
+    )
+    .await;
+
+    match result {
+        Ok(_) => {
+            if let Err(error) = state.store.confirm(&message_id) {
+                tracing::error!(?error, "failed to confirm {message_id}");
+                state
+                    .write_observer
+                    .record_error(format!("failed to confirm {message_id}: {error}"));
+            } else {
+                state.write_observer.record_successful_write();
+            }
+        }
+        Err(error) => {
+            tracing::error!("daemon message {message_id} failed: {error}");
+            state.write_observer.record_error(error.to_string());
+            let disposition = queue_failure_disposition(&error);
+            if let Err(mark_error) = state.store.mark_failed_with_disposition(
+                &message_id,
+                &error.to_string(),
+                disposition,
+            ) {
+                tracing::error!(?mark_error, "failed to mark_failed {message_id}");
+                state
+                    .write_observer
+                    .record_error(format!("failed to mark_failed {message_id}: {mark_error}"));
+            }
+        }
+    }
+}
+
+fn drain_finished_hook_workers(hook_workers: &mut JoinSet<()>) {
+    while let Some(result) = hook_workers.try_join_next() {
+        handle_hook_worker_join(result);
+    }
+}
+
+async fn wait_for_hook_worker_or_tick(hook_workers: &mut JoinSet<()>, tick: Duration) {
+    if hook_workers.is_empty() {
+        tokio::time::sleep(tick).await;
+        return;
+    }
+
+    tokio::select! {
+        result = hook_workers.join_next() => {
+            if let Some(result) = result {
+                handle_hook_worker_join(result);
+            }
+        }
+        () = tokio::time::sleep(tick) => {}
+    }
+}
+
+async fn drain_hook_workers_with_budget(hook_workers: &mut JoinSet<()>, budget: Duration) {
+    let drain_start = tokio::time::Instant::now();
+    while !hook_workers.is_empty() {
+        let elapsed = drain_start.elapsed();
+        let remaining = budget.saturating_sub(elapsed);
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, hook_workers.join_next()).await {
+            Ok(Some(result)) => handle_hook_worker_join(result),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    if !hook_workers.is_empty() {
+        tracing::warn!(
+            remaining = hook_workers.len(),
+            "hook workers did not exit within drain deadline; task claims will be released on shutdown"
+        );
+        hook_workers.abort_all();
+        while let Some(result) = hook_workers.join_next().await {
+            handle_hook_worker_join(result);
+        }
+    }
+}
+
+fn handle_hook_worker_join(result: std::result::Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        tracing::error!(?error, "hook worker task failed");
+    }
 }
 
 fn spawn_stall_watchdog(

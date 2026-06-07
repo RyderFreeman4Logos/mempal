@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use common::harness::{BootstrapObserver, DaemonSupervisor, start as start_embed_mock};
+use common::harness::{BootstrapObserver, DaemonSupervisor, FailMode, start as start_embed_mock};
 use mempal::bootstrap_events::BootstrapEvent;
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
@@ -139,6 +139,19 @@ fn latest_drawer_row(db_path: &Path) -> (String, String, String, String) {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("latest drawer row")
+}
+
+fn drawer_content_contains(db_path: &Path, marker: &str) -> bool {
+    let pattern = format!("%{marker}%");
+    Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM drawers WHERE content LIKE ?1 AND deleted_at IS NULL)",
+            [pattern],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query drawer content marker")
+        != 0
 }
 
 fn message_status(db_path: &Path, id: &str) -> Option<(String, i64)> {
@@ -390,6 +403,106 @@ async fn test_daemon_processes_hook_post_tool_to_drawer() {
         "privacy scrub must affect stored preview: {body}"
     );
     assert!(!body.contains(raw_secret), "raw secret leaked into drawer");
+
+    daemon.sigterm();
+    let status = daemon.wait().await.expect("wait daemon");
+    assert!(status.success(), "daemon exited with {status:?}");
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_daemon_slow_hook_does_not_block_later_hook() {
+    let _guard = test_guard().await;
+    let (tmp, _mempal_home, db_path, config_path) = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    handle.set_fail_mode(FailMode::Timeout).await;
+    handle
+        .set_fail_if_input_contains(Some("slow-marker".to_string()))
+        .await;
+    write_config(
+        &config_path,
+        &db_path,
+        true,
+        20,
+        60,
+        Some(&format!("http://{addr}/v1")),
+    );
+
+    let slow_id = enqueue_envelope(
+        &db_path,
+        &CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "claude".to_string(),
+            captured_at: "123".to_string(),
+            claude_cwd: tmp.path().display().to_string(),
+            payload: Some(
+                serde_json::json!({
+                    "tool_name": "Bash",
+                    "input": "printf slow",
+                    "output": "slow-marker",
+                    "exit_code": 0
+                })
+                .to_string(),
+            ),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: 128,
+            truncated: false,
+        },
+    );
+    let fast_id = enqueue_envelope(
+        &db_path,
+        &CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "claude".to_string(),
+            captured_at: "124".to_string(),
+            claude_cwd: tmp.path().display().to_string(),
+            payload: Some(
+                serde_json::json!({
+                    "tool_name": "Bash",
+                    "input": "printf fast",
+                    "output": "fast-marker",
+                    "exit_code": 0
+                })
+                .to_string(),
+            ),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: 128,
+            truncated: false,
+        },
+    );
+
+    let mut daemon = DaemonSupervisor::spawn(
+        HashMap::from([("HOME".to_string(), tmp.path().display().to_string())]),
+        vec!["--foreground".to_string()],
+    )
+    .await
+    .expect("spawn daemon");
+    daemon
+        .wait_ready(Duration::from_secs(5))
+        .await
+        .expect("wait ready");
+
+    wait_for_condition(Duration::from_secs(10), || {
+        message_status(&db_path, &fast_id).is_none()
+            && drawer_content_contains(&db_path, "fast-marker")
+    })
+    .await;
+    assert!(
+        matches!(message_status(&db_path, &slow_id), Some((ref status, _)) if status == "claimed"),
+        "slow hook should still be isolated in one claimed worker"
+    );
+
+    handle.set_fail_if_input_contains(None).await;
+    handle.set_fail_mode(FailMode::Ok).await;
+    wait_for_condition(Duration::from_secs(10), || {
+        message_status(&db_path, &slow_id).is_none()
+            && drawer_content_contains(&db_path, "slow-marker")
+    })
+    .await;
 
     daemon.sigterm();
     let status = daemon.wait().await.expect("wait daemon");
