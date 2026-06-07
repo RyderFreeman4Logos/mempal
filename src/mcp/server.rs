@@ -69,8 +69,9 @@ use crate::knowledge_lifecycle::{
     promote_knowledge,
 };
 use crate::search::{
-    SearchFilters, SearchMode, SearchOptions, dispatch_access_update, resolve_route,
-    search_bm25_only_with_options, search_with_vector_and_scope_options,
+    SearchFilters, SearchMode, SearchOptions, VectorSearchCircuit, bm25_fallback_warning_degraded,
+    bm25_fallback_warning_embed_error, bm25_fallback_warning_timeout, dispatch_access_update,
+    resolve_route, search_bm25_only_with_options, search_with_vector_and_scope_options,
 };
 use anyhow::Context;
 use rmcp::{
@@ -1723,6 +1724,8 @@ impl MempalMcpServer {
             .map(|(project_id, count)| PinnedFactProjectCount { project_id, count })
             .collect();
         let mut system_warnings = current_system_warnings();
+        let vector_search_circuit =
+            VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
         if null_project_backfill_pending > 0 {
             system_warnings.push(SystemWarning {
                 level: "warn".to_string(),
@@ -1812,16 +1815,15 @@ impl MempalMcpServer {
                 last_success_at_unix_ms: embed_snapshot.last_success_at_unix_ms,
             },
             embedder_circuit: EmbedderCircuitDto {
-                open: embed_snapshot.degraded,
-                failure_count: embed_snapshot.fail_count,
-                failure_threshold: config.embed.degradation.degrade_after_n_failures,
-                bm25_fallback_enabled: config.search.bm25_fallback,
-                search_deadline_secs: config.embed.retry.search_deadline_secs,
-                vector_search_mode: if config.search.bm25_fallback && embed_snapshot.degraded {
-                    SearchMode::Bm25Only.as_str().to_string()
-                } else {
-                    SearchMode::Hybrid.as_str().to_string()
-                },
+                open: vector_search_circuit.open,
+                failure_count: vector_search_circuit.failure_count,
+                failure_threshold: vector_search_circuit.failure_threshold,
+                bm25_fallback_enabled: vector_search_circuit.bm25_fallback_enabled,
+                search_deadline_secs: vector_search_circuit.search_deadline_secs,
+                vector_search_mode: vector_search_circuit
+                    .vector_search_mode
+                    .as_str()
+                    .to_string(),
             },
             queue_stats: QueueStatsDto {
                 pending: queue_stats.pending,
@@ -1964,9 +1966,8 @@ impl MempalMcpServer {
                 Ok(embedder) => Some(embedder),
                 Err(error) if config.search.bm25_fallback => {
                     search_mode = SearchMode::Bm25Only;
-                    let warning = format!(
-                        "embedding unavailable; using BM25-only search: {} (retry may help)",
-                        crate::core::config::scrub_sensitive_text(&error.to_string())
+                    let warning = bm25_fallback_warning_embed_error(
+                        &crate::core::config::scrub_sensitive_text(&error.to_string()),
                     );
                     response_warnings.push(warning.clone());
                     extra_warnings.push(SystemWarning {
@@ -6720,22 +6721,6 @@ pub(super) fn current_system_warnings() -> Vec<SystemWarning> {
             }),
     );
     warnings
-}
-
-fn bm25_fallback_warning_degraded(fail_count: u64) -> String {
-    format!(
-        "embedding backend is degraded after {fail_count} failures; using BM25-only search until recovery (retry unlikely to help)"
-    )
-}
-
-fn bm25_fallback_warning_embed_error(error: &str) -> String {
-    format!("embedding unavailable; using BM25-only search: {error} (retry may help)")
-}
-
-fn bm25_fallback_warning_timeout(deadline_secs: u64) -> String {
-    format!(
-        "embedding deadline exceeded after {deadline_secs}s; using BM25-only search (retry may help)"
-    )
 }
 
 fn stale_index_warning_from_bool(is_stale: bool) -> Option<SystemWarning> {

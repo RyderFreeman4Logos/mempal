@@ -48,6 +48,13 @@ enabled = false
 [search]
 bm25_fallback = true
 
+[embed.retry]
+search_deadline_secs = 5
+
+[embed.degradation]
+degrade_after_n_failures = 2
+block_writes_when_degraded = true
+
 [api]
 write_queue_capacity = 10
 write_drain_timeout_secs = 2
@@ -319,6 +326,12 @@ async fn test_bm25_fallback_when_embedder_down() {
             .expect("warnings")
             .is_empty()
     );
+    assert_eq!(
+        results[0]["warnings"][0].as_str(),
+        Some(
+            "embedding unavailable; using BM25-only search: embedding runtime error: embedder down (retry may help)"
+        )
+    );
     assert!(
         results[0]["content"]
             .as_str()
@@ -331,7 +344,7 @@ async fn test_bm25_fallback_when_embedder_down() {
 async fn test_status_shows_degraded_mode() {
     let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
-    for _ in 0..10 {
+    for _ in 0..2 {
         global_embed_status().record_failure(&EmbedError::Runtime("down".to_string()));
     }
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
@@ -341,6 +354,76 @@ async fn test_status_shows_degraded_mode() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["embedding_status"], "degraded");
     assert_eq!(body["search_mode"], "bm25_only");
+    let circuit = body["embedder_circuit"]
+        .as_object()
+        .expect("embedder circuit");
+    assert_eq!(circuit.get("open").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        circuit.get("failure_count").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        circuit.get("failure_threshold").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        circuit
+            .get("bm25_fallback_enabled")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        circuit.get("search_deadline_secs").and_then(Value::as_u64),
+        Some(5)
+    );
+    assert_eq!(
+        circuit.get("vector_search_mode").and_then(Value::as_str),
+        Some("bm25_only")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_search_deadline_warning_surfaces_timeout_reason() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    insert_search_drawer(&env.db());
+    let started = Arc::new(Notify::new());
+    let released = Arc::new(Notify::new());
+    let has_started = Arc::new(AtomicBool::new(false));
+    let state = env.state(Arc::new(BlockingEmbedderFactory {
+        started: Arc::clone(&started),
+        released: Arc::clone(&released),
+        has_started: Arc::clone(&has_started),
+    }));
+
+    tokio::time::pause();
+    let request = tokio::spawn({
+        let state = state.clone();
+        async move { get_json(state, "/api/search?q=alpha&top_k=5").await }
+    });
+
+    while !has_started.load(Ordering::SeqCst) {
+        started.notified().await;
+    }
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+
+    let (status, headers, body) = request.await.expect("join search request");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("search-mode").and_then(|v| v.to_str().ok()),
+        Some("bm25_only")
+    );
+    assert_eq!(
+        headers.get("degraded").and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    let results = body.as_array().expect("search response array");
+    assert_eq!(results[0]["search_mode"], "bm25_only");
+    assert_eq!(
+        results[0]["warnings"][0].as_str(),
+        Some("embedding deadline exceeded after 5s; using BM25-only search (retry may help)")
+    );
 }
 
 #[tokio::test]
