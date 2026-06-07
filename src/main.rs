@@ -5840,41 +5840,16 @@ async fn reindex_command_by_embedder(
     }
 }
 
-/// Resolve the fingerprint the live embedder path would write without
-/// constructing the embedder itself.
-fn resolve_reindex_vector_fingerprint(config: &Config, embedder_name: &str) -> Result<String> {
-    let dim = resolve_reindex_vector_dimension(config, embedder_name)?;
-    Ok(config.embed.vector_embedder_fingerprint(embedder_name, dim))
-}
-
-/// Deliberately model-free mirror of `Embedder::dimensions()` used only by
-/// reindex dry-run so stale rows can be snapshotted without loading a model or
-/// making any network call.
-///
-/// Keep this in sync with each backend's real `dimensions()` implementation.
-/// The guard tests
-/// `reindex_embedder_dry_run_dimension_matches_real_embedder_openai_compat_dim_override`,
-/// `reindex_embedder_dry_run_dimension_matches_real_embedder_openai_compat_default_dim`,
-/// and `reindex_embedder_dry_run_dimension_matches_real_embedder_model2vec`
-/// assert the equivalence.
-fn resolve_reindex_vector_dimension(config: &Config, embedder_name: &str) -> Result<usize> {
-    match embedder_name {
-        "openai_compat" | "api" | "stub" => Ok(config.embed.resolved_openai_dim()),
-        #[cfg(feature = "onnx")]
-        "onnx" => Ok(384),
-        #[cfg(feature = "model2vec")]
-        "model2vec" => Ok(256),
-        other => bail!("unsupported embed backend: {other}"),
-    }
-}
-
 async fn preview_reindex_stale_vector_work(
     db: &Database,
     config: &Config,
     embedder_name: &str,
     target: ReindexVectorTarget,
 ) -> Result<usize> {
-    let target_fingerprint = resolve_reindex_vector_fingerprint(config, embedder_name)?;
+    let embedder = build_specific_embedder(config, embedder_name).await?;
+    let target_fingerprint = config
+        .embed
+        .vector_embedder_fingerprint(embedder_name, embedder.dimensions());
     build_reindex_stale_pending_rows(db, &target_fingerprint, &target)
         .context("failed to snapshot stale reindex work list")
 }
@@ -12236,7 +12211,13 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "model2vec")]
+    use safetensors::tensor::TensorView;
+    #[cfg(feature = "model2vec")]
+    use safetensors::{Dtype, serialize_to_file};
     use std::collections::BTreeSet;
+    #[cfg(feature = "model2vec")]
+    use std::path::Path;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -12352,13 +12333,48 @@ mod tests {
         config
     }
 
-    fn openai_compat_dry_run_config(dim: Option<usize>) -> Config {
-        let mut config = Config::default();
-        config.embed.backend = "openai_compat".to_string();
-        config.embed.openai_compat.base_url = Some("http://127.0.0.1:18002/v1".to_string());
-        config.embed.openai_compat.model = Some("Qwen/Qwen3-Embedding-8B".to_string());
-        config.embed.openai_compat.dim = dim;
-        config
+    #[cfg(feature = "model2vec")]
+    fn write_model2vec_fixture(model_dir: &Path, dimensions: usize) {
+        std::fs::create_dir_all(model_dir).expect("create model2vec fixture dir");
+
+        let tokenizer = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "[UNK]": 0
+                },
+                "unk_token": "[UNK]"
+            }
+        });
+        std::fs::write(
+            model_dir.join("tokenizer.json"),
+            serde_json::to_vec(&tokenizer).expect("serialize tokenizer"),
+        )
+        .expect("write tokenizer.json");
+
+        let embedding_bytes = vec![1.0_f32; dimensions]
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let tensor = TensorView::new(Dtype::F32, vec![1, dimensions], &embedding_bytes)
+            .expect("create embeddings tensor");
+        serialize_to_file(
+            [(String::from("embeddings"), tensor)],
+            &None,
+            &model_dir.join("model.safetensors"),
+        )
+        .expect("write model.safetensors");
+
+        std::fs::write(model_dir.join("config.json"), r#"{"normalize":true}"#)
+            .expect("write config.json");
     }
 
     fn insert_reindex_test_drawer(
@@ -12562,16 +12578,22 @@ mod tests {
     async fn reindex_embedder_dry_run_snapshots_stale_rows_without_writes() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
-        db.recreate_vectors_table(256).expect("create vector table");
+        let model_dir = tmp.path().join("model2vec-fixture");
+        write_model2vec_fixture(&model_dir, 1024);
+        let mut config = model2vec_dry_run_config();
+        config.embed.model = Some(model_dir.display().to_string());
+        let embedder = build_specific_embedder(&config, "model2vec")
+            .await
+            .expect("build local model2vec embedder");
+        let dim = embedder.dimensions();
+        db.recreate_vectors_table(dim).expect("create vector table");
 
         insert_reindex_test_drawer(&db, "fresh", "fresh content", "fixtures/source.txt", 0);
         insert_reindex_test_drawer(&db, "stale", "stale content", "fixtures/source.txt", 1);
 
-        let config = model2vec_dry_run_config();
-        let target_fingerprint = resolve_reindex_vector_fingerprint(&config, "model2vec")
-            .expect("resolve target fingerprint");
-        let fresh_vector = vec![0.1_f32; 256];
-        let stale_vector = vec![0.2_f32; 256];
+        let target_fingerprint = config.embed.vector_embedder_fingerprint("model2vec", dim);
+        let fresh_vector = vec![0.1_f32; dim];
+        let stale_vector = vec![0.2_f32; dim];
         db.insert_vector_with_project("fresh", &fresh_vector, Some("default"))
             .expect("insert fresh vector");
         db.insert_vector_with_project("stale", &stale_vector, Some("default"))
@@ -12636,43 +12658,6 @@ mod tests {
             message.contains("--stale"),
             "error should tell the user to add --stale, got: {message}"
         );
-    }
-
-    async fn assert_reindex_dry_run_matches_real_embedder(config: &Config, embedder_name: &str) {
-        let dry_run_fingerprint = resolve_reindex_vector_fingerprint(config, embedder_name)
-            .expect("resolve dry-run fingerprint");
-        let embedder = build_specific_embedder(config, embedder_name)
-            .await
-            .expect("build real embedder");
-
-        assert_eq!(
-            dry_run_fingerprint,
-            config
-                .embed
-                .vector_embedder_fingerprint(embedder_name, embedder.dimensions()),
-            "dry-run fingerprint must match the live embedder's dimensions"
-        );
-    }
-
-    #[tokio::test]
-    async fn reindex_embedder_dry_run_dimension_matches_real_embedder_openai_compat_dim_override() {
-        let config = openai_compat_dry_run_config(Some(4096));
-        assert_reindex_dry_run_matches_real_embedder(&config, "openai_compat").await;
-    }
-
-    #[tokio::test]
-    async fn reindex_embedder_dry_run_dimension_matches_real_embedder_openai_compat_default_dim() {
-        let config = openai_compat_dry_run_config(None);
-        assert_reindex_dry_run_matches_real_embedder(&config, "openai_compat").await;
-    }
-
-    // `onnx` is omitted here because `OnnxEmbedder::new_or_download()` fetches
-    // model assets from external URLs.
-    #[cfg(feature = "model2vec")]
-    #[tokio::test]
-    async fn reindex_embedder_dry_run_dimension_matches_real_embedder_model2vec() {
-        let config = model2vec_dry_run_config();
-        assert_reindex_dry_run_matches_real_embedder(&config, "model2vec").await;
     }
 
     #[tokio::test]
