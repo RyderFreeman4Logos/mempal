@@ -8,6 +8,7 @@ use crate::adoption_analytics::build_runtime_adoption_analytics;
 use crate::brief::brief_from_context;
 use crate::context::assemble_context_with_vector;
 use crate::core::{
+    AsyncDb,
     anchor::{self, DerivedAnchor},
     config::ConfigHandle,
     db::{CURRENT_VECTOR_INDEX_VERSION, Database, VECTOR_DISTANCE_METRIC, read_fork_ext_version},
@@ -22,13 +23,14 @@ use crate::core::{
         runtime_adoption_instrumentation_policy, should_write_checked_record,
     },
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
+    queue::AsyncPendingMessageStore,
     reindex::ReindexProgressStore,
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
-        AnchorKind, BootstrapIdentityParts, Drawer, ExplicitTunnel, KnowledgeCardFilter,
-        KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance, RuntimeAdoptionEvent,
-        RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack, SourceType,
-        TriggerHints, Triple, default_confidence,
+        AnchorKind, BootstrapIdentityParts, Drawer, DrawerSummary, ExplicitTunnel,
+        KnowledgeCardFilter, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance,
+        RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack,
+        SourceType, TriggerHints, Triple, default_confidence,
     },
     utils::{
         build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp, iso_timestamp,
@@ -117,6 +119,8 @@ use super::tools::{
 #[derive(Clone)]
 pub struct MempalMcpServer {
     db_path: PathBuf,
+    async_db: AsyncDb,
+    async_queue: AsyncPendingMessageStore,
     gating_runtime: Arc<GatingRuntime>,
     embedder_factory: Arc<dyn EmbedderFactory>,
     tool_router: ToolRouter<Self>,
@@ -153,8 +157,13 @@ impl MempalMcpServer {
         config: crate::core::config::Config,
         embedder_factory: Arc<dyn EmbedderFactory>,
     ) -> Self {
+        let async_db =
+            AsyncDb::open(&db_path, 4).expect("MCP async database pool should open at server init");
+        let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path);
         Self {
             db_path,
+            async_db,
+            async_queue,
             gating_runtime: Arc::new(GatingRuntime::new(config, Arc::clone(&embedder_factory))),
             embedder_factory,
             tool_router: Self::tool_router(),
@@ -164,6 +173,12 @@ impl MempalMcpServer {
             session_hit_drawers: Arc::new(Mutex::new(HashSet::new())),
             ingest_worker_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_async_db_for_test(mut self, async_db: AsyncDb) -> Self {
+        self.async_db = async_db;
+        self
     }
 
     pub async fn serve_stdio(
@@ -290,10 +305,17 @@ impl MempalMcpServer {
             std::process::id(),
             Arc::as_ptr(&self.ingest_worker_started) as usize
         );
-        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&self.db_path);
+        let queue = self.async_queue.clone();
 
         loop {
-            match queue.claim_next_by_kind(&worker_id, INGEST_CLAIM_TTL_SECS, INGEST_ASYNC_KIND) {
+            match queue
+                .claim_next_by_kind(
+                    worker_id.clone(),
+                    INGEST_CLAIM_TTL_SECS,
+                    INGEST_ASYNC_KIND.to_string(),
+                )
+                .await
+            {
                 Ok(Some(claim)) => {
                     if let Err(error) = self.process_ingest_claim(&queue, &worker_id, claim).await {
                         tracing::warn!(error = %error, "async ingest worker failed to process op");
@@ -310,7 +332,7 @@ impl MempalMcpServer {
 
     async fn process_ingest_claim(
         &self,
-        queue: &crate::core::queue::PendingMessageStore,
+        queue: &AsyncPendingMessageStore,
         worker_id: &str,
         claim: crate::core::queue::ClaimedMessage,
     ) -> anyhow::Result<()> {
@@ -328,7 +350,7 @@ impl MempalMcpServer {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Err(error) = heartbeat_queue.refresh_heartbeat(&heartbeat_id, &heartbeat_worker_id) {
+                        if let Err(error) = heartbeat_queue.refresh_heartbeat(heartbeat_id.clone(), heartbeat_worker_id.clone()).await {
                             tracing::warn!(error = %error, claim_id = %heartbeat_id, "failed to refresh async ingest heartbeat");
                             break;
                         }
@@ -381,13 +403,14 @@ impl MempalMcpServer {
                 };
                 queue
                     .complete_operation(
-                        &claim.id,
-                        state.as_str(),
-                        result_drawer_id,
-                        rejected_reason.as_deref(),
+                        claim.id.clone(),
+                        state.as_str().to_string(),
+                        result_drawer_id.map(ToOwned::to_owned),
+                        rejected_reason.clone(),
                         None,
-                        Some(&result_json),
+                        Some(result_json),
                     )
+                    .await
                     .map_err(|error| {
                         anyhow::anyhow!("failed to store async ingest result: {error}")
                     })?;
@@ -406,13 +429,14 @@ impl MempalMcpServer {
                     .context("failed to serialize failed ingest response")?;
                 queue
                     .complete_operation(
-                        &claim.id,
-                        IngestOperationState::Failed.as_str(),
+                        claim.id.clone(),
+                        IngestOperationState::Failed.as_str().to_string(),
                         None,
                         None,
-                        Some(&detail),
-                        Some(&result_json),
+                        Some(detail),
+                        Some(result_json),
                     )
+                    .await
                     .map_err(|error| {
                         anyhow::anyhow!("failed to store async ingest failure: {error}")
                     })?;
@@ -426,6 +450,81 @@ impl MempalMcpServer {
         Database::open(&self.db_path).map_err(|error| {
             ErrorData::internal_error(format!("failed to open database: {error}"), None)
         })
+    }
+
+    async fn load_status_db_snapshot(
+        &self,
+        project_scope: ProjectSearchScope,
+        turns_config: crate::core::config::TurnsConfig,
+    ) -> std::result::Result<StatusDbSnapshot, ErrorData> {
+        self.async_db
+            .run_read_anyhow(move |db| {
+                let schema_version = db.schema_version()?;
+                let fork_ext_version = read_fork_ext_version(db.conn())?;
+                let stale_drawer_count = db.stale_drawer_count(CURRENT_NORMALIZE_VERSION)? as u64;
+                let vector_index_stale = db.vector_index_is_stale().unwrap_or(false);
+                let drawer_count = db.drawer_count()?;
+                let vector_rows = db.vector_row_count()?;
+                let vector_index_empty = vector_rows == 0 && drawer_count > 0;
+                let consolidation_stats = db.consolidation_stats()?;
+                let pending_card_count = db.pending_auto_generated_knowledge_card_count()?;
+                let last_crystallization_at = db.last_crystallization_at()?;
+                let raw_turn_count = count_raw_turn_drawers(db, &turns_config)?;
+                let null_project_backfill_pending = db.null_project_backfill_pending_count()?;
+                let taxonomy_count = db.taxonomy_count()?;
+                let db_size_bytes = db.database_size_bytes()?;
+                let diary_rollup_days = db.diary_rollup_days()?;
+                let scopes = db
+                    .scope_counts_for_search_scope(&project_scope)?
+                    .into_iter()
+                    .map(|(wing, room, drawer_count)| ScopeCount {
+                        wing,
+                        room,
+                        drawer_count,
+                    })
+                    .collect();
+                let source_type_distribution = db
+                    .source_type_counts()?
+                    .into_iter()
+                    .map(|(source_type, count)| SourceTypeCount {
+                        source_type: source_type.to_string(),
+                        count,
+                    })
+                    .collect();
+                let pinned_fact_counts = db
+                    .pinned_fact_counts_by_project()?
+                    .into_iter()
+                    .map(|(project_id, count)| PinnedFactProjectCount { project_id, count })
+                    .collect();
+                Ok(StatusDbSnapshot {
+                    schema_version,
+                    fork_ext_version,
+                    stale_drawer_count,
+                    vector_index_stale,
+                    drawer_count,
+                    vector_rows,
+                    vector_index_empty,
+                    total_compacted_drawers: consolidation_stats.total_compacted_drawers,
+                    consolidation_runs: consolidation_stats.consolidation_runs,
+                    last_consolidation_at: consolidation_stats.last_consolidation_at,
+                    last_sleep_at: consolidation_stats.last_sleep_at,
+                    sleep_items_pruned: consolidation_stats.sleep_items_pruned,
+                    sleep_items_compacted: consolidation_stats.sleep_items_compacted,
+                    sleep_conflicts_resolved: consolidation_stats.sleep_conflicts_resolved,
+                    pending_card_count,
+                    last_crystallization_at,
+                    raw_turn_count,
+                    null_project_backfill_pending,
+                    taxonomy_count,
+                    db_size_bytes,
+                    diary_rollup_days,
+                    scopes,
+                    source_type_distribution,
+                    pinned_fact_counts,
+                })
+            })
+            .await
+            .map_err(db_error)
     }
 
     pub(super) async fn resolve_mcp_project_id(
@@ -1027,6 +1126,33 @@ impl Drop for IngestDrainWorkerStartedGuard {
     fn drop(&mut self) {
         self.started.store(false, Ordering::Release);
     }
+}
+
+struct StatusDbSnapshot {
+    schema_version: u32,
+    fork_ext_version: u32,
+    stale_drawer_count: u64,
+    vector_index_stale: bool,
+    drawer_count: i64,
+    vector_rows: i64,
+    vector_index_empty: bool,
+    total_compacted_drawers: u64,
+    consolidation_runs: u64,
+    last_consolidation_at: Option<String>,
+    last_sleep_at: Option<String>,
+    sleep_items_pruned: u64,
+    sleep_items_compacted: u64,
+    sleep_conflicts_resolved: u64,
+    pending_card_count: i64,
+    last_crystallization_at: Option<String>,
+    raw_turn_count: i64,
+    null_project_backfill_pending: i64,
+    taxonomy_count: i64,
+    db_size_bytes: u64,
+    diary_rollup_days: u32,
+    scopes: Vec<ScopeCount>,
+    source_type_distribution: Vec<SourceTypeCount>,
+    pinned_fact_counts: Vec<PinnedFactProjectCount>,
 }
 
 fn validate_temporal_param(name: &str, value: Option<&str>) -> std::result::Result<(), ErrorData> {
@@ -1646,7 +1772,6 @@ impl MempalMcpServer {
         });
         let cfg_meta = ConfigHandle::snapshot_meta();
         let config = ConfigHandle::current();
-        let db = self.open_db()?;
         let project_id = self
             .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
             .await?;
@@ -1664,85 +1789,37 @@ impl MempalMcpServer {
                 },
             },
         };
-        let queue_stats = crate::core::queue::PendingMessageStore::new(db.path())
-            .map_err(|error| {
-                ErrorData::internal_error(format!("queue init failed: {error}"), None)
-            })?
-            .stats()
-            .map_err(|error| {
-                ErrorData::internal_error(format!("queue stats failed: {error}"), None)
-            })?;
+        let queue_stats = self.async_queue.stats().await.map_err(|error| {
+            ErrorData::internal_error(format!("queue stats failed: {error}"), None)
+        })?;
+        let db_snapshot = self
+            .load_status_db_snapshot(project_scope, config.turns.clone())
+            .await?;
         let endpoint_health = crate::endpoint_health::probe_endpoints(config.as_ref()).await;
         let embed_snapshot = global_embed_status().snapshot();
         let intelligence_snapshot = crate::intelligence::global_intelligence_status().snapshot();
-        let schema_version = db.schema_version().map_err(db_error)?;
-        let fork_ext_version = read_fork_ext_version(db.conn()).map_err(db_error)?;
-        let stale_drawer_count = db
-            .stale_drawer_count(CURRENT_NORMALIZE_VERSION)
-            .map_err(db_error)? as u64;
-        // This sqlite_master read is once per request so external reindex clears the warning immediately.
-        let vector_index_stale = db.vector_index_is_stale().unwrap_or(false);
-        let drawer_count = db.drawer_count().map_err(db_error)?;
-        // #302: row count exposes a vector table emptied by a failed
-        // recreate-reindex, which the metric-only staleness check above misses.
-        let vector_rows = db.vector_row_count().map_err(db_error)?;
-        let vector_index_empty = vector_rows == 0 && drawer_count > 0;
-        let consolidation_stats = db.consolidation_stats().map_err(db_error)?;
-        let pending_card_count = db
-            .pending_auto_generated_knowledge_card_count()
-            .map_err(db_error)?;
-        let last_crystallization_at = db.last_crystallization_at().map_err(db_error)?;
-        let raw_turn_count = count_raw_turn_drawers(&db, &config.turns).map_err(db_error)?;
-        let null_project_backfill_pending =
-            db.null_project_backfill_pending_count().map_err(db_error)?;
-        let taxonomy_count = db.taxonomy_count().map_err(db_error)?;
-        let db_size_bytes = db.database_size_bytes().map_err(db_error)?;
-        let diary_rollup_days = db.diary_rollup_days().map_err(db_error)?;
-        let scopes = db
-            .scope_counts_for_search_scope(&project_scope)
-            .map_err(db_error)?
-            .into_iter()
-            .map(|(wing, room, drawer_count)| ScopeCount {
-                wing,
-                room,
-                drawer_count,
-            })
-            .collect();
-        let source_type_distribution = db
-            .source_type_counts()
-            .map_err(db_error)?
-            .into_iter()
-            .map(|(source_type, count)| SourceTypeCount {
-                source_type: source_type.to_string(),
-                count,
-            })
-            .collect();
-        let pinned_fact_counts = db
-            .pinned_fact_counts_by_project()
-            .map_err(db_error)?
-            .into_iter()
-            .map(|(project_id, count)| PinnedFactProjectCount { project_id, count })
-            .collect();
         let mut system_warnings = current_system_warnings();
         let vector_search_circuit =
             VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
-        if null_project_backfill_pending > 0 {
+        if db_snapshot.null_project_backfill_pending > 0 {
             system_warnings.push(SystemWarning {
                 level: "warn".to_string(),
                 message: format!(
-                    "{null_project_backfill_pending} drawers still have NULL project_id; run `mempal project migrate --project <id>` to backfill historical records"
+                    "{} drawers still have NULL project_id; run `mempal project migrate --project <id>` to backfill historical records",
+                    db_snapshot.null_project_backfill_pending
                 ),
                 source: "project_isolation".to_string(),
             });
         }
-        if let Some(warning) = stale_index_warning_from_bool(vector_index_stale) {
+        if let Some(warning) = stale_index_warning_from_bool(db_snapshot.vector_index_stale) {
             system_warnings.push(warning);
         }
-        if vector_index_empty {
+        if db_snapshot.vector_index_empty {
             system_warnings.push(SystemWarning {
                 level: "warn".to_string(),
                 message: format!(
-                    "drawer_vectors index is empty ({vector_rows} vectors for {drawer_count} drawers); vector recall is disabled (BM25-only) until `mempal reindex --from-config` repopulates it"
+                    "drawer_vectors index is empty ({} vectors for {} drawers); vector recall is disabled (BM25-only) until `mempal reindex --from-config` repopulates it",
+                    db_snapshot.vector_rows, db_snapshot.drawer_count
                 ),
                 source: "vector_index".to_string(),
             });
@@ -1759,32 +1836,32 @@ impl MempalMcpServer {
             crate::core::queue::failure_headline_count(embed_snapshot.fail_count, &queue_stats);
 
         Ok(Json(StatusResponse {
-            schema_version,
-            fork_ext_version,
+            schema_version: db_snapshot.schema_version,
+            fork_ext_version: db_snapshot.fork_ext_version,
             normalize_version_current: CURRENT_NORMALIZE_VERSION,
-            stale_drawer_count,
-            vector_index_stale,
-            vector_rows,
-            vector_index_empty,
+            stale_drawer_count: db_snapshot.stale_drawer_count,
+            vector_index_stale: db_snapshot.vector_index_stale,
+            vector_rows: db_snapshot.vector_rows,
+            vector_index_empty: db_snapshot.vector_index_empty,
             search_decay_mode: config.search.decay.mode.to_string(),
-            drawer_count,
-            total_compacted_drawers: consolidation_stats.total_compacted_drawers,
-            consolidation_runs: consolidation_stats.consolidation_runs,
-            last_consolidation_at: consolidation_stats.last_consolidation_at,
-            last_sleep_at: consolidation_stats.last_sleep_at,
-            sleep_items_pruned: consolidation_stats.sleep_items_pruned,
-            sleep_items_compacted: consolidation_stats.sleep_items_compacted,
-            sleep_conflicts_resolved: consolidation_stats.sleep_conflicts_resolved,
-            pending_card_count,
-            last_crystallization_at,
-            taxonomy_count,
-            db_size_bytes,
-            diary_rollup_days,
+            drawer_count: db_snapshot.drawer_count,
+            total_compacted_drawers: db_snapshot.total_compacted_drawers,
+            consolidation_runs: db_snapshot.consolidation_runs,
+            last_consolidation_at: db_snapshot.last_consolidation_at,
+            last_sleep_at: db_snapshot.last_sleep_at,
+            sleep_items_pruned: db_snapshot.sleep_items_pruned,
+            sleep_items_compacted: db_snapshot.sleep_items_compacted,
+            sleep_conflicts_resolved: db_snapshot.sleep_conflicts_resolved,
+            pending_card_count: db_snapshot.pending_card_count,
+            last_crystallization_at: db_snapshot.last_crystallization_at,
+            taxonomy_count: db_snapshot.taxonomy_count,
+            db_size_bytes: db_snapshot.db_size_bytes,
+            diary_rollup_days: db_snapshot.diary_rollup_days,
             config_version: cfg_meta.version,
             config_loaded_at_unix_ms: cfg_meta.loaded_at_unix_ms,
-            scopes,
-            source_type_distribution,
-            pinned_fact_counts,
+            scopes: db_snapshot.scopes,
+            source_type_distribution: db_snapshot.source_type_distribution,
+            pinned_fact_counts: db_snapshot.pinned_fact_counts,
             aaak_spec: match detail {
                 StatusDetail::Compact => String::new(),
                 StatusDetail::Full => crate::aaak::generate_spec(),
@@ -1854,7 +1931,7 @@ impl MempalMcpServer {
             turn_storage: TurnStorageStatusDto {
                 storage_mode: config.turns.storage_mode.to_string(),
                 default_importance: config.turns.default_importance,
-                raw_turn_count,
+                raw_turn_count: db_snapshot.raw_turn_count,
                 raw_turn_wings: config.turns.raw_turn_wings.clone(),
                 raw_turn_rooms: config.turns.raw_turn_rooms.clone(),
             },
@@ -1915,14 +1992,6 @@ impl MempalMcpServer {
             request.all_projects.unwrap_or(false),
             config.search.strict_project_isolation,
         );
-        let db = self.open_db()?;
-        let route = resolve_route(
-            &db,
-            &request.query,
-            request.wing.as_deref(),
-            request.room.as_deref(),
-        )
-        .map_err(|error| ErrorData::internal_error(format!("routing failed: {error}"), None))?;
         let top_k = request.top_k.unwrap_or(10);
         let search_options = SearchOptions {
             filters: SearchFilters {
@@ -1937,6 +2006,18 @@ impl MempalMcpServer {
             include_raw_turns: request.include_raw_turns.unwrap_or(false),
             include_expired: request.include_expired.unwrap_or(false),
         };
+        let route = {
+            let query = request.query.clone();
+            let wing = request.wing.clone();
+            let room = request.room.clone();
+            self.async_db
+                .run_read_anyhow(move |db| {
+                    resolve_route(db, &query, wing.as_deref(), room.as_deref())
+                        .map_err(|error| anyhow::anyhow!("routing failed: {error}"))
+                })
+                .await
+                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
+        };
         let mut extra_warnings = Vec::new();
         let mut search_mode = SearchMode::Hybrid;
         let mut response_warnings = Vec::new();
@@ -1950,17 +2031,17 @@ impl MempalMcpServer {
                 message: warning,
                 source: "embed".to_string(),
             });
-            search_bm25_only_with_options(
-                &db,
-                &request.query,
-                route.clone(),
-                &scope,
-                search_options.clone(),
-                top_k,
-            )
-            .map_err(|error| {
-                ErrorData::internal_error(format!("BM25 fallback search failed: {error}"), None)
-            })?
+            let query = request.query.clone();
+            let route = route.clone();
+            let scope = scope.clone();
+            let search_options = search_options.clone();
+            self.async_db
+                .run_read_anyhow(move |db| {
+                    search_bm25_only_with_options(db, &query, route, &scope, search_options, top_k)
+                        .map_err(|error| anyhow::anyhow!("BM25 fallback search failed: {error}"))
+                })
+                .await
+                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
         } else {
             let embedder = match self.embedder_factory.build().await {
                 Ok(embedder) => Some(embedder),
@@ -1995,18 +2076,25 @@ impl MempalMcpServer {
                         let query_vector = vectors.into_iter().next().ok_or_else(|| {
                             ErrorData::internal_error("embedder returned no query vector", None)
                         })?;
-                        search_with_vector_and_scope_options(
-                            &db,
-                            &request.query,
-                            &query_vector,
-                            route.clone(),
-                            &scope,
-                            search_options.clone(),
-                            top_k,
-                        )
-                        .map_err(|error| {
-                            ErrorData::internal_error(format!("search failed: {error}"), None)
-                        })?
+                        let query = request.query.clone();
+                        let route = route.clone();
+                        let scope = scope.clone();
+                        let search_options = search_options.clone();
+                        self.async_db
+                            .run_read_anyhow(move |db| {
+                                search_with_vector_and_scope_options(
+                                    db,
+                                    &query,
+                                    &query_vector,
+                                    route,
+                                    &scope,
+                                    search_options,
+                                    top_k,
+                                )
+                                .map_err(|error| anyhow::anyhow!("search failed: {error}"))
+                            })
+                            .await
+                            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
                     }
                     Ok(Err(error)) => {
                         search_mode = SearchMode::Bm25Only;
@@ -2019,22 +2107,28 @@ impl MempalMcpServer {
                             message: warning,
                             source: "embed".to_string(),
                         });
-                        search_bm25_only_with_options(
-                            &db,
-                            &request.query,
-                            route.clone(),
-                            &scope,
-                            search_options.clone(),
-                            top_k,
-                        )
-                        .map_err(|bm25_error| {
-                            ErrorData::internal_error(
-                                format!(
-                                    "search failed after vector fallback: {error}; bm25 fallback failed: {bm25_error}"
-                                ),
-                                None,
-                            )
-                        })?
+                        let query = request.query.clone();
+                        let route = route.clone();
+                        let scope = scope.clone();
+                        let search_options = search_options.clone();
+                        self.async_db
+                            .run_read_anyhow(move |db| {
+                                search_bm25_only_with_options(
+                                    db,
+                                    &query,
+                                    route,
+                                    &scope,
+                                    search_options,
+                                    top_k,
+                                )
+                                .map_err(|bm25_error| {
+                                    anyhow::anyhow!(
+                                        "search failed after vector fallback: {error}; bm25 fallback failed: {bm25_error}"
+                                    )
+                                })
+                            })
+                            .await
+                            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
                     }
                     Err(_) => {
                         search_mode = SearchMode::Bm25Only;
@@ -2046,37 +2140,49 @@ impl MempalMcpServer {
                             message: warning,
                             source: "embed".to_string(),
                         });
-                        search_bm25_only_with_options(
-                            &db,
-                            &request.query,
-                            route.clone(),
-                            &scope,
-                            search_options.clone(),
-                            top_k,
-                        )
-                        .map_err(|error| {
-                            ErrorData::internal_error(
-                                format!("search deadline fallback failed: {error}"),
-                                None,
-                            )
-                        })?
+                        let query = request.query.clone();
+                        let route = route.clone();
+                        let scope = scope.clone();
+                        let search_options = search_options.clone();
+                        self.async_db
+                            .run_read_anyhow(move |db| {
+                                search_bm25_only_with_options(
+                                    db,
+                                    &query,
+                                    route,
+                                    &scope,
+                                    search_options,
+                                    top_k,
+                                )
+                                .map_err(|error| {
+                                    anyhow::anyhow!("search deadline fallback failed: {error}")
+                                })
+                            })
+                            .await
+                            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
                     }
                 }
             } else {
-                search_bm25_only_with_options(
-                    &db,
-                    &request.query,
-                    route.clone(),
-                    &scope,
-                    search_options.clone(),
-                    top_k,
-                )
-                .map_err(|error| {
-                    ErrorData::internal_error(
-                        format!("search failed after embedder build fallback: {error}"),
-                        None,
-                    )
-                })?
+                let query = request.query.clone();
+                let route = route.clone();
+                let scope = scope.clone();
+                let search_options = search_options.clone();
+                self.async_db
+                    .run_read_anyhow(move |db| {
+                        search_bm25_only_with_options(
+                            db,
+                            &query,
+                            route,
+                            &scope,
+                            search_options,
+                            top_k,
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!("search failed after embedder build fallback: {error}")
+                        })
+                    })
+                    .await
+                    .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
             }
         };
 
@@ -2091,7 +2197,12 @@ impl MempalMcpServer {
 
         let mut system_warnings = current_system_warnings();
         system_warnings.extend(extra_warnings);
-        if let Some(warning) = stale_index_warning(&db) {
+        let vector_index_stale = self
+            .async_db
+            .run_read(|db| db.vector_index_is_stale())
+            .await
+            .unwrap_or(false);
+        if let Some(warning) = stale_index_warning_from_bool(vector_index_stale) {
             system_warnings.push(warning);
         }
         if unresolved_scope && config.search.strict_project_isolation {
@@ -2760,13 +2871,16 @@ impl MempalMcpServer {
         self.spawn_ingest_drain_worker();
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let room = request.room.as_deref();
-        let db = self.open_db()?;
         // Snapshot the request-wide warnings once so every early-return path reports a
         // consistent set from a single `sqlite_master` read. A mid-request embed transition
         // to degraded is not lost: the synchronous degraded-write guard below
         // (`should_block_writes`) re-reads fresh status via `degraded_write_error()` and
         // rejects before any success response that would carry this snapshot is built.
-        let request_system_warnings = system_warnings_with_stale_index(&db);
+        let request_system_warnings = self
+            .async_db
+            .run_read_anyhow(|db| Ok(system_warnings_with_stale_index(db)))
+            .await
+            .map_err(db_error)?;
         let dry_run = request.dry_run.unwrap_or(false);
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
@@ -2803,22 +2917,22 @@ impl MempalMcpServer {
         let project_id = self
             .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
             .await?;
-        let prepared = self.prepare_async_ingest_operation(
-            &request,
-            controls,
-            config.as_ref(),
-            compiled_privacy.as_ref(),
-            &db,
-            project_id,
-        )?;
+        let prepared = self
+            .prepare_async_ingest_operation(
+                &request,
+                controls,
+                config.as_ref(),
+                compiled_privacy.as_ref(),
+                project_id,
+            )
+            .await?;
         let payload = serde_json::to_string(&prepared).map_err(|error| {
             ErrorData::internal_error(format!("failed to serialize ingest request: {error}"), None)
         })?;
-        let queue = crate::core::queue::PendingMessageStore::new(db.path()).map_err(|error| {
-            ErrorData::internal_error(format!("failed to open ingest queue: {error}"), None)
-        })?;
-        let operation_id = queue
-            .enqueue(INGEST_ASYNC_KIND, &payload)
+        let operation_id = self
+            .async_queue
+            .enqueue(INGEST_ASYNC_KIND.to_string(), payload)
+            .await
             .map_err(|error| {
                 ErrorData::internal_error(
                     format!("failed to enqueue ingest operation: {error}"),
@@ -2871,13 +2985,12 @@ impl MempalMcpServer {
         Ok(Json(queued_response))
     }
 
-    fn prepare_async_ingest_operation(
+    async fn prepare_async_ingest_operation(
         &self,
         request: &IngestRequest,
         controls: IngestControls,
         config: &crate::core::config::Config,
         compiled_privacy: &crate::core::config::CompiledPrivacyConfig,
-        db: &Database,
         project_id: Option<String>,
     ) -> std::result::Result<PreparedIngestOperation, ErrorData> {
         let scrubbed_content =
@@ -2901,15 +3014,15 @@ impl MempalMcpServer {
             .replace_text
             .as_deref()
             .map(|text| config.scrub_content_with_compiled(text, compiled_privacy));
-        let replacement_target = db
-            .resolve_replacement_target(
-                request.supersedes.as_deref(),
-                scrubbed_replace_text.as_deref(),
-                &request.wing,
-                room,
-                project_id.as_deref(),
+        let replacement_target = self
+            .resolve_replacement_target_async(
+                request.supersedes.clone(),
+                scrubbed_replace_text.clone(),
+                request.wing.clone(),
+                request.room.clone(),
+                project_id.clone(),
             )
-            .map_err(replacement_db_error)?;
+            .await?;
         let mut request = request.clone();
         request.content = scrubbed_content.clone();
         request.source = scrubbed_source;
@@ -2928,6 +3041,28 @@ impl MempalMcpServer {
             raw_turn,
             drawer_importance,
         })
+    }
+
+    async fn resolve_replacement_target_async(
+        &self,
+        supersedes: Option<String>,
+        replace_text: Option<String>,
+        wing: String,
+        room: Option<String>,
+        project_id: Option<String>,
+    ) -> std::result::Result<Option<DrawerSummary>, ErrorData> {
+        self.async_db
+            .run_read(move |db| {
+                db.resolve_replacement_target(
+                    supersedes.as_deref(),
+                    replace_text.as_deref(),
+                    &wing,
+                    room.as_deref(),
+                    project_id.as_deref(),
+                )
+            })
+            .await
+            .map_err(replacement_db_error)
     }
 
     async fn mempal_ingest_sync(
@@ -3780,11 +3915,15 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<OperationStatusRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        let db = self.open_db()?;
-        let store = crate::core::queue::PendingMessageStore::new_without_reclaim(db.path());
-        let system_warnings = system_warnings_with_stale_index(&db);
-        let record = store
-            .operation_status(&request.operation_id)
+        let system_warnings = self
+            .async_db
+            .run_read_anyhow(|db| Ok(system_warnings_with_stale_index(db)))
+            .await
+            .map_err(db_error)?;
+        let record = self
+            .async_queue
+            .operation_status(request.operation_id.clone())
+            .await
             .map_err(|error| {
                 ErrorData::internal_error(format!("queue lookup failed: {error}"), None)
             })?
@@ -7020,7 +7159,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -7247,6 +7386,105 @@ mod tests {
         .expect("insert drawer");
         db.insert_vector(id, &[0.1, 0.2, 0.3])
             .expect("insert vector");
+    }
+
+    fn spawn_runtime_ticker() -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticks_bg = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks_bg.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (ticks, ticker)
+    }
+
+    fn assert_runtime_ticked(ticks: &AtomicU64, label: &str) {
+        let observed = ticks.load(Ordering::SeqCst);
+        assert!(
+            observed >= 5,
+            "{label} advanced ticker {observed} times; MCP DB work must not block Tokio worker"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_status_db_work_runs_off_runtime() {
+        let (_tempdir, db_path, server) = setup_server();
+        let async_db = AsyncDb::open(&db_path, 4)
+            .expect("open async db")
+            .with_read_delay(Duration::from_millis(300));
+        let server = server.with_async_db_for_test(async_db);
+        let (ticks, ticker) = spawn_runtime_ticker();
+
+        let status = server.mempal_status().await.expect("status").0;
+        ticker.abort();
+
+        assert!(status.schema_version > 0);
+        assert_runtime_ticked(&ticks, "mempal_status");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_search_db_work_runs_off_runtime() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "offruntime-search",
+            "offruntime search marker",
+            "mcp",
+            Some("runtime"),
+            "offruntime-search.md",
+            3,
+        );
+        let async_db = AsyncDb::open(&db_path, 4)
+            .expect("open async db")
+            .with_read_delay(Duration::from_millis(300));
+        let server = server.with_async_db_for_test(async_db);
+        let (ticks, ticker) = spawn_runtime_ticker();
+
+        let response = server
+            .mempal_search(Parameters(SearchRequest {
+                query: "offruntime search marker".to_string(),
+                wing: Some("mcp".to_string()),
+                room: Some("runtime".to_string()),
+                top_k: Some(1),
+                ..SearchRequest::default()
+            }))
+            .await
+            .expect("search")
+            .0;
+        ticker.abort();
+
+        assert!(!response.results.is_empty());
+        assert_runtime_ticked(&ticks, "mempal_search");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_admission_db_work_runs_off_runtime() {
+        let (_tempdir, db_path, server) = setup_server();
+        let async_db = AsyncDb::open(&db_path, 4)
+            .expect("open async db")
+            .with_read_delay(Duration::from_millis(300));
+        let server = server.with_async_db_for_test(async_db);
+        let (ticks, ticker) = spawn_runtime_ticker();
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "offruntime ingest admission".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("runtime".to_string()),
+                dry_run: Some(false),
+                wait: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("ingest")
+            .0;
+        ticker.abort();
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.operation_id.is_some());
+        assert_runtime_ticked(&ticks, "mempal_ingest admission");
     }
 
     fn recreate_vectors_with_metric(db_path: &Path, metric: &str) {
@@ -10089,7 +10327,6 @@ enabled = true
         };
 
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
-        let db = server.open_db().expect("open db");
         let project_id = server
             .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
             .await
@@ -10100,9 +10337,9 @@ enabled = true
                 IngestControls::default(),
                 config.as_ref(),
                 compiled_privacy.as_ref(),
-                &db,
                 project_id,
             )
+            .await
             .expect("prepare async ingest");
         let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
         let decoded: PreparedIngestOperation =
@@ -10141,7 +10378,6 @@ enabled = true
                 vector: vec![0.4, 0.5, 0.6],
             }),
         );
-        let db = server.open_db().expect("open db");
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let request = IngestRequest {
             content: "status tool async ingest".to_string(),
@@ -10161,9 +10397,9 @@ enabled = true
                 IngestControls::default(),
                 config.as_ref(),
                 compiled_privacy.as_ref(),
-                &db,
                 project_id,
             )
+            .await
             .expect("prepare async ingest");
         let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
         let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
@@ -10182,6 +10418,7 @@ enabled = true
             .claim_next_by_kind("worker-a", 60, INGEST_ASYNC_KIND)
             .expect("claim queued op")
             .expect("claimed queued op");
+        let db = server.open_db().expect("open db");
         db.conn()
             .execute(
                 "UPDATE pending_messages SET claimed_at = ?2, heartbeat_at = ?2 WHERE id = ?1",
@@ -10200,8 +10437,9 @@ enabled = true
             .claim_next_by_kind("worker-b", 60, INGEST_ASYNC_KIND)
             .expect("reclaim claim")
             .expect("reclaimed queued op");
+        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
         server
-            .process_ingest_claim(&queue, "worker-b", reclaimed_claim)
+            .process_ingest_claim(&async_queue, "worker-b", reclaimed_claim)
             .await
             .expect("process reclaimed op");
 
