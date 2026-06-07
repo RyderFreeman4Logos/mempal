@@ -5842,21 +5842,26 @@ async fn reindex_command_by_embedder(
 
 /// Resolve the fingerprint the live embedder path would write without
 /// constructing the embedder itself.
-///
-/// Dry-run uses this to snapshot stale rows without loading a model or making
-/// any network call.
 fn resolve_reindex_vector_fingerprint(config: &Config, embedder_name: &str) -> Result<String> {
     let dim = resolve_reindex_vector_dimension(config, embedder_name)?;
     Ok(config.embed.vector_embedder_fingerprint(embedder_name, dim))
 }
 
+/// Deliberately model-free mirror of `Embedder::dimensions()` used only by
+/// reindex dry-run so stale rows can be snapshotted without loading a model or
+/// making any network call.
+///
+/// Keep this in sync with each backend's real `dimensions()` implementation.
+/// The guard tests
+/// `reindex_embedder_dry_run_dimension_matches_real_embedder_openai_compat_dim_override`,
+/// `reindex_embedder_dry_run_dimension_matches_real_embedder_openai_compat_default_dim`,
+/// and `reindex_embedder_dry_run_dimension_matches_real_embedder_model2vec`
+/// assert the equivalence.
 fn resolve_reindex_vector_dimension(config: &Config, embedder_name: &str) -> Result<usize> {
     match embedder_name {
         "openai_compat" | "api" | "stub" => Ok(config.embed.resolved_openai_dim()),
         #[cfg(feature = "onnx")]
         "onnx" => Ok(384),
-        // The current model2vec fingerprint model in this repo is 256d
-        // (see the benchmark summary and P8 privacy spec).
         #[cfg(feature = "model2vec")]
         "model2vec" => Ok(256),
         other => bail!("unsupported embed backend: {other}"),
@@ -12347,6 +12352,15 @@ mod tests {
         config
     }
 
+    fn openai_compat_dry_run_config(dim: Option<usize>) -> Config {
+        let mut config = Config::default();
+        config.embed.backend = "openai_compat".to_string();
+        config.embed.openai_compat.base_url = Some("http://127.0.0.1:18002/v1".to_string());
+        config.embed.openai_compat.model = Some("Qwen/Qwen3-Embedding-8B".to_string());
+        config.embed.openai_compat.dim = dim;
+        config
+    }
+
     fn insert_reindex_test_drawer(
         db: &Database,
         id: &str,
@@ -12622,6 +12636,43 @@ mod tests {
             message.contains("--stale"),
             "error should tell the user to add --stale, got: {message}"
         );
+    }
+
+    async fn assert_reindex_dry_run_matches_real_embedder(config: &Config, embedder_name: &str) {
+        let dry_run_fingerprint = resolve_reindex_vector_fingerprint(config, embedder_name)
+            .expect("resolve dry-run fingerprint");
+        let embedder = build_specific_embedder(config, embedder_name)
+            .await
+            .expect("build real embedder");
+
+        assert_eq!(
+            dry_run_fingerprint,
+            config
+                .embed
+                .vector_embedder_fingerprint(embedder_name, embedder.dimensions()),
+            "dry-run fingerprint must match the live embedder's dimensions"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_embedder_dry_run_dimension_matches_real_embedder_openai_compat_dim_override() {
+        let config = openai_compat_dry_run_config(Some(4096));
+        assert_reindex_dry_run_matches_real_embedder(&config, "openai_compat").await;
+    }
+
+    #[tokio::test]
+    async fn reindex_embedder_dry_run_dimension_matches_real_embedder_openai_compat_default_dim() {
+        let config = openai_compat_dry_run_config(None);
+        assert_reindex_dry_run_matches_real_embedder(&config, "openai_compat").await;
+    }
+
+    // `onnx` is omitted here because `OnnxEmbedder::new_or_download()` fetches
+    // model assets from external URLs.
+    #[cfg(feature = "model2vec")]
+    #[tokio::test]
+    async fn reindex_embedder_dry_run_dimension_matches_real_embedder_model2vec() {
+        let config = model2vec_dry_run_config();
+        assert_reindex_dry_run_matches_real_embedder(&config, "model2vec").await;
     }
 
     #[tokio::test]
