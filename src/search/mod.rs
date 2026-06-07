@@ -59,6 +59,87 @@ impl SearchMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorSearchCircuit {
+    /// True when the sticky embedder circuit is open and vector search falls
+    /// back to BM25 unless fallback is disabled.
+    pub open: bool,
+    /// Consecutive embed failures since the last success.
+    pub failure_count: u64,
+    /// Sticky-failure threshold that opens the circuit.
+    pub failure_threshold: u64,
+    /// Whether BM25 fallback is enabled at all.
+    pub bm25_fallback_enabled: bool,
+    /// Per-query vector-embedding deadline that can still trigger BM25
+    /// fallback even when the embedding endpoint itself is reachable.
+    pub search_deadline_secs: u64,
+    /// Current sticky vector-search mode derived from the circuit state.
+    pub vector_search_mode: SearchMode,
+}
+
+impl VectorSearchCircuit {
+    /// Snapshot the current vector-search availability policy from the global
+    /// embed health state and the active configuration.
+    pub fn current() -> Self {
+        let config = crate::core::config::ConfigHandle::current();
+        let embed_snapshot = global_embed_status().snapshot();
+        Self::from_config_and_snapshot(config.as_ref(), &embed_snapshot)
+    }
+
+    /// Build a vector-search policy snapshot from an explicit config/snapshot
+    /// pair. This keeps callers on one shared decision path without forcing an
+    /// extra status read.
+    pub fn from_config_and_snapshot(
+        config: &crate::core::config::Config,
+        embed_snapshot: &crate::embed::EmbedHealthSnapshot,
+    ) -> Self {
+        Self {
+            open: embed_snapshot.degraded,
+            failure_count: embed_snapshot.fail_count,
+            failure_threshold: config.embed.degradation.degrade_after_n_failures,
+            bm25_fallback_enabled: config.search.bm25_fallback,
+            search_deadline_secs: config.embed.retry.search_deadline_secs,
+            vector_search_mode: if config.search.bm25_fallback && embed_snapshot.degraded {
+                SearchMode::Bm25Only
+            } else {
+                SearchMode::Hybrid
+            },
+        }
+    }
+}
+
+/// Wording for the sticky embedder circuit opening after repeated failures.
+pub fn bm25_fallback_warning_degraded(fail_count: u64) -> String {
+    format!(
+        "embedding backend is degraded after {fail_count} failures; using BM25-only search until recovery (retry unlikely to help)"
+    )
+}
+
+/// Wording for embedding build/runtime failures while BM25 fallback is enabled.
+pub fn bm25_fallback_warning_embed_error(error: &str) -> String {
+    format!("embedding unavailable; using BM25-only search: {error} (retry may help)")
+}
+
+/// Wording for query-embedding deadline expiry while BM25 fallback is enabled.
+pub fn bm25_fallback_warning_timeout(deadline_secs: u64) -> String {
+    format!(
+        "embedding deadline exceeded after {deadline_secs}s; using BM25-only search (retry may help)"
+    )
+}
+
+/// Wording for the edge case where the embedder returns no query vector.
+pub fn bm25_fallback_warning_missing_query_vector() -> String {
+    "embedding returned no query vector; using BM25-only search".to_string()
+}
+
+/// Wording for the edge case where the query vector dimension mismatches the
+/// stored vector index.
+pub fn bm25_fallback_warning_dimension_mismatch(new_dim: usize, current_dim: usize) -> String {
+    format!(
+        "embedding dimension mismatch ({new_dim}d query vs {current_dim}d index); using BM25-only search"
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
@@ -229,8 +310,8 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
         return Ok(SearchOutcome::hybrid(Vec::new()));
     }
 
-    let config = crate::core::config::ConfigHandle::current();
-    if config.search.bm25_fallback && global_embed_status().is_degraded() {
+    let vector_search_circuit = VectorSearchCircuit::current();
+    if vector_search_circuit.bm25_fallback_enabled && vector_search_circuit.open {
         return bm25_fallback_outcome(
             db,
             query,
@@ -238,13 +319,13 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
             scope,
             options,
             top_k,
-            "embedding backend is degraded; using BM25-only search".to_string(),
+            bm25_fallback_warning_degraded(vector_search_circuit.failure_count),
         );
     }
 
     let embeddings = match embedder.embed(&[query]).await {
         Ok(embeddings) => embeddings,
-        Err(error) if config.search.bm25_fallback => {
+        Err(error) if vector_search_circuit.bm25_fallback_enabled => {
             return bm25_fallback_outcome(
                 db,
                 query,
@@ -252,16 +333,15 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
                 scope,
                 options,
                 top_k,
-                format!(
-                    "embedding unavailable; using BM25-only search: {}",
-                    crate::core::config::scrub_sensitive_text(&error.to_string())
-                ),
+                bm25_fallback_warning_embed_error(&crate::core::config::scrub_sensitive_text(
+                    &error.to_string(),
+                )),
             );
         }
         Err(error) => return Err(SearchError::EmbedQuery(error)),
     };
     let Some(query_vector) = embeddings.into_iter().next() else {
-        if config.search.bm25_fallback {
+        if vector_search_circuit.bm25_fallback_enabled {
             return bm25_fallback_outcome(
                 db,
                 query,
@@ -269,7 +349,7 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
                 scope,
                 options,
                 top_k,
-                "embedding returned no query vector; using BM25-only search".to_string(),
+                bm25_fallback_warning_missing_query_vector(),
             );
         }
         return Err(SearchError::MissingQueryVector);
@@ -277,7 +357,7 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
     if let Some(current_dim) = current_vector_dim(db).map_err(SearchError::KeywordSearch)?
         && current_dim != query_vector.len()
     {
-        if config.search.bm25_fallback {
+        if vector_search_circuit.bm25_fallback_enabled {
             return bm25_fallback_outcome(
                 db,
                 query,
@@ -285,10 +365,7 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
                 scope,
                 options,
                 top_k,
-                format!(
-                    "embedding dimension mismatch ({new_dim}d query vs {current_dim}d index); using BM25-only search",
-                    new_dim = query_vector.len()
-                ),
+                bm25_fallback_warning_dimension_mismatch(query_vector.len(), current_dim),
             );
         }
         return Err(SearchError::VectorDimensionMismatch {

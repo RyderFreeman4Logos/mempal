@@ -26,8 +26,10 @@ use crate::core::{
 use crate::ingest::gating::evaluate_fact_check_gate;
 use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use crate::search::{
-    SearchMode, SearchOptions, resolve_route, search_bm25_only_with_options,
-    search_with_vector_and_scope_options,
+    SearchMode, SearchOptions, VectorSearchCircuit, bm25_fallback_warning_degraded,
+    bm25_fallback_warning_dimension_mismatch, bm25_fallback_warning_embed_error,
+    bm25_fallback_warning_missing_query_vector, bm25_fallback_warning_timeout, resolve_route,
+    search_bm25_only_with_options, search_with_vector_and_scope_options,
 };
 use axum::{
     Json, Router,
@@ -340,6 +342,7 @@ struct StatusResponse {
     db_size_bytes: u64,
     embedding_status: String,
     search_mode: String,
+    embedder_circuit: EmbedderCircuitStatus,
     write_queue: WriteQueueStats,
     feature_flags: FeatureFlags,
     hermes_compat_version: String,
@@ -347,6 +350,29 @@ struct StatusResponse {
     wings: Vec<ScopeCount>,
     source_type_distribution: Vec<SourceTypeCount>,
     turn_storage: TurnStorageStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbedderCircuitStatus {
+    open: bool,
+    failure_count: u64,
+    failure_threshold: u64,
+    bm25_fallback_enabled: bool,
+    search_deadline_secs: u64,
+    vector_search_mode: String,
+}
+
+impl From<VectorSearchCircuit> for EmbedderCircuitStatus {
+    fn from(value: VectorSearchCircuit) -> Self {
+        Self {
+            open: value.open,
+            failure_count: value.failure_count,
+            failure_threshold: value.failure_threshold,
+            bm25_fallback_enabled: value.bm25_fallback_enabled,
+            search_deadline_secs: value.search_deadline_secs,
+            vector_search_mode: value.vector_search_mode.as_str().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -471,30 +497,31 @@ async fn search_handler(
         ..SearchOptions::default()
     };
     let top_k = query.top_k.unwrap_or(10);
+    let embed_snapshot = crate::embed::global_embed_status().snapshot();
+    let vector_search_circuit =
+        VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
     let mut search_mode = SearchMode::Hybrid;
     let mut warnings = Vec::new();
-    let query_vector = if config.search.bm25_fallback
-        && crate::embed::global_embed_status().is_degraded()
+    let query_vector = if vector_search_circuit.bm25_fallback_enabled && vector_search_circuit.open
     {
         search_mode = SearchMode::Bm25Only;
-        warnings.push("embedding backend is degraded; using BM25-only search".to_string());
+        warnings.push(bm25_fallback_warning_degraded(
+            vector_search_circuit.failure_count,
+        ));
         None
     } else {
         match state.embedder_factory.build().await {
             Ok(embedder) => match tokio::time::timeout(
-                Duration::from_secs(config.embed.retry.search_deadline_secs),
+                Duration::from_secs(vector_search_circuit.search_deadline_secs),
                 embedder.embed(&[query.q.as_str()]),
             )
             .await
             {
                 Ok(Ok(vectors)) => match vectors.into_iter().next() {
                     Some(vector) => Some(vector),
-                    None if config.search.bm25_fallback => {
+                    None if vector_search_circuit.bm25_fallback_enabled => {
                         search_mode = SearchMode::Bm25Only;
-                        warnings.push(
-                            "embedding returned no query vector; using BM25-only search"
-                                .to_string(),
-                        );
+                        warnings.push(bm25_fallback_warning_missing_query_vector());
                         None
                     }
                     None => {
@@ -504,19 +531,19 @@ async fn search_handler(
                         ));
                     }
                 },
-                Ok(Err(error)) if config.search.bm25_fallback => {
+                Ok(Err(error)) if vector_search_circuit.bm25_fallback_enabled => {
                     search_mode = SearchMode::Bm25Only;
-                    warnings.push(format!(
-                        "embedding unavailable; using BM25-only search: {}",
-                        crate::core::config::scrub_sensitive_text(&error.to_string())
+                    warnings.push(bm25_fallback_warning_embed_error(
+                        &crate::core::config::scrub_sensitive_text(&error.to_string()),
                     ));
                     None
                 }
                 Ok(Err(error)) => return Err(internal_error(error)),
-                Err(_) if config.search.bm25_fallback => {
+                Err(_) if vector_search_circuit.bm25_fallback_enabled => {
                     search_mode = SearchMode::Bm25Only;
-                    warnings
-                        .push("embedding deadline exceeded; using BM25-only search".to_string());
+                    warnings.push(bm25_fallback_warning_timeout(
+                        vector_search_circuit.search_deadline_secs,
+                    ));
                     None
                 }
                 Err(_) => {
@@ -526,11 +553,10 @@ async fn search_handler(
                     ));
                 }
             },
-            Err(error) if config.search.bm25_fallback => {
+            Err(error) if vector_search_circuit.bm25_fallback_enabled => {
                 search_mode = SearchMode::Bm25Only;
-                warnings.push(format!(
-                    "embedding unavailable; using BM25-only search: {}",
-                    crate::core::config::scrub_sensitive_text(&error.to_string())
+                warnings.push(bm25_fallback_warning_embed_error(
+                    &crate::core::config::scrub_sensitive_text(&error.to_string()),
                 ));
                 None
             }
@@ -551,13 +577,14 @@ async fn search_handler(
             top_k,
         ) {
             Ok(results) => results,
-            Err(error @ crate::search::SearchError::VectorDimensionMismatch { .. })
-                if config.search.bm25_fallback =>
-            {
+            Err(crate::search::SearchError::VectorDimensionMismatch {
+                current_dim,
+                new_dim,
+            }) if vector_search_circuit.bm25_fallback_enabled => {
                 search_mode = SearchMode::Bm25Only;
-                warnings.push(format!(
-                    "{}; using BM25-only search",
-                    crate::core::config::scrub_sensitive_text(&error.to_string())
+                warnings.push(bm25_fallback_warning_dimension_mismatch(
+                    new_dim,
+                    current_dim,
                 ));
                 search_bm25_only_with_options(&db, &query.q, route, &scope, search_options, top_k)
                     .map_err(internal_error)?
@@ -936,6 +963,9 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
     let db = Database::open(&state.db_path).map_err(internal_error)?;
     let drawer_count = db.drawer_count().map_err(internal_error)?;
     let config = ConfigHandle::current();
+    let embed_snapshot = crate::embed::global_embed_status().snapshot();
+    let vector_search_circuit =
+        VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
     let raw_turn_count = count_raw_turn_drawers(&db, &config.turns).map_err(internal_error)?;
     let taxonomy_count = db.taxonomy_count().map_err(internal_error)?;
     let db_size_bytes = db.database_size_bytes().map_err(internal_error)?;
@@ -963,8 +993,12 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         drawer_count,
         taxonomy_count,
         db_size_bytes,
-        embedding_status: current_embedding_status().to_string(),
-        search_mode: current_search_mode(config.as_ref()).to_string(),
+        embedding_status: current_embedding_status(&embed_snapshot).to_string(),
+        search_mode: vector_search_circuit
+            .vector_search_mode
+            .as_str()
+            .to_string(),
+        embedder_circuit: vector_search_circuit.into(),
         write_queue: state.write_queue().stats(),
         feature_flags: FeatureFlags {
             typed_ingest: true,
@@ -988,22 +1022,13 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
     }))
 }
 
-fn current_embedding_status() -> &'static str {
-    let snapshot = crate::embed::global_embed_status().snapshot();
+fn current_embedding_status(snapshot: &crate::embed::EmbedHealthSnapshot) -> &'static str {
     if snapshot.degraded {
         "degraded"
     } else if snapshot.fail_count > 0 && snapshot.last_success_at_unix_ms.is_none() {
         "unavailable"
     } else {
         "healthy"
-    }
-}
-
-fn current_search_mode(config: &crate::core::config::Config) -> &'static str {
-    if config.search.bm25_fallback && crate::embed::global_embed_status().is_degraded() {
-        SearchMode::Bm25Only.as_str()
-    } else {
-        SearchMode::Hybrid.as_str()
     }
 }
 
