@@ -29,7 +29,7 @@ fn new_store() -> (TempDir, PathBuf, PendingMessageStore) {
 
 #[test]
 fn test_enqueue_then_claim_returns_same_payload() {
-    let (_tmp, _db_path, store) = new_store();
+    let (_tmp, db_path, store) = new_store();
 
     let id = store
         .enqueue("hook_event", r#"{"tool":"Bash"}"#)
@@ -43,6 +43,16 @@ fn test_enqueue_then_claim_returns_same_payload() {
     assert_eq!(claimed.kind, "hook_event");
     assert_eq!(claimed.payload, r#"{"tool":"Bash"}"#);
     assert_eq!(claimed.retry_count, 0);
+
+    let op_state: String = Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT op_state FROM pending_messages WHERE id = ?1",
+            [&id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read claim op_state");
+    assert_eq!(op_state, "running");
 }
 
 #[test]
@@ -64,7 +74,7 @@ fn test_confirm_deletes_row() {
     assert_eq!(stats.claimed, 0);
     assert_eq!(stats.failed, 0);
 
-    let remaining = Connection::open(db_path)
+    let remaining = Connection::open(&db_path)
         .expect("open sqlite")
         .query_row(
             "SELECT COUNT(*) FROM pending_messages WHERE id = ?1",
@@ -73,6 +83,16 @@ fn test_confirm_deletes_row() {
         )
         .expect("count confirmed row");
     assert_eq!(remaining, 0);
+
+    let completion_op_state: String = Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT op_state FROM pending_message_completions WHERE message_id = ?1",
+            [&claimed.id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read completion op_state");
+    assert_eq!(completion_op_state, "completed");
 }
 
 #[test]
@@ -101,17 +121,27 @@ fn test_mark_failed_sets_backoff_next_attempt() {
     store.mark_failed(&id, "timeout").expect("mark failed");
 
     let conn = Connection::open(db_path).expect("open sqlite");
-    let (retry_count, retry_backoff_ms, next_attempt_at, status, last_error): (
+    let (retry_count, retry_backoff_ms, next_attempt_at, status, op_state, last_error): (
         i64,
         i64,
         i64,
         String,
+        String,
         Option<String>,
     ) = conn
         .query_row(
-            "SELECT retry_count, retry_backoff_ms, next_attempt_at, status, last_error FROM pending_messages WHERE id = ?1",
+            "SELECT retry_count, retry_backoff_ms, next_attempt_at, status, op_state, last_error FROM pending_messages WHERE id = ?1",
             [&id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .expect("read row");
 
@@ -120,6 +150,7 @@ fn test_mark_failed_sets_backoff_next_attempt() {
     assert!(next_attempt_at >= before + 5);
     assert!(next_attempt_at < before + 15);
     assert_eq!(status, "pending");
+    assert_eq!(op_state, "queued");
     assert_eq!(last_error.as_deref(), Some("timeout"));
 }
 
@@ -165,7 +196,7 @@ fn test_terminal_failure_dead_letters_immediately() {
         )
         .expect("mark terminal failure");
 
-    let (status, retry_count, next_attempt_at): (String, i64, i64) = Connection::open(db_path)
+    let (status, retry_count, next_attempt_at): (String, i64, i64) = Connection::open(&db_path)
         .expect("open sqlite")
         .query_row(
             "SELECT status, retry_count, next_attempt_at FROM pending_messages WHERE id = ?1",
@@ -176,6 +207,15 @@ fn test_terminal_failure_dead_letters_immediately() {
     assert_eq!(status, "failed");
     assert_eq!(retry_count, 1);
     assert!(next_attempt_at <= now_secs());
+    let op_state: String = Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT op_state FROM pending_messages WHERE id = ?1",
+            [&id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read terminal op_state");
+    assert_eq!(op_state, "failed");
     assert!(
         store
             .claim_next("worker-b", 60)
@@ -347,6 +387,14 @@ fn test_retry_failed_embed_messages_requeues_only_failed_embed_items() {
         assert_eq!(retry_count, expected_retry_count, "{id}");
         assert_eq!(last_error.as_deref(), expected_error, "{id}");
     }
+    let op_state: String = conn
+        .query_row(
+            "SELECT op_state FROM pending_messages WHERE id = ?1",
+            [&failed_embed],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read retried op_state");
+    assert_eq!(op_state, "queued");
     drop(conn);
 
     let recovered = store
@@ -426,7 +474,7 @@ fn test_store_startup_auto_reclaims_stale() {
     drop(store);
 
     let restarted = PendingMessageStore::new(&db_path).expect("restart store");
-    let reclaimed = Connection::open(db_path)
+    let reclaimed = Connection::open(&db_path)
         .expect("reopen sqlite")
         .query_row(
             "SELECT status, claimed_at, heartbeat_at FROM pending_messages WHERE id = ?1",
@@ -444,6 +492,15 @@ fn test_store_startup_auto_reclaims_stale() {
     assert_eq!(reclaimed.0, "pending");
     assert!(reclaimed.1.is_none());
     assert!(reclaimed.2.is_none());
+    let op_state: String = Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT op_state FROM pending_messages WHERE id = ?1",
+            [&id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read reclaimed op_state");
+    assert_eq!(op_state, "queued");
     assert_eq!(restarted.stats().expect("stats").pending, 1);
 }
 

@@ -280,6 +280,167 @@ fn test_fork_ext_v18_to_v19_adds_async_ingest_columns_idempotently() {
 }
 
 #[test]
+fn test_fork_ext_v19_to_v20_backfills_op_state_and_normalizes_completion_created_at() {
+    let conn = Connection::open_in_memory().expect("open sqlite connection");
+    let schema_version = current_schema_version();
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE fork_ext_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO fork_ext_meta (key, value) VALUES ('fork_ext_version', '19');
+
+        CREATE TABLE pending_messages (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            claim_token TEXT,
+            claimed_at INTEGER,
+            heartbeat_at INTEGER,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            retry_backoff_ms INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'claimed', 'done', 'failed')),
+            payload TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_error TEXT,
+            result_drawer_id TEXT,
+            op_state TEXT NOT NULL DEFAULT 'queued' CHECK(op_state IN ('queued', 'running', 'completed', 'rejected', 'failed')),
+            rejected_reason TEXT,
+            failure_detail TEXT,
+            result_json TEXT
+        );
+
+        CREATE TABLE pending_message_completions (
+            message_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            claimed_at INTEGER,
+            completed_at INTEGER NOT NULL,
+            processing_ms INTEGER,
+            result_drawer_id TEXT,
+            op_state TEXT NOT NULL DEFAULT 'queued' CHECK(op_state IN ('queued', 'running', 'completed', 'rejected', 'failed')),
+            rejected_reason TEXT,
+            failure_detail TEXT,
+            result_json TEXT
+        );
+
+        INSERT INTO pending_messages (
+            id,
+            kind,
+            source_hash,
+            claim_token,
+            claimed_at,
+            heartbeat_at,
+            retry_count,
+            retry_backoff_ms,
+            next_attempt_at,
+            status,
+            payload,
+            created_at,
+            last_error,
+            result_drawer_id,
+            op_state,
+            rejected_reason,
+            failure_detail,
+            result_json
+        )
+        VALUES
+            ('pm-pending', 'hook_event', 'hash-pending', NULL, NULL, NULL, 0, 0, 0, 'pending', 'payload-pending', 1700000000, NULL, NULL, 'queued', NULL, NULL, NULL),
+            ('pm-claimed', 'hook_event', 'hash-claimed', 'worker:claim', 1700000001, 1700000001, 0, 0, 1700000001, 'claimed', 'payload-claimed', 1700000001, NULL, NULL, 'queued', NULL, NULL, NULL),
+            ('pm-done', 'hook_event', 'hash-done', NULL, NULL, NULL, 0, 0, 0, 'done', 'payload-done', 1700000002, NULL, NULL, 'queued', NULL, NULL, NULL),
+            ('pm-failed', 'hook_event', 'hash-failed', NULL, NULL, NULL, 0, 0, 0, 'failed', 'payload-failed', 1700000003, 'boom', NULL, 'queued', NULL, NULL, NULL);
+
+        INSERT INTO pending_message_completions (
+            message_id,
+            kind,
+            created_at,
+            claimed_at,
+            completed_at,
+            processing_ms,
+            result_drawer_id,
+            op_state,
+            rejected_reason,
+            failure_detail,
+            result_json
+        )
+        VALUES
+            ('comp-completed', 'hook_event', 1700000000000001, 1700000001, 1700000001234, 1234, 'drawer-1', 'queued', NULL, NULL, '{{"state":"completed"}}'),
+            ('comp-rejected', 'hook_event', 1700000000000002, 1700000002, 1700000002234, 1234, NULL, 'queued', 'policy', NULL, '{{"state":"rejected"}}'),
+            ('comp-failed', 'hook_event', 1700000000000003, 1700000003, 1700000003234, 1234, NULL, 'queued', NULL, 'boom', '{{"state":"failed"}}');
+
+        PRAGMA user_version = {schema_version};
+        "#
+    ))
+    .expect("create v19 schema");
+
+    apply_fork_ext_migrations_to(&conn, 20).expect("first v20 migration");
+    apply_fork_ext_migrations_to(&conn, 20).expect("second v20 migration");
+
+    for (id, expected_status, expected_op_state) in [
+        ("pm-pending", "pending", "queued"),
+        ("pm-claimed", "claimed", "running"),
+        ("pm-done", "done", "completed"),
+        ("pm-failed", "failed", "failed"),
+    ] {
+        let (status, op_state): (String, String) = conn
+            .query_row(
+                "SELECT status, op_state FROM pending_messages WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read pending row");
+        assert_eq!(status, expected_status, "{id}");
+        assert_eq!(op_state, expected_op_state, "{id}");
+    }
+
+    for (id, expected_op_state) in [
+        ("comp-completed", "completed"),
+        ("comp-rejected", "rejected"),
+        ("comp-failed", "failed"),
+    ] {
+        let op_state: String = conn
+            .query_row(
+                "SELECT op_state FROM pending_message_completions WHERE message_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("read completion row");
+        assert_eq!(op_state, expected_op_state, "{id}");
+    }
+
+    let queued_completions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_message_completions WHERE op_state = 'queued'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count queued completions");
+    assert_eq!(queued_completions, 0);
+
+    let (min_created_len, max_created_len): (i64, i64) = conn
+        .query_row(
+            r#"
+            SELECT
+                MIN(LENGTH(CAST(created_at AS TEXT))),
+                MAX(LENGTH(CAST(created_at AS TEXT)))
+            FROM pending_message_completions
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read created_at lengths");
+    assert_eq!((min_created_len, max_created_len), (13, 13));
+
+    assert_eq!(read_fork_ext_version(&conn).expect("read version"), 20);
+    let user_version = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        .expect("read user_version");
+    assert_eq!(user_version, schema_version);
+}
+
+#[test]
 fn test_fork_ext_meta_table_exists_after_init() {
     let (_tmp, _db_path, db) = new_test_db();
 

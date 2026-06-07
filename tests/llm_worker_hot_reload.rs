@@ -36,6 +36,15 @@ fn test_release_claim_returns_task_to_pending() {
         .expect("claim_next_by_kind")
         .expect("claimed message");
     assert_eq!(msg.id, id);
+    let op_state: String = db
+        .conn()
+        .query_row(
+            "SELECT op_state FROM pending_messages WHERE id = ?1",
+            [&id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read claimed op_state");
+    assert_eq!(op_state, "running");
 
     let stats_claimed = store.stats().expect("stats");
     assert_eq!(stats_claimed.claimed, 1);
@@ -43,6 +52,15 @@ fn test_release_claim_returns_task_to_pending() {
 
     // Release back to pending — simulates worker cancellation due to config change.
     store.release_claim(&id).expect("release_claim");
+    let released_op_state: String = db
+        .conn()
+        .query_row(
+            "SELECT op_state FROM pending_messages WHERE id = ?1",
+            [&id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read released op_state");
+    assert_eq!(released_op_state, "queued");
 
     let stats_after = store.stats().expect("stats after release");
     assert_eq!(stats_after.claimed, 0, "task must be pending after release");

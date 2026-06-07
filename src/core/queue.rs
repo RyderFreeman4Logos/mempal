@@ -190,10 +190,7 @@ impl PendingMessageStore {
                 claim_token = ?2,
                 claimed_at = ?3,
                 heartbeat_at = ?3,
-                op_state = CASE
-                    WHEN kind = 'ingest_async' THEN 'running'
-                    ELSE op_state
-                END
+                op_state = 'running'
             WHERE id = ?1 AND status = 'pending'
             "#,
             params![id, claim_token, now],
@@ -264,10 +261,7 @@ impl PendingMessageStore {
                 claim_token = ?2,
                 claimed_at = ?3,
                 heartbeat_at = ?3,
-                op_state = CASE
-                    WHEN kind = 'ingest_async' THEN 'running'
-                    ELSE op_state
-                END
+                op_state = 'running'
             WHERE id = ?1 AND status = 'pending'
             "#,
             params![id, claim_token, now],
@@ -293,7 +287,7 @@ impl PendingMessageStore {
     pub fn confirm(&self, id: &str) -> Result<()> {
         let mut conn = self.open_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        confirm_in_tx(&tx, id)?;
+        confirm_in_tx(&tx, id, "completed")?;
         tx.commit()?;
         Ok(())
     }
@@ -328,7 +322,7 @@ impl PendingMessageStore {
                 result_json
             ],
         )?;
-        confirm_in_tx(&tx, id)?;
+        confirm_in_tx(&tx, id, op_state)?;
         tx.commit()?;
         Ok(())
     }
@@ -386,6 +380,7 @@ impl PendingMessageStore {
                 retry_backoff_ms = ?3,
                 next_attempt_at = ?4,
                 status = ?5,
+                op_state = CASE WHEN ?5 = 'failed' THEN 'failed' ELSE 'queued' END,
                 claim_token = NULL,
                 claimed_at = NULL,
                 heartbeat_at = NULL,
@@ -430,10 +425,7 @@ impl PendingMessageStore {
                 claimed_at = NULL,
                 heartbeat_at = NULL,
                 last_error = NULL,
-                op_state = CASE
-                    WHEN kind = 'ingest_async' THEN 'queued'
-                    ELSE op_state
-                END,
+                op_state = 'queued',
                 result_drawer_id = CASE
                     WHEN kind = 'ingest_async' THEN NULL
                     ELSE result_drawer_id
@@ -471,10 +463,7 @@ impl PendingMessageStore {
                 claim_token = NULL,
                 claimed_at = NULL,
                 heartbeat_at = NULL,
-                op_state = CASE
-                    WHEN kind = 'ingest_async' THEN 'queued'
-                    ELSE op_state
-                END,
+                op_state = 'queued',
                 result_drawer_id = CASE
                     WHEN kind = 'ingest_async' THEN NULL
                     ELSE result_drawer_id
@@ -549,14 +538,13 @@ impl PendingMessageStore {
     }
 }
 
-fn confirm_in_tx(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
+fn confirm_in_tx(tx: &rusqlite::Transaction<'_>, id: &str, op_state: &str) -> Result<()> {
     let row = tx
         .query_row(
             r#"
             SELECT kind,
                    created_at,
                    claimed_at,
-                   op_state,
                    result_drawer_id,
                    rejected_reason,
                    failure_detail,
@@ -570,11 +558,10 @@ fn confirm_in_tx(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         )
@@ -619,11 +606,11 @@ fn confirm_in_tx(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
             row.2.map(|s| s.saturating_mul(1_000)),
             completed_at,
             processing_ms,
-            row.4,
             row.3,
+            op_state,
+            row.4,
             row.5,
-            row.6,
-            row.7
+            row.6
         ],
     )?;
     let updated = tx.execute("DELETE FROM pending_messages WHERE id = ?1", [id])?;
@@ -800,19 +787,16 @@ pub fn failure_headline_count(live_fail_count: u64, queue_stats: &QueueStats) ->
 fn reclaim_stale_tx(conn: &rusqlite::Transaction<'_>, stale_cutoff: i64) -> rusqlite::Result<u64> {
     let updated = conn.execute(
         r#"
-        UPDATE pending_messages
-        SET status = 'pending',
-            claim_token = NULL,
-            claimed_at = NULL,
-            heartbeat_at = NULL,
-            op_state = CASE
-                WHEN kind = 'ingest_async' THEN 'queued'
-                ELSE op_state
-            END,
-            result_drawer_id = CASE
-                WHEN kind = 'ingest_async' THEN NULL
-                ELSE result_drawer_id
-            END,
+            UPDATE pending_messages
+            SET status = 'pending',
+                claim_token = NULL,
+                claimed_at = NULL,
+                heartbeat_at = NULL,
+                op_state = 'queued',
+                result_drawer_id = CASE
+                    WHEN kind = 'ingest_async' THEN NULL
+                    ELSE result_drawer_id
+                END,
             rejected_reason = CASE
                 WHEN kind = 'ingest_async' THEN NULL
                 ELSE rejected_reason
@@ -841,10 +825,7 @@ fn reclaim_stale_conn(conn: &Connection, stale_cutoff: i64) -> rusqlite::Result<
             claim_token = NULL,
             claimed_at = NULL,
             heartbeat_at = NULL,
-            op_state = CASE
-                WHEN kind = 'ingest_async' THEN 'queued'
-                ELSE op_state
-            END,
+            op_state = 'queued',
             result_drawer_id = CASE
                 WHEN kind = 'ingest_async' THEN NULL
                 ELSE result_drawer_id
