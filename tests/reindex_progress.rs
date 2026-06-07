@@ -180,6 +180,28 @@ fn run_reindex(
     command.output().expect("run reindex command")
 }
 
+fn read_reindex_progress_status_counts(db: &Database) -> (i64, i64, i64) {
+    db.conn()
+        .query_row(
+            r#"
+            SELECT
+                COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
+            FROM reindex_progress
+            "#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .expect("read reindex progress status counts")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_reindex_resume_from_checkpoint() {
     let _guard = test_guard().await;
@@ -246,6 +268,10 @@ async fn test_reindex_stale_finalizes_progress() {
     write_config(&home, &db_path, &server.base_url);
     seed_db(&db_path);
 
+    let db = Database::open(&db_path).expect("open db before stale reindex");
+    let before = read_reindex_progress_status_counts(&db);
+    drop(db);
+
     let output = run_reindex(&home, None, false, true);
     assert!(
         output.status.success(),
@@ -255,6 +281,20 @@ async fn test_reindex_stale_finalizes_progress() {
     assert_eq!(server.request_count(), 1);
 
     let db = Database::open(&db_path).expect("open db after stale reindex");
+    let after = read_reindex_progress_status_counts(&db);
+    assert_eq!(
+        after.0, before.0,
+        "successful stale reindex must not leave extra running rows"
+    );
+    assert_eq!(
+        after.1,
+        before.1 + 1,
+        "successful stale reindex must settle one additional row to done"
+    );
+    assert_eq!(
+        after.2, before.2,
+        "successful stale reindex must not resurrect failed rows"
+    );
     let state = db
         .conn()
         .query_row(
@@ -300,6 +340,7 @@ async fn test_reindex_progress_reconciliation_finalizes_orphan_running_row() {
         )
         .expect("read running checkpoint");
     assert_eq!(running, "running");
+    let before = read_reindex_progress_status_counts(&db);
 
     let target_fingerprint = format!(
         "openai_compat:Qwen/Qwen3-Embedding-8B:{}:{}",
@@ -310,6 +351,32 @@ async fn test_reindex_progress_reconciliation_finalizes_orphan_running_row() {
         .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, &target_fingerprint)
         .expect("reconcile orphan running row");
     assert_eq!(reconciled, 1);
+    let after_first = read_reindex_progress_status_counts(&db);
+    assert_eq!(after_first.0, before.0 - 1);
+    assert_eq!(after_first.1, before.1 + 1);
+    assert_eq!(after_first.2, before.2);
+
+    let reconciled_again = progress
+        .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, &target_fingerprint)
+        .expect("reconcile orphan running row twice");
+    assert_eq!(reconciled_again, 0);
+    let after_second = read_reindex_progress_status_counts(&db);
+    assert_eq!(after_second, after_first);
+
+    db.conn()
+        .execute(
+            "UPDATE reindex_progress SET status = 'failed' WHERE source_path = 'fixtures/source.txt'",
+            [],
+        )
+        .expect("flip checkpoint to failed");
+
+    let failed = read_reindex_progress_status_counts(&db);
+    assert_eq!(failed, (0, 0, 1));
+
+    let reconciled_failed = progress
+        .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, &target_fingerprint)
+        .expect("reconcile failed checkpoint");
+    assert_eq!(reconciled_failed, 0);
 
     let state = db
         .conn()
@@ -319,5 +386,5 @@ async fn test_reindex_progress_reconciliation_finalizes_orphan_running_row() {
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .expect("read reconciled checkpoint");
-    assert_eq!(state, (49, "done".to_string()));
+    assert_eq!(state, (49, "failed".to_string()));
 }
