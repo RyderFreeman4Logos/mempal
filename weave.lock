@@ -1,5 +1,5 @@
 [[package]]
 name = "cli-sub-agent"
 repo = "https://github.com/RyderFreeman4Logos/cli-sub-agent.git"
-commit = "3c1d49e645b0b15db46ee35196b6a67b08cc12c0"
+commit = "c1a4177b6bf3c1038069f404d06a9744423c03d9"
 source_kind = "git"
