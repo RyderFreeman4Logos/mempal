@@ -70,6 +70,11 @@ impl DaemonWriteObserver {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::new()
+    }
+
     pub fn record_successful_write(&self) {
         self.inner
             .last_successful_write_secs

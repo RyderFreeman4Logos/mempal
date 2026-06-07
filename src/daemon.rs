@@ -212,8 +212,6 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     };
 
     let mut hook_workers = JoinSet::new();
-    let mut hook_worker_seq: u64 = 0;
-
     loop {
         context.write_observer.maybe_log_stall(&context.store);
         drain_finished_hook_workers(&mut hook_workers);
@@ -234,13 +232,12 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .await
         {
             ClaimPollResult::Claimed(message) => {
-                hook_worker_seq = hook_worker_seq.saturating_add(1);
                 spawn_hook_worker(
                     &mut hook_workers,
                     HookWorkerState {
                         async_db: context.async_db.clone(),
                         store: context.store.clone(),
-                        worker_id: format!("{worker_id}-hook-{hook_worker_seq}"),
+                        worker_id: worker_id.clone(),
                         embedder: Arc::clone(&embedder),
                         prototype_classifier: Arc::clone(&prototype_classifier),
                         config: Arc::clone(&context.config),
@@ -1625,8 +1622,10 @@ impl Embedder for DaemonEmbedder {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::core::{
         AsyncDb,
@@ -1638,8 +1637,9 @@ mod tests {
     use crate::hook::{CapturedHookEnvelope, HookEvent};
 
     use super::{
-        ClaimNextSource, ClaimPollResult, DaemonIngestContext, build_drawer_records,
-        poll_claim_next, process_claimed_message_with_embedder, wing_from_cwd,
+        ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext, HookWorkerState,
+        build_drawer_records, poll_claim_next, process_claimed_message_with_embedder,
+        wing_from_cwd,
     };
 
     struct StubClaimSource {
@@ -1679,6 +1679,13 @@ mod tests {
             created_at: 0,
             claimed_at: 0,
         }
+    }
+
+    fn unix_now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_secs() as i64
     }
 
     #[tokio::test]
@@ -1728,6 +1735,124 @@ mod tests {
         fn name(&self) -> &str {
             "static-test"
         }
+    }
+
+    struct HeartbeatProbeEmbedder {
+        db_path: PathBuf,
+        message_id: String,
+        stale_heartbeat_at: i64,
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for HeartbeatProbeEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(EmbedError::Runtime("transient test failure".to_string()));
+            }
+
+            let heartbeat_at: Option<i64> = rusqlite::Connection::open(&self.db_path)
+                .expect("open heartbeat probe db")
+                .query_row(
+                    "SELECT heartbeat_at FROM pending_messages WHERE id = ?1",
+                    [self.message_id.as_str()],
+                    |row| row.get(0),
+                )
+                .expect("read heartbeat");
+            assert!(
+                heartbeat_at.unwrap_or_default() > self.stale_heartbeat_at,
+                "bounded hook worker must heartbeat using the same worker id that claimed the row"
+            );
+
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "heartbeat-probe"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bounded_hook_worker_heartbeats_with_claim_worker_id() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+        Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(&db_path).expect("store");
+
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "printf heartbeat",
+            "output": "ok",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        let queued_id = store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let worker_id = "bounded-hook-worker";
+        let message = store
+            .claim_next(worker_id, 60)
+            .expect("claim next")
+            .expect("claimed message");
+        assert_eq!(message.id, queued_id);
+
+        let stale_heartbeat_at = unix_now_secs() - 30;
+        rusqlite::Connection::open(&db_path)
+            .expect("open sqlite")
+            .execute(
+                "UPDATE pending_messages SET claimed_at = ?2, heartbeat_at = ?2 WHERE id = ?1",
+                rusqlite::params![queued_id, stale_heartbeat_at],
+            )
+            .expect("age heartbeat");
+
+        let config = Config::default();
+        assert!(
+            !config.llm.enabled,
+            "test runtime config must keep LLM disabled"
+        );
+        super::process_hook_worker_message(
+            HookWorkerState {
+                async_db,
+                store,
+                worker_id: worker_id.to_string(),
+                embedder: std::sync::Arc::new(DaemonEmbedder {
+                    primary: Box::new(HeartbeatProbeEmbedder {
+                        db_path,
+                        message_id: message.id.clone(),
+                        stale_heartbeat_at,
+                        attempts: AtomicUsize::new(0),
+                    }),
+                    fallback: None,
+                }),
+                prototype_classifier: std::sync::Arc::new(None),
+                config: std::sync::Arc::new(config),
+                mempal_home,
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+            },
+            message,
+        )
+        .await;
     }
 
     struct LlmClaimRaceProbeEmbedder {
