@@ -3,11 +3,14 @@
 mod common;
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
+use async_trait::async_trait;
+use axum::{Json, Router, routing::get};
 use common::harness::start as start_mock;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
@@ -87,6 +90,51 @@ impl TestHome {
             config_path,
             db_path,
         }
+    }
+}
+
+async fn spawn_models_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let app = Router::new().route(
+        "/v1/models",
+        get(|| async { Json(serde_json::json!({ "object": "list", "data": [] })) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind models server");
+    let addr = listener.local_addr().expect("models server addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve models server");
+    });
+    (addr, handle)
+}
+
+#[derive(Clone)]
+struct SlowEmbedderFactory;
+
+struct SlowEmbedder;
+
+#[async_trait]
+impl mempal::embed::EmbedderFactory for SlowEmbedderFactory {
+    async fn build(&self) -> std::result::Result<Box<dyn mempal::embed::Embedder>, EmbedError> {
+        Ok(Box::new(SlowEmbedder))
+    }
+}
+
+#[async_trait]
+impl mempal::embed::Embedder for SlowEmbedder {
+    async fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        Ok(texts.iter().map(|_| vec![0.25; 4]).collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    fn name(&self) -> &str {
+        "slow-test-embedder"
     }
 }
 
@@ -176,6 +224,7 @@ async fn test_search_deadline_bm25_fallback() {
         }
     });
 
+    tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(5)).await;
     let response = search
         .await
@@ -183,12 +232,93 @@ async fn test_search_deadline_bm25_fallback() {
         .expect("search result")
         .0;
     assert_eq!(response.results[0].drawer_id, "bm25-hit");
+    assert_eq!(response.search_mode, "bm25_only");
     assert!(response.system_warnings.iter().any(|warning| {
-        warning.message.contains("BM25 fallback") || warning.message.contains("vector unavailable")
+        warning.message.contains("deadline exceeded after 5s")
+            && warning.message.contains("retry may help")
     }));
 
     handle.resume();
     handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_search_deadline_warning_surfaces_timeout_reason() {
+    let _guard = test_guard().await;
+    let (models_addr, models_handle) = spawn_models_server().await;
+    let config_text = embed_config(
+        std::path::Path::new("/tmp/placeholder.db"),
+        &format!("http://{models_addr}/v1"),
+        "",
+    );
+    let env =
+        TestHome::new(&config_text.replace("/tmp/placeholder.db", "/tmp/mempal-timeout-search.db"));
+    let db = Database::open(&env.db_path).expect("open db");
+    db.insert_drawer_with_project(
+        &Drawer {
+            id: "deadline-hit".to_string(),
+            content: "fallback keyword memory".to_string(),
+            wing: "test".to_string(),
+            room: Some("fallback".to_string()),
+            source_file: Some("fixtures/deadline.txt".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "1713000000".to_string(),
+            chunk_index: Some(0),
+            importance: 2,
+            ..Drawer::default()
+        },
+        Some("default"),
+    )
+    .expect("insert drawer");
+
+    let server =
+        MempalMcpServer::new_with_factory(env.db_path.clone(), Arc::new(SlowEmbedderFactory));
+    let status = server.mempal_status().await.expect("status").0;
+    assert!(status.endpoint_health.embedding_reachable, "{status:#?}");
+    assert!(status.embedder_circuit.bm25_fallback_enabled);
+    assert_eq!(status.embedder_circuit.search_deadline_secs, 5);
+    assert_eq!(status.embedder_circuit.vector_search_mode, "hybrid");
+    assert!(!status.embedder_circuit.open, "{status:#?}");
+
+    tokio::time::pause();
+    let search = tokio::spawn({
+        let server = server.clone();
+        async move {
+            server
+                .mempal_search(Parameters(SearchRequest {
+                    query: "fallback keyword".to_string(),
+                    top_k: Some(5),
+                    ..SearchRequest::default()
+                }))
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let response = search
+        .await
+        .expect("join search task")
+        .expect("search result")
+        .0;
+    assert_eq!(response.search_mode, "bm25_only");
+    assert!(
+        response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("deadline exceeded after 5s")),
+        "{response:#?}"
+    );
+    assert!(
+        response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("retry may help")),
+        "{response:#?}"
+    );
+
+    models_handle.abort();
+    let _ = models_handle.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -206,14 +336,31 @@ async fn test_successful_embed_exits_degraded() {
     status.reset_for_tests();
     status.record_failure(&"synthetic failure 1");
     status.record_failure(&"synthetic failure 2");
+    let degraded_status = server.mempal_status().await.expect("status").0;
     assert!(
-        server
-            .mempal_status()
-            .await
-            .expect("status")
-            .0
-            .embed_status
-            .degraded
+        degraded_status.embed_status.degraded,
+        "{degraded_status:#?}"
+    );
+    assert!(
+        degraded_status.embedder_circuit.open,
+        "{degraded_status:#?}"
+    );
+    assert_eq!(
+        degraded_status.embedder_circuit.vector_search_mode, "bm25_only",
+        "{degraded_status:#?}"
+    );
+    assert_eq!(
+        degraded_status.embedder_circuit.failure_count, 2,
+        "{degraded_status:#?}"
+    );
+    assert_eq!(
+        degraded_status.embedder_circuit.failure_threshold, 2,
+        "{degraded_status:#?}"
+    );
+    assert!(degraded_status.embedder_circuit.bm25_fallback_enabled);
+    assert_eq!(
+        degraded_status.embedder_circuit.search_deadline_secs, 5,
+        "{degraded_status:#?}"
     );
 
     let embedder = from_config(&config).await.expect("build managed embedder");
@@ -230,6 +377,9 @@ async fn test_successful_embed_exits_degraded() {
     assert!(!snapshot.embed_status.degraded);
     assert_eq!(snapshot.embed_status.failure_count, 0);
     assert!(snapshot.embed_status.last_success_at_unix_ms.is_some());
+    assert!(!snapshot.embedder_circuit.open, "{snapshot:#?}");
+    assert_eq!(snapshot.embedder_circuit.vector_search_mode, "hybrid");
+    assert_eq!(snapshot.embedder_circuit.failure_count, 0);
 
     handle.shutdown().await;
 }
