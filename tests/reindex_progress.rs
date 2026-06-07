@@ -180,6 +180,29 @@ fn run_reindex(
     command.output().expect("run reindex command")
 }
 
+fn run_reindex_from_config(
+    home: &Path,
+    stop_after: Option<usize>,
+    resume: bool,
+    stale: bool,
+) -> std::process::Output {
+    let mut command = Command::new(mempal_bin());
+    command
+        .env("HOME", home)
+        .arg("reindex")
+        .arg("--from-config");
+    if stale {
+        command.arg("--stale");
+    }
+    if let Some(limit) = stop_after {
+        command.env("MEMPAL_TEST_REINDEX_STOP_AFTER", limit.to_string());
+    }
+    if resume {
+        command.arg("--resume");
+    }
+    command.output().expect("run reindex command")
+}
+
 fn read_reindex_progress_status_counts(db: &Database) -> (i64, i64, i64) {
     db.conn()
         .query_row(
@@ -387,4 +410,93 @@ async fn test_reindex_progress_reconciliation_finalizes_orphan_running_row() {
         )
         .expect("read reconciled checkpoint");
     assert_eq!(state, (49, "failed".to_string()));
+
+    db.conn()
+        .execute(
+            "UPDATE reindex_progress SET status = 'paused' WHERE source_path = 'fixtures/source.txt'",
+            [],
+        )
+        .expect("flip checkpoint to paused");
+
+    let paused = read_reindex_progress_status_counts(&db);
+    assert_eq!(paused, (0, 0, 0));
+
+    let reconciled_paused = progress
+        .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, &target_fingerprint)
+        .expect("reconcile paused checkpoint");
+    assert_eq!(reconciled_paused, 0);
+
+    let paused_state = db
+        .conn()
+        .query_row(
+            "SELECT last_processed_chunk_id, status FROM reindex_progress WHERE source_path = 'fixtures/source.txt'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("read paused checkpoint");
+    assert_eq!(paused_state, (49, "paused".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_reindex_stale_finalizes_orphan_running_row_with_zero_drawers() {
+    let _guard = test_guard().await;
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    let db_path = home.join(".mempal").join("palace.db");
+    let server = MockEmbeddingServer::start();
+
+    write_config(&home, &db_path, &server.base_url);
+    seed_db(&db_path);
+
+    let full = run_reindex(&home, None, false, false);
+    assert!(
+        full.status.success(),
+        "full reindex stderr: {}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+    assert_eq!(server.request_count(), 50);
+
+    let db = Database::open(&db_path).expect("open db before stale reconcile");
+    let progress = ReindexProgressStore::new(&db_path);
+    progress
+        .upsert_running("fixtures/source.txt", Some(49), "openai_compat")
+        .expect("insert orphan running row");
+
+    let before = read_reindex_progress_status_counts(&db);
+    assert_eq!(before, (1, 0, 0));
+    drop(db);
+
+    let stale = run_reindex_from_config(&home, None, false, true);
+    assert!(
+        stale.status.success(),
+        "stale reindex stderr: {}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    assert_eq!(server.request_count(), 50);
+
+    let db = Database::open(&db_path).expect("open db after stale reconcile");
+    let after = read_reindex_progress_status_counts(&db);
+    assert_eq!(after, (0, 1, 0));
+
+    let state = db
+        .conn()
+        .query_row(
+            "SELECT last_processed_chunk_id, status FROM reindex_progress WHERE source_path = 'fixtures/source.txt'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("read reconciled checkpoint");
+    assert_eq!(state, (49, "done".to_string()));
+
+    let repeat = run_reindex_from_config(&home, None, false, true);
+    assert!(
+        repeat.status.success(),
+        "repeat stale reindex stderr: {}",
+        String::from_utf8_lossy(&repeat.stderr)
+    );
+    assert_eq!(server.request_count(), 50);
+
+    let db = Database::open(&db_path).expect("open db after repeat stale reconcile");
+    let repeat_counts = read_reindex_progress_status_counts(&db);
+    assert_eq!(repeat_counts, after);
 }

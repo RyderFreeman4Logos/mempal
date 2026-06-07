@@ -100,44 +100,8 @@ impl ReindexProgressStore {
     ) -> Result<usize> {
         let now = now_secs();
         let conn = self.open_connection()?;
-        // Aggregate each source once, then join the summary back to running rows.
         let updated = conn.execute(
-            r#"
-            WITH source_summary AS (
-                SELECT
-                    COALESCE(d.source_file, d.id) AS source_path,
-                    COUNT(*) AS drawer_count,
-                    MAX(COALESCE(d.chunk_index, 0)) AS last_processed_chunk_id,
-                    SUM(
-                        CASE
-                            WHEN v.id IS NULL
-                              OR COALESCE(idx.value, legacy_idx.value, '') != ?1
-                              OR COALESCE(fp.value, '') != ?2
-                            THEN 1
-                            ELSE 0
-                        END
-                    ) AS stale_drawer_count
-                FROM drawers AS d
-                LEFT JOIN drawer_vectors AS v ON v.id = d.id
-                LEFT JOIN fork_ext_meta AS idx
-                  ON idx.key = 'reindex:' || d.id || ':index_version'
-                LEFT JOIN fork_ext_meta AS legacy_idx
-                  ON legacy_idx.key = 'reindex:' || d.id || ':normalize_version'
-                LEFT JOIN fork_ext_meta AS fp
-                  ON fp.key = 'reindex:' || d.id || ':embedder_fingerprint'
-                WHERE d.deleted_at IS NULL
-                GROUP BY COALESCE(d.source_file, d.id)
-            )
-            UPDATE reindex_progress
-            SET last_processed_chunk_id = source_summary.last_processed_chunk_id,
-                updated_at = ?3,
-                status = 'done'
-            FROM source_summary
-            WHERE reindex_progress.status = 'running'
-              AND reindex_progress.source_path = source_summary.source_path
-              AND source_summary.drawer_count > 0
-              AND source_summary.stale_drawer_count = 0
-            "#,
+            FINALIZE_COMPLETED_RUNNING_ROWS_SQL,
             params![current_index_version, target_fingerprint, now],
         )?;
         Ok(updated)
@@ -236,4 +200,74 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+const FINALIZE_COMPLETED_RUNNING_ROWS_SQL: &str = r#"
+    WITH source_summary AS (
+        SELECT
+            COALESCE(d.source_file, d.id) AS source_path,
+            COUNT(*) AS drawer_count,
+            MAX(COALESCE(d.chunk_index, 0)) AS last_processed_chunk_id,
+            SUM(
+                CASE
+                    WHEN NOT EXISTS (
+                        SELECT 1
+                        FROM drawer_vectors AS dv
+                        WHERE dv.id = d.id
+                    )
+                      OR COALESCE(idx.value, legacy_idx.value, '') != ?1
+                      OR COALESCE(fp.value, '') != ?2
+                    THEN 1
+                    ELSE 0
+                END
+            ) AS stale_drawer_count
+        FROM drawers AS d
+        LEFT JOIN fork_ext_meta AS idx
+          ON idx.key = 'reindex:' || d.id || ':index_version'
+        LEFT JOIN fork_ext_meta AS legacy_idx
+          ON legacy_idx.key = 'reindex:' || d.id || ':normalize_version'
+        LEFT JOIN fork_ext_meta AS fp
+          ON fp.key = 'reindex:' || d.id || ':embedder_fingerprint'
+        WHERE d.deleted_at IS NULL
+        GROUP BY COALESCE(d.source_file, d.id)
+    )
+    UPDATE reindex_progress
+    SET last_processed_chunk_id = source_summary.last_processed_chunk_id,
+        updated_at = ?3,
+        status = 'done'
+    FROM source_summary
+    WHERE reindex_progress.status = 'running'
+      AND reindex_progress.source_path = source_summary.source_path
+      AND source_summary.drawer_count > 0
+      AND source_summary.stale_drawer_count = 0
+    "#;
+
+#[cfg(test)]
+mod tests {
+    use super::FINALIZE_COMPLETED_RUNNING_ROWS_SQL;
+
+    #[test]
+    fn finalize_running_rows_uses_correlated_exists_point_lookup() {
+        assert!(
+            FINALIZE_COMPLETED_RUNNING_ROWS_SQL.contains("NOT EXISTS (")
+                && FINALIZE_COMPLETED_RUNNING_ROWS_SQL.contains("SELECT 1")
+                && FINALIZE_COMPLETED_RUNNING_ROWS_SQL.contains("FROM drawer_vectors AS dv")
+                && FINALIZE_COMPLETED_RUNNING_ROWS_SQL.contains("WHERE dv.id = d.id"),
+            "finalize must use a correlated EXISTS point lookup for vec0"
+        );
+        assert!(
+            !FINALIZE_COMPLETED_RUNNING_ROWS_SQL
+                .contains("LEFT JOIN drawer_vectors AS v ON v.id = d.id"),
+            "finalize must not use the fragile vec0 set-join"
+        );
+        assert!(
+            FINALIZE_COMPLETED_RUNNING_ROWS_SQL.contains("AND source_summary.drawer_count > 0"),
+            "finalize must keep the non-empty-source guard"
+        );
+        assert!(
+            FINALIZE_COMPLETED_RUNNING_ROWS_SQL
+                .contains("AND source_summary.stale_drawer_count = 0"),
+            "finalize must keep the zero-stale guard"
+        );
+    }
 }
