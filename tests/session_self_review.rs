@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
+use mempal::core::AsyncDb;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
@@ -201,7 +202,7 @@ preview_chars = 48
             .store
             .claim_next("worker-session-review", 120)?
             .expect("claimed message");
-        let db = Database::open(&self.db_path)?;
+        let db = AsyncDb::open(&self.db_path, 4)?;
         process_claimed_message_with_embedder(
             &db,
             &self.store,

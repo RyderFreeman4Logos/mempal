@@ -173,6 +173,23 @@ impl AsyncDb {
         exec(Arc::clone(&self.readers), delay, f).await
     }
 
+    /// Run a read-only closure that returns [`anyhow::Result`] off the runtime.
+    ///
+    /// This is for higher-level orchestration paths that already compose
+    /// database calls with filesystem, parsing, or domain validation errors.
+    /// The same self-containment rules as [`run_read`](Self::run_read) apply.
+    pub async fn run_read_anyhow<F, R>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.read_delay;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay: Option<Duration> = None;
+        exec_anyhow(Arc::clone(&self.readers), delay, f).await
+    }
+
     /// Run a read-write closure against the single writer connection off the
     /// runtime. Writes are serialized by the 1-permit writer semaphore; the same
     /// self-containment rules as [`run_read`](Self::run_read) apply.
@@ -182,6 +199,19 @@ impl AsyncDb {
         R: Send + 'static,
     {
         exec(Arc::clone(&self.writer), None, f).await
+    }
+
+    /// Run a read-write closure that returns [`anyhow::Result`] off the runtime.
+    ///
+    /// Writes are still serialized by the single writer connection. Use this
+    /// only when the closure needs to compose `Database` calls with non-DB
+    /// errors; pure database operations should prefer [`run_write`](Self::run_write).
+    pub async fn run_write_anyhow<F, R>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        exec_anyhow(Arc::clone(&self.writer), None, f).await
     }
 }
 
@@ -203,12 +233,15 @@ where
         })?;
     let conn = pool.take_or_open()?;
     let checkin_pool = Arc::clone(&pool);
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let join = tokio::task::spawn_blocking(move || {
-        if let Some(d) = delay {
-            std::thread::sleep(d);
-        }
-        let out = f(&conn);
-        (conn, out)
+        tracing::dispatcher::with_default(&dispatch, || {
+            if let Some(d) = delay {
+                std::thread::sleep(d);
+            }
+            let out = f(&conn);
+            (conn, out)
+        })
     })
     .await;
     match join {
@@ -220,6 +253,43 @@ where
         Err(join_err) => {
             drop(permit);
             Err(DbError::BlockingTaskFailed(join_err.to_string()))
+        }
+    }
+}
+
+async fn exec_anyhow<F, R>(pool: Arc<ConnPool>, delay: Option<Duration>, f: F) -> anyhow::Result<R>
+where
+    F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    let permit = pool
+        .sem
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("connection pool semaphore closed"))?;
+    let conn = pool.take_or_open()?;
+    let checkin_pool = Arc::clone(&pool);
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let join = tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            if let Some(d) = delay {
+                std::thread::sleep(d);
+            }
+            let out = f(&conn);
+            (conn, out)
+        })
+    })
+    .await;
+    match join {
+        Ok((conn, out)) => {
+            checkin_pool.checkin(conn);
+            drop(permit);
+            out
+        }
+        Err(join_err) => {
+            drop(permit);
+            Err(anyhow::anyhow!("blocking database task failed: {join_err}"))
         }
     }
 }

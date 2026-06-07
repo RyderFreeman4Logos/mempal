@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use mempal::core::AsyncDb;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
@@ -43,7 +44,6 @@ impl Embedder for StaticEmbedder {
 struct TestEnv {
     _tmp: TempDir,
     config: Config,
-    db: Database,
     db_path: PathBuf,
     mempal_home: PathBuf,
     project_dir: PathBuf,
@@ -102,7 +102,6 @@ enabled = false
         Self {
             _tmp: tmp,
             config,
-            db,
             db_path,
             mempal_home,
             project_dir,
@@ -141,8 +140,9 @@ enabled = false
             .claim_next("hook-project-promotion-test", 120)
             .expect("claim next")
             .expect("claimed message");
+        let async_db = AsyncDb::open(&self.db_path, 4).expect("open async db");
         process_claimed_message_with_embedder(
-            &self.db,
+            &async_db,
             &self.store,
             "hook-project-promotion-test",
             &claimed,
@@ -263,7 +263,6 @@ fn count_drawers_by_wing_only(db_path: &Path, wing: &str) -> i64 {
 struct MinimalEnv {
     _tmp: TempDir,
     config: Config,
-    db: Database,
     db_path: PathBuf,
     mempal_home: PathBuf,
     store: PendingMessageStore,
@@ -324,7 +323,6 @@ enabled = false
         Self {
             _tmp: tmp,
             config,
-            db,
             db_path,
             mempal_home,
             store,
@@ -362,8 +360,9 @@ enabled = false
             .claim_next("wing-routing-test", 120)
             .expect("claim next")
             .expect("claimed message");
+        let async_db = AsyncDb::open(&self.db_path, 4).expect("open async db");
         process_claimed_message_with_embedder(
-            &self.db,
+            &async_db,
             &self.store,
             "wing-routing-test",
             &claimed,

@@ -8,6 +8,7 @@ use std::{future::Future, pin::Pin};
 
 use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
+    AsyncDb,
     db::Database,
     project::resolve_project_id,
     queue::{ClaimedMessage, PendingMessageStore, QueueFailureDisposition},
@@ -219,22 +220,19 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         {
             ClaimPollResult::Claimed(message) => {
                 let message_id = message.id.clone();
-                let result = {
-                    let db = context.db.lock().await;
-                    process_claimed_message_with_embedder(
-                        &db,
-                        &context.store,
-                        &worker_id,
-                        &message,
-                        &embedder,
-                        DaemonIngestContext {
-                            prototype_classifier: prototype_classifier.as_ref(),
-                            config: context.config.as_ref(),
-                            mempal_home: &context.mempal_home,
-                        },
-                    )
-                    .await
-                };
+                let result = process_claimed_message_with_embedder(
+                    &context.async_db,
+                    &context.store,
+                    &worker_id,
+                    &message,
+                    &embedder,
+                    DaemonIngestContext {
+                        prototype_classifier: prototype_classifier.as_ref(),
+                        config: context.config.as_ref(),
+                        mempal_home: &context.mempal_home,
+                    },
+                )
+                .await;
 
                 match result {
                     Ok(_) => {
@@ -352,7 +350,7 @@ pub struct DaemonIngestContext<'a> {
 }
 
 struct DrawerIngestContext<'a, E: Embedder + ?Sized> {
-    db: &'a Database,
+    db: &'a AsyncDb,
     store: &'a PendingMessageStore,
     worker_id: &'a str,
     message: &'a ClaimedMessage,
@@ -382,7 +380,7 @@ where
 }
 
 pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
-    db: &Database,
+    db: &AsyncDb,
     store: &PendingMessageStore,
     worker_id: &str,
     message: &ClaimedMessage,
@@ -391,7 +389,13 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
 ) -> Result<String> {
     let envelope: CapturedHookEnvelope =
         serde_json::from_str(&message.payload).context("failed to decode queued hook envelope")?;
-    let records = build_drawer_records(db, &envelope, context.config, context.mempal_home)?;
+    let records = {
+        let envelope = envelope.clone();
+        let config = (*context.config).clone();
+        let mempal_home = context.mempal_home.to_path_buf();
+        db.run_write_anyhow(move |db| build_drawer_records(db, &envelope, &config, &mempal_home))
+            .await?
+    };
     let drawer_context = DrawerIngestContext {
         db,
         store,
@@ -404,13 +408,22 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
     let mut last_drawer_id = None;
     for record in records {
         let drawer_id = ingest_drawer_record(&drawer_context, record).await?;
-        if let Err(error) = suggest_for_drawer(
-            db,
-            context.config,
-            context.mempal_home,
-            &drawer_id,
-            GenerationOptions::default(),
-        ) {
+        let suggest_result = {
+            let config = (*context.config).clone();
+            let mempal_home = context.mempal_home.to_path_buf();
+            let drawer_id_for_suggest = drawer_id.clone();
+            db.run_read_anyhow(move |db| {
+                suggest_for_drawer(
+                    db,
+                    &config,
+                    &mempal_home,
+                    &drawer_id_for_suggest,
+                    GenerationOptions::default(),
+                )
+            })
+            .await
+        };
+        if let Err(error) = suggest_result {
             tracing::warn!(?error, drawer_id, "hotpatch suggestion generation failed");
         }
         last_drawer_id = Some(drawer_id);
@@ -815,20 +828,26 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     context: &DrawerIngestContext<'_, E>,
     record: DrawerRecord,
 ) -> Result<String> {
-    let (drawer_id, exists) = context
-        .db
-        .resolve_ingest_drawer_id(
-            &record.wing,
-            Some(record.room.as_str()),
-            &record.content,
-            record.project_id.as_deref(),
-        )
-        .with_context(|| {
-            format!(
-                "failed to resolve drawer identity for {}/{}",
-                record.wing, record.room
-            )
-        })?;
+    let (drawer_id, exists) = {
+        let record = record.clone();
+        context
+            .db
+            .run_read_anyhow(move |db| {
+                db.resolve_ingest_drawer_id(
+                    &record.wing,
+                    Some(record.room.as_str()),
+                    &record.content,
+                    record.project_id.as_deref(),
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to resolve drawer identity for {}/{}",
+                        record.wing, record.room
+                    )
+                })
+            })
+            .await?
+    };
     if exists {
         return Ok(drawer_id);
     }
@@ -848,15 +867,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     if let Some(decision) = gating_decision.as_ref()
         && decision.is_rejected()
     {
-        context
-            .db
-            .record_gating_audit(
-                &drawer_id,
-                decision,
-                record.project_id.as_deref(),
-                Some(&candidate.content),
-            )
-            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        record_gating_audit_async(
+            context.db,
+            &drawer_id,
+            decision,
+            record.project_id.clone(),
+            &candidate.content,
+        )
+        .await?;
         return Ok(drawer_id);
     }
 
@@ -890,15 +908,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 .embedding_classifier
                 .threshold,
         );
-        context
-            .db
-            .record_gating_audit(
-                &drawer_id,
-                &decision,
-                record.project_id.as_deref(),
-                Some(&candidate.content),
-            )
-            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        record_gating_audit_async(
+            context.db,
+            &drawer_id,
+            &decision,
+            record.project_id.clone(),
+            &candidate.content,
+        )
+        .await?;
         gating_audit_recorded = true;
         if decision.is_rejected() {
             return Ok(drawer_id);
@@ -907,15 +924,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         vector = Some(candidate_vector);
     }
     if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
-        context
-            .db
-            .record_gating_audit(
-                &drawer_id,
-                decision,
-                record.project_id.as_deref(),
-                Some(&candidate.content),
-            )
-            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        record_gating_audit_async(
+            context.db,
+            &drawer_id,
+            decision,
+            record.project_id.clone(),
+            &candidate.content,
+        )
+        .await?;
     }
 
     if should_enqueue_llm_gating(context.daemon.config, &gating_decision) {
@@ -957,51 +973,54 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         }
     };
     if record.bypass_novelty {
-        insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+        insert_drawer_with_vector_async(context.db, &drawer_id, record.clone(), vector.clone())
+            .await?;
         return Ok(drawer_id);
     }
 
-    let novelty = evaluate_novelty(
-        context.db,
-        &NoveltyCandidate {
+    let novelty = {
+        let candidate = NoveltyCandidate {
             wing: record.wing.clone(),
             room: Some(record.room.clone()),
             project_id: record.project_id.clone(),
-        },
-        &vector,
-        &context.daemon.config.ingest_gating.novelty,
-    );
+        };
+        let vector = vector.clone();
+        let config = context.daemon.config.ingest_gating.novelty.clone();
+        context
+            .db
+            .run_read_anyhow(move |db| Ok(evaluate_novelty(db, &candidate, &vector, &config)))
+            .await?
+    };
     match novelty.action {
         NoveltyAction::Insert => {
             if novelty.should_audit {
-                context
-                    .db
-                    .record_novelty_audit(
-                        &drawer_id,
-                        NoveltyAction::Insert,
-                        novelty.near_drawer_id.as_deref(),
-                        novelty.cosine,
-                        novelty.audit_decision,
-                        record.project_id.as_deref(),
-                    )
-                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+                record_novelty_audit_async(
+                    context.db,
+                    &drawer_id,
+                    NoveltyAction::Insert,
+                    novelty.near_drawer_id.clone(),
+                    novelty.cosine,
+                    novelty.audit_decision.map(ToOwned::to_owned),
+                    record.project_id.clone(),
+                )
+                .await?;
             }
-            insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+            insert_drawer_with_vector_async(context.db, &drawer_id, record.clone(), vector.clone())
+                .await?;
             Ok(drawer_id)
         }
         NoveltyAction::Drop => {
             if novelty.should_audit {
-                context
-                    .db
-                    .record_novelty_audit(
-                        &drawer_id,
-                        NoveltyAction::Drop,
-                        novelty.near_drawer_id.as_deref(),
-                        novelty.cosine,
-                        novelty.audit_decision,
-                        record.project_id.as_deref(),
-                    )
-                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+                record_novelty_audit_async(
+                    context.db,
+                    &drawer_id,
+                    NoveltyAction::Drop,
+                    novelty.near_drawer_id.clone(),
+                    novelty.cosine,
+                    novelty.audit_decision.map(ToOwned::to_owned),
+                    record.project_id.clone(),
+                )
+                .await?;
             }
             Ok(novelty.near_drawer_id.unwrap_or(drawer_id))
         }
@@ -1022,11 +1041,19 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                     .with_context(|| format!("failed to lock merge target {}", target_id))?,
                 )
             };
-            let (existing_content, merge_count) = context
-                .db
-                .drawer_merge_state(&target_id)
-                .with_context(|| format!("failed to load merge target {}", target_id))?
-                .ok_or_else(|| anyhow::anyhow!("novelty merge target missing: {}", target_id))?;
+            let (existing_content, merge_count) = {
+                let target_id = target_id.clone();
+                context
+                    .db
+                    .run_read_anyhow(move |db| {
+                        db.drawer_merge_state(&target_id)
+                            .with_context(|| format!("failed to load merge target {}", target_id))?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("novelty merge target missing: {}", target_id)
+                            })
+                    })
+                    .await?
+            };
             let merged_at = current_timestamp();
             let merged_content = format!(
                 "{existing_content}\n---\nSUPPLEMENTARY ({merged_at}):\n{}",
@@ -1047,18 +1074,23 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         .novelty
                         .max_content_bytes_per_drawer;
             if capped {
-                context
-                    .db
-                    .record_novelty_audit(
-                        &drawer_id,
-                        NoveltyAction::Insert,
-                        Some(target_id.as_str()),
-                        novelty.cosine,
-                        Some("insert_due_to_merge_cap"),
-                        record.project_id.as_deref(),
-                    )
-                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
-                insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+                record_novelty_audit_async(
+                    context.db,
+                    &drawer_id,
+                    NoveltyAction::Insert,
+                    Some(target_id),
+                    novelty.cosine,
+                    Some("insert_due_to_merge_cap".to_string()),
+                    record.project_id.clone(),
+                )
+                .await?;
+                insert_drawer_with_vector_async(
+                    context.db,
+                    &drawer_id,
+                    record.clone(),
+                    vector.clone(),
+                )
+                .await?;
                 Ok(drawer_id)
             } else {
                 let merged_vector = match embed_text_with_heartbeat(
@@ -1076,47 +1108,114 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                             merged_content_bytes = merged_content.len(),
                             "novelty merge re-embed failed; fail-open insert"
                         );
-                        context
-                            .db
-                            .record_novelty_audit(
-                                &drawer_id,
-                                NoveltyAction::Insert,
-                                Some(target_id.as_str()),
-                                novelty.cosine,
-                                Some("insert_due_to_embed_error"),
-                                record.project_id.as_deref(),
-                            )
-                            .with_context(|| {
-                                format!("failed to record novelty audit {}", drawer_id)
-                            })?;
-                        insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+                        record_novelty_audit_async(
+                            context.db,
+                            &drawer_id,
+                            NoveltyAction::Insert,
+                            Some(target_id),
+                            novelty.cosine,
+                            Some("insert_due_to_embed_error".to_string()),
+                            record.project_id.clone(),
+                        )
+                        .await?;
+                        insert_drawer_with_vector_async(
+                            context.db,
+                            &drawer_id,
+                            record.clone(),
+                            vector.clone(),
+                        )
+                        .await?;
                         return Ok(drawer_id);
                     }
                 };
+                let drawer_id_for_merge = drawer_id.clone();
+                let target_id_for_merge = target_id.clone();
+                let audit_decision = novelty.audit_decision.map(ToOwned::to_owned);
+                let project_id = record.project_id.clone();
                 context
                     .db
-                    .record_novelty_audit(
-                        &drawer_id,
-                        NoveltyAction::Merge,
-                        Some(target_id.as_str()),
-                        novelty.cosine,
-                        novelty.audit_decision,
-                        record.project_id.as_deref(),
-                    )
-                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
-                context
-                    .db
-                    .update_drawer_after_merge(
-                        &target_id,
-                        &merged_content,
-                        &merged_at,
-                        &merged_vector,
-                    )
-                    .with_context(|| format!("failed to merge hook drawer {}", target_id))?;
+                    .run_write_anyhow(move |db| {
+                        db.record_novelty_audit(
+                            &drawer_id_for_merge,
+                            NoveltyAction::Merge,
+                            Some(target_id_for_merge.as_str()),
+                            novelty.cosine,
+                            audit_decision.as_deref(),
+                            project_id.as_deref(),
+                        )
+                        .with_context(|| {
+                            format!("failed to record novelty audit {}", drawer_id_for_merge)
+                        })?;
+                        db.update_drawer_after_merge(
+                            &target_id_for_merge,
+                            &merged_content,
+                            &merged_at,
+                            &merged_vector,
+                        )
+                        .with_context(|| {
+                            format!("failed to merge hook drawer {}", target_id_for_merge)
+                        })?;
+                        Ok(())
+                    })
+                    .await?;
                 Ok(target_id)
             }
         }
     }
+}
+
+async fn record_gating_audit_async(
+    db: &AsyncDb,
+    drawer_id: &str,
+    decision: &GatingDecision,
+    project_id: Option<String>,
+    content: &str,
+) -> Result<()> {
+    let drawer_id = drawer_id.to_string();
+    let decision = decision.clone();
+    let content = content.to_string();
+    db.run_write_anyhow(move |db| {
+        db.record_gating_audit(&drawer_id, &decision, project_id.as_deref(), Some(&content))
+            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        Ok(())
+    })
+    .await
+}
+
+async fn record_novelty_audit_async(
+    db: &AsyncDb,
+    drawer_id: &str,
+    action: NoveltyAction,
+    near_drawer_id: Option<String>,
+    cosine: Option<f32>,
+    audit_decision: Option<String>,
+    project_id: Option<String>,
+) -> Result<()> {
+    let drawer_id = drawer_id.to_string();
+    db.run_write_anyhow(move |db| {
+        db.record_novelty_audit(
+            &drawer_id,
+            action,
+            near_drawer_id.as_deref(),
+            cosine,
+            audit_decision.as_deref(),
+            project_id.as_deref(),
+        )
+        .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+        Ok(())
+    })
+    .await
+}
+
+async fn insert_drawer_with_vector_async(
+    db: &AsyncDb,
+    drawer_id: &str,
+    record: DrawerRecord,
+    vector: Vec<f32>,
+) -> Result<()> {
+    let drawer_id = drawer_id.to_string();
+    db.run_write_anyhow(move |db| insert_drawer_with_vector(db, &drawer_id, &record, &vector))
+        .await
 }
 
 fn insert_drawer_with_vector(
@@ -1363,6 +1462,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::core::{
+        AsyncDb,
         config::{Config, TurnStorageMode},
         db::Database,
         queue::{ClaimedMessage, PendingMessageStore, QueueError},
@@ -1468,6 +1568,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
         let store = PendingMessageStore::new(db.path()).expect("open queue");
         let captured_at = "2026-05-01T12:34:56Z";
         let hook_payload = serde_json::json!({
@@ -1502,7 +1603,7 @@ mod tests {
         let mut config = Config::default();
         config.project.id = Some("timestamp-test".to_string());
         process_claimed_message_with_embedder(
-            &db,
+            &async_db,
             &store,
             "timestamp-test-worker",
             &message,

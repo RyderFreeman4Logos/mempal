@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
+    AsyncDb,
     config::{Config, ConfigHandle},
     db::Database,
     queue::PendingMessageStore,
@@ -44,6 +45,7 @@ struct DaemonStallDiagnostic {
 pub struct DaemonContext {
     pub runtime: tokio::runtime::Runtime,
     pub db: SharedDatabase,
+    pub async_db: AsyncDb,
     pub store: PendingMessageStore,
     pub write_observer: DaemonWriteObserver,
     pub config: std::sync::Arc<crate::core::config::Config>,
@@ -234,6 +236,7 @@ fn bootstrap_inner(
     // harness-point: PR0
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::DbOpen);
     let db = Database::open(&db_path).context("failed to open daemon database")?;
+    let async_db = AsyncDb::open(&db_path, 4).context("failed to open daemon async database")?;
     let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
     let db = Arc::new(AsyncMutex::new(db));
     let write_observer = DaemonWriteObserver::new();
@@ -249,6 +252,7 @@ fn bootstrap_inner(
     Ok(DaemonContext {
         runtime,
         db,
+        async_db,
         store,
         write_observer,
         config,

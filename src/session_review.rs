@@ -400,12 +400,14 @@ fn linked_session_id(wing: &str, source_type: &str, content: &str) -> Option<Str
         return None;
     }
 
-    if source_type != "conversation" {
+    if !matches!(source_type, "agent_observation" | "conversation") {
         return None;
     }
 
     // Round-4 security fix: hooks-raw linkage must trust only daemon-persisted
     // metadata already stored in the drawer, never attacker-chosen disk paths.
+    // `conversation` is the legacy persisted value; modern daemon writes use
+    // `agent_observation`.
     split_hooks_raw_metadata(content)
         .1
         .session_id
