@@ -4,6 +4,7 @@ use super::client::{LlmError, LlmResponse};
 
 pub type HeartbeatCallback = dyn Fn() -> Result<(), LlmError> + Send + Sync;
 
+const MAX_HEARTBEAT_REFRESH_SECS: u64 = 5;
 const MAX_RETRY_AFTER_SECS: u64 = 60;
 
 pub async fn retry_llm_operation<F, Fut>(
@@ -15,8 +16,9 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<LlmResponse, LlmError>>,
 {
+    let heartbeat_interval_secs = retry_interval_secs.clamp(1, MAX_HEARTBEAT_REFRESH_SECS);
     loop {
-        match operation().await {
+        match await_with_heartbeat(operation(), heartbeat, heartbeat_interval_secs).await {
             Ok(response) => return Ok(response),
             Err(error) => {
                 if !error.is_retryable() {
@@ -25,6 +27,31 @@ where
                 let wait = retry_after_from_error(&error, retry_interval_secs);
                 refresh_heartbeat(heartbeat);
                 wait_with_heartbeat(wait, heartbeat).await;
+            }
+        }
+    }
+}
+
+async fn await_with_heartbeat<Fut, T>(
+    future: Fut,
+    heartbeat: Option<&HeartbeatCallback>,
+    heartbeat_interval_secs: u64,
+) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    match heartbeat {
+        None => future.await,
+        Some(callback) => {
+            let mut future = Box::pin(future);
+            let mut ticker = tokio::time::interval(Duration::from_secs(heartbeat_interval_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    result = &mut future => return result,
+                    _ = ticker.tick() => refresh_heartbeat(Some(callback)),
+                }
             }
         }
     }
