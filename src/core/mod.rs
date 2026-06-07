@@ -1,9 +1,11 @@
 #![warn(clippy::all)]
 
 pub mod anchor;
+pub mod async_db;
 pub mod compaction;
 pub mod config;
 pub mod db;
+pub use async_db::AsyncDb;
 pub mod decay;
 pub mod hot_reload;
 pub mod patterns;

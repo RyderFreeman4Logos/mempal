@@ -228,6 +228,16 @@ pub enum DbError {
     CompactionDrawerNotFound { drawer_id: String },
     #[error("LLM compaction not yet implemented")]
     LlmCompactionNotImplemented,
+    #[error("off-runtime database task failed to complete: {0}")]
+    BlockingTaskFailed(String),
+    #[error(
+        "read-pool cache budget exceeded: {conns} connections request {requested_mib} MiB of page cache, over the {budget_mib} MiB cap (issue #311)"
+    )]
+    PoolCacheBudgetExceeded {
+        conns: usize,
+        requested_mib: i64,
+        budget_mib: i64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
