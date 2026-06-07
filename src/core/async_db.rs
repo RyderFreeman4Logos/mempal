@@ -52,7 +52,7 @@ const PAGE_CACHE_BUDGET_MIB: i64 = 1536;
 /// Bounded connection pool: a tokio [`Semaphore`] whose permit count equals the
 /// connection count, paired with the idle connections themselves. Acquiring a
 /// permit guarantees a connection is available (or can be reopened to self-heal
-/// after a cancelled checkout lost one).
+/// after a panicking checkout lost one).
 struct ConnPool {
     sem: Arc<Semaphore>,
     idle: Mutex<Vec<Database>>,
@@ -219,9 +219,11 @@ impl AsyncDb {
 ///
 /// Acquires a permit, hands the owned connection to the closure, then checks the
 /// connection back in *before* releasing the permit so a waiter never wakes to
-/// an empty pool on the happy path. On a closure panic (only observable with
-/// unwinding builds) the connection is dropped on the blocking thread and the
-/// pool self-heals on the next checkout.
+/// an empty pool. The permit lives inside the blocking closure, so cancelling
+/// the async caller cannot release capacity while the connection is still
+/// checked out. On a closure panic (only observable with unwinding builds) the
+/// connection is dropped on the blocking thread and the pool self-heals on the
+/// next checkout.
 async fn exec<F, R>(pool: Arc<ConnPool>, delay: Option<Duration>, f: F) -> Result<R, DbError>
 where
     F: FnOnce(&Database) -> Result<R, DbError> + Send + 'static,
@@ -235,25 +237,21 @@ where
     let checkin_pool = Arc::clone(&pool);
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let join = tokio::task::spawn_blocking(move || {
+        let permit = permit;
         tracing::dispatcher::with_default(&dispatch, || {
             if let Some(d) = delay {
                 std::thread::sleep(d);
             }
             let out = f(&conn);
-            (conn, out)
+            checkin_pool.checkin(conn);
+            drop(permit);
+            out
         })
     })
     .await;
     match join {
-        Ok((conn, out)) => {
-            checkin_pool.checkin(conn);
-            drop(permit);
-            out
-        }
-        Err(join_err) => {
-            drop(permit);
-            Err(DbError::BlockingTaskFailed(join_err.to_string()))
-        }
+        Ok(out) => out,
+        Err(join_err) => Err(DbError::BlockingTaskFailed(join_err.to_string())),
     }
 }
 
@@ -272,25 +270,21 @@ where
     let checkin_pool = Arc::clone(&pool);
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let join = tokio::task::spawn_blocking(move || {
+        let permit = permit;
         tracing::dispatcher::with_default(&dispatch, || {
             if let Some(d) = delay {
                 std::thread::sleep(d);
             }
             let out = f(&conn);
-            (conn, out)
+            checkin_pool.checkin(conn);
+            drop(permit);
+            out
         })
     })
     .await;
     match join {
-        Ok((conn, out)) => {
-            checkin_pool.checkin(conn);
-            drop(permit);
-            out
-        }
-        Err(join_err) => {
-            drop(permit);
-            Err(anyhow::anyhow!("blocking database task failed: {join_err}"))
-        }
+        Ok(out) => out,
+        Err(join_err) => Err(anyhow::anyhow!("blocking database task failed: {join_err}")),
     }
 }
 
@@ -420,5 +414,85 @@ mod tests {
             matches!(result, Err(DbError::PoolCacheBudgetExceeded { .. })),
             "oversized pool must be rejected with PoolCacheBudgetExceeded"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_db_error_read_keeps_permit_until_checkin() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let adb_for_cancel = adb.clone();
+
+        let handle = tokio::spawn(async move {
+            adb_for_cancel
+                .run_read(move |_db| {
+                    let _ = started_tx.send(());
+                    std::thread::sleep(Duration::from_millis(300));
+                    Ok::<_, DbError>(1_i64)
+                })
+                .await
+        });
+
+        started_rx.await.expect("blocking read started");
+        handle.abort();
+        let abort_err = handle.await.expect_err("read task should be cancelled");
+        assert!(abort_err.is_cancelled(), "read task must be cancelled");
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(100),
+            adb.run_read(|_db| Ok::<_, DbError>(2_i64)),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "cancelled read must retain its permit until the blocking task checks the connection in"
+        );
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let out = adb
+            .run_read(|_db| Ok::<_, DbError>(3_i64))
+            .await
+            .expect("reader recovers after cancelled blocking task returns");
+        assert_eq!(out, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_anyhow_read_keeps_permit_until_checkin() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let adb_for_cancel = adb.clone();
+
+        let handle = tokio::spawn(async move {
+            adb_for_cancel
+                .run_read_anyhow(move |_db| {
+                    let _ = started_tx.send(());
+                    std::thread::sleep(Duration::from_millis(300));
+                    Ok(1_i64)
+                })
+                .await
+        });
+
+        started_rx.await.expect("blocking read started");
+        handle.abort();
+        let abort_err = handle.await.expect_err("read task should be cancelled");
+        assert!(abort_err.is_cancelled(), "read task must be cancelled");
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(100),
+            adb.run_read_anyhow(|_db| Ok(2_i64)),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "cancelled anyhow read must retain its permit until the blocking task checks the connection in"
+        );
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let out = adb
+            .run_read_anyhow(|_db| Ok(3_i64))
+            .await
+            .expect("reader recovers after cancelled blocking task returns");
+        assert_eq!(out, 3);
     }
 }
