@@ -10141,6 +10141,39 @@ fn append_reindex_target_filters(
 const REINDEX_SKIPPED_TABLE: &str = "tmp_reindex_skipped";
 const REINDEX_PENDING_TABLE: &str = "tmp_reindex_pending";
 
+/// Stale-detection snapshot query for the "vectors already exist" path.
+///
+/// Issue #341: vector presence MUST be checked with a correlated `EXISTS`
+/// point-lookup, never a set-based `LEFT JOIN drawer_vectors` against the
+/// sqlite-vec `vec0` virtual table. `vec0` reliably serves a point lookup by
+/// `id` but not a plain set equi-join inside a larger plan; at production scale
+/// the planner can resolve such a set-join to NULL for every row, which would
+/// mis-flag every live drawer as stale and trigger a full-DB re-embed (a strictly
+/// worse failure than the #340 finalize 0-promotion). The point lookup mirrors
+/// the proven `drawer_vector_exists` (`SELECT EXISTS(SELECT 1 FROM
+/// drawer_vectors WHERE id = ?)`) and the #340 finalize-sweep fix. `{pending_table}`
+/// is substituted with `REINDEX_PENDING_TABLE` at call time; the two `?`
+/// placeholders bind the current index version and target fingerprint.
+const REINDEX_STALE_PENDING_VECTORED_SQL: &str = r#"
+                INSERT INTO {pending_table} (id, source_path, chunk_index)
+                SELECT d.id,
+                       COALESCE(d.source_file, d.id) AS source_path,
+                       COALESCE(d.chunk_index, 0) AS chunk_index
+                FROM drawers d
+                LEFT JOIN fork_ext_meta idx
+                  ON idx.key = 'reindex:' || d.id || ':index_version'
+                LEFT JOIN fork_ext_meta legacy_idx
+                  ON legacy_idx.key = 'reindex:' || d.id || ':normalize_version'
+                LEFT JOIN fork_ext_meta fp
+                  ON fp.key = 'reindex:' || d.id || ':embedder_fingerprint'
+                WHERE d.deleted_at IS NULL
+                  AND (
+                      NOT EXISTS (SELECT 1 FROM drawer_vectors dv WHERE dv.id = d.id)
+                      OR COALESCE(idx.value, legacy_idx.value, '') != ?
+                      OR COALESCE(fp.value, '') != ?
+                  )
+                "#;
+
 /// Create the reindex skip TEMP table if absent. Idempotent, so any staging or
 /// query call may invoke it without coordinating with the loop.
 fn ensure_reindex_skipped_table(db: &Database) -> Result<()> {
@@ -10234,28 +10267,7 @@ fn build_reindex_stale_pending_rows(
             CURRENT_VECTOR_INDEX_VERSION.to_string(),
         ));
         values.push(rusqlite::types::Value::Text(target_fingerprint.to_string()));
-        format!(
-            r#"
-                INSERT INTO {REINDEX_PENDING_TABLE} (id, source_path, chunk_index)
-                SELECT d.id,
-                       COALESCE(d.source_file, d.id) AS source_path,
-                       COALESCE(d.chunk_index, 0) AS chunk_index
-                FROM drawers d
-                LEFT JOIN drawer_vectors v ON v.id = d.id
-                LEFT JOIN fork_ext_meta idx
-                  ON idx.key = 'reindex:' || d.id || ':index_version'
-                LEFT JOIN fork_ext_meta legacy_idx
-                  ON legacy_idx.key = 'reindex:' || d.id || ':normalize_version'
-                LEFT JOIN fork_ext_meta fp
-                  ON fp.key = 'reindex:' || d.id || ':embedder_fingerprint'
-                WHERE d.deleted_at IS NULL
-                  AND (
-                      v.id IS NULL
-                      OR COALESCE(idx.value, legacy_idx.value, '') != ?
-                      OR COALESCE(fp.value, '') != ?
-                  )
-                "#
-        )
+        REINDEX_STALE_PENDING_VECTORED_SQL.replace("{pending_table}", REINDEX_PENDING_TABLE)
     } else {
         format!(
             r#"
@@ -12660,6 +12672,27 @@ mod tests {
             rows.len(),
             3,
             "all stale drawers must be selected when nothing is skipped"
+        );
+    }
+
+    /// Issue #341 regression guard. The stale-detection snapshot must check
+    /// vector presence with a correlated `EXISTS` point-lookup that the `vec0`
+    /// virtual table reliably serves — never a set-based `LEFT JOIN
+    /// drawer_vectors`, which the planner can resolve to NULL for every row at
+    /// production scale, mis-flagging every live drawer as stale and triggering
+    /// a full-DB re-embed. Mirrors the #340 finalize-sweep fix. A behavioural
+    /// test cannot catch the regression because the set-join still works at the
+    /// small scale of unit tests, so this asserts the SQL form directly.
+    #[test]
+    fn reindex_stale_pending_vectored_sql_uses_correlated_exists_point_lookup() {
+        let sql = REINDEX_STALE_PENDING_VECTORED_SQL;
+        assert!(
+            sql.contains("NOT EXISTS (SELECT 1 FROM drawer_vectors dv WHERE dv.id = d.id)"),
+            "stale-detection must check vector presence with a correlated EXISTS point-lookup"
+        );
+        assert!(
+            !sql.contains("LEFT JOIN drawer_vectors"),
+            "stale-detection must NOT set-join the drawer_vectors vec0 virtual table"
         );
     }
 }
