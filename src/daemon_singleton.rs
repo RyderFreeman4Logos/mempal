@@ -172,7 +172,7 @@ pub fn is_daemon_argv<S: AsRef<str>>(argv: &[S], binary_name: &str) -> bool {
     }
 }
 
-fn first_cli_subcommand<S: AsRef<str>>(argv: &[S]) -> Option<(usize, &str)> {
+pub(crate) fn first_cli_subcommand<S: AsRef<str>>(argv: &[S]) -> Option<(usize, &str)> {
     let mut skip_next = false;
     for (index, arg) in argv.iter().enumerate().skip(1) {
         let arg = arg.as_ref();

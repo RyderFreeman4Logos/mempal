@@ -2,6 +2,8 @@
 use std::fs;
 use std::path::Path;
 #[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
@@ -158,12 +160,7 @@ fn build_report(
         .count();
     let extra_holder_count = holders
         .iter()
-        .filter(|holder| {
-            !matches!(
-                holder.classification.as_str(),
-                "current_process" | "current_daemon" | "current_mcp_server"
-            )
-        })
+        .filter(|holder| holder.classification == "extra_holder")
         .count();
 
     DbHolderReport {
@@ -206,10 +203,19 @@ fn opened_db_files(fd_dir: &Path, targets: &[(&'static str, DbFileIdentity)]) ->
 
 #[cfg(target_os = "linux")]
 fn read_daemon_pid(db_path: &Path) -> Option<i32> {
-    let pid_path = db_path.parent()?.join("daemon.pid");
+    let pid_path = daemon_pid_path(db_path);
     fs::read_to_string(pid_path)
         .ok()
         .and_then(|content| content.trim().parse::<i32>().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_pid_path(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("daemon.pid")
 }
 
 #[cfg(target_os = "linux")]
@@ -283,41 +289,10 @@ fn is_mempal_invocation(argv: &[String], binary_name: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_mcp_server_argv(argv: &[String]) -> bool {
-    let Some((_, subcommand)) = first_cli_subcommand(argv) else {
+    let Some((_, subcommand)) = crate::daemon_singleton::first_cli_subcommand(argv) else {
         return false;
     };
     subcommand == "serve"
-}
-
-#[cfg(target_os = "linux")]
-fn first_cli_subcommand(argv: &[String]) -> Option<(usize, &str)> {
-    let mut index = 1;
-    while index < argv.len() {
-        let arg = argv[index].as_str();
-        if arg == "--" {
-            return argv.get(index + 1).map(|value| (index + 1, value.as_str()));
-        }
-        if global_flag_takes_value(arg) {
-            index += 2;
-            continue;
-        }
-        if global_flag_has_inline_value(arg) || arg.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        return Some((index, arg));
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn global_flag_takes_value(arg: &str) -> bool {
-    matches!(arg, "--config" | "--db-path")
-}
-
-#[cfg(target_os = "linux")]
-fn global_flag_has_inline_value(arg: &str) -> bool {
-    arg.starts_with("--config=") || arg.starts_with("--db-path=")
 }
 
 #[cfg(target_os = "linux")]
@@ -378,6 +353,7 @@ mod tests {
         use std::fs;
         use std::fs::File;
         use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
 
         fn write_process(proc_root: &Path, pid: i32, argv: &[&str], db_files: &[&Path]) {
             let pid_dir = proc_root.join(pid.to_string());
@@ -406,13 +382,31 @@ mod tests {
             ]));
             assert!(is_mcp_server_argv(&[
                 "/usr/local/bin/mempal".to_string(),
-                "--db-path".to_string(),
-                "/tmp/palace.db".to_string(),
+                "--config-path".to_string(),
+                "/tmp/config.toml".to_string(),
+                "serve".to_string(),
+                "--mcp".to_string()
+            ]));
+            assert!(is_mcp_server_argv(&[
+                "/usr/local/bin/mempal".to_string(),
+                "--config-path=/tmp/config.toml".to_string(),
                 "serve".to_string(),
                 "--mcp".to_string()
             ]));
             let stat = "123 (mempal worker) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 98765";
             assert_eq!(parse_start_ticks(stat), Some(98765));
+        }
+
+        #[test]
+        fn test_daemon_pid_path_uses_current_dir_for_bare_relative_db_path() {
+            assert_eq!(
+                daemon_pid_path(Path::new("palace.db")),
+                PathBuf::from(".").join("daemon.pid")
+            );
+            assert_eq!(
+                daemon_pid_path(Path::new("data/palace.db")),
+                PathBuf::from("data").join("daemon.pid")
+            );
         }
 
         #[test]
@@ -447,13 +441,19 @@ mod tests {
                 &["mempal", "daemon", "--foreground"],
                 &[db_path.as_path()],
             );
+            write_process(
+                &proc_root,
+                99,
+                &["sqlite3", "palace.db"],
+                &[wal_path.as_path()],
+            );
 
             let report = inspect_db_holders_in_proc(&db_path, &proc_root, 1100, 100);
 
-            assert_eq!(report.holder_count, 3);
+            assert_eq!(report.holder_count, 4);
             assert_eq!(report.stale_mcp_server_count, 1);
             assert_eq!(report.orphan_daemon_count, 1);
-            assert_eq!(report.extra_holder_count, 2);
+            assert_eq!(report.extra_holder_count, 1);
             assert!(report.has_problem());
             assert_eq!(report.holders[0].classification, "current_daemon");
             assert_eq!(report.holders[1].classification, "stale_mcp_server");
@@ -461,6 +461,7 @@ mod tests {
             assert_eq!(report.holders[1].started_at_unix_secs, Some(1002));
             assert_eq!(report.holders[1].age_secs, Some(98));
             assert_eq!(report.holders[2].classification, "orphan_daemon");
+            assert_eq!(report.holders[3].classification, "extra_holder");
         }
 
         #[test]

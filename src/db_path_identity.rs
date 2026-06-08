@@ -63,7 +63,7 @@ impl DbFileIdentity {
             return true;
         }
 
-        let stripped_target = strip_deleted_suffix(fd_target.to_path_buf());
+        let stripped_target = strip_deleted_suffix(fd_path, fd_target);
         let canonical_target = canonicalize_if_present(&stripped_target);
 
         self.fd_targets.contains(&canonical_target) || self.fd_targets.contains(&stripped_target)
@@ -164,12 +164,50 @@ fn file_id_for_path(path: &Path) -> Option<FileId> {
 }
 
 #[cfg(target_os = "linux")]
-fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
+fn strip_deleted_suffix(fd_path: &Path, path: &Path) -> PathBuf {
     const DELETED_SUFFIX: &[u8] = b" (deleted)";
     let bytes = path.as_os_str().as_bytes();
     if bytes.ends_with(DELETED_SUFFIX) {
+        let target_file_id = file_id_for_path(path);
+        let fd_file_id = file_id_for_path(fd_path);
+        if target_file_id.is_some() && target_file_id == fd_file_id {
+            return path.to_path_buf();
+        }
         let keep = bytes.len().saturating_sub(DELETED_SUFFIX.len());
         return PathBuf::from(OsString::from_vec(bytes[..keep].to_vec()));
     }
-    path
+    path.to_path_buf()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    #[test]
+    fn test_matches_fd_does_not_strip_literal_deleted_suffix_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let literal_deleted_path = tmp.path().join("palace.db (deleted)");
+        File::create(&db_path).expect("db file");
+        File::create(&literal_deleted_path).expect("literal deleted suffix file");
+        let identity = DbFileIdentity::from_resolved_path(&db_path);
+
+        assert!(
+            !identity.matches_fd(&literal_deleted_path, &literal_deleted_path),
+            "a real file whose name ends with the kernel suffix text is not the DB"
+        );
+    }
+
+    #[test]
+    fn test_matches_fd_strips_kernel_deleted_suffix_when_target_path_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let fd_path = tmp.path().join("fd-3");
+        File::create(&db_path).expect("db file");
+        let identity = DbFileIdentity::from_resolved_path(&db_path);
+        let deleted_target = append_os_suffix(&db_path, " (deleted)");
+
+        assert!(identity.matches_fd(&fd_path, &deleted_target));
+    }
 }
