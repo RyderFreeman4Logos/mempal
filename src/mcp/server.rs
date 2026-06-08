@@ -7237,10 +7237,7 @@ fn push_db_holder_warnings(
             source: "db_holders".to_string(),
         });
     }
-    if report.extra_holder_count > 0
-        && report.stale_mcp_server_count == 0
-        && report.orphan_daemon_count == 0
-    {
+    if report.extra_holder_count > 0 {
         system_warnings.push(SystemWarning {
             level: "warn".to_string(),
             message: format!(
@@ -8272,6 +8269,32 @@ mod tests {
             warning.source == "vector_index"
                 && warning.message.contains("reindex --from-config --stale")
         })
+    }
+
+    #[test]
+    fn test_db_holder_system_warnings_report_extra_holders_with_specific_roles() {
+        let report = crate::process_diagnostics::DbHolderReport {
+            db_path: "/tmp/palace.db".to_string(),
+            holder_count: 3,
+            extra_holder_count: 1,
+            stale_mcp_server_count: 1,
+            orphan_daemon_count: 1,
+            error: None,
+            holders: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+
+        push_db_holder_warnings(&mut warnings, &report);
+
+        assert!(warnings.iter().any(|warning| {
+            warning.source == "db_holders" && warning.message.contains("stale mempal MCP server")
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning.source == "db_holders" && warning.message.contains("orphan daemon")
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning.source == "db_holders" && warning.message.contains("extra process")
+        }));
     }
 
     fn insert_drawer_with_project(

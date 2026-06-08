@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
