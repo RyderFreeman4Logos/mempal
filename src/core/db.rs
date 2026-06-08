@@ -285,6 +285,27 @@ pub struct GatingDropCounts {
     pub by_reason: std::collections::BTreeMap<String, u64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoricalRejudgeAudit<'a> {
+    pub drawer_id: &'a str,
+    pub decision: &'a str,
+    pub tier: u8,
+    pub reason: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub score: Option<f64>,
+    pub project_id: Option<&'a str>,
+    pub content_preview: Option<&'a str>,
+    pub judge_model: Option<&'a str>,
+    pub config_version: &'a str,
+    pub mutation: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoricalRejudgeCandidate {
+    pub drawer: Drawer,
+    pub project_id: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 enum OpenMode {
     ReadOnly,
@@ -706,6 +727,82 @@ impl Database {
             WHERE drawer_id = ?3
             "#,
             params![verdict, score, drawer_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_historical_rejudge_audit(
+        &self,
+        audit: HistoricalRejudgeAudit<'_>,
+    ) -> Result<(), DbError> {
+        let created_at = super::utils::current_timestamp()
+            .parse::<i64>()
+            .unwrap_or_default();
+        let retained_until = created_at + AUDIT_RETENTION_SECS;
+        let unique_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let explain_json = serde_json::json!({
+            "workflow": "historical_rejudge",
+            "decision": audit.decision,
+            "reason": audit.reason,
+            "label": audit.label,
+            "score": audit.score,
+            "judge_model": audit.judge_model,
+            "config_version": audit.config_version,
+            "mutation": audit.mutation,
+        });
+        let explain_json = serde_json::to_string(&explain_json)?;
+        let id_seed = format!(
+            "historical_rejudge:{}:{created_at}:{unique_nanos}:{}",
+            audit.drawer_id, explain_json
+        );
+        let id = format!("gating_{}", blake3::hash(id_seed.as_bytes()).to_hex());
+        self.conn.execute(
+            r#"
+            INSERT INTO gating_audit (
+                id,
+                candidate_hash,
+                drawer_id,
+                decision,
+                tier,
+                label,
+                reason,
+                score,
+                explain_json,
+                retained_until,
+                created_at,
+                project_id,
+                content_preview,
+                llm_verdict,
+                llm_score
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            "#,
+            params![
+                id,
+                audit.drawer_id,
+                audit.drawer_id,
+                audit.decision,
+                i64::from(audit.tier),
+                audit.label,
+                audit.reason,
+                audit.score,
+                explain_json,
+                retained_until,
+                created_at,
+                audit.project_id,
+                audit.content_preview,
+                audit
+                    .judge_model
+                    .filter(|model| *model != "deterministic")
+                    .map(|_| audit.decision),
+                audit
+                    .judge_model
+                    .filter(|model| *model != "deterministic")
+                    .and(audit.score),
+            ],
         )?;
         Ok(())
     }
@@ -3163,6 +3260,31 @@ impl Database {
         Ok(affected > 0)
     }
 
+    pub fn soft_delete_drawers_by_ids(&self, drawer_ids: &[String]) -> Result<usize, DbError> {
+        let timestamp = super::utils::current_timestamp();
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<usize, DbError> {
+            let mut affected_total = 0usize;
+            for drawer_id in drawer_ids {
+                affected_total += self.conn.execute(
+                    "UPDATE drawers SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                    params![timestamp, drawer_id],
+                )?;
+            }
+            Ok(affected_total)
+        })();
+        match result {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(count)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     pub fn supersede_drawer(&self, old_id: &str, reason: &str) -> Result<bool, DbError> {
         let timestamp = super::utils::current_timestamp();
         let affected = self.conn.execute(
@@ -3251,6 +3373,49 @@ impl Database {
             .query_row(&sql, params_from_iter(values), |row| row.get(0))?)
     }
 
+    pub fn historical_rejudge_candidates(
+        &self,
+        wing: Option<&str>,
+        room: Option<&str>,
+        project_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HistoricalRejudgeCandidate>, DbError> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut sql = format!(
+            r#"
+            SELECT {DRAWER_SELECT_COLUMNS}, project_id
+            FROM drawers
+            WHERE deleted_at IS NULL
+            "#
+        );
+        let mut values: Vec<SqlValue> = Vec::new();
+        if let Some(wing) = wing {
+            values.push(SqlValue::Text(wing.to_string()));
+            sql.push_str(&format!("AND wing = ?{} ", values.len()));
+        }
+        if let Some(room) = room {
+            values.push(SqlValue::Text(room.to_string()));
+            sql.push_str(&format!("AND room = ?{} ", values.len()));
+        }
+        if let Some(project_id) = project_id {
+            values.push(SqlValue::Text(project_id.to_string()));
+            sql.push_str(&format!("AND project_id = ?{} ", values.len()));
+        }
+        values.push(SqlValue::Integer(limit_i64));
+        sql.push_str(&format!("ORDER BY rowid ASC LIMIT ?{}", values.len()));
+
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(values), |row| {
+                Ok(HistoricalRejudgeCandidate {
+                    drawer: drawer_from_row(row).map_err(row_decode_error)?,
+                    project_id: row.get(32)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn timeline_drawers(
         &self,
         wing: Option<&str>,
@@ -3296,6 +3461,49 @@ impl Database {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn hard_delete_drawers_by_ids(&self, drawer_ids: &[String]) -> Result<usize, DbError> {
+        if drawer_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let vectors_exist: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get(0),
+        )?;
+
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<usize, DbError> {
+            let mut deleted_total = 0usize;
+            for id in drawer_ids {
+                if vectors_exist {
+                    self.conn
+                        .execute("DELETE FROM drawer_vectors WHERE id = ?1", [id])?;
+                }
+                self.conn.execute(
+                    "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
+                    [id],
+                )?;
+                deleted_total += self.conn.execute(
+                    "DELETE FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+                    [id],
+                )?;
+            }
+            Ok(deleted_total)
+        })();
+
+        match result {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(count)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
     }
 
     pub fn purge_deleted(&self, before: Option<&str>) -> Result<u64, DbError> {
