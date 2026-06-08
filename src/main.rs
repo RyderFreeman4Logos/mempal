@@ -2997,9 +2997,16 @@ fn block_on_result<F, T>(future: F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
-    tokio::runtime::Runtime::new()
-        .context("failed to construct tokio runtime")?
-        .block_on(future)
+    let runtime = tokio::runtime::Runtime::new().context("failed to construct tokio runtime")?;
+    let result = runtime.block_on(future);
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.is::<IngestWaitTimedOut>())
+    {
+        runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+    }
+    result
 }
 
 async fn bench_command(config: &Config, command: BenchCommands) -> Result<()> {
@@ -3709,11 +3716,11 @@ async fn ingest_stdin_command(
             .map(|response| response.0)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         if response.timed_out {
-            print_operation_response(&response)?;
-            bail!(
-                "timed out waiting for ingest operation {}",
-                response.operation_id.as_deref().unwrap_or("")
-            );
+            print_ingest_wait_receipt_response(options.json, &response)?;
+            std::io::stdout()
+                .flush()
+                .context("failed to flush timed-out ingest receipt")?;
+            return Err(IngestWaitTimedOut::new(response.operation_id.as_deref()).into());
         }
 
         let mut wait_stats = ingest_stdin_wait_stats_from_response(&response);
@@ -3740,7 +3747,7 @@ async fn ingest_stdin_command(
                 );
             }
             _ => {
-                print_operation_response(&response)?;
+                print_ingest_wait_receipt_response(options.json, &response)?;
                 return Ok(());
             }
         }
@@ -12876,3 +12883,44 @@ mod tests {
         );
     }
 }
+
+fn print_ingest_wait_receipt_response(json: bool, response: &IngestResponse) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(response)
+                .context("failed to serialize ingest wait receipt JSON")?
+        );
+        return Ok(());
+    }
+    print_operation_response(response)
+}
+
+#[derive(Debug)]
+struct IngestWaitTimedOut {
+    operation_id: String,
+}
+
+impl IngestWaitTimedOut {
+    fn new(operation_id: Option<&str>) -> Self {
+        Self {
+            operation_id: operation_id.unwrap_or("").to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for IngestWaitTimedOut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.operation_id.is_empty() {
+            formatter.write_str("timed out waiting for ingest operation")
+        } else {
+            write!(
+                formatter,
+                "timed out waiting for ingest operation {}",
+                self.operation_id
+            )
+        }
+    }
+}
+
+impl std::error::Error for IngestWaitTimedOut {}

@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
+use std::thread;
 use std::time::Duration;
 
 use common::harness::embed_mock::start as start_embed_mock;
@@ -110,6 +111,48 @@ fn run_cli_with_stdin(home: &Path, args: &[&str], payload: &[u8]) -> Output {
         stdin.write_all(payload).expect("write stdin payload");
     }
     child.wait_with_output().expect("wait mempal")
+}
+
+fn run_cli_with_stdin_timeout(
+    home: &Path,
+    args: &[&str],
+    payload: &[u8],
+    timeout: Duration,
+) -> Output {
+    use std::io::Write as _;
+
+    let mut child = Command::new(mempal_bin())
+        .args(args)
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mempal");
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(payload).expect("write stdin payload");
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => return child.wait_with_output().expect("wait mempal"),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().expect("wait killed mempal");
+                    panic!(
+                        "mempal command timed out after {:?}: args={args:?} stdout={} stderr={}",
+                        timeout,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => panic!("poll mempal child failed: {error}"),
+        }
+    }
 }
 
 fn spawn_cli(home: &Path, args: &[&str]) -> Child {
@@ -489,6 +532,58 @@ async fn test_ingest_wait_json_matches_non_wait_json_output() {
     assert!(
         drawer_ids.iter().all(|value| value.as_str().is_some()),
         "drawer_ids must contain strings"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_wait_json_timeout_exits_after_receipt() {
+    let home = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    let _config = write_config(home.path(), &format!("http://{addr}/v1"));
+    handle.pause();
+
+    let payload = serde_json::json!({
+        "content": "cli wait json timeout content",
+        "wing": "cli-wing"
+    })
+    .to_string();
+
+    let output = run_cli_with_stdin_timeout(
+        home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--project",
+            "mempal",
+            "--source-type",
+            "agent_observation",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            "1",
+            "--json",
+        ],
+        payload.as_bytes(),
+        Duration::from_secs(4),
+    );
+    handle.resume();
+    handle.shutdown().await;
+
+    assert!(
+        !output.status.success(),
+        "timeout must preserve non-zero CLI status: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value =
+        serde_json::from_slice(&output.stdout).expect("timed-out receipt must be JSON");
+    assert!(receipt["operation_id"].as_str().is_some());
+    assert_eq!(receipt["state"], "queued");
+    assert_eq!(receipt["timed_out"], true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("timed out waiting for ingest operation"),
+        "{stderr}"
     );
 }
 
