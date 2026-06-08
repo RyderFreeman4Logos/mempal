@@ -19,6 +19,7 @@ use mempal::core::db::{
     read_fork_ext_version, set_fork_ext_version,
 };
 use mempal::core::queue::PendingMessageStore;
+use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::ingest::gating::{
     GatingDecision, GatingRuntime, IngestCandidate, compile_classifier_from_config,
@@ -436,6 +437,21 @@ fn insert_gating_audit_row(db: &Database, seed: GatingAuditSeed) {
             ],
         )
         .expect("insert gating audit row");
+}
+
+fn insert_status_drawer(db: &Database, id: &str) {
+    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: id.to_string(),
+        content: format!("status fixture drawer {id}"),
+        wing: "code-memory".to_string(),
+        room: Some("gating".to_string()),
+        source_file: Some(format!("{id}.md")),
+        source_type: SourceType::UserExplicit,
+        added_at: "2026-06-08T00:00:00Z".to_string(),
+        chunk_index: Some(0),
+        importance: 3,
+    });
+    db.insert_drawer(&drawer).expect("insert status drawer");
 }
 
 fn now_unix_secs() -> i64 {
@@ -2117,6 +2133,109 @@ threshold = 0.42
     assert_eq!(gate.quarantined_total, 0);
     assert!(gate.last_keep_at.is_some());
     assert!(gate.last_skip_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_status_uses_llm_task_and_gate_delete_sources() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(
+        r#"
+[llm]
+enabled = true
+base_url = "http://localhost:18317/v1"
+model = "test-model"
+
+[gating]
+enabled = true
+
+[gating.llm_judge]
+enabled = true
+threshold = 0.42
+"#,
+    );
+    let db = env.db();
+
+    let audit_created_at = 1_700_000_000;
+    let llm_completed_at = 1_800_000_123_456;
+    let llm_failed_at = 1_900_000_654_000;
+
+    insert_gating_audit_row(
+        &db,
+        GatingAuditSeed {
+            candidate_hash: "llm-keep-candidate".to_string(),
+            drawer_id: Some("llm-keep-drawer".to_string()),
+            decision: "keep",
+            tier: 3,
+            label: Some("llm_pending".to_string()),
+            reason: None,
+            score: Some(0.9),
+            created_at: audit_created_at,
+        },
+    );
+    db.upsert_llm_verdict("llm-keep-drawer", "keep", Some(0.9))
+        .expect("upsert keep verdict");
+
+    insert_status_drawer(&db, "llm-rejected-drawer");
+    insert_gating_audit_row(
+        &db,
+        GatingAuditSeed {
+            candidate_hash: "llm-reject-candidate".to_string(),
+            drawer_id: Some("llm-rejected-drawer".to_string()),
+            decision: "keep",
+            tier: 3,
+            label: Some("llm_pending".to_string()),
+            reason: None,
+            score: Some(0.1),
+            created_at: audit_created_at + 1,
+        },
+    );
+    db.upsert_llm_verdict("llm-rejected-drawer", "reject", Some(0.1))
+        .expect("upsert reject verdict");
+    db.soft_delete_drawer("llm-rejected-drawer")
+        .expect("soft delete rejected drawer");
+
+    insert_status_drawer(&db, "manual-delete-drawer");
+    db.soft_delete_drawer("manual-delete-drawer")
+        .expect("soft delete unrelated drawer");
+
+    db.conn()
+        .execute(
+            r#"
+            INSERT INTO pending_message_completions (
+                message_id, kind, created_at, claimed_at, completed_at, processing_ms,
+                result_drawer_id, op_state, rejected_reason, failure_detail, result_json
+            )
+            VALUES (
+                'llm-success', 'llm_task', ?1, ?1, ?2, 123,
+                'llm-keep-drawer', 'completed', NULL, NULL, NULL
+            )
+            "#,
+            rusqlite::params![audit_created_at * 1000, llm_completed_at],
+        )
+        .expect("insert LLM completion");
+    db.conn()
+        .execute(
+            r#"
+            INSERT INTO pending_messages (
+                id, kind, source_hash, status, payload, created_at,
+                next_attempt_at, retry_count, last_error
+            )
+            VALUES (
+                'llm-failed', 'llm_task', 'failed-source', 'failed', '{}',
+                ?1, ?2, 1, 'boom'
+            )
+            "#,
+            rusqlite::params![audit_created_at, llm_failed_at / 1000],
+        )
+        .expect("insert failed LLM task");
+
+    let server = MempalMcpServer::new(env.db_path.clone(), env.config()).expect("create server");
+    let status = server.mempal_status().await.expect("status").0;
+    let gate = status.ingest_gating_status;
+
+    assert_eq!(gate.last_llm_success_at, Some(llm_completed_at));
+    assert_eq!(gate.last_llm_failure_at, Some(llm_failed_at));
+    assert_eq!(gate.soft_deleted_total, 1);
 }
 
 #[test]

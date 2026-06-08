@@ -239,12 +239,10 @@ pub fn gating_runtime_status(
         skipped_total,
         dropped_total: dropped_total.max(skipped_total as u64),
         quarantined_total: 0,
-        soft_deleted_total: db
-            .deleted_drawer_count()
-            .context("failed to count soft-deleted drawers for gating status")?,
+        soft_deleted_total: gating_soft_deleted_count(db)?,
         last_keep_at: last_gating_decision_at(db, "keep")?,
         last_skip_at: last_gating_decision_at(db, "skip")?,
-        last_llm_success_at: last_llm_verdict_at(db)?,
+        last_llm_success_at: last_completed_llm_task_at(db)?,
         last_llm_failure_at: last_failed_llm_task_at(db)?,
         restart_required_config_changes,
     })
@@ -274,34 +272,102 @@ fn last_gating_decision_at(db: &Database, decision: &str) -> Result<Option<i64>>
         .context("failed to read last gating decision timestamp")
 }
 
-fn last_llm_verdict_at(db: &Database) -> Result<Option<i64>> {
-    if !table_has_column(db, "gating_audit", "llm_verdict")? {
-        return Ok(None);
+fn gating_soft_deleted_count(db: &Database) -> Result<i64> {
+    if !table_has_column(db, "gating_audit", "drawer_id")?
+        || !table_has_column(db, "gating_audit", "llm_verdict")?
+    {
+        return Ok(0);
     }
+
     db.conn()
         .query_row(
-            "SELECT MAX(created_at) FROM gating_audit WHERE llm_verdict IS NOT NULL",
+            r#"
+            SELECT COUNT(DISTINCT drawers.id)
+            FROM drawers
+            INNER JOIN gating_audit ON gating_audit.drawer_id = drawers.id
+            WHERE drawers.deleted_at IS NOT NULL
+              AND gating_audit.llm_verdict = 'reject'
+            "#,
             [],
-            |row| row.get::<_, Option<i64>>(0),
+            |row| row.get::<_, i64>(0),
         )
+        .context("failed to count gate soft-deleted drawers")
+}
+
+fn last_completed_llm_task_at(db: &Database) -> Result<Option<i64>> {
+    if !table_has_column(db, "pending_message_completions", "completed_at")? {
+        return Ok(None);
+    }
+
+    let sql = if table_has_column(db, "pending_message_completions", "op_state")? {
+        r#"
+        SELECT MAX(completed_at)
+        FROM pending_message_completions
+        WHERE kind = 'llm_task' AND op_state IN ('completed', 'rejected')
+        "#
+    } else {
+        r#"
+        SELECT MAX(completed_at)
+        FROM pending_message_completions
+        WHERE kind = 'llm_task'
+        "#
+    };
+
+    db.conn()
+        .query_row(sql, [], |row| row.get::<_, Option<i64>>(0))
         .optional()
         .map(Option::flatten)
-        .context("failed to read last LLM gating verdict timestamp")
+        .context("failed to read last completed LLM task timestamp")
 }
 
 fn last_failed_llm_task_at(db: &Database) -> Result<Option<i64>> {
-    if !table_has_column(db, "pending_messages", "kind")? {
-        return Ok(None);
+    let completion_failure_at =
+        if table_has_column(db, "pending_message_completions", "completed_at")?
+            && table_has_column(db, "pending_message_completions", "op_state")?
+        {
+            db.conn()
+                .query_row(
+                    r#"
+                    SELECT MAX(completed_at)
+                    FROM pending_message_completions
+                    WHERE kind = 'llm_task' AND op_state = 'failed'
+                    "#,
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()
+                .map(Option::flatten)
+                .context("failed to read completed failed LLM task timestamp")?
+        } else {
+            None
+        };
+
+    let dead_letter_failure_at = if table_has_column(db, "pending_messages", "kind")?
+        && table_has_column(db, "pending_messages", "next_attempt_at")?
+    {
+        db.conn()
+            .query_row(
+                r#"
+                SELECT MAX(next_attempt_at * 1000)
+                FROM pending_messages
+                WHERE kind = 'llm_task' AND status = 'failed'
+                "#,
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .context("failed to read dead-lettered LLM task timestamp")?
+    } else {
+        None
+    };
+
+    match (completion_failure_at, dead_letter_failure_at) {
+        (Some(completion), Some(dead_letter)) => Ok(Some(completion.max(dead_letter))),
+        (Some(completion), None) => Ok(Some(completion)),
+        (None, Some(dead_letter)) => Ok(Some(dead_letter)),
+        (None, None) => Ok(None),
     }
-    db.conn()
-        .query_row(
-            "SELECT MAX(created_at) FROM pending_messages WHERE kind = 'llm_task' AND status = 'failed'",
-            [],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()
-        .map(Option::flatten)
-        .context("failed to read last failed LLM task timestamp")
 }
 
 fn table_has_column(db: &Database, table: &str, column: &str) -> Result<bool> {
