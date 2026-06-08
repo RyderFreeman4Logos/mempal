@@ -24,6 +24,7 @@ impl FileId {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DbFileIdentity {
     fd_targets: BTreeSet<PathBuf>,
+    target_names: BTreeSet<OsString>,
     file_ids: BTreeSet<FileId>,
 }
 
@@ -38,30 +39,58 @@ impl DbFileIdentity {
         let canonical = canonicalize_if_present(path);
         self.fd_targets.insert(path.to_path_buf());
         self.fd_targets.insert(canonical.clone());
+        self.insert_target_name(path);
+        self.insert_target_name(&canonical);
 
         if let Some(file_id) = file_id_for_path(path).or_else(|| file_id_for_path(&canonical)) {
             self.file_ids.insert(file_id);
         }
     }
 
+    fn insert_target_name(&mut self, path: &Path) {
+        if let Some(file_name) = path.file_name() {
+            self.target_names.insert(file_name.to_os_string());
+        }
+    }
+
     pub(crate) fn merge(&mut self, other: Self) {
         self.fd_targets.extend(other.fd_targets);
+        self.target_names.extend(other.target_names);
         self.file_ids.extend(other.file_ids);
     }
 
     pub(crate) fn matches_fd(&self, fd_path: &Path, fd_target: &Path) -> bool {
-        let fd_file_id = file_id_for_path(fd_path);
-        if let Some(file_id) = fd_file_id {
-            if self.file_ids.contains(&file_id) {
-                return true;
-            }
+        if self.fd_targets.contains(fd_target) {
+            return true;
         }
 
-        let stripped_target = strip_deleted_suffix(fd_file_id, fd_target);
-        let canonical_target = canonicalize_if_present(&stripped_target);
+        let target_name_matches = self.target_name_matches(fd_target);
+        let canonical_target = canonicalize_if_present(fd_target);
+        if self.fd_targets.contains(&canonical_target) {
+            return true;
+        }
+        if !target_name_matches && !self.target_name_matches(&canonical_target) {
+            return false;
+        }
 
-        self.fd_targets.contains(&canonical_target)
+        let fd_file_id = file_id_for_path(fd_path);
+        if fd_file_id.is_some_and(|file_id| self.file_ids.contains(&file_id)) {
+            return true;
+        }
+        let stripped_target = strip_deleted_suffix(fd_file_id, fd_target);
+
+        self.fd_targets
+            .contains(&canonicalize_if_present(&stripped_target))
             || self.fd_targets.contains(stripped_target.as_ref())
+    }
+
+    fn target_name_matches(&self, path: &Path) -> bool {
+        let Some(file_name) = path.file_name() else {
+            return false;
+        };
+        self.target_names.contains(file_name)
+            || stripped_deleted_name(file_name)
+                .is_some_and(|stripped| self.target_names.contains(&stripped))
     }
 }
 
@@ -164,8 +193,16 @@ fn file_id_for_path(path: &Path) -> Option<FileId> {
         .map(|metadata| FileId::from_metadata(&metadata))
 }
 
+const DELETED_SUFFIX: &[u8] = b" (deleted)";
+
+fn stripped_deleted_name(file_name: &OsStr) -> Option<OsString> {
+    let bytes = file_name.as_bytes();
+    bytes.ends_with(DELETED_SUFFIX).then(|| {
+        OsString::from_vec(bytes[..bytes.len().saturating_sub(DELETED_SUFFIX.len())].to_vec())
+    })
+}
+
 fn strip_deleted_suffix(fd_file_id: Option<FileId>, path: &Path) -> Cow<'_, Path> {
-    const DELETED_SUFFIX: &[u8] = b" (deleted)";
     let bytes = path.as_os_str().as_bytes();
     if bytes.ends_with(DELETED_SUFFIX) {
         if let Some(target_file_id) = file_id_for_path(path) {
@@ -183,6 +220,29 @@ fn strip_deleted_suffix(fd_file_id: Option<FileId>, path: &Path) -> Cow<'_, Path
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn test_matches_fd_direct_target_does_not_require_fd_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        File::create(&db_path).expect("db file");
+        let identity = DbFileIdentity::from_resolved_path(&db_path);
+
+        assert!(identity.matches_fd(&tmp.path().join("missing-fd"), &db_path));
+    }
+
+    #[test]
+    fn test_matches_fd_canonical_target_keeps_symlink_path_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_db_path = tmp.path().join("palace.db");
+        let linked_db_path = tmp.path().join("linked.db");
+        File::create(&real_db_path).expect("db file");
+        symlink(&real_db_path, &linked_db_path).expect("db symlink");
+        let identity = DbFileIdentity::from_resolved_path(&real_db_path);
+
+        assert!(identity.matches_fd(&tmp.path().join("missing-fd"), &linked_db_path));
+    }
 
     #[test]
     fn test_matches_fd_does_not_strip_literal_deleted_suffix_path() {
