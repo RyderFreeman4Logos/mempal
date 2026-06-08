@@ -67,40 +67,27 @@ impl DbFileIdentity {
         }
 
         let target_name_matches = self.target_name_matches(fd_target);
-        let mut fd_file_id = None;
-        if target_name_matches {
-            fd_file_id = file_id_for_path(fd_path);
-            if fd_file_id.is_some_and(|file_id| self.file_ids.contains(&file_id)) {
-                return true;
-            }
+        if !target_name_matches {
+            return false;
         }
 
-        let canonical_target =
-            if target_is_symlink(fd_target) || (target_name_matches && fd_file_id.is_none()) {
-                Some(canonicalize_if_present(fd_target))
-            } else {
-                None
-            };
+        let fd_file_id = file_id_for_path(fd_path);
+        if fd_file_id.is_some_and(|file_id| self.file_ids.contains(&file_id)) {
+            return true;
+        }
+
+        let canonical_target = if target_is_symlink(fd_target) || fd_file_id.is_none() {
+            Some(canonicalize_if_present(fd_target))
+        } else {
+            None
+        };
         if canonical_target
             .as_ref()
             .is_some_and(|target| self.fd_targets.contains(target))
         {
             return true;
         }
-        if !target_name_matches
-            && !canonical_target
-                .as_ref()
-                .is_some_and(|target| self.target_name_matches(target))
-        {
-            return false;
-        }
 
-        if fd_file_id.is_none() {
-            fd_file_id = file_id_for_path(fd_path);
-        }
-        if fd_file_id.is_some_and(|file_id| self.file_ids.contains(&file_id)) {
-            return true;
-        }
         let stripped_target = strip_deleted_suffix(fd_file_id, fd_target);
 
         self.fd_targets.contains(stripped_target.as_ref())
@@ -273,10 +260,26 @@ mod tests {
     }
 
     #[test]
-    fn test_matches_fd_canonical_target_keeps_symlink_path_match() {
+    fn test_matches_fd_rejects_unrelated_absolute_target_before_metadata_fallback() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let real_db_path = tmp.path().join("palace.db");
-        let linked_db_path = tmp.path().join("linked.db");
+        let db_path = tmp.path().join("palace.db");
+        let unrelated_path = tmp.path().join("notes.txt");
+        File::create(&db_path).expect("db file");
+        File::create(&unrelated_path).expect("unrelated file");
+        let identity = DbFileIdentity::from_resolved_path(&db_path);
+
+        assert!(!identity.matches_fd(&tmp.path().join("missing-fd"), &unrelated_path));
+    }
+
+    #[test]
+    fn test_matches_fd_canonical_target_keeps_matching_name_symlink_path_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_dir = tmp.path().join("real");
+        let linked_dir = tmp.path().join("linked");
+        fs::create_dir(&real_dir).expect("real dir");
+        fs::create_dir(&linked_dir).expect("linked dir");
+        let real_db_path = real_dir.join("palace.db");
+        let linked_db_path = linked_dir.join("palace.db");
         File::create(&real_db_path).expect("db file");
         symlink(&real_db_path, &linked_db_path).expect("db symlink");
         let identity = DbFileIdentity::from_resolved_path(&real_db_path);
