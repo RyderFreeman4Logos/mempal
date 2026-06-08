@@ -1,10 +1,10 @@
-#[cfg(target_os = "linux")]
-use std::fs;
 use std::path::Path;
 #[cfg(target_os = "linux")]
-use std::path::PathBuf;
-#[cfg(target_os = "linux")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(target_os = "linux")]
 use crate::db_path_identity::{DbFileIdentity, db_file_targets};

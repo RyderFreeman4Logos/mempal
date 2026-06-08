@@ -1,26 +1,17 @@
-#[cfg(target_os = "linux")]
 use std::borrow::Cow;
-#[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
-#[cfg(target_os = "linux")]
 use std::ffi::{OsStr, OsString};
-#[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(target_os = "linux")]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
-#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct FileId {
     dev: u64,
     ino: u64,
 }
 
-#[cfg(target_os = "linux")]
 impl FileId {
     fn from_metadata(metadata: &fs::Metadata) -> Self {
         Self {
@@ -30,14 +21,12 @@ impl FileId {
     }
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DbFileIdentity {
     fd_targets: BTreeSet<PathBuf>,
     file_ids: BTreeSet<FileId>,
 }
 
-#[cfg(target_os = "linux")]
 impl DbFileIdentity {
     pub(crate) fn from_resolved_path(path: &Path) -> Self {
         let mut identity = Self::default();
@@ -76,14 +65,12 @@ impl DbFileIdentity {
     }
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub(crate) struct DbPathIdentity {
     db_path: PathBuf,
     files: DbFileIdentity,
 }
 
-#[cfg(target_os = "linux")]
 impl DbPathIdentity {
     pub(crate) fn from_existing_db_path(db_path: &Path) -> Option<Self> {
         let absolute_db_path = resolve_configured_path_lossy(db_path);
@@ -109,7 +96,6 @@ impl DbPathIdentity {
     }
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn db_file_targets(db_path: &Path) -> Vec<(&'static str, DbFileIdentity)> {
     db_file_targets_from_resolved_db_path(resolve_configured_path_lossy(db_path))
 }
@@ -122,7 +108,6 @@ pub(crate) fn db_file_targets_with_cwd(
     db_file_targets_from_resolved_db_path(resolve_path_with_cwd_lossy(db_path, cwd))
 }
 
-#[cfg(target_os = "linux")]
 fn db_file_targets_from_resolved_db_path(db_path: PathBuf) -> Vec<(&'static str, DbFileIdentity)> {
     let resolved_db_path = canonicalize_if_present(&db_path);
     let shm_path = append_os_suffix(&resolved_db_path, "-shm");
@@ -134,20 +119,17 @@ fn db_file_targets_from_resolved_db_path(db_path: PathBuf) -> Vec<(&'static str,
     ]
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn append_os_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut os = OsString::from(path.as_os_str());
     os.push(OsStr::new(suffix));
     PathBuf::from(os)
 }
 
-#[cfg(target_os = "linux")]
 fn resolve_configured_path_lossy(path: &Path) -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     resolve_path_with_cwd_lossy(path, &cwd)
 }
 
-#[cfg(target_os = "linux")]
 fn resolve_path_with_cwd_lossy(path: &Path, cwd: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -157,7 +139,6 @@ fn resolve_path_with_cwd_lossy(path: &Path, cwd: &Path) -> PathBuf {
     canonicalize_if_present(&absolute)
 }
 
-#[cfg(target_os = "linux")]
 fn canonicalize_db_path_or_parent(path: PathBuf) -> Option<PathBuf> {
     if let Ok(canonical) = fs::canonicalize(&path) {
         return Some(canonical);
@@ -173,19 +154,16 @@ fn canonicalize_db_path_or_parent(path: PathBuf) -> Option<PathBuf> {
         .map(|canonical_parent| canonical_parent.join(file_name))
 }
 
-#[cfg(target_os = "linux")]
 fn canonicalize_if_present(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-#[cfg(target_os = "linux")]
 fn file_id_for_path(path: &Path) -> Option<FileId> {
     fs::metadata(path)
         .ok()
         .map(|metadata| FileId::from_metadata(&metadata))
 }
 
-#[cfg(target_os = "linux")]
 fn strip_deleted_suffix(fd_file_id: Option<FileId>, path: &Path) -> Cow<'_, Path> {
     const DELETED_SUFFIX: &[u8] = b" (deleted)";
     let bytes = path.as_os_str().as_bytes();
