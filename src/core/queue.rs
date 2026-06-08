@@ -21,6 +21,8 @@ pub enum QueueError {
     Sqlite(#[from] rusqlite::Error),
     #[error("pending message not found: {0}")]
     MessageNotFound(String),
+    #[error("pending message claim lost: {0}")]
+    ClaimLost(String),
     #[error("retry count does not fit in u32 for message {id}")]
     RetryCountOverflow { id: String },
     #[error("blocking queue task failed: {0}")]
@@ -163,13 +165,13 @@ impl AsyncPendingMessageStore {
             .await
     }
 
-    pub async fn confirm(&self, id: String) -> Result<()> {
-        self.run(move |store| store.confirm(&id)).await
+    pub async fn confirm(&self, claim: ClaimedMessage) -> Result<()> {
+        self.run(move |store| store.confirm(&claim)).await
     }
 
     pub async fn complete_operation(
         &self,
-        id: String,
+        claim: ClaimedMessage,
         op_state: String,
         result_drawer_id: Option<String>,
         rejected_reason: Option<String>,
@@ -178,7 +180,7 @@ impl AsyncPendingMessageStore {
     ) -> Result<()> {
         self.run(move |store| {
             store.complete_operation(
-                &id,
+                &claim,
                 &op_state,
                 result_drawer_id.as_deref(),
                 rejected_reason.as_deref(),
@@ -193,22 +195,23 @@ impl AsyncPendingMessageStore {
         self.run(move |store| store.operation_status(&id)).await
     }
 
-    pub async fn mark_failed(&self, id: String, error: String) -> Result<()> {
-        self.run(move |store| store.mark_failed(&id, &error)).await
+    pub async fn mark_failed(&self, claim: ClaimedMessage, error: String) -> Result<()> {
+        self.run(move |store| store.mark_failed(&claim, &error))
+            .await
     }
 
     pub async fn mark_failed_with_disposition(
         &self,
-        id: String,
+        claim: ClaimedMessage,
         error: String,
         disposition: QueueFailureDisposition,
     ) -> Result<()> {
-        self.run(move |store| store.mark_failed_with_disposition(&id, &error, disposition))
+        self.run(move |store| store.mark_failed_with_disposition(&claim, &error, disposition))
             .await
     }
 
-    pub async fn release_claim(&self, id: String) -> Result<()> {
-        self.run(move |store| store.release_claim(&id)).await
+    pub async fn release_claim(&self, claim: ClaimedMessage) -> Result<()> {
+        self.run(move |store| store.release_claim(&claim)).await
     }
 
     pub async fn refresh_heartbeat(&self, id: String, worker_id: String) -> Result<()> {
@@ -446,17 +449,17 @@ impl PendingMessageStore {
         }))
     }
 
-    pub fn confirm(&self, id: &str) -> Result<()> {
+    pub fn confirm(&self, claim: &ClaimedMessage) -> Result<()> {
         let mut conn = self.open_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        confirm_in_tx(&tx, id, "completed")?;
+        confirm_in_tx(&tx, claim, "completed")?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn complete_operation(
         &self,
-        id: &str,
+        claim: &ClaimedMessage,
         op_state: &str,
         result_drawer_id: Option<&str>,
         rejected_reason: Option<&str>,
@@ -465,7 +468,7 @@ impl PendingMessageStore {
     ) -> Result<()> {
         let mut conn = self.open_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
+        let updated = tx.execute(
             r#"
             UPDATE pending_messages
             SET op_state = ?2,
@@ -473,18 +476,22 @@ impl PendingMessageStore {
                 rejected_reason = ?4,
                 failure_detail = ?5,
                 result_json = ?6
-            WHERE id = ?1 AND status = 'claimed'
+            WHERE id = ?1 AND status = 'claimed' AND claim_token = ?7
             "#,
             params![
-                id,
+                claim.id,
                 op_state,
                 result_drawer_id,
                 rejected_reason,
                 failure_detail,
-                result_json
+                result_json,
+                claim.claim_token
             ],
         )?;
-        confirm_in_tx(&tx, id, op_state)?;
+        if updated == 0 {
+            return Err(claim_miss_error(&tx, &claim.id)?);
+        }
+        confirm_in_tx(&tx, claim, op_state)?;
         tx.commit()?;
         Ok(())
     }
@@ -497,31 +504,40 @@ impl PendingMessageStore {
         operation_status_from_completion(&conn, id)
     }
 
-    pub fn mark_failed(&self, id: &str, error: &str) -> Result<()> {
-        self.mark_failed_with_disposition(id, error, QueueFailureDisposition::Retryable)
+    pub fn mark_failed(&self, claim: &ClaimedMessage, error: &str) -> Result<()> {
+        self.mark_failed_with_disposition(claim, error, QueueFailureDisposition::Retryable)
     }
 
     /// Record a failed processing attempt with explicit retry/dead-letter policy.
     pub fn mark_failed_with_disposition(
         &self,
-        id: &str,
+        claim: &ClaimedMessage,
         error: &str,
         disposition: QueueFailureDisposition,
     ) -> Result<()> {
         let mut conn = self.open_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let redacted_error = sanitize_last_error(error);
-        let current_retry = tx
+        let current_retry = match tx
             .query_row(
-                "SELECT retry_count FROM pending_messages WHERE id = ?1",
-                [id],
+                r#"
+                SELECT retry_count
+                FROM pending_messages
+                WHERE id = ?1 AND status = 'claimed' AND claim_token = ?2
+                "#,
+                params![claim.id, claim.claim_token],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?
-            .ok_or_else(|| QueueError::MessageNotFound(id.to_string()))?;
+        {
+            Some(retry_count) => retry_count,
+            None => return Err(claim_miss_error(&tx, &claim.id)?),
+        };
         let next_retry = current_retry.saturating_add(1);
-        let next_retry_u32 = u32::try_from(next_retry)
-            .map_err(|_| QueueError::RetryCountOverflow { id: id.to_string() })?;
+        let next_retry_u32 =
+            u32::try_from(next_retry).map_err(|_| QueueError::RetryCountOverflow {
+                id: claim.id.clone(),
+            })?;
         let terminal = disposition == QueueFailureDisposition::Terminal;
         let backoff_ms = if terminal {
             0
@@ -547,19 +563,20 @@ impl PendingMessageStore {
                 claimed_at = NULL,
                 heartbeat_at = NULL,
                 last_error = ?6
-            WHERE id = ?1
+            WHERE id = ?1 AND status = 'claimed' AND claim_token = ?7
             "#,
             params![
-                id,
+                claim.id,
                 next_retry,
                 backoff_ms,
                 next_attempt_at,
                 status,
-                redacted_error
+                redacted_error,
+                claim.claim_token
             ],
         )?;
         if updated == 0 {
-            return Err(QueueError::MessageNotFound(id.to_string()));
+            return Err(claim_miss_error(&tx, &claim.id)?);
         }
 
         tx.commit()?;
@@ -616,9 +633,10 @@ impl PendingMessageStore {
     ///
     /// Used by LLM workers cancelled due to a config hot-reload so the task is
     /// retried with the new configuration rather than charged a retry.
-    pub fn release_claim(&self, id: &str) -> Result<()> {
-        let conn = self.open_connection()?;
-        let updated = conn.execute(
+    pub fn release_claim(&self, claim: &ClaimedMessage) -> Result<()> {
+        let mut conn = self.open_connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
             r#"
             UPDATE pending_messages
             SET status = 'pending',
@@ -642,13 +660,14 @@ impl PendingMessageStore {
                     WHEN kind = 'ingest_async' THEN NULL
                     ELSE result_json
                 END
-            WHERE id = ?1 AND status = 'claimed'
+            WHERE id = ?1 AND status = 'claimed' AND claim_token = ?2
             "#,
-            [id],
+            params![claim.id, claim.claim_token],
         )?;
         if updated == 0 {
-            return Err(QueueError::MessageNotFound(id.to_string()));
+            return Err(claim_miss_error(&tx, &claim.id)?);
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -700,8 +719,12 @@ impl PendingMessageStore {
     }
 }
 
-fn confirm_in_tx(tx: &rusqlite::Transaction<'_>, id: &str, op_state: &str) -> Result<()> {
-    let row = tx
+fn confirm_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    claim: &ClaimedMessage,
+    op_state: &str,
+) -> Result<()> {
+    let row = match tx
         .query_row(
             r#"
             SELECT kind,
@@ -712,9 +735,9 @@ fn confirm_in_tx(tx: &rusqlite::Transaction<'_>, id: &str, op_state: &str) -> Re
                    failure_detail,
                    result_json
             FROM pending_messages
-            WHERE id = ?1
+            WHERE id = ?1 AND status = 'claimed' AND claim_token = ?2
             "#,
-            [id],
+            params![claim.id, claim.claim_token],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -728,7 +751,10 @@ fn confirm_in_tx(tx: &rusqlite::Transaction<'_>, id: &str, op_state: &str) -> Re
             },
         )
         .optional()?
-        .ok_or_else(|| QueueError::MessageNotFound(id.to_string()))?;
+    {
+        Some(row) => row,
+        None => return Err(claim_miss_error(tx, &claim.id)?),
+    };
     let completed_at = now_millis();
     let processing_ms = row
         .2
@@ -762,7 +788,7 @@ fn confirm_in_tx(tx: &rusqlite::Transaction<'_>, id: &str, op_state: &str) -> Re
             result_json = excluded.result_json
         "#,
         params![
-            id,
+            claim.id,
             row.0,
             row.1.saturating_mul(1_000),
             row.2.map(|s| s.saturating_mul(1_000)),
@@ -775,11 +801,31 @@ fn confirm_in_tx(tx: &rusqlite::Transaction<'_>, id: &str, op_state: &str) -> Re
             row.6
         ],
     )?;
-    let updated = tx.execute("DELETE FROM pending_messages WHERE id = ?1", [id])?;
+    let updated = tx.execute(
+        r#"
+        DELETE FROM pending_messages
+        WHERE id = ?1 AND status = 'claimed' AND claim_token = ?2
+        "#,
+        params![claim.id, claim.claim_token],
+    )?;
     if updated == 0 {
-        return Err(QueueError::MessageNotFound(id.to_string()));
+        return Err(claim_miss_error(tx, &claim.id)?);
     }
     Ok(())
+}
+
+fn claim_miss_error(conn: &Connection, id: &str) -> Result<QueueError> {
+    let exists = conn
+        .query_row("SELECT 1 FROM pending_messages WHERE id = ?1", [id], |_| {
+            Ok(())
+        })
+        .optional()?
+        .is_some();
+    if exists {
+        Ok(QueueError::ClaimLost(id.to_string()))
+    } else {
+        Ok(QueueError::MessageNotFound(id.to_string()))
+    }
 }
 
 fn operation_status_from_pending(
@@ -1116,10 +1162,7 @@ mod tests {
             .await
             .expect("claim")
             .expect("claimed message");
-        store
-            .confirm(claimed.id)
-            .await
-            .expect("confirm off runtime");
+        store.confirm(claimed).await.expect("confirm off runtime");
         ticker.abort();
 
         let observed = ticks.load(Ordering::SeqCst);

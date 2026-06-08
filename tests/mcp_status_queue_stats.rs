@@ -130,7 +130,7 @@ async fn test_mcp_status_surfaces_queue_stats() {
         .claim_next("worker-done", 60)
         .expect("claim")
         .expect("done");
-    store.confirm(&done.id).expect("confirm");
+    store.confirm(&done).expect("confirm");
 
     let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server.mempal_status().await.expect("status").0;
@@ -163,7 +163,7 @@ async fn test_mcp_status_headline_reflects_failed_queue() {
         .expect("claim")
         .expect("failed row");
     store
-        .mark_failed_with_disposition(&failed.id, "boom", QueueFailureDisposition::Terminal)
+        .mark_failed_with_disposition(&failed, "boom", QueueFailureDisposition::Terminal)
         .expect("mark terminal failed");
 
     let server = MempalMcpServer::new(db_path, config).expect("create MCP server");

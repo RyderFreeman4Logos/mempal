@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::AsyncDb;
 use crate::core::config::ConfigHandle;
 use crate::core::db::Database;
-use crate::core::queue::{AsyncPendingMessageStore, PendingMessageStore};
+use crate::core::queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore};
 use crate::daemon_bootstrap::DaemonWriteObserver;
 
 use super::client::{LlmClient, LlmMessage, LlmRequest};
@@ -145,14 +145,14 @@ pub async fn run_llm_worker(
         match task_result {
             Some(Ok(())) => {
                 tracing::info!("LLM task {message_id} completed in {latency_ms}ms");
-                confirm_llm_task_async(&store, &message_id).await?;
+                confirm_llm_task_async(&store, message.clone()).await?;
                 write_observer.record_successful_write();
             }
             Some(Err(error)) => {
                 tracing::error!("LLM task {message_id} failed after {latency_ms}ms: {error}");
                 write_observer.record_error(error.to_string());
                 store
-                    .mark_failed(message_id.clone(), error.to_string())
+                    .mark_failed(message.clone(), error.to_string())
                     .await
                     .with_context(|| format!("failed to mark_failed LLM task {message_id}"))?;
             }
@@ -162,7 +162,7 @@ pub async fn run_llm_worker(
                     message_id,
                     "LLM worker restarting due to config change; releasing task back to pending"
                 );
-                if let Err(error) = store.release_claim(message_id.clone()).await {
+                if let Err(error) = store.release_claim(message.clone()).await {
                     tracing::warn!(
                         ?error,
                         message_id,
@@ -179,8 +179,12 @@ pub async fn run_llm_worker(
 }
 
 /// Confirm a completed LLM task in the pending-message store.
-async fn confirm_llm_task_async(store: &AsyncPendingMessageStore, message_id: &str) -> Result<()> {
-    match store.confirm(message_id.to_string()).await {
+async fn confirm_llm_task_async(
+    store: &AsyncPendingMessageStore,
+    claim: ClaimedMessage,
+) -> Result<()> {
+    let message_id = claim.id.clone();
+    match store.confirm(claim).await {
         Ok(()) => {}
         Err(crate::core::queue::QueueError::MessageNotFound(_)) => {
             tracing::warn!(
@@ -199,8 +203,9 @@ async fn confirm_llm_task_async(store: &AsyncPendingMessageStore, message_id: &s
 ///
 /// Async daemon workers use `confirm_llm_task_async` so queue SQLite does not
 /// run on Tokio worker threads.
-pub fn confirm_llm_task(store: &PendingMessageStore, message_id: &str) -> Result<()> {
-    match store.confirm(message_id) {
+pub fn confirm_llm_task(store: &PendingMessageStore, claim: &ClaimedMessage) -> Result<()> {
+    let message_id = claim.id.clone();
+    match store.confirm(claim) {
         Ok(()) => {}
         Err(crate::core::queue::QueueError::MessageNotFound(_)) => {
             tracing::warn!(

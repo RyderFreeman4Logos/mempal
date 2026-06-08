@@ -167,21 +167,25 @@ fn record_novelty_audit(db_path: &Path, drawer_id: &str, action: NoveltyAction, 
 
 fn seed_queue_rows(db_path: &Path) {
     let store = PendingMessageStore::new(db_path).expect("queue store");
-    let _pending = store
-        .enqueue("hook", "pending payload")
-        .expect("enqueue pending");
+    let _failed = store
+        .enqueue("hook", "failed payload")
+        .expect("enqueue failed");
     let _claimed = store
         .enqueue("hook", "claimed payload")
         .expect("enqueue claimed");
-    let failed = store
-        .enqueue("hook", "failed payload")
-        .expect("enqueue failed");
-    let _claim = store
-        .claim_next("dashboard-test", 120)
+    let _pending = store
+        .enqueue("hook", "pending payload")
+        .expect("enqueue pending");
+    let failed_claim = store
+        .claim_next("dashboard-failed", 120)
+        .expect("claim next")
+        .expect("failed message");
+    let _claimed_claim = store
+        .claim_next("dashboard-claimed", 120)
         .expect("claim next")
         .expect("claimed message");
     store
-        .mark_failed_with_disposition(&failed, "boom", QueueFailureDisposition::Terminal)
+        .mark_failed_with_disposition(&failed_claim, "boom", QueueFailureDisposition::Terminal)
         .expect("mark terminal failed");
 }
 

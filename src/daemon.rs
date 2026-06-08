@@ -383,7 +383,7 @@ async fn process_hook_worker_message(
 
     match result {
         Ok(_) => {
-            if let Err(error) = state.store.confirm(message_id.clone()).await {
+            if let Err(error) = state.store.confirm(message.clone()).await {
                 tracing::error!(?error, "failed to confirm {message_id}");
                 state
                     .write_observer
@@ -398,7 +398,7 @@ async fn process_hook_worker_message(
             let disposition = queue_failure_disposition(&error);
             if let Err(mark_error) = state
                 .store
-                .mark_failed_with_disposition(message_id.clone(), error.to_string(), disposition)
+                .mark_failed_with_disposition(message.clone(), error.to_string(), disposition)
                 .await
             {
                 tracing::error!(?mark_error, "failed to mark_failed {message_id}");

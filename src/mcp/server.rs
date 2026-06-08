@@ -26,7 +26,7 @@ use crate::core::{
         runtime_adoption_instrumentation_policy, should_write_checked_record,
     },
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
-    queue::AsyncPendingMessageStore,
+    queue::{AsyncPendingMessageStore, ClaimedMessage},
     reindex::ReindexProgressStore,
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
@@ -383,11 +383,17 @@ impl MempalMcpServer {
         &self,
         queue: &AsyncPendingMessageStore,
         worker_id: &str,
-        claim: crate::core::queue::ClaimedMessage,
+        claim: ClaimedMessage,
     ) -> anyhow::Result<()> {
-        let prepared: PreparedIngestOperation = serde_json::from_str(&claim.payload)
-            .with_context(|| format!("failed to decode ingest operation {}", claim.id))?;
         let queue_wait_ms = queue_wait_ms(claim.created_at, claim.claimed_at);
+        let prepared: PreparedIngestOperation = match serde_json::from_str(&claim.payload) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let detail = format!("failed to decode ingest operation {}: {error}", claim.id);
+                complete_failed_ingest_claim(queue, &claim, queue_wait_ms, detail).await?;
+                return Ok(());
+            }
+        };
 
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let heartbeat_queue = queue.clone();
@@ -457,7 +463,7 @@ impl MempalMcpServer {
                 };
                 queue
                     .complete_operation(
-                        claim.id.clone(),
+                        claim.clone(),
                         state.as_str().to_string(),
                         result_drawer_id.map(ToOwned::to_owned),
                         rejected_reason.clone(),
@@ -470,29 +476,7 @@ impl MempalMcpServer {
                     })?;
             }
             Err(detail) => {
-                let mut finalized = finalize_failed_ingest_response(
-                    claim.id.clone(),
-                    claim.created_at,
-                    detail.clone(),
-                );
-                finalized
-                    .timings
-                    .insert("queue_wait_ms".to_string(), queue_wait_ms);
-                let result_json = serde_json::to_string(&finalized)
-                    .context("failed to serialize failed ingest response")?;
-                queue
-                    .complete_operation(
-                        claim.id.clone(),
-                        IngestOperationState::Failed.as_str().to_string(),
-                        None,
-                        None,
-                        Some(detail),
-                        Some(result_json),
-                    )
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to store async ingest failure: {error}")
-                    })?;
+                complete_failed_ingest_claim(queue, &claim, queue_wait_ms, detail).await?;
             }
         }
 
@@ -7254,6 +7238,33 @@ fn queue_wait_ms(created_at_secs: i64, claimed_at_secs: i64) -> u64 {
         .saturating_mul(1_000) as u64
 }
 
+async fn complete_failed_ingest_claim(
+    queue: &AsyncPendingMessageStore,
+    claim: &ClaimedMessage,
+    queue_wait_ms: u64,
+    detail: String,
+) -> anyhow::Result<()> {
+    let mut finalized =
+        finalize_failed_ingest_response(claim.id.clone(), claim.created_at, detail.clone());
+    finalized
+        .timings
+        .insert("queue_wait_ms".to_string(), queue_wait_ms);
+    let result_json =
+        serde_json::to_string(&finalized).context("failed to serialize failed ingest response")?;
+    queue
+        .complete_operation(
+            claim.clone(),
+            IngestOperationState::Failed.as_str().to_string(),
+            None,
+            None,
+            Some(detail),
+            Some(result_json),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to store async ingest failure: {error}"))?;
+    Ok(())
+}
+
 fn rfc3339_from_secs(secs: i64) -> String {
     crate::cowork::peek::format_rfc3339(UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64))
 }
@@ -8145,6 +8156,46 @@ mod tests {
         assert!(!completed.drawer_id.is_empty());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_async_ingest_malformed_payload_records_failed_receipt() {
+        let (_tempdir, db_path, server) = setup_server();
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, "{not json")
+            .expect("enqueue malformed async ingest");
+        let claim = queue
+            .claim_next_by_kind("worker-malformed", 60, INGEST_ASYNC_KIND)
+            .expect("claim malformed op")
+            .expect("claimed malformed op");
+        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
+
+        server
+            .process_ingest_claim(&async_queue, "worker-malformed", claim)
+            .await
+            .expect("process malformed payload");
+
+        let failed = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("failed status");
+        assert_eq!(failed.state, Some(IngestOperationState::Failed));
+        assert!(failed.drawer_id.is_empty());
+        assert!(
+            failed
+                .failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("failed to decode ingest operation")),
+            "{failed:?}"
+        );
+
+        let record = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(&operation_id)
+            .expect("load operation record")
+            .expect("operation record exists");
+        assert_eq!(record.op_state, IngestOperationState::Failed.as_str());
+        assert!(record.completed_at.is_some());
+    }
+
     fn recreate_vectors_with_metric(db_path: &Path, metric: &str) {
         let db = Database::open(db_path).expect("open db");
         db.conn()
@@ -8235,7 +8286,7 @@ mod tests {
             .expect("failed fixture row");
         store
             .mark_failed_with_disposition(
-                &failed.id,
+                &failed,
                 "boom",
                 crate::core::queue::QueueFailureDisposition::Terminal,
             )

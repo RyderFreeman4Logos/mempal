@@ -4,7 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::Database;
 use mempal::core::queue::{
-    LAST_ERROR_MAX_BYTES, PendingMessageStore, QueueConfig, QueueFailureDisposition,
+    ClaimedMessage, LAST_ERROR_MAX_BYTES, PendingMessageStore, QueueConfig, QueueError,
+    QueueFailureDisposition,
 };
 use mempal::llm::worker::confirm_llm_task;
 use rusqlite::Connection;
@@ -26,6 +27,55 @@ fn new_store() -> (TempDir, PathBuf, PendingMessageStore) {
     Database::open(&db_path).expect("open db");
     let store = PendingMessageStore::new(&db_path).expect("create store");
     (tmp, db_path, store)
+}
+
+fn stale_then_reclaimed(
+    store: &PendingMessageStore,
+    db_path: &PathBuf,
+) -> (ClaimedMessage, ClaimedMessage) {
+    let id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
+    let stale = store
+        .claim_next("worker-a", 60)
+        .expect("claim stale")
+        .expect("stale claim");
+    assert_eq!(stale.id, id);
+
+    Connection::open(db_path)
+        .expect("open sqlite")
+        .execute(
+            "UPDATE pending_messages SET heartbeat_at = ?2, claimed_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, now_secs() - 120],
+        )
+        .expect("age heartbeat");
+    assert_eq!(store.reclaim_stale(60).expect("reclaim stale"), 1);
+
+    let reclaimed = store
+        .claim_next("worker-b", 60)
+        .expect("reclaim claim")
+        .expect("reclaimed claim");
+    assert_eq!(reclaimed.id, stale.id);
+    assert_ne!(reclaimed.claim_token, stale.claim_token);
+    (stale, reclaimed)
+}
+
+fn assert_active_claim(db_path: &PathBuf, claim: &ClaimedMessage) {
+    let (status, claim_token): (String, String) = Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT status, claim_token FROM pending_messages WHERE id = ?1",
+            [&claim.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read active claim");
+    assert_eq!(status, "claimed");
+    assert_eq!(claim_token, claim.claim_token);
+}
+
+fn assert_claim_lost(error: QueueError, expected_id: &str) {
+    match error {
+        QueueError::ClaimLost(id) => assert_eq!(id, expected_id),
+        other => panic!("expected ClaimLost for {expected_id}, got {other:?}"),
+    }
 }
 
 #[test]
@@ -68,7 +118,7 @@ fn test_confirm_deletes_row() {
         .expect("message");
     assert_eq!(claimed.id, id);
 
-    store.confirm(&claimed.id).expect("confirm");
+    store.confirm(&claimed).expect("confirm");
     let stats = store.stats().expect("stats");
 
     assert_eq!(stats.pending, 0);
@@ -116,7 +166,7 @@ fn test_confirm_llm_task_missing_row_is_benign() {
         .expect("delete claimed row");
     drop(conn);
 
-    confirm_llm_task(&store, &id).expect("confirm missing LLM task");
+    confirm_llm_task(&store, &claimed).expect("confirm missing LLM task");
 }
 
 #[test]
@@ -142,7 +192,7 @@ fn test_mark_failed_sets_backoff_next_attempt() {
     assert_eq!(claimed.id, id);
 
     let before = now_secs();
-    store.mark_failed(&id, "timeout").expect("mark failed");
+    store.mark_failed(&claimed, "timeout").expect("mark failed");
 
     let conn = Connection::open(db_path).expect("open sqlite");
     let (retry_count, retry_backoff_ms, next_attempt_at, status, op_state, last_error): (
@@ -182,13 +232,18 @@ fn test_mark_failed_sets_backoff_next_attempt() {
 fn test_retryable_failure_is_retried_not_dead_lettered_first() {
     let (_tmp, db_path, store) = new_store();
     let id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
-    store
+    let claimed = store
         .claim_next("worker-a", 60)
         .expect("claim")
         .expect("message");
+    assert_eq!(claimed.id, id);
 
     store
-        .mark_failed_with_disposition(&id, "transport timeout", QueueFailureDisposition::Retryable)
+        .mark_failed_with_disposition(
+            &claimed,
+            "transport timeout",
+            QueueFailureDisposition::Retryable,
+        )
         .expect("mark retryable failure");
 
     let (status, retry_count): (String, i64) = Connection::open(db_path)
@@ -207,14 +262,14 @@ fn test_retryable_failure_is_retried_not_dead_lettered_first() {
 fn test_terminal_failure_dead_letters_immediately() {
     let (_tmp, db_path, store) = new_store();
     let id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
-    store
+    let claimed = store
         .claim_next("worker-a", 60)
         .expect("claim")
         .expect("message");
 
     store
         .mark_failed_with_disposition(
-            &id,
+            &claimed,
             "invalid embedding input",
             QueueFailureDisposition::Terminal,
         )
@@ -249,6 +304,43 @@ fn test_terminal_failure_dead_letters_immediately() {
 }
 
 #[test]
+fn test_stale_claim_finalizers_fail_without_touching_reclaimed_claim() {
+    let (_tmp, db_path, store) = new_store();
+
+    let (stale_complete, active_complete) = stale_then_reclaimed(&store, &db_path);
+    let complete_error = store
+        .complete_operation(&stale_complete, "completed", None, None, None, None)
+        .expect_err("stale complete must fail");
+    assert_claim_lost(complete_error, &stale_complete.id);
+    assert_active_claim(&db_path, &active_complete);
+
+    let (stale_confirm, active_confirm) = stale_then_reclaimed(&store, &db_path);
+    let confirm_error = store
+        .confirm(&stale_confirm)
+        .expect_err("stale confirm must fail");
+    assert_claim_lost(confirm_error, &stale_confirm.id);
+    assert_active_claim(&db_path, &active_confirm);
+
+    let (stale_fail, active_fail) = stale_then_reclaimed(&store, &db_path);
+    let fail_error = store
+        .mark_failed_with_disposition(
+            &stale_fail,
+            "stale failure",
+            QueueFailureDisposition::Terminal,
+        )
+        .expect_err("stale failure finalizer must fail");
+    assert_claim_lost(fail_error, &stale_fail.id);
+    assert_active_claim(&db_path, &active_fail);
+
+    let (stale_release, active_release) = stale_then_reclaimed(&store, &db_path);
+    let release_error = store
+        .release_claim(&stale_release)
+        .expect_err("stale release must fail");
+    assert_claim_lost(release_error, &stale_release.id);
+    assert_active_claim(&db_path, &active_release);
+}
+
+#[test]
 fn test_retryable_failure_stays_retryable_past_max_retries() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
@@ -270,7 +362,7 @@ fn test_retryable_failure_stays_retryable_past_max_retries() {
             .expect("claim")
             .expect("message");
         assert_eq!(claimed.id, id);
-        store.mark_failed(&id, "timeout").expect("mark failed");
+        store.mark_failed(&claimed, "timeout").expect("mark failed");
     }
 
     let conn = Connection::open(&db_path).expect("open sqlite");
@@ -613,7 +705,7 @@ fn test_last_error_is_redacted_and_truncated() {
     let id = store
         .enqueue("hook_event", r#"{"tool":"Bash"}"#)
         .expect("enqueue");
-    store
+    let claimed = store
         .claim_next("worker-a", 60)
         .expect("claim")
         .expect("message");
@@ -621,7 +713,7 @@ fn test_last_error_is_redacted_and_truncated() {
     let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789SECRETKEY";
     let oversized_error = format!("before {secret} {}", "x".repeat(LAST_ERROR_MAX_BYTES * 2));
     store
-        .mark_failed(&id, &oversized_error)
+        .mark_failed(&claimed, &oversized_error)
         .expect("mark failed with secret");
 
     let stored_error = Connection::open(db_path)
