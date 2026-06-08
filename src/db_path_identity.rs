@@ -76,15 +76,8 @@ impl DbFileIdentity {
             return true;
         }
 
-        let canonical_target = if target_is_symlink(fd_target) || fd_file_id.is_none() {
-            Some(canonicalize_if_present(fd_target))
-        } else {
-            None
-        };
-        if canonical_target
-            .as_ref()
-            .is_some_and(|target| self.fd_targets.contains(target))
-        {
+        let canonical_target = canonicalize_if_present(fd_target);
+        if self.fd_targets.contains(&canonical_target) {
             return true;
         }
 
@@ -200,10 +193,6 @@ fn canonicalize_if_present(path: &Path) -> PathBuf {
     canonicalize_db_path_or_parent(path.to_path_buf()).unwrap_or_else(|| path.to_path_buf())
 }
 
-fn target_is_symlink(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-}
-
 fn file_id_for_path(path: &Path) -> Option<FileId> {
     fs::metadata(path)
         .ok()
@@ -285,6 +274,25 @@ mod tests {
         let identity = DbFileIdentity::from_resolved_path(&real_db_path);
 
         assert!(identity.matches_fd(&tmp.path().join("missing-fd"), &linked_db_path));
+    }
+
+    #[test]
+    fn test_matches_fd_canonical_target_matches_parent_symlink_after_recreate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_dir = tmp.path().join("real");
+        let linked_dir = tmp.path().join("linked");
+        let stale_dir = tmp.path().join("stale");
+        fs::create_dir(&real_dir).expect("real dir");
+        fs::create_dir(&stale_dir).expect("stale dir");
+        symlink(&real_dir, &linked_dir).expect("dir symlink");
+        let real_db_path = real_dir.join("palace.db");
+        let linked_db_path = linked_dir.join("palace.db");
+        let stale_fd_path = stale_dir.join("palace.db");
+        File::create(&real_db_path).expect("db file");
+        File::create(&stale_fd_path).expect("stale fd file");
+        let identity = DbFileIdentity::from_resolved_path(&real_db_path);
+
+        assert!(identity.matches_fd(&stale_fd_path, &linked_db_path));
     }
 
     #[test]
