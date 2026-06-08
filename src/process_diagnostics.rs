@@ -186,11 +186,12 @@ fn opened_db_files(fd_dir: &Path, targets: &[(&'static str, DbFileIdentity)]) ->
     };
     let mut opened = Vec::new();
     for entry in entries.flatten() {
-        let Ok(target) = fs::read_link(entry.path()) else {
+        let fd_path = entry.path();
+        let Ok(target) = fs::read_link(&fd_path) else {
             continue;
         };
         for (kind, expected) in targets {
-            if expected.matches_fd(&entry.path(), &target)
+            if expected.matches_fd(&fd_path, &target)
                 && !opened.iter().any(|opened_kind| opened_kind == kind)
             {
                 opened.push((*kind).to_string());

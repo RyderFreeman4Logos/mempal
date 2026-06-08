@@ -168,10 +168,10 @@ fn strip_deleted_suffix(fd_path: &Path, path: &Path) -> PathBuf {
     const DELETED_SUFFIX: &[u8] = b" (deleted)";
     let bytes = path.as_os_str().as_bytes();
     if bytes.ends_with(DELETED_SUFFIX) {
-        let target_file_id = file_id_for_path(path);
-        let fd_file_id = file_id_for_path(fd_path);
-        if target_file_id.is_some() && target_file_id == fd_file_id {
-            return path.to_path_buf();
+        if let Some(target_file_id) = file_id_for_path(path) {
+            if file_id_for_path(fd_path) == Some(target_file_id) {
+                return path.to_path_buf();
+            }
         }
         let keep = bytes.len().saturating_sub(DELETED_SUFFIX.len());
         return PathBuf::from(OsString::from_vec(bytes[..keep].to_vec()));
