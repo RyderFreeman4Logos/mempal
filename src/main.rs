@@ -2999,11 +2999,7 @@ where
 {
     let runtime = tokio::runtime::Runtime::new().context("failed to construct tokio runtime")?;
     let result = runtime.block_on(future);
-    if result
-        .as_ref()
-        .err()
-        .is_some_and(|error| error.is::<IngestWaitTimedOut>())
-    {
+    if result.as_ref().err().is_some_and(is_ingest_wait_timed_out) {
         runtime.shutdown_timeout(std::time::Duration::from_millis(100));
     }
     result
@@ -12924,3 +12920,30 @@ impl std::fmt::Display for IngestWaitTimedOut {
 }
 
 impl std::error::Error for IngestWaitTimedOut {}
+
+fn is_ingest_wait_timed_out(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|source| source.downcast_ref::<IngestWaitTimedOut>().is_some())
+}
+
+#[cfg(test)]
+mod ingest_wait_timeout_error_tests {
+    use super::*;
+
+    #[test]
+    fn detects_context_wrapped_ingest_wait_timeout() {
+        let wrapped = Err::<(), IngestWaitTimedOut>(IngestWaitTimedOut::new(Some("op-1")))
+            .context("wait failed")
+            .expect_err("context-wrapped timeout should remain an error");
+
+        assert!(is_ingest_wait_timed_out(&wrapped));
+    }
+
+    #[test]
+    fn ignores_other_errors_for_ingest_wait_timeout() {
+        let error = anyhow::anyhow!("other error");
+
+        assert!(!is_ingest_wait_timed_out(&error));
+    }
+}
