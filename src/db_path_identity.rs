@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+use std::borrow::Cow;
+#[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use std::ffi::{OsStr, OsString};
@@ -59,14 +61,18 @@ impl DbFileIdentity {
     }
 
     pub(crate) fn matches_fd(&self, fd_path: &Path, fd_target: &Path) -> bool {
-        if file_id_for_path(fd_path).is_some_and(|file_id| self.file_ids.contains(&file_id)) {
-            return true;
+        let fd_file_id = file_id_for_path(fd_path);
+        if let Some(file_id) = fd_file_id {
+            if self.file_ids.contains(&file_id) {
+                return true;
+            }
         }
 
-        let stripped_target = strip_deleted_suffix(fd_path, fd_target);
+        let stripped_target = strip_deleted_suffix(fd_file_id, fd_target);
         let canonical_target = canonicalize_if_present(&stripped_target);
 
-        self.fd_targets.contains(&canonical_target) || self.fd_targets.contains(&stripped_target)
+        self.fd_targets.contains(&canonical_target)
+            || self.fd_targets.contains(stripped_target.as_ref())
     }
 }
 
@@ -164,19 +170,19 @@ fn file_id_for_path(path: &Path) -> Option<FileId> {
 }
 
 #[cfg(target_os = "linux")]
-fn strip_deleted_suffix(fd_path: &Path, path: &Path) -> PathBuf {
+fn strip_deleted_suffix(fd_file_id: Option<FileId>, path: &Path) -> Cow<'_, Path> {
     const DELETED_SUFFIX: &[u8] = b" (deleted)";
     let bytes = path.as_os_str().as_bytes();
     if bytes.ends_with(DELETED_SUFFIX) {
         if let Some(target_file_id) = file_id_for_path(path) {
-            if file_id_for_path(fd_path) == Some(target_file_id) {
-                return path.to_path_buf();
+            if fd_file_id == Some(target_file_id) {
+                return Cow::Borrowed(path);
             }
         }
         let keep = bytes.len().saturating_sub(DELETED_SUFFIX.len());
-        return PathBuf::from(OsString::from_vec(bytes[..keep].to_vec()));
+        return Cow::Owned(PathBuf::from(OsString::from_vec(bytes[..keep].to_vec())));
     }
-    path.to_path_buf()
+    Cow::Borrowed(path)
 }
 
 #[cfg(all(test, target_os = "linux"))]
