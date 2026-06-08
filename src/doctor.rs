@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
+use crate::core::config::ConfigHandle;
 use crate::core::db::CURRENT_SCHEMA_VERSION;
 use crate::process_diagnostics::{DbHolderReport, inspect_db_holders};
 
@@ -65,6 +66,7 @@ pub struct DoctorReport {
     pub db: DoctorDbReport,
     pub db_holders: DbHolderReport,
     pub install: DoctorInstallReport,
+    pub restart_required_config_changes: Vec<String>,
     pub warnings: Vec<String>,
     pub recommendations: Vec<String>,
 }
@@ -89,6 +91,7 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
     let db = inspect_db(db_path);
     let db_holders = inspect_db_holders(db_path);
     let install = inspect_install();
+    let restart_required_config_changes = ConfigHandle::restart_required_pending();
     let mut warnings = Vec::new();
     let mut recommendations = vec![
         "Run `mempal doctor --format json` after installing or upgrading mempal.".to_string(),
@@ -107,6 +110,9 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
     if let Some(error) = db.error.as_deref() {
         warnings.push(format!("database schema could not be inspected: {error}"));
     }
+    for change in &restart_required_config_changes {
+        warnings.push(format!("config change pending restart: {change}"));
+    }
     push_db_holder_warnings(&mut warnings, &mut recommendations, &db_holders);
     if install.path_matches_current_exe == Some(false) {
         warnings
@@ -124,6 +130,7 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
         db,
         db_holders,
         install,
+        restart_required_config_changes,
         warnings,
         recommendations,
     }

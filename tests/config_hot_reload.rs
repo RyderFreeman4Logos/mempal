@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use mempal::core::config::ConfigHandle;
 use mempal::core::db::{CURRENT_FORK_EXT_VERSION, Database};
+use mempal::doctor::build_doctor_report;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
 use mempal::ingest::gating::{IngestCandidate, evaluate_tier1};
 use mempal::mcp::{IngestRequest, MempalMcpServer};
@@ -535,6 +536,60 @@ async fn test_embedder_backend_change_warns_and_ignores() {
     );
     write_config_atomic(&env.config_path, &allowed);
     wait_for_version_change(&stable_version);
+}
+
+#[cfg(feature = "integration")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_restart_required_hot_reload_changes_surface_in_status_and_doctor() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(&base_config(&PathBuf::from("/tmp/placeholder")));
+    let config = base_config(&env.db_path);
+    write_config_atomic(&env.config_path, &config);
+    ConfigHandle::bootstrap(&env.config_path).expect("rebootstrap config");
+
+    let changed = config.replace("http://gb10:18002/v1/", "http://localhost:9000/v1/");
+    write_config_atomic(&env.config_path, &changed);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let pending = ConfigHandle::restart_required_pending();
+    assert!(
+        pending
+            .iter()
+            .any(|event| event.contains("embedder.base_url requires restart")),
+        "pending restart-required changes missing: {pending:?}"
+    );
+
+    let output = Command::new(mempal_bin())
+        .arg("status")
+        .env("HOME", env._tmp.path())
+        .output()
+        .expect("run mempal status");
+    assert!(output.status.success(), "status failed: {output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
+    assert!(
+        stdout.contains("restart_required_config_changes:"),
+        "status did not print restart-required changes: {stdout}"
+    );
+    assert!(
+        stdout.contains("embedder.base_url requires restart"),
+        "status did not include ignored change: {stdout}"
+    );
+
+    let report = build_doctor_report(&env.db_path);
+    assert!(
+        report
+            .restart_required_config_changes
+            .iter()
+            .any(|event| event.contains("embedder.base_url requires restart")),
+        "doctor report missing restart-required changes: {report:#?}"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("config change pending restart")),
+        "doctor warnings missing restart-required warning: {report:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

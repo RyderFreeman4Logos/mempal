@@ -1679,17 +1679,29 @@ impl ConfigHandle {
 
     pub fn collect_runtime_warnings() -> Vec<RuntimeWarning> {
         let mut warnings = Self::current().collect_runtime_warnings();
-        let mut seen = std::collections::BTreeSet::new();
-        for event in Self::recent_events() {
-            if event.contains("requires restart, change ignored") && seen.insert(event.clone()) {
-                warnings.push(RuntimeWarning {
-                    level: "warn",
-                    source: "config",
-                    message: event,
-                });
-            }
+        for event in Self::restart_required_pending() {
+            warnings.push(RuntimeWarning {
+                level: "warn",
+                source: "config",
+                message: event,
+            });
         }
         warnings
+    }
+
+    pub fn restart_required_pending() -> Vec<String> {
+        let mut events =
+            super::hot_reload::global_hot_reload_state().restart_required_pending_events();
+        events.extend(
+            super::hot_reload::restart_required_pending_events_from_config_path(
+                &default_config_path(),
+            ),
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        events
+            .into_iter()
+            .filter(|event| seen.insert(event.clone()))
+            .collect()
     }
 
     pub fn runtime_prototypes() -> Vec<String> {

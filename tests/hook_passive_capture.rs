@@ -154,6 +154,28 @@ fn drawer_content_contains(db_path: &Path, marker: &str) -> bool {
         != 0
 }
 
+fn active_queue_count(db_path: &Path) -> i64 {
+    Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT COUNT(*) FROM pending_messages WHERE status IN ('pending', 'claimed')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query active queue count")
+}
+
+fn gating_skip_count(db_path: &Path) -> i64 {
+    Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT COUNT(*) FROM gating_audit WHERE decision = 'skip'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query gating skip count")
+}
+
 fn message_status(db_path: &Path, id: &str) -> Option<(String, i64)> {
     Connection::open(db_path)
         .expect("open sqlite")
@@ -403,6 +425,127 @@ async fn test_daemon_processes_hook_post_tool_to_drawer() {
         "privacy scrub must affect stored preview: {body}"
     );
     assert!(!body.contains(raw_secret), "raw secret leaked into drawer");
+
+    daemon.sigterm();
+    let status = daemon.wait().await.expect("wait daemon");
+    assert!(status.success(), "daemon exited with {status:?}");
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_daemon_gating_drops_low_value_hook_and_keeps_high_signal_prompt() {
+    let _guard = test_guard().await;
+    let (tmp, _mempal_home, db_path, config_path) = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+db_path = "{}"
+
+[embed]
+backend = "openai_compat"
+
+[embed.openai_compat]
+base_url = "http://{addr}/v1"
+model = "test-embed"
+dim = 4
+request_timeout_secs = 2
+
+[hooks]
+enabled = true
+daemon_poll_interval_ms = 50
+daemon_claim_ttl_secs = 60
+
+[privacy]
+enabled = true
+
+[gating]
+enabled = true
+
+[daemon]
+log_path = "{}"
+"#,
+            db_path.display(),
+            db_path
+                .parent()
+                .expect("mempal home")
+                .join("daemon.log")
+                .display()
+        ),
+    )
+    .expect("write gated config");
+
+    enqueue_envelope(
+        &db_path,
+        &CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "claude".to_string(),
+            captured_at: "123".to_string(),
+            claude_cwd: tmp.path().display().to_string(),
+            payload: Some(
+                serde_json::json!({
+                    "session_id": "sess-low-value-read",
+                    "tool_name": "Read",
+                    "input": "README.md",
+                    "output": "LOW_VALUE_READ_SENTINEL",
+                    "exit_code": 0
+                })
+                .to_string(),
+            ),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: 128,
+            truncated: false,
+        },
+    );
+    enqueue_envelope(
+        &db_path,
+        &CapturedHookEnvelope {
+            event: HookEvent::UserPromptSubmit.display_name().to_string(),
+            kind: HookEvent::UserPromptSubmit.queue_kind().to_string(),
+            agent: "claude".to_string(),
+            captured_at: "124".to_string(),
+            claude_cwd: tmp.path().display().to_string(),
+            payload: Some(
+                serde_json::json!({
+                    "session_id": "sess-high-signal-prompt",
+                    "prompt": "HIGH_SIGNAL_DECISION_SENTINEL We decided the LLM salience gate must stay active for passive hooks while preserving root causes and architecture decisions."
+                })
+                .to_string(),
+            ),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: 256,
+            truncated: false,
+        },
+    );
+
+    let mut daemon = DaemonSupervisor::spawn(
+        HashMap::from([("HOME".to_string(), tmp.path().display().to_string())]),
+        vec!["--foreground".to_string()],
+    )
+    .await
+    .expect("spawn daemon");
+    daemon
+        .wait_ready(Duration::from_secs(5))
+        .await
+        .expect("wait ready");
+    wait_for_condition(Duration::from_secs(10), || {
+        active_queue_count(&db_path) == 0
+    })
+    .await;
+
+    assert!(
+        !drawer_content_contains(&db_path, "LOW_VALUE_READ_SENTINEL"),
+        "low-value Read hook should not become durable drawer content"
+    );
+    assert!(
+        drawer_content_contains(&db_path, "HIGH_SIGNAL_DECISION_SENTINEL"),
+        "high-signal user prompt should be retained as durable drawer content"
+    );
+    assert_eq!(gating_skip_count(&db_path), 1);
 
     daemon.sigterm();
     let status = daemon.wait().await.expect("wait daemon");

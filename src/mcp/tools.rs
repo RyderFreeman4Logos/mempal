@@ -1920,6 +1920,8 @@ pub struct StatusResponse {
     pub embed_status: EmbedStatusDto,
     /// Sticky embedder circuit plus the current vector-search fallback policy.
     pub embedder_circuit: EmbedderCircuitDto,
+    /// Runtime write-admission gate state for passive ingest and explicit writes.
+    pub ingest_gating_status: GatingRuntimeStatusDto,
     pub queue_stats: QueueStatsDto,
     /// Live processes holding `palace.db`, `palace.db-wal`, or
     /// `palace.db-shm` open, classified as current daemon/MCP server versus
@@ -1993,6 +1995,61 @@ pub struct LlmStatusDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub max_concurrent: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct GatingRuntimeStatusDto {
+    pub enabled: bool,
+    pub tier1_active: bool,
+    pub tier2_active: bool,
+    pub llm_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_model: Option<String>,
+    pub tier2_threshold: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_threshold: Option<f64>,
+    pub tier1_skip_events: Vec<String>,
+    pub rules_count: usize,
+    pub kept_total: usize,
+    pub skipped_total: usize,
+    pub dropped_total: u64,
+    pub quarantined_total: u64,
+    pub soft_deleted_total: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_keep_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_skip_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_llm_success_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_llm_failure_at: Option<i64>,
+    pub restart_required_config_changes: Vec<String>,
+}
+
+impl From<crate::observability::GatingRuntimeStatus> for GatingRuntimeStatusDto {
+    fn from(value: crate::observability::GatingRuntimeStatus) -> Self {
+        Self {
+            enabled: value.enabled,
+            tier1_active: value.tier1_active,
+            tier2_active: value.tier2_active,
+            llm_active: value.llm_active,
+            llm_model: value.llm_model,
+            tier2_threshold: value.tier2_threshold,
+            llm_threshold: value.llm_threshold,
+            tier1_skip_events: value.tier1_skip_events,
+            rules_count: value.rules_count,
+            kept_total: value.kept_total,
+            skipped_total: value.skipped_total,
+            dropped_total: value.dropped_total,
+            quarantined_total: value.quarantined_total,
+            soft_deleted_total: value.soft_deleted_total,
+            last_keep_at: value.last_keep_at,
+            last_skip_at: value.last_skip_at,
+            last_llm_success_at: value.last_llm_success_at,
+            last_llm_failure_at: value.last_llm_failure_at,
+            restart_required_config_changes: value.restart_required_config_changes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]

@@ -2058,6 +2058,105 @@ threshold = 0.5
     assert_eq!(rows[0].label.as_deref(), Some("llm_pending"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_status_reports_active_llm_gate_and_metrics() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(
+        r#"
+[llm]
+enabled = true
+base_url = "http://localhost:18317/v1"
+model = "test-model"
+max_concurrent = 8
+
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.8
+prototypes = ["valuable"]
+
+[gating.llm_judge]
+enabled = true
+threshold = 0.42
+"#,
+    );
+    let config = env.config();
+    let server = MempalMcpServer::new_with_factory_and_config(
+        env.db_path.clone(),
+        config,
+        deterministic_factory(
+            &[
+                ("valuable", vec![1.0, 0.0]),
+                ("durable architecture decision root cause", vec![0.99, 0.01]),
+            ],
+            vec![0.2, 0.2],
+            &[],
+        ),
+    )
+    .expect("create MCP server");
+
+    let skipped = ingest_mcp(&server, "tiny").await;
+    assert!(skipped.dropped, "short content should be skipped");
+    let kept = ingest_mcp(&server, "durable architecture decision root cause").await;
+    assert!(!kept.dropped, "high-signal content should be retained");
+
+    let status = server.mempal_status().await.expect("status").0;
+    let gate = status.ingest_gating_status;
+    assert!(gate.enabled);
+    assert!(gate.tier1_active);
+    assert!(gate.tier2_active);
+    assert!(gate.llm_active);
+    assert_eq!(gate.llm_model.as_deref(), Some("test-model"));
+    assert_eq!(gate.llm_threshold, Some(0.42));
+    assert_eq!(gate.tier2_threshold, 0.8);
+    assert_eq!(gate.kept_total, 1);
+    assert_eq!(gate.skipped_total, 1);
+    assert_eq!(gate.dropped_total, 1);
+    assert_eq!(gate.quarantined_total, 0);
+    assert!(gate.last_keep_at.is_some());
+    assert!(gate.last_skip_at.is_some());
+}
+
+#[test]
+fn test_tier1_rejects_low_value_hook_and_keeps_high_signal_prompt() {
+    let _guard = test_guard_blocking();
+    let config = Config::parse(
+        r#"
+[gating]
+enabled = true
+"#,
+    )
+    .expect("parse config");
+
+    let read_decision = evaluate_tier1(
+        &IngestCandidate {
+            content: "Read output that should not become durable evidence".to_string(),
+            event: Some("PostToolUse".to_string()),
+            tool_name: Some("Read".to_string()),
+            exit_code: Some(0),
+        },
+        &config.ingest_gating,
+    )
+    .expect("read tool decision");
+    assert!(read_decision.is_rejected());
+    assert_eq!(read_decision.gating_reason.as_deref(), Some("read_tool"));
+
+    let prompt_decision = evaluate_tier1(
+        &IngestCandidate {
+            content: "We decided to keep the local LLM salience gate because it prevents passive hook flood while preserving architecture decisions.".to_string(),
+            event: Some("UserPromptSubmit".to_string()),
+            tool_name: None,
+            exit_code: None,
+        },
+        &config.ingest_gating,
+    )
+    .expect("user prompt decision");
+    assert!(!prompt_decision.is_rejected());
+    assert_eq!(prompt_decision.label.as_deref(), Some("user_prompt_submit"));
+}
+
 /// Multi-chunk ingest with Tier 3 LLM reject must soft-delete every chunk drawer,
 /// not just the first one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
