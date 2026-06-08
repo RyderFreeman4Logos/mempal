@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -20,8 +20,8 @@ use mempal::core::{
     compaction::merge_cluster,
     config::{CompiledPrivacyConfig, Config, ConfigHandle, default_config_path},
     db::{
-        CURRENT_VECTOR_INDEX_VERSION, Database, ReindexVectorStash, VECTOR_DISTANCE_METRIC,
-        find_similar_clusters, vector_metadata_key,
+        CURRENT_VECTOR_INDEX_VERSION, Database, HistoricalRejudgeAudit, ReindexVectorStash,
+        VECTOR_DISTANCE_METRIC, find_similar_clusters, vector_metadata_key,
     },
     phase3::{
         CardContextDefaultProposalReport, CardContextRollbackControlReport, EvaluatorAdviceInput,
@@ -97,6 +97,7 @@ use mempal::knowledge_gate::{
 use mempal::knowledge_lifecycle::{
     DemoteRequest, PromoteRequest, demote_knowledge, promote_knowledge,
 };
+use mempal::llm::{DEFAULT_GATING_JUDGE_PROMPT, LlmClient, LlmMessage, LlmRequest};
 use mempal::mcp::{
     IngestControls, IngestOperationState, IngestRequest, IngestResponse, MempalMcpServer,
     OperationStatusRequest,
@@ -1969,6 +1970,26 @@ enum MaintenanceCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Re-run current retention policy over historical drawers.
+    Rejudge {
+        /// Mutate storage. Omit for dry-run.
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+        /// Irreversibly delete candidates instead of auditable soft-delete.
+        #[arg(long = "hard-delete", default_value_t = false)]
+        hard_delete: bool,
+        /// Limit number of active drawers scanned.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long)]
+        room: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2078,6 +2099,61 @@ struct MaintenanceGuidedRunReport {
 struct MaintenanceStep {
     command: String,
     description: String,
+}
+
+struct HistoricalRejudgeOptions<'a> {
+    execute: bool,
+    hard_delete: bool,
+    limit: usize,
+    wing: Option<&'a str>,
+    room: Option<&'a str>,
+    project: Option<&'a str>,
+    format: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HistoricalRejudgeReport {
+    dry_run: bool,
+    mutation: String,
+    scanned_count: usize,
+    candidate_count: usize,
+    protected_count: usize,
+    mutated_count: usize,
+    estimated_bytes_reclaimed: usize,
+    judge_model: Option<String>,
+    config_version: String,
+    wings_rooms: Vec<HistoricalRejudgeScopeCount>,
+    examples: Vec<HistoricalRejudgeExample>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HistoricalRejudgeScopeCount {
+    wing: String,
+    room: Option<String>,
+    count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HistoricalRejudgeExample {
+    drawer_id: String,
+    wing: String,
+    room: Option<String>,
+    reason: String,
+    score: Option<f64>,
+    judge: String,
+    bytes: usize,
+    preview: String,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalRejudgeDecision {
+    delete_candidate: bool,
+    protected: bool,
+    reason: String,
+    label: Option<String>,
+    score: Option<f64>,
+    tier: u8,
+    judge: String,
 }
 
 fn main() {
@@ -2758,6 +2834,30 @@ fn run() -> Result<()> {
                 dry_run,
             },
         ),
+        Commands::Maintenance {
+            command:
+                MaintenanceCommands::Rejudge {
+                    execute,
+                    hard_delete,
+                    limit,
+                    wing,
+                    room,
+                    project,
+                    format,
+                },
+        } => block_on_result(maintenance_rejudge_command(
+            &db,
+            config.as_ref(),
+            HistoricalRejudgeOptions {
+                execute,
+                hard_delete,
+                limit,
+                wing: wing.as_deref(),
+                room: room.as_deref(),
+                project: project.as_deref(),
+                format: format.as_str(),
+            },
+        )),
         Commands::Kg { command } => kg_command(&db, command),
         Commands::Knowledge { command } => {
             block_on_result(knowledge_command(&db, config.as_ref(), command))
@@ -12003,6 +12103,515 @@ fn maintenance_guided_run_command(format: String) -> Result<()> {
     }
 }
 
+async fn maintenance_rejudge_command(
+    db: &Database,
+    config: &Config,
+    options: HistoricalRejudgeOptions<'_>,
+) -> Result<()> {
+    if options.limit == 0 {
+        bail!("--limit must be greater than zero");
+    }
+    if options.hard_delete && !options.execute {
+        bail!("--hard-delete requires --execute");
+    }
+    let current_dir = env::current_dir().ok();
+    let project_id = if options.project.is_some() {
+        resolve_project_id(options.project, config, current_dir.as_deref())
+            .context("failed to resolve historical rejudge project id")?
+    } else {
+        None
+    };
+    let rows = db
+        .historical_rejudge_candidates(
+            options.wing,
+            options.room,
+            project_id.as_deref(),
+            options.limit,
+        )
+        .context("failed to load historical rejudge candidates")?;
+    let config_version = historical_rejudge_config_version(config);
+    let llm_client = historical_rejudge_llm_client(config);
+    let judge_model = llm_client
+        .as_ref()
+        .and(config.llm.model.clone())
+        .or_else(|| Some("deterministic".to_string()).filter(|_| llm_client.is_none()));
+
+    let mut decisions = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let decision = evaluate_historical_drawer(row, config, llm_client.as_ref()).await;
+        decisions.push((row, decision));
+    }
+
+    let candidates = decisions
+        .iter()
+        .filter(|(_, decision)| decision.delete_candidate)
+        .collect::<Vec<_>>();
+    let candidate_ids = candidates
+        .iter()
+        .map(|(row, _)| row.drawer.id.clone())
+        .collect::<Vec<_>>();
+
+    let mutated_count = if options.execute && !candidate_ids.is_empty() {
+        if options.hard_delete {
+            db.hard_delete_drawers_by_ids(&candidate_ids)
+                .context("failed to hard-delete historical rejudge candidates")?
+        } else {
+            db.soft_delete_drawers_by_ids(&candidate_ids)
+                .context("failed to soft-delete historical rejudge candidates")?
+        }
+    } else {
+        0
+    };
+
+    for (row, decision) in &decisions {
+        let audit_decision = if decision.delete_candidate {
+            "skip"
+        } else {
+            "keep"
+        };
+        db.record_historical_rejudge_audit(HistoricalRejudgeAudit {
+            drawer_id: &row.drawer.id,
+            decision: audit_decision,
+            tier: decision.tier,
+            reason: Some(&decision.reason),
+            label: decision.label.as_deref(),
+            score: decision.score,
+            project_id: row.project_id.as_deref(),
+            content_preview: Some(&preview_one_line(&row.drawer.content, 500)),
+            judge_model: judge_model.as_deref(),
+            config_version: &config_version,
+            mutation: if !options.execute {
+                "dry_run"
+            } else if options.hard_delete {
+                "hard_delete"
+            } else {
+                "soft_delete"
+            },
+        })
+        .context("failed to record historical rejudge audit")?;
+    }
+
+    if options.execute {
+        append_audit_entry(
+            db,
+            "maintenance-rejudge",
+            &serde_json::json!({
+                "hard_delete": options.hard_delete,
+                "scanned_count": rows.len(),
+                "candidate_count": candidate_ids.len(),
+                "mutated_count": mutated_count,
+                "drawer_ids": candidate_ids,
+                "judge_model": judge_model,
+                "config_version": config_version,
+            }),
+        )
+        .context("failed to append historical rejudge audit log")?;
+    }
+
+    let report = build_historical_rejudge_report(
+        !options.execute,
+        if options.hard_delete {
+            "hard_delete"
+        } else {
+            "soft_delete"
+        },
+        rows.len(),
+        mutated_count,
+        judge_model,
+        config_version,
+        &decisions,
+    );
+    print_historical_rejudge_report(&report, options.format)
+}
+
+async fn evaluate_historical_drawer(
+    row: &mempal::core::db::HistoricalRejudgeCandidate,
+    config: &Config,
+    llm_client: Option<&LlmClient>,
+) -> HistoricalRejudgeDecision {
+    let drawer = &row.drawer;
+    if let Some(reason) = historical_protection_reason(drawer) {
+        return HistoricalRejudgeDecision {
+            delete_candidate: false,
+            protected: true,
+            reason,
+            label: Some("protected".to_string()),
+            score: Some(1.0),
+            tier: 0,
+            judge: "deterministic".to_string(),
+        };
+    }
+
+    let candidate = historical_ingest_candidate(drawer);
+    if let Some(decision) = evaluate_tier1(&candidate, &config.ingest_gating)
+        && decision.is_rejected()
+    {
+        return HistoricalRejudgeDecision {
+            delete_candidate: true,
+            protected: false,
+            reason: decision
+                .gating_reason
+                .clone()
+                .unwrap_or_else(|| "tier1_rejected".to_string()),
+            label: decision.label.clone(),
+            score: decision.score.map(f64::from),
+            tier: decision.tier,
+            judge: "deterministic".to_string(),
+        };
+    }
+
+    if let Some(client) = llm_client {
+        match request_historical_llm_score(client, drawer, config).await {
+            Ok((score, reason)) => {
+                let threshold = config
+                    .ingest_gating
+                    .llm_judge
+                    .as_ref()
+                    .map(|judge| judge.threshold)
+                    .unwrap_or(0.3);
+                return HistoricalRejudgeDecision {
+                    delete_candidate: score < threshold,
+                    protected: false,
+                    reason: if score < threshold {
+                        format!("llm_below_threshold:{reason}")
+                    } else {
+                        format!("llm_keep:{reason}")
+                    },
+                    label: Some("llm_judge".to_string()),
+                    score: Some(score),
+                    tier: 3,
+                    judge: "llm".to_string(),
+                };
+            }
+            Err(error) => {
+                let deterministic = deterministic_historical_decision(drawer);
+                return HistoricalRejudgeDecision {
+                    reason: format!("llm_unavailable_fallback:{}:{error}", deterministic.reason),
+                    ..deterministic
+                };
+            }
+        }
+    }
+
+    deterministic_historical_decision(drawer)
+}
+
+fn historical_protection_reason(drawer: &Drawer) -> Option<String> {
+    if drawer.is_pinned {
+        return Some("pinned".to_string());
+    }
+    if matches!(
+        drawer.status,
+        Some(KnowledgeStatus::Canonical | KnowledgeStatus::Promoted)
+    ) {
+        return Some("canonical_or_promoted".to_string());
+    }
+    if matches!(
+        drawer.memory_kind,
+        MemoryKind::Knowledge | MemoryKind::ProfileFact
+    ) {
+        return Some("typed_high_signal_memory".to_string());
+    }
+    let score = mempal::importance::score_importance(drawer);
+    if score >= 3 {
+        return Some(format!("importance_score_{score}"));
+    }
+    let content = drawer.content.to_ascii_lowercase();
+    for marker in [
+        "decision",
+        "we decided",
+        "architecture",
+        "root cause",
+        "bug root cause",
+        "review finding",
+        "user prefers",
+        "explicit user",
+        "canonical fact",
+    ] {
+        if content.contains(marker) {
+            return Some(format!("high_signal_marker:{marker}"));
+        }
+    }
+    None
+}
+
+fn historical_ingest_candidate(drawer: &Drawer) -> IngestCandidate {
+    let content = drawer.content.clone();
+    let lower_source = drawer
+        .source_file
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let event = if drawer.wing == "hooks-raw" || lower_source.contains("hook") {
+        if drawer.room.as_deref() == Some("user-prompt") {
+            Some("UserPromptSubmit".to_string())
+        } else {
+            Some("PostToolUse".to_string())
+        }
+    } else {
+        None
+    };
+    let tool_name = drawer
+        .room
+        .as_deref()
+        .filter(|room| drawer.wing == "hooks-raw" && *room != "user-prompt")
+        .map(ToOwned::to_owned)
+        .or_else(|| extract_json_string_field(&content, "tool_name"));
+    let exit_code = extract_json_i32_field(&content, "exit_code");
+    IngestCandidate {
+        content,
+        event,
+        tool_name,
+        exit_code,
+    }
+}
+
+fn deterministic_historical_decision(drawer: &Drawer) -> HistoricalRejudgeDecision {
+    let score = mempal::importance::score_importance(drawer);
+    HistoricalRejudgeDecision {
+        delete_candidate: score <= 1,
+        protected: false,
+        reason: if score <= 1 {
+            format!("importance_score_{score}")
+        } else {
+            format!("importance_keep_{score}")
+        },
+        label: Some("importance".to_string()),
+        score: Some(f64::from(score) / 5.0),
+        tier: 0,
+        judge: "deterministic".to_string(),
+    }
+}
+
+fn historical_rejudge_llm_client(config: &Config) -> Option<LlmClient> {
+    if !config.llm.enabled || !config.llm.enabled_for.iter().any(|item| item == "gating") {
+        return None;
+    }
+    let judge = config.ingest_gating.llm_judge.as_ref()?;
+    if !judge.enabled {
+        return None;
+    }
+    LlmClient::from_config(&config.llm).ok()
+}
+
+async fn request_historical_llm_score(
+    client: &LlmClient,
+    drawer: &Drawer,
+    config: &Config,
+) -> Result<(f64, String)> {
+    let system_prompt = config
+        .ingest_gating
+        .llm_judge
+        .as_ref()
+        .and_then(|judge| judge.system_prompt.as_deref())
+        .unwrap_or(DEFAULT_GATING_JUDGE_PROMPT);
+    let request = LlmRequest {
+        messages: vec![
+            LlmMessage {
+                role: "system".to_string(),
+                content: system_prompt.to_string(),
+            },
+            LlmMessage {
+                role: "user".to_string(),
+                content: drawer.content.clone(),
+            },
+        ],
+        model: None,
+        temperature: Some(0.0),
+        max_tokens: Some(512),
+    };
+    let response = client
+        .chat_completion(&request)
+        .await
+        .context("historical rejudge LLM request failed")?;
+    Ok(parse_historical_llm_score(&response.content))
+}
+
+fn parse_historical_llm_score(content: &str) -> (f64, String) {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).unwrap_or_default();
+    let score = parsed
+        .get("score")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_else(|| {
+            let verdict = parsed
+                .get("verdict")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("keep")
+                .to_ascii_lowercase();
+            if matches!(
+                verdict.as_str(),
+                "reject" | "delete" | "drop" | "quarantine"
+            ) {
+                0.0
+            } else {
+                1.0
+            }
+        })
+        .clamp(0.0, 1.0);
+    let reason = parsed
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("no_reason")
+        .to_string();
+    (score, reason)
+}
+
+fn extract_json_string_field(content: &str, key: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn extract_json_i32_field(content: &str, key: &str) -> Option<i32> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| value.get(key).and_then(serde_json::Value::as_i64))
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn historical_rejudge_config_version(config: &Config) -> String {
+    let relevant = serde_json::json!({
+        "gating": config.ingest_gating,
+        "llm": {
+            "enabled": config.llm.enabled,
+            "model": config.llm.model,
+            "enabled_for": config.llm.enabled_for,
+            "max_concurrent": config.llm.max_concurrent,
+        }
+    });
+    let bytes = serde_json::to_vec(&relevant).unwrap_or_default();
+    blake3::hash(&bytes).to_hex()[..12].to_string()
+}
+
+fn build_historical_rejudge_report(
+    dry_run: bool,
+    mutation: &str,
+    scanned_count: usize,
+    mutated_count: usize,
+    judge_model: Option<String>,
+    config_version: String,
+    decisions: &[(
+        &mempal::core::db::HistoricalRejudgeCandidate,
+        HistoricalRejudgeDecision,
+    )],
+) -> HistoricalRejudgeReport {
+    let mut scope_counts: BTreeMap<(String, Option<String>), usize> = BTreeMap::new();
+    let mut examples = Vec::new();
+    let mut estimated_bytes_reclaimed = 0usize;
+    let mut candidate_count = 0usize;
+    let mut protected_count = 0usize;
+    for (row, decision) in decisions {
+        if decision.protected {
+            protected_count += 1;
+        }
+        if !decision.delete_candidate {
+            continue;
+        }
+        candidate_count += 1;
+        estimated_bytes_reclaimed += row.drawer.content.len();
+        *scope_counts
+            .entry((row.drawer.wing.clone(), row.drawer.room.clone()))
+            .or_default() += 1;
+        if examples.len() < 5 {
+            examples.push(HistoricalRejudgeExample {
+                drawer_id: row.drawer.id.clone(),
+                wing: row.drawer.wing.clone(),
+                room: row.drawer.room.clone(),
+                reason: decision.reason.clone(),
+                score: decision.score,
+                judge: decision.judge.clone(),
+                bytes: row.drawer.content.len(),
+                preview: preview_one_line(&row.drawer.content, 120),
+            });
+        }
+    }
+    let wings_rooms = scope_counts
+        .into_iter()
+        .map(|((wing, room), count)| HistoricalRejudgeScopeCount { wing, room, count })
+        .collect();
+    HistoricalRejudgeReport {
+        dry_run,
+        mutation: mutation.to_string(),
+        scanned_count,
+        candidate_count,
+        protected_count,
+        mutated_count,
+        estimated_bytes_reclaimed,
+        judge_model,
+        config_version,
+        wings_rooms,
+        examples,
+    }
+}
+
+fn print_historical_rejudge_report(report: &HistoricalRejudgeReport, format: &str) -> Result<()> {
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(report)?);
+            Ok(())
+        }
+        "plain" => {
+            println!("Historical Memory Rejudge");
+            println!("dry_run={}", report.dry_run);
+            println!("mutation={}", report.mutation);
+            println!("scanned={}", report.scanned_count);
+            println!("candidates={}", report.candidate_count);
+            println!("protected={}", report.protected_count);
+            println!("mutated={}", report.mutated_count);
+            println!(
+                "estimated_bytes_reclaimed={}",
+                report.estimated_bytes_reclaimed
+            );
+            println!(
+                "judge_model={}",
+                report.judge_model.as_deref().unwrap_or("none")
+            );
+            println!("config_version={}", report.config_version);
+            if !report.wings_rooms.is_empty() {
+                println!("affected_wings_rooms:");
+                for scope in &report.wings_rooms {
+                    println!(
+                        "  {}/{} count={}",
+                        scope.wing,
+                        scope.room.as_deref().unwrap_or("default"),
+                        scope.count
+                    );
+                }
+            }
+            if !report.examples.is_empty() {
+                println!("examples:");
+                for example in &report.examples {
+                    println!(
+                        "  {} {}/{} reason={} score={} bytes={} judge={} preview=\"{}\"",
+                        example.drawer_id,
+                        example.wing,
+                        example.room.as_deref().unwrap_or("default"),
+                        example.reason,
+                        example
+                            .score
+                            .map(|score| format!("{score:.3}"))
+                            .unwrap_or_else(|| "none".to_string()),
+                        example.bytes,
+                        example.judge,
+                        example.preview
+                    );
+                }
+            }
+            if report.dry_run && report.candidate_count > 0 {
+                println!("rerun with --execute to apply auditable soft-delete");
+                println!("add --hard-delete --execute only for irreversible deletion");
+            }
+            Ok(())
+        }
+        other => bail!("unsupported maintenance rejudge format: {other}"),
+    }
+}
+
 fn release_readiness_command(format: String) -> Result<()> {
     let checks = vec![
         ReleaseReadinessCheck {
@@ -13075,5 +13684,207 @@ mod ingest_wait_timeout_error_tests {
         let error = anyhow::anyhow!("other error");
 
         assert!(!is_ingest_wait_timed_out(&error));
+    }
+}
+
+#[cfg(test)]
+mod historical_rejudge_tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config::parse("[gating]\nenabled = true\n").expect("parse config")
+    }
+
+    fn insert_drawer(db: &Database, id: &str, content: &str, wing: &str, room: Option<&str>) {
+        db.insert_drawer(&Drawer {
+            id: id.to_string(),
+            content: content.to_string(),
+            wing: wing.to_string(),
+            room: room.map(ToOwned::to_owned),
+            source_file: Some(format!("{id}.json")),
+            source_type: SourceType::AgentInference,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            ..Drawer::default()
+        })
+        .expect("insert drawer");
+    }
+
+    fn insert_custom_drawer(db: &Database, drawer: Drawer) {
+        db.insert_drawer(&drawer).expect("insert drawer");
+    }
+
+    fn audit_count(db: &Database) -> i64 {
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM gating_audit", [], |row| row.get(0))
+            .expect("count gating audit")
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_dry_run_reports_without_deleting() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: false,
+                hard_delete: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("dry-run rejudge");
+
+        assert!(db.get_drawer("low").expect("load drawer").is_some());
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_eq!(audit_count(&db), 1, "dry-run still records auditability");
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_execute_soft_deletes_candidates() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "plain",
+            },
+        )
+        .await
+        .expect("execute rejudge");
+
+        assert!(db.get_drawer("low").expect("load drawer").is_none());
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+        let audit_log =
+            std::fs::read_to_string(tmp.path().join("audit.jsonl")).expect("read audit log");
+        assert!(audit_log.contains("\"command\":\"maintenance-rejudge\""));
+        assert!(audit_log.contains("\"drawer_ids\":[\"low\"]"));
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_preserves_pinned_canonical_and_high_signal() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_custom_drawer(
+            &db,
+            Drawer {
+                id: "pinned".to_string(),
+                content: "ok".to_string(),
+                wing: "notes".to_string(),
+                is_pinned: true,
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+                ..Drawer::default()
+            },
+        );
+        insert_custom_drawer(
+            &db,
+            Drawer {
+                id: "canonical".to_string(),
+                content: "ok".to_string(),
+                wing: "notes".to_string(),
+                status: Some(KnowledgeStatus::Canonical),
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+                ..Drawer::default()
+            },
+        );
+        insert_drawer(
+            &db,
+            "high-signal",
+            "We decided the historical rejudge must preserve architecture decisions and bug root cause findings.",
+            "notes",
+            None,
+        );
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("execute rejudge");
+
+        for id in ["pinned", "canonical", "high-signal"] {
+            assert!(db.get_drawer(id).expect("load drawer").is_some(), "{id}");
+        }
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_cleans_low_value_hook_events() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(
+            &db,
+            "read-hook",
+            r#"{"tool_name":"Read","input":"README.md","output":"file contents","exit_code":0}"#,
+            "hooks-raw",
+            Some("Read"),
+        );
+        insert_drawer(
+            &db,
+            "decision-prompt",
+            "We decided to keep salience gating for hooks because it preserves long-term memory quality.",
+            "hooks-raw",
+            Some("user-prompt"),
+        );
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                limit: 100,
+                wing: Some("hooks-raw"),
+                room: None,
+                project: None,
+                format: "plain",
+            },
+        )
+        .await
+        .expect("execute hook rejudge");
+
+        assert!(
+            db.get_drawer("read-hook")
+                .expect("load read hook")
+                .is_none()
+        );
+        assert!(
+            db.get_drawer("decision-prompt")
+                .expect("load decision prompt")
+                .is_some()
+        );
+        let reason: String = db
+            .conn()
+            .query_row(
+                "SELECT reason FROM gating_audit WHERE drawer_id = 'read-hook'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load read-hook audit reason");
+        assert_eq!(reason, "read_tool");
     }
 }
