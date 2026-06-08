@@ -212,6 +212,12 @@ impl MempalMcpServer {
     }
 
     #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_async_queue_for_test(mut self, async_queue: AsyncPendingMessageStore) -> Self {
+        self.async_queue = async_queue;
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_ingest_processing_delay_for_test(mut self, delay: Duration) -> Self {
         self.ingest_processing_delay = Some(delay);
         self
@@ -3205,25 +3211,16 @@ impl MempalMcpServer {
         let payload = serde_json::to_string(&prepared).map_err(|error| {
             ErrorData::internal_error(format!("failed to serialize ingest request: {error}"), None)
         })?;
-        let operation_id = match tokio::time::timeout(
-            self.ingest_admission_deadline,
-            self.async_queue
-                .enqueue(INGEST_ASYNC_KIND.to_string(), payload),
-        )
-        .await
+        let operation_id = match self
+            .async_queue
+            .enqueue(INGEST_ASYNC_KIND.to_string(), payload)
+            .await
         {
-            Ok(Ok(operation_id)) => operation_id,
-            Ok(Err(error)) => {
+            Ok(operation_id) => operation_id,
+            Err(error) => {
                 return Err(ErrorData::internal_error(
                     format!("failed to enqueue ingest operation: {error}"),
                     None,
-                ));
-            }
-            Err(_) => {
-                return Err(mcp_stage_timeout_error(
-                    "mempal_ingest",
-                    "queue admission",
-                    self.ingest_admission_deadline,
                 ));
             }
         };
@@ -7929,6 +7926,44 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_queue_admission_waits_for_receipt_after_deadline() {
+        let (_tempdir, db_path, server) = setup_server();
+        let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_blocking_delay(Duration::from_millis(150));
+        let server = server
+            .with_async_queue_for_test(async_queue)
+            .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.mempal_ingest(Parameters(IngestRequest {
+                content: "slow queue admission still returns a receipt".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("receipt".to_string()),
+                dry_run: Some(false),
+                wait: Some(false),
+                ..IngestRequest::default()
+            })),
+        )
+        .await
+        .expect("MCP ingest should wait for queue admission receipt")
+        .expect("slow queue admission should still succeed")
+        .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        let operation_id = response
+            .operation_id
+            .as_deref()
+            .expect("queued response must include operation id");
+        let record = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(operation_id)
+            .expect("load queued operation status")
+            .expect("operation must be durable when receipt is returned");
+        assert_eq!(record.id, operation_id);
+        assert_eq!(record.kind, INGEST_ASYNC_KIND);
     }
 
     #[tokio::test(flavor = "current_thread")]
