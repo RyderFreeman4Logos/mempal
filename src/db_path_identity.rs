@@ -166,12 +166,11 @@ fn resolve_configured_path_lossy(path: &Path) -> PathBuf {
 }
 
 fn resolve_path_with_cwd_lossy(path: &Path, cwd: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
+    if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
-    };
-    canonicalize_if_present(&absolute)
+    }
 }
 
 fn canonicalize_db_path_or_parent(path: PathBuf) -> Option<PathBuf> {
@@ -333,6 +332,20 @@ mod tests {
             std::fs::canonicalize(tmp.path())
                 .expect("canonical tempdir")
                 .join("palace.db")
+        );
+    }
+
+    #[test]
+    fn test_resolve_path_with_cwd_lossy_absolutizes_without_canonicalizing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_dir = tmp.path().join("real");
+        let linked_dir = tmp.path().join("linked");
+        fs::create_dir(&real_dir).expect("real dir");
+        symlink(&real_dir, &linked_dir).expect("dir symlink");
+
+        assert_eq!(
+            resolve_path_with_cwd_lossy(Path::new("palace.db"), &linked_dir),
+            linked_dir.join("palace.db")
         );
     }
 
