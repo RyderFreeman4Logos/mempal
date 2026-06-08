@@ -30,7 +30,7 @@ use crate::core::{
         AnchorKind, BootstrapIdentityParts, Drawer, DrawerSummary, ExplicitTunnel,
         KnowledgeCardFilter, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance,
         RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack,
-        SourceType, TriggerHints, Triple, default_confidence,
+        SearchResult, SourceType, TriggerHints, Triple, default_confidence,
     },
     utils::{
         build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp, iso_timestamp,
@@ -116,6 +116,12 @@ use super::tools::{
     TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
+const MCP_SEARCH_ROUTE_DEADLINE: Duration = Duration::from_secs(5);
+const MCP_SEARCH_DB_DEADLINE: Duration = Duration::from_secs(30);
+const MCP_SEARCH_STALE_INDEX_DEADLINE: Duration = Duration::from_secs(2);
+const MCP_INGEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
+const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 pub struct MempalMcpServer {
     db_path: PathBuf,
@@ -133,6 +139,11 @@ pub struct MempalMcpServer {
     /// Flushed and boosted on the next `mempal_ingest` call (P13).
     session_hit_drawers: Arc<Mutex<HashSet<String>>>,
     ingest_worker_started: Arc<AtomicBool>,
+    search_route_deadline: Duration,
+    search_db_deadline: Duration,
+    search_stale_index_deadline: Duration,
+    ingest_admission_deadline: Duration,
+    operation_status_deadline: Duration,
     #[cfg(any(test, feature = "db-test-seam"))]
     ingest_processing_delay: Option<Duration>,
 }
@@ -181,6 +192,11 @@ impl MempalMcpServer {
             client_peer: Arc::new(Mutex::new(None)),
             session_hit_drawers: Arc::new(Mutex::new(HashSet::new())),
             ingest_worker_started: Arc::new(AtomicBool::new(false)),
+            search_route_deadline: MCP_SEARCH_ROUTE_DEADLINE,
+            search_db_deadline: MCP_SEARCH_DB_DEADLINE,
+            search_stale_index_deadline: MCP_SEARCH_STALE_INDEX_DEADLINE,
+            ingest_admission_deadline: MCP_INGEST_ADMISSION_DEADLINE,
+            operation_status_deadline: MCP_OPERATION_STATUS_DEADLINE,
             #[cfg(any(test, feature = "db-test-seam"))]
             ingest_processing_delay: None,
         })
@@ -195,6 +211,16 @@ impl MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_ingest_processing_delay_for_test(mut self, delay: Duration) -> Self {
         self.ingest_processing_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_mcp_deadline_for_test(mut self, deadline: Duration) -> Self {
+        self.search_route_deadline = deadline;
+        self.search_db_deadline = deadline;
+        self.search_stale_index_deadline = deadline;
+        self.ingest_admission_deadline = deadline;
+        self.operation_status_deadline = deadline;
         self
     }
 
@@ -680,6 +706,61 @@ impl MempalMcpServer {
                 format!("timed out waiting for ingest operation {operation_id}"),
                 None,
             )),
+        }
+    }
+
+    async fn run_read_anyhow_bounded<F, R>(
+        &self,
+        f: F,
+        deadline: Duration,
+    ) -> anyhow::Result<Option<R>>
+    where
+        F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        match tokio::time::timeout(deadline, self.async_db.run_read_anyhow(f)).await {
+            Ok(result) => result.map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn run_bm25_search_bounded(
+        &self,
+        query: String,
+        route: crate::core::types::RouteDecision,
+        scope: ProjectSearchScope,
+        search_options: SearchOptions,
+        top_k: usize,
+    ) -> anyhow::Result<Option<Vec<SearchResult>>> {
+        self.run_read_anyhow_bounded(
+            move |db| {
+                search_bm25_only_with_options(db, &query, route, &scope, search_options, top_k)
+                    .map_err(|error| anyhow::anyhow!("BM25 search failed: {error}"))
+            },
+            self.search_db_deadline,
+        )
+        .await
+    }
+
+    async fn system_warnings_with_stale_index_bounded(
+        &self,
+        deadline: Duration,
+    ) -> std::result::Result<Vec<SystemWarning>, ErrorData> {
+        match self
+            .run_read_anyhow_bounded(|db| Ok(system_warnings_with_stale_index(db)), deadline)
+            .await
+            .map_err(db_error)?
+        {
+            Some(warnings) => Ok(warnings),
+            None => {
+                let mut warnings = current_system_warnings();
+                warnings.push(SystemWarning {
+                    level: "warn".to_string(),
+                    message: mcp_stage_timeout_warning("stale vector index check", deadline),
+                    source: "mcp_timeout".to_string(),
+                });
+                Ok(warnings)
+            }
         }
     }
 
@@ -2052,21 +2133,46 @@ impl MempalMcpServer {
             include_raw_turns: request.include_raw_turns.unwrap_or(false),
             include_expired: request.include_expired.unwrap_or(false),
         };
+        let mut extra_warnings = Vec::new();
+        let mut search_mode = SearchMode::Hybrid;
+        let mut response_warnings = Vec::new();
         let route = {
             let query = request.query.clone();
             let wing = request.wing.clone();
             let room = request.room.clone();
-            self.async_db
-                .run_read_anyhow(move |db| {
-                    resolve_route(db, &query, wing.as_deref(), room.as_deref())
-                        .map_err(|error| anyhow::anyhow!("routing failed: {error}"))
-                })
+            let fallback_route = crate::core::types::RouteDecision {
+                wing: wing.clone(),
+                room: room.clone(),
+                confidence: if wing.is_some() || room.is_some() {
+                    1.0
+                } else {
+                    0.0
+                },
+                reason: "bounded MCP fallback: route resolution timed out".to_string(),
+            };
+            match self
+                .run_read_anyhow_bounded(
+                    move |db| {
+                        resolve_route(db, &query, wing.as_deref(), room.as_deref())
+                            .map_err(|error| anyhow::anyhow!("routing failed: {error}"))
+                    },
+                    self.search_route_deadline,
+                )
                 .await
                 .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
+            {
+                Some(route) => route,
+                None => {
+                    push_mcp_timeout_warning(
+                        &mut response_warnings,
+                        &mut extra_warnings,
+                        "search route resolution",
+                        self.search_route_deadline,
+                    );
+                    fallback_route
+                }
+            }
         };
-        let mut extra_warnings = Vec::new();
-        let mut search_mode = SearchMode::Hybrid;
-        let mut response_warnings = Vec::new();
         let embed_snapshot = global_embed_status().snapshot();
         let results = if config.search.bm25_fallback && embed_snapshot.degraded {
             search_mode = SearchMode::Bm25Only;
@@ -2081,13 +2187,22 @@ impl MempalMcpServer {
             let route = route.clone();
             let scope = scope.clone();
             let search_options = search_options.clone();
-            self.async_db
-                .run_read_anyhow(move |db| {
-                    search_bm25_only_with_options(db, &query, route, &scope, search_options, top_k)
-                        .map_err(|error| anyhow::anyhow!("BM25 fallback search failed: {error}"))
-                })
+            match self
+                .run_bm25_search_bounded(query, route, scope, search_options, top_k)
                 .await
                 .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
+            {
+                Some(results) => results,
+                None => {
+                    push_mcp_timeout_warning(
+                        &mut response_warnings,
+                        &mut extra_warnings,
+                        "BM25 fallback search",
+                        self.search_db_deadline,
+                    );
+                    Vec::new()
+                }
+            }
         } else {
             let embedder = match self.embedder_factory.build().await {
                 Ok(embedder) => Some(embedder),
@@ -2123,24 +2238,66 @@ impl MempalMcpServer {
                             ErrorData::internal_error("embedder returned no query vector", None)
                         })?;
                         let query = request.query.clone();
-                        let route = route.clone();
-                        let scope = scope.clone();
-                        let search_options = search_options.clone();
-                        self.async_db
-                            .run_read_anyhow(move |db| {
-                                search_with_vector_and_scope_options(
-                                    db,
-                                    &query,
-                                    &query_vector,
-                                    route,
-                                    &scope,
-                                    search_options,
-                                    top_k,
-                                )
-                                .map_err(|error| anyhow::anyhow!("search failed: {error}"))
-                            })
+                        let hybrid_route = route.clone();
+                        let hybrid_scope = scope.clone();
+                        let hybrid_options = search_options.clone();
+                        match self
+                            .run_read_anyhow_bounded(
+                                move |db| {
+                                    search_with_vector_and_scope_options(
+                                        db,
+                                        &query,
+                                        &query_vector,
+                                        hybrid_route,
+                                        &hybrid_scope,
+                                        hybrid_options,
+                                        top_k,
+                                    )
+                                    .map_err(|error| anyhow::anyhow!("search failed: {error}"))
+                                },
+                                self.search_db_deadline,
+                            )
                             .await
                             .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
+                        {
+                            Some(results) => results,
+                            None => {
+                                search_mode = SearchMode::Bm25Only;
+                                push_mcp_timeout_warning(
+                                    &mut response_warnings,
+                                    &mut extra_warnings,
+                                    "hybrid search",
+                                    self.search_db_deadline,
+                                );
+                                let query = request.query.clone();
+                                let route = route.clone();
+                                let scope = scope.clone();
+                                let search_options = search_options.clone();
+                                match self
+                                    .run_bm25_search_bounded(
+                                        query,
+                                        route,
+                                        scope,
+                                        search_options,
+                                        top_k,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        ErrorData::internal_error(error.to_string(), None)
+                                    })? {
+                                    Some(results) => results,
+                                    None => {
+                                        push_mcp_timeout_warning(
+                                            &mut response_warnings,
+                                            &mut extra_warnings,
+                                            "BM25 fallback search",
+                                            self.search_db_deadline,
+                                        );
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                        }
                     }
                     Ok(Err(error)) => {
                         search_mode = SearchMode::Bm25Only;
@@ -2157,24 +2314,28 @@ impl MempalMcpServer {
                         let route = route.clone();
                         let scope = scope.clone();
                         let search_options = search_options.clone();
-                        self.async_db
-                            .run_read_anyhow(move |db| {
-                                search_bm25_only_with_options(
-                                    db,
-                                    &query,
-                                    route,
-                                    &scope,
-                                    search_options,
-                                    top_k,
-                                )
-                                .map_err(|bm25_error| {
-                                    anyhow::anyhow!(
-                                        "search failed after vector fallback: {error}; bm25 fallback failed: {bm25_error}"
-                                    )
-                                })
-                            })
+                        match self
+                            .run_bm25_search_bounded(query, route, scope, search_options, top_k)
                             .await
-                            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
+                            .map_err(|bm25_error| {
+                                ErrorData::internal_error(
+                                    format!(
+                                        "search failed after vector fallback: {error}; bm25 fallback failed: {bm25_error}"
+                                    ),
+                                    None,
+                                )
+                            })? {
+                            Some(results) => results,
+                            None => {
+                                push_mcp_timeout_warning(
+                                    &mut response_warnings,
+                                    &mut extra_warnings,
+                                    "BM25 fallback search",
+                                    self.search_db_deadline,
+                                );
+                                Vec::new()
+                            }
+                        }
                     }
                     Err(_) => {
                         search_mode = SearchMode::Bm25Only;
@@ -2190,22 +2351,26 @@ impl MempalMcpServer {
                         let route = route.clone();
                         let scope = scope.clone();
                         let search_options = search_options.clone();
-                        self.async_db
-                            .run_read_anyhow(move |db| {
-                                search_bm25_only_with_options(
-                                    db,
-                                    &query,
-                                    route,
-                                    &scope,
-                                    search_options,
-                                    top_k,
-                                )
-                                .map_err(|error| {
-                                    anyhow::anyhow!("search deadline fallback failed: {error}")
-                                })
-                            })
+                        match self
+                            .run_bm25_search_bounded(query, route, scope, search_options, top_k)
                             .await
-                            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
+                            .map_err(|error| {
+                                ErrorData::internal_error(
+                                    format!("search deadline fallback failed: {error}"),
+                                    None,
+                                )
+                            })? {
+                            Some(results) => results,
+                            None => {
+                                push_mcp_timeout_warning(
+                                    &mut response_warnings,
+                                    &mut extra_warnings,
+                                    "BM25 fallback search",
+                                    self.search_db_deadline,
+                                );
+                                Vec::new()
+                            }
+                        }
                     }
                 }
             } else {
@@ -2213,22 +2378,26 @@ impl MempalMcpServer {
                 let route = route.clone();
                 let scope = scope.clone();
                 let search_options = search_options.clone();
-                self.async_db
-                    .run_read_anyhow(move |db| {
-                        search_bm25_only_with_options(
-                            db,
-                            &query,
-                            route,
-                            &scope,
-                            search_options,
-                            top_k,
-                        )
-                        .map_err(|error| {
-                            anyhow::anyhow!("search failed after embedder build fallback: {error}")
-                        })
-                    })
+                match self
+                    .run_bm25_search_bounded(query, route, scope, search_options, top_k)
                     .await
-                    .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
+                    .map_err(|error| {
+                        ErrorData::internal_error(
+                            format!("search failed after embedder build fallback: {error}"),
+                            None,
+                        )
+                    })? {
+                    Some(results) => results,
+                    None => {
+                        push_mcp_timeout_warning(
+                            &mut response_warnings,
+                            &mut extra_warnings,
+                            "BM25 fallback search",
+                            self.search_db_deadline,
+                        );
+                        Vec::new()
+                    }
+                }
             }
         };
 
@@ -2243,13 +2412,35 @@ impl MempalMcpServer {
 
         let mut system_warnings = current_system_warnings();
         system_warnings.extend(extra_warnings);
-        let vector_index_stale = self
-            .async_db
-            .run_read(|db| db.vector_index_is_stale())
+        match self
+            .run_read_anyhow_bounded(
+                |db| Ok(db.vector_index_is_stale().unwrap_or(false)),
+                self.search_stale_index_deadline,
+            )
             .await
-            .unwrap_or(false);
-        if let Some(warning) = stale_index_warning_from_bool(vector_index_stale) {
-            system_warnings.push(warning);
+        {
+            Ok(Some(vector_index_stale)) => {
+                if let Some(warning) = stale_index_warning_from_bool(vector_index_stale) {
+                    system_warnings.push(warning);
+                }
+            }
+            Ok(None) => {
+                system_warnings.push(SystemWarning {
+                    level: "warn".to_string(),
+                    message: mcp_stage_timeout_warning(
+                        "stale vector index check",
+                        self.search_stale_index_deadline,
+                    ),
+                    source: "mcp_timeout".to_string(),
+                });
+            }
+            Err(error) => {
+                system_warnings.push(SystemWarning {
+                    level: "warn".to_string(),
+                    message: format!("stale vector index check failed: {error}"),
+                    source: "vector_index".to_string(),
+                });
+            }
         }
         if unresolved_scope && config.search.strict_project_isolation {
             system_warnings.push(SystemWarning {
@@ -2923,10 +3114,8 @@ impl MempalMcpServer {
         // (`should_block_writes`) re-reads fresh status via `degraded_write_error()` and
         // rejects before any success response that would carry this snapshot is built.
         let request_system_warnings = self
-            .async_db
-            .run_read_anyhow(|db| Ok(system_warnings_with_stale_index(db)))
-            .await
-            .map_err(db_error)?;
+            .system_warnings_with_stale_index_bounded(self.ingest_admission_deadline)
+            .await?;
         let dry_run = request.dry_run.unwrap_or(false);
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
@@ -2963,28 +3152,53 @@ impl MempalMcpServer {
         let project_id = self
             .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
             .await?;
-        let prepared = self
-            .prepare_async_ingest_operation(
+        let prepared = match tokio::time::timeout(
+            self.ingest_admission_deadline,
+            self.prepare_async_ingest_operation(
                 &request,
                 controls,
                 config.as_ref(),
                 compiled_privacy.as_ref(),
                 project_id,
-            )
-            .await?;
+            ),
+        )
+        .await
+        {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(mcp_stage_timeout_error(
+                    "mempal_ingest",
+                    "admission preparation",
+                    self.ingest_admission_deadline,
+                ));
+            }
+        };
         let payload = serde_json::to_string(&prepared).map_err(|error| {
             ErrorData::internal_error(format!("failed to serialize ingest request: {error}"), None)
         })?;
-        let operation_id = self
-            .async_queue
-            .enqueue(INGEST_ASYNC_KIND.to_string(), payload)
-            .await
-            .map_err(|error| {
-                ErrorData::internal_error(
+        let operation_id = match tokio::time::timeout(
+            self.ingest_admission_deadline,
+            self.async_queue
+                .enqueue(INGEST_ASYNC_KIND.to_string(), payload),
+        )
+        .await
+        {
+            Ok(Ok(operation_id)) => operation_id,
+            Ok(Err(error)) => {
+                return Err(ErrorData::internal_error(
                     format!("failed to enqueue ingest operation: {error}"),
                     None,
-                )
-            })?;
+                ));
+            }
+            Err(_) => {
+                return Err(mcp_stage_timeout_error(
+                    "mempal_ingest",
+                    "queue admission",
+                    self.ingest_admission_deadline,
+                ));
+            }
+        };
 
         let queued_response = IngestResponse {
             operation_id: Some(operation_id),
@@ -3962,23 +4176,36 @@ impl MempalMcpServer {
         Parameters(request): Parameters<OperationStatusRequest>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let system_warnings = self
-            .async_db
-            .run_read_anyhow(|db| Ok(system_warnings_with_stale_index(db)))
-            .await
-            .map_err(db_error)?;
-        let record = self
-            .async_queue
-            .operation_status(request.operation_id.clone())
-            .await
-            .map_err(|error| {
-                ErrorData::internal_error(format!("queue lookup failed: {error}"), None)
-            })?
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!("operation not found: {}", request.operation_id),
+            .system_warnings_with_stale_index_bounded(self.operation_status_deadline)
+            .await?;
+        let record = match tokio::time::timeout(
+            self.operation_status_deadline,
+            self.async_queue
+                .operation_status(request.operation_id.clone()),
+        )
+        .await
+        {
+            Ok(Ok(record)) => record,
+            Ok(Err(error)) => {
+                return Err(ErrorData::internal_error(
+                    format!("queue lookup failed: {error}"),
                     None,
-                )
-            })?;
+                ));
+            }
+            Err(_) => {
+                return Err(mcp_stage_timeout_error(
+                    "mempal_operation_status",
+                    "queue lookup",
+                    self.operation_status_deadline,
+                ));
+            }
+        }
+        .ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("operation not found: {}", request.operation_id),
+                None,
+            )
+        })?;
 
         Ok(Json(operation_record_to_response(record, system_warnings)))
     }
@@ -6909,6 +7136,47 @@ pub(super) fn current_system_warnings() -> Vec<SystemWarning> {
     warnings
 }
 
+fn format_deadline(deadline: Duration) -> String {
+    let millis = deadline.as_millis();
+    if millis >= 1_000 && millis % 1_000 == 0 {
+        format!("{}s", deadline.as_secs())
+    } else {
+        format!("{millis}ms")
+    }
+}
+
+fn mcp_stage_timeout_warning(stage: &str, deadline: Duration) -> String {
+    format!(
+        "{stage} exceeded {}; returning a bounded diagnostic before the MCP client timeout",
+        format_deadline(deadline)
+    )
+}
+
+fn mcp_stage_timeout_error(operation: &str, stage: &str, deadline: Duration) -> ErrorData {
+    ErrorData::internal_error(
+        format!(
+            "{operation} {stage} exceeded {}; no durable result was confirmed before returning",
+            format_deadline(deadline)
+        ),
+        None,
+    )
+}
+
+fn push_mcp_timeout_warning(
+    response_warnings: &mut Vec<String>,
+    system_warnings: &mut Vec<SystemWarning>,
+    stage: &str,
+    deadline: Duration,
+) {
+    let warning = mcp_stage_timeout_warning(stage, deadline);
+    response_warnings.push(warning.clone());
+    system_warnings.push(SystemWarning {
+        level: "warn".to_string(),
+        message: warning,
+        source: "mcp_timeout".to_string(),
+    });
+}
+
 fn stale_index_warning_from_bool(is_stale: bool) -> Option<SystemWarning> {
     is_stale.then(|| SystemWarning {
         level: "warn".to_string(),
@@ -7507,6 +7775,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_search_returns_diagnostic_when_db_reads_exceed_deadline() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "bounded-search",
+            "bounded search marker",
+            "mcp",
+            Some("deadline"),
+            "bounded-search.md",
+            3,
+        );
+        let async_db = AsyncDb::open(&db_path, 4)
+            .expect("open async db")
+            .with_read_delay(Duration::from_millis(150));
+        let server = server
+            .with_async_db_for_test(async_db)
+            .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.mempal_search(Parameters(SearchRequest {
+                query: "bounded search marker".to_string(),
+                wing: Some("mcp".to_string()),
+                room: Some("deadline".to_string()),
+                top_k: Some(1),
+                disable_progressive: Some(true),
+                ..SearchRequest::default()
+            })),
+        )
+        .await
+        .expect("MCP search should return before client timeout")
+        .expect("bounded diagnostic response")
+        .0;
+
+        assert_eq!(response.search_mode, SearchMode::Bm25Only.as_str());
+        assert!(response.results.is_empty());
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("hybrid search exceeded")),
+            "hybrid timeout warning missing: {:?}",
+            response.warnings
+        );
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("BM25 fallback search exceeded")),
+            "BM25 timeout warning missing: {:?}",
+            response.warnings
+        );
+        assert!(
+            response
+                .system_warnings
+                .iter()
+                .any(|warning| warning.source == "mcp_timeout"),
+            "system warning should expose bounded MCP timeout"
+        );
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_ingest_admission_db_work_runs_off_runtime() {
         let (_tempdir, db_path, server) = setup_server();
         let async_db = AsyncDb::open(&db_path, 4)
@@ -7532,6 +7864,44 @@ mod tests {
         assert_eq!(response.state, Some(IngestOperationState::Queued));
         assert!(response.operation_id.is_some());
         assert_runtime_ticked(&ticks, "mempal_ingest admission");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_admission_returns_error_when_db_reads_exceed_deadline() {
+        let (_tempdir, db_path, server) = setup_server();
+        let async_db = AsyncDb::open(&db_path, 4)
+            .expect("open async db")
+            .with_read_delay(Duration::from_millis(150));
+        let server = server
+            .with_async_db_for_test(async_db)
+            .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.mempal_ingest(Parameters(IngestRequest {
+                content: "bounded ingest admission".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("deadline".to_string()),
+                dry_run: Some(false),
+                wait: Some(false),
+                ..IngestRequest::default()
+            })),
+        )
+        .await
+        .expect("MCP ingest should return before client timeout");
+        let error = match result {
+            Ok(_) => panic!("slow admission should not claim durable acceptance"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("mempal_ingest admission preparation exceeded"),
+            "unexpected error: {error}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
