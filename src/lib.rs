@@ -13,6 +13,8 @@ pub mod crystallize;
 pub mod daemon;
 pub mod daemon_bootstrap;
 pub mod daemon_singleton;
+#[cfg(target_os = "linux")]
+pub(crate) mod db_path_identity;
 pub mod doctor;
 pub mod embed;
 pub mod endpoint_health;
@@ -35,6 +37,7 @@ pub mod knowledge_lifecycle;
 pub mod llm;
 pub mod mcp;
 pub mod observability;
+pub mod process_diagnostics;
 pub mod repair;
 pub mod search;
 pub mod session_review;

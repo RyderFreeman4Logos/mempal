@@ -135,6 +135,7 @@ async fn test_mcp_status_surfaces_queue_stats() {
     let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server.mempal_status().await.expect("status").0;
 
+    assert!(response.db_holders.error.is_none());
     assert_eq!(response.queue_stats.pending, 1);
     assert_eq!(response.queue_stats.claimed, 0);
     assert_eq!(response.queue_stats.failed, 0);

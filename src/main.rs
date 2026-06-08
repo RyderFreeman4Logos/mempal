@@ -9401,6 +9401,8 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         Some(hb) => println!("  last_heartbeat_unix_secs: {hb}"),
         None => println!("  last_heartbeat_unix_secs: none"),
     }
+    let db_holders = mempal::process_diagnostics::inspect_db_holders(db.path());
+    print_db_holder_report("DB Holders", &db_holders, "  ");
     println!("Queue:");
     println!("  pending: {}", queue_stats.pending);
     println!("  claimed: {}", queue_stats.claimed);
@@ -11126,6 +11128,8 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
             siblings.len()
         );
     }
+    let db_holders = mempal::process_diagnostics::inspect_db_holders(db_path);
+    print_db_holder_report("db_holders", &db_holders, "");
     Ok(())
 }
 fn prime_embedder_degraded() -> bool {
@@ -12016,9 +12020,62 @@ fn doctor_command(format: String) -> Result<()> {
             for warning in &report.warnings {
                 println!("warning: {warning}");
             }
+            print_db_holder_report("db_holders", &report.db_holders, "");
         }
     }
     Ok(())
+}
+
+fn print_db_holder_report(
+    heading: &str,
+    report: &mempal::process_diagnostics::DbHolderReport,
+    indent: &str,
+) {
+    println!("{heading}:");
+    println!("{indent}path: {}", report.db_path);
+    println!("{indent}total: {}", report.holder_count);
+    println!("{indent}extra_holders: {}", report.extra_holder_count);
+    println!(
+        "{indent}stale_mcp_servers: {}",
+        report.stale_mcp_server_count
+    );
+    println!("{indent}orphan_daemons: {}", report.orphan_daemon_count);
+    if let Some(error) = report.error.as_deref() {
+        println!("{indent}error: {error}");
+    }
+    if report.holders.is_empty() {
+        println!("{indent}holders: none");
+        return;
+    }
+    println!("{indent}holders:");
+    for holder in &report.holders {
+        let age = holder
+            .age_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let started = holder
+            .started_at_unix_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let files = if holder.opened_files.is_empty() {
+            "none".to_string()
+        } else {
+            holder.opened_files.join(",")
+        };
+        println!(
+            "{indent}- pid={} role={} classification={} current_process={} current_daemon={} current_mcp_server={} age_secs={} started_at_unix_secs={} files={} command={}",
+            holder.pid,
+            holder.role,
+            holder.classification,
+            holder.current_process,
+            holder.current_daemon,
+            holder.current_mcp_server,
+            age,
+            started,
+            files,
+            holder.command
+        );
+    }
 }
 
 async fn brief_command(

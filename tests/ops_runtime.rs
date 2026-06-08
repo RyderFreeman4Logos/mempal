@@ -106,6 +106,12 @@ fn test_cli_doctor_json_reports_schema_and_path() {
     assert_eq!(value["supported_schema_version"], CURRENT_SCHEMA_VERSION);
     assert_eq!(value["db"]["exists"], true);
     assert_eq!(value["db"]["schema_version"], CURRENT_SCHEMA_VERSION);
+    let expected_db_path = palace_db_path(&home).display().to_string();
+    assert_eq!(
+        value["db_holders"]["db_path"].as_str(),
+        Some(expected_db_path.as_str())
+    );
+    assert!(value["db_holders"]["holder_count"].as_u64().is_some());
     assert_eq!(value["install"]["path_matches_current_exe"], false);
     assert!(
         value["warnings"]

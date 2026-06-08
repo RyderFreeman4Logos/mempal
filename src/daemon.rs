@@ -361,6 +361,7 @@ async fn process_hook_worker_message(
     claim_ttl_secs: i64,
 ) {
     let message_id = message.id.clone();
+    refresh_hook_message_heartbeat(&state.store, &message_id, &state.worker_id).await;
     let heartbeat_handle = spawn_hook_message_heartbeat(
         state.store.clone(),
         message_id.clone(),
@@ -421,23 +422,32 @@ fn spawn_hook_message_heartbeat(
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
         loop {
             ticker.tick().await;
             if shutdown_requested() {
                 break;
             }
-            if let Err(error) = store
-                .refresh_heartbeat(message_id.clone(), worker_id.clone())
-                .await
-            {
-                tracing::warn!(
-                    ?error,
-                    message_id,
-                    "failed to refresh hook message heartbeat"
-                );
-            }
+            refresh_hook_message_heartbeat(&store, &message_id, &worker_id).await;
         }
     })
+}
+
+async fn refresh_hook_message_heartbeat(
+    store: &AsyncPendingMessageStore,
+    message_id: &str,
+    worker_id: &str,
+) {
+    if let Err(error) = store
+        .refresh_heartbeat(message_id.to_string(), worker_id.to_string())
+        .await
+    {
+        tracing::warn!(
+            ?error,
+            message_id,
+            "failed to refresh hook message heartbeat"
+        );
+    }
 }
 
 fn hook_message_heartbeat_interval(claim_ttl_secs: i64) -> Duration {

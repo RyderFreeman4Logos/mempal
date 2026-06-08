@@ -5,6 +5,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
 use crate::core::db::CURRENT_SCHEMA_VERSION;
+use crate::process_diagnostics::{DbHolderReport, inspect_db_holders};
 
 pub const REQUIRED_MCP_TOOLS: &[&str] = &[
     "mempal_context",
@@ -62,6 +63,7 @@ pub struct DoctorReport {
     pub current_version: String,
     pub supported_schema_version: u32,
     pub db: DoctorDbReport,
+    pub db_holders: DbHolderReport,
     pub install: DoctorInstallReport,
     pub warnings: Vec<String>,
     pub recommendations: Vec<String>,
@@ -85,6 +87,7 @@ pub struct DoctorInstallReport {
 
 pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
     let db = inspect_db(db_path);
+    let db_holders = inspect_db_holders(db_path);
     let install = inspect_install();
     let mut warnings = Vec::new();
     let mut recommendations = vec![
@@ -104,6 +107,7 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
     if let Some(error) = db.error.as_deref() {
         warnings.push(format!("database schema could not be inspected: {error}"));
     }
+    push_db_holder_warnings(&mut warnings, &mut recommendations, &db_holders);
     if install.path_matches_current_exe == Some(false) {
         warnings
             .push("PATH resolves mempal to a different executable than this process".to_string());
@@ -118,9 +122,45 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         supported_schema_version: CURRENT_SCHEMA_VERSION,
         db,
+        db_holders,
         install,
         warnings,
         recommendations,
+    }
+}
+
+fn push_db_holder_warnings(
+    warnings: &mut Vec<String>,
+    recommendations: &mut Vec<String>,
+    db_holders: &DbHolderReport,
+) {
+    if let Some(error) = db_holders.error.as_deref() {
+        warnings.push(format!(
+            "database holder processes could not be inspected: {error}"
+        ));
+    }
+    if db_holders.stale_mcp_server_count > 0 {
+        warnings.push(format!(
+            "{} stale mempal MCP server process(es) hold the database open",
+            db_holders.stale_mcp_server_count
+        ));
+        recommendations.push(
+            "Restart stale MCP clients after confirming they are not the active session."
+                .to_string(),
+        );
+    }
+    if db_holders.orphan_daemon_count > 0 {
+        warnings.push(format!(
+            "{} orphan daemon process(es) hold the database open",
+            db_holders.orphan_daemon_count
+        ));
+        recommendations.push("Run `mempal daemon status` and `mempal daemon reap`.".to_string());
+    }
+    if db_holders.extra_holder_count > 0 {
+        warnings.push(format!(
+            "{} extra process(es) hold the database open",
+            db_holders.extra_holder_count
+        ));
     }
 }
 
@@ -187,4 +227,42 @@ fn paths_match(left: &Path, right: &Path) -> bool {
     let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
     let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
     left == right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_db_holder_warnings_report_extra_holders_alongside_specific_roles() {
+        let report = DbHolderReport {
+            db_path: "/tmp/palace.db".to_string(),
+            holder_count: 3,
+            extra_holder_count: 1,
+            stale_mcp_server_count: 1,
+            orphan_daemon_count: 1,
+            error: None,
+            holders: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let mut recommendations = Vec::new();
+
+        push_db_holder_warnings(&mut warnings, &mut recommendations, &report);
+
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("stale mempal MCP server"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("orphan daemon"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("extra process"))
+        );
+    }
 }

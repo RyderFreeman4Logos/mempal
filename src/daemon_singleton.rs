@@ -24,12 +24,13 @@
 //! and is released automatically when the process dies — even on `SIGKILL`,
 //! which is precisely how an orphaned daemon's lock frees up for its successor.
 
-use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use crate::db_path_identity::DbPathIdentity;
 use thiserror::Error;
 
 /// Lock file name, written next to `daemon.pid` inside `mempal_home`.
@@ -171,7 +172,7 @@ pub fn is_daemon_argv<S: AsRef<str>>(argv: &[S], binary_name: &str) -> bool {
     }
 }
 
-fn first_cli_subcommand<S: AsRef<str>>(argv: &[S]) -> Option<(usize, &str)> {
+pub(crate) fn first_cli_subcommand<S: AsRef<str>>(argv: &[S]) -> Option<(usize, &str)> {
     let mut skip_next = false;
     for (index, arg) in argv.iter().enumerate().skip(1) {
         let arg = arg.as_ref();
@@ -220,7 +221,7 @@ fn enumerate_daemon_pids_in_proc(
     self_pid: i32,
 ) -> Vec<i32> {
     let mut pids = Vec::new();
-    let Some(db_identity) = DbPathIdentity::from_db_path(db_path) else {
+    let Some(db_identity) = DbPathIdentity::from_existing_db_path(db_path) else {
         return pids;
     };
     let Ok(entries) = std::fs::read_dir(proc_root) else {
@@ -262,50 +263,6 @@ fn process_matches_db_path(proc_pid_dir: &Path, db_identity: &DbPathIdentity) ->
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone)]
-struct DbPathIdentity {
-    db_path: PathBuf,
-    fd_targets: BTreeSet<PathBuf>,
-}
-
-#[cfg(target_os = "linux")]
-impl DbPathIdentity {
-    fn from_db_path(db_path: &Path) -> Option<Self> {
-        let db_path = std::fs::canonicalize(db_path).ok()?;
-        let mut fd_targets = BTreeSet::new();
-        fd_targets.insert(db_path.clone());
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = append_os_suffix(&db_path, suffix);
-            fd_targets.insert(canonicalize_if_present(&sidecar));
-        }
-        Some(Self {
-            db_path,
-            fd_targets,
-        })
-    }
-
-    fn db_path(&self) -> &Path {
-        &self.db_path
-    }
-
-    fn matches_fd_target(&self, fd_target: &Path) -> bool {
-        self.fd_targets.contains(fd_target)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn append_os_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut os = OsString::from(path.as_os_str());
-    os.push(OsStr::new(suffix));
-    PathBuf::from(os)
-}
-
-#[cfg(target_os = "linux")]
-fn canonicalize_if_present(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-#[cfg(target_os = "linux")]
 fn process_has_db_fd(proc_pid_dir: &Path, db_identity: &DbPathIdentity) -> bool {
     let Ok(entries) = std::fs::read_dir(proc_pid_dir.join("fd")) else {
         return false;
@@ -315,10 +272,7 @@ fn process_has_db_fd(proc_pid_dir: &Path, db_identity: &DbPathIdentity) -> bool 
         let Ok(target) = std::fs::read_link(entry.path()) else {
             return false;
         };
-        let Ok(canonical_target) = std::fs::canonicalize(target) else {
-            return false;
-        };
-        db_identity.matches_fd_target(&canonical_target)
+        db_identity.matches_fd(&entry.path(), &target)
     })
 }
 
@@ -680,6 +634,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_enumerate_proc_scan_matches_non_utf8_db_path() {
+        use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
         let temp = tempfile::tempdir().expect("temp dir");
