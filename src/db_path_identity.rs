@@ -63,6 +63,9 @@ impl DbFileIdentity {
         if self.fd_targets.contains(fd_target) {
             return true;
         }
+        if !fd_target.is_absolute() {
+            return false;
+        }
 
         let target_name_matches = self.target_name_matches(fd_target);
         let canonical_target = canonicalize_if_present(fd_target);
@@ -230,6 +233,16 @@ mod tests {
         let identity = DbFileIdentity::from_resolved_path(&db_path);
 
         assert!(identity.matches_fd(&tmp.path().join("missing-fd"), &db_path));
+    }
+
+    #[test]
+    fn test_matches_fd_rejects_non_absolute_fd_targets_after_direct_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        File::create(&db_path).expect("db file");
+        let identity = DbFileIdentity::from_resolved_path(&db_path);
+
+        assert!(!identity.matches_fd(&tmp.path().join("fd-3"), Path::new("socket:[12345]")));
     }
 
     #[test]
