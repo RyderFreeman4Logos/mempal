@@ -2,10 +2,10 @@
 use std::fs;
 use std::path::Path;
 #[cfg(target_os = "linux")]
-use std::path::PathBuf;
-#[cfg(target_os = "linux")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+use crate::db_path_identity::{DbFileIdentity, db_file_targets};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 
@@ -182,7 +182,7 @@ fn empty_report(db_path: &Path, error: Option<String>) -> DbHolderReport {
 }
 
 #[cfg(target_os = "linux")]
-fn opened_db_files(fd_dir: &Path, targets: &[(String, PathBuf)]) -> Vec<String> {
+fn opened_db_files(fd_dir: &Path, targets: &[(&'static str, DbFileIdentity)]) -> Vec<String> {
     let entries = match fs::read_dir(fd_dir) {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
@@ -192,45 +192,16 @@ fn opened_db_files(fd_dir: &Path, targets: &[(String, PathBuf)]) -> Vec<String> 
         let Ok(target) = fs::read_link(entry.path()) else {
             continue;
         };
-        let target = strip_deleted_suffix(target);
         for (kind, expected) in targets {
-            if target == *expected && !opened.contains(kind) {
-                opened.push(kind.clone());
+            if expected.matches_fd(&entry.path(), &target)
+                && !opened.iter().any(|opened_kind| opened_kind == kind)
+            {
+                opened.push((*kind).to_string());
             }
         }
     }
     opened.sort();
     opened
-}
-
-#[cfg(target_os = "linux")]
-fn db_file_targets(db_path: &Path) -> Vec<(String, PathBuf)> {
-    vec![
-        ("db".to_string(), db_path.to_path_buf()),
-        ("shm".to_string(), path_with_suffix(db_path, "-shm")),
-        ("wal".to_string(), path_with_suffix(db_path, "-wal")),
-    ]
-}
-
-#[cfg(target_os = "linux")]
-fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
-#[cfg(target_os = "linux")]
-fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-    const DELETED_SUFFIX: &[u8] = b" (deleted)";
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.ends_with(DELETED_SUFFIX) {
-        let keep = bytes.len().saturating_sub(DELETED_SUFFIX.len());
-        return PathBuf::from(OsString::from_vec(bytes[..keep].to_vec()));
-    }
-    path
 }
 
 #[cfg(target_os = "linux")]
@@ -403,7 +374,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux {
         use super::super::*;
+        use crate::db_path_identity::{append_os_suffix, db_file_targets_with_cwd};
         use std::fs;
+        use std::fs::File;
         use std::os::unix::fs::symlink;
 
         fn write_process(proc_root: &Path, pid: i32, argv: &[&str], db_files: &[&Path]) {
@@ -452,8 +425,8 @@ mod tests {
             let mempal_home = tmp.path().join(".mempal");
             fs::create_dir_all(&mempal_home).expect("create mempal home");
             let db_path = mempal_home.join("palace.db");
-            let wal_path = path_with_suffix(&db_path, "-wal");
-            let shm_path = path_with_suffix(&db_path, "-shm");
+            let wal_path = append_os_suffix(&db_path, "-wal");
+            let shm_path = append_os_suffix(&db_path, "-shm");
             fs::write(mempal_home.join("daemon.pid"), "42\n").expect("write pidfile");
 
             write_process(
@@ -517,6 +490,69 @@ mod tests {
             assert_eq!(report.holder_count, 1);
             assert_eq!(report.holders[0].role, "other");
             assert_eq!(report.holders[0].classification, "extra_holder");
+        }
+
+        #[test]
+        fn test_opened_db_files_matches_relative_db_path_against_absolute_fd_target() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let proc_root = tmp.path().join("proc");
+            fs::create_dir_all(&proc_root).expect("create proc");
+            let db_path = tmp.path().join("palace.db");
+            File::create(&db_path).expect("db file");
+            write_process(&proc_root, 33, &["mempal", "serve"], &[db_path.as_path()]);
+
+            let targets = db_file_targets_with_cwd(Path::new("palace.db"), tmp.path());
+            let opened = opened_db_files(&proc_root.join("33").join("fd"), &targets);
+
+            assert_eq!(opened, vec!["db"]);
+        }
+
+        #[test]
+        fn test_opened_db_files_matches_symlinked_db_directory() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let proc_root = tmp.path().join("proc");
+            let real_home = tmp.path().join("real-mempal");
+            let linked_home = tmp.path().join("linked-mempal");
+            fs::create_dir_all(&proc_root).expect("create proc");
+            fs::create_dir_all(&real_home).expect("create real home");
+            symlink(&real_home, &linked_home).expect("symlink home");
+            let real_db_path = real_home.join("palace.db");
+            File::create(&real_db_path).expect("db file");
+            write_process(
+                &proc_root,
+                44,
+                &["mempal", "serve"],
+                &[real_db_path.as_path()],
+            );
+
+            let targets = db_file_targets(&linked_home.join("palace.db"));
+            let opened = opened_db_files(&proc_root.join("44").join("fd"), &targets);
+
+            assert_eq!(opened, vec!["db"]);
+        }
+
+        #[test]
+        fn test_opened_db_files_matches_symlinked_db_path() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let proc_root = tmp.path().join("proc");
+            let real_home = tmp.path().join("real-mempal");
+            fs::create_dir_all(&proc_root).expect("create proc");
+            fs::create_dir_all(&real_home).expect("create real home");
+            let real_db_path = real_home.join("palace.db");
+            let linked_db_path = tmp.path().join("palace-link.db");
+            File::create(&real_db_path).expect("db file");
+            symlink(&real_db_path, &linked_db_path).expect("symlink db");
+            write_process(
+                &proc_root,
+                55,
+                &["mempal", "serve"],
+                &[real_db_path.as_path()],
+            );
+
+            let targets = db_file_targets(&linked_db_path);
+            let opened = opened_db_files(&proc_root.join("55").join("fd"), &targets);
+
+            assert_eq!(opened, vec!["db"]);
         }
     }
 
