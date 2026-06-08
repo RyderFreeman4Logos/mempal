@@ -12904,7 +12904,7 @@ struct IngestWaitTimedOut {
 impl IngestWaitTimedOut {
     fn new(operation_id: Option<&str>) -> Self {
         Self {
-            operation_id: operation_id.unwrap_or("").to_string(),
+            operation_id: operation_id.unwrap_or_default().to_string(),
         }
     }
 }
