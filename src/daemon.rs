@@ -10,7 +10,7 @@ use std::{future::Future, pin::Pin};
 use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
     AsyncDb,
-    db::{Database, DbError},
+    db::{Database, DbError, NoveltyAuditInsert},
     project::resolve_project_id,
     queue::{AsyncPendingMessageStore, ClaimedMessage, QueueFailureDisposition},
     strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
@@ -1349,23 +1349,20 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 context
                     .db
                     .run_write_anyhow(move |db| {
-                        db.record_novelty_audit(
-                            &drawer_id_for_merge,
-                            NoveltyAction::Merge,
-                            Some(target_id_for_merge.as_str()),
-                            novelty.cosine,
-                            audit_decision.as_deref(),
-                            project_id.as_deref(),
-                        )
-                        .with_context(|| {
-                            format!("failed to record novelty audit {}", drawer_id_for_merge)
-                        })?;
-                        db.update_drawer_after_merge(
+                        db.update_drawer_after_merge_and_record_novelty_audit(
                             &target_id_for_merge,
                             &merged_content,
                             &merged_at,
                             &merged_vector,
                             merge_count,
+                            NoveltyAuditInsert {
+                                candidate_hash: &drawer_id_for_merge,
+                                action: NoveltyAction::Merge,
+                                near_drawer_id: Some(target_id_for_merge.as_str()),
+                                cosine: novelty.cosine,
+                                audit_decision: audit_decision.as_deref(),
+                                project_id: project_id.as_deref(),
+                            },
                         )
                         .map_err(|error| match error {
                             DbError::DrawerMergeConflict { .. } => anyhow::Error::new(error),
@@ -2209,6 +2206,18 @@ mod tests {
         assert!(content.contains("other supplement"));
         assert!(!content.contains("candidate supplement"));
         assert_eq!(merge_count, 1);
+
+        let merge_audit_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM novelty_audit WHERE decision = 'merge' AND near_drawer_id = 'existing-target'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count merge audit rows");
+        assert_eq!(
+            merge_audit_count, 0,
+            "conflicted daemon merge must not record a successful merge audit row"
+        );
     }
 
     struct LlmClaimRaceProbeEmbedder {
