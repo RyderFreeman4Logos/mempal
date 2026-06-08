@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -8,11 +10,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
 
 use super::config::{CompiledPrivacyConfig, Config, ConfigError, ConfigSnapshotMeta};
 
 const MAX_EVENT_LOG: usize = 64;
+const MAX_PERSISTED_EVENT_LOG_BYTES: u64 = 64 * 1024;
+const HOT_RELOAD_EVENT_LOG_FILE: &str = "hot-reload-events.log";
 const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const HOT_RELOAD_EVENT_KIND_RESTART_REQUIRED: &str = "restart_required";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersistedHotReloadEvent {
+    mempal_hot_reload_event: String,
+    schema_version: u8,
+    pid: u32,
+    message: String,
+}
 
 #[derive(Debug)]
 struct ConfigSnapshot {
@@ -90,6 +104,7 @@ pub struct HotReloadState {
     snapshot: ArcSwap<ConfigSnapshot>,
     runtime: Mutex<Option<RuntimeControl>>,
     event_log: Mutex<VecDeque<String>>,
+    event_log_path: Mutex<Option<PathBuf>>,
     parse_attempts: AtomicUsize,
     // harness-point: PR0 — counts successful reload applications (version changes)
     reload_count: Arc<AtomicUsize>,
@@ -110,6 +125,7 @@ impl HotReloadState {
             snapshot: ArcSwap::from_pointee(snapshot),
             runtime: Mutex::new(None),
             event_log: Mutex::new(VecDeque::new()),
+            event_log_path: Mutex::new(None),
             parse_attempts: AtomicUsize::new(0),
             reload_count: Arc::new(AtomicUsize::new(0)),
             runtime_prototypes: ArcSwap::from_pointee(
@@ -123,6 +139,18 @@ impl HotReloadState {
         let config = Config::load_from(path)?;
         let snapshot = ConfigSnapshot::from_config(config.clone())?;
         self.snapshot.store(Arc::new(snapshot));
+        *self
+            .event_log_path
+            .lock()
+            .expect("event log path mutex poisoned") = Some(hot_reload_event_log_path(path));
+        clear_persisted_restart_events_for_pid(
+            &hot_reload_event_log_path(path),
+            std::process::id(),
+        );
+        self.event_log
+            .lock()
+            .expect("event log mutex poisoned")
+            .clear();
         self.runtime_prototypes.store(Arc::new(
             config.ingest_gating.embedding_classifier.prototypes.clone(),
         ));
@@ -195,6 +223,20 @@ impl HotReloadState {
             .iter()
             .cloned()
             .collect()
+    }
+
+    pub fn restart_required_pending_events(&self) -> Vec<String> {
+        let mut events = Vec::new();
+        events.extend(self.recent_events());
+        if let Some(path) = self
+            .event_log_path
+            .lock()
+            .expect("event log path mutex poisoned")
+            .clone()
+        {
+            events.extend(read_restart_required_events_from_path(&path));
+        }
+        dedupe_restart_required_events(events)
     }
 
     pub fn runtime_prototypes(&self) -> Vec<String> {
@@ -449,12 +491,155 @@ impl HotReloadState {
 
     fn push_event(&self, event: String) {
         eprintln!("{event}");
+        self.persist_event(&event);
         let mut events = self.event_log.lock().expect("event log mutex poisoned");
         if events.len() == MAX_EVENT_LOG {
             let _ = events.pop_front();
         }
         events.push_back(event);
     }
+
+    fn persist_event(&self, event: &str) {
+        let Some(path) = self
+            .event_log_path
+            .lock()
+            .expect("event log path mutex poisoned")
+            .clone()
+        else {
+            return;
+        };
+        if std::fs::metadata(&path)
+            .map(|metadata| metadata.len() > MAX_PERSISTED_EVENT_LOG_BYTES)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::write(&path, "");
+        }
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", persisted_event_line(event));
+            }
+            Err(error) => {
+                eprintln!(
+                    "config hot-reload: failed to persist event to {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+pub fn hot_reload_event_log_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(HOT_RELOAD_EVENT_LOG_FILE)
+}
+
+pub fn restart_required_pending_events_from_config_path(config_path: &Path) -> Vec<String> {
+    read_restart_required_events_from_path(&hot_reload_event_log_path(config_path))
+}
+
+fn read_restart_required_events_from_path(path: &Path) -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    dedupe_restart_required_events(
+        contents
+            .lines()
+            .filter_map(restart_required_message_from_persisted_line),
+    )
+}
+
+fn dedupe_restart_required_events(events: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    events
+        .into_iter()
+        .filter(|event| is_restart_required_event(event))
+        .filter(|event| seen.insert(event.clone()))
+        .collect()
+}
+
+fn is_restart_required_event(event: &str) -> bool {
+    event.contains("requires restart, change ignored")
+        || event.contains("effective after daemon restart")
+}
+
+fn persisted_event_line(event: &str) -> String {
+    if !is_restart_required_event(event) {
+        return event.to_string();
+    }
+
+    let record = PersistedHotReloadEvent {
+        mempal_hot_reload_event: HOT_RELOAD_EVENT_KIND_RESTART_REQUIRED.to_string(),
+        schema_version: 1,
+        pid: std::process::id(),
+        message: event.to_string(),
+    };
+    serde_json::to_string(&record).unwrap_or_else(|_| event.to_string())
+}
+
+fn restart_required_message_from_persisted_line(line: &str) -> Option<String> {
+    let record = serde_json::from_str::<PersistedHotReloadEvent>(line).ok()?;
+    if record.mempal_hot_reload_event != HOT_RELOAD_EVENT_KIND_RESTART_REQUIRED {
+        return None;
+    }
+    if !is_restart_required_event(&record.message) || !process_is_running(record.pid) {
+        return None;
+    }
+    Some(record.message)
+}
+
+fn clear_persisted_restart_events_for_pid(path: &Path, pid: u32) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+
+    let mut changed = false;
+    let retained = contents
+        .lines()
+        .filter(
+            |line| match serde_json::from_str::<PersistedHotReloadEvent>(line) {
+                Ok(record)
+                    if record.mempal_hot_reload_event == HOT_RELOAD_EVENT_KIND_RESTART_REQUIRED
+                        && record.pid == pid =>
+                {
+                    changed = true;
+                    false
+                }
+                _ => true,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    if changed {
+        let next = if retained.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", retained.join("\n"))
+        };
+        let _ = std::fs::write(path, next);
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: kill(pid, 0) does not send a signal; it only checks whether a
+    // process exists and whether this process may signal it.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_running(pid: u32) -> bool {
+    pid == std::process::id()
 }
 
 fn create_watcher(

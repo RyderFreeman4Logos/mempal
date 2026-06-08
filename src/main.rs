@@ -9222,6 +9222,16 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         .context("failed to read gating counters")?;
     let gating_stats =
         observability::gating_stats(db, config, None).context("failed to read gating stats")?;
+    let dropped_total = gating_drop_counts
+        .total
+        .unwrap_or_else(|| gating_drop_counts.by_reason.values().copied().sum::<u64>());
+    let ingest_gating_status = observability::gating_runtime_status(
+        db,
+        config,
+        dropped_total,
+        ConfigHandle::restart_required_pending(),
+    )
+    .context("failed to build ingest gating status")?;
     let db_size_bytes = db
         .database_size_bytes()
         .context("failed to compute database size")?;
@@ -9438,6 +9448,27 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         println!("  redactions_per_pattern: {per}");
     }
     println!("Gating:");
+    println!("  enabled: {}", ingest_gating_status.enabled);
+    println!("  tier1_active: {}", ingest_gating_status.tier1_active);
+    println!("  tier2_active: {}", ingest_gating_status.tier2_active);
+    println!("  llm_active: {}", ingest_gating_status.llm_active);
+    match ingest_gating_status.llm_model.as_deref() {
+        Some(model) => println!("  llm_model: {model}"),
+        None => println!("  llm_model: none"),
+    }
+    println!(
+        "  tier2_threshold: {}",
+        ingest_gating_status.tier2_threshold
+    );
+    match ingest_gating_status.llm_threshold {
+        Some(threshold) => println!("  llm_threshold: {threshold}"),
+        None => println!("  llm_threshold: none"),
+    }
+    println!("  rules_count: {}", ingest_gating_status.rules_count);
+    println!(
+        "  tier1_skip_events: {}",
+        display_list_or_none(&ingest_gating_status.tier1_skip_events)
+    );
     println!("  kept: {}", gating_stats.kept);
     println!("  skipped: {}", gating_stats.skipped);
     println!("  tier1_kept: {}", gating_stats.tier1_kept);
@@ -9450,10 +9481,44 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         .iter()
         .filter_map(|(r, c)| (*c > 0).then_some(format!("{r}={c}")))
         .collect::<Vec<_>>();
-    let dropped_total = gating_drop_counts
-        .total
-        .unwrap_or_else(|| gating_drop_counts.by_reason.values().copied().sum::<u64>());
     println!("  dropped_total: {dropped_total}");
+    println!(
+        "  quarantined_total: {}",
+        ingest_gating_status.quarantined_total
+    );
+    println!(
+        "  soft_deleted_total: {}",
+        ingest_gating_status.soft_deleted_total
+    );
+    match ingest_gating_status.last_keep_at {
+        Some(timestamp) => println!("  last_keep_at: {timestamp}"),
+        None => println!("  last_keep_at: none"),
+    }
+    match ingest_gating_status.last_skip_at {
+        Some(timestamp) => println!("  last_skip_at: {timestamp}"),
+        None => println!("  last_skip_at: none"),
+    }
+    match ingest_gating_status.last_llm_success_at {
+        Some(timestamp) => println!("  last_llm_success_at: {timestamp}"),
+        None => println!("  last_llm_success_at: none"),
+    }
+    match ingest_gating_status.last_llm_failure_at {
+        Some(timestamp) => println!("  last_llm_failure_at: {timestamp}"),
+        None => println!("  last_llm_failure_at: none"),
+    }
+    if ingest_gating_status
+        .restart_required_config_changes
+        .is_empty()
+    {
+        println!("  restart_required_config_changes: none");
+    } else {
+        println!(
+            "  restart_required_config_changes: {}",
+            ingest_gating_status
+                .restart_required_config_changes
+                .join(" | ")
+        );
+    }
     if nonzero.is_empty() {
         println!("  dropped_by_reason: none");
     } else {
@@ -12017,6 +12082,14 @@ fn doctor_command(format: String) -> Result<()> {
                 "path_matches_current_exe={:?}",
                 report.install.path_matches_current_exe
             );
+            if report.restart_required_config_changes.is_empty() {
+                println!("restart_required_config_changes=none");
+            } else {
+                println!(
+                    "restart_required_config_changes={}",
+                    report.restart_required_config_changes.join(" | ")
+                );
+            }
             for warning in &report.warnings {
                 println!("warning: {warning}");
             }

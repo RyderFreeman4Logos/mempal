@@ -101,23 +101,24 @@ use super::tools::{
     CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DoctorMcpDto,
     DoctorRequest, DoctorResponse, DoctorToolDto, DuplicateWarning, EmbedStatusDto,
     EmbedderCircuitDto, EndpointHealthDto, FactCheckRequest, FactCheckResponse,
-    FieldTaxonomyEntryDto, FieldTaxonomyResponse, IngestControls, IngestOperationState,
-    IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto,
-    KnowledgeCardDto, KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse,
-    KnowledgeDemoteRequest, KnowledgeDemoteResponse, KnowledgeDistillRequest,
-    KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse,
-    KnowledgePromoteRequest, KnowledgePromoteResponse, KnowledgePublishAnchorRequest,
-    KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest, LeaseResponse, LlmStatusDto,
-    MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest,
-    PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
-    Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
-    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
-    ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto, RollbackRequest,
-    RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto,
-    SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
-    SkillSummaryDto, SourceTypeCount, StatusDetail, StatusRequest, StatusResponse, StatusScope,
-    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
-    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    FieldTaxonomyEntryDto, FieldTaxonomyResponse, GatingRuntimeStatusDto, IngestControls,
+    IngestOperationState, IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest,
+    KgResponse, KgStatsDto, KnowledgeCardDto, KnowledgeCardEventDto, KnowledgeCardsRequest,
+    KnowledgeCardsResponse, KnowledgeDemoteRequest, KnowledgeDemoteResponse,
+    KnowledgeDistillRequest, KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse,
+    KnowledgePolicyResponse, KnowledgePromoteRequest, KnowledgePromoteResponse,
+    KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest,
+    LeaseResponse, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS,
+    OperationStatusRequest, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto,
+    Phase3Request, Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest,
+    PinnedFactsResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest,
+    ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto,
+    RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto,
+    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, SkillDto,
+    SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, StatusDetail, StatusRequest,
+    StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto, TaxonomyRequest,
+    TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto, TunnelsRequest,
+    TunnelsResponse, TurnStorageStatusDto,
 };
 
 const MCP_SEARCH_ROUTE_DEADLINE: Duration = Duration::from_secs(5);
@@ -1976,6 +1977,30 @@ impl MempalMcpServer {
 
         let embed_failure_headline =
             crate::core::queue::failure_headline_count(embed_snapshot.fail_count, &queue_stats);
+        let config_for_gating_status = Arc::clone(&config);
+        let restart_required_config_changes = ConfigHandle::restart_required_pending();
+        let async_db = self.async_db().await.map_err(|error| {
+            ErrorData::internal_error(format!("async db init failed: {error}"), None)
+        })?;
+        let ingest_gating_status = async_db
+            .run_read_anyhow(move |db| {
+                let gating_drop_counts = db
+                    .gating_drop_counts()
+                    .context("gating drop counts failed")?;
+                let dropped_total = gating_drop_counts
+                    .total
+                    .unwrap_or_else(|| gating_drop_counts.by_reason.values().copied().sum::<u64>());
+                crate::observability::gating_runtime_status(
+                    db,
+                    config_for_gating_status.as_ref(),
+                    dropped_total,
+                    restart_required_config_changes,
+                )
+            })
+            .await
+            .map_err(|error| {
+                ErrorData::internal_error(format!("ingest gating status failed: {error}"), None)
+            })?;
 
         Ok(Json(StatusResponse {
             schema_version: db_snapshot.schema_version,
@@ -2044,6 +2069,7 @@ impl MempalMcpServer {
                     .as_str()
                     .to_string(),
             },
+            ingest_gating_status: GatingRuntimeStatusDto::from(ingest_gating_status),
             queue_stats: QueueStatsDto {
                 pending: queue_stats.pending,
                 claimed: queue_stats.claimed,

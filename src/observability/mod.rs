@@ -11,7 +11,7 @@ use crate::core::project::{ProjectFilterMode, ProjectSearchScope, resolve_projec
 use crate::cowork::peek::{format_rfc3339, parse_rfc3339};
 use anyhow::{Context, Result, bail};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -175,6 +175,211 @@ pub struct GatingStatsSummary {
     pub unclassified: usize,
     pub kept_by_label: std::collections::BTreeMap<String, usize>,
     pub skipped_by_reason: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GatingRuntimeStatus {
+    pub enabled: bool,
+    pub tier1_active: bool,
+    pub tier2_active: bool,
+    pub llm_active: bool,
+    pub llm_model: Option<String>,
+    pub tier2_threshold: f32,
+    pub llm_threshold: Option<f64>,
+    pub tier1_skip_events: Vec<String>,
+    pub rules_count: usize,
+    pub kept_total: usize,
+    pub skipped_total: usize,
+    pub dropped_total: u64,
+    pub quarantined_total: u64,
+    pub soft_deleted_total: i64,
+    pub last_keep_at: Option<i64>,
+    pub last_skip_at: Option<i64>,
+    pub last_llm_success_at: Option<i64>,
+    pub last_llm_failure_at: Option<i64>,
+    pub restart_required_config_changes: Vec<String>,
+}
+
+pub fn gating_runtime_status(
+    db: &Database,
+    config: &Config,
+    dropped_total: u64,
+    restart_required_config_changes: Vec<String>,
+) -> Result<GatingRuntimeStatus> {
+    let kept_total = gating_decision_count(db, "keep")?;
+    let skipped_total = gating_decision_count(db, "skip")?;
+    Ok(GatingRuntimeStatus {
+        enabled: config.ingest_gating.enabled,
+        tier1_active: config.ingest_gating.enabled,
+        tier2_active: config.ingest_gating.enabled
+            && config.ingest_gating.embedding_classifier.enabled
+            && !config
+                .ingest_gating
+                .embedding_classifier
+                .prototypes
+                .is_empty(),
+        llm_active: config.ingest_gating.enabled
+            && config.llm.enabled
+            && config.llm.enabled_for.iter().any(|item| item == "gating")
+            && config
+                .ingest_gating
+                .llm_judge
+                .as_ref()
+                .is_some_and(|judge| judge.enabled),
+        llm_model: config.llm.model.clone(),
+        tier2_threshold: config.ingest_gating.embedding_classifier.threshold,
+        llm_threshold: config
+            .ingest_gating
+            .llm_judge
+            .as_ref()
+            .map(|judge| judge.threshold),
+        tier1_skip_events: config.ingest_gating.tier1_skip_events.clone(),
+        rules_count: config.ingest_gating.rules.len(),
+        kept_total,
+        skipped_total,
+        dropped_total: dropped_total.max(skipped_total as u64),
+        quarantined_total: 0,
+        soft_deleted_total: gating_soft_deleted_count(db)?,
+        last_keep_at: last_gating_decision_at(db, "keep")?,
+        last_skip_at: last_gating_decision_at(db, "skip")?,
+        last_llm_success_at: last_completed_llm_task_at(db)?,
+        last_llm_failure_at: last_failed_llm_task_at(db)?,
+        restart_required_config_changes,
+    })
+}
+
+fn gating_decision_count(db: &Database, decision: &str) -> Result<usize> {
+    let count = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM gating_audit WHERE decision = ?1",
+            [decision],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count gating decisions")?;
+    usize::try_from(count).context("gating decision count was negative or too large")
+}
+
+fn last_gating_decision_at(db: &Database, decision: &str) -> Result<Option<i64>> {
+    db.conn()
+        .query_row(
+            "SELECT MAX(created_at) FROM gating_audit WHERE decision = ?1",
+            [decision],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .context("failed to read last gating decision timestamp")
+}
+
+fn gating_soft_deleted_count(db: &Database) -> Result<i64> {
+    if !table_has_column(db, "gating_audit", "drawer_id")?
+        || !table_has_column(db, "gating_audit", "llm_verdict")?
+    {
+        return Ok(0);
+    }
+
+    db.conn()
+        .query_row(
+            r#"
+            SELECT COUNT(DISTINCT drawers.id)
+            FROM drawers
+            INNER JOIN gating_audit ON gating_audit.drawer_id = drawers.id
+            WHERE drawers.deleted_at IS NOT NULL
+              AND gating_audit.llm_verdict = 'reject'
+            "#,
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count gate soft-deleted drawers")
+}
+
+fn last_completed_llm_task_at(db: &Database) -> Result<Option<i64>> {
+    if !table_has_column(db, "pending_message_completions", "completed_at")? {
+        return Ok(None);
+    }
+
+    let sql = if table_has_column(db, "pending_message_completions", "op_state")? {
+        r#"
+        SELECT MAX(completed_at)
+        FROM pending_message_completions
+        WHERE kind = 'llm_task' AND op_state IN ('completed', 'rejected')
+        "#
+    } else {
+        r#"
+        SELECT MAX(completed_at)
+        FROM pending_message_completions
+        WHERE kind = 'llm_task'
+        "#
+    };
+
+    db.conn()
+        .query_row(sql, [], |row| row.get::<_, Option<i64>>(0))
+        .optional()
+        .map(Option::flatten)
+        .context("failed to read last completed LLM task timestamp")
+}
+
+fn last_failed_llm_task_at(db: &Database) -> Result<Option<i64>> {
+    let completion_failure_at =
+        if table_has_column(db, "pending_message_completions", "completed_at")?
+            && table_has_column(db, "pending_message_completions", "op_state")?
+        {
+            db.conn()
+                .query_row(
+                    r#"
+                    SELECT MAX(completed_at)
+                    FROM pending_message_completions
+                    WHERE kind = 'llm_task' AND op_state = 'failed'
+                    "#,
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()
+                .map(Option::flatten)
+                .context("failed to read completed failed LLM task timestamp")?
+        } else {
+            None
+        };
+
+    let dead_letter_failure_at = if table_has_column(db, "pending_messages", "kind")?
+        && table_has_column(db, "pending_messages", "next_attempt_at")?
+    {
+        db.conn()
+            .query_row(
+                r#"
+                SELECT MAX(next_attempt_at * 1000)
+                FROM pending_messages
+                WHERE kind = 'llm_task' AND status = 'failed'
+                "#,
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .context("failed to read dead-lettered LLM task timestamp")?
+    } else {
+        None
+    };
+
+    match (completion_failure_at, dead_letter_failure_at) {
+        (Some(completion), Some(dead_letter)) => Ok(Some(completion.max(dead_letter))),
+        (Some(completion), None) => Ok(Some(completion)),
+        (None, Some(dead_letter)) => Ok(Some(dead_letter)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn table_has_column(db: &Database, table: &str, column: &str) -> Result<bool> {
+    let mut statement = db
+        .conn()
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("failed to inspect {table} columns"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read {table} columns"))?;
+    Ok(columns.iter().any(|candidate| candidate == column))
 }
 
 pub fn tail_command(db: &Database, config: &Config, options: TailOptions<'_>) -> Result<()> {
