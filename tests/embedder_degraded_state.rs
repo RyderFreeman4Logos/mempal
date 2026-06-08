@@ -74,7 +74,8 @@ async fn test_degraded_state_blocks_mcp_writes() {
     let tmp = TempDir::new().expect("tempdir");
     let _config_path = bootstrap_config(&tmp);
     let db_path = tmp.path().join("palace.db");
-    let server = MempalMcpServer::new_with_factory(db_path, Arc::new(StubEmbedderFactory));
+    let server = MempalMcpServer::new_with_factory(db_path, Arc::new(StubEmbedderFactory))
+        .expect("create MCP server");
     let status = global_embed_status();
     status.reset_for_tests();
 

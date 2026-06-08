@@ -132,7 +132,7 @@ async fn test_mcp_status_surfaces_queue_stats() {
         .expect("done");
     store.confirm(&done.id).expect("confirm");
 
-    let server = MempalMcpServer::new(db_path, config);
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server.mempal_status().await.expect("status").0;
 
     assert_eq!(response.queue_stats.pending, 1);
@@ -166,7 +166,7 @@ async fn test_mcp_status_headline_reflects_failed_queue() {
         .mark_failed_with_disposition(&failed.id, "boom", QueueFailureDisposition::Terminal)
         .expect("mark terminal failed");
 
-    let server = MempalMcpServer::new(db_path, config);
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server.mempal_status().await.expect("status").0;
 
     assert_eq!(response.queue_stats.failed, 1);
@@ -181,7 +181,7 @@ async fn test_mcp_status_surfaces_source_type_distribution() {
     insert_drawer_with_source_type(&db_path, "drawer-user", SourceType::UserExplicit);
     insert_drawer_with_source_type(&db_path, "drawer-hook", SourceType::SystemGenerated);
 
-    let server = MempalMcpServer::new(db_path, config);
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server.mempal_status().await.expect("status").0;
 
     let user_count = response
@@ -220,7 +220,7 @@ async fn test_mcp_status_surfaces_consolidation_stats() {
     }
     merge_cluster(&db, &ids, CompactionStrategy::RichestContent, false).expect("merge cluster");
 
-    let server = MempalMcpServer::new(db_path, config);
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server.mempal_status().await.expect("status").0;
 
     assert_eq!(response.total_compacted_drawers, 2);

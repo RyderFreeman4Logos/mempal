@@ -111,6 +111,7 @@ backend = "model2vec"
             self.config(),
             Arc::new(StaticEmbedderFactory { dim: 4 }),
         )
+        .expect("create MCP server")
     }
 }
 
@@ -200,7 +201,8 @@ async fn test_pinned_facts_no_embedding() {
         env.db_path.clone(),
         env.config(),
         Arc::new(PanicEmbedderFactory),
-    );
+    )
+    .expect("create MCP server");
 
     let response = server
         .mempal_pinned_facts(Parameters(PinnedFactsRequest {

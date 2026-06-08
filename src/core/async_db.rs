@@ -116,6 +116,8 @@ pub struct AsyncDb {
     /// regression tests (#345). Never present in production builds.
     #[cfg(any(test, feature = "db-test-seam"))]
     read_delay: Option<Duration>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    write_delay: Option<Duration>,
 }
 
 impl AsyncDb {
@@ -145,6 +147,8 @@ impl AsyncDb {
             writer: Arc::new(writer),
             #[cfg(any(test, feature = "db-test-seam"))]
             read_delay: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            write_delay: None,
         })
     }
 
@@ -152,6 +156,13 @@ impl AsyncDb {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_read_delay(mut self, delay: Duration) -> Self {
         self.read_delay = Some(delay);
+        self
+    }
+
+    /// Inject a synthetic cold-write delay into every `run_write` (tests only).
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_write_delay(mut self, delay: Duration) -> Self {
+        self.write_delay = Some(delay);
         self
     }
 
@@ -198,7 +209,11 @@ impl AsyncDb {
         F: FnOnce(&Database) -> Result<R, DbError> + Send + 'static,
         R: Send + 'static,
     {
-        exec(Arc::clone(&self.writer), None, f).await
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.write_delay;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay: Option<Duration> = None;
+        exec(Arc::clone(&self.writer), delay, f).await
     }
 
     /// Run a read-write closure that returns [`anyhow::Result`] off the runtime.
@@ -211,7 +226,11 @@ impl AsyncDb {
         F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
-        exec_anyhow(Arc::clone(&self.writer), None, f).await
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.write_delay;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay: Option<Duration> = None;
+        exec_anyhow(Arc::clone(&self.writer), delay, f).await
     }
 }
 

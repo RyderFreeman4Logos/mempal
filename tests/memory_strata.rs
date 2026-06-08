@@ -66,7 +66,8 @@ impl TestEnv {
         Database::open(&db_path).expect("open db");
         ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
         let server =
-            MempalMcpServer::new_with_factory(db_path.clone(), Arc::new(StaticEmbedderFactory));
+            MempalMcpServer::new_with_factory(db_path.clone(), Arc::new(StaticEmbedderFactory))
+                .expect("create MCP server");
         Self {
             _tmp: tmp,
             db_path,

@@ -45,7 +45,8 @@ fn setup_mcp_server() -> (TempDir, Database, MempalMcpServer) {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
     let db = Database::open(&db_path).expect("open db");
-    let server = MempalMcpServer::new_with_factory(db_path, Arc::new(StubEmbedderFactory));
+    let server = MempalMcpServer::new_with_factory(db_path, Arc::new(StubEmbedderFactory))
+        .expect("create MCP server");
     (tmp, db, server)
 }
 

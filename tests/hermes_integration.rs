@@ -160,10 +160,12 @@ impl TestEnv {
                 vector: vec![0.2, 0.4, 0.6, 0.8],
             }),
         )
+        .expect("create MCP server")
     }
 
     fn server_with_factory(&self, factory: Arc<dyn EmbedderFactory>) -> MempalMcpServer {
         MempalMcpServer::new_with_factory_and_config(self.db_path.clone(), self.config(), factory)
+            .expect("create MCP server")
     }
 }
 

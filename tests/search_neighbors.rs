@@ -383,7 +383,8 @@ fn active_chunk_indexes(db: &Database, source_file: &str) -> Vec<i64> {
 fn setup_mcp_server() -> (TempDir, std::path::PathBuf, MempalMcpServer) {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("palace.db");
-    let server = MempalMcpServer::new_with_factory(db_path.clone(), Arc::new(StubEmbedderFactory));
+    let server = MempalMcpServer::new_with_factory(db_path.clone(), Arc::new(StubEmbedderFactory))
+        .expect("create MCP server");
     (tmp, db_path, server)
 }
 

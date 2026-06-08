@@ -328,7 +328,8 @@ async fn test_search_and_ingest_during_partial_reindex() {
         Arc::new(StubEmbedderFactory {
             vector: vec![0.2, 0.3, 0.4, 0.5],
         }),
-    );
+    )
+    .expect("create MCP server");
     let search = server
         .mempal_search(Parameters(SearchRequest {
             query: "drawer content".to_string(),
@@ -1267,7 +1268,7 @@ block_writes_when_degraded = true
     );
     ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
     let config = Config::load_from(&config_path).expect("load config");
-    let server = MempalMcpServer::new(db_path, config);
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let status = global_embed_status();
     status.reset_for_tests();
     status.record_failure(&"synthetic 1");
@@ -1310,7 +1311,8 @@ async fn test_embed_degraded_allows_writes_when_not_configured() {
     status.record_failure(&"synthetic 1");
     status.record_failure(&"synthetic 2");
 
-    let server = MempalMcpServer::new(env.db_path.clone(), config.clone());
+    let server =
+        MempalMcpServer::new(env.db_path.clone(), config.clone()).expect("create MCP server");
     let response = tokio::time::timeout(
         Duration::from_secs(2),
         server.mempal_ingest(Parameters(IngestRequest {

@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::core::AsyncDb;
 use crate::core::config::ConfigHandle;
 use crate::core::db::Database;
 use crate::core::queue::{AsyncPendingMessageStore, PendingMessageStore};
-use crate::daemon_bootstrap::{DaemonWriteObserver, SharedDatabase};
+use crate::daemon_bootstrap::DaemonWriteObserver;
 
 use super::client::{LlmClient, LlmMessage, LlmRequest};
 use super::retry::{self, HeartbeatCallback};
@@ -36,7 +37,7 @@ pub async fn run_llm_worker(
     store: Arc<AsyncPendingMessageStore>,
     client: Arc<LlmClient>,
     status: Arc<LlmStatus>,
-    db: SharedDatabase,
+    db: AsyncDb,
     write_observer: DaemonWriteObserver,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -217,7 +218,7 @@ pub fn confirm_llm_task(store: &PendingMessageStore, message_id: &str) -> Result
 async fn process_llm_task_shared(
     client: &LlmClient,
     status: &LlmStatus,
-    db: &SharedDatabase,
+    db: &AsyncDb,
     payload: &str,
     config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
@@ -234,14 +235,24 @@ async fn process_llm_task_shared(
 async fn process_gating_task(
     client: &LlmClient,
     status: &LlmStatus,
-    db: &SharedDatabase,
+    db: &AsyncDb,
     task: &LlmTaskPayload,
     config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
 ) -> Result<()> {
     let (verdict, score) = request_gating_verdict(client, status, task, config, heartbeat).await?;
-    let db = db.lock().await;
-    apply_gating_verdict(&db, task, config, &verdict, score)
+    apply_gating_verdict_async(db, task.clone(), config.clone(), verdict, score).await
+}
+
+async fn apply_gating_verdict_async(
+    db: &AsyncDb,
+    task: LlmTaskPayload,
+    config: crate::core::config::Config,
+    verdict: String,
+    score: f64,
+) -> Result<()> {
+    db.run_write_anyhow(move |db| apply_gating_verdict(db, &task, &config, &verdict, score))
+        .await
 }
 
 pub async fn process_llm_task(
@@ -388,5 +399,93 @@ fn parse_gating_verdict(content: &str) -> (String, f64) {
         ("reject".to_string(), 0.1)
     } else {
         ("keep".to_string(), 0.8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::config::Config;
+    use crate::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
+    use rusqlite::params;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn spawn_runtime_ticker() -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticks_bg = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks_bg.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (ticks, ticker)
+    }
+
+    fn assert_runtime_ticked(ticks: &AtomicU64, label: &str) {
+        let observed = ticks.load(Ordering::SeqCst);
+        assert!(
+            observed >= 5,
+            "{label} advanced ticker {observed} times; LLM DB verdict work must not block Tokio worker"
+        );
+    }
+
+    fn insert_drawer(db: &Database, id: &str) {
+        db.insert_drawer(&Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: id.to_string(),
+            content: "LLM verdict runtime liveness drawer".to_string(),
+            wing: "llm".to_string(),
+            room: Some("runtime".to_string()),
+            source_file: Some("llm-runtime.md".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "1713000000".to_string(),
+            chunk_index: Some(0),
+            importance: 3,
+        }))
+        .expect("insert drawer");
+    }
+
+    fn drawer_is_deleted(db: &Database, id: &str) -> bool {
+        db.conn()
+            .query_row(
+                "SELECT deleted_at IS NOT NULL FROM drawers WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("read drawer deletion state")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_llm_verdict_db_work_runs_off_runtime() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        insert_drawer(&db, "llm-verdict-offruntime");
+        let async_db = AsyncDb::open(&db_path, 4)
+            .expect("open async db")
+            .with_write_delay(Duration::from_millis(300));
+        let task = LlmTaskPayload {
+            task_type: "gating".to_string(),
+            drawer_id: "llm-verdict-offruntime".to_string(),
+            drawer_ids: vec!["llm-verdict-offruntime".to_string()],
+            content: "judge me".to_string(),
+            system_prompt: None,
+        };
+        let (ticks, ticker) = spawn_runtime_ticker();
+
+        apply_gating_verdict_async(
+            &async_db,
+            task,
+            Config::default(),
+            "reject".to_string(),
+            0.1,
+        )
+        .await
+        .expect("apply verdict");
+        ticker.abort();
+
+        assert_runtime_ticked(&ticks, "LLM verdict");
+        assert!(drawer_is_deleted(&db, "llm-verdict-offruntime"));
     }
 }

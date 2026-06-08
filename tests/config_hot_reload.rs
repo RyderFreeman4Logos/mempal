@@ -118,7 +118,7 @@ impl TestEnv {
     }
 
     fn server(&self, factory: Arc<dyn EmbedderFactory>) -> MempalMcpServer {
-        MempalMcpServer::new_with_factory(self.db_path.clone(), factory)
+        MempalMcpServer::new_with_factory(self.db_path.clone(), factory).expect("create MCP server")
     }
 
     fn db(&self) -> Database {

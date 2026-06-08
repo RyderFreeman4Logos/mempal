@@ -803,7 +803,8 @@ prototypes = ["valuable", "noise"]
             vec![0.2, 0.2],
             &[],
         ),
-    );
+    )
+    .expect("create MCP server");
 
     for content in [
         "valuable candidate one",
@@ -849,7 +850,8 @@ prototypes = ["valuable"]
         env.db_path.clone(),
         config,
         deterministic_factory(&[], vec![0.3, 0.3], &["valuable"]),
-    );
+    )
+    .expect("create MCP server");
 
     let response = ingest_mcp(&server, "content that bypasses gating entirely").await;
 
@@ -885,7 +887,8 @@ prototypes = ["valuable"]
             vec![0.2, 0.2, 0.2],
             &[],
         ),
-    );
+    )
+    .expect("create MCP server");
 
     let response = ingest_mcp(&server, "vector dim stays consistent").await;
     let rows = gating_rows(&env.db());
@@ -1652,7 +1655,8 @@ async fn test_tier1_skips_short_content() {
         env.db_path.clone(),
         config,
         deterministic_factory(&[], vec![0.2, 0.2], &[]),
-    );
+    )
+    .expect("create MCP server");
 
     let response = ingest_mcp(&server, "tiny").await;
     let rows = gating_rows(&env.db());
@@ -1692,7 +1696,8 @@ prototypes = ["valuable", "noise"]
             vec![0.2, 0.2],
             &[],
         ),
-    );
+    )
+    .expect("create MCP server");
 
     let response = ingest_mcp(&server, "above threshold candidate").await;
     let rows = gating_rows(&env.db());
@@ -1732,7 +1737,8 @@ prototypes = ["valuable", "noise"]
             vec![0.2, 0.2],
             &[],
         ),
-    );
+    )
+    .expect("create MCP server");
 
     let response = ingest_mcp(&server, "below threshold candidate").await;
     let rows = gating_rows(&env.db());
@@ -1833,7 +1839,8 @@ enabled = false
         env.db_path.clone(),
         config,
         deterministic_factory(&[], vec![0.2, 0.2], &[]),
-    );
+    )
+    .expect("create MCP server");
 
     let mcp_status = server.mempal_status().await.expect("mcp status").0;
     let output = run_mempal(&env.home, &["status"]);
@@ -1879,7 +1886,8 @@ prototypes = ["valuable"]
         env.db_path.clone(),
         config,
         deterministic_factory(&[("valuable", vec![1.0, 0.0])], vec![0.2, 0.2], &[]),
-    );
+    )
+    .expect("create MCP server");
 
     let mcp_status = server.mempal_status().await.expect("mcp status").0;
     let output = run_mempal(&env.home, &["status"]);
@@ -1948,7 +1956,8 @@ enabled = true
             vec![0.2, 0.2],
             &[],
         ),
-    );
+    )
+    .expect("create MCP server");
 
     // Case 1: Tier 1 Skip (too short) — no LLM task enqueued.
     let response = ingest_mcp(&server, "tiny").await;
@@ -2026,7 +2035,8 @@ threshold = 0.5
             vec![0.2, 0.2],
             &[],
         ),
-    );
+    )
+    .expect("create MCP server");
 
     // Content below threshold → Tier 2 unclassified → Tier 3 LLM judge (fail-open).
     let response = ingest_mcp(&server, "ambiguous content to judge").await;
@@ -2105,7 +2115,8 @@ threshold = 0.5
             vec![0.5, 0.5],
             &[],
         ),
-    );
+    )
+    .expect("create MCP server");
 
     // Content long enough to produce multiple chunks with max_tokens=10.
     let long_content = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa";
@@ -2220,7 +2231,8 @@ threshold = 0.5
         env.db_path.clone(),
         config,
         deterministic_factory(&[("keep_proto", vec![1.0, 0.0])], vec![0.5, 0.5], &[]),
-    );
+    )
+    .expect("create MCP server");
 
     let response = ingest_mcp(&server, "ambiguous high-score reject content").await;
     assert!(!response.dropped, "tier3 must fail-open before verdict");
@@ -2308,7 +2320,8 @@ enabled = false
             vec![0.5, 0.5],
             &[],
         ),
-    );
+    )
+    .expect("create MCP server");
     let first_response = ingest_mcp(&server_phase1, "ambiguous dedup content").await;
     assert!(!first_response.dropped, "phase1 must store the drawer");
     assert_eq!(env.db().drawer_count().expect("drawer count phase1"), 1);
@@ -2357,7 +2370,8 @@ threshold = 0.5
             vec![0.5, 0.5],
             &[],
         ),
-    );
+    )
+    .expect("create MCP server");
     let second_response = ingest_mcp(&server_phase2, "ambiguous dedup content").await;
 
     // Fail-open: not dropped (dedup re-ingest keeps the existing drawer).

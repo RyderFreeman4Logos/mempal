@@ -959,7 +959,7 @@ async fn test_operation_status_reports_queued_then_completed() {
     let _guard = ConfigOverrideGuard::install(&config_path);
     let config = Config::load_from(&config_path).expect("load config");
     let db_path = home.path().join(".mempal/palace.db");
-    let server = MempalMcpServer::new(db_path.clone(), config);
+    let server = MempalMcpServer::new(db_path.clone(), config).expect("create MCP server");
 
     let operation_id =
         enqueue_prepared_operation(&db_path, "status cli content", "mcp", Some("status"));
@@ -999,7 +999,7 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
     let _guard = ConfigOverrideGuard::install(&config_path);
     let config = Config::load_from(&config_path).expect("load config");
     let db_path = home.path().join(".mempal/palace.db");
-    let server = MempalMcpServer::new(db_path.clone(), config);
+    let server = MempalMcpServer::new(db_path.clone(), config).expect("create MCP server");
 
     let operation_id =
         enqueue_prepared_operation(&db_path, "wait cli content", "mcp", Some("wait"));

@@ -3702,7 +3702,7 @@ async fn ingest_stdin_command(
             no_gate: resolved.no_gate,
             bypass_novelty: resolved.bypass_novelty,
         };
-        let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone());
+        let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone())?;
         let response = server
             .mempal_ingest_with_controls(wait_request, controls)
             .await
@@ -4075,7 +4075,7 @@ async fn operation_command(
     config: &Config,
     command: OperationCommands,
 ) -> Result<()> {
-    let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone());
+    let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone())?;
     match command {
         OperationCommands::Status { operation_id } => {
             let response = server
@@ -9600,7 +9600,7 @@ async fn serve_command(config: &Config, mcp: bool) -> Result<()> {
 }
 
 async fn serve_mcp_command(config: &Config) -> Result<()> {
-    let server = MempalMcpServer::new(expand_home(&config.db_path), config.clone());
+    let server = MempalMcpServer::new(expand_home(&config.db_path), config.clone())?;
     let service = server.serve_stdio().await?;
     service.waiting().await?;
     Ok(())
@@ -9626,7 +9626,7 @@ async fn serve_mcp_and_rest_command(config: &Config) -> Result<()> {
             .await
             .context("REST server failed")
     });
-    let server = MempalMcpServer::new(db_path, config.clone());
+    let server = MempalMcpServer::new(db_path, config.clone())?;
     let service = server.serve_stdio().await?;
     let mut mcp_task = Box::pin(async move {
         service.waiting().await.context("MCP server failed")?;

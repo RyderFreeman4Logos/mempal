@@ -143,7 +143,8 @@ fn setup_mcp_server() -> (TempDir, Database, MempalMcpServer) {
         Arc::new(StubEmbedderFactory {
             vector: vec![0.1, 0.2, 0.3],
         }),
-    );
+    )
+    .expect("create MCP server");
     (tmp, db, server)
 }
 
@@ -155,7 +156,8 @@ fn setup_rest_mcp_server() -> (TempDir, Database, MempalMcpServer, mempal::api::
     let factory = Arc::new(StubEmbedderFactory {
         vector: vec![0.1, 0.2, 0.3],
     });
-    let server = MempalMcpServer::new_with_factory(db_path.clone(), factory.clone());
+    let server = MempalMcpServer::new_with_factory(db_path.clone(), factory.clone())
+        .expect("create MCP server");
     let state = mempal::api::ApiState::new(db_path, factory);
     (tmp, db, server, state)
 }

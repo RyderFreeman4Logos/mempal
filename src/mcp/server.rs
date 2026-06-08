@@ -133,10 +133,12 @@ pub struct MempalMcpServer {
     /// Flushed and boosted on the next `mempal_ingest` call (P13).
     session_hit_drawers: Arc<Mutex<HashSet<String>>>,
     ingest_worker_started: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    ingest_processing_delay: Option<Duration>,
 }
 
 impl MempalMcpServer {
-    pub fn new(db_path: PathBuf, config: crate::core::config::Config) -> Self {
+    pub fn new(db_path: PathBuf, config: crate::core::config::Config) -> anyhow::Result<Self> {
         Self::new_with_factory_and_config(
             db_path,
             config.clone(),
@@ -144,7 +146,10 @@ impl MempalMcpServer {
         )
     }
 
-    pub fn new_with_factory(db_path: PathBuf, embedder_factory: Arc<dyn EmbedderFactory>) -> Self {
+    pub fn new_with_factory(
+        db_path: PathBuf,
+        embedder_factory: Arc<dyn EmbedderFactory>,
+    ) -> anyhow::Result<Self> {
         Self::new_with_factory_and_config(
             db_path,
             ConfigHandle::current().as_ref().clone(),
@@ -156,11 +161,15 @@ impl MempalMcpServer {
         db_path: PathBuf,
         config: crate::core::config::Config,
         embedder_factory: Arc<dyn EmbedderFactory>,
-    ) -> Self {
-        let async_db =
-            AsyncDb::open(&db_path, 4).expect("MCP async database pool should open at server init");
+    ) -> anyhow::Result<Self> {
+        let async_db = AsyncDb::open(&db_path, 4).with_context(|| {
+            format!(
+                "failed to open MCP async database pool for {}",
+                db_path.display()
+            )
+        })?;
         let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path);
-        Self {
+        Ok(Self {
             db_path,
             async_db,
             async_queue,
@@ -172,12 +181,20 @@ impl MempalMcpServer {
             client_peer: Arc::new(Mutex::new(None)),
             session_hit_drawers: Arc::new(Mutex::new(HashSet::new())),
             ingest_worker_started: Arc::new(AtomicBool::new(false)),
-        }
+            #[cfg(any(test, feature = "db-test-seam"))]
+            ingest_processing_delay: None,
+        })
     }
 
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_async_db_for_test(mut self, async_db: AsyncDb) -> Self {
         self.async_db = async_db;
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_ingest_processing_delay_for_test(mut self, delay: Duration) -> Self {
+        self.ingest_processing_delay = Some(delay);
         self
     }
 
@@ -361,14 +378,14 @@ impl MempalMcpServer {
         });
 
         let outcome = self
-            .mempal_ingest_sync(prepared.request.clone(), prepared.controls)
+            .run_prepared_ingest_off_runtime(prepared.request.clone(), prepared.controls)
             .await;
 
         let _ = stop_tx.send(());
         let _ = heartbeat.await;
 
         match outcome {
-            Ok(Json(mut response)) => {
+            Ok(mut response) => {
                 let rejected_reason = response
                     .gating_decision
                     .as_ref()
@@ -444,6 +461,35 @@ impl MempalMcpServer {
         }
 
         Ok(())
+    }
+
+    async fn run_prepared_ingest_off_runtime(
+        &self,
+        request: IngestRequest,
+        controls: IngestControls,
+    ) -> anyhow::Result<IngestResponse> {
+        let worker = self.clone();
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let ingest_processing_delay = self.ingest_processing_delay;
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatcher, || {
+                #[cfg(any(test, feature = "db-test-seam"))]
+                if let Some(delay) = ingest_processing_delay {
+                    std::thread::sleep(delay);
+                }
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to build blocking ingest runtime")?;
+                runtime
+                    .block_on(worker.mempal_ingest_sync(request, controls))
+                    .map(|response| response.0)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+            })
+        })
+        .await
+        .context("blocking ingest worker task failed")?
     }
 
     pub(super) fn open_db(&self) -> std::result::Result<Database, ErrorData> {
@@ -7270,7 +7316,8 @@ mod tests {
             Arc::new(StubEmbedderFactory {
                 vector: vec![0.1, 0.2, 0.3],
             }),
-        );
+        )
+        .expect("create MCP server");
         (tempdir, db_path, server)
     }
 
@@ -7485,6 +7532,60 @@ mod tests {
         assert_eq!(response.state, Some(IngestOperationState::Queued));
         assert!(response.operation_id.is_some());
         assert_runtime_ticked(&ticks, "mempal_ingest admission");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_drain_worker_runs_sync_ingest_off_runtime() {
+        let (_tempdir, db_path, server) = setup_server();
+        let server = server.with_ingest_processing_delay_for_test(Duration::from_millis(300));
+        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let request = IngestRequest {
+            content: "offruntime queued ingest drain".to_string(),
+            wing: "mcp".to_string(),
+            room: Some("runtime".to_string()),
+            project_id: Some("project-drain".to_string()),
+            dry_run: Some(false),
+            ..IngestRequest::default()
+        };
+        let project_id = server
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await
+            .expect("resolve project");
+        let prepared = server
+            .prepare_async_ingest_operation(
+                &request,
+                IngestControls::default(),
+                config.as_ref(),
+                compiled_privacy.as_ref(),
+                project_id,
+            )
+            .await
+            .expect("prepare async ingest");
+        let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, &payload)
+            .expect("enqueue async ingest");
+        let claim = queue
+            .claim_next_by_kind("worker-drain", 60, INGEST_ASYNC_KIND)
+            .expect("claim queued op")
+            .expect("claimed queued op");
+        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
+        let (ticks, ticker) = spawn_runtime_ticker();
+
+        server
+            .process_ingest_claim(&async_queue, "worker-drain", claim)
+            .await
+            .expect("process queued ingest");
+        ticker.abort();
+
+        assert_runtime_ticked(&ticks, "mempal_ingest drain worker");
+        let completed = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("completed status");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
+        assert!(!completed.drawer_id.is_empty());
     }
 
     fn recreate_vectors_with_metric(db_path: &Path, metric: &str) {
@@ -10132,7 +10233,8 @@ mod tests {
                 call_count: Arc::clone(&call_count),
                 gate: Arc::clone(&gate),
             }),
-        );
+        )
+        .expect("create MCP server");
 
         let response = tokio::time::timeout(
             Duration::from_secs(2),
@@ -10166,7 +10268,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read queued op_state");
-        assert_eq!(op_state, "queued");
+        assert!(
+            matches!(op_state.as_str(), "queued" | "running"),
+            "receipt may return before or just after the drain worker claims the op, got {op_state}"
+        );
 
         gate.notify_one();
         let completed = server
@@ -10192,7 +10297,8 @@ mod tests {
                 call_count: Arc::clone(&call_count),
                 gate: Arc::clone(&gate),
             }),
-        );
+        )
+        .expect("create MCP server");
 
         let request = IngestRequest {
             content: "wait path should return the final ingest result".to_string(),
@@ -10258,7 +10364,8 @@ mod tests {
                 call_count: Arc::new(AtomicUsize::new(0)),
                 gate: Arc::clone(&gate),
             }),
-        );
+        )
+        .expect("create MCP server");
 
         let response = server
             .mempal_ingest(Parameters(IngestRequest {
@@ -10277,7 +10384,14 @@ mod tests {
 
         assert_eq!(response.state, Some(IngestOperationState::Queued));
         assert!(response.timed_out);
-        assert!(response.operation_id.is_some());
+        let operation_id = response.operation_id.expect("operation id");
+
+        gate.notify_one();
+        let completed = server
+            .wait_for_operation_completion(&operation_id)
+            .await
+            .expect("cleanup ingest completion");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
     }
 
     #[tokio::test]
@@ -10377,7 +10491,8 @@ enabled = true
             Arc::new(StubEmbedderFactory {
                 vector: vec![0.4, 0.5, 0.6],
             }),
-        );
+        )
+        .expect("create MCP server");
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let request = IngestRequest {
             content: "status tool async ingest".to_string(),
@@ -10610,7 +10725,8 @@ enabled = false
                 call_count: Arc::clone(&call_count),
                 gate: Arc::clone(&gate),
             }),
-        );
+        )
+        .expect("create MCP server");
 
         let response = server
             .mempal_ingest(Parameters(IngestRequest {

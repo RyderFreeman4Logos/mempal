@@ -217,6 +217,7 @@ async fn status_response(db_path: &Path) -> StatusResponse {
             ..Config::default()
         },
     )
+    .expect("create MCP server")
     .mempal_status()
     .await
     .expect("status")

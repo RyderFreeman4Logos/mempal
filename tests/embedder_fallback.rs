@@ -65,7 +65,7 @@ async fn test_embedder_fallback_to_model2vec_when_lan_unreachable() {
         std::env::set_var("XDG_CACHE_HOME", &xdg_cache_home);
     }
 
-    let server = MempalMcpServer::new(db_path, config);
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server
         .ingest_json_for_test(
             serde_json::to_value(IngestRequest {

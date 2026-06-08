@@ -180,7 +180,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                 let llm_status = std::sync::Arc::new(crate::llm::LlmStatus::new(10));
                 let llm_store = std::sync::Arc::new(context.store.clone());
                 let llm_client = std::sync::Arc::new(llm_client);
-                let shared_db = context.db.clone();
+                let async_db = context.async_db.clone();
                 let write_observer = context.write_observer.clone();
                 tracing::info!("spawning {num_workers} LLM worker tasks");
                 (0..num_workers)
@@ -188,7 +188,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                         let store = llm_store.clone();
                         let client = llm_client.clone();
                         let status = llm_status.clone();
-                        let db = shared_db.clone();
+                        let db = async_db.clone();
                         let observer = write_observer.clone();
                         tokio::spawn(async move {
                             if let Err(e) = crate::llm::worker::run_llm_worker(

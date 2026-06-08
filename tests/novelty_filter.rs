@@ -171,6 +171,7 @@ impl TestEnv {
                 ),
             }),
         )
+        .expect("create MCP server")
     }
 }
 
