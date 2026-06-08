@@ -328,8 +328,11 @@ fn read_start_ticks(path: &Path) -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn parse_start_ticks(stat: &str) -> Option<u64> {
     let close = stat.rfind(") ")?;
-    let fields = stat[close + 2..].split_whitespace().collect::<Vec<_>>();
-    fields.get(19)?.parse::<u64>().ok()
+    stat[close + 2..]
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()
 }
 
 #[cfg(target_os = "linux")]
