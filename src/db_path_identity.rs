@@ -222,8 +222,8 @@ fn stripped_deleted_name(file_name: &OsStr) -> Option<OsString> {
 fn strip_deleted_suffix(fd_file_id: Option<FileId>, path: &Path) -> Cow<'_, Path> {
     let bytes = path.as_os_str().as_bytes();
     if bytes.ends_with(DELETED_SUFFIX) {
-        if let Some(target_file_id) = file_id_for_path(path) {
-            if fd_file_id == Some(target_file_id) {
+        if let Some(fd_file_id) = fd_file_id {
+            if file_id_for_path(path).is_some_and(|target_file_id| fd_file_id == target_file_id) {
                 return Cow::Borrowed(path);
             }
         }
