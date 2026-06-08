@@ -2292,6 +2292,15 @@ struct HistoricalRejudgeRestoreReport {
     audit_count: usize,
 }
 
+#[derive(Debug, Default)]
+struct HistoricalRejudgeRestoreItemOutcome {
+    would_restore: bool,
+    restored: bool,
+    skipped_active: bool,
+    conflict: bool,
+    audit_recorded: bool,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
@@ -12728,36 +12737,25 @@ fn maintenance_rejudge_restore_command(
     };
 
     for item in &backup.items {
-        let state = drawer_deleted_at(db, &item.drawer.id)?;
-        match state {
-            Some(None) if conflict_policy == RejudgeRestoreConflictPolicy::Skip => {
-                report.skipped_active_count += 1;
-                report.conflict_count += 1;
-                continue;
-            }
-            Some(None) => {
-                report.conflict_count += 1;
-                report.would_restore_count += 1;
-                if execute {
-                    db.hard_delete_drawers_by_ids(std::slice::from_ref(&item.drawer.id))
-                        .with_context(|| {
-                            format!("failed to overwrite active drawer {}", item.drawer.id)
-                        })?;
-                    restore_rejudge_backup_item(db, item)?;
-                    report.restored_count += 1;
-                    record_rejudge_restore_audit(db, item, &backup)?;
-                    report.audit_count += 1;
-                }
-            }
-            Some(Some(_)) | None => {
-                report.would_restore_count += 1;
-                if execute {
-                    restore_rejudge_backup_item(db, item)?;
-                    report.restored_count += 1;
-                    record_rejudge_restore_audit(db, item, &backup)?;
-                    report.audit_count += 1;
-                }
-            }
+        let outcome = if execute {
+            restore_rejudge_backup_item_transaction(db, item, &backup, conflict_policy)?
+        } else {
+            dry_run_rejudge_restore_item(db, item, conflict_policy)?
+        };
+        if outcome.skipped_active {
+            report.skipped_active_count += 1;
+        }
+        if outcome.conflict {
+            report.conflict_count += 1;
+        }
+        if outcome.would_restore {
+            report.would_restore_count += 1;
+        }
+        if outcome.restored {
+            report.restored_count += 1;
+        }
+        if outcome.audit_recorded {
+            report.audit_count += 1;
         }
     }
 
@@ -12828,6 +12826,111 @@ fn drawer_deleted_at(db: &Database, drawer_id: &str) -> Result<Option<Option<Str
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()?)
+}
+
+fn dry_run_rejudge_restore_item(
+    db: &Database,
+    item: &HistoricalRejudgeBackupItem,
+    conflict_policy: RejudgeRestoreConflictPolicy,
+) -> Result<HistoricalRejudgeRestoreItemOutcome> {
+    let state = drawer_deleted_at(db, &item.drawer.id)?;
+    Ok(rejudge_restore_outcome_for_state(state, conflict_policy))
+}
+
+fn restore_rejudge_backup_item_transaction(
+    db: &Database,
+    item: &HistoricalRejudgeBackupItem,
+    backup: &HistoricalRejudgeBackup,
+    conflict_policy: RejudgeRestoreConflictPolicy,
+) -> Result<HistoricalRejudgeRestoreItemOutcome> {
+    db.conn()
+        .execute_batch("BEGIN IMMEDIATE;")
+        .context("failed to begin historical rejudge restore transaction")?;
+    let result = (|| -> Result<HistoricalRejudgeRestoreItemOutcome> {
+        let state = drawer_deleted_at(db, &item.drawer.id)?;
+        let outcome = rejudge_restore_outcome_for_state(state, conflict_policy);
+        if !outcome.would_restore {
+            return Ok(outcome);
+        }
+        if outcome.conflict {
+            hard_delete_active_drawer_for_restore(db, &item.drawer.id)
+                .with_context(|| format!("failed to overwrite active drawer {}", item.drawer.id))?;
+        }
+        restore_rejudge_backup_item(db, item)?;
+        record_rejudge_restore_audit(db, item, backup)?;
+        Ok(HistoricalRejudgeRestoreItemOutcome {
+            restored: true,
+            audit_recorded: true,
+            ..outcome
+        })
+    })();
+
+    match result {
+        Ok(outcome) => {
+            if let Err(error) = db.conn().execute_batch("COMMIT;") {
+                let _ = db.conn().execute_batch("ROLLBACK;");
+                return Err(error)
+                    .context("failed to commit historical rejudge restore transaction");
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            let _ = db.conn().execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
+fn rejudge_restore_outcome_for_state(
+    state: Option<Option<String>>,
+    conflict_policy: RejudgeRestoreConflictPolicy,
+) -> HistoricalRejudgeRestoreItemOutcome {
+    match state {
+        Some(None) if conflict_policy == RejudgeRestoreConflictPolicy::Skip => {
+            HistoricalRejudgeRestoreItemOutcome {
+                skipped_active: true,
+                conflict: true,
+                ..HistoricalRejudgeRestoreItemOutcome::default()
+            }
+        }
+        Some(None) => HistoricalRejudgeRestoreItemOutcome {
+            would_restore: true,
+            conflict: true,
+            ..HistoricalRejudgeRestoreItemOutcome::default()
+        },
+        Some(Some(_)) | None => HistoricalRejudgeRestoreItemOutcome {
+            would_restore: true,
+            ..HistoricalRejudgeRestoreItemOutcome::default()
+        },
+    }
+}
+
+fn hard_delete_active_drawer_for_restore(db: &Database, drawer_id: &str) -> Result<usize> {
+    let vectors_exist: bool = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to query vector table presence")?;
+    if vectors_exist {
+        db.conn()
+            .execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])
+            .with_context(|| format!("failed to delete vector row for drawer {drawer_id}"))?;
+    }
+    db.conn()
+        .execute(
+            "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
+            [drawer_id],
+        )
+        .with_context(|| format!("failed to detach triples for drawer {drawer_id}"))?;
+    db.conn()
+        .execute(
+            "DELETE FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+            [drawer_id],
+        )
+        .with_context(|| format!("failed to delete active drawer {drawer_id}"))
 }
 
 fn restore_rejudge_backup_item(db: &Database, item: &HistoricalRejudgeBackupItem) -> Result<()> {
@@ -14887,6 +14990,93 @@ mod historical_rejudge_tests {
         let audit_log =
             std::fs::read_to_string(tmp.path().join("audit.jsonl")).expect("read audit log");
         assert!(audit_log.contains("\"command\":\"maintenance-rejudge-restore\""));
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_restore_overwrite_rolls_back_on_vector_failure() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        db.insert_vector("low", &[1.0, 0.0, 0.0])
+            .expect("insert vector");
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: true,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("hard-delete rejudge");
+        let backup_path = only_backup_file(&backups);
+
+        insert_drawer(&db, "low", "replacement active", "notes", None);
+        db.insert_vector("low", &[0.0, 1.0, 0.0])
+            .expect("insert replacement vector");
+
+        let mut backup =
+            read_historical_rejudge_backup(&backup_path).expect("read original backup");
+        let invalid_embedding = [0_u8; 4];
+        let vector = backup.items[0]
+            .vector
+            .as_mut()
+            .expect("backup should include vector");
+        vector.embedding_hex = bytes_to_hex(&invalid_embedding);
+        vector.embedding_sha256 = sha256_hex(&invalid_embedding);
+        backup.integrity.payload_sha256 =
+            historical_rejudge_backup_payload_hash(&backup).expect("hash backup");
+        std::fs::write(
+            &backup_path,
+            serde_json::to_vec_pretty(&backup).expect("serialize backup"),
+        )
+        .expect("write modified backup");
+
+        let error = maintenance_rejudge_restore_command(
+            &db,
+            &backup_path,
+            true,
+            RejudgeRestoreConflictPolicy::Overwrite,
+            "json",
+        )
+        .expect_err("restore with invalid vector must fail");
+
+        assert!(
+            error.to_string().contains("failed to restore vector row"),
+            "{error}"
+        );
+        let drawer = db
+            .get_drawer("low")
+            .expect("load active drawer")
+            .expect("active conflict drawer should survive rollback");
+        assert_eq!(drawer.content, "replacement active");
+        let vector_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawer_vectors WHERE id = 'low'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count replacement vector");
+        assert_eq!(vector_count, 1);
+        let restore_audits: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM gating_audit WHERE drawer_id = 'low' AND explain_json LIKE '%\"mutation\":\"restore\"%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count restore audits");
+        assert_eq!(restore_audits, 0);
     }
 
     #[tokio::test]
