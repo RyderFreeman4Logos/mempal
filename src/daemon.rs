@@ -347,7 +347,7 @@ async fn run_hook_worker(state: HookWorkerState, claim_ttl_secs: i64, poll_inter
         .await
         {
             ClaimPollResult::Claimed(message) => {
-                process_hook_worker_message(state.clone(), message).await;
+                process_hook_worker_message(state.clone(), message, claim_ttl_secs).await;
             }
             ClaimPollResult::Idle => tokio::time::sleep(poll_interval).await,
             ClaimPollResult::RetryAfterError => continue,
@@ -355,8 +355,18 @@ async fn run_hook_worker(state: HookWorkerState, claim_ttl_secs: i64, poll_inter
     }
 }
 
-async fn process_hook_worker_message(state: HookWorkerState, message: ClaimedMessage) {
+async fn process_hook_worker_message(
+    state: HookWorkerState,
+    message: ClaimedMessage,
+    claim_ttl_secs: i64,
+) {
     let message_id = message.id.clone();
+    let heartbeat_handle = spawn_hook_message_heartbeat(
+        state.store.clone(),
+        message_id.clone(),
+        state.worker_id.clone(),
+        hook_message_heartbeat_interval(claim_ttl_secs),
+    );
     let result = process_claimed_message_with_embedder(
         &state.async_db,
         &state.store,
@@ -398,6 +408,41 @@ async fn process_hook_worker_message(state: HookWorkerState, message: ClaimedMes
             }
         }
     }
+    heartbeat_handle.abort();
+    let _ = heartbeat_handle.await;
+}
+
+fn spawn_hook_message_heartbeat(
+    store: AsyncPendingMessageStore,
+    message_id: String,
+    worker_id: String,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if shutdown_requested() {
+                break;
+            }
+            if let Err(error) = store
+                .refresh_heartbeat(message_id.clone(), worker_id.clone())
+                .await
+            {
+                tracing::warn!(
+                    ?error,
+                    message_id,
+                    "failed to refresh hook message heartbeat"
+                );
+            }
+        }
+    })
+}
+
+fn hook_message_heartbeat_interval(claim_ttl_secs: i64) -> Duration {
+    let ttl_secs = claim_ttl_secs.max(1) as u64;
+    Duration::from_secs((ttl_secs / 3).max(1))
 }
 
 async fn wait_for_hook_worker_or_tick(hook_workers: &mut JoinSet<()>, tick: Duration) {
@@ -2038,6 +2083,7 @@ mod tests {
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
             },
             message,
+            60,
         )
         .await;
     }
@@ -2128,6 +2174,7 @@ mod tests {
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
             },
             message,
+            60,
         )
         .await;
         assert!(
@@ -2167,6 +2214,117 @@ mod tests {
     struct LlmClaimRaceProbeEmbedder {
         store: PendingMessageStore,
         embed_calls: AtomicUsize,
+    }
+
+    struct SlowEmbedder {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for SlowEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            tokio::time::sleep(self.delay).await;
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "slow-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hook_worker_heartbeats_long_message_processing_until_confirm() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+        Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(&db_path).expect("store");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "printf slow",
+            "output": "slow processing",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        let queued_id = store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let worker_id = "long-processing-worker";
+        let message = store
+            .claim_next(worker_id, 1)
+            .expect("claim next")
+            .expect("claimed message");
+        assert_eq!(message.id, queued_id);
+
+        let config = Config::default();
+        assert!(
+            !config.llm.enabled,
+            "test runtime config must keep LLM disabled"
+        );
+        let worker = tokio::spawn(super::process_hook_worker_message(
+            HookWorkerState {
+                async_db,
+                store: async_store.clone(),
+                worker_id: worker_id.to_string(),
+                embedder: Arc::new(DaemonEmbedder {
+                    primary: Box::new(SlowEmbedder {
+                        delay: Duration::from_secs(3),
+                    }),
+                    fallback: None,
+                }),
+                prototype_classifier: Arc::new(None),
+                config: Arc::new(config),
+                mempal_home,
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+            },
+            message,
+            1,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        let duplicate = async_store
+            .claim_next("stealing-worker".to_string(), 1)
+            .await
+            .expect("stealing worker claim_next");
+        assert!(
+            duplicate.is_none(),
+            "long-running hook processing must heartbeat so claim_next cannot reclaim it"
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .expect("worker should finish")
+            .expect("worker task should not panic");
+        let completed: i64 = rusqlite::Connection::open(&db_path)
+            .expect("open sqlite")
+            .query_row(
+                "SELECT COUNT(*) FROM pending_message_completions WHERE message_id = ?1",
+                [queued_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count completions");
+        assert_eq!(completed, 1);
     }
 
     #[async_trait::async_trait]
