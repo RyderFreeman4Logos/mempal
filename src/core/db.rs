@@ -6691,7 +6691,8 @@ fn build_fts_match_query(query: &str) -> Option<String> {
     }
 }
 
-fn fts_tokenize_content(content: &str) -> String {
+/// Tokenize drawer content exactly as the FTS index stores it.
+pub fn fts_tokenize_content(content: &str) -> String {
     if !contains_cjk(content) {
         return content.to_string();
     }

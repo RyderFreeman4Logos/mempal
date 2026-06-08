@@ -21,7 +21,7 @@ use mempal::core::{
     config::{CompiledPrivacyConfig, Config, ConfigHandle, default_config_path},
     db::{
         CURRENT_VECTOR_INDEX_VERSION, Database, HistoricalRejudgeAudit, ReindexVectorStash,
-        VECTOR_DISTANCE_METRIC, find_similar_clusters, vector_metadata_key,
+        VECTOR_DISTANCE_METRIC, find_similar_clusters, fts_tokenize_content, vector_metadata_key,
     },
     phase3::{
         CardContextDefaultProposalReport, CardContextRollbackControlReport, EvaluatorAdviceInput,
@@ -13044,6 +13044,7 @@ fn rejudge_restore_outcome_for_state(
 }
 
 fn delete_drawer_for_restore(db: &Database, drawer_id: &str) -> Result<usize> {
+    delete_rejudge_drawer_fts_row(db, drawer_id)?;
     let vectors_exist: bool = db
         .conn()
         .query_row(
@@ -13121,6 +13122,7 @@ fn restore_soft_deleted_rejudge_drawer(
             item.drawer.id
         );
     }
+    delete_rejudge_drawer_fts_row(db, &item.drawer.id)?;
     restore_rejudge_drawer_fts_row(db, &item.drawer.id)
 }
 
@@ -13168,12 +13170,65 @@ fn restore_rejudge_drawer_fts_row(db: &Database, drawer_id: &str) -> Result<()> 
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .with_context(|| format!("failed to load restored drawer {drawer_id} for FTS"))?;
+    let tokenized = fts_tokenize_content(&content);
     db.conn()
         .execute(
             "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
-            rusqlite::params![rowid, content],
+            rusqlite::params![rowid, tokenized],
         )
         .with_context(|| format!("failed to restore FTS row for drawer {drawer_id}"))?;
+    Ok(())
+}
+
+fn delete_rejudge_drawer_fts_row(db: &Database, drawer_id: &str) -> Result<()> {
+    use rusqlite::OptionalExtension;
+
+    if !db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawers_fts')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to query FTS table presence")?
+    {
+        return Ok(());
+    }
+
+    let rowid = db
+        .conn()
+        .query_row(
+            "SELECT rowid FROM drawers WHERE id = ?1",
+            [drawer_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to load drawer {drawer_id} for FTS delete"))?;
+    let Some(rowid) = rowid else {
+        return Ok(());
+    };
+
+    db.conn()
+        .execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS temp.rejudge_restore_fts_vocab \
+             USING fts5vocab('main', 'drawers_fts', 'instance')",
+        )
+        .context("failed to create FTS vocab view")?;
+    let indexed: bool = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.rejudge_restore_fts_vocab WHERE doc = ?1)",
+            [rowid],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("failed to query FTS row presence for drawer {drawer_id}"))?;
+    if !indexed {
+        return Ok(());
+    }
+
+    db.conn()
+        .execute("DELETE FROM drawers_fts WHERE rowid = ?1", [rowid])
+        .with_context(|| format!("failed to delete FTS row for drawer {drawer_id}"))?;
     Ok(())
 }
 
@@ -13224,11 +13279,10 @@ fn restore_rejudge_backup_item(db: &Database, item: &HistoricalRejudgeBackupItem
         Some(None) => {}
         None => {
             insert_rejudge_raw_drawer_row(db, item)?;
+            restore_rejudge_drawer_fts_row(db, &item.drawer.id)?;
         }
     }
-    if let Some(vector) = &item.vector {
-        restore_rejudge_backup_vector(db, &item.drawer.id, vector)?;
-    }
+    restore_rejudge_backup_vector(db, &item.drawer.id, item.vector.as_ref())?;
     restore_rejudge_source_drawer_triples(db, item)?;
     Ok(())
 }
@@ -13256,7 +13310,7 @@ fn restore_rejudge_source_drawer_triples(
 fn restore_rejudge_backup_vector(
     db: &Database,
     drawer_id: &str,
-    vector: &HistoricalRejudgeBackupVector,
+    vector: Option<&HistoricalRejudgeBackupVector>,
 ) -> Result<()> {
     if !db
         .conn()
@@ -13269,10 +13323,15 @@ fn restore_rejudge_backup_vector(
     {
         return Ok(());
     }
-    let embedding = hex_to_bytes(&vector.embedding_hex)?;
+    let embedding = vector
+        .map(|vector| hex_to_bytes(&vector.embedding_hex))
+        .transpose()?;
     db.conn()
         .execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])
         .with_context(|| format!("failed to replace vector row for drawer {drawer_id}"))?;
+    let Some((vector, embedding)) = vector.zip(embedding) else {
+        return Ok(());
+    };
     if vector_table_has_project_id(db)? {
         db.conn()
             .execute(
@@ -15430,6 +15489,14 @@ mod historical_rejudge_tests {
         )
         .expect("restore hard-deleted drawer");
 
+        let fts_matches = db
+            .search_fts("ok", None, None, "all", None, 10)
+            .expect("search restored drawer through FTS");
+        assert!(
+            fts_matches.iter().any(|(id, _)| id == "low"),
+            "restored hard-deleted drawer must be BM25-searchable: {fts_matches:?}"
+        );
+
         let (merge_count, updated_at, access_count, last_accessed_at, stale_penalty): (
             i64,
             String,
@@ -15578,6 +15645,8 @@ mod historical_rejudge_tests {
         let backup = only_backup_file(&backups);
 
         insert_drawer(&db, "low", "different later payload", "notes", None);
+        db.insert_vector("low", &[0.0, 1.0, 0.0])
+            .expect("insert replacement vector");
         assert!(
             db.soft_delete_drawer("low")
                 .expect("soft-delete replacement")
@@ -15598,6 +15667,32 @@ mod historical_rejudge_tests {
             .expect("drawer restored");
         assert_eq!(drawer.content, "original backup payload");
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        let restored_matches = db
+            .search_fts("original", None, None, "all", None, 10)
+            .expect("search restored payload through FTS");
+        assert!(
+            restored_matches.iter().any(|(id, _)| id == "low"),
+            "restored backup payload must be BM25-searchable: {restored_matches:?}"
+        );
+        let stale_matches = db
+            .search_fts("different", None, None, "all", None, 10)
+            .expect("search stale replacement payload through FTS");
+        assert!(
+            stale_matches.iter().all(|(id, _)| id != "low"),
+            "stale replacement payload must not remain BM25-searchable: {stale_matches:?}"
+        );
+        let vector_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawer_vectors WHERE id = 'low'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count restored vector rows");
+        assert_eq!(
+            vector_count, 0,
+            "backup without a vector must clear same-id replacement vector"
+        );
         let restore_audits: i64 = db
             .conn()
             .query_row(
