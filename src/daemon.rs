@@ -212,47 +212,41 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         vec![]
     };
 
+    let hook_worker_state = HookWorkerState {
+        async_db: context.async_db.clone(),
+        store: context.store.clone(),
+        worker_id: worker_id.clone(),
+        embedder: Arc::clone(&embedder),
+        prototype_classifier: Arc::clone(&prototype_classifier),
+        config: Arc::clone(&context.config),
+        mempal_home: context.mempal_home.clone(),
+        write_observer: context.write_observer.clone(),
+    };
     let mut hook_workers = JoinSet::new();
+    let mut next_hook_worker_index = 0;
+    spawn_hook_workers_until_limit(
+        &mut hook_workers,
+        &hook_worker_state,
+        &mut next_hook_worker_index,
+        claim_ttl_secs,
+        poll_interval,
+    );
     loop {
         context.write_observer.maybe_log_stall(&context.store).await;
-        drain_finished_hook_workers(&mut hook_workers);
 
         if shutdown_requested() {
             tracing::info!("shutdown requested; stopping daemon loop");
             break;
         }
 
-        if hook_workers.len() >= DAEMON_HOOK_WORKER_LIMIT {
-            wait_for_hook_worker_or_tick(&mut hook_workers, poll_interval).await;
-            continue;
-        }
-
-        match poll_claim_next(&context.store, &worker_id, claim_ttl_secs, |duration| {
-            Box::pin(tokio::time::sleep(duration))
-        })
-        .await
-        {
-            ClaimPollResult::Claimed(message) => {
-                spawn_hook_worker(
-                    &mut hook_workers,
-                    HookWorkerState {
-                        async_db: context.async_db.clone(),
-                        store: context.store.clone(),
-                        worker_id: worker_id.clone(),
-                        embedder: Arc::clone(&embedder),
-                        prototype_classifier: Arc::clone(&prototype_classifier),
-                        config: Arc::clone(&context.config),
-                        mempal_home: context.mempal_home.clone(),
-                        write_observer: context.write_observer.clone(),
-                    },
-                    message,
-                );
-            }
-            ClaimPollResult::Idle => {
-                wait_for_hook_worker_or_tick(&mut hook_workers, poll_interval).await;
-            }
-            ClaimPollResult::RetryAfterError => continue,
-        }
+        spawn_hook_workers_until_limit(
+            &mut hook_workers,
+            &hook_worker_state,
+            &mut next_hook_worker_index,
+            claim_ttl_secs,
+            poll_interval,
+        );
+        wait_for_hook_worker_or_tick(&mut hook_workers, poll_interval).await;
     }
 
     drain_hook_workers_with_budget(&mut hook_workers, DAEMON_DRAIN_BUDGET).await;
@@ -296,6 +290,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct HookWorkerState {
     async_db: AsyncDb,
     store: AsyncPendingMessageStore,
@@ -307,14 +302,57 @@ struct HookWorkerState {
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
 }
 
+fn spawn_hook_workers_until_limit(
+    hook_workers: &mut JoinSet<()>,
+    state: &HookWorkerState,
+    next_worker_index: &mut usize,
+    claim_ttl_secs: i64,
+    poll_interval: Duration,
+) {
+    while hook_workers.len() < DAEMON_HOOK_WORKER_LIMIT {
+        let worker_index = *next_worker_index;
+        *next_worker_index = (*next_worker_index).saturating_add(1);
+        spawn_hook_worker(
+            hook_workers,
+            state.clone(),
+            worker_index,
+            claim_ttl_secs,
+            poll_interval,
+        );
+    }
+}
+
 fn spawn_hook_worker(
     hook_workers: &mut JoinSet<()>,
-    state: HookWorkerState,
-    message: ClaimedMessage,
+    mut state: HookWorkerState,
+    worker_index: usize,
+    claim_ttl_secs: i64,
+    poll_interval: Duration,
 ) {
+    state.worker_id = format!("{}-hook-{worker_index}", state.worker_id);
     hook_workers.spawn(async move {
-        process_hook_worker_message(state, message).await;
+        run_hook_worker(state, claim_ttl_secs, poll_interval).await;
     });
+}
+
+async fn run_hook_worker(state: HookWorkerState, claim_ttl_secs: i64, poll_interval: Duration) {
+    loop {
+        if shutdown_requested() {
+            break;
+        }
+
+        match poll_claim_next(&state.store, &state.worker_id, claim_ttl_secs, |duration| {
+            Box::pin(tokio::time::sleep(duration))
+        })
+        .await
+        {
+            ClaimPollResult::Claimed(message) => {
+                process_hook_worker_message(state.clone(), message).await;
+            }
+            ClaimPollResult::Idle => tokio::time::sleep(poll_interval).await,
+            ClaimPollResult::RetryAfterError => continue,
+        }
+    }
 }
 
 async fn process_hook_worker_message(state: HookWorkerState, message: ClaimedMessage) {
@@ -359,12 +397,6 @@ async fn process_hook_worker_message(state: HookWorkerState, message: ClaimedMes
                     .record_error(format!("failed to mark_failed {message_id}: {mark_error}"));
             }
         }
-    }
-}
-
-fn drain_finished_hook_workers(hook_workers: &mut JoinSet<()>) {
-    while let Some(result) = hook_workers.try_join_next() {
-        handle_hook_worker_join(result);
     }
 }
 
@@ -1641,7 +1673,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::core::{
         AsyncDb,
@@ -1657,7 +1689,7 @@ mod tests {
     use super::{
         ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext, HookWorkerState,
         build_drawer_records, poll_claim_next, process_claimed_message_with_embedder,
-        wing_from_cwd,
+        run_hook_worker, wing_from_cwd,
     };
 
     struct StubClaimSource {
@@ -1742,6 +1774,99 @@ mod tests {
                 panic!("expected claimed message on retry")
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bounded_hook_worker_continues_claiming_after_completed_batch() {
+        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+        Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(&db_path).expect("store");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+
+        for label in ["first", "second"] {
+            let hook_payload = serde_json::json!({
+                "tool_name": "Bash",
+                "input": format!("printf {label}"),
+                "output": label,
+                "exit_code": 0
+            })
+            .to_string();
+            let envelope = CapturedHookEnvelope {
+                event: HookEvent::PostToolUse.display_name().to_string(),
+                kind: HookEvent::PostToolUse.queue_kind().to_string(),
+                agent: "codex".to_string(),
+                captured_at: "2026-05-01T12:34:56Z".to_string(),
+                claude_cwd: tmp.path().to_string_lossy().to_string(),
+                payload: Some(hook_payload.clone()),
+                payload_path: None,
+                payload_preview: None,
+                original_size_bytes: hook_payload.len(),
+                truncated: false,
+            };
+            let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+            store
+                .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+                .expect("enqueue hook envelope");
+        }
+
+        let config = Config::default();
+        assert!(
+            !config.llm.enabled,
+            "test runtime config must keep LLM disabled"
+        );
+        let worker = tokio::spawn(run_hook_worker(
+            HookWorkerState {
+                async_db,
+                store: async_store,
+                worker_id: "bounded-continuation-worker".to_string(),
+                embedder: Arc::new(DaemonEmbedder {
+                    primary: Box::new(StaticEmbedder),
+                    fallback: None,
+                }),
+                prototype_classifier: Arc::new(None),
+                config: Arc::new(config),
+                mempal_home,
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+            },
+            60,
+            Duration::from_millis(10),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let completed: i64 = rusqlite::Connection::open(&db_path)
+                    .expect("open sqlite")
+                    .query_row(
+                        "SELECT COUNT(*) FROM pending_message_completions WHERE kind = ?1",
+                        [HookEvent::PostToolUse.queue_kind()],
+                        |row| row.get(0),
+                    )
+                    .expect("count completions");
+                if completed == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should continue claiming after first completion");
+
+        let stats = store.stats().expect("queue stats");
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.claimed, 0);
+
+        super::SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("worker should observe shutdown")
+            .expect("worker task should not panic");
+        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
     }
 
     struct StaticEmbedder;
