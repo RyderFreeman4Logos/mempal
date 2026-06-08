@@ -12930,19 +12930,119 @@ fn delete_drawer_for_restore(db: &Database, drawer_id: &str) -> Result<usize> {
         .with_context(|| format!("failed to delete drawer {drawer_id}"))
 }
 
+fn restore_soft_deleted_rejudge_drawer(
+    db: &Database,
+    item: &HistoricalRejudgeBackupItem,
+) -> Result<()> {
+    let raw_id = json_string_field(&item.raw_drawer_row, "id")
+        .with_context(|| format!("backup row for {} is missing id", item.drawer.id))?;
+    if raw_id != item.drawer.id {
+        bail!(
+            "backup row id mismatch: item={} raw={raw_id}",
+            item.drawer.id
+        );
+    }
+    let raw_content = json_string_field(&item.raw_drawer_row, "content")
+        .with_context(|| format!("backup row for {} is missing content", item.drawer.id))?;
+    if raw_content != item.drawer.content {
+        bail!("backup row content mismatch for {}", item.drawer.id);
+    }
+
+    let columns = drawer_table_columns(db)?;
+    let mut assignments = Vec::new();
+    let mut values = Vec::new();
+    for column in columns {
+        if column == "id" {
+            continue;
+        }
+        let quoted = quote_sql_identifier(&column);
+        if column == "deleted_at" {
+            assignments.push(format!("{quoted} = NULL"));
+            continue;
+        }
+        let value = item
+            .raw_drawer_row
+            .get(&column)
+            .with_context(|| format!("backup row for {} is missing {column}", item.drawer.id))?;
+        values.push(json_value_to_sqlite_value(value)?);
+        assignments.push(format!("{quoted} = ?{}", values.len()));
+    }
+    let drawer_id_param = values.len() + 1;
+    let sql = format!(
+        "UPDATE drawers SET {} WHERE id = ?{drawer_id_param} AND deleted_at IS NOT NULL",
+        assignments.join(", ")
+    );
+    values.push(rusqlite::types::Value::Text(item.drawer.id.clone()));
+    let affected = db
+        .conn()
+        .execute(&sql, rusqlite::params_from_iter(values.iter()))
+        .with_context(|| format!("failed to restore soft-deleted drawer {}", item.drawer.id))?;
+    if affected != 1 {
+        bail!(
+            "soft-deleted drawer not found for restore: {}",
+            item.drawer.id
+        );
+    }
+    restore_rejudge_drawer_fts_row(db, &item.drawer.id)
+}
+
+fn json_value_to_sqlite_value(value: &serde_json::Value) -> Result<rusqlite::types::Value> {
+    match value {
+        serde_json::Value::Null => Ok(rusqlite::types::Value::Null),
+        serde_json::Value::Bool(value) => Ok(rusqlite::types::Value::Integer(i64::from(*value))),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(rusqlite::types::Value::Integer(value))
+            } else if let Some(value) = value.as_u64() {
+                let value = i64::try_from(value).context("backup integer exceeds i64")?;
+                Ok(rusqlite::types::Value::Integer(value))
+            } else if let Some(value) = value.as_f64() {
+                Ok(rusqlite::types::Value::Real(value))
+            } else {
+                bail!("unsupported backup number value")
+            }
+        }
+        serde_json::Value::String(value) => Ok(rusqlite::types::Value::Text(value.clone())),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            bail!("unsupported structured backup SQL value")
+        }
+    }
+}
+
+fn restore_rejudge_drawer_fts_row(db: &Database, drawer_id: &str) -> Result<()> {
+    if !db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawers_fts')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to query FTS table presence")?
+    {
+        return Ok(());
+    }
+
+    let (rowid, content) = db
+        .conn()
+        .query_row(
+            "SELECT rowid, content FROM drawers WHERE id = ?1",
+            [drawer_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .with_context(|| format!("failed to load restored drawer {drawer_id} for FTS"))?;
+    db.conn()
+        .execute(
+            "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
+            rusqlite::params![rowid, content],
+        )
+        .with_context(|| format!("failed to restore FTS row for drawer {drawer_id}"))?;
+    Ok(())
+}
+
 fn restore_rejudge_backup_item(db: &Database, item: &HistoricalRejudgeBackupItem) -> Result<()> {
     match drawer_deleted_at(db, &item.drawer.id)? {
         Some(Some(_)) => {
-            delete_drawer_for_restore(db, &item.drawer.id)
-                .with_context(|| format!("failed to replace deleted drawer {}", item.drawer.id))?;
-            db.insert_drawer_with_project_validity(
-                &item.drawer,
-                item.project_id.as_deref(),
-                item.source_root.as_deref(),
-                item.valid_from.as_deref(),
-                item.valid_until.as_deref(),
-            )
-            .with_context(|| format!("failed to restore drawer {}", item.drawer.id))?;
+            restore_soft_deleted_rejudge_drawer(db, item)?;
         }
         Some(None) => {}
         None => {
@@ -14957,6 +15057,64 @@ mod historical_rejudge_tests {
         let audit_log =
             std::fs::read_to_string(tmp.path().join("audit.jsonl")).expect("read audit log");
         assert!(audit_log.contains("\"command\":\"maintenance-rejudge-restore\""));
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_restore_preserves_kg_source_drawer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        db.insert_triple(&mempal::core::types::Triple {
+            id: "triple-low".to_string(),
+            subject: "mempal".to_string(),
+            predicate: "has_note".to_string(),
+            object: "ok".to_string(),
+            valid_from: Some(current_timestamp()),
+            valid_to: None,
+            confidence: 1.0,
+            source_drawer: Some("low".to_string()),
+        })
+        .expect("insert source triple");
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("execute soft-delete rejudge");
+        let backup = only_backup_file(&backups);
+
+        maintenance_rejudge_restore_command(
+            &db,
+            &backup,
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect("restore execute");
+
+        assert!(db.get_drawer("low").expect("load drawer").is_some());
+        let source_drawer: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT source_drawer FROM triples WHERE id = 'triple-low'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load triple source drawer");
+        assert_eq!(source_drawer.as_deref(), Some("low"));
     }
 
     #[tokio::test]
