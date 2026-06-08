@@ -75,11 +75,23 @@ impl DbFileIdentity {
             }
         }
 
-        let canonical_target = canonicalize_if_present(fd_target);
-        if self.fd_targets.contains(&canonical_target) {
+        let canonical_target =
+            if target_is_symlink(fd_target) || (target_name_matches && fd_file_id.is_none()) {
+                Some(canonicalize_if_present(fd_target))
+            } else {
+                None
+            };
+        if canonical_target
+            .as_ref()
+            .is_some_and(|target| self.fd_targets.contains(target))
+        {
             return true;
         }
-        if !target_name_matches && !self.target_name_matches(&canonical_target) {
+        if !target_name_matches
+            && !canonical_target
+                .as_ref()
+                .is_some_and(|target| self.target_name_matches(target))
+        {
             return false;
         }
 
@@ -91,9 +103,11 @@ impl DbFileIdentity {
         }
         let stripped_target = strip_deleted_suffix(fd_file_id, fd_target);
 
-        self.fd_targets
-            .contains(&canonicalize_if_present(&stripped_target))
-            || self.fd_targets.contains(stripped_target.as_ref())
+        self.fd_targets.contains(stripped_target.as_ref())
+            || (matches!(stripped_target, Cow::Owned(_))
+                && self
+                    .fd_targets
+                    .contains(&canonicalize_if_present(&stripped_target)))
     }
 
     fn target_name_matches(&self, path: &Path) -> bool {
@@ -197,6 +211,10 @@ fn canonicalize_db_path_or_parent(path: PathBuf) -> Option<PathBuf> {
 
 fn canonicalize_if_present(path: &Path) -> PathBuf {
     canonicalize_db_path_or_parent(path.to_path_buf()).unwrap_or_else(|| path.to_path_buf())
+}
+
+fn target_is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
 fn file_id_for_path(path: &Path) -> Option<FileId> {
