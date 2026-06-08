@@ -1939,6 +1939,7 @@ impl MempalMcpServer {
         let embed_snapshot = global_embed_status().snapshot();
         let intelligence_snapshot = crate::intelligence::global_intelligence_status().snapshot();
         let mut system_warnings = current_system_warnings();
+        let db_holders = crate::process_diagnostics::inspect_db_holders(&self.db_path);
         let vector_search_circuit =
             VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
         if db_snapshot.null_project_backfill_pending > 0 {
@@ -1971,6 +1972,7 @@ impl MempalMcpServer {
                 source: "project_isolation".to_string(),
             });
         }
+        push_db_holder_warnings(&mut system_warnings, &db_holders);
 
         let embed_failure_headline =
             crate::core::queue::failure_headline_count(embed_snapshot.fail_count, &queue_stats);
@@ -2051,6 +2053,7 @@ impl MempalMcpServer {
                 avg_processing_ms: queue_stats.avg_processing_ms,
                 eta_secs: queue_stats.eta_secs,
             },
+            db_holders,
             scrub_stats: ScrubStatsDto::from(ConfigHandle::scrub_stats()),
             chunker_stats: ChunkerStatsDto::from(
                 crate::ingest::chunk::global_chunker_stats().snapshot(),
@@ -7201,6 +7204,52 @@ fn push_mcp_timeout_warning(
         message: warning,
         source: "mcp_timeout".to_string(),
     });
+}
+
+fn push_db_holder_warnings(
+    system_warnings: &mut Vec<SystemWarning>,
+    report: &crate::process_diagnostics::DbHolderReport,
+) {
+    if let Some(error) = report.error.as_deref() {
+        system_warnings.push(SystemWarning {
+            level: "warn".to_string(),
+            message: format!("database holder process inspection failed: {error}"),
+            source: "db_holders".to_string(),
+        });
+    }
+    if report.stale_mcp_server_count > 0 {
+        system_warnings.push(SystemWarning {
+            level: "warn".to_string(),
+            message: format!(
+                "{} stale mempal MCP server process(es) hold palace.db open",
+                report.stale_mcp_server_count
+            ),
+            source: "db_holders".to_string(),
+        });
+    }
+    if report.orphan_daemon_count > 0 {
+        system_warnings.push(SystemWarning {
+            level: "warn".to_string(),
+            message: format!(
+                "{} orphan daemon process(es) hold palace.db open",
+                report.orphan_daemon_count
+            ),
+            source: "db_holders".to_string(),
+        });
+    }
+    if report.extra_holder_count > 0
+        && report.stale_mcp_server_count == 0
+        && report.orphan_daemon_count == 0
+    {
+        system_warnings.push(SystemWarning {
+            level: "warn".to_string(),
+            message: format!(
+                "{} extra process(es) hold palace.db open",
+                report.extra_holder_count
+            ),
+            source: "db_holders".to_string(),
+        });
+    }
 }
 
 fn stale_index_warning_from_bool(is_stale: bool) -> Option<SystemWarning> {

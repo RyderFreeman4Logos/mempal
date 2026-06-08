@@ -29,6 +29,7 @@ use crate::knowledge_card_retrieval::{RetrievedEvidenceCitation, RetrievedKnowle
 use crate::knowledge_distill::DistillOutcome;
 use crate::knowledge_gate::{GateReport, PromotionPolicyEntry};
 use crate::knowledge_lifecycle::{DemoteOutcome, PromoteOutcome};
+use crate::process_diagnostics::DbHolderReport;
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 
@@ -1920,6 +1921,10 @@ pub struct StatusResponse {
     /// Sticky embedder circuit plus the current vector-search fallback policy.
     pub embedder_circuit: EmbedderCircuitDto,
     pub queue_stats: QueueStatsDto,
+    /// Live processes holding `palace.db`, `palace.db-wal`, or
+    /// `palace.db-shm` open, classified as current daemon/MCP server versus
+    /// stale or extra holders.
+    pub db_holders: DbHolderReport,
     pub scrub_stats: ScrubStatsDto,
     pub chunker_stats: ChunkerStatsDto,
     pub llm_status: LlmStatusDto,
@@ -2366,6 +2371,7 @@ pub struct DoctorResponse {
     pub current_version: String,
     pub supported_schema_version: u32,
     pub db: DoctorDbDto,
+    pub db_holders: DbHolderReport,
     pub install: DoctorInstallDto,
     pub warnings: Vec<String>,
     pub recommendations: Vec<String>,
@@ -2378,6 +2384,7 @@ impl DoctorResponse {
             current_version: report.current_version,
             supported_schema_version: report.supported_schema_version,
             db: report.db.into(),
+            db_holders: report.db_holders,
             install: report.install.into(),
             warnings: report.warnings,
             recommendations: report.recommendations,
