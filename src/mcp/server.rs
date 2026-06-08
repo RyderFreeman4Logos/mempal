@@ -403,9 +403,14 @@ impl MempalMcpServer {
             }
         });
 
-        let outcome = self
+        let outcome = match self
             .run_prepared_ingest_off_runtime(prepared.request.clone(), prepared.controls)
-            .await;
+            .await
+        {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
 
         let _ = stop_tx.send(());
         let _ = heartbeat.await;
@@ -458,8 +463,7 @@ impl MempalMcpServer {
                         anyhow::anyhow!("failed to store async ingest result: {error}")
                     })?;
             }
-            Err(error) => {
-                let detail = error.to_string();
+            Err(detail) => {
                 let mut finalized = finalize_failed_ingest_response(
                     claim.id.clone(),
                     claim.created_at,
@@ -493,7 +497,7 @@ impl MempalMcpServer {
         &self,
         request: IngestRequest,
         controls: IngestControls,
-    ) -> anyhow::Result<IngestResponse> {
+    ) -> anyhow::Result<std::result::Result<IngestResponse, ErrorData>> {
         let worker = self.clone();
         #[cfg(any(test, feature = "db-test-seam"))]
         let ingest_processing_delay = self.ingest_processing_delay;
@@ -508,10 +512,9 @@ impl MempalMcpServer {
                     .enable_all()
                     .build()
                     .context("failed to build blocking ingest runtime")?;
-                runtime
+                Ok(runtime
                     .block_on(worker.mempal_ingest_sync(request, controls))
-                    .map(|response| response.0)
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+                    .map(|response| response.0))
             })
         })
         .await
@@ -3144,7 +3147,29 @@ impl MempalMcpServer {
             }));
         }
         if dry_run {
-            return self.mempal_ingest_sync(request, controls).await;
+            let response = match tokio::time::timeout(
+                self.ingest_admission_deadline,
+                self.run_prepared_ingest_off_runtime(request, controls),
+            )
+            .await
+            {
+                Ok(Ok(Ok(response))) => response,
+                Ok(Ok(Err(error))) => return Err(error),
+                Ok(Err(error)) => {
+                    return Err(ErrorData::internal_error(
+                        format!("failed to run dry-run ingest off runtime: {error}"),
+                        None,
+                    ));
+                }
+                Err(_) => {
+                    return Err(mcp_stage_timeout_error(
+                        "mempal_ingest",
+                        "dry-run admission",
+                        self.ingest_admission_deadline,
+                    ));
+                }
+            };
+            return Ok(Json(response));
         }
         if global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
@@ -7898,6 +7923,75 @@ mod tests {
             error
                 .to_string()
                 .contains("mempal_ingest admission preparation exceeded"),
+            "unexpected error: {error}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_dry_run_sync_preview_runs_off_runtime() {
+        let (_tempdir, db_path, server) = setup_server();
+        let server = server.with_ingest_processing_delay_for_test(Duration::from_millis(300));
+        let (ticks, ticker) = spawn_runtime_ticker();
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "dry-run preview must not block the MCP runtime".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("runtime".to_string()),
+                dry_run: Some(true),
+                wait: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("dry-run ingest")
+            .0;
+        ticker.abort();
+
+        assert!(response.operation_id.is_none());
+        assert!(response.state.is_none());
+        assert_eq!(response.chunk_count, 1);
+        assert!(!response.drawer_id.is_empty());
+        assert_runtime_ticked(&ticks, "mempal_ingest dry-run preview");
+
+        let db = Database::open(&db_path).expect("open db");
+        let drawer_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
+            .expect("count drawers");
+        assert_eq!(drawer_count, 0, "dry-run ingest must not persist drawers");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_dry_run_returns_error_when_preview_exceeds_deadline() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server
+            .with_ingest_processing_delay_for_test(Duration::from_millis(150))
+            .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.mempal_ingest(Parameters(IngestRequest {
+                content: "bounded dry-run preview".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("deadline".to_string()),
+                dry_run: Some(true),
+                wait: Some(false),
+                ..IngestRequest::default()
+            })),
+        )
+        .await
+        .expect("MCP dry-run ingest should return before client timeout");
+        let error = match result {
+            Ok(_) => panic!("slow dry-run preview should not claim success"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("mempal_ingest dry-run admission exceeded"),
             "unexpected error: {error}"
         );
 
