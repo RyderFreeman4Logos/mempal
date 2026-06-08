@@ -41,6 +41,7 @@ pub struct DbHolderProcess {
     pub pid: i32,
     pub role: String,
     pub classification: String,
+    /// Sanitized process label for human diagnostics. This is never raw argv.
     pub command: String,
     pub opened_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,7 +133,7 @@ fn inspect_db_holders_in_proc(
             pid,
             role: role.to_string(),
             classification: classification.to_string(),
-            command: command_display(&argv),
+            command: command_display(role),
             opened_files,
             started_at_unix_secs,
             age_secs,
@@ -299,11 +300,14 @@ fn is_mcp_server_argv(argv: &[String]) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn command_display(argv: &[String]) -> String {
-    if argv.is_empty() {
-        return "<unknown>".to_string();
+fn command_display(role: &str) -> String {
+    match role {
+        "mempal_daemon" => "mempal daemon".to_string(),
+        "mempal_mcp_server" => "mempal serve".to_string(),
+        "mempal_cli" => "mempal cli".to_string(),
+        "other" => "other process".to_string(),
+        _ => "<unknown>".to_string(),
     }
-    argv.join(" ")
 }
 
 #[cfg(target_os = "linux")]
@@ -401,6 +405,14 @@ mod tests {
         }
 
         #[test]
+        fn test_command_display_uses_fixed_labels_only() {
+            assert_eq!(command_display("mempal_mcp_server"), "mempal serve");
+            assert_eq!(command_display("mempal_daemon"), "mempal daemon");
+            assert_eq!(command_display("mempal_cli"), "mempal cli");
+            assert_eq!(command_display("other"), "other process");
+        }
+
+        #[test]
         fn test_daemon_pid_path_uses_current_dir_for_bare_relative_db_path() {
             assert_eq!(
                 daemon_pid_path(Path::new("palace.db")),
@@ -494,6 +506,66 @@ mod tests {
             assert_eq!(report.holder_count, 1);
             assert_eq!(report.holders[0].role, "other");
             assert_eq!(report.holders[0].classification, "extra_holder");
+        }
+
+        #[test]
+        fn test_inspect_db_holders_redacts_sensitive_argv_from_diagnostics() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let proc_root = tmp.path().join("proc");
+            fs::create_dir_all(&proc_root).expect("create proc");
+            fs::write(proc_root.join("stat"), "btime 1000\n").expect("write proc stat");
+
+            let db_path = tmp.path().join("palace.db");
+            let private_config = tmp.path().join("private").join("config.toml");
+            write_process(
+                &proc_root,
+                77,
+                &[
+                    "/private/bin/mempal",
+                    "serve",
+                    "--mcp",
+                    "--api-key",
+                    "sk-test-secret",
+                    "--config-path",
+                    private_config.to_str().expect("utf8 path"),
+                    "--token=ghp_test_secret",
+                ],
+                &[db_path.as_path()],
+            );
+            write_process(
+                &proc_root,
+                99,
+                &[
+                    "/private/tools/sqlite3",
+                    db_path.to_str().expect("utf8 path"),
+                    "--password=hunter2",
+                    "OPENAI_API_KEY=sk-hidden",
+                ],
+                &[db_path.as_path()],
+            );
+
+            let report = inspect_db_holders_in_proc(&db_path, &proc_root, 1100, 100);
+            let serialized = serde_json::to_string(&report).expect("serialize report");
+
+            assert_eq!(report.holder_count, 2);
+            assert_eq!(report.holders[0].command, "mempal serve");
+            assert_eq!(report.holders[1].command, "other process");
+            for forbidden in [
+                "--api-key",
+                "sk-test-secret",
+                "--config-path",
+                private_config.to_str().expect("utf8 path"),
+                "--token=ghp_test_secret",
+                "--password=hunter2",
+                "OPENAI_API_KEY=sk-hidden",
+                "/private/bin/mempal",
+                "/private/tools/sqlite3",
+            ] {
+                assert!(
+                    !serialized.contains(forbidden),
+                    "db holder diagnostics leaked raw argv fragment: {forbidden}"
+                );
+            }
         }
 
         #[test]
