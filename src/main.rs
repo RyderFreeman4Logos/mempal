@@ -12231,15 +12231,7 @@ async fn evaluate_historical_drawer(
 ) -> HistoricalRejudgeDecision {
     let drawer = &row.drawer;
     if let Some(reason) = historical_protection_reason(drawer) {
-        return HistoricalRejudgeDecision {
-            delete_candidate: false,
-            protected: true,
-            reason,
-            label: Some("protected".to_string()),
-            score: Some(1.0),
-            tier: 0,
-            judge: "deterministic".to_string(),
-        };
+        return protected_historical_decision(reason);
     }
 
     let candidate = historical_ingest_candidate(drawer);
@@ -12296,9 +12288,20 @@ async fn evaluate_historical_drawer(
     deterministic_historical_decision(drawer)
 }
 
+const HIGH_HISTORICAL_IMPORTANCE_THRESHOLD: i32 = 3;
+
 fn historical_protection_reason(drawer: &Drawer) -> Option<String> {
     if drawer.is_pinned {
         return Some("pinned".to_string());
+    }
+    if drawer.importance >= HIGH_HISTORICAL_IMPORTANCE_THRESHOLD {
+        return Some(format!("explicit_importance_{}", drawer.importance));
+    }
+    if drawer.effective_importance >= f64::from(HIGH_HISTORICAL_IMPORTANCE_THRESHOLD) {
+        return Some(format!(
+            "effective_importance_{:.3}",
+            drawer.effective_importance
+        ));
     }
     if matches!(
         drawer.status,
@@ -12367,6 +12370,10 @@ fn historical_ingest_candidate(drawer: &Drawer) -> IngestCandidate {
 }
 
 fn deterministic_historical_decision(drawer: &Drawer) -> HistoricalRejudgeDecision {
+    if let Some(reason) = historical_protection_reason(drawer) {
+        return protected_historical_decision(reason);
+    }
+
     let score = mempal::importance::score_importance(drawer);
     HistoricalRejudgeDecision {
         delete_candidate: score <= 1,
@@ -12378,6 +12385,18 @@ fn deterministic_historical_decision(drawer: &Drawer) -> HistoricalRejudgeDecisi
         },
         label: Some("importance".to_string()),
         score: Some(f64::from(score) / 5.0),
+        tier: 0,
+        judge: "deterministic".to_string(),
+    }
+}
+
+fn protected_historical_decision(reason: String) -> HistoricalRejudgeDecision {
+    HistoricalRejudgeDecision {
+        delete_candidate: false,
+        protected: true,
+        reason,
+        label: Some("protected".to_string()),
+        score: Some(1.0),
         tier: 0,
         judge: "deterministic".to_string(),
     }
@@ -13713,10 +13732,63 @@ mod historical_rejudge_tests {
         db.insert_drawer(&drawer).expect("insert drawer");
     }
 
+    fn insert_high_importance_drawer(db: &Database, id: &str) {
+        insert_custom_drawer(
+            db,
+            Drawer {
+                id: id.to_string(),
+                content: "ok".to_string(),
+                wing: "notes".to_string(),
+                source_file: Some(format!("{id}.json")),
+                source_type: SourceType::AgentInference,
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+                importance: 5,
+                ..Drawer::default()
+            },
+        );
+    }
+
+    fn assert_protected_importance_audit(db: &Database, drawer_id: &str, mutation: &str) {
+        let (decision, reason, explain_json): (String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT decision, reason, explain_json FROM gating_audit WHERE drawer_id = ?1",
+                [drawer_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load protected importance audit");
+        let explain =
+            serde_json::from_str::<serde_json::Value>(&explain_json).expect("parse explain json");
+
+        assert_eq!(decision, "keep");
+        assert_eq!(reason, "explicit_importance_5");
+        assert_eq!(
+            explain.get("mutation").and_then(serde_json::Value::as_str),
+            Some(mutation)
+        );
+    }
+
     fn audit_count(db: &Database) -> i64 {
         db.conn()
             .query_row("SELECT COUNT(*) FROM gating_audit", [], |row| row.get(0))
             .expect("count gating audit")
+    }
+
+    #[test]
+    fn deterministic_historical_decision_preserves_explicit_high_importance() {
+        let drawer = Drawer {
+            id: "important".to_string(),
+            content: "ok".to_string(),
+            wing: "notes".to_string(),
+            importance: 5,
+            ..Drawer::default()
+        };
+
+        let decision = deterministic_historical_decision(&drawer);
+
+        assert!(!decision.delete_candidate);
+        assert!(decision.protected);
+        assert_eq!(decision.reason, "explicit_importance_5");
     }
 
     #[tokio::test]
@@ -13747,6 +13819,33 @@ mod historical_rejudge_tests {
     }
 
     #[tokio::test]
+    async fn historical_rejudge_dry_run_preserves_explicit_high_importance() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_high_importance_drawer(&db, "important");
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: false,
+                hard_delete: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("dry-run rejudge");
+
+        assert!(db.get_drawer("important").expect("load drawer").is_some());
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_protected_importance_audit(&db, "important", "dry_run");
+    }
+
+    #[tokio::test]
     async fn historical_rejudge_execute_soft_deletes_candidates() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
@@ -13774,6 +13873,40 @@ mod historical_rejudge_tests {
             std::fs::read_to_string(tmp.path().join("audit.jsonl")).expect("read audit log");
         assert!(audit_log.contains("\"command\":\"maintenance-rejudge\""));
         assert!(audit_log.contains("\"drawer_ids\":[\"low\"]"));
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_execute_preserves_explicit_high_importance() {
+        for (hard_delete, mutation) in [(false, "soft_delete"), (true, "hard_delete")] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+            insert_drawer(&db, "low", "ok", "notes", None);
+            insert_high_importance_drawer(&db, "important");
+
+            maintenance_rejudge_command(
+                &db,
+                &test_config(),
+                HistoricalRejudgeOptions {
+                    execute: true,
+                    hard_delete,
+                    limit: 100,
+                    wing: None,
+                    room: None,
+                    project: None,
+                    format: "plain",
+                },
+            )
+            .await
+            .expect("execute rejudge");
+
+            assert!(db.get_drawer("low").expect("load low drawer").is_none());
+            assert!(
+                db.get_drawer("important")
+                    .expect("load important drawer")
+                    .is_some()
+            );
+            assert_protected_importance_audit(&db, "important", mutation);
+        }
     }
 
     #[tokio::test]
