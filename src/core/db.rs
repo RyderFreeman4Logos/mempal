@@ -2061,12 +2061,28 @@ impl Database {
     }
 
     fn delete_drawer_fts_row(&self, rowid: i64, content: &str) -> Result<(), DbError> {
+        if !self.drawer_fts_row_indexed(rowid)? {
+            return Ok(());
+        }
+
         let tokenized = fts_tokenize_content(content);
         self.conn.execute(
             "INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', ?1, ?2)",
             params![rowid, tokenized],
         )?;
         Ok(())
+    }
+
+    fn drawer_fts_row_indexed(&self, rowid: i64) -> Result<bool, DbError> {
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS temp.drawer_fts_vocab \
+             USING fts5vocab('main', 'drawers_fts', 'instance')",
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.drawer_fts_vocab WHERE doc = ?1)",
+            [rowid],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn drawer_vector_details(&self, drawer_id: &str) -> Result<DrawerVectorDetails, DbError> {
@@ -6934,6 +6950,28 @@ mod tests {
             .expect("read drawer rowid")
     }
 
+    fn drawer_fts_doc_indexed(db: &Database, rowid: i64) -> bool {
+        db.conn()
+            .execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS temp.test_drawer_fts_vocab \
+                 USING fts5vocab('main', 'drawers_fts', 'instance')",
+            )
+            .expect("create FTS vocab view");
+        db.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM temp.test_drawer_fts_vocab WHERE doc = ?1)",
+                [rowid],
+                |row| row.get(0),
+            )
+            .expect("query FTS doc presence")
+    }
+
+    fn remove_drawer_fts_doc(db: &Database, rowid: i64) {
+        db.conn()
+            .execute("DELETE FROM drawers_fts WHERE rowid = ?1", [rowid])
+            .expect("remove FTS doc");
+    }
+
     fn active_drawer_source_root(db: &Database, id: &str) -> Option<Option<String>> {
         db.conn()
             .query_row(
@@ -7721,13 +7759,44 @@ mod tests {
     }
 
     #[test]
-    fn purge_deleted_removes_fts_row_before_rowid_reuse() {
+    fn purge_deleted_tolerates_legacy_soft_deleted_row_missing_fts_doc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("test.db")).expect("open db");
+        insert_test_drawer(
+            &db,
+            "legacy-missing",
+            "purgelegacymissing soft deleted payload",
+            None,
+        );
+        let old_rowid = drawer_rowid(&db, "legacy-missing");
+
+        assert!(
+            db.soft_delete_drawer("legacy-missing")
+                .expect("soft delete drawer")
+        );
+        remove_drawer_fts_doc(&db, old_rowid);
+        assert!(
+            !drawer_fts_doc_indexed(&db, old_rowid),
+            "test requires a legacy soft-deleted row absent from FTS"
+        );
+
+        let purged = db.purge_deleted(None).expect("purge deleted drawer");
+        assert_eq!(purged, 1);
+        assert_eq!(db.deleted_drawer_count().expect("count deleted drawers"), 0);
+    }
+
+    #[test]
+    fn purge_deleted_removes_existing_stale_fts_row_before_rowid_reuse() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::open(&dir.path().join("test.db")).expect("open db");
         insert_test_drawer(&db, "old", "purgelegacyneedle soft deleted payload", None);
         let old_rowid = drawer_rowid(&db, "old");
 
         assert!(db.soft_delete_drawer("old").expect("soft delete drawer"));
+        assert!(
+            drawer_fts_doc_indexed(&db, old_rowid),
+            "test requires an existing stale FTS doc before purge"
+        );
         let purged = db.purge_deleted(None).expect("purge deleted drawer");
         assert_eq!(purged, 1);
 
