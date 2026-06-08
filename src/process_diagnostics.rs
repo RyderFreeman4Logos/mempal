@@ -1,5 +1,9 @@
+#[cfg(target_os = "linux")]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::schemars::{self, JsonSchema};
@@ -46,11 +50,10 @@ pub struct DbHolderProcess {
     pub current_mcp_server: bool,
 }
 
-/// Inspect live DB holders. On non-Unix platforms this returns an empty report
-/// because portable process fd enumeration is not available without external
-/// tooling.
+/// Inspect live DB holders. On non-Linux platforms this returns an empty report
+/// because `/proc/<pid>/fd` enumeration is Linux-specific.
 pub fn inspect_db_holders(db_path: &Path) -> DbHolderReport {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -65,16 +68,13 @@ pub fn inspect_db_holders(db_path: &Path) -> DbHolderReport {
         )
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
-        empty_report(
-            db_path,
-            Some("process fd inspection is only supported on Unix".to_string()),
-        )
+        empty_report(db_path, None)
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn inspect_db_holders_in_proc(
     db_path: &Path,
     proc_root: &Path,
@@ -181,7 +181,7 @@ fn empty_report(db_path: &Path, error: Option<String>) -> DbHolderReport {
     build_report(db_path, Vec::new(), error)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn opened_db_files(fd_dir: &Path, targets: &[(String, PathBuf)]) -> Vec<String> {
     let entries = match fs::read_dir(fd_dir) {
         Ok(entries) => entries,
@@ -203,7 +203,7 @@ fn opened_db_files(fd_dir: &Path, targets: &[(String, PathBuf)]) -> Vec<String> 
     opened
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn db_file_targets(db_path: &Path) -> Vec<(String, PathBuf)> {
     vec![
         ("db".to_string(), db_path.to_path_buf()),
@@ -212,14 +212,14 @@ fn db_file_targets(db_path: &Path) -> Vec<(String, PathBuf)> {
     ]
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -233,7 +233,7 @@ fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
     path
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_daemon_pid(db_path: &Path) -> Option<i32> {
     let pid_path = db_path.parent()?.join("daemon.pid");
     fs::read_to_string(pid_path)
@@ -241,7 +241,7 @@ fn read_daemon_pid(db_path: &Path) -> Option<i32> {
         .and_then(|content| content.trim().parse::<i32>().ok())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_cmdline(path: &Path) -> Vec<String> {
     let Ok(bytes) = fs::read(path) else {
         return Vec::new();
@@ -249,7 +249,7 @@ fn read_cmdline(path: &Path) -> Vec<String> {
     parse_cmdline(&bytes)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn parse_cmdline(bytes: &[u8]) -> Vec<String> {
     bytes
         .split(|byte| *byte == b'\0')
@@ -258,7 +258,7 @@ fn parse_cmdline(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn classify_role(argv: &[String], binary_name: &str) -> &'static str {
     if !is_mempal_invocation(argv, binary_name) {
         return "other";
@@ -274,7 +274,7 @@ fn classify_role(argv: &[String], binary_name: &str) -> &'static str {
     "mempal_cli"
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn classify_holder(
     role: &str,
     current_process: bool,
@@ -296,7 +296,7 @@ fn classify_holder(
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn is_mempal_invocation(argv: &[String], binary_name: &str) -> bool {
     let Some(program) = argv.first() else {
         return false;
@@ -310,7 +310,7 @@ fn is_mempal_invocation(argv: &[String], binary_name: &str) -> bool {
     name == binary_name || name == "mempal"
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn is_mcp_server_argv(argv: &[String]) -> bool {
     let Some((index, subcommand)) = first_cli_subcommand(argv) else {
         return false;
@@ -318,7 +318,7 @@ fn is_mcp_server_argv(argv: &[String]) -> bool {
     subcommand == "serve" && argv[index + 1..].iter().any(|arg| arg == "--mcp")
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn first_cli_subcommand(argv: &[String]) -> Option<(usize, &str)> {
     let mut index = 1;
     while index < argv.len() {
@@ -339,17 +339,17 @@ fn first_cli_subcommand(argv: &[String]) -> Option<(usize, &str)> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn global_flag_takes_value(arg: &str) -> bool {
     matches!(arg, "--config" | "--db-path")
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn global_flag_has_inline_value(arg: &str) -> bool {
     arg.starts_with("--config=") || arg.starts_with("--db-path=")
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn command_display(argv: &[String]) -> String {
     if argv.is_empty() {
         return "<unknown>".to_string();
@@ -357,7 +357,7 @@ fn command_display(argv: &[String]) -> String {
     argv.join(" ")
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_boot_time(proc_root: &Path) -> Option<u64> {
     let content = fs::read_to_string(proc_root.join("stat")).ok()?;
     content.lines().find_map(|line| {
@@ -366,20 +366,20 @@ fn read_boot_time(proc_root: &Path) -> Option<u64> {
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_start_ticks(path: &Path) -> Option<u64> {
     let content = fs::read_to_string(path).ok()?;
     parse_start_ticks(&content)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn parse_start_ticks(stat: &str) -> Option<u64> {
     let close = stat.rfind(") ")?;
     let fields = stat[close + 2..].split_whitespace().collect::<Vec<_>>();
     fields.get(19)?.parse::<u64>().ok()
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn parse_pid(value: &str) -> Option<i32> {
     if value.is_empty() {
         return None;
@@ -387,7 +387,7 @@ fn parse_pid(value: &str) -> Option<i32> {
     value.parse::<i32>().ok().filter(|pid| *pid > 0)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn clock_ticks_per_second() -> u64 {
     // SAFETY: sysconf(_SC_CLK_TCK) is a read-only libc query with no pointer
     // arguments and no Rust aliasing or lifetime requirements.
@@ -400,8 +400,8 @@ fn clock_ticks_per_second() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    mod unix {
+    #[cfg(target_os = "linux")]
+    mod linux {
         use super::super::*;
         use std::fs;
         use std::os::unix::fs::symlink;
@@ -427,6 +427,13 @@ mod tests {
                 parse_cmdline(b"/usr/local/bin/mempal\0serve\0--mcp\0"),
                 vec!["/usr/local/bin/mempal", "serve", "--mcp"]
             );
+            assert!(is_mcp_server_argv(&[
+                "/usr/local/bin/mempal".to_string(),
+                "--db-path".to_string(),
+                "/tmp/palace.db".to_string(),
+                "serve".to_string(),
+                "--mcp".to_string()
+            ]));
             let stat = "123 (mempal worker) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 98765";
             assert_eq!(parse_start_ticks(stat), Some(98765));
         }
@@ -506,6 +513,24 @@ mod tests {
             assert_eq!(report.holder_count, 1);
             assert_eq!(report.holders[0].role, "other");
             assert_eq!(report.holders[0].classification, "extra_holder");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    mod non_linux {
+        use super::super::*;
+        use std::path::Path;
+
+        #[test]
+        fn test_inspect_db_holders_noops_without_error() {
+            let report = inspect_db_holders(Path::new("/tmp/palace.db"));
+
+            assert_eq!(report.holder_count, 0);
+            assert_eq!(report.extra_holder_count, 0);
+            assert_eq!(report.stale_mcp_server_count, 0);
+            assert_eq!(report.orphan_daemon_count, 0);
+            assert!(report.error.is_none());
+            assert!(!report.has_problem());
         }
     }
 }
