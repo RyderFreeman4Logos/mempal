@@ -89,6 +89,7 @@ use rmcp::{
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::OnceCell;
 
 use super::timeline::{TimelineRequest, TimelineResponse};
 use super::tools::{
@@ -128,7 +129,7 @@ const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct MempalMcpServer {
     db_path: PathBuf,
-    async_db: AsyncDb,
+    async_db: Arc<OnceCell<AsyncDb>>,
     async_queue: AsyncPendingMessageStore,
     gating_runtime: Arc<GatingRuntime>,
     embedder_factory: Arc<dyn EmbedderFactory>,
@@ -176,16 +177,10 @@ impl MempalMcpServer {
         config: crate::core::config::Config,
         embedder_factory: Arc<dyn EmbedderFactory>,
     ) -> anyhow::Result<Self> {
-        let async_db = AsyncDb::open(&db_path, 4).with_context(|| {
-            format!(
-                "failed to open MCP async database pool for {}",
-                db_path.display()
-            )
-        })?;
         let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path);
         Ok(Self {
             db_path,
-            async_db,
+            async_db: Arc::new(OnceCell::new()),
             async_queue,
             gating_runtime: Arc::new(GatingRuntime::new(config, Arc::clone(&embedder_factory))),
             embedder_factory,
@@ -207,7 +202,9 @@ impl MempalMcpServer {
 
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_async_db_for_test(mut self, async_db: AsyncDb) -> Self {
-        self.async_db = async_db;
+        let cell = Arc::new(OnceCell::new());
+        debug_assert!(cell.set(async_db).is_ok());
+        self.async_db = cell;
         self
     }
 
@@ -536,12 +533,31 @@ impl MempalMcpServer {
         })
     }
 
+    async fn async_db(&self) -> anyhow::Result<AsyncDb> {
+        let db_path = self.db_path.clone();
+        let async_db = self
+            .async_db
+            .get_or_try_init(|| async move {
+                let display_path = db_path.display().to_string();
+                tokio::task::spawn_blocking(move || {
+                    AsyncDb::open(&db_path, 4).with_context(|| {
+                        format!("failed to open MCP async database pool for {display_path}")
+                    })
+                })
+                .await
+                .context("blocking MCP async database pool open failed")?
+            })
+            .await?;
+        Ok(async_db.clone())
+    }
+
     async fn load_status_db_snapshot(
         &self,
         project_scope: ProjectSearchScope,
         turns_config: crate::core::config::TurnsConfig,
     ) -> std::result::Result<StatusDbSnapshot, ErrorData> {
-        self.async_db
+        let async_db = self.async_db().await.map_err(db_error)?;
+        async_db
             .run_read_anyhow(move |db| {
                 let schema_version = db.schema_version()?;
                 let fork_ext_version = read_fork_ext_version(db.conn())?;
@@ -730,7 +746,8 @@ impl MempalMcpServer {
         F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
-        match tokio::time::timeout(deadline, self.async_db.run_read_anyhow(f)).await {
+        let async_db = self.async_db().await?;
+        match tokio::time::timeout(deadline, async_db.run_read_anyhow(f)).await {
             Ok(result) => result.map(Some),
             Err(_) => Ok(None),
         }
@@ -3336,7 +3353,8 @@ impl MempalMcpServer {
         room: Option<String>,
         project_id: Option<String>,
     ) -> std::result::Result<Option<DrawerSummary>, ErrorData> {
-        self.async_db
+        let async_db = self.async_db().await.map_err(db_error)?;
+        async_db
             .run_read(move |db| {
                 db.resolve_replacement_target(
                     supersedes.as_deref(),
@@ -7603,6 +7621,25 @@ mod tests {
     fn setup_server() -> (TempDir, PathBuf, MempalMcpServer) {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db fixture");
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_async_db_for_test(async_db);
+        (tempdir, db_path, server)
+    }
+
+    #[tokio::test]
+    async fn test_mcp_doctor_missing_db_is_read_only_after_server_construction() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_dir = tempdir.path().join("missing-home").join(".mempal");
+        let db_path = db_dir.join("palace.db");
+        assert!(!db_dir.exists());
+
         let server = MempalMcpServer::new_with_factory(
             db_path.clone(),
             Arc::new(StubEmbedderFactory {
@@ -7610,7 +7647,26 @@ mod tests {
             }),
         )
         .expect("create MCP server");
-        (tempdir, db_path, server)
+        assert!(
+            !db_dir.exists(),
+            "server construction must not create db dir"
+        );
+
+        let response = server
+            .mempal_doctor(Parameters(DoctorRequest {}))
+            .await
+            .expect("doctor")
+            .0;
+
+        assert_eq!(response.db.path, db_path.display().to_string());
+        assert!(!response.db.exists);
+        assert_eq!(response.db.schema_version, None);
+        assert!(response.db.compatible);
+        assert!(!db_path.exists(), "doctor must not create database file");
+        assert!(
+            !db_dir.exists(),
+            "doctor must not create database directory"
+        );
     }
 
     fn knowledge_card(
