@@ -17,6 +17,8 @@ use super::status::LlmStatus;
 const LLM_TASK_KIND: &str = "llm_task";
 const LLM_CLAIM_TTL_SECS: i64 = 300;
 const LLM_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const LLM_VERDICT_KEEP: &str = "keep";
+const LLM_VERDICT_REJECT: &str = "reject";
 
 pub const DEFAULT_GATING_JUDGE_PROMPT: &str = "You are a memory importance judge for a software engineering project memory system.\n\nGiven a piece of content captured from a coding session, determine if it contains IMPORTANT information worth storing long-term. Score from 0.0 to 1.0.\n\nIMPORTANT (score >= 0.7):\n- Architecture or design decisions and their rationale\n- Bug root cause analysis and fix strategies\n- User preferences, workflow choices, or explicit feedback\n- Configuration decisions and why they were made\n- Trade-off evaluations between approaches\n- Security concerns or mitigation strategies\n- Project milestones, status changes, or completion records\n- Integration decisions (which tools, which APIs, why)\n\nNOT IMPORTANT (score < 0.4):\n- Raw tool output (file listings, grep results, git status)\n- Routine code edits without design rationale\n- Build/test output logs\n- Boilerplate file content\n- Simple command execution without decision context\n- Repetitive status checks\n\nRespond with ONLY a JSON object: {\"score\": 0.0-1.0, \"reason\": \"brief explanation\"}";
 
@@ -334,12 +336,6 @@ fn apply_gating_verdict(
     verdict: &str,
     score: f64,
 ) -> Result<()> {
-    // The gating_audit row exists only for the primary drawer_id (recorded during ingest
-    // before chunking). Record the verdict there; the remaining chunk IDs have no audit
-    // row and updating them would violate the NOT NULL explain_json constraint.
-    db.upsert_llm_verdict(&task.drawer_id, verdict, Some(score))
-        .context("failed to upsert LLM verdict")?;
-
     let threshold = config
         .ingest_gating
         .llm_judge
@@ -347,8 +343,15 @@ fn apply_gating_verdict(
         .map(|judge| judge.threshold)
         .unwrap_or(0.3);
 
-    let rejected_by_verdict = is_reject_verdict(verdict);
-    if rejected_by_verdict || score < threshold {
+    let effective_verdict = effective_retention_verdict(verdict, score, threshold);
+    // The gating_audit row exists only for the primary drawer_id (recorded during ingest
+    // before chunking). Record the effective retention verdict there; the remaining
+    // chunk IDs have no audit row and updating them would violate the NOT NULL
+    // explain_json constraint.
+    db.upsert_llm_verdict(&task.drawer_id, effective_verdict, Some(score))
+        .context("failed to upsert LLM verdict")?;
+
+    if effective_verdict == LLM_VERDICT_REJECT {
         // Resolve all drawer IDs: prefer the multi-chunk list when present,
         // fall back to the single drawer_id for backward-compat queue tasks.
         let all_ids: Vec<&str> = if task.drawer_ids.is_empty() {
@@ -358,7 +361,8 @@ fn apply_gating_verdict(
         };
         tracing::info!(
             drawer_ids = ?all_ids,
-            verdict,
+            verdict = effective_verdict,
+            raw_verdict = verdict,
             score,
             threshold,
             "LLM verdict triggered retroactive soft-delete for drawers"
@@ -370,7 +374,8 @@ fn apply_gating_verdict(
             if deleted {
                 tracing::info!(
                     drawer_id = %id,
-                    verdict,
+                    verdict = effective_verdict,
+                    raw_verdict = verdict,
                     score,
                     threshold,
                     "LLM verdict retroactively soft-deleted drawer"
@@ -382,10 +387,27 @@ fn apply_gating_verdict(
     Ok(())
 }
 
+fn effective_retention_verdict(verdict: &str, score: f64, threshold: f64) -> &'static str {
+    if is_reject_verdict(verdict) || score < threshold {
+        LLM_VERDICT_REJECT
+    } else {
+        LLM_VERDICT_KEEP
+    }
+}
+
 fn is_reject_verdict(verdict: &str) -> bool {
     matches!(
         verdict.trim().to_ascii_lowercase().as_str(),
-        "reject" | "rejected" | "skip" | "skipped"
+        "reject"
+            | "rejected"
+            | "skip"
+            | "skipped"
+            | "delete"
+            | "deleted"
+            | "drop"
+            | "dropped"
+            | "quarantine"
+            | "quarantined"
     )
 }
 
@@ -410,8 +432,9 @@ fn parse_gating_verdict(content: &str) -> (String, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::Config;
+    use crate::core::config::{Config, IngestGatingConfig, LlmJudgeConfig};
     use crate::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
+    use crate::ingest::gating::GatingDecision;
     use rusqlite::params;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -459,6 +482,86 @@ mod tests {
                 |row| row.get::<_, bool>(0),
             )
             .expect("read drawer deletion state")
+    }
+
+    fn record_pending_llm_audit(db: &Database, id: &str) {
+        let decision = GatingDecision::accepted(0, Some("llm_pending".to_string()), None);
+        db.record_gating_audit(id, &decision, None, Some("judge me"))
+            .expect("record pending LLM audit row");
+    }
+
+    fn llm_judge_config(threshold: f64) -> Config {
+        Config {
+            ingest_gating: IngestGatingConfig {
+                llm_judge: Some(LlmJudgeConfig {
+                    enabled: true,
+                    threshold,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn gating_task(id: &str) -> LlmTaskPayload {
+        LlmTaskPayload {
+            task_type: "gating".to_string(),
+            drawer_id: id.to_string(),
+            drawer_ids: vec![id.to_string()],
+            content: "judge me".to_string(),
+            system_prompt: None,
+        }
+    }
+
+    fn llm_audit_verdict(db: &Database, id: &str) -> (String, f64) {
+        db.conn()
+            .query_row(
+                "SELECT llm_verdict, llm_score FROM gating_audit WHERE drawer_id = ?1",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+            )
+            .expect("read LLM audit verdict")
+    }
+
+    #[test]
+    fn test_below_threshold_keep_verdict_becomes_reject_and_soft_deletes() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        insert_drawer(&db, "llm-low-score-keep");
+        record_pending_llm_audit(&db, "llm-low-score-keep");
+        let task = gating_task("llm-low-score-keep");
+        let config = llm_judge_config(0.6);
+
+        apply_gating_verdict(&db, &task, &config, "keep", 0.2).expect("apply verdict");
+
+        assert!(drawer_is_deleted(&db, "llm-low-score-keep"));
+        assert_eq!(
+            llm_audit_verdict(&db, "llm-low-score-keep"),
+            ("reject".to_string(), 0.2)
+        );
+        assert_eq!(effective_retention_verdict("keep", 0.2, 0.6), "reject");
+    }
+
+    #[test]
+    fn test_above_threshold_keep_verdict_stays_keep_without_soft_delete() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        insert_drawer(&db, "llm-high-score-keep");
+        record_pending_llm_audit(&db, "llm-high-score-keep");
+        let task = gating_task("llm-high-score-keep");
+        let config = llm_judge_config(0.6);
+
+        apply_gating_verdict(&db, &task, &config, "keep", 0.9).expect("apply verdict");
+
+        assert!(!drawer_is_deleted(&db, "llm-high-score-keep"));
+        assert_eq!(
+            llm_audit_verdict(&db, "llm-high-score-keep"),
+            ("keep".to_string(), 0.9)
+        );
+        assert_eq!(effective_retention_verdict("keep", 0.9, 0.6), "keep");
     }
 
     #[tokio::test(flavor = "current_thread")]
