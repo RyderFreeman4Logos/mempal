@@ -137,6 +137,26 @@ fn test_hook_writes_nothing_to_stdout() {
 }
 
 #[test]
+fn test_hook_post_tool_canonical_stdout_is_empty_and_bootstrap_uses_stderr() {
+    let (home, _db_path) = setup_home();
+    let payload = r#"{"event":"PostToolUse","tool_name":"diagnostic","cwd":"/tmp","command":"true","exit_code":0}"#;
+
+    let output = run_hook(&home, "PostToolUse", payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout is Codex hook protocol; got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("config hot-reload: bootstrapped version "),
+        "human-readable bootstrap status must be emitted on stderr, got {stderr:?}"
+    );
+}
+
+#[test]
 fn test_hook_envelopes_oversized_payload() {
     let (home, db_path) = setup_home();
     let mut oversized = String::from("{\"payload\":\"");
