@@ -196,7 +196,7 @@ fn canonicalize_db_path_or_parent(path: PathBuf) -> Option<PathBuf> {
 }
 
 fn canonicalize_if_present(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    canonicalize_db_path_or_parent(path.to_path_buf()).unwrap_or_else(|| path.to_path_buf())
 }
 
 fn file_id_for_path(path: &Path) -> Option<FileId> {
@@ -303,6 +303,24 @@ mod tests {
             identity.db_path(),
             std::fs::canonicalize(tmp.path())
                 .expect("canonical tempdir")
+                .join("palace.db")
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_if_present_uses_canonical_parent_when_file_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_dir = tmp.path().join("real");
+        let linked_dir = tmp.path().join("linked");
+        fs::create_dir(&real_dir).expect("real dir");
+        symlink(&real_dir, &linked_dir).expect("dir symlink");
+
+        let db_path = linked_dir.join("palace.db");
+
+        assert_eq!(
+            canonicalize_if_present(&db_path),
+            std::fs::canonicalize(&real_dir)
+                .expect("canonical real dir")
                 .join("palace.db")
         );
     }
