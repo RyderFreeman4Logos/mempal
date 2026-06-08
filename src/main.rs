@@ -12734,6 +12734,7 @@ fn delete_rejudge_backup_items_by_version(
                 continue;
             }
             if hard_delete {
+                delete_rejudge_drawer_fts_row(db, &item.drawer.id)?;
                 if vectors_exist {
                     db.conn()
                         .execute(
@@ -15156,6 +15157,37 @@ mod historical_rejudge_tests {
             .expect("changed drawer must not be deleted");
         assert_eq!(drawer.content, changed_content);
         assert_eq!(drawer.importance, 5);
+    }
+
+    #[test]
+    fn historical_rejudge_hard_delete_removes_fts_row_before_drawer_delete() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "legacyneedle", "notes", None);
+        let rows = db
+            .historical_rejudge_candidates(None, None, None, 100)
+            .expect("load candidates");
+        let row = rows
+            .iter()
+            .find(|row| row.drawer.id == "low")
+            .expect("low candidate");
+        let decision = deterministic_historical_decision(&row.drawer);
+        let item = build_historical_rejudge_backup_item(&db, row, &decision, "hard_delete")
+            .expect("build backup item")
+            .expect("version-matched item");
+
+        let deleted = delete_rejudge_backup_items_by_version(&db, &[item], true)
+            .expect("versioned hard-delete");
+        assert_eq!(deleted, 1);
+
+        insert_drawer(&db, "replacement", "fresh payload", "notes", None);
+        let stale_matches = db
+            .search_fts("legacyneedle", None, None, "all", None, 10)
+            .expect("search stale hard-deleted payload through FTS");
+        assert!(
+            stale_matches.is_empty(),
+            "hard-delete must remove stale BM25 rows before rowid reuse: {stale_matches:?}"
+        );
     }
 
     #[tokio::test]
