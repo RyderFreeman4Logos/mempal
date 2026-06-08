@@ -38,13 +38,10 @@ impl DbFileIdentity {
     }
 
     fn insert_target(&mut self, path: &Path) {
-        let canonical = canonicalize_if_present(path);
         self.fd_targets.insert(path.to_path_buf());
-        self.fd_targets.insert(canonical.clone());
         self.insert_target_name(path);
-        self.insert_target_name(&canonical);
 
-        if let Some(file_id) = file_id_for_path(path).or_else(|| file_id_for_path(&canonical)) {
+        if let Some(file_id) = file_id_for_path(path) {
             self.file_ids.insert(file_id);
         }
     }
