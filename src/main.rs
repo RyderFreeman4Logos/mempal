@@ -12853,7 +12853,7 @@ fn restore_rejudge_backup_item_transaction(
             return Ok(outcome);
         }
         if outcome.conflict {
-            hard_delete_active_drawer_for_restore(db, &item.drawer.id)
+            delete_drawer_for_restore(db, &item.drawer.id)
                 .with_context(|| format!("failed to overwrite active drawer {}", item.drawer.id))?;
         }
         restore_rejudge_backup_item(db, item)?;
@@ -12905,7 +12905,7 @@ fn rejudge_restore_outcome_for_state(
     }
 }
 
-fn hard_delete_active_drawer_for_restore(db: &Database, drawer_id: &str) -> Result<usize> {
+fn delete_drawer_for_restore(db: &Database, drawer_id: &str) -> Result<usize> {
     let vectors_exist: bool = db
         .conn()
         .query_row(
@@ -12926,23 +12926,23 @@ fn hard_delete_active_drawer_for_restore(db: &Database, drawer_id: &str) -> Resu
         )
         .with_context(|| format!("failed to detach triples for drawer {drawer_id}"))?;
     db.conn()
-        .execute(
-            "DELETE FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
-            [drawer_id],
-        )
-        .with_context(|| format!("failed to delete active drawer {drawer_id}"))
+        .execute("DELETE FROM drawers WHERE id = ?1", [drawer_id])
+        .with_context(|| format!("failed to delete drawer {drawer_id}"))
 }
 
 fn restore_rejudge_backup_item(db: &Database, item: &HistoricalRejudgeBackupItem) -> Result<()> {
     match drawer_deleted_at(db, &item.drawer.id)? {
         Some(Some(_)) => {
-            db.conn()
-                .execute(
-                    "UPDATE drawers SET deleted_at = NULL, valid_until = ?2 WHERE id = ?1",
-                    rusqlite::params![item.drawer.id, item.valid_until.as_deref()],
-                )
-                .with_context(|| format!("failed to reactivate drawer {}", item.drawer.id))?;
-            restore_drawer_fts_row(db, &item.drawer.id)?;
+            delete_drawer_for_restore(db, &item.drawer.id)
+                .with_context(|| format!("failed to replace deleted drawer {}", item.drawer.id))?;
+            db.insert_drawer_with_project_validity(
+                &item.drawer,
+                item.project_id.as_deref(),
+                item.source_root.as_deref(),
+                item.valid_from.as_deref(),
+                item.valid_until.as_deref(),
+            )
+            .with_context(|| format!("failed to restore drawer {}", item.drawer.id))?;
         }
         Some(None) => {}
         None => {
@@ -12958,39 +12958,6 @@ fn restore_rejudge_backup_item(db: &Database, item: &HistoricalRejudgeBackupItem
     }
     if let Some(vector) = &item.vector {
         restore_rejudge_backup_vector(db, &item.drawer.id, vector)?;
-    }
-    Ok(())
-}
-
-fn restore_drawer_fts_row(db: &Database, drawer_id: &str) -> Result<()> {
-    use rusqlite::OptionalExtension;
-
-    if !db
-        .conn()
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawers_fts')",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .context("failed to query FTS table presence")?
-    {
-        return Ok(());
-    }
-    let row = db
-        .conn()
-        .query_row(
-            "SELECT rowid, content FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
-            [drawer_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    if let Some((rowid, content)) = row {
-        db.conn()
-            .execute(
-                "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
-                rusqlite::params![rowid, content],
-            )
-            .with_context(|| format!("failed to restore FTS row for drawer {drawer_id}"))?;
     }
     Ok(())
 }
@@ -15077,6 +15044,64 @@ mod historical_rejudge_tests {
             )
             .expect("count restore audits");
         assert_eq!(restore_audits, 0);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_restore_replaces_same_id_deleted_payload() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "original backup payload", "notes", None);
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: true,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("hard-delete original drawer");
+        let backup = only_backup_file(&backups);
+
+        insert_drawer(&db, "low", "different later payload", "notes", None);
+        assert!(
+            db.soft_delete_drawer("low")
+                .expect("soft-delete replacement")
+        );
+
+        maintenance_rejudge_restore_command(
+            &db,
+            &backup,
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect("restore backup over same-id deleted replacement");
+
+        let drawer = db
+            .get_drawer("low")
+            .expect("load restored drawer")
+            .expect("drawer restored");
+        assert_eq!(drawer.content, "original backup payload");
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        let restore_audits: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM gating_audit WHERE drawer_id = 'low' AND explain_json LIKE '%\"mutation\":\"restore\"%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count restore audits");
+        assert_eq!(restore_audits, 1);
     }
 
     #[tokio::test]
