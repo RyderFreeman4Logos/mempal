@@ -2001,11 +2001,7 @@ impl Database {
 
             for (rowid, id, content) in &rows {
                 if fts_exists {
-                    let tokenized = fts_tokenize_content(content);
-                    self.conn.execute(
-                        "INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', ?1, ?2)",
-                        params![rowid, tokenized],
-                    )?;
+                    self.delete_drawer_fts_row(*rowid, content)?;
                 }
                 if vectors_exist {
                     self.conn.execute(
@@ -2062,6 +2058,15 @@ impl Database {
 
     fn table_exists(&self, table_name: &str) -> Result<bool, DbError> {
         table_exists_conn(&self.conn, table_name)
+    }
+
+    fn delete_drawer_fts_row(&self, rowid: i64, content: &str) -> Result<(), DbError> {
+        let tokenized = fts_tokenize_content(content);
+        self.conn.execute(
+            "INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', ?1, ?2)",
+            params![rowid, tokenized],
+        )?;
+        Ok(())
     }
 
     pub fn drawer_vector_details(&self, drawer_id: &str) -> Result<DrawerVectorDetails, DbError> {
@@ -3476,6 +3481,7 @@ impl Database {
 
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<usize, DbError> {
+            let fts_exists = self.table_exists("drawers_fts")?;
             let mut deleted_total = 0usize;
             for id in drawer_ids {
                 if vectors_exist {
@@ -3486,6 +3492,19 @@ impl Database {
                     "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
                     [id],
                 )?;
+                if fts_exists {
+                    let fts_row = self
+                        .conn
+                        .query_row(
+                            "SELECT rowid, content FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+                            [id],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()?;
+                    if let Some((rowid, content)) = fts_row {
+                        self.delete_drawer_fts_row(rowid, &content)?;
+                    }
+                }
                 deleted_total += self.conn.execute(
                     "DELETE FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
                     [id],
@@ -3508,21 +3527,33 @@ impl Database {
 
     pub fn purge_deleted(&self, before: Option<&str>) -> Result<u64, DbError> {
         // First collect IDs to purge, then delete from both tables
-        let ids: Vec<String> = if let Some(before) = before {
+        let rows: Vec<(i64, String, String)> = if let Some(before) = before {
             let mut stmt = self.conn.prepare(
-                "SELECT id FROM drawers WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
+                "SELECT rowid, id, content FROM drawers WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
             )?;
-            stmt.query_map([before], |row| row.get(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
+            stmt.query_map([before], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id FROM drawers WHERE deleted_at IS NOT NULL")?;
-            stmt.query_map([], |row| row.get(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
+                .prepare("SELECT rowid, id, content FROM drawers WHERE deleted_at IS NOT NULL")?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
-        if ids.is_empty() {
+        if rows.is_empty() {
             return Ok(0);
         }
 
@@ -3532,6 +3563,7 @@ impl Database {
             [],
             |row| row.get(0),
         )?;
+        let fts_exists = self.table_exists("drawers_fts")?;
 
         // Wrap the purge in a single transaction. Clearing the
         // triples.source_drawer FK and deleting the drawer must be atomic:
@@ -3541,7 +3573,7 @@ impl Database {
         // — silently dropping provenance for a drawer that was not purged.
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<u64, DbError> {
-            for id in &ids {
+            for (rowid, id, content) in &rows {
                 if vectors_exist {
                     self.conn
                         .execute("DELETE FROM drawer_vectors WHERE id = ?1", [id])?;
@@ -3553,10 +3585,13 @@ impl Database {
                     "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
                     [id],
                 )?;
+                if fts_exists {
+                    self.delete_drawer_fts_row(*rowid, content)?;
+                }
                 self.conn
                     .execute("DELETE FROM drawers WHERE id = ?1", [id])?;
             }
-            Ok(ids.len() as u64)
+            Ok(rows.len() as u64)
         })();
 
         match result {
@@ -6891,6 +6926,14 @@ mod tests {
             .expect("read vector project_id")
     }
 
+    fn drawer_rowid(db: &Database, id: &str) -> i64 {
+        db.conn()
+            .query_row("SELECT rowid FROM drawers WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .expect("read drawer rowid")
+    }
+
     fn active_drawer_source_root(db: &Database, id: &str) -> Option<Option<String>> {
         db.conn()
             .query_row(
@@ -7646,6 +7689,61 @@ mod tests {
         assert!(
             !results.is_empty(),
             "CJK search should find Chinese content"
+        );
+    }
+
+    #[test]
+    fn hard_delete_drawers_by_ids_removes_fts_row_before_rowid_reuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("test.db")).expect("open db");
+        insert_test_drawer(&db, "old", "legacyneedle hard deleted payload", None);
+        let old_rowid = drawer_rowid(&db, "old");
+
+        let deleted = db
+            .hard_delete_drawers_by_ids(&[String::from("old")])
+            .expect("hard delete drawer");
+        assert_eq!(deleted, 1);
+
+        insert_test_drawer(&db, "replacement", "fresh replacement payload", None);
+        assert_eq!(
+            drawer_rowid(&db, "replacement"),
+            old_rowid,
+            "test requires SQLite to reuse the deleted drawer rowid"
+        );
+
+        let stale_matches = db
+            .search_fts("legacyneedle", None, None, "all", None, 10)
+            .expect("search stale hard-deleted payload through FTS");
+        assert!(
+            stale_matches.is_empty(),
+            "hard-delete must remove stale BM25 rows before rowid reuse: {stale_matches:?}"
+        );
+    }
+
+    #[test]
+    fn purge_deleted_removes_fts_row_before_rowid_reuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("test.db")).expect("open db");
+        insert_test_drawer(&db, "old", "purgelegacyneedle soft deleted payload", None);
+        let old_rowid = drawer_rowid(&db, "old");
+
+        assert!(db.soft_delete_drawer("old").expect("soft delete drawer"));
+        let purged = db.purge_deleted(None).expect("purge deleted drawer");
+        assert_eq!(purged, 1);
+
+        insert_test_drawer(&db, "replacement", "fresh replacement payload", None);
+        assert_eq!(
+            drawer_rowid(&db, "replacement"),
+            old_rowid,
+            "test requires SQLite to reuse the purged drawer rowid"
+        );
+
+        let stale_matches = db
+            .search_fts("purgelegacyneedle", None, None, "all", None, 10)
+            .expect("search stale purged payload through FTS");
+        assert!(
+            stale_matches.is_empty(),
+            "purge must remove stale BM25 rows before rowid reuse: {stale_matches:?}"
         );
     }
 }
