@@ -312,10 +312,10 @@ fn is_mempal_invocation(argv: &[String], binary_name: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_mcp_server_argv(argv: &[String]) -> bool {
-    let Some((index, subcommand)) = first_cli_subcommand(argv) else {
+    let Some((_, subcommand)) = first_cli_subcommand(argv) else {
         return false;
     };
-    subcommand == "serve" && argv[index + 1..].iter().any(|arg| arg == "--mcp")
+    subcommand == "serve"
 }
 
 #[cfg(target_os = "linux")]
@@ -429,6 +429,10 @@ mod tests {
             );
             assert!(is_mcp_server_argv(&[
                 "/usr/local/bin/mempal".to_string(),
+                "serve".to_string()
+            ]));
+            assert!(is_mcp_server_argv(&[
+                "/usr/local/bin/mempal".to_string(),
                 "--db-path".to_string(),
                 "/tmp/palace.db".to_string(),
                 "serve".to_string(),
@@ -461,7 +465,7 @@ mod tests {
             write_process(
                 &proc_root,
                 77,
-                &["/usr/local/bin/mempal", "serve", "--mcp"],
+                &["/usr/local/bin/mempal", "serve"],
                 &[db_path.as_path(), wal_path.as_path(), shm_path.as_path()],
             );
             write_process(
