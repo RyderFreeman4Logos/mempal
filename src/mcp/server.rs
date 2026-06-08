@@ -11,7 +11,10 @@ use crate::core::{
     AsyncDb,
     anchor::{self, DerivedAnchor},
     config::ConfigHandle,
-    db::{CURRENT_VECTOR_INDEX_VERSION, Database, VECTOR_DISTANCE_METRIC, read_fork_ext_version},
+    db::{
+        CURRENT_VECTOR_INDEX_VERSION, Database, NoveltyAuditInsert, VECTOR_DISTANCE_METRIC,
+        read_fork_ext_version,
+    },
     phase3::{
         EvaluatorAdviceInput, RuntimeAdoptionCaptureInput, RuntimeAdoptionCheckedRecordReport,
         RuntimeAdoptionRecordPlanInput, RuntimeAdoptionReviewFilters,
@@ -3949,21 +3952,20 @@ impl MempalMcpServer {
                         Ok(merged_vectors) => match merged_vectors.into_iter().next() {
                             Some(merged_vector) => {
                                 ensure_vector_dim_matches(&db, merged_vector.len())?;
-                                db.update_drawer_after_merge(
+                                db.update_drawer_after_merge_and_record_novelty_audit(
                                     &target_id,
                                     &merged_content,
                                     &merged_at,
                                     &merged_vector,
                                     merge_count,
-                                )
-                                .map_err(db_error)?;
-                                db.record_novelty_audit(
-                                    &drawer_id,
-                                    NoveltyAction::Merge,
-                                    Some(target_id.as_str()),
-                                    novelty.cosine,
-                                    novelty.audit_decision,
-                                    project_id.as_deref(),
+                                    NoveltyAuditInsert {
+                                        candidate_hash: &drawer_id,
+                                        action: NoveltyAction::Merge,
+                                        near_drawer_id: Some(target_id.as_str()),
+                                        cosine: novelty.cosine,
+                                        audit_decision: novelty.audit_decision,
+                                        project_id: project_id.as_deref(),
+                                    },
                                 )
                                 .map_err(db_error)?;
                                 novelty_action = Some(NoveltyAction::Merge);

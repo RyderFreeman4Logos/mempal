@@ -13,7 +13,7 @@ use mempal::core::db::{
 };
 use mempal::core::types::{Drawer, SourceType, Triple};
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory};
-use mempal::mcp::{IngestRequest, IngestResponse, MempalMcpServer};
+use mempal::mcp::{IngestOperationState, IngestRequest, IngestResponse, MempalMcpServer};
 use rusqlite::{Connection, OptionalExtension, params};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -686,6 +686,60 @@ async fn test_medium_similarity_candidate_merged() {
     assert_eq!(audits.len(), 1);
     assert_eq!(audits[0].decision, "merge");
     assert_eq!(audits[0].near_drawer_id.as_deref(), Some("existing"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_mcp_merge_audit_failure_rolls_back_target_update() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(true);
+    insert_drawer(
+        &env.db_path,
+        DrawerSeed {
+            id: "existing",
+            content: "Decision: keep atomic MCP merge audits",
+            wing: DEFAULT_WING,
+            room: DEFAULT_ROOM,
+            project_id: None,
+        },
+        &[1.0, 0.0],
+    );
+    Connection::open(&env.db_path)
+        .expect("open sqlite")
+        .execute_batch("DROP TABLE novelty_audit")
+        .expect("drop novelty audit table");
+    let candidate = "Also: audit insert failure must roll back merge";
+    let server = env.server(&[(candidate, vec![0.9, 0.4358899])], &[]);
+
+    let response = server
+        .ingest_json_for_test(
+            serde_json::to_value(IngestRequest {
+                content: candidate.to_string(),
+                wing: DEFAULT_WING.to_string(),
+                room: Some(DEFAULT_ROOM.to_string()),
+                dry_run: Some(false),
+                ..IngestRequest::default()
+            })
+            .expect("serialize ingest request"),
+        )
+        .await
+        .expect("failed operation response");
+
+    assert_eq!(response.state, Some(IngestOperationState::Failed));
+    assert!(
+        response
+            .failure_detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("novelty_audit"),
+        "failure detail should mention audit write failure: {response:?}"
+    );
+    assert_eq!(
+        drawer_content(&env.db_path, "existing"),
+        "Decision: keep atomic MCP merge audits"
+    );
+    let (merge_count, updated_at) = merge_state(&env.db_path, "existing");
+    assert_eq!(merge_count, 0);
+    assert_eq!(updated_at, None);
 }
 
 #[tokio::test(flavor = "current_thread")]
