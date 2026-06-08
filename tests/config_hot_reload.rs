@@ -538,6 +538,67 @@ async fn test_embedder_backend_change_warns_and_ignores() {
     wait_for_version_change(&stable_version);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_restart_required_hot_reload_event_expires_after_restart_bootstrap() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(&base_config(&PathBuf::from("/tmp/placeholder")));
+    let config = base_config(&env.db_path);
+    write_config_atomic(&env.config_path, &config);
+    ConfigHandle::bootstrap(&env.config_path).expect("rebootstrap config");
+
+    let changed = config.replace("http://gb10:18002/v1/", "http://localhost:9000/v1/");
+    write_config_atomic(&env.config_path, &changed);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let pending = ConfigHandle::restart_required_pending();
+    assert!(
+        pending
+            .iter()
+            .any(|event| event.contains("embedder.base_url requires restart")),
+        "pending restart-required changes missing before restart: {pending:?}"
+    );
+
+    let event_log_path = env
+        .config_path
+        .parent()
+        .expect("config path has parent")
+        .join("hot-reload-events.log");
+    let persisted = fs::read_to_string(&event_log_path).expect("read hot reload event log");
+    assert!(
+        persisted.contains("\"mempal_hot_reload_event\":\"restart_required\""),
+        "restart-required event should be persisted with structured metadata: {persisted}"
+    );
+
+    ConfigHandle::bootstrap(&env.config_path).expect("restart bootstrap");
+    assert_eq!(
+        ConfigHandle::current().embed.base_url.as_deref(),
+        Some("http://localhost:9000/v1/")
+    );
+
+    let pending_after_restart = ConfigHandle::restart_required_pending();
+    assert!(
+        pending_after_restart
+            .iter()
+            .all(|event| !event.contains("embedder.base_url requires restart")),
+        "stale restart-required change survived restart: {pending_after_restart:?}"
+    );
+
+    #[cfg(feature = "integration")]
+    {
+        let output = Command::new(mempal_bin())
+            .arg("status")
+            .env("HOME", env._tmp.path())
+            .output()
+            .expect("run mempal status after restart");
+        assert!(output.status.success(), "status failed: {output:?}");
+        let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
+        assert!(
+            stdout.contains("restart_required_config_changes: none"),
+            "status still reported stale restart-required changes: {stdout}"
+        );
+    }
+}
+
 #[cfg(feature = "integration")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_restart_required_hot_reload_changes_surface_in_status_and_doctor() {
