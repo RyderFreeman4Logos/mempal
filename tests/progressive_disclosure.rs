@@ -112,6 +112,7 @@ impl TestEnv {
                 vector: vec![0.1, 0.2, 0.3],
             }),
         )
+        .expect("create MCP server")
     }
 }
 

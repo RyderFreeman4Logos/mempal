@@ -355,7 +355,8 @@ async fn test_mcp_knowledge_cards_retrieve_action() {
     let server = MempalMcpServer::new_with_factory(
         db_path,
         Arc::new(StubEmbedderFactory { vector: vector() }),
-    );
+    )
+    .expect("create MCP server");
 
     let response = server
         .knowledge_cards_json_for_test(json!({

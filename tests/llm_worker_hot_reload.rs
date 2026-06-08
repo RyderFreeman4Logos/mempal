@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::{Json, Router, routing::post};
 use mempal::core::config::{Config, ConfigHandle, IngestGatingConfig, LlmConfig, LlmJudgeConfig};
 use mempal::core::db::Database;
-use mempal::core::queue::PendingMessageStore;
+use mempal::core::queue::{ClaimedMessage, PendingMessageStore};
 use mempal::llm::client::LlmClient;
 use mempal::llm::status::LlmStatus;
 use mempal::llm::worker::confirm_llm_task;
@@ -23,6 +23,19 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn make_store(db: &Database) -> PendingMessageStore {
     PendingMessageStore::new(db.path()).expect("open queue")
+}
+
+fn fake_claim(id: &str) -> ClaimedMessage {
+    ClaimedMessage {
+        id: id.to_string(),
+        kind: "llm_task".to_string(),
+        payload: "{}".to_string(),
+        retry_count: 0,
+        claim_token: "worker:claim".to_string(),
+        source_hash: String::new(),
+        created_at: 0,
+        claimed_at: 0,
+    }
 }
 
 fn llm_chat_response_body(content: &str) -> serde_json::Value {
@@ -79,7 +92,7 @@ fn test_release_claim_returns_task_to_pending() {
     assert_eq!(stats_claimed.pending, 0);
 
     // Release back to pending — simulates worker cancellation due to config change.
-    store.release_claim(&id).expect("release_claim");
+    store.release_claim(&msg).expect("release_claim");
     let released_op_state: String = db
         .conn()
         .query_row(
@@ -110,9 +123,10 @@ fn test_release_claim_does_not_increment_retry_count() {
         .claim_next_by_kind("worker", 300, "llm_task")
         .expect("claim_next_by_kind")
         .expect("message");
+    assert_eq!(msg.id, id);
     assert_eq!(msg.retry_count, 0);
 
-    store.release_claim(&id).expect("release_claim");
+    store.release_claim(&msg).expect("release_claim");
 
     // Claim again — retry_count must still be 0.
     let msg2 = store
@@ -131,7 +145,7 @@ fn test_release_claim_returns_error_for_unknown_id() {
     let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
     let store = make_store(&db);
 
-    let result = store.release_claim("nonexistent-id");
+    let result = store.release_claim(&fake_claim("nonexistent-id"));
     assert!(
         result.is_err(),
         "release_claim on unknown id must return MessageNotFound"
@@ -374,7 +388,7 @@ async fn test_llm_process_refreshes_heartbeat_during_long_judge_call() {
     let (process_result, _) = tokio::join!(process, claim_probe);
     process_result.expect("process llm task");
 
-    confirm_llm_task(&store, &claimed.id).expect("confirm llm task");
+    confirm_llm_task(&store, &claimed).expect("confirm llm task");
 
     let after_confirm = store
         .claim_next_by_kind("worker-c", 1, "llm_task")
@@ -424,7 +438,7 @@ fn test_release_claim_on_already_pending_is_error() {
 
     let id = store.enqueue("llm_task", "{}").expect("enqueue");
     // Task is pending (not claimed) — release_claim should return error.
-    let result = store.release_claim(&id);
+    let result = store.release_claim(&fake_claim(&id));
     assert!(
         result.is_err(),
         "release_claim on a pending (unclaimed) task must fail"

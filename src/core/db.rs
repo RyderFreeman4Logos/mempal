@@ -226,8 +226,25 @@ pub enum DbError {
     CompactionClusterEmpty,
     #[error("compaction drawer {drawer_id} was not found, inactive, or already compacted")]
     CompactionDrawerNotFound { drawer_id: String },
+    #[error(
+        "drawer {drawer_id} changed during novelty merge: expected merge_count {expected_merge_count}"
+    )]
+    DrawerMergeConflict {
+        drawer_id: String,
+        expected_merge_count: u32,
+    },
     #[error("LLM compaction not yet implemented")]
     LlmCompactionNotImplemented,
+    #[error("off-runtime database task failed to complete: {0}")]
+    BlockingTaskFailed(String),
+    #[error(
+        "read-pool cache budget exceeded: {conns} connections request {requested_mib} MiB of page cache, over the {budget_mib} MiB cap (issue #311)"
+    )]
+    PoolCacheBudgetExceeded {
+        conns: usize,
+        requested_mib: i64,
+        budget_mib: i64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -239,6 +256,27 @@ pub(crate) struct ReindexSourceScopeSummary {
 pub struct Database {
     conn: Connection,
     path: PathBuf,
+}
+
+/// Novelty audit row to insert with a database-side mutation.
+#[derive(Debug, Clone, Copy)]
+pub struct NoveltyAuditInsert<'a> {
+    pub candidate_hash: &'a str,
+    pub action: NoveltyAction,
+    pub near_drawer_id: Option<&'a str>,
+    pub cosine: Option<f32>,
+    pub audit_decision: Option<&'a str>,
+    pub project_id: Option<&'a str>,
+}
+
+struct DrawerMergeUpdate<'a> {
+    drawer_id: &'a str,
+    merged_content: &'a str,
+    updated_at: &'a str,
+    content_hash: &'a str,
+    vector_json: &'a str,
+    vector_len: usize,
+    expected_merge_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -751,35 +789,22 @@ impl Database {
         merged_content: &str,
         updated_at: &str,
         vector: &[f32],
+        expected_merge_count: u32,
     ) -> Result<(), DbError> {
         self.ensure_vectors_table(vector.len())?;
         let vector_json = serde_json::to_string(vector)?;
         let content_hash = content_hash_hex(merged_content);
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<(), DbError> {
-            self.conn.execute(
-                r#"
-                UPDATE drawers
-                SET content = ?2,
-                    updated_at = ?3,
-                    content_hash = ?4,
-                    merge_count = COALESCE(merge_count, 0) + 1
-                WHERE id = ?1
-                "#,
-                params![drawer_id, merged_content, updated_at, content_hash],
-            )?;
-            self.conn
-                .execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])?;
-            let project_id = self.conn.query_row(
-                "SELECT project_id FROM drawers WHERE id = ?1",
-                [drawer_id],
-                |row| row.get::<_, Option<String>>(0),
-            )?;
-            self.conn.execute(
-                "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
-                params![drawer_id, vector_json, project_id],
-            )?;
-            self.record_current_vector_metadata(drawer_id, vector.len())?;
+            self.apply_drawer_merge_update(DrawerMergeUpdate {
+                drawer_id,
+                merged_content,
+                updated_at,
+                content_hash: &content_hash,
+                vector_json: &vector_json,
+                vector_len: vector.len(),
+                expected_merge_count,
+            })?;
             Ok(())
         })();
         match result {
@@ -794,6 +819,87 @@ impl Database {
         }
     }
 
+    pub fn update_drawer_after_merge_and_record_novelty_audit(
+        &self,
+        drawer_id: &str,
+        merged_content: &str,
+        updated_at: &str,
+        vector: &[f32],
+        expected_merge_count: u32,
+        audit: NoveltyAuditInsert<'_>,
+    ) -> Result<(), DbError> {
+        self.ensure_vectors_table(vector.len())?;
+        let vector_json = serde_json::to_string(vector)?;
+        let content_hash = content_hash_hex(merged_content);
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), DbError> {
+            self.apply_drawer_merge_update(DrawerMergeUpdate {
+                drawer_id,
+                merged_content,
+                updated_at,
+                content_hash: &content_hash,
+                vector_json: &vector_json,
+                vector_len: vector.len(),
+                expected_merge_count,
+            })?;
+            self.insert_novelty_audit_row(audit)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_drawer_merge_update(&self, update: DrawerMergeUpdate<'_>) -> Result<(), DbError> {
+        let updated = self.conn.execute(
+            r#"
+            UPDATE drawers
+            SET content = ?2,
+                updated_at = ?3,
+                content_hash = ?4,
+                merge_count = COALESCE(merge_count, 0) + 1
+            WHERE id = ?1
+              AND deleted_at IS NULL
+              AND COALESCE(merge_count, 0) = ?5
+            "#,
+            params![
+                update.drawer_id,
+                update.merged_content,
+                update.updated_at,
+                update.content_hash,
+                update.expected_merge_count
+            ],
+        )?;
+        if updated == 0 {
+            return Err(DbError::DrawerMergeConflict {
+                drawer_id: update.drawer_id.to_string(),
+                expected_merge_count: update.expected_merge_count,
+            });
+        }
+        self.conn.execute(
+            "DELETE FROM drawer_vectors WHERE id = ?1",
+            [update.drawer_id],
+        )?;
+        let project_id = self.conn.query_row(
+            "SELECT project_id FROM drawers WHERE id = ?1",
+            [update.drawer_id],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, vec_f32(?2), ?3)",
+            params![update.drawer_id, update.vector_json, project_id],
+        )?;
+        self.record_current_vector_metadata(update.drawer_id, update.vector_len)?;
+        Ok(())
+    }
+
     pub fn record_novelty_audit(
         &self,
         candidate_hash: &str,
@@ -803,6 +909,17 @@ impl Database {
         audit_decision: Option<&str>,
         project_id: Option<&str>,
     ) -> Result<(), DbError> {
+        self.insert_novelty_audit_row(NoveltyAuditInsert {
+            candidate_hash,
+            action,
+            near_drawer_id,
+            cosine,
+            audit_decision,
+            project_id,
+        })
+    }
+
+    fn insert_novelty_audit_row(&self, audit: NoveltyAuditInsert<'_>) -> Result<(), DbError> {
         let created_at = super::utils::current_timestamp()
             .parse::<i64>()
             .unwrap_or_default();
@@ -810,13 +927,15 @@ impl Database {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        let decision = audit_decision
+        let decision = audit
+            .audit_decision
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| action.as_str().to_string());
+            .unwrap_or_else(|| audit.action.as_str().to_string());
         let id_seed = format!(
-            "{candidate_hash}:{created_at}:{unique_nanos}:{decision}:{}:{}",
-            near_drawer_id.unwrap_or_default(),
-            cosine.unwrap_or_default()
+            "{}:{created_at}:{unique_nanos}:{decision}:{}:{}",
+            audit.candidate_hash,
+            audit.near_drawer_id.unwrap_or_default(),
+            audit.cosine.unwrap_or_default()
         );
         let id = format!("novelty_{}", blake3::hash(id_seed.as_bytes()).to_hex());
         self.conn.execute(
@@ -826,12 +945,12 @@ impl Database {
             "#,
             params![
                 id,
-                candidate_hash,
+                audit.candidate_hash,
                 decision,
-                near_drawer_id,
-                cosine,
+                audit.near_drawer_id,
+                audit.cosine,
                 created_at,
-                project_id
+                audit.project_id
             ],
         )?;
         Ok(())

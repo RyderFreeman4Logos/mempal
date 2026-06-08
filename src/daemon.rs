@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -8,9 +9,10 @@ use std::{future::Future, pin::Pin};
 
 use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
-    db::Database,
+    AsyncDb,
+    db::{Database, DbError, NoveltyAuditInsert},
     project::resolve_project_id,
-    queue::{ClaimedMessage, PendingMessageStore, QueueFailureDisposition},
+    queue::{AsyncPendingMessageStore, ClaimedMessage, QueueFailureDisposition},
     strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{BootstrapEvidenceArgs, Drawer, SourceType},
     utils::{current_timestamp, route_room_from_taxonomy, synthetic_source_file},
@@ -27,6 +29,7 @@ use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evalua
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::daemon_bootstrap::DaemonContext;
 use crate::hook::CapturedHookEnvelope;
@@ -41,6 +44,7 @@ const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 /// Budget given to LLM workers to finish in-flight tasks during graceful shutdown.
 /// Coupled to the orphan reaper grace period in `src/main.rs`.
 pub const DAEMON_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+const DAEMON_HOOK_WORKER_LIMIT: usize = 4;
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
     run_command_with_bootstrap_events(config_path, foreground, None)
@@ -143,20 +147,24 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         return Ok(());
     }
 
-    let embedder = DaemonEmbedder::from_config(context.config.as_ref())
-        .await
-        .context("failed to build daemon embedder")?;
-    let prototype_classifier =
-        compile_classifier_from_embedder(&embedder, &context.config.ingest_gating)
+    let embedder = Arc::new(
+        DaemonEmbedder::from_config(context.config.as_ref())
+            .await
+            .context("failed to build daemon embedder")?,
+    );
+    let prototype_classifier = Arc::new(
+        compile_classifier_from_embedder(embedder.as_ref(), &context.config.ingest_gating)
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))
-            .context("gating prototype init failed")?;
+            .context("gating prototype init failed")?,
+    );
     let worker_id = format!("mempal-daemon-{}", std::process::id());
     let claim_ttl_secs = context.config.hooks.daemon_claim_ttl_secs as i64;
     let poll_interval = Duration::from_millis(context.config.hooks.daemon_poll_interval_ms);
     let reclaimed = context
         .store
         .reclaim_stale(claim_ttl_secs)
+        .await
         .context("failed to reclaim stale daemon claims")?;
     tracing::info!("daemon startup reclaim_stale reclaimed={reclaimed}");
     let stall_watchdog_handle = spawn_stall_watchdog(
@@ -172,7 +180,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                 let llm_status = std::sync::Arc::new(crate::llm::LlmStatus::new(10));
                 let llm_store = std::sync::Arc::new(context.store.clone());
                 let llm_client = std::sync::Arc::new(llm_client);
-                let shared_db = context.db.clone();
+                let async_db = context.async_db.clone();
                 let write_observer = context.write_observer.clone();
                 tracing::info!("spawning {num_workers} LLM worker tasks");
                 (0..num_workers)
@@ -180,7 +188,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                         let store = llm_store.clone();
                         let client = llm_client.clone();
                         let status = llm_status.clone();
-                        let db = shared_db.clone();
+                        let db = async_db.clone();
                         let observer = write_observer.clone();
                         tokio::spawn(async move {
                             if let Err(e) = crate::llm::worker::run_llm_worker(
@@ -204,67 +212,44 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         vec![]
     };
 
+    let hook_worker_state = HookWorkerState {
+        async_db: context.async_db.clone(),
+        store: context.store.clone(),
+        worker_id: worker_id.clone(),
+        embedder: Arc::clone(&embedder),
+        prototype_classifier: Arc::clone(&prototype_classifier),
+        config: Arc::clone(&context.config),
+        mempal_home: context.mempal_home.clone(),
+        write_observer: context.write_observer.clone(),
+    };
+    let mut hook_workers = JoinSet::new();
+    let mut next_hook_worker_index = 0;
+    spawn_hook_workers_until_limit(
+        &mut hook_workers,
+        &hook_worker_state,
+        &mut next_hook_worker_index,
+        claim_ttl_secs,
+        poll_interval,
+    );
     loop {
-        context.write_observer.maybe_log_stall(&context.store);
+        context.write_observer.maybe_log_stall(&context.store).await;
 
         if shutdown_requested() {
             tracing::info!("shutdown requested; stopping daemon loop");
             break;
         }
 
-        match poll_claim_next(&context.store, &worker_id, claim_ttl_secs, |duration| {
-            Box::pin(tokio::time::sleep(duration))
-        })
-        .await
-        {
-            ClaimPollResult::Claimed(message) => {
-                let message_id = message.id.clone();
-                let result = {
-                    let db = context.db.lock().await;
-                    process_claimed_message_with_embedder(
-                        &db,
-                        &context.store,
-                        &worker_id,
-                        &message,
-                        &embedder,
-                        DaemonIngestContext {
-                            prototype_classifier: prototype_classifier.as_ref(),
-                            config: context.config.as_ref(),
-                            mempal_home: &context.mempal_home,
-                        },
-                    )
-                    .await
-                };
-
-                match result {
-                    Ok(_) => {
-                        context
-                            .store
-                            .confirm(&message_id)
-                            .with_context(|| format!("failed to confirm {message_id}"))?;
-                        context.write_observer.record_successful_write();
-                    }
-                    Err(error) => {
-                        tracing::error!("daemon message {message_id} failed: {error}");
-                        context.write_observer.record_error(error.to_string());
-                        let disposition = queue_failure_disposition(&error);
-                        context
-                            .store
-                            .mark_failed_with_disposition(
-                                &message_id,
-                                &error.to_string(),
-                                disposition,
-                            )
-                            .with_context(|| format!("failed to mark_failed {message_id}"))?;
-                    }
-                }
-            }
-            ClaimPollResult::Idle => {
-                tokio::time::sleep(poll_interval).await;
-            }
-            ClaimPollResult::RetryAfterError => continue,
-        }
+        spawn_hook_workers_until_limit(
+            &mut hook_workers,
+            &hook_worker_state,
+            &mut next_hook_worker_index,
+            claim_ttl_secs,
+            poll_interval,
+        );
+        wait_for_hook_worker_or_tick(&mut hook_workers, poll_interval).await;
     }
+
+    drain_hook_workers_with_budget(&mut hook_workers, DAEMON_DRAIN_BUDGET).await;
 
     // Give LLM workers a window to finish their current tasks, then abort.
     let drain_start = tokio::time::Instant::now();
@@ -290,10 +275,14 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     let _ = stall_watchdog_handle.await;
 
     // Release any tasks still claimed by workers that were aborted or did not finish.
-    let released = context.store.reclaim_stale(0).unwrap_or_else(|error| {
-        tracing::warn!(?error, "failed to release claimed messages on shutdown");
-        0
-    });
+    let released = context
+        .store
+        .reclaim_stale(0)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(?error, "failed to release claimed messages on shutdown");
+            0
+        });
     if released > 0 {
         tracing::info!("released {released} claimed messages back to pending on shutdown");
     }
@@ -301,9 +290,132 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     Ok(())
 }
 
-fn spawn_stall_watchdog(
-    observer: crate::daemon_bootstrap::DaemonWriteObserver,
-    store: PendingMessageStore,
+#[derive(Clone)]
+struct HookWorkerState {
+    async_db: AsyncDb,
+    store: AsyncPendingMessageStore,
+    worker_id: String,
+    embedder: Arc<DaemonEmbedder>,
+    prototype_classifier: Arc<Option<PrototypeClassifier>>,
+    config: Arc<crate::core::config::Config>,
+    mempal_home: PathBuf,
+    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+}
+
+fn spawn_hook_workers_until_limit(
+    hook_workers: &mut JoinSet<()>,
+    state: &HookWorkerState,
+    next_worker_index: &mut usize,
+    claim_ttl_secs: i64,
+    poll_interval: Duration,
+) {
+    while hook_workers.len() < DAEMON_HOOK_WORKER_LIMIT {
+        let worker_index = *next_worker_index;
+        *next_worker_index = (*next_worker_index).saturating_add(1);
+        spawn_hook_worker(
+            hook_workers,
+            state.clone(),
+            worker_index,
+            claim_ttl_secs,
+            poll_interval,
+        );
+    }
+}
+
+fn spawn_hook_worker(
+    hook_workers: &mut JoinSet<()>,
+    mut state: HookWorkerState,
+    worker_index: usize,
+    claim_ttl_secs: i64,
+    poll_interval: Duration,
+) {
+    state.worker_id = format!("{}-hook-{worker_index}", state.worker_id);
+    hook_workers.spawn(async move {
+        run_hook_worker(state, claim_ttl_secs, poll_interval).await;
+    });
+}
+
+async fn run_hook_worker(state: HookWorkerState, claim_ttl_secs: i64, poll_interval: Duration) {
+    loop {
+        if shutdown_requested() {
+            break;
+        }
+
+        match poll_claim_next(&state.store, &state.worker_id, claim_ttl_secs, |duration| {
+            Box::pin(tokio::time::sleep(duration))
+        })
+        .await
+        {
+            ClaimPollResult::Claimed(message) => {
+                process_hook_worker_message(state.clone(), message, claim_ttl_secs).await;
+            }
+            ClaimPollResult::Idle => tokio::time::sleep(poll_interval).await,
+            ClaimPollResult::RetryAfterError => continue,
+        }
+    }
+}
+
+async fn process_hook_worker_message(
+    state: HookWorkerState,
+    message: ClaimedMessage,
+    claim_ttl_secs: i64,
+) {
+    let message_id = message.id.clone();
+    let heartbeat_handle = spawn_hook_message_heartbeat(
+        state.store.clone(),
+        message_id.clone(),
+        state.worker_id.clone(),
+        hook_message_heartbeat_interval(claim_ttl_secs),
+    );
+    let result = process_claimed_message_with_embedder(
+        &state.async_db,
+        &state.store,
+        &state.worker_id,
+        &message,
+        state.embedder.as_ref(),
+        DaemonIngestContext {
+            prototype_classifier: state.prototype_classifier.as_ref().as_ref(),
+            config: state.config.as_ref(),
+            mempal_home: &state.mempal_home,
+        },
+    )
+    .await;
+
+    match result {
+        Ok(_) => {
+            if let Err(error) = state.store.confirm(message.clone()).await {
+                tracing::error!(?error, "failed to confirm {message_id}");
+                state
+                    .write_observer
+                    .record_error(format!("failed to confirm {message_id}: {error}"));
+            } else {
+                state.write_observer.record_successful_write();
+            }
+        }
+        Err(error) => {
+            tracing::error!("daemon message {message_id} failed: {error}");
+            state.write_observer.record_error(error.to_string());
+            let disposition = queue_failure_disposition(&error);
+            if let Err(mark_error) = state
+                .store
+                .mark_failed_with_disposition(message.clone(), error.to_string(), disposition)
+                .await
+            {
+                tracing::error!(?mark_error, "failed to mark_failed {message_id}");
+                state
+                    .write_observer
+                    .record_error(format!("failed to mark_failed {message_id}: {mark_error}"));
+            }
+        }
+    }
+    heartbeat_handle.abort();
+    let _ = heartbeat_handle.await;
+}
+
+fn spawn_hook_message_heartbeat(
+    store: AsyncPendingMessageStore,
+    message_id: String,
+    worker_id: String,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -314,26 +426,108 @@ fn spawn_stall_watchdog(
             if shutdown_requested() {
                 break;
             }
-            observer.maybe_log_stall(&store);
+            if let Err(error) = store
+                .refresh_heartbeat(message_id.clone(), worker_id.clone())
+                .await
+            {
+                tracing::warn!(
+                    ?error,
+                    message_id,
+                    "failed to refresh hook message heartbeat"
+                );
+            }
+        }
+    })
+}
+
+fn hook_message_heartbeat_interval(claim_ttl_secs: i64) -> Duration {
+    let ttl_secs = claim_ttl_secs.max(1) as u64;
+    Duration::from_secs((ttl_secs / 3).max(1))
+}
+
+async fn wait_for_hook_worker_or_tick(hook_workers: &mut JoinSet<()>, tick: Duration) {
+    if hook_workers.is_empty() {
+        tokio::time::sleep(tick).await;
+        return;
+    }
+
+    tokio::select! {
+        result = hook_workers.join_next() => {
+            if let Some(result) = result {
+                handle_hook_worker_join(result);
+            }
+        }
+        () = tokio::time::sleep(tick) => {}
+    }
+}
+
+async fn drain_hook_workers_with_budget(hook_workers: &mut JoinSet<()>, budget: Duration) {
+    let drain_start = tokio::time::Instant::now();
+    while !hook_workers.is_empty() {
+        let elapsed = drain_start.elapsed();
+        let remaining = budget.saturating_sub(elapsed);
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, hook_workers.join_next()).await {
+            Ok(Some(result)) => handle_hook_worker_join(result),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    if !hook_workers.is_empty() {
+        tracing::warn!(
+            remaining = hook_workers.len(),
+            "hook workers did not exit within drain deadline; task claims will be released on shutdown"
+        );
+        hook_workers.abort_all();
+        while let Some(result) = hook_workers.join_next().await {
+            handle_hook_worker_join(result);
+        }
+    }
+}
+
+fn handle_hook_worker_join(result: std::result::Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        tracing::error!(?error, "hook worker task failed");
+    }
+}
+
+fn spawn_stall_watchdog(
+    observer: crate::daemon_bootstrap::DaemonWriteObserver,
+    store: AsyncPendingMessageStore,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if shutdown_requested() {
+                break;
+            }
+            observer.maybe_log_stall(&store).await;
         }
     })
 }
 
 trait ClaimNextSource {
-    fn claim_next(
-        &self,
-        worker_id: &str,
+    fn claim_next<'a>(
+        &'a self,
+        worker_id: &'a str,
         claim_ttl_secs: i64,
-    ) -> crate::core::queue::Result<Option<ClaimedMessage>>;
+    ) -> Pin<Box<dyn Future<Output = crate::core::queue::Result<Option<ClaimedMessage>>> + Send + 'a>>;
 }
 
-impl ClaimNextSource for PendingMessageStore {
-    fn claim_next(
-        &self,
-        worker_id: &str,
+impl ClaimNextSource for AsyncPendingMessageStore {
+    fn claim_next<'a>(
+        &'a self,
+        worker_id: &'a str,
         claim_ttl_secs: i64,
-    ) -> crate::core::queue::Result<Option<ClaimedMessage>> {
-        PendingMessageStore::claim_next(self, worker_id, claim_ttl_secs)
+    ) -> Pin<Box<dyn Future<Output = crate::core::queue::Result<Option<ClaimedMessage>>> + Send + 'a>>
+    {
+        Box::pin(async move { self.claim_next(worker_id.to_string(), claim_ttl_secs).await })
     }
 }
 
@@ -352,8 +546,8 @@ pub struct DaemonIngestContext<'a> {
 }
 
 struct DrawerIngestContext<'a, E: Embedder + ?Sized> {
-    db: &'a Database,
-    store: &'a PendingMessageStore,
+    db: &'a AsyncDb,
+    store: &'a AsyncPendingMessageStore,
     worker_id: &'a str,
     message: &'a ClaimedMessage,
     embedder: &'a E,
@@ -370,7 +564,7 @@ async fn poll_claim_next<'a, S>(
 where
     S: Fn(Duration) -> SleepFuture<'a>,
 {
-    match store.claim_next(worker_id, claim_ttl_secs) {
+    match store.claim_next(worker_id, claim_ttl_secs).await {
         Ok(Some(message)) => ClaimPollResult::Claimed(message),
         Ok(None) => ClaimPollResult::Idle,
         Err(error) => {
@@ -382,8 +576,8 @@ where
 }
 
 pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
-    db: &Database,
-    store: &PendingMessageStore,
+    db: &AsyncDb,
+    store: &AsyncPendingMessageStore,
     worker_id: &str,
     message: &ClaimedMessage,
     embedder: &E,
@@ -391,7 +585,13 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
 ) -> Result<String> {
     let envelope: CapturedHookEnvelope =
         serde_json::from_str(&message.payload).context("failed to decode queued hook envelope")?;
-    let records = build_drawer_records(db, &envelope, context.config, context.mempal_home)?;
+    let records = {
+        let envelope = envelope.clone();
+        let config = (*context.config).clone();
+        let mempal_home = context.mempal_home.to_path_buf();
+        db.run_write_anyhow(move |db| build_drawer_records(db, &envelope, &config, &mempal_home))
+            .await?
+    };
     let drawer_context = DrawerIngestContext {
         db,
         store,
@@ -404,13 +604,22 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
     let mut last_drawer_id = None;
     for record in records {
         let drawer_id = ingest_drawer_record(&drawer_context, record).await?;
-        if let Err(error) = suggest_for_drawer(
-            db,
-            context.config,
-            context.mempal_home,
-            &drawer_id,
-            GenerationOptions::default(),
-        ) {
+        let suggest_result = {
+            let config = (*context.config).clone();
+            let mempal_home = context.mempal_home.to_path_buf();
+            let drawer_id_for_suggest = drawer_id.clone();
+            db.run_read_anyhow(move |db| {
+                suggest_for_drawer(
+                    db,
+                    &config,
+                    &mempal_home,
+                    &drawer_id_for_suggest,
+                    GenerationOptions::default(),
+                )
+            })
+            .await
+        };
+        if let Err(error) = suggest_result {
             tracing::warn!(?error, drawer_id, "hotpatch suggestion generation failed");
         }
         last_drawer_id = Some(drawer_id);
@@ -815,20 +1024,26 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     context: &DrawerIngestContext<'_, E>,
     record: DrawerRecord,
 ) -> Result<String> {
-    let (drawer_id, exists) = context
-        .db
-        .resolve_ingest_drawer_id(
-            &record.wing,
-            Some(record.room.as_str()),
-            &record.content,
-            record.project_id.as_deref(),
-        )
-        .with_context(|| {
-            format!(
-                "failed to resolve drawer identity for {}/{}",
-                record.wing, record.room
-            )
-        })?;
+    let (drawer_id, exists) = {
+        let record = record.clone();
+        context
+            .db
+            .run_read_anyhow(move |db| {
+                db.resolve_ingest_drawer_id(
+                    &record.wing,
+                    Some(record.room.as_str()),
+                    &record.content,
+                    record.project_id.as_deref(),
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to resolve drawer identity for {}/{}",
+                        record.wing, record.room
+                    )
+                })
+            })
+            .await?
+    };
     if exists {
         return Ok(drawer_id);
     }
@@ -848,15 +1063,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     if let Some(decision) = gating_decision.as_ref()
         && decision.is_rejected()
     {
-        context
-            .db
-            .record_gating_audit(
-                &drawer_id,
-                decision,
-                record.project_id.as_deref(),
-                Some(&candidate.content),
-            )
-            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        record_gating_audit_async(
+            context.db,
+            &drawer_id,
+            decision,
+            record.project_id.clone(),
+            &candidate.content,
+        )
+        .await?;
         return Ok(drawer_id);
     }
 
@@ -864,9 +1078,18 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     let heartbeat_message_id = context.message.id.clone();
     let heartbeat_worker_id = context.worker_id.to_string();
     let heartbeat = move || -> crate::embed::Result<()> {
-        heartbeat_store
-            .refresh_heartbeat(&heartbeat_message_id, &heartbeat_worker_id)
-            .map_err(|error| EmbedError::Runtime(format!("refresh heartbeat failed: {error}")))?;
+        let store = heartbeat_store.clone();
+        let message_id = heartbeat_message_id.clone();
+        let worker_id = heartbeat_worker_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
+                tracing::warn!(
+                    ?error,
+                    message_id,
+                    "failed to refresh daemon ingest heartbeat"
+                );
+            }
+        });
         Ok(())
     };
 
@@ -890,15 +1113,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 .embedding_classifier
                 .threshold,
         );
-        context
-            .db
-            .record_gating_audit(
-                &drawer_id,
-                &decision,
-                record.project_id.as_deref(),
-                Some(&candidate.content),
-            )
-            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        record_gating_audit_async(
+            context.db,
+            &drawer_id,
+            &decision,
+            record.project_id.clone(),
+            &candidate.content,
+        )
+        .await?;
         gating_audit_recorded = true;
         if decision.is_rejected() {
             return Ok(drawer_id);
@@ -907,42 +1129,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         vector = Some(candidate_vector);
     }
     if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
-        context
-            .db
-            .record_gating_audit(
-                &drawer_id,
-                decision,
-                record.project_id.as_deref(),
-                Some(&candidate.content),
-            )
-            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
-    }
-
-    if should_enqueue_llm_gating(context.daemon.config, &gating_decision) {
-        let system_prompt = context
-            .daemon
-            .config
-            .ingest_gating
-            .llm_judge
-            .as_ref()
-            .and_then(|j| j.system_prompt.clone());
-        let payload = serde_json::to_string(&crate::llm::LlmTaskPayload {
-            task_type: "gating".to_string(),
-            drawer_id: drawer_id.clone(),
-            drawer_ids: vec![drawer_id.clone()],
-            content: analysis_content(&record.content).to_string(),
-            system_prompt,
-        })
-        .context("failed to serialize LLM gating payload")?;
-        if let Err(error) = context.store.enqueue("llm_task", &payload) {
-            tracing::warn!(
-                ?error,
-                "failed to enqueue LLM gating task for {}",
-                drawer_id
-            );
-        } else {
-            tracing::info!("enqueued LLM gating task for {}", drawer_id);
-        }
+        record_gating_audit_async(
+            context.db,
+            &drawer_id,
+            decision,
+            record.project_id.clone(),
+            &candidate.content,
+        )
+        .await?;
     }
 
     let vector = match vector {
@@ -957,51 +1151,72 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         }
     };
     if record.bypass_novelty {
-        insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+        insert_drawer_with_vector_async(context.db, &drawer_id, record.clone(), vector.clone())
+            .await?;
+        enqueue_llm_gating_after_durable_insert(
+            context.db,
+            context.store,
+            context.daemon.config,
+            &gating_decision,
+            &drawer_id,
+            &candidate.content,
+        )
+        .await?;
         return Ok(drawer_id);
     }
 
-    let novelty = evaluate_novelty(
-        context.db,
-        &NoveltyCandidate {
+    let novelty = {
+        let candidate = NoveltyCandidate {
             wing: record.wing.clone(),
             room: Some(record.room.clone()),
             project_id: record.project_id.clone(),
-        },
-        &vector,
-        &context.daemon.config.ingest_gating.novelty,
-    );
+        };
+        let vector = vector.clone();
+        let config = context.daemon.config.ingest_gating.novelty.clone();
+        context
+            .db
+            .run_read_anyhow(move |db| Ok(evaluate_novelty(db, &candidate, &vector, &config)))
+            .await?
+    };
     match novelty.action {
         NoveltyAction::Insert => {
             if novelty.should_audit {
-                context
-                    .db
-                    .record_novelty_audit(
-                        &drawer_id,
-                        NoveltyAction::Insert,
-                        novelty.near_drawer_id.as_deref(),
-                        novelty.cosine,
-                        novelty.audit_decision,
-                        record.project_id.as_deref(),
-                    )
-                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+                record_novelty_audit_async(
+                    context.db,
+                    &drawer_id,
+                    NoveltyAction::Insert,
+                    novelty.near_drawer_id.clone(),
+                    novelty.cosine,
+                    novelty.audit_decision.map(ToOwned::to_owned),
+                    record.project_id.clone(),
+                )
+                .await?;
             }
-            insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+            insert_drawer_with_vector_async(context.db, &drawer_id, record.clone(), vector.clone())
+                .await?;
+            enqueue_llm_gating_after_durable_insert(
+                context.db,
+                context.store,
+                context.daemon.config,
+                &gating_decision,
+                &drawer_id,
+                &candidate.content,
+            )
+            .await?;
             Ok(drawer_id)
         }
         NoveltyAction::Drop => {
             if novelty.should_audit {
-                context
-                    .db
-                    .record_novelty_audit(
-                        &drawer_id,
-                        NoveltyAction::Drop,
-                        novelty.near_drawer_id.as_deref(),
-                        novelty.cosine,
-                        novelty.audit_decision,
-                        record.project_id.as_deref(),
-                    )
-                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+                record_novelty_audit_async(
+                    context.db,
+                    &drawer_id,
+                    NoveltyAction::Drop,
+                    novelty.near_drawer_id.clone(),
+                    novelty.cosine,
+                    novelty.audit_decision.map(ToOwned::to_owned),
+                    record.project_id.clone(),
+                )
+                .await?;
             }
             Ok(novelty.near_drawer_id.unwrap_or(drawer_id))
         }
@@ -1022,11 +1237,19 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                     .with_context(|| format!("failed to lock merge target {}", target_id))?,
                 )
             };
-            let (existing_content, merge_count) = context
-                .db
-                .drawer_merge_state(&target_id)
-                .with_context(|| format!("failed to load merge target {}", target_id))?
-                .ok_or_else(|| anyhow::anyhow!("novelty merge target missing: {}", target_id))?;
+            let (existing_content, merge_count) = {
+                let target_id = target_id.clone();
+                context
+                    .db
+                    .run_read_anyhow(move |db| {
+                        db.drawer_merge_state(&target_id)
+                            .with_context(|| format!("failed to load merge target {}", target_id))?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("novelty merge target missing: {}", target_id)
+                            })
+                    })
+                    .await?
+            };
             let merged_at = current_timestamp();
             let merged_content = format!(
                 "{existing_content}\n---\nSUPPLEMENTARY ({merged_at}):\n{}",
@@ -1047,18 +1270,32 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         .novelty
                         .max_content_bytes_per_drawer;
             if capped {
-                context
-                    .db
-                    .record_novelty_audit(
-                        &drawer_id,
-                        NoveltyAction::Insert,
-                        Some(target_id.as_str()),
-                        novelty.cosine,
-                        Some("insert_due_to_merge_cap"),
-                        record.project_id.as_deref(),
-                    )
-                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
-                insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+                record_novelty_audit_async(
+                    context.db,
+                    &drawer_id,
+                    NoveltyAction::Insert,
+                    Some(target_id),
+                    novelty.cosine,
+                    Some("insert_due_to_merge_cap".to_string()),
+                    record.project_id.clone(),
+                )
+                .await?;
+                insert_drawer_with_vector_async(
+                    context.db,
+                    &drawer_id,
+                    record.clone(),
+                    vector.clone(),
+                )
+                .await?;
+                enqueue_llm_gating_after_durable_insert(
+                    context.db,
+                    context.store,
+                    context.daemon.config,
+                    &gating_decision,
+                    &drawer_id,
+                    &candidate.content,
+                )
+                .await?;
                 Ok(drawer_id)
             } else {
                 let merged_vector = match embed_text_with_heartbeat(
@@ -1076,47 +1313,163 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                             merged_content_bytes = merged_content.len(),
                             "novelty merge re-embed failed; fail-open insert"
                         );
-                        context
-                            .db
-                            .record_novelty_audit(
-                                &drawer_id,
-                                NoveltyAction::Insert,
-                                Some(target_id.as_str()),
-                                novelty.cosine,
-                                Some("insert_due_to_embed_error"),
-                                record.project_id.as_deref(),
-                            )
-                            .with_context(|| {
-                                format!("failed to record novelty audit {}", drawer_id)
-                            })?;
-                        insert_drawer_with_vector(context.db, &drawer_id, &record, &vector)?;
+                        record_novelty_audit_async(
+                            context.db,
+                            &drawer_id,
+                            NoveltyAction::Insert,
+                            Some(target_id),
+                            novelty.cosine,
+                            Some("insert_due_to_embed_error".to_string()),
+                            record.project_id.clone(),
+                        )
+                        .await?;
+                        insert_drawer_with_vector_async(
+                            context.db,
+                            &drawer_id,
+                            record.clone(),
+                            vector.clone(),
+                        )
+                        .await?;
+                        enqueue_llm_gating_after_durable_insert(
+                            context.db,
+                            context.store,
+                            context.daemon.config,
+                            &gating_decision,
+                            &drawer_id,
+                            &candidate.content,
+                        )
+                        .await?;
                         return Ok(drawer_id);
                     }
                 };
+                let drawer_id_for_merge = drawer_id.clone();
+                let target_id_for_merge = target_id.clone();
+                let audit_decision = novelty.audit_decision.map(ToOwned::to_owned);
+                let project_id = record.project_id.clone();
                 context
                     .db
-                    .record_novelty_audit(
-                        &drawer_id,
-                        NoveltyAction::Merge,
-                        Some(target_id.as_str()),
-                        novelty.cosine,
-                        novelty.audit_decision,
-                        record.project_id.as_deref(),
-                    )
-                    .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
-                context
-                    .db
-                    .update_drawer_after_merge(
-                        &target_id,
-                        &merged_content,
-                        &merged_at,
-                        &merged_vector,
-                    )
-                    .with_context(|| format!("failed to merge hook drawer {}", target_id))?;
+                    .run_write_anyhow(move |db| {
+                        db.update_drawer_after_merge_and_record_novelty_audit(
+                            &target_id_for_merge,
+                            &merged_content,
+                            &merged_at,
+                            &merged_vector,
+                            merge_count,
+                            NoveltyAuditInsert {
+                                candidate_hash: &drawer_id_for_merge,
+                                action: NoveltyAction::Merge,
+                                near_drawer_id: Some(target_id_for_merge.as_str()),
+                                cosine: novelty.cosine,
+                                audit_decision: audit_decision.as_deref(),
+                                project_id: project_id.as_deref(),
+                            },
+                        )
+                        .map_err(|error| match error {
+                            DbError::DrawerMergeConflict { .. } => anyhow::Error::new(error),
+                            error => anyhow::Error::new(error).context(format!(
+                                "failed to merge hook drawer {}",
+                                target_id_for_merge
+                            )),
+                        })?;
+                        Ok(())
+                    })
+                    .await?;
                 Ok(target_id)
             }
         }
     }
+}
+
+async fn enqueue_llm_gating_after_durable_insert(
+    _db: &AsyncDb,
+    store: &AsyncPendingMessageStore,
+    config: &crate::core::config::Config,
+    gating_decision: &Option<GatingDecision>,
+    drawer_id: &str,
+    content: &str,
+) -> Result<()> {
+    if !should_enqueue_llm_gating(config, gating_decision) {
+        return Ok(());
+    }
+
+    let system_prompt = config
+        .ingest_gating
+        .llm_judge
+        .as_ref()
+        .and_then(|j| j.system_prompt.clone());
+    let payload = serde_json::to_string(&crate::llm::LlmTaskPayload {
+        task_type: "gating".to_string(),
+        drawer_id: drawer_id.to_string(),
+        drawer_ids: vec![drawer_id.to_string()],
+        content: content.to_string(),
+        system_prompt,
+    })
+    .context("failed to serialize LLM gating payload")?;
+    let drawer_id = drawer_id.to_string();
+    if let Err(error) = store.enqueue("llm_task".to_string(), payload).await {
+        tracing::warn!(
+            ?error,
+            "failed to enqueue LLM gating task for {}",
+            drawer_id
+        );
+    } else {
+        tracing::info!("enqueued LLM gating task for {}", drawer_id);
+    }
+    Ok(())
+}
+
+async fn record_gating_audit_async(
+    db: &AsyncDb,
+    drawer_id: &str,
+    decision: &GatingDecision,
+    project_id: Option<String>,
+    content: &str,
+) -> Result<()> {
+    let drawer_id = drawer_id.to_string();
+    let decision = decision.clone();
+    let content = content.to_string();
+    db.run_write_anyhow(move |db| {
+        db.record_gating_audit(&drawer_id, &decision, project_id.as_deref(), Some(&content))
+            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        Ok(())
+    })
+    .await
+}
+
+async fn record_novelty_audit_async(
+    db: &AsyncDb,
+    drawer_id: &str,
+    action: NoveltyAction,
+    near_drawer_id: Option<String>,
+    cosine: Option<f32>,
+    audit_decision: Option<String>,
+    project_id: Option<String>,
+) -> Result<()> {
+    let drawer_id = drawer_id.to_string();
+    db.run_write_anyhow(move |db| {
+        db.record_novelty_audit(
+            &drawer_id,
+            action,
+            near_drawer_id.as_deref(),
+            cosine,
+            audit_decision.as_deref(),
+            project_id.as_deref(),
+        )
+        .with_context(|| format!("failed to record novelty audit {}", drawer_id))?;
+        Ok(())
+    })
+    .await
+}
+
+async fn insert_drawer_with_vector_async(
+    db: &AsyncDb,
+    drawer_id: &str,
+    record: DrawerRecord,
+    vector: Vec<f32>,
+) -> Result<()> {
+    let drawer_id = drawer_id.to_string();
+    db.run_write_anyhow(move |db| insert_drawer_with_vector(db, &drawer_id, &record, &vector))
+        .await
 }
 
 fn insert_drawer_with_vector(
@@ -1359,20 +1712,26 @@ impl Embedder for DaemonEmbedder {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::core::{
-        config::{Config, TurnStorageMode},
+        AsyncDb,
+        config::{Config, LlmJudgeConfig, TurnStorageMode},
         db::Database,
-        queue::{ClaimedMessage, PendingMessageStore, QueueError},
+        queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore, QueueError},
+        types::{Drawer, SourceType},
     };
-    use crate::embed::Embedder;
+    use crate::embed::{EmbedError, Embedder};
     use crate::hook::{CapturedHookEnvelope, HookEvent};
+    use std::pin::Pin;
 
     use super::{
-        ClaimNextSource, ClaimPollResult, DaemonIngestContext, build_drawer_records,
-        poll_claim_next, process_claimed_message_with_embedder, wing_from_cwd,
+        ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext, HookWorkerState,
+        build_drawer_records, poll_claim_next, process_claimed_message_with_embedder,
+        run_hook_worker, wing_from_cwd,
     };
 
     struct StubClaimSource {
@@ -1388,16 +1747,22 @@ mod tests {
     }
 
     impl ClaimNextSource for StubClaimSource {
-        fn claim_next(
-            &self,
-            _worker_id: &str,
+        fn claim_next<'a>(
+            &'a self,
+            _worker_id: &'a str,
             _claim_ttl_secs: i64,
-        ) -> crate::core::queue::Result<Option<ClaimedMessage>> {
-            self.responses
-                .lock()
-                .expect("responses mutex")
-                .pop_front()
-                .expect("stub response")
+        ) -> Pin<
+            Box<
+                dyn Future<Output = crate::core::queue::Result<Option<ClaimedMessage>>> + Send + 'a,
+            >,
+        > {
+            Box::pin(std::future::ready(
+                self.responses
+                    .lock()
+                    .expect("responses mutex")
+                    .pop_front()
+                    .expect("stub response"),
+            ))
         }
     }
 
@@ -1412,6 +1777,13 @@ mod tests {
             created_at: 0,
             claimed_at: 0,
         }
+    }
+
+    fn unix_now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_secs() as i64
     }
 
     #[tokio::test]
@@ -1446,6 +1818,99 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bounded_hook_worker_continues_claiming_after_completed_batch() {
+        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+        Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(&db_path).expect("store");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+
+        for label in ["first", "second"] {
+            let hook_payload = serde_json::json!({
+                "tool_name": "Bash",
+                "input": format!("printf {label}"),
+                "output": label,
+                "exit_code": 0
+            })
+            .to_string();
+            let envelope = CapturedHookEnvelope {
+                event: HookEvent::PostToolUse.display_name().to_string(),
+                kind: HookEvent::PostToolUse.queue_kind().to_string(),
+                agent: "codex".to_string(),
+                captured_at: "2026-05-01T12:34:56Z".to_string(),
+                claude_cwd: tmp.path().to_string_lossy().to_string(),
+                payload: Some(hook_payload.clone()),
+                payload_path: None,
+                payload_preview: None,
+                original_size_bytes: hook_payload.len(),
+                truncated: false,
+            };
+            let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+            store
+                .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+                .expect("enqueue hook envelope");
+        }
+
+        let config = Config::default();
+        assert!(
+            !config.llm.enabled,
+            "test runtime config must keep LLM disabled"
+        );
+        let worker = tokio::spawn(run_hook_worker(
+            HookWorkerState {
+                async_db,
+                store: async_store,
+                worker_id: "bounded-continuation-worker".to_string(),
+                embedder: Arc::new(DaemonEmbedder {
+                    primary: Box::new(StaticEmbedder),
+                    fallback: None,
+                }),
+                prototype_classifier: Arc::new(None),
+                config: Arc::new(config),
+                mempal_home,
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+            },
+            60,
+            Duration::from_millis(10),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let completed: i64 = rusqlite::Connection::open(&db_path)
+                    .expect("open sqlite")
+                    .query_row(
+                        "SELECT COUNT(*) FROM pending_message_completions WHERE kind = ?1",
+                        [HookEvent::PostToolUse.queue_kind()],
+                        |row| row.get(0),
+                    )
+                    .expect("count completions");
+                if completed == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should continue claiming after first completion");
+
+        let stats = store.stats().expect("queue stats");
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.claimed, 0);
+
+        super::SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("worker should observe shutdown")
+            .expect("worker task should not panic");
+        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    }
+
     struct StaticEmbedder;
 
     #[async_trait::async_trait]
@@ -1463,12 +1928,446 @@ mod tests {
         }
     }
 
+    struct HeartbeatProbeEmbedder {
+        db_path: PathBuf,
+        message_id: String,
+        stale_heartbeat_at: i64,
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for HeartbeatProbeEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(EmbedError::Runtime("transient test failure".to_string()));
+            }
+
+            let heartbeat_at: Option<i64> = rusqlite::Connection::open(&self.db_path)
+                .expect("open heartbeat probe db")
+                .query_row(
+                    "SELECT heartbeat_at FROM pending_messages WHERE id = ?1",
+                    [self.message_id.as_str()],
+                    |row| row.get(0),
+                )
+                .expect("read heartbeat");
+            assert!(
+                heartbeat_at.unwrap_or_default() > self.stale_heartbeat_at,
+                "bounded hook worker must heartbeat using the same worker id that claimed the row"
+            );
+
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "heartbeat-probe"
+        }
+    }
+
+    struct MergeConflictProbeEmbedder {
+        db_path: PathBuf,
+        injected: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for MergeConflictProbeEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            if texts.iter().any(|text| text.contains("SUPPLEMENTARY"))
+                && self
+                    .injected
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                let db = Database::open(&self.db_path)
+                    .map_err(|error| EmbedError::Runtime(format!("open db failed: {error}")))?;
+                db.update_drawer_after_merge(
+                    "existing-target",
+                    "original target\n---\nSUPPLEMENTARY (other):\nother supplement",
+                    "1713000001",
+                    &[0.8, 0.2, 0.0],
+                    0,
+                )
+                .map_err(|error| EmbedError::Runtime(format!("inject merge failed: {error}")))?;
+            }
+            Ok(texts.iter().map(|_| vec![0.9, 0.435_889_9, 0.0]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "merge-conflict-probe"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bounded_hook_worker_heartbeats_with_claim_worker_id() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+        Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(&db_path).expect("store");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "printf heartbeat",
+            "output": "ok",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        let queued_id = store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let worker_id = "bounded-hook-worker";
+        let message = store
+            .claim_next(worker_id, 60)
+            .expect("claim next")
+            .expect("claimed message");
+        assert_eq!(message.id, queued_id);
+
+        let stale_heartbeat_at = unix_now_secs() - 30;
+        rusqlite::Connection::open(&db_path)
+            .expect("open sqlite")
+            .execute(
+                "UPDATE pending_messages SET claimed_at = ?2, heartbeat_at = ?2 WHERE id = ?1",
+                rusqlite::params![queued_id, stale_heartbeat_at],
+            )
+            .expect("age heartbeat");
+
+        let config = Config::default();
+        assert!(
+            !config.llm.enabled,
+            "test runtime config must keep LLM disabled"
+        );
+        super::process_hook_worker_message(
+            HookWorkerState {
+                async_db,
+                store: async_store,
+                worker_id: worker_id.to_string(),
+                embedder: std::sync::Arc::new(DaemonEmbedder {
+                    primary: Box::new(HeartbeatProbeEmbedder {
+                        db_path,
+                        message_id: message.id.clone(),
+                        stale_heartbeat_at,
+                        attempts: AtomicUsize::new(0),
+                    }),
+                    fallback: None,
+                }),
+                prototype_classifier: std::sync::Arc::new(None),
+                config: std::sync::Arc::new(config),
+                mempal_home,
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+            },
+            message,
+            60,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_hook_worker_retries_stale_novelty_merge_without_overwrite() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+        let db = Database::open(&db_path).expect("open db");
+        let project_id = Some("merge-conflict-project");
+        db.insert_drawer_with_project(
+            &Drawer {
+                id: "existing-target".to_string(),
+                content: "original target".to_string(),
+                wing: "hooks-raw".to_string(),
+                room: Some("Bash".to_string()),
+                source_file: Some("existing-target.md".to_string()),
+                source_type: SourceType::SystemGenerated,
+                added_at: "1713000000".to_string(),
+                chunk_index: Some(0),
+                ..Drawer::default()
+            },
+            project_id,
+        )
+        .expect("insert target drawer");
+        db.insert_vector_with_project("existing-target", &[1.0, 0.0, 0.0], project_id)
+            .expect("insert target vector");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(&db_path).expect("store");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "printf candidate",
+            "output": "candidate supplement",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        let queued_id = store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("merge-conflict-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+        assert_eq!(message.id, queued_id);
+
+        let mut config = Config::default();
+        config.project.id = project_id.map(ToOwned::to_owned);
+        config.ingest_gating.novelty.enabled = true;
+        config.ingest_gating.novelty.merge_threshold = 0.85;
+        config.ingest_gating.novelty.duplicate_threshold = 0.95;
+        assert!(
+            !config.llm.enabled,
+            "test runtime config must keep LLM disabled"
+        );
+        let injected = Arc::new(AtomicBool::new(false));
+        super::process_hook_worker_message(
+            HookWorkerState {
+                async_db,
+                store: async_store,
+                worker_id: "merge-conflict-worker".to_string(),
+                embedder: Arc::new(DaemonEmbedder {
+                    primary: Box::new(MergeConflictProbeEmbedder {
+                        db_path: db_path.clone(),
+                        injected: Arc::clone(&injected),
+                    }),
+                    fallback: None,
+                }),
+                prototype_classifier: Arc::new(None),
+                config: Arc::new(config),
+                mempal_home,
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+            },
+            message,
+            60,
+        )
+        .await;
+        assert!(
+            injected.load(Ordering::SeqCst),
+            "test embedder must inject a concurrent merge during re-embed"
+        );
+
+        let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
+        let (status, retry_count, last_error): (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, retry_count, last_error FROM pending_messages WHERE id = ?1",
+                [queued_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query queue row");
+        assert_eq!(status, "pending");
+        assert_eq!(retry_count, 1);
+        assert!(
+            last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed during novelty merge")),
+            "last_error={last_error:?}"
+        );
+
+        let (content, merge_count): (String, i64) = conn
+            .query_row(
+                "SELECT content, merge_count FROM drawers WHERE id = 'existing-target'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query target drawer");
+        assert!(content.contains("other supplement"));
+        assert!(!content.contains("candidate supplement"));
+        assert_eq!(merge_count, 1);
+
+        let merge_audit_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM novelty_audit WHERE decision = 'merge' AND near_drawer_id = 'existing-target'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count merge audit rows");
+        assert_eq!(
+            merge_audit_count, 0,
+            "conflicted daemon merge must not record a successful merge audit row"
+        );
+    }
+
+    struct LlmClaimRaceProbeEmbedder {
+        store: PendingMessageStore,
+        embed_calls: AtomicUsize,
+    }
+
+    struct SlowEmbedder {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for SlowEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            tokio::time::sleep(self.delay).await;
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "slow-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hook_worker_heartbeats_long_message_processing_until_confirm() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+        Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(&db_path).expect("store");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "printf slow",
+            "output": "slow processing",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        let queued_id = store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let worker_id = "long-processing-worker";
+        let message = store
+            .claim_next(worker_id, 1)
+            .expect("claim next")
+            .expect("claimed message");
+        assert_eq!(message.id, queued_id);
+
+        let config = Config::default();
+        assert!(
+            !config.llm.enabled,
+            "test runtime config must keep LLM disabled"
+        );
+        let worker = tokio::spawn(super::process_hook_worker_message(
+            HookWorkerState {
+                async_db,
+                store: async_store.clone(),
+                worker_id: worker_id.to_string(),
+                embedder: Arc::new(DaemonEmbedder {
+                    primary: Box::new(SlowEmbedder {
+                        delay: Duration::from_secs(3),
+                    }),
+                    fallback: None,
+                }),
+                prototype_classifier: Arc::new(None),
+                config: Arc::new(config),
+                mempal_home,
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+            },
+            message,
+            1,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        let duplicate = async_store
+            .claim_next("stealing-worker".to_string(), 1)
+            .await
+            .expect("stealing worker claim_next");
+        assert!(
+            duplicate.is_none(),
+            "long-running hook processing must heartbeat so claim_next cannot reclaim it"
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .expect("worker should finish")
+            .expect("worker task should not panic");
+        let completed: i64 = rusqlite::Connection::open(&db_path)
+            .expect("open sqlite")
+            .query_row(
+                "SELECT COUNT(*) FROM pending_message_completions WHERE message_id = ?1",
+                [queued_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count completions");
+        assert_eq!(completed, 1);
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for LlmClaimRaceProbeEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            self.embed_calls.fetch_add(1, Ordering::SeqCst);
+            let claim = self
+                .store
+                .claim_next_by_kind("llm-race-probe", 60, "llm_task")
+                .map_err(|error| EmbedError::Runtime(format!("claim llm task failed: {error}")))?;
+            assert!(
+                claim.is_none(),
+                "LLM gating task must not be claimable before drawer/vector insert completes"
+            );
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "llm-race-probe"
+        }
+    }
+
     #[tokio::test]
     async fn test_daemon_uses_envelope_captured_at_for_drawer_added_at() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
         let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
         let captured_at = "2026-05-01T12:34:56Z";
         let hook_payload = serde_json::json!({
             "tool_name": "Bash",
@@ -1502,8 +2401,8 @@ mod tests {
         let mut config = Config::default();
         config.project.id = Some("timestamp-test".to_string());
         process_claimed_message_with_embedder(
-            &db,
-            &store,
+            &async_db,
+            &async_store,
             "timestamp-test-worker",
             &message,
             &StaticEmbedder,
@@ -1527,6 +2426,95 @@ mod tests {
         assert_eq!(added_at, captured_at);
         assert_eq!(source_type, "system_generated");
         assert!((confidence - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_daemon_enqueues_llm_gating_after_drawer_vector_is_durable() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "printf race",
+            "output": "durable before llm",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        let queued_id = store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("llm-race-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+        assert_eq!(message.id, queued_id);
+
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+        let embedder = LlmClaimRaceProbeEmbedder {
+            store: store.clone(),
+            embed_calls: AtomicUsize::new(0),
+        };
+        let drawer_id = process_claimed_message_with_embedder(
+            &async_db,
+            &async_store,
+            "llm-race-worker",
+            &message,
+            &embedder,
+            DaemonIngestContext {
+                prototype_classifier: None,
+                config: &config,
+                mempal_home: tmp.path(),
+            },
+        )
+        .await
+        .expect("process hook envelope");
+
+        assert_eq!(embedder.embed_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            db.drawer_exists(&drawer_id).expect("drawer exists query"),
+            "drawer must exist before LLM task is claimable"
+        );
+        let vector_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawer_vectors WHERE id = ?1",
+                [drawer_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("query vector");
+        assert_eq!(
+            vector_count, 1,
+            "vector must exist before LLM task is claimable"
+        );
+
+        let llm_task = store
+            .claim_next_by_kind("llm-race-final", 60, "llm_task")
+            .expect("claim llm task")
+            .expect("llm task should be queued after durable insert");
+        let task: crate::llm::LlmTaskPayload =
+            serde_json::from_str(&llm_task.payload).expect("decode llm task");
+        assert_eq!(task.drawer_id, drawer_id);
     }
 
     #[test]

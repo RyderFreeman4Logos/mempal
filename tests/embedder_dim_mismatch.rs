@@ -66,7 +66,7 @@ request_timeout_secs = 5
     .expect("parse config");
     global_embed_status().reset_for_tests();
 
-    let service = MempalMcpServer::new(db_path, config);
+    let service = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = service
         .ingest_json_for_test(
             serde_json::to_value(IngestRequest {

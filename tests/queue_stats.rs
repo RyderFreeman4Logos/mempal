@@ -230,7 +230,7 @@ fn test_queue_stats_reflects_current_state() {
         .expect("claim")
         .expect("done row");
     assert_eq!(done.id, done_id);
-    store.confirm(&done.id).expect("confirm");
+    store.confirm(&done).expect("confirm");
 
     let failed = store
         .claim_next("worker-failed", 60)
@@ -238,7 +238,7 @@ fn test_queue_stats_reflects_current_state() {
         .expect("failed row");
     assert_eq!(failed.id, failed_id);
     store
-        .mark_failed_with_disposition(&failed.id, "boom", QueueFailureDisposition::Terminal)
+        .mark_failed_with_disposition(&failed, "boom", QueueFailureDisposition::Terminal)
         .expect("mark terminal failed");
 
     let stats = store.stats().expect("stats");
@@ -315,14 +315,14 @@ fn test_status_command_shows_queue_stats() {
         .expect("claim")
         .expect("done");
     assert_eq!(done.id, done_id);
-    store.confirm(&done.id).expect("confirm");
+    store.confirm(&done).expect("confirm");
     let failed = store
         .claim_next("worker-failed", 60)
         .expect("claim")
         .expect("failed");
     assert_eq!(failed.id, failed_id);
     store
-        .mark_failed_with_disposition(&failed.id, "boom", QueueFailureDisposition::Terminal)
+        .mark_failed_with_disposition(&failed, "boom", QueueFailureDisposition::Terminal)
         .expect("mark terminal failed");
 
     let output = Command::new(mempal_bin())

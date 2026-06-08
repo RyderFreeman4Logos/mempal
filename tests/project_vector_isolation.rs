@@ -122,6 +122,7 @@ impl SearchEnv {
                 vector: vec![0.1, 0.2, 0.3],
             }),
         )
+        .expect("create MCP server")
     }
 }
 
@@ -775,7 +776,8 @@ async fn test_stale_reindex_preserves_project_id() {
         Arc::new(StaticEmbedderFactory {
             vector: vec![0.0, 0.0, 0.0, 0.0],
         }),
-    );
+    )
+    .expect("create MCP server");
     let project_ids = parse_search_ids(
         &search_response_json_with_request(
             &server,

@@ -143,7 +143,8 @@ fn setup_mcp_server() -> (TempDir, Database, MempalMcpServer) {
         Arc::new(StubEmbedderFactory {
             vector: vec![0.1, 0.2, 0.3],
         }),
-    );
+    )
+    .expect("create MCP server");
     (tmp, db, server)
 }
 
@@ -155,7 +156,8 @@ fn setup_rest_mcp_server() -> (TempDir, Database, MempalMcpServer, mempal::api::
     let factory = Arc::new(StubEmbedderFactory {
         vector: vec![0.1, 0.2, 0.3],
     });
-    let server = MempalMcpServer::new_with_factory(db_path.clone(), factory.clone());
+    let server = MempalMcpServer::new_with_factory(db_path.clone(), factory.clone())
+        .expect("create MCP server");
     let state = mempal::api::ApiState::new(db_path, factory);
     (tmp, db, server, state)
 }
@@ -894,9 +896,10 @@ async fn test_rest_after_mcp_default_ingest_reuses_existing_bootstrap_drawer() {
 
 #[cfg(feature = "rest")]
 #[tokio::test]
-async fn test_rest_ingest_does_not_claim_typed_field_parity() {
+async fn test_rest_ingest_preserves_typed_fields_on_bootstrap_identity() {
     let (_tmp, db, _server, state) = setup_rest_mcp_server();
-    let content = "REST typed fields remain ignored";
+    let content = "REST typed fields are persisted";
+    let statement = "REST should preserve typed knowledge metadata.";
     let (status, body) = post_rest_ingest(
         state,
         json!({
@@ -904,7 +907,7 @@ async fn test_rest_ingest_does_not_claim_typed_field_parity() {
             "wing": "mempal",
             "room": "identity",
             "memory_kind": "knowledge",
-            "statement": "REST should not accept typed knowledge yet.",
+            "statement": statement,
             "tier": "shu",
             "status": "promoted",
             "supporting_refs": ["drawer_ev_001"]
@@ -924,10 +927,11 @@ async fn test_rest_ingest_does_not_claim_typed_field_parity() {
         .get_drawer(&expected)
         .expect("load rest drawer")
         .expect("rest drawer exists");
-    assert_eq!(drawer.memory_kind, MemoryKind::Evidence);
-    assert_eq!(drawer.statement, None);
-    assert_eq!(drawer.tier, None);
-    assert_eq!(drawer.status, None);
+    assert_eq!(drawer.memory_kind, MemoryKind::Knowledge);
+    assert_eq!(drawer.statement.as_deref(), Some(statement));
+    assert_eq!(drawer.tier, Some(KnowledgeTier::Shu));
+    assert_eq!(drawer.status, Some(KnowledgeStatus::Promoted));
+    assert_eq!(drawer.supporting_refs, vec!["drawer_ev_001"]);
 }
 
 #[tokio::test]

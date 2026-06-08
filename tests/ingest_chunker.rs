@@ -159,7 +159,8 @@ async fn test_mcp_ingest_short_content_single_chunk() {
         dim: 4,
         max_tokens: 100,
     });
-    let server = MempalMcpServer::new_with_factory_and_config(env.db_path.clone(), config, factory);
+    let server = MempalMcpServer::new_with_factory_and_config(env.db_path.clone(), config, factory)
+        .expect("create MCP server");
 
     let content = make_content(10);
     let response = server
@@ -196,7 +197,8 @@ async fn test_mcp_ingest_large_content_multi_chunk() {
         dim: 4,
         max_tokens: 50,
     });
-    let server = MempalMcpServer::new_with_factory_and_config(env.db_path.clone(), config, factory);
+    let server = MempalMcpServer::new_with_factory_and_config(env.db_path.clone(), config, factory)
+        .expect("create MCP server");
 
     let content = make_content(100);
     let response = server
@@ -263,7 +265,8 @@ async fn test_mcp_ingest_dry_run_returns_chunk_info() {
         dim: 4,
         max_tokens: 50,
     });
-    let server = MempalMcpServer::new_with_factory_and_config(env.db_path.clone(), config, factory);
+    let server = MempalMcpServer::new_with_factory_and_config(env.db_path.clone(), config, factory)
+        .expect("create MCP server");
 
     let content = make_content(100);
     let response = server

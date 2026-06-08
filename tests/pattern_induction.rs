@@ -210,6 +210,7 @@ impl TestEnv {
                 default: default_vec,
             }),
         )
+        .expect("create MCP server")
     }
 
     fn db(&self) -> Database {

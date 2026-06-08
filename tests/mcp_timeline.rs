@@ -73,6 +73,7 @@ impl TimelineEnv {
 
     fn server(&self) -> MempalMcpServer {
         MempalMcpServer::new_with_factory(self.db_path.clone(), Arc::new(PanicEmbedderFactory))
+            .expect("create MCP server")
     }
 }
 

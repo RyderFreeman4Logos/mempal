@@ -217,6 +217,7 @@ async fn status_response(db_path: &Path) -> StatusResponse {
             ..Config::default()
         },
     )
+    .expect("create MCP server")
     .mempal_status()
     .await
     .expect("status")
@@ -497,13 +498,7 @@ pattern = "("
 #[test]
 fn test_no_new_runtime_dependencies_introduced() {
     let runtime_packages = runtime_dependency_names();
-    let baseline_output = Command::new("git")
-        .args(["show", "main:Cargo.lock"])
-        .output()
-        .expect("read baseline Cargo.lock from main");
-    assert!(baseline_output.status.success(), "{baseline_output:?}");
-    let baseline_lock =
-        String::from_utf8(baseline_output.stdout).expect("baseline Cargo.lock is utf8");
+    let baseline_lock = baseline_cargo_lock();
     let baseline_packages = lockfile_package_names(&baseline_lock);
 
     // Intentional additions approved in feat/integrate-upstream-subcommands:
@@ -520,6 +515,41 @@ fn test_no_new_runtime_dependencies_introduced() {
         new_runtime_packages.is_empty(),
         "new runtime dependencies detected: {new_runtime_packages:?}"
     );
+}
+
+fn baseline_cargo_lock() -> String {
+    let base_ref = std::env::var("GITHUB_BASE_REF").unwrap_or_else(|_| "main".to_string());
+    let direct_refs = [
+        format!("{base_ref}:Cargo.lock"),
+        format!("origin/{base_ref}:Cargo.lock"),
+        "main:Cargo.lock".to_string(),
+        "origin/main:Cargo.lock".to_string(),
+    ];
+
+    for spec in direct_refs {
+        if let Some(lock) = git_show_cargo_lock(&spec) {
+            return lock;
+        }
+    }
+
+    let fetch = Command::new("git")
+        .args(["fetch", "--depth=1", "origin", &base_ref])
+        .output()
+        .expect("fetch baseline Cargo.lock ref");
+    assert!(fetch.status.success(), "{fetch:?}");
+
+    git_show_cargo_lock("FETCH_HEAD:Cargo.lock").expect("baseline Cargo.lock is available")
+}
+
+fn git_show_cargo_lock(spec: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["show", spec])
+        .output()
+        .expect("read baseline Cargo.lock");
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(output.stdout).expect("baseline Cargo.lock is utf8"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

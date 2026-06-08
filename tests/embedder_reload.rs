@@ -394,7 +394,7 @@ async fn test_openai_compat_section_requires_restart() {
     assert_eq!(ConfigHandle::version(), old_version);
 
     let config = Config::load_from(&env.config_path).expect("load changed config");
-    let server = MempalMcpServer::new(env.db_path.clone(), config);
+    let server = MempalMcpServer::new(env.db_path.clone(), config).expect("create MCP server");
     let status = server.mempal_status().await.expect("mcp status").0;
     assert!(status.system_warnings.iter().any(|warning| {
         warning
@@ -456,7 +456,7 @@ async fn test_dim_mismatch_fail_fast() {
     let (addr, _handle) = start_mock(0).await.expect("start mock");
     let config = Config::parse(&config_text(&db_path, &format!("http://{addr}/v1"), ""))
         .expect("parse config");
-    let server = MempalMcpServer::new(db_path, config);
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server
         .ingest_json_for_test(
             serde_json::to_value(IngestRequest {

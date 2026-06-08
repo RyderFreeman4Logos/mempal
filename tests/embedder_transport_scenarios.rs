@@ -209,7 +209,7 @@ async fn test_search_deadline_bm25_fallback() {
     )
     .expect("insert drawer");
 
-    let server = MempalMcpServer::new(env.db_path.clone(), config);
+    let server = MempalMcpServer::new(env.db_path.clone(), config).expect("create MCP server");
     tokio::time::pause();
     let search = tokio::spawn({
         let server = server.clone();
@@ -272,7 +272,8 @@ async fn test_search_deadline_warning_surfaces_timeout_reason() {
     .expect("insert drawer");
 
     let server =
-        MempalMcpServer::new_with_factory(env.db_path.clone(), Arc::new(SlowEmbedderFactory));
+        MempalMcpServer::new_with_factory(env.db_path.clone(), Arc::new(SlowEmbedderFactory))
+            .expect("create MCP server");
     let status = server.mempal_status().await.expect("status").0;
     assert!(status.endpoint_health.embedding_reachable, "{status:#?}");
     assert!(status.embedder_circuit.bm25_fallback_enabled);
@@ -331,7 +332,8 @@ async fn test_successful_embed_exits_degraded() {
         "",
     ));
     let config = Config::load_from(&env.config_path).expect("load config");
-    let server = MempalMcpServer::new(env.db_path.clone(), config.clone());
+    let server =
+        MempalMcpServer::new(env.db_path.clone(), config.clone()).expect("create MCP server");
     let status = global_embed_status();
     status.reset_for_tests();
     status.record_failure(&"synthetic failure 1");
@@ -385,7 +387,7 @@ async fn test_successful_embed_exits_degraded() {
 }
 
 async fn ingest_with_config(db_path: PathBuf, config: Config) -> Result<serde_json::Value> {
-    let server = MempalMcpServer::new(db_path, config);
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server
         .mempal_ingest(Parameters(IngestRequest {
             content: "blocked until recover".to_string(),
@@ -437,7 +439,8 @@ async fn test_ingest_returns_receipt_when_block_writes_false() {
         .get("operation_id")
         .and_then(|value| value.as_str())
         .expect("operation id");
-    let status_server = MempalMcpServer::new(env.db_path.clone(), config);
+    let status_server =
+        MempalMcpServer::new(env.db_path.clone(), config).expect("create MCP server");
     let completed = status_server
         .wait_for_operation_completion(operation_id)
         .await
@@ -470,7 +473,8 @@ block_writes_when_degraded = true
     let server = MempalMcpServer::new(
         std::path::PathBuf::from("/tmp/mempal-server-info.db"),
         config,
-    );
+    )
+    .expect("create MCP server");
     let tmp = TempDir::new().expect("tempdir");
     let config_path = tmp.path().join("config.toml");
     write_config(
@@ -579,7 +583,8 @@ async fn test_status_exposes_embed_status() {
         "",
     ));
     let config = Config::load_from(&env.config_path).expect("load config");
-    let server = MempalMcpServer::new(env.db_path.clone(), config.clone());
+    let server =
+        MempalMcpServer::new(env.db_path.clone(), config.clone()).expect("create MCP server");
     let embedder = from_config(&config).await.expect("build managed embedder");
     embedder
         .embed(&["status update"])
