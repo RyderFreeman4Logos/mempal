@@ -87,7 +87,7 @@ pub(crate) struct DbPathIdentity {
 impl DbPathIdentity {
     pub(crate) fn from_existing_db_path(db_path: &Path) -> Option<Self> {
         let absolute_db_path = resolve_configured_path_lossy(db_path);
-        let canonical_db_path = fs::canonicalize(absolute_db_path).ok()?;
+        let canonical_db_path = canonicalize_db_path_or_parent(absolute_db_path)?;
         Some(Self::from_resolved_db_path(canonical_db_path))
     }
 
@@ -158,6 +158,22 @@ fn resolve_path_with_cwd_lossy(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
+fn canonicalize_db_path_or_parent(path: PathBuf) -> Option<PathBuf> {
+    if let Ok(canonical) = fs::canonicalize(&path) {
+        return Some(canonical);
+    }
+
+    let file_name = path.file_name()?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::canonicalize(parent)
+        .ok()
+        .map(|canonical_parent| canonical_parent.join(file_name))
+}
+
+#[cfg(target_os = "linux")]
 fn canonicalize_if_present(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -215,5 +231,19 @@ mod tests {
         let deleted_target = append_os_suffix(&db_path, " (deleted)");
 
         assert!(identity.matches_fd(&fd_path, &deleted_target));
+    }
+
+    #[test]
+    fn test_from_existing_db_path_uses_canonical_parent_when_db_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let identity = DbPathIdentity::from_existing_db_path(&db_path).expect("db identity");
+
+        assert_eq!(
+            identity.db_path(),
+            std::fs::canonicalize(tmp.path())
+                .expect("canonical tempdir")
+                .join("palace.db")
+        );
     }
 }

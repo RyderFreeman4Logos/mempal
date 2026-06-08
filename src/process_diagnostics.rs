@@ -104,7 +104,8 @@ fn inspect_db_holders_in_proc(
 
     let mut holders = Vec::new();
     for entry in entries.flatten() {
-        let Some(pid) = parse_pid(entry.file_name().to_string_lossy().as_ref()) else {
+        let file_name = entry.file_name();
+        let Some(pid) = file_name.to_str().and_then(parse_pid) else {
             continue;
         };
         let pid_dir = entry.path();
