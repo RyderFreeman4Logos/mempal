@@ -191,9 +191,10 @@ fn opened_db_files(fd_dir: &Path, targets: &[(&'static str, DbFileIdentity)]) ->
             continue;
         };
         for (kind, expected) in targets {
-            if expected.matches_fd(&fd_path, &target)
-                && !opened.iter().any(|opened_kind| opened_kind == kind)
-            {
+            if opened.iter().any(|opened_kind| opened_kind == kind) {
+                continue;
+            }
+            if expected.matches_fd(&fd_path, &target) {
                 opened.push((*kind).to_string());
             }
         }

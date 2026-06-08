@@ -422,6 +422,7 @@ fn spawn_hook_message_heartbeat(
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
         loop {
             ticker.tick().await;
             if shutdown_requested() {
