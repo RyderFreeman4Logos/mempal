@@ -70,6 +70,14 @@ impl DbFileIdentity {
         }
 
         let target_name_matches = self.target_name_matches(fd_target);
+        let mut fd_file_id = None;
+        if target_name_matches {
+            fd_file_id = file_id_for_path(fd_path);
+            if fd_file_id.is_some_and(|file_id| self.file_ids.contains(&file_id)) {
+                return true;
+            }
+        }
+
         let canonical_target = canonicalize_if_present(fd_target);
         if self.fd_targets.contains(&canonical_target) {
             return true;
@@ -78,7 +86,9 @@ impl DbFileIdentity {
             return false;
         }
 
-        let fd_file_id = file_id_for_path(fd_path);
+        if fd_file_id.is_none() {
+            fd_file_id = file_id_for_path(fd_path);
+        }
         if fd_file_id.is_some_and(|file_id| self.file_ids.contains(&file_id)) {
             return true;
         }
