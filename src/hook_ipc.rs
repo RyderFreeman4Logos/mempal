@@ -44,10 +44,12 @@ pub(crate) enum HookIpcClientOutcome {
 pub(crate) enum HookIpcFallbackReason {
     SocketUnavailable,
     RuntimeInitFailed(String),
+    ConnectFailed(String),
     Timeout,
-    Io(String),
+    RequestEncodeFailed(String),
+    RequestWriteFailed(String),
     Rejected(String),
-    Protocol(String),
+    ResponseReadFailed(String),
 }
 
 pub(crate) struct SocketFileGuard {
@@ -59,11 +61,28 @@ impl fmt::Display for HookIpcFallbackReason {
         match self {
             Self::SocketUnavailable => write!(f, "daemon IPC socket unavailable"),
             Self::RuntimeInitFailed(error) => write!(f, "daemon IPC runtime init failed: {error}"),
+            Self::ConnectFailed(error) => write!(f, "daemon IPC connect failed: {error}"),
             Self::Timeout => write!(f, "daemon IPC timed out"),
-            Self::Io(error) => write!(f, "daemon IPC I/O failed: {error}"),
+            Self::RequestEncodeFailed(error) => {
+                write!(f, "daemon IPC request encode failed: {error}")
+            }
+            Self::RequestWriteFailed(error) => {
+                write!(f, "daemon IPC request write failed: {error}")
+            }
             Self::Rejected(message) => write!(f, "daemon IPC rejected payload: {message}"),
-            Self::Protocol(error) => write!(f, "daemon IPC protocol failed: {error}"),
+            Self::ResponseReadFailed(error) => {
+                write!(f, "daemon IPC response read failed: {error}")
+            }
         }
+    }
+}
+
+impl HookIpcFallbackReason {
+    pub(crate) fn may_have_reached_daemon(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout | Self::RequestWriteFailed(_) | Self::ResponseReadFailed(_)
+        )
     }
 }
 
@@ -138,23 +157,29 @@ async fn enqueue_once(path: &Path, request: HookIpcEnqueueRequest) -> HookIpcCli
     let mut stream = match UnixStream::connect(path).await {
         Ok(stream) => stream,
         Err(error) => {
-            return HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Io(error.to_string()));
+            return HookIpcClientOutcome::Fallback(HookIpcFallbackReason::ConnectFailed(
+                error.to_string(),
+            ));
         }
     };
     let mut frame = match serde_json::to_vec(&request) {
         Ok(frame) => frame,
         Err(error) => {
-            return HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Protocol(
+            return HookIpcClientOutcome::Fallback(HookIpcFallbackReason::RequestEncodeFailed(
                 error.to_string(),
             ));
         }
     };
     frame.push(b'\n');
     if let Err(error) = stream.write_all(&frame).await {
-        return HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Io(error.to_string()));
+        return HookIpcClientOutcome::Fallback(HookIpcFallbackReason::RequestWriteFailed(
+            error.to_string(),
+        ));
     }
     if let Err(error) = stream.flush().await {
-        return HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Io(error.to_string()));
+        return HookIpcClientOutcome::Fallback(HookIpcFallbackReason::RequestWriteFailed(
+            error.to_string(),
+        ));
     }
 
     match read_enqueue_response(&mut stream).await {
@@ -162,9 +187,9 @@ async fn enqueue_once(path: &Path, request: HookIpcEnqueueRequest) -> HookIpcCli
         Ok(HookIpcEnqueueResponse::Error { message }) => {
             HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Rejected(message))
         }
-        Err(error) => {
-            HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Protocol(error.to_string()))
-        }
+        Err(error) => HookIpcClientOutcome::Fallback(HookIpcFallbackReason::ResponseReadFailed(
+            error.to_string(),
+        )),
     }
 }
 

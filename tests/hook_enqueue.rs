@@ -105,6 +105,21 @@ fn spawn_fake_persisting_daemon_ipc(
     db_path: PathBuf,
     response_delay: Duration,
 ) -> thread::JoinHandle<String> {
+    spawn_fake_persisting_daemon_ipc_with_response(
+        home,
+        db_path,
+        response_delay,
+        Some(r#"{"status":"accepted"}"#),
+    )
+}
+
+#[cfg(unix)]
+fn spawn_fake_persisting_daemon_ipc_with_response(
+    home: &TempDir,
+    db_path: PathBuf,
+    response_delay: Duration,
+    response: Option<&'static str>,
+) -> thread::JoinHandle<String> {
     let socket_path = home.path().join(".mempal").join("daemon-hook.sock");
     let _ = fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).expect("bind fake daemon IPC socket");
@@ -127,9 +142,13 @@ fn spawn_fake_persisting_daemon_ipc(
             .enqueue_idempotent_with_key(kind, payload, idempotency_key)
             .expect("fake daemon persist");
 
-        let _ = stream.write_all(br#"{"status":"accepted"}"#);
-        let _ = stream.write_all(b"\n");
-        let _ = stream.flush();
+        if let Some(response) = response {
+            let _ = stream.write_all(response.as_bytes());
+            if !response.as_bytes().ends_with(b"\n") {
+                let _ = stream.write_all(b"\n");
+            }
+            let _ = stream.flush();
+        }
         request
     })
 }
@@ -254,6 +273,46 @@ fn test_hook_ipc_timeout_fallback_dedupes_with_slow_daemon_persist() {
         1,
         "slow daemon persist and timeout fallback must share the same attempt key"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ipc_lost_or_malformed_ack_fallback_dedupes_after_daemon_persist() {
+    let cases = [
+        ("lost response", None),
+        ("malformed response", Some("not-json")),
+    ];
+
+    for (label, response) in cases {
+        let (home, db_path) = setup_home();
+        let ipc = spawn_fake_persisting_daemon_ipc_with_response(
+            &home,
+            db_path.clone(),
+            Duration::from_millis(0),
+            response,
+        );
+        let payload = format!(r#"{{"prompt":"{label} fallback persists once"}}"#);
+
+        let output = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+
+        assert_eq!(output.status.code(), Some(0), "{label}");
+        assert!(
+            output.stdout.is_empty(),
+            "{label}: stdout must stay empty, got {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{label}: fallback success must stay quiet, got {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = ipc.join().expect("fake daemon IPC thread");
+        assert_eq!(
+            pending_message_count(&db_path),
+            1,
+            "{label}: daemon persist and fallback must share the same attempt key"
+        );
+    }
 }
 
 #[cfg(unix)]

@@ -190,15 +190,17 @@ fn try_enqueue_via_daemon(mempal_home: &Path, kind: &str, payload: &str) -> Daem
     let idempotency_key = request.idempotency_key.clone();
     match crate::hook_ipc::enqueue_with_default_timeout(mempal_home, request) {
         crate::hook_ipc::HookIpcClientOutcome::Accepted => DaemonEnqueueOutcome::Accepted,
-        crate::hook_ipc::HookIpcClientOutcome::Fallback(reason) => match reason {
-            crate::hook_ipc::HookIpcFallbackReason::Timeout => {
+        crate::hook_ipc::HookIpcClientOutcome::Fallback(reason) => {
+            let reason_text = reason.to_string();
+            if reason.may_have_reached_daemon() {
                 DaemonEnqueueOutcome::Fallback(DaemonFallback::Idempotent {
-                    reason: reason.to_string(),
+                    reason: reason_text,
                     key: idempotency_key,
                 })
+            } else {
+                DaemonEnqueueOutcome::Fallback(DaemonFallback::Fresh(reason_text))
             }
-            reason => DaemonEnqueueOutcome::Fallback(DaemonFallback::Fresh(reason.to_string())),
-        },
+        }
     }
 }
 
