@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::adoption_analytics::build_runtime_adoption_analytics;
 #[cfg(feature = "rest")]
@@ -21,7 +21,7 @@ use mempal::core::{
     config::{CompiledPrivacyConfig, Config, ConfigHandle, default_config_path},
     db::{
         CURRENT_VECTOR_INDEX_VERSION, Database, HistoricalRejudgeAudit, ReindexVectorStash,
-        VECTOR_DISTANCE_METRIC, find_similar_clusters, vector_metadata_key,
+        VECTOR_DISTANCE_METRIC, find_similar_clusters, fts_tokenize_content, vector_metadata_key,
     },
     phase3::{
         CardContextDefaultProposalReport, CardContextRollbackControlReport, EvaluatorAdviceInput,
@@ -1972,12 +1972,20 @@ enum MaintenanceCommands {
     },
     /// Re-run current retention policy over historical drawers.
     Rejudge {
+        #[command(subcommand)]
+        command: Option<MaintenanceRejudgeCommands>,
         /// Mutate storage. Omit for dry-run.
         #[arg(long, default_value_t = false)]
         execute: bool,
         /// Irreversibly delete candidates instead of auditable soft-delete.
         #[arg(long = "hard-delete", default_value_t = false)]
         hard_delete: bool,
+        /// Absolute directory for atomic rejudge backup files.
+        #[arg(long = "backup-dir")]
+        backup_dir: Option<PathBuf>,
+        /// Allow hard-delete execution without a backup.
+        #[arg(long = "unsafe-no-backup", default_value_t = false)]
+        unsafe_no_backup: bool,
         /// Limit number of active drawers scanned.
         #[arg(long, default_value_t = 1000)]
         limit: usize,
@@ -1990,6 +1998,39 @@ enum MaintenanceCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+}
+
+#[derive(Subcommand)]
+enum MaintenanceRejudgeCommands {
+    /// Restore drawers from a historical rejudge backup.
+    Restore {
+        /// Absolute path to a rejudge backup JSON file.
+        #[arg(long)]
+        backup: PathBuf,
+        /// Mutate storage. Omit for dry-run.
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+        /// Existing active drawer conflict behavior.
+        #[arg(long = "conflict-policy", value_enum, default_value_t = RejudgeRestoreConflictPolicy::Skip)]
+        conflict_policy: RejudgeRestoreConflictPolicy,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RejudgeRestoreConflictPolicy {
+    Skip,
+    Overwrite,
+}
+
+impl RejudgeRestoreConflictPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::Overwrite => "overwrite",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -2101,9 +2142,12 @@ struct MaintenanceStep {
     description: String,
 }
 
+#[derive(Clone, Copy)]
 struct HistoricalRejudgeOptions<'a> {
     execute: bool,
     hard_delete: bool,
+    backup_dir: Option<&'a Path>,
+    unsafe_no_backup: bool,
     limit: usize,
     wing: Option<&'a str>,
     room: Option<&'a str>,
@@ -2122,8 +2166,23 @@ struct HistoricalRejudgeReport {
     estimated_bytes_reclaimed: usize,
     judge_model: Option<String>,
     config_version: String,
+    backup_path: Option<PathBuf>,
     wings_rooms: Vec<HistoricalRejudgeScopeCount>,
     examples: Vec<HistoricalRejudgeExample>,
+}
+
+struct HistoricalRejudgeReportInput<'a> {
+    dry_run: bool,
+    mutation: &'a str,
+    scanned_count: usize,
+    mutated_count: usize,
+    judge_model: Option<String>,
+    config_version: String,
+    backup_path: Option<PathBuf>,
+    decisions: &'a [(
+        &'a mempal::core::db::HistoricalRejudgeCandidate,
+        HistoricalRejudgeDecision,
+    )],
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2154,6 +2213,94 @@ struct HistoricalRejudgeDecision {
     score: Option<f64>,
     tier: u8,
     judge: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalRejudgeBackup {
+    version: u32,
+    metadata: HistoricalRejudgeBackupMetadata,
+    items: Vec<HistoricalRejudgeBackupItem>,
+    integrity: HistoricalRejudgeBackupIntegrity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalRejudgeBackupMetadata {
+    created_at: String,
+    source_db_path: PathBuf,
+    command_args: HistoricalRejudgeCommandArgs,
+    judge_model: Option<String>,
+    config_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalRejudgeCommandArgs {
+    execute: bool,
+    hard_delete: bool,
+    unsafe_no_backup: bool,
+    limit: usize,
+    wing: Option<String>,
+    room: Option<String>,
+    project: Option<String>,
+    format: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalRejudgeBackupItem {
+    drawer: Drawer,
+    project_id: Option<String>,
+    source_root: Option<String>,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+    raw_drawer_row: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_drawer_triple_ids: Vec<String>,
+    vector: Option<HistoricalRejudgeBackupVector>,
+    decision: HistoricalRejudgeBackupDecision,
+    content_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalRejudgeBackupVector {
+    embedding_hex: String,
+    project_id: Option<String>,
+    embedding_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalRejudgeBackupDecision {
+    reason: String,
+    label: Option<String>,
+    score: Option<f64>,
+    tier: u8,
+    judge: String,
+    mutation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalRejudgeBackupIntegrity {
+    payload_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HistoricalRejudgeRestoreReport {
+    dry_run: bool,
+    backup: PathBuf,
+    conflict_policy: String,
+    item_count: usize,
+    would_restore_count: usize,
+    restored_count: usize,
+    skipped_active_count: usize,
+    conflict_count: usize,
+    audit_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct HistoricalRejudgeRestoreItemOutcome {
+    would_restore: bool,
+    restored: bool,
+    skipped_active: bool,
+    conflict: bool,
+    audit_recorded: bool,
 }
 
 fn main() {
@@ -2837,8 +2984,11 @@ fn run() -> Result<()> {
         Commands::Maintenance {
             command:
                 MaintenanceCommands::Rejudge {
+                    command: None,
                     execute,
                     hard_delete,
+                    backup_dir,
+                    unsafe_no_backup,
                     limit,
                     wing,
                     room,
@@ -2851,6 +3001,8 @@ fn run() -> Result<()> {
             HistoricalRejudgeOptions {
                 execute,
                 hard_delete,
+                backup_dir: backup_dir.as_deref(),
+                unsafe_no_backup,
                 limit,
                 wing: wing.as_deref(),
                 room: room.as_deref(),
@@ -2858,6 +3010,25 @@ fn run() -> Result<()> {
                 format: format.as_str(),
             },
         )),
+        Commands::Maintenance {
+            command:
+                MaintenanceCommands::Rejudge {
+                    command:
+                        Some(MaintenanceRejudgeCommands::Restore {
+                            backup,
+                            execute,
+                            conflict_policy,
+                            format,
+                        }),
+                    ..
+                },
+        } => maintenance_rejudge_restore_command(
+            &db,
+            &backup,
+            execute,
+            conflict_policy,
+            format.as_str(),
+        ),
         Commands::Kg { command } => kg_command(&db, command),
         Commands::Knowledge { command } => {
             block_on_result(knowledge_command(&db, config.as_ref(), command))
@@ -12114,6 +12285,12 @@ async fn maintenance_rejudge_command(
     if options.hard_delete && !options.execute {
         bail!("--hard-delete requires --execute");
     }
+    if options.unsafe_no_backup && !options.hard_delete {
+        bail!("--unsafe-no-backup is only valid with --hard-delete");
+    }
+    if let Some(backup_dir) = options.backup_dir {
+        validate_absolute_path(backup_dir, "--backup-dir")?;
+    }
     let current_dir = env::current_dir().ok();
     let project_id = if options.project.is_some() {
         resolve_project_id(options.project, config, current_dir.as_deref())
@@ -12150,15 +12327,58 @@ async fn maintenance_rejudge_command(
         .iter()
         .map(|(row, _)| row.drawer.id.clone())
         .collect::<Vec<_>>();
+    let candidate_backup_items = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let (row, decision) = *candidate;
+            match build_historical_rejudge_backup_item(
+                db,
+                row,
+                decision,
+                if options.hard_delete {
+                    "hard_delete"
+                } else {
+                    "soft_delete"
+                },
+            ) {
+                Ok(Some(item)) => Some(Ok(item)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if options.execute && !candidate_ids.is_empty() && options.backup_dir.is_none() {
+        if options.hard_delete && options.unsafe_no_backup {
+            // Explicit unsafe operator choice.
+        } else {
+            bail!(
+                "--execute requires --backup-dir when historical rejudge has deletion candidates"
+            );
+        }
+    }
+
+    let backup_path = if (!options.execute || !candidate_backup_items.is_empty())
+        && let Some(backup_dir) = options.backup_dir
+    {
+        Some(
+            write_historical_rejudge_backup(
+                db,
+                backup_dir,
+                options,
+                judge_model.clone(),
+                config_version.clone(),
+                &candidate_backup_items,
+            )
+            .context("failed to write historical rejudge backup")?,
+        )
+    } else {
+        None
+    };
 
     let mutated_count = if options.execute && !candidate_ids.is_empty() {
-        if options.hard_delete {
-            db.hard_delete_drawers_by_ids(&candidate_ids)
-                .context("failed to hard-delete historical rejudge candidates")?
-        } else {
-            db.soft_delete_drawers_by_ids(&candidate_ids)
-                .context("failed to soft-delete historical rejudge candidates")?
-        }
+        delete_rejudge_backup_items_by_version(db, &candidate_backup_items, options.hard_delete)
+            .context("failed to delete historical rejudge candidates")?
     } else {
         0
     };
@@ -12203,25 +12423,983 @@ async fn maintenance_rejudge_command(
                 "drawer_ids": candidate_ids,
                 "judge_model": judge_model,
                 "config_version": config_version,
+                "backup_path": backup_path,
+                "unsafe_no_backup": options.unsafe_no_backup,
             }),
         )
         .context("failed to append historical rejudge audit log")?;
     }
 
-    let report = build_historical_rejudge_report(
-        !options.execute,
-        if options.hard_delete {
+    let report = build_historical_rejudge_report(HistoricalRejudgeReportInput {
+        dry_run: !options.execute,
+        mutation: if options.hard_delete {
             "hard_delete"
         } else {
             "soft_delete"
         },
-        rows.len(),
+        scanned_count: rows.len(),
         mutated_count,
         judge_model,
         config_version,
-        &decisions,
-    );
+        backup_path,
+        decisions: &decisions,
+    });
     print_historical_rejudge_report(&report, options.format)
+}
+
+fn validate_absolute_path(path: &Path, arg_name: &str) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("{arg_name} must be an absolute path: {}", path.display());
+    }
+    Ok(())
+}
+
+fn write_historical_rejudge_backup(
+    db: &Database,
+    backup_dir: &Path,
+    options: HistoricalRejudgeOptions<'_>,
+    judge_model: Option<String>,
+    config_version: String,
+    items: &[HistoricalRejudgeBackupItem],
+) -> Result<PathBuf> {
+    validate_absolute_path(backup_dir, "--backup-dir")?;
+    fs::create_dir_all(backup_dir)
+        .with_context(|| format!("failed to create backup dir {}", backup_dir.display()))?;
+
+    let metadata = HistoricalRejudgeBackupMetadata {
+        created_at: iso_timestamp(),
+        source_db_path: db.path().to_path_buf(),
+        command_args: HistoricalRejudgeCommandArgs {
+            execute: options.execute,
+            hard_delete: options.hard_delete,
+            unsafe_no_backup: options.unsafe_no_backup,
+            limit: options.limit,
+            wing: options.wing.map(ToOwned::to_owned),
+            room: options.room.map(ToOwned::to_owned),
+            project: options.project.map(ToOwned::to_owned),
+            format: options.format.to_string(),
+        },
+        judge_model,
+        config_version,
+    };
+    let mut backup = HistoricalRejudgeBackup {
+        version: 1,
+        metadata,
+        items: items.to_vec(),
+        integrity: HistoricalRejudgeBackupIntegrity {
+            payload_sha256: String::new(),
+        },
+    };
+    backup.integrity.payload_sha256 = historical_rejudge_backup_payload_hash(&backup)?;
+    let payload = serde_json::to_vec_pretty(&backup)?;
+    let short_hash = &backup.integrity.payload_sha256[..12];
+    let timestamp = backup
+        .metadata
+        .created_at
+        .replace([':', '-'], "")
+        .replace('T', "-")
+        .trim_end_matches('Z')
+        .to_string();
+    let file_name = format!("rejudge-backup-{timestamp}-{short_hash}.json");
+    let final_path = backup_dir.join(file_name);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp_path = backup_dir.join(format!(".rejudge-backup-{nonce}.tmp"));
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("failed to create temp backup {}", temp_path.display()))?;
+        file.write_all(&payload)
+            .with_context(|| format!("failed to write temp backup {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync temp backup {}", temp_path.display()))?;
+    }
+    fs::rename(&temp_path, &final_path).with_context(|| {
+        format!(
+            "failed to atomically rename {} to {}",
+            temp_path.display(),
+            final_path.display()
+        )
+    })?;
+    Ok(final_path)
+}
+
+fn build_historical_rejudge_backup_item(
+    db: &Database,
+    row: &mempal::core::db::HistoricalRejudgeCandidate,
+    decision: &HistoricalRejudgeDecision,
+    mutation: &str,
+) -> Result<Option<HistoricalRejudgeBackupItem>> {
+    let Some(raw_drawer_row) = load_optional_raw_drawer_row(db, &row.drawer.id)? else {
+        return Ok(None);
+    };
+    if !raw_drawer_row_matches_scored_candidate(&raw_drawer_row, row) {
+        return Ok(None);
+    }
+    let source_root = json_string_field(&raw_drawer_row, "source_root");
+    let valid_from = json_string_field(&raw_drawer_row, "valid_from");
+    let valid_until = json_string_field(&raw_drawer_row, "valid_until");
+    Ok(Some(HistoricalRejudgeBackupItem {
+        drawer: row.drawer.clone(),
+        project_id: row.project_id.clone(),
+        source_root,
+        valid_from,
+        valid_until,
+        raw_drawer_row,
+        source_drawer_triple_ids: load_source_drawer_triple_ids(db, &row.drawer.id)?,
+        vector: load_rejudge_backup_vector(db, &row.drawer.id)?,
+        decision: HistoricalRejudgeBackupDecision {
+            reason: decision.reason.clone(),
+            label: decision.label.clone(),
+            score: decision.score,
+            tier: decision.tier,
+            judge: decision.judge.clone(),
+            mutation: mutation.to_string(),
+        },
+        content_sha256: sha256_hex(row.drawer.content.as_bytes()),
+    }))
+}
+
+fn load_optional_raw_drawer_row(
+    db: &Database,
+    drawer_id: &str,
+) -> Result<Option<BTreeMap<String, serde_json::Value>>> {
+    use rusqlite::OptionalExtension;
+
+    let columns = drawer_table_columns(db)?;
+    let select_columns = columns
+        .iter()
+        .map(|column| quote_sql_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT {select_columns} FROM drawers WHERE id = ?1");
+    let mut statement = db.conn().prepare(&sql)?;
+    let raw = statement
+        .query_row([drawer_id], |row| {
+            let mut values = BTreeMap::new();
+            for (index, column) in columns.iter().enumerate() {
+                values.insert(
+                    column.clone(),
+                    sqlite_value_ref_to_json(row.get_ref(index)?),
+                );
+            }
+            Ok(values)
+        })
+        .optional()
+        .with_context(|| format!("failed to load raw drawer row {drawer_id}"))?;
+    Ok(raw)
+}
+
+fn raw_drawer_row_matches_scored_candidate(
+    raw_drawer_row: &BTreeMap<String, serde_json::Value>,
+    row: &mempal::core::db::HistoricalRejudgeCandidate,
+) -> bool {
+    json_string_field(raw_drawer_row, "id").as_deref() == Some(row.drawer.id.as_str())
+        && json_string_field(raw_drawer_row, "content").as_deref()
+            == Some(row.drawer.content.as_str())
+        && json_string_field(raw_drawer_row, "project_id") == row.project_id
+        && raw_drawer_row.get("deleted_at") == Some(&serde_json::Value::Null)
+        && json_string_field(raw_drawer_row, "content_hash").is_none_or(|hash| {
+            hash == blake3::hash(row.drawer.content.as_bytes())
+                .to_hex()
+                .as_str()
+        })
+}
+
+fn load_source_drawer_triple_ids(db: &Database, drawer_id: &str) -> Result<Vec<String>> {
+    let mut statement = db
+        .conn()
+        .prepare("SELECT id FROM triples WHERE source_drawer = ?1 ORDER BY id")?;
+    let rows = statement
+        .query_map([drawer_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn drawer_table_columns(db: &Database) -> Result<Vec<String>> {
+    let mut statement = db.conn().prepare("PRAGMA table_info(drawers)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns)
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn sqlite_value_ref_to_json(value: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
+    match value {
+        rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+        rusqlite::types::ValueRef::Integer(value) => serde_json::json!(value),
+        rusqlite::types::ValueRef::Real(value) => serde_json::json!(value),
+        rusqlite::types::ValueRef::Text(value) => {
+            serde_json::Value::String(String::from_utf8_lossy(value).into_owned())
+        }
+        rusqlite::types::ValueRef::Blob(value) => serde_json::json!({
+            "encoding": "hex",
+            "value": bytes_to_hex(value),
+        }),
+    }
+}
+
+fn json_string_field(row: &BTreeMap<String, serde_json::Value>, field: &str) -> Option<String> {
+    row.get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn load_rejudge_backup_vector(
+    db: &Database,
+    drawer_id: &str,
+) -> Result<Option<HistoricalRejudgeBackupVector>> {
+    use rusqlite::OptionalExtension;
+
+    if !db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to query vector table presence")?
+    {
+        return Ok(None);
+    }
+    let has_project_id = vector_table_has_project_id(db)?;
+    let sql = if has_project_id {
+        "SELECT embedding, project_id FROM drawer_vectors WHERE id = ?1"
+    } else {
+        "SELECT embedding, NULL AS project_id FROM drawer_vectors WHERE id = ?1"
+    };
+    let vector = db
+        .conn()
+        .query_row(sql, [drawer_id], |row| {
+            let embedding = row.get::<_, Vec<u8>>(0)?;
+            Ok(HistoricalRejudgeBackupVector {
+                embedding_sha256: sha256_hex(&embedding),
+                embedding_hex: bytes_to_hex(&embedding),
+                project_id: row.get(1)?,
+            })
+        })
+        .optional()
+        .with_context(|| format!("failed to load vector row {drawer_id}"))?;
+    Ok(vector)
+}
+
+fn vector_table_has_project_id(db: &Database) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+
+    let sql = db
+        .conn()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drawer_vectors'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(sql.is_some_and(|sql| sql.contains("project_id")))
+}
+
+fn delete_rejudge_backup_items_by_version(
+    db: &Database,
+    items: &[HistoricalRejudgeBackupItem],
+    hard_delete: bool,
+) -> Result<usize> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+
+    let vectors_exist: bool = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to query vector table presence")?;
+
+    db.conn()
+        .execute_batch("BEGIN IMMEDIATE;")
+        .context("failed to begin historical rejudge delete transaction")?;
+    let result = (|| -> Result<usize> {
+        let timestamp = current_timestamp();
+        let mut mutated_total = 0usize;
+        for item in items {
+            if !current_drawer_matches_backup_row(db, item)? {
+                continue;
+            }
+            if hard_delete {
+                delete_rejudge_drawer_fts_row(db, &item.drawer.id)?;
+                if vectors_exist {
+                    db.conn()
+                        .execute(
+                            "DELETE FROM drawer_vectors WHERE id = ?1",
+                            [item.drawer.id.as_str()],
+                        )
+                        .with_context(|| {
+                            format!("failed to delete vector row for drawer {}", item.drawer.id)
+                        })?;
+                }
+                db.conn()
+                    .execute(
+                        "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
+                        [item.drawer.id.as_str()],
+                    )
+                    .with_context(|| {
+                        format!("failed to detach triples for drawer {}", item.drawer.id)
+                    })?;
+                mutated_total += db
+                    .conn()
+                    .execute(
+                        "DELETE FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+                        [item.drawer.id.as_str()],
+                    )
+                    .with_context(|| format!("failed to hard-delete drawer {}", item.drawer.id))?;
+            } else {
+                mutated_total += db
+                    .conn()
+                    .execute(
+                        "UPDATE drawers SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                        rusqlite::params![timestamp, item.drawer.id.as_str()],
+                    )
+                    .with_context(|| format!("failed to soft-delete drawer {}", item.drawer.id))?;
+            }
+        }
+        Ok(mutated_total)
+    })();
+
+    match result {
+        Ok(count) => {
+            if let Err(error) = db.conn().execute_batch("COMMIT;") {
+                let _ = db.conn().execute_batch("ROLLBACK;");
+                return Err(error)
+                    .context("failed to commit historical rejudge delete transaction");
+            }
+            Ok(count)
+        }
+        Err(error) => {
+            let _ = db.conn().execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
+fn current_drawer_matches_backup_row(
+    db: &Database,
+    item: &HistoricalRejudgeBackupItem,
+) -> Result<bool> {
+    let Some(current_row) = load_optional_raw_drawer_row(db, &item.drawer.id)? else {
+        return Ok(false);
+    };
+    Ok(raw_drawer_rows_match(&item.raw_drawer_row, &current_row))
+}
+
+fn raw_drawer_rows_match(
+    expected: &BTreeMap<String, serde_json::Value>,
+    actual: &BTreeMap<String, serde_json::Value>,
+) -> bool {
+    expected
+        .iter()
+        .all(|(column, value)| actual.get(column) == Some(value))
+}
+
+fn historical_rejudge_backup_payload_hash(backup: &HistoricalRejudgeBackup) -> Result<String> {
+    let payload = serde_json::json!({
+        "version": backup.version,
+        "metadata": &backup.metadata,
+        "items": &backup.items,
+    });
+    Ok(sha256_hex(&serde_json::to_vec(&payload)?))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    bytes_to_hex(&hasher.finalize())
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        bail!("hex value has odd length");
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(chunk[0])?;
+        let low = hex_nibble(chunk[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => bail!("invalid hex digit"),
+    }
+}
+
+fn maintenance_rejudge_restore_command(
+    db: &Database,
+    backup_path: &Path,
+    execute: bool,
+    conflict_policy: RejudgeRestoreConflictPolicy,
+    format: &str,
+) -> Result<()> {
+    let backup = read_historical_rejudge_backup(backup_path)?;
+    let mut report = HistoricalRejudgeRestoreReport {
+        dry_run: !execute,
+        backup: backup_path.to_path_buf(),
+        conflict_policy: conflict_policy.as_str().to_string(),
+        item_count: backup.items.len(),
+        would_restore_count: 0,
+        restored_count: 0,
+        skipped_active_count: 0,
+        conflict_count: 0,
+        audit_count: 0,
+    };
+
+    for item in &backup.items {
+        let outcome = if execute {
+            restore_rejudge_backup_item_transaction(db, item, &backup, conflict_policy)?
+        } else {
+            dry_run_rejudge_restore_item(db, item, conflict_policy)?
+        };
+        if outcome.skipped_active {
+            report.skipped_active_count += 1;
+        }
+        if outcome.conflict {
+            report.conflict_count += 1;
+        }
+        if outcome.would_restore {
+            report.would_restore_count += 1;
+        }
+        if outcome.restored {
+            report.restored_count += 1;
+        }
+        if outcome.audit_recorded {
+            report.audit_count += 1;
+        }
+    }
+
+    if execute {
+        append_audit_entry(
+            db,
+            "maintenance-rejudge-restore",
+            &serde_json::json!({
+                "backup": backup_path,
+                "item_count": report.item_count,
+                "restored_count": report.restored_count,
+                "skipped_active_count": report.skipped_active_count,
+                "conflict_count": report.conflict_count,
+                "conflict_policy": conflict_policy.as_str(),
+                "backup_payload_sha256": backup.integrity.payload_sha256,
+            }),
+        )
+        .context("failed to append historical rejudge restore audit log")?;
+    }
+
+    print_historical_rejudge_restore_report(&report, format)
+}
+
+fn read_historical_rejudge_backup(path: &Path) -> Result<HistoricalRejudgeBackup> {
+    validate_absolute_path(path, "--backup")?;
+    let raw = fs::read(path)
+        .with_context(|| format!("failed to read rejudge backup {}", path.display()))?;
+    let backup: HistoricalRejudgeBackup = serde_json::from_slice(&raw)
+        .with_context(|| format!("failed to parse rejudge backup {}", path.display()))?;
+    if backup.version != 1 {
+        bail!(
+            "unsupported historical rejudge backup version {}",
+            backup.version
+        );
+    }
+    let expected_payload_hash = historical_rejudge_backup_payload_hash(&backup)?;
+    if backup.integrity.payload_sha256 != expected_payload_hash {
+        bail!("historical rejudge backup integrity mismatch");
+    }
+    for item in &backup.items {
+        if item.content_sha256 != sha256_hex(item.drawer.content.as_bytes()) {
+            bail!(
+                "historical rejudge backup content integrity mismatch for {}",
+                item.drawer.id
+            );
+        }
+        if let Some(vector) = &item.vector {
+            let embedding = hex_to_bytes(&vector.embedding_hex)?;
+            if vector.embedding_sha256 != sha256_hex(&embedding) {
+                bail!(
+                    "historical rejudge backup vector integrity mismatch for {}",
+                    item.drawer.id
+                );
+            }
+        }
+    }
+    Ok(backup)
+}
+
+fn drawer_deleted_at(db: &Database, drawer_id: &str) -> Result<Option<Option<String>>> {
+    use rusqlite::OptionalExtension;
+
+    Ok(db
+        .conn()
+        .query_row(
+            "SELECT deleted_at FROM drawers WHERE id = ?1",
+            [drawer_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?)
+}
+
+fn dry_run_rejudge_restore_item(
+    db: &Database,
+    item: &HistoricalRejudgeBackupItem,
+    conflict_policy: RejudgeRestoreConflictPolicy,
+) -> Result<HistoricalRejudgeRestoreItemOutcome> {
+    let state = drawer_deleted_at(db, &item.drawer.id)?;
+    Ok(rejudge_restore_outcome_for_state(state, conflict_policy))
+}
+
+fn restore_rejudge_backup_item_transaction(
+    db: &Database,
+    item: &HistoricalRejudgeBackupItem,
+    backup: &HistoricalRejudgeBackup,
+    conflict_policy: RejudgeRestoreConflictPolicy,
+) -> Result<HistoricalRejudgeRestoreItemOutcome> {
+    db.conn()
+        .execute_batch("BEGIN IMMEDIATE;")
+        .context("failed to begin historical rejudge restore transaction")?;
+    let result = (|| -> Result<HistoricalRejudgeRestoreItemOutcome> {
+        let state = drawer_deleted_at(db, &item.drawer.id)?;
+        let outcome = rejudge_restore_outcome_for_state(state, conflict_policy);
+        if !outcome.would_restore {
+            return Ok(outcome);
+        }
+        if outcome.conflict {
+            delete_drawer_for_restore(db, &item.drawer.id)
+                .with_context(|| format!("failed to overwrite active drawer {}", item.drawer.id))?;
+        }
+        restore_rejudge_backup_item(db, item)?;
+        record_rejudge_restore_audit(db, item, backup)?;
+        Ok(HistoricalRejudgeRestoreItemOutcome {
+            restored: true,
+            audit_recorded: true,
+            ..outcome
+        })
+    })();
+
+    match result {
+        Ok(outcome) => {
+            if let Err(error) = db.conn().execute_batch("COMMIT;") {
+                let _ = db.conn().execute_batch("ROLLBACK;");
+                return Err(error)
+                    .context("failed to commit historical rejudge restore transaction");
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            let _ = db.conn().execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
+fn rejudge_restore_outcome_for_state(
+    state: Option<Option<String>>,
+    conflict_policy: RejudgeRestoreConflictPolicy,
+) -> HistoricalRejudgeRestoreItemOutcome {
+    match state {
+        Some(None) if conflict_policy == RejudgeRestoreConflictPolicy::Skip => {
+            HistoricalRejudgeRestoreItemOutcome {
+                skipped_active: true,
+                conflict: true,
+                ..HistoricalRejudgeRestoreItemOutcome::default()
+            }
+        }
+        Some(None) => HistoricalRejudgeRestoreItemOutcome {
+            would_restore: true,
+            conflict: true,
+            ..HistoricalRejudgeRestoreItemOutcome::default()
+        },
+        Some(Some(_)) | None => HistoricalRejudgeRestoreItemOutcome {
+            would_restore: true,
+            ..HistoricalRejudgeRestoreItemOutcome::default()
+        },
+    }
+}
+
+fn delete_drawer_for_restore(db: &Database, drawer_id: &str) -> Result<usize> {
+    delete_rejudge_drawer_fts_row(db, drawer_id)?;
+    let vectors_exist: bool = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to query vector table presence")?;
+    if vectors_exist {
+        db.conn()
+            .execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])
+            .with_context(|| format!("failed to delete vector row for drawer {drawer_id}"))?;
+    }
+    db.conn()
+        .execute(
+            "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
+            [drawer_id],
+        )
+        .with_context(|| format!("failed to detach triples for drawer {drawer_id}"))?;
+    db.conn()
+        .execute("DELETE FROM drawers WHERE id = ?1", [drawer_id])
+        .with_context(|| format!("failed to delete drawer {drawer_id}"))
+}
+
+fn restore_soft_deleted_rejudge_drawer(
+    db: &Database,
+    item: &HistoricalRejudgeBackupItem,
+) -> Result<()> {
+    let raw_id = json_string_field(&item.raw_drawer_row, "id")
+        .with_context(|| format!("backup row for {} is missing id", item.drawer.id))?;
+    if raw_id != item.drawer.id {
+        bail!(
+            "backup row id mismatch: item={} raw={raw_id}",
+            item.drawer.id
+        );
+    }
+    let raw_content = json_string_field(&item.raw_drawer_row, "content")
+        .with_context(|| format!("backup row for {} is missing content", item.drawer.id))?;
+    if raw_content != item.drawer.content {
+        bail!("backup row content mismatch for {}", item.drawer.id);
+    }
+
+    let columns = drawer_table_columns(db)?;
+    let mut assignments = Vec::new();
+    let mut values = Vec::new();
+    for column in columns {
+        if column == "id" {
+            continue;
+        }
+        let quoted = quote_sql_identifier(&column);
+        if column == "deleted_at" {
+            assignments.push(format!("{quoted} = NULL"));
+            continue;
+        }
+        let value = item
+            .raw_drawer_row
+            .get(&column)
+            .with_context(|| format!("backup row for {} is missing {column}", item.drawer.id))?;
+        values.push(json_value_to_sqlite_value(value)?);
+        assignments.push(format!("{quoted} = ?{}", values.len()));
+    }
+    let drawer_id_param = values.len() + 1;
+    let sql = format!(
+        "UPDATE drawers SET {} WHERE id = ?{drawer_id_param} AND deleted_at IS NOT NULL",
+        assignments.join(", ")
+    );
+    values.push(rusqlite::types::Value::Text(item.drawer.id.clone()));
+    let affected = db
+        .conn()
+        .execute(&sql, rusqlite::params_from_iter(values.iter()))
+        .with_context(|| format!("failed to restore soft-deleted drawer {}", item.drawer.id))?;
+    if affected != 1 {
+        bail!(
+            "soft-deleted drawer not found for restore: {}",
+            item.drawer.id
+        );
+    }
+    delete_rejudge_drawer_fts_row(db, &item.drawer.id)?;
+    restore_rejudge_drawer_fts_row(db, &item.drawer.id)
+}
+
+fn json_value_to_sqlite_value(value: &serde_json::Value) -> Result<rusqlite::types::Value> {
+    match value {
+        serde_json::Value::Null => Ok(rusqlite::types::Value::Null),
+        serde_json::Value::Bool(value) => Ok(rusqlite::types::Value::Integer(i64::from(*value))),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(rusqlite::types::Value::Integer(value))
+            } else if let Some(value) = value.as_u64() {
+                let value = i64::try_from(value).context("backup integer exceeds i64")?;
+                Ok(rusqlite::types::Value::Integer(value))
+            } else if let Some(value) = value.as_f64() {
+                Ok(rusqlite::types::Value::Real(value))
+            } else {
+                bail!("unsupported backup number value")
+            }
+        }
+        serde_json::Value::String(value) => Ok(rusqlite::types::Value::Text(value.clone())),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            bail!("unsupported structured backup SQL value")
+        }
+    }
+}
+
+fn restore_rejudge_drawer_fts_row(db: &Database, drawer_id: &str) -> Result<()> {
+    if !db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawers_fts')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to query FTS table presence")?
+    {
+        return Ok(());
+    }
+
+    let (rowid, content) = db
+        .conn()
+        .query_row(
+            "SELECT rowid, content FROM drawers WHERE id = ?1",
+            [drawer_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .with_context(|| format!("failed to load restored drawer {drawer_id} for FTS"))?;
+    let tokenized = fts_tokenize_content(&content);
+    db.conn()
+        .execute(
+            "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
+            rusqlite::params![rowid, tokenized],
+        )
+        .with_context(|| format!("failed to restore FTS row for drawer {drawer_id}"))?;
+    Ok(())
+}
+
+fn delete_rejudge_drawer_fts_row(db: &Database, drawer_id: &str) -> Result<()> {
+    use rusqlite::OptionalExtension;
+
+    if !db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawers_fts')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to query FTS table presence")?
+    {
+        return Ok(());
+    }
+
+    let rowid = db
+        .conn()
+        .query_row(
+            "SELECT rowid FROM drawers WHERE id = ?1",
+            [drawer_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to load drawer {drawer_id} for FTS delete"))?;
+    let Some(rowid) = rowid else {
+        return Ok(());
+    };
+
+    db.conn()
+        .execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS temp.rejudge_restore_fts_vocab \
+             USING fts5vocab('main', 'drawers_fts', 'instance')",
+        )
+        .context("failed to create FTS vocab view")?;
+    let indexed: bool = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.rejudge_restore_fts_vocab WHERE doc = ?1)",
+            [rowid],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("failed to query FTS row presence for drawer {drawer_id}"))?;
+    if !indexed {
+        return Ok(());
+    }
+
+    db.conn()
+        .execute("DELETE FROM drawers_fts WHERE rowid = ?1", [rowid])
+        .with_context(|| format!("failed to delete FTS row for drawer {drawer_id}"))?;
+    Ok(())
+}
+
+fn insert_rejudge_raw_drawer_row(db: &Database, item: &HistoricalRejudgeBackupItem) -> Result<()> {
+    let raw_id = json_string_field(&item.raw_drawer_row, "id")
+        .with_context(|| format!("backup row for {} is missing id", item.drawer.id))?;
+    if raw_id != item.drawer.id {
+        bail!(
+            "backup row id mismatch: item={} raw={raw_id}",
+            item.drawer.id
+        );
+    }
+    let raw_content = json_string_field(&item.raw_drawer_row, "content")
+        .with_context(|| format!("backup row for {} is missing content", item.drawer.id))?;
+    if raw_content != item.drawer.content {
+        bail!("backup row content mismatch for {}", item.drawer.id);
+    }
+
+    let columns = drawer_table_columns(db)?;
+    let mut quoted_columns = Vec::with_capacity(columns.len());
+    let mut placeholders = Vec::with_capacity(columns.len());
+    let mut values = Vec::with_capacity(columns.len());
+    for column in columns {
+        let value = item
+            .raw_drawer_row
+            .get(&column)
+            .with_context(|| format!("backup row for {} is missing {column}", item.drawer.id))?;
+        quoted_columns.push(quote_sql_identifier(&column));
+        values.push(json_value_to_sqlite_value(value)?);
+        placeholders.push(format!("?{}", values.len()));
+    }
+    let sql = format!(
+        "INSERT INTO drawers ({}) VALUES ({})",
+        quoted_columns.join(", "),
+        placeholders.join(", ")
+    );
+    db.conn()
+        .execute(&sql, rusqlite::params_from_iter(values.iter()))
+        .with_context(|| format!("failed to restore raw drawer row {}", item.drawer.id))?;
+    Ok(())
+}
+
+fn restore_rejudge_backup_item(db: &Database, item: &HistoricalRejudgeBackupItem) -> Result<()> {
+    match drawer_deleted_at(db, &item.drawer.id)? {
+        Some(Some(_)) => {
+            restore_soft_deleted_rejudge_drawer(db, item)?;
+        }
+        Some(None) => {}
+        None => {
+            insert_rejudge_raw_drawer_row(db, item)?;
+            restore_rejudge_drawer_fts_row(db, &item.drawer.id)?;
+        }
+    }
+    restore_rejudge_backup_vector(db, &item.drawer.id, item.vector.as_ref())?;
+    restore_rejudge_source_drawer_triples(db, item)?;
+    Ok(())
+}
+
+fn restore_rejudge_source_drawer_triples(
+    db: &Database,
+    item: &HistoricalRejudgeBackupItem,
+) -> Result<()> {
+    for triple_id in &item.source_drawer_triple_ids {
+        db.conn()
+            .execute(
+                "UPDATE triples SET source_drawer = ?1 WHERE id = ?2 AND source_drawer IS NULL",
+                rusqlite::params![item.drawer.id.as_str(), triple_id.as_str()],
+            )
+            .with_context(|| {
+                format!(
+                    "failed to restore source_drawer for triple {triple_id} to {}",
+                    item.drawer.id
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn restore_rejudge_backup_vector(
+    db: &Database,
+    drawer_id: &str,
+    vector: Option<&HistoricalRejudgeBackupVector>,
+) -> Result<()> {
+    if !db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to query vector table presence")?
+    {
+        return Ok(());
+    }
+    let embedding = vector
+        .map(|vector| hex_to_bytes(&vector.embedding_hex))
+        .transpose()?;
+    db.conn()
+        .execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])
+        .with_context(|| format!("failed to replace vector row for drawer {drawer_id}"))?;
+    let Some((vector, embedding)) = vector.zip(embedding) else {
+        return Ok(());
+    };
+    if vector_table_has_project_id(db)? {
+        db.conn()
+            .execute(
+                "INSERT INTO drawer_vectors (id, embedding, project_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![drawer_id, embedding, vector.project_id.as_deref()],
+            )
+            .with_context(|| format!("failed to restore vector row for drawer {drawer_id}"))?;
+    } else {
+        db.conn()
+            .execute(
+                "INSERT INTO drawer_vectors (id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![drawer_id, embedding],
+            )
+            .with_context(|| format!("failed to restore vector row for drawer {drawer_id}"))?;
+    }
+    Ok(())
+}
+
+fn record_rejudge_restore_audit(
+    db: &Database,
+    item: &HistoricalRejudgeBackupItem,
+    backup: &HistoricalRejudgeBackup,
+) -> Result<()> {
+    let reason = format!("restore_from_backup:{}", backup.integrity.payload_sha256);
+    db.record_historical_rejudge_audit(HistoricalRejudgeAudit {
+        drawer_id: &item.drawer.id,
+        decision: "keep",
+        tier: item.decision.tier,
+        reason: Some(&reason),
+        label: Some("restore"),
+        score: item.decision.score,
+        project_id: item.project_id.as_deref(),
+        content_preview: Some(&preview_one_line(&item.drawer.content, 500)),
+        judge_model: backup.metadata.judge_model.as_deref(),
+        config_version: &backup.metadata.config_version,
+        mutation: "restore",
+    })
+    .context("failed to record historical rejudge restore audit")
+}
+
+fn print_historical_rejudge_restore_report(
+    report: &HistoricalRejudgeRestoreReport,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(report)?);
+            Ok(())
+        }
+        "plain" => {
+            println!("Historical Memory Rejudge Restore");
+            println!("dry_run={}", report.dry_run);
+            println!("backup={}", report.backup.display());
+            println!("conflict_policy={}", report.conflict_policy);
+            println!("items={}", report.item_count);
+            println!("would_restore={}", report.would_restore_count);
+            println!("restored={}", report.restored_count);
+            println!("skipped_active={}", report.skipped_active_count);
+            println!("conflicts={}", report.conflict_count);
+            println!("audit_records={}", report.audit_count);
+            if report.dry_run && report.would_restore_count > 0 {
+                println!("rerun with --execute to restore backup items");
+            }
+            Ok(())
+        }
+        other => bail!("unsupported maintenance rejudge restore format: {other}"),
+    }
 }
 
 async fn evaluate_historical_drawer(
@@ -12508,23 +13686,14 @@ fn historical_rejudge_config_version(config: &Config) -> String {
 }
 
 fn build_historical_rejudge_report(
-    dry_run: bool,
-    mutation: &str,
-    scanned_count: usize,
-    mutated_count: usize,
-    judge_model: Option<String>,
-    config_version: String,
-    decisions: &[(
-        &mempal::core::db::HistoricalRejudgeCandidate,
-        HistoricalRejudgeDecision,
-    )],
+    input: HistoricalRejudgeReportInput<'_>,
 ) -> HistoricalRejudgeReport {
     let mut scope_counts: BTreeMap<(String, Option<String>), usize> = BTreeMap::new();
     let mut examples = Vec::new();
     let mut estimated_bytes_reclaimed = 0usize;
     let mut candidate_count = 0usize;
     let mut protected_count = 0usize;
-    for (row, decision) in decisions {
+    for (row, decision) in input.decisions {
         if decision.protected {
             protected_count += 1;
         }
@@ -12554,15 +13723,16 @@ fn build_historical_rejudge_report(
         .map(|((wing, room), count)| HistoricalRejudgeScopeCount { wing, room, count })
         .collect();
     HistoricalRejudgeReport {
-        dry_run,
-        mutation: mutation.to_string(),
-        scanned_count,
+        dry_run: input.dry_run,
+        mutation: input.mutation.to_string(),
+        scanned_count: input.scanned_count,
         candidate_count,
         protected_count,
-        mutated_count,
+        mutated_count: input.mutated_count,
         estimated_bytes_reclaimed,
-        judge_model,
-        config_version,
+        judge_model: input.judge_model,
+        config_version: input.config_version,
+        backup_path: input.backup_path,
         wings_rooms,
         examples,
     }
@@ -12591,6 +13761,15 @@ fn print_historical_rejudge_report(report: &HistoricalRejudgeReport, format: &st
                 report.judge_model.as_deref().unwrap_or("none")
             );
             println!("config_version={}", report.config_version);
+            println!(
+                "backup_path={}",
+                report
+                    .backup_path
+                    .as_deref()
+                    .map(Path::display)
+                    .map(|display| display.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
             if !report.wings_rooms.is_empty() {
                 println!("affected_wings_rooms:");
                 for scope in &report.wings_rooms {
@@ -13748,6 +14927,29 @@ mod historical_rejudge_tests {
         );
     }
 
+    fn backup_dir(tmp: &tempfile::TempDir) -> PathBuf {
+        tmp.path().join("rejudge-backups")
+    }
+
+    fn backup_files(dir: &Path) -> Vec<PathBuf> {
+        if !dir.exists() {
+            return Vec::new();
+        }
+        let mut files = std::fs::read_dir(dir)
+            .expect("read backup dir")
+            .map(|entry| entry.expect("backup dir entry").path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    fn only_backup_file(dir: &Path) -> PathBuf {
+        let files = backup_files(dir);
+        assert_eq!(files.len(), 1, "expected one backup file, got {files:?}");
+        files[0].clone()
+    }
+
     fn assert_protected_importance_audit(db: &Database, drawer_id: &str, mutation: &str) {
         let (decision, reason, explain_json): (String, String, String) = db
             .conn()
@@ -13803,6 +15005,8 @@ mod historical_rejudge_tests {
             HistoricalRejudgeOptions {
                 execute: false,
                 hard_delete: false,
+                backup_dir: None,
+                unsafe_no_backup: false,
                 limit: 100,
                 wing: None,
                 room: None,
@@ -13816,6 +15020,10 @@ mod historical_rejudge_tests {
         assert!(db.get_drawer("low").expect("load drawer").is_some());
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
         assert_eq!(audit_count(&db), 1, "dry-run still records auditability");
+        assert!(
+            backup_files(&backup_dir(&tmp)).is_empty(),
+            "dry-run without --backup-dir must not write backup files"
+        );
     }
 
     #[tokio::test]
@@ -13830,6 +15038,8 @@ mod historical_rejudge_tests {
             HistoricalRejudgeOptions {
                 execute: false,
                 hard_delete: false,
+                backup_dir: None,
+                unsafe_no_backup: false,
                 limit: 100,
                 wing: None,
                 room: None,
@@ -13850,6 +15060,9 @@ mod historical_rejudge_tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
         insert_drawer(&db, "low", "ok", "notes", None);
+        db.insert_vector("low", &[1.0, 0.0, 0.0])
+            .expect("insert vector");
+        let backups = backup_dir(&tmp);
 
         maintenance_rejudge_command(
             &db,
@@ -13857,6 +15070,8 @@ mod historical_rejudge_tests {
             HistoricalRejudgeOptions {
                 execute: true,
                 hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
                 limit: 100,
                 wing: None,
                 room: None,
@@ -13873,6 +15088,106 @@ mod historical_rejudge_tests {
             std::fs::read_to_string(tmp.path().join("audit.jsonl")).expect("read audit log");
         assert!(audit_log.contains("\"command\":\"maintenance-rejudge\""));
         assert!(audit_log.contains("\"drawer_ids\":[\"low\"]"));
+        let backup = read_historical_rejudge_backup(&only_backup_file(&backups))
+            .expect("read rejudge backup");
+        assert_eq!(backup.items.len(), 1);
+        assert_eq!(backup.items[0].drawer.id, "low");
+        assert_eq!(
+            backup.items[0]
+                .raw_drawer_row
+                .get("deleted_at")
+                .and_then(serde_json::Value::as_str),
+            None,
+            "backup must capture the active row before mutation"
+        );
+        assert!(
+            backup.items[0].vector.is_some(),
+            "backup must include vector row when present"
+        );
+        assert_eq!(backup.items[0].decision.reason, "too_short");
+    }
+
+    #[test]
+    fn historical_rejudge_versioned_delete_skips_changed_drawer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        let rows = db
+            .historical_rejudge_candidates(None, None, None, 100)
+            .expect("load candidates");
+        let row = rows
+            .iter()
+            .find(|row| row.drawer.id == "low")
+            .expect("low candidate");
+        let decision = deterministic_historical_decision(&row.drawer);
+        assert!(decision.delete_candidate);
+        let item = build_historical_rejudge_backup_item(&db, row, &decision, "hard_delete")
+            .expect("build backup item")
+            .expect("version-matched item");
+
+        let changed_content = "This later high-value drawer should survive stale rejudge deletion.";
+        db.conn()
+            .execute(
+                r#"
+                UPDATE drawers
+                SET content = ?1,
+                    content_hash = ?2,
+                    importance = 5,
+                    merge_count = COALESCE(merge_count, 0) + 1,
+                    updated_at = ?3
+                WHERE id = 'low'
+                "#,
+                rusqlite::params![
+                    changed_content,
+                    blake3::hash(changed_content.as_bytes())
+                        .to_hex()
+                        .to_string(),
+                    current_timestamp(),
+                ],
+            )
+            .expect("concurrent drawer update");
+
+        let deleted = delete_rejudge_backup_items_by_version(&db, &[item], true)
+            .expect("versioned hard-delete");
+
+        assert_eq!(deleted, 0);
+        let drawer = db
+            .get_drawer("low")
+            .expect("load changed drawer")
+            .expect("changed drawer must not be deleted");
+        assert_eq!(drawer.content, changed_content);
+        assert_eq!(drawer.importance, 5);
+    }
+
+    #[test]
+    fn historical_rejudge_hard_delete_removes_fts_row_before_drawer_delete() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "legacyneedle", "notes", None);
+        let rows = db
+            .historical_rejudge_candidates(None, None, None, 100)
+            .expect("load candidates");
+        let row = rows
+            .iter()
+            .find(|row| row.drawer.id == "low")
+            .expect("low candidate");
+        let decision = deterministic_historical_decision(&row.drawer);
+        let item = build_historical_rejudge_backup_item(&db, row, &decision, "hard_delete")
+            .expect("build backup item")
+            .expect("version-matched item");
+
+        let deleted = delete_rejudge_backup_items_by_version(&db, &[item], true)
+            .expect("versioned hard-delete");
+        assert_eq!(deleted, 1);
+
+        insert_drawer(&db, "replacement", "fresh payload", "notes", None);
+        let stale_matches = db
+            .search_fts("legacyneedle", None, None, "all", None, 10)
+            .expect("search stale hard-deleted payload through FTS");
+        assert!(
+            stale_matches.is_empty(),
+            "hard-delete must remove stale BM25 rows before rowid reuse: {stale_matches:?}"
+        );
     }
 
     #[tokio::test]
@@ -13882,6 +15197,7 @@ mod historical_rejudge_tests {
             let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
             insert_drawer(&db, "low", "ok", "notes", None);
             insert_high_importance_drawer(&db, "important");
+            let backups = backup_dir(&tmp);
 
             maintenance_rejudge_command(
                 &db,
@@ -13889,6 +15205,8 @@ mod historical_rejudge_tests {
                 HistoricalRejudgeOptions {
                     execute: true,
                     hard_delete,
+                    backup_dir: Some(&backups),
+                    unsafe_no_backup: false,
                     limit: 100,
                     wing: None,
                     room: None,
@@ -13907,6 +15225,563 @@ mod historical_rejudge_tests {
             );
             assert_protected_importance_audit(&db, "important", mutation);
         }
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_execute_rejects_relative_backup_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        let relative = PathBuf::from("relative-backups");
+
+        let error = maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(&relative),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect_err("relative backup path must fail");
+
+        assert!(error.to_string().contains("absolute path"), "{error}");
+        assert!(db.get_drawer("low").expect("load drawer").is_some());
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_hard_delete_requires_backup_or_unsafe_override() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+
+        let error = maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: true,
+                backup_dir: None,
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect_err("hard-delete without backup must fail");
+        assert!(error.to_string().contains("--backup-dir"), "{error}");
+        assert!(db.get_drawer("low").expect("load drawer").is_some());
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: true,
+                backup_dir: None,
+                unsafe_no_backup: true,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("unsafe hard-delete override");
+        assert!(db.get_drawer("low").expect("load drawer").is_none());
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_restore_dry_run_reports_without_mutating() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("execute rejudge");
+        let backup = only_backup_file(&backups);
+
+        maintenance_rejudge_restore_command(
+            &db,
+            &backup,
+            false,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect("restore dry-run");
+
+        assert!(db.get_drawer("low").expect("load drawer").is_none());
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_restore_execute_reactivates_and_audits() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("execute rejudge");
+        let backup = only_backup_file(&backups);
+
+        maintenance_rejudge_restore_command(
+            &db,
+            &backup,
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect("restore execute");
+
+        assert!(db.get_drawer("low").expect("load drawer").is_some());
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        let restore_audits: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM gating_audit WHERE drawer_id = 'low' AND explain_json LIKE '%\"mutation\":\"restore\"%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count restore audits");
+        assert_eq!(restore_audits, 1);
+        let audit_log =
+            std::fs::read_to_string(tmp.path().join("audit.jsonl")).expect("read audit log");
+        assert!(audit_log.contains("\"command\":\"maintenance-rejudge-restore\""));
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_restore_preserves_kg_source_drawer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        db.insert_triple(&mempal::core::types::Triple {
+            id: "triple-low".to_string(),
+            subject: "mempal".to_string(),
+            predicate: "has_note".to_string(),
+            object: "ok".to_string(),
+            valid_from: Some(current_timestamp()),
+            valid_to: None,
+            confidence: 1.0,
+            source_drawer: Some("low".to_string()),
+        })
+        .expect("insert source triple");
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("execute soft-delete rejudge");
+        let backup = only_backup_file(&backups);
+
+        maintenance_rejudge_restore_command(
+            &db,
+            &backup,
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect("restore execute");
+
+        assert!(db.get_drawer("low").expect("load drawer").is_some());
+        let source_drawer: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT source_drawer FROM triples WHERE id = 'triple-low'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load triple source drawer");
+        assert_eq!(source_drawer.as_deref(), Some("low"));
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_hard_delete_restore_preserves_raw_row_and_kg_source() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        db.conn()
+            .execute(
+                r#"
+                UPDATE drawers
+                SET merge_count = 7,
+                    updated_at = '2026-02-03T04:05:06Z',
+                    access_count = 11,
+                    last_accessed_at = 1780000000000,
+                    stale_penalty_applied = 0.25
+                WHERE id = 'low'
+                "#,
+                [],
+            )
+            .expect("seed raw-only drawer metadata");
+        db.insert_triple(&mempal::core::types::Triple {
+            id: "triple-low-hard".to_string(),
+            subject: "mempal".to_string(),
+            predicate: "has_note".to_string(),
+            object: "ok".to_string(),
+            valid_from: Some(current_timestamp()),
+            valid_to: None,
+            confidence: 1.0,
+            source_drawer: Some("low".to_string()),
+        })
+        .expect("insert source triple");
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: true,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("hard-delete rejudge");
+        assert!(db.get_drawer("low").expect("load deleted drawer").is_none());
+        let detached_source: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT source_drawer FROM triples WHERE id = 'triple-low-hard'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load detached triple");
+        assert_eq!(detached_source, None);
+        let backup = only_backup_file(&backups);
+
+        maintenance_rejudge_restore_command(
+            &db,
+            &backup,
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect("restore hard-deleted drawer");
+
+        let fts_matches = db
+            .search_fts("ok", None, None, "all", None, 10)
+            .expect("search restored drawer through FTS");
+        assert!(
+            fts_matches.iter().any(|(id, _)| id == "low"),
+            "restored hard-deleted drawer must be BM25-searchable: {fts_matches:?}"
+        );
+
+        let (merge_count, updated_at, access_count, last_accessed_at, stale_penalty): (
+            i64,
+            String,
+            i64,
+            i64,
+            f64,
+        ) = db
+            .conn()
+            .query_row(
+                r#"
+                SELECT merge_count, updated_at, access_count, last_accessed_at, stale_penalty_applied
+                FROM drawers
+                WHERE id = 'low'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("load restored raw-only metadata");
+        assert_eq!(merge_count, 7);
+        assert_eq!(updated_at, "2026-02-03T04:05:06Z");
+        assert_eq!(access_count, 11);
+        assert_eq!(last_accessed_at, 1780000000000);
+        assert_eq!(stale_penalty, 0.25);
+        let restored_source: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT source_drawer FROM triples WHERE id = 'triple-low-hard'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load restored triple source");
+        assert_eq!(restored_source.as_deref(), Some("low"));
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_restore_overwrite_rolls_back_on_vector_failure() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        db.insert_vector("low", &[1.0, 0.0, 0.0])
+            .expect("insert vector");
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: true,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("hard-delete rejudge");
+        let backup_path = only_backup_file(&backups);
+
+        insert_drawer(&db, "low", "replacement active", "notes", None);
+        db.insert_vector("low", &[0.0, 1.0, 0.0])
+            .expect("insert replacement vector");
+
+        let mut backup =
+            read_historical_rejudge_backup(&backup_path).expect("read original backup");
+        let invalid_embedding = [0_u8; 4];
+        let vector = backup.items[0]
+            .vector
+            .as_mut()
+            .expect("backup should include vector");
+        vector.embedding_hex = bytes_to_hex(&invalid_embedding);
+        vector.embedding_sha256 = sha256_hex(&invalid_embedding);
+        backup.integrity.payload_sha256 =
+            historical_rejudge_backup_payload_hash(&backup).expect("hash backup");
+        std::fs::write(
+            &backup_path,
+            serde_json::to_vec_pretty(&backup).expect("serialize backup"),
+        )
+        .expect("write modified backup");
+
+        let error = maintenance_rejudge_restore_command(
+            &db,
+            &backup_path,
+            true,
+            RejudgeRestoreConflictPolicy::Overwrite,
+            "json",
+        )
+        .expect_err("restore with invalid vector must fail");
+
+        assert!(
+            error.to_string().contains("failed to restore vector row"),
+            "{error}"
+        );
+        let drawer = db
+            .get_drawer("low")
+            .expect("load active drawer")
+            .expect("active conflict drawer should survive rollback");
+        assert_eq!(drawer.content, "replacement active");
+        let vector_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawer_vectors WHERE id = 'low'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count replacement vector");
+        assert_eq!(vector_count, 1);
+        let restore_audits: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM gating_audit WHERE drawer_id = 'low' AND explain_json LIKE '%\"mutation\":\"restore\"%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count restore audits");
+        assert_eq!(restore_audits, 0);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_restore_replaces_same_id_deleted_payload() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "original backup payload", "notes", None);
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: true,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("hard-delete original drawer");
+        let backup = only_backup_file(&backups);
+
+        insert_drawer(&db, "low", "different later payload", "notes", None);
+        db.insert_vector("low", &[0.0, 1.0, 0.0])
+            .expect("insert replacement vector");
+        assert!(
+            db.soft_delete_drawer("low")
+                .expect("soft-delete replacement")
+        );
+
+        maintenance_rejudge_restore_command(
+            &db,
+            &backup,
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect("restore backup over same-id deleted replacement");
+
+        let drawer = db
+            .get_drawer("low")
+            .expect("load restored drawer")
+            .expect("drawer restored");
+        assert_eq!(drawer.content, "original backup payload");
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        let restored_matches = db
+            .search_fts("original", None, None, "all", None, 10)
+            .expect("search restored payload through FTS");
+        assert!(
+            restored_matches.iter().any(|(id, _)| id == "low"),
+            "restored backup payload must be BM25-searchable: {restored_matches:?}"
+        );
+        let stale_matches = db
+            .search_fts("different", None, None, "all", None, 10)
+            .expect("search stale replacement payload through FTS");
+        assert!(
+            stale_matches.iter().all(|(id, _)| id != "low"),
+            "stale replacement payload must not remain BM25-searchable: {stale_matches:?}"
+        );
+        let vector_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawer_vectors WHERE id = 'low'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count restored vector rows");
+        assert_eq!(
+            vector_count, 0,
+            "backup without a vector must clear same-id replacement vector"
+        );
+        let restore_audits: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM gating_audit WHERE drawer_id = 'low' AND explain_json LIKE '%\"mutation\":\"restore\"%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count restore audits");
+        assert_eq!(restore_audits, 1);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_restore_blocks_integrity_mismatch() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("execute rejudge");
+        let backup = only_backup_file(&backups);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&backup).expect("read backup"))
+                .expect("parse backup json");
+        value["items"][0]["drawer"]["content"] = serde_json::json!("tampered");
+        std::fs::write(
+            &backup,
+            serde_json::to_vec_pretty(&value).expect("serialize backup"),
+        )
+        .expect("write tampered backup");
+
+        let error = maintenance_rejudge_restore_command(
+            &db,
+            &backup,
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect_err("tampered backup must fail");
+
+        assert!(error.to_string().contains("integrity mismatch"), "{error}");
+        assert!(db.get_drawer("low").expect("load drawer").is_none());
     }
 
     #[tokio::test]
@@ -13942,6 +15817,7 @@ mod historical_rejudge_tests {
             "notes",
             None,
         );
+        let backups = backup_dir(&tmp);
 
         maintenance_rejudge_command(
             &db,
@@ -13949,6 +15825,8 @@ mod historical_rejudge_tests {
             HistoricalRejudgeOptions {
                 execute: true,
                 hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
                 limit: 100,
                 wing: None,
                 room: None,
@@ -13983,6 +15861,7 @@ mod historical_rejudge_tests {
             "hooks-raw",
             Some("user-prompt"),
         );
+        let backups = backup_dir(&tmp);
 
         maintenance_rejudge_command(
             &db,
@@ -13990,6 +15869,8 @@ mod historical_rejudge_tests {
             HistoricalRejudgeOptions {
                 execute: true,
                 hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
                 limit: 100,
                 wing: Some("hooks-raw"),
                 room: None,
