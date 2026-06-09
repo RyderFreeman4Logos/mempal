@@ -92,6 +92,11 @@ fn test_hook_post_tool_enqueues_to_queue() {
         "stdout must stay empty, got {:?}",
         String::from_utf8_lossy(&output.stdout)
     );
+    assert!(
+        output.stderr.is_empty(),
+        "successful hook stderr must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let conn = Connection::open(db_path).expect("open sqlite");
     let (kind, envelope): (String, String) = conn
@@ -137,23 +142,33 @@ fn test_hook_writes_nothing_to_stdout() {
 }
 
 #[test]
-fn test_hook_post_tool_canonical_stdout_is_empty_and_bootstrap_uses_stderr() {
-    let (home, _db_path) = setup_home();
-    let payload = r#"{"event":"PostToolUse","tool_name":"diagnostic","cwd":"/tmp","command":"true","exit_code":0}"#;
+fn test_passive_hook_success_paths_are_quiet() {
+    let cases = [
+        (
+            "PostToolUse",
+            r#"{"tool_name":"shell","tool_input":{"command":"true"},"tool_response":{"exit_code":0,"stdout":"","stderr":""}}"#,
+        ),
+        ("UserPromptSubmit", r#"{"prompt":"remember the decision"}"#),
+        ("SessionStart", r#"{"session_id":"sess-quiet"}"#),
+        ("SessionEnd", r#"{"session_id":"sess-quiet"}"#),
+    ];
 
-    let output = run_hook(&home, "PostToolUse", payload.as_bytes());
+    for (command, payload) in cases {
+        let (home, _db_path) = setup_home();
+        let output = run_hook(&home, command, payload.as_bytes());
 
-    assert_eq!(output.status.code(), Some(0));
-    assert!(
-        output.stdout.is_empty(),
-        "stdout is Codex hook protocol; got {:?}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("config hot-reload: bootstrapped version "),
-        "human-readable bootstrap status must be emitted on stderr, got {stderr:?}"
-    );
+        assert_eq!(output.status.code(), Some(0), "{command} failed");
+        assert!(
+            output.stdout.is_empty(),
+            "{command} stdout is Codex hook protocol; got {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{command} successful stderr must stay empty; got {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
