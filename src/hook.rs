@@ -88,7 +88,7 @@ pub fn run_command(command: HookCommands) -> Result<()> {
 }
 
 fn run_capture_command(event: HookEvent) -> Result<()> {
-    ConfigHandle::bootstrap(default_config_path()).context("failed to bootstrap config")?;
+    ConfigHandle::bootstrap_quiet(default_config_path()).context("failed to bootstrap config")?;
     enqueue_from_stdin(event)
 }
 

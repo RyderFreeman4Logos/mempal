@@ -136,6 +136,18 @@ impl HotReloadState {
     }
 
     pub fn bootstrap(&self, path: &Path) -> Result<(), ConfigError> {
+        self.bootstrap_with_bootstrap_stderr(path, true)
+    }
+
+    pub fn bootstrap_quiet(&self, path: &Path) -> Result<(), ConfigError> {
+        self.bootstrap_with_bootstrap_stderr(path, false)
+    }
+
+    fn bootstrap_with_bootstrap_stderr(
+        &self,
+        path: &Path,
+        emit_bootstrap_event_to_stderr: bool,
+    ) -> Result<(), ConfigError> {
         let config = Config::load_from(path)?;
         let snapshot = ConfigSnapshot::from_config(config.clone())?;
         self.snapshot.store(Arc::new(snapshot));
@@ -154,10 +166,13 @@ impl HotReloadState {
         self.runtime_prototypes.store(Arc::new(
             config.ingest_gating.embedding_classifier.prototypes.clone(),
         ));
-        self.push_event(format!(
-            "config hot-reload: bootstrapped version {}",
-            self.snapshot_meta().version
-        ));
+        self.record_event(
+            format!(
+                "config hot-reload: bootstrapped version {}",
+                self.snapshot_meta().version
+            ),
+            emit_bootstrap_event_to_stderr,
+        );
 
         let mut runtime = self.runtime.lock().expect("runtime mutex poisoned");
         if let Some(existing) = runtime.take() {
@@ -490,7 +505,13 @@ impl HotReloadState {
     }
 
     fn push_event(&self, event: String) {
-        eprintln!("{event}");
+        self.record_event(event, true);
+    }
+
+    fn record_event(&self, event: String, emit_stderr: bool) {
+        if emit_stderr {
+            eprintln!("{event}");
+        }
         self.persist_event(&event);
         let mut events = self.event_log.lock().expect("event log mutex poisoned");
         if events.len() == MAX_EVENT_LOG {

@@ -1633,6 +1633,10 @@ impl ConfigHandle {
         super::hot_reload::global_hot_reload_state().bootstrap(path.as_ref())
     }
 
+    pub fn bootstrap_quiet(path: impl AsRef<Path>) -> Result<(), ConfigError> {
+        super::hot_reload::global_hot_reload_state().bootstrap_quiet(path.as_ref())
+    }
+
     pub fn current() -> Arc<Config> {
         super::hot_reload::global_hot_reload_state().current()
     }
