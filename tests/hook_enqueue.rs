@@ -91,6 +91,9 @@ fn spawn_fake_daemon_ipc(
             thread::sleep(delay);
         }
         let _ = stream.write_all(response.as_bytes());
+        if !response.as_bytes().ends_with(b"\n") {
+            let _ = stream.write_all(b"\n");
+        }
         let _ = stream.flush();
         request
     })

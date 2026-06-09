@@ -616,10 +616,18 @@ async fn handle_hook_ipc_connection(
     store: AsyncPendingMessageStore,
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
 ) {
-    let response = match crate::hook_ipc::read_enqueue_request(&mut stream).await {
-        Ok(request) => persist_hook_ipc_request(&store, &write_observer, request).await,
-        Err(error) => crate::hook_ipc::HookIpcEnqueueResponse::Error {
+    let request_result = tokio::time::timeout(
+        crate::hook_ipc::HOOK_IPC_READ_TIMEOUT,
+        crate::hook_ipc::read_enqueue_request(&mut stream),
+    )
+    .await;
+    let response = match request_result {
+        Ok(Ok(request)) => persist_hook_ipc_request(&store, &write_observer, request).await,
+        Ok(Err(error)) => crate::hook_ipc::HookIpcEnqueueResponse::Error {
             message: format!("invalid hook IPC request: {error}"),
+        },
+        Err(_) => crate::hook_ipc::HookIpcEnqueueResponse::Error {
+            message: "invalid hook IPC request: timed out reading frame".to_string(),
         },
     };
 
@@ -2062,6 +2070,51 @@ mod tests {
         assert_eq!(count_while_locked, 0);
 
         lock_conn.execute_batch("ROLLBACK;").expect("release lock");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hook_ipc_stalled_request_times_out_without_persisting() {
+        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+
+        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+        let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
+        let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+
+        let mut reader = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        let bytes_read = tokio::time::timeout(
+            crate::hook_ipc::HOOK_IPC_READ_TIMEOUT + Duration::from_secs(1),
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+        )
+        .await
+        .expect("stalled request must receive timeout response")
+        .expect("read response");
+        assert!(bytes_read > 0, "daemon should write an error response");
+
+        handler.await.expect("handler task");
+        match serde_json::from_str::<crate::hook_ipc::HookIpcEnqueueResponse>(line.trim())
+            .expect("hook IPC response")
+        {
+            crate::hook_ipc::HookIpcEnqueueResponse::Accepted => {
+                panic!("stalled IPC request must not be accepted")
+            }
+            crate::hook_ipc::HookIpcEnqueueResponse::Error { message } => {
+                assert!(message.contains("timed out reading frame"), "{message}");
+            }
+        }
+
+        let count: i64 = rusqlite::Connection::open(&db_path)
+            .expect("open sqlite")
+            .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+                row.get(0)
+            })
+            .expect("count pending");
+        assert_eq!(count, 0);
     }
 
     #[cfg(unix)]

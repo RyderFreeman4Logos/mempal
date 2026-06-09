@@ -7,14 +7,16 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 pub(crate) const HOOK_IPC_TIMEOUT: Duration = Duration::from_millis(250);
+pub(crate) const HOOK_IPC_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 const SOCKET_FILE_NAME: &str = "daemon-hook.sock";
 const MAX_IPC_FRAME_BYTES: usize = 12 * 1024 * 1024;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+const IPC_READ_CHUNK_BYTES: usize = 8 * 1024;
 
 static ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -212,19 +214,43 @@ async fn read_enqueue_response(stream: &mut UnixStream) -> Result<HookIpcEnqueue
 }
 
 async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
-    let mut reader = BufReader::new(stream);
+    read_frame_with_limit(stream, MAX_IPC_FRAME_BYTES).await
+}
+
+async fn read_frame_with_limit(stream: &mut UnixStream, max_frame_bytes: usize) -> Result<Vec<u8>> {
+    if max_frame_bytes == 0 {
+        bail!("hook IPC frame limit must be greater than zero");
+    }
+
     let mut frame = Vec::new();
-    let bytes = reader
-        .read_until(b'\n', &mut frame)
-        .await
-        .context("failed to read hook IPC frame")?;
-    if bytes == 0 {
-        bail!("empty hook IPC frame");
+    let mut chunk = [0_u8; IPC_READ_CHUNK_BYTES];
+
+    loop {
+        let bytes = stream
+            .read(&mut chunk)
+            .await
+            .context("failed to read hook IPC frame")?;
+        if bytes == 0 {
+            if frame.is_empty() {
+                bail!("empty hook IPC frame");
+            }
+            bail!("unterminated hook IPC frame");
+        }
+
+        let received = &chunk[..bytes];
+        let frame_part_len = received
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(received.len(), |delimiter_index| delimiter_index + 1);
+        if frame.len() + frame_part_len > max_frame_bytes {
+            bail!("hook IPC frame exceeds {} bytes", max_frame_bytes);
+        }
+
+        frame.extend_from_slice(&received[..frame_part_len]);
+        if frame.ends_with(b"\n") {
+            return Ok(frame);
+        }
     }
-    if frame.len() > MAX_IPC_FRAME_BYTES {
-        bail!("hook IPC frame exceeds {} bytes", MAX_IPC_FRAME_BYTES);
-    }
-    Ok(frame)
 }
 
 fn trim_line_ending(frame: &[u8]) -> &[u8] {
@@ -247,4 +273,66 @@ fn new_idempotency_key() -> String {
     hasher.update(&pid.to_le_bytes());
     hasher.update(&counter.to_le_bytes());
     format!("hook-ipc-{}", hasher.finalize().to_hex())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_frame_rejects_oversized_frame_before_extending_past_limit() {
+        let (mut client, mut server) = UnixStream::pair().expect("unix stream pair");
+        let reader = tokio::spawn(async move { read_frame_with_limit(&mut server, 32).await });
+
+        let oversized = vec![b'a'; 33];
+        let _ = client.write_all(&oversized).await;
+
+        let error = reader
+            .await
+            .expect("reader task")
+            .expect_err("oversized frame must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("hook IPC frame exceeds 32 bytes"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_frame_rejects_unterminated_frame() {
+        let (mut client, mut server) = UnixStream::pair().expect("unix stream pair");
+        let reader = tokio::spawn(async move { read_frame_with_limit(&mut server, 32).await });
+
+        client
+            .write_all(b"{\"status\":\"accepted\"}")
+            .await
+            .expect("write frame");
+        client.shutdown().await.expect("shutdown client");
+
+        let error = reader
+            .await
+            .expect("reader task")
+            .expect_err("unterminated frame must fail");
+        assert!(
+            error.to_string().contains("unterminated hook IPC frame"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_frame_accepts_delimited_frame_at_limit() {
+        let (mut client, mut server) = UnixStream::pair().expect("unix stream pair");
+        let reader = tokio::spawn(async move { read_frame_with_limit(&mut server, 32).await });
+
+        let mut frame = vec![b'a'; 31];
+        frame.push(b'\n');
+        client.write_all(&frame).await.expect("write frame");
+
+        let read = reader.await.expect("reader task").expect("frame at limit");
+        assert_eq!(read, frame);
+    }
 }
