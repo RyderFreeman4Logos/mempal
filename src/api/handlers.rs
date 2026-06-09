@@ -23,6 +23,7 @@ use crate::core::{
         source_file_or_synthetic,
     },
 };
+use crate::embed::global_embed_status;
 use crate::ingest::gating::evaluate_fact_check_gate;
 use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use crate::search::{
@@ -619,6 +620,12 @@ async fn ingest_handler(
     State(state): State<ApiState>,
     Json(request): Json<IngestRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if global_embed_status().should_block_writes() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "mempal embed backend degraded; writes are paused until recovery. Read operations remain available.",
+        ));
+    }
     let response = state.write_queue().enqueue(request).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -628,6 +635,12 @@ async fn process_ingest_request(
     embedder_factory: Arc<dyn crate::embed::EmbedderFactory>,
     request: IngestRequest,
 ) -> Result<IngestResponse, ApiError> {
+    if global_embed_status().should_block_writes() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "mempal embed backend degraded; writes are paused until recovery. Read operations remain available.",
+        ));
+    }
     let embedder: Box<dyn crate::embed::Embedder> =
         embedder_factory.build().await.map_err(internal_error)?;
     let db = Database::open(&db_path).map_err(internal_error)?;

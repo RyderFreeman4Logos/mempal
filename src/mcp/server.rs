@@ -3148,6 +3148,10 @@ impl MempalMcpServer {
         controls: IngestControls,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         self.spawn_ingest_drain_worker();
+        let dry_run = request.dry_run.unwrap_or(false);
+        if !dry_run && global_embed_status().should_block_writes() {
+            return Err(degraded_write_error());
+        }
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let room = request.room.as_deref();
         // Snapshot the request-wide warnings once so every early-return path reports a
@@ -3158,7 +3162,6 @@ impl MempalMcpServer {
         let request_system_warnings = self
             .system_warnings_with_stale_index_bounded(self.ingest_admission_deadline)
             .await?;
-        let dry_run = request.dry_run.unwrap_or(false);
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
@@ -3209,9 +3212,6 @@ impl MempalMcpServer {
                 }
             };
             return Ok(Json(response));
-        }
-        if global_embed_status().should_block_writes() {
-            return Err(degraded_write_error());
         }
         let project_id = self
             .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
@@ -3386,6 +3386,10 @@ impl MempalMcpServer {
         request: IngestRequest,
         controls: IngestControls,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        let dry_run = request.dry_run.unwrap_or(false);
+        if !dry_run && global_embed_status().should_block_writes() {
+            return Err(degraded_write_error());
+        }
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let project_id = self
             .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
@@ -3400,7 +3404,6 @@ impl MempalMcpServer {
         // (`should_block_writes`) re-reads fresh status via `degraded_write_error()` and
         // rejects before any success response that would carry this snapshot is built.
         let request_system_warnings = system_warnings_with_stale_index(&db);
-        let dry_run = request.dry_run.unwrap_or(false);
         let no_gate = controls.no_gate;
         let bypass_novelty = controls.bypass_novelty;
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
@@ -3433,10 +3436,6 @@ impl MempalMcpServer {
         let confidence = resolve_confidence_param(source_type, request.confidence)?;
         let metadata = validate_ingest_request(&request, &source_type)?;
         let mut timings = BTreeMap::new();
-
-        if !dry_run && global_embed_status().should_block_writes() {
-            return Err(degraded_write_error());
-        }
 
         let embedder = self.embedder_factory.build().await.map_err(|error| {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
