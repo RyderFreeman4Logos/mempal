@@ -64,7 +64,7 @@ search_deadline_secs = 5
 "#,
     )
     .expect("write config");
-    ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
+    ConfigHandle::bootstrap_quiet(&config_path).expect("bootstrap config");
     config_path
 }
 
