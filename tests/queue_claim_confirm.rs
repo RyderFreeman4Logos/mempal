@@ -202,6 +202,39 @@ fn test_idempotent_enqueue_collapses_pending_and_completed_capture() {
 }
 
 #[test]
+fn test_explicit_idempotency_key_scopes_one_delivery_attempt() {
+    let (_tmp, db_path, store) = new_store();
+    let payload = r#"{"tool":"Bash"}"#;
+
+    let first_id = store
+        .enqueue_idempotent_with_key("hook_event", payload, "attempt-1")
+        .expect("first attempt enqueue");
+    let duplicate_id = store
+        .enqueue_idempotent_with_key("hook_event", payload, "attempt-1")
+        .expect("duplicate attempt enqueue");
+    assert_eq!(duplicate_id, first_id);
+
+    let second_attempt_id = store
+        .enqueue_idempotent_with_key("hook_event", payload, "attempt-2")
+        .expect("second attempt enqueue");
+    assert_ne!(second_attempt_id, first_id);
+
+    let (pending_count, distinct_source_hashes): (i64, i64) = Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT source_hash) FROM pending_messages",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("count pending rows");
+    assert_eq!(pending_count, 2);
+    assert_eq!(
+        distinct_source_hashes, 1,
+        "attempt key, not payload hash, must define the idempotency boundary"
+    );
+}
+
+#[test]
 fn test_confirm_llm_task_missing_row_is_benign() {
     let (_tmp, db_path, store) = new_store();
     let id = store

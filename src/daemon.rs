@@ -635,7 +635,11 @@ async fn persist_hook_ipc_request(
     request: crate::hook_ipc::HookIpcEnqueueRequest,
 ) -> crate::hook_ipc::HookIpcEnqueueResponse {
     match store
-        .enqueue_idempotent_fail_fast(request.kind.clone(), request.payload.clone())
+        .enqueue_idempotent_with_key_fail_fast(
+            request.kind.clone(),
+            request.payload.clone(),
+            request.idempotency_key.clone(),
+        )
         .await
     {
         Ok(message_id) => {
@@ -1994,10 +1998,10 @@ mod tests {
 
         let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
         let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
-        let request = crate::hook_ipc::HookIpcEnqueueRequest {
-            kind: HookEvent::UserPromptSubmit.queue_kind().to_string(),
-            payload: r#"{"event":"UserPromptSubmit","payload":"durable before ack"}"#.to_string(),
-        };
+        let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
+            HookEvent::UserPromptSubmit.queue_kind(),
+            r#"{"event":"UserPromptSubmit","payload":"durable before ack"}"#,
+        );
 
         let response = send_hook_ipc_request(store, observer, request).await;
         assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
@@ -2027,10 +2031,10 @@ mod tests {
 
         let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
         let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
-        let request = crate::hook_ipc::HookIpcEnqueueRequest {
-            kind: HookEvent::UserPromptSubmit.queue_kind().to_string(),
-            payload: r#"{"event":"UserPromptSubmit","payload":"not durable"}"#.to_string(),
-        };
+        let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
+            HookEvent::UserPromptSubmit.queue_kind(),
+            r#"{"event":"UserPromptSubmit","payload":"not durable"}"#,
+        );
 
         let response = tokio::time::timeout(
             crate::hook_ipc::HOOK_IPC_TIMEOUT,
@@ -2071,10 +2075,8 @@ mod tests {
         let kind = HookEvent::UserPromptSubmit.queue_kind().to_string();
         let payload =
             r#"{"event":"UserPromptSubmit","payload":"timeout fallback same capture"}"#.to_string();
-        let request = crate::hook_ipc::HookIpcEnqueueRequest {
-            kind: kind.clone(),
-            payload: payload.clone(),
-        };
+        let request = crate::hook_ipc::HookIpcEnqueueRequest::new(&kind, &payload);
+        let idempotency_key = request.idempotency_key.clone();
 
         let store = AsyncPendingMessageStore::new_without_reclaim(&db_path)
             .with_blocking_delay(crate::hook_ipc::HOOK_IPC_TIMEOUT + Duration::from_millis(200));
@@ -2104,7 +2106,7 @@ mod tests {
 
         let fallback_store = PendingMessageStore::new_without_reclaim(&db_path);
         let fallback_id = fallback_store
-            .enqueue_idempotent(&kind, &payload)
+            .enqueue_idempotent_with_key(&kind, &payload, &idempotency_key)
             .expect("fallback enqueue");
 
         handler.await.expect("handler task");

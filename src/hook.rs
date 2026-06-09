@@ -132,46 +132,85 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
 
     let payload =
         serde_json::to_string(&envelope).context("failed to serialize hook capture envelope")?;
-    let fallback_reason = try_enqueue_via_daemon(&mempal_home, event.queue_kind(), &payload);
-    if fallback_reason.is_none() {
-        return Ok(());
-    }
+    let fallback = match try_enqueue_via_daemon(&mempal_home, event.queue_kind(), &payload) {
+        DaemonEnqueueOutcome::Accepted => return Ok(()),
+        DaemonEnqueueOutcome::Fallback(fallback) => fallback,
+    };
 
     let db = Database::open(&db_path).with_context(|| {
-        let reason = fallback_reason
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "daemon IPC unavailable".to_string());
-        format!("failed to open database for hook enqueue after {reason}")
+        format!(
+            "failed to open database for hook enqueue after {}",
+            fallback.reason()
+        )
     })?;
     let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
-    store
-        .enqueue_idempotent(event.queue_kind(), &payload)
-        .with_context(|| {
-            let reason = fallback_reason
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "daemon IPC unavailable".to_string());
-            format!("failed to enqueue hook payload after {reason}")
-        })?;
+    match fallback.identity() {
+        FallbackEnqueueIdentity::Fresh => store.enqueue(event.queue_kind(), &payload),
+        FallbackEnqueueIdentity::Idempotent { key } => {
+            store.enqueue_idempotent_with_key(event.queue_kind(), &payload, key)
+        }
+    }
+    .with_context(|| format!("failed to enqueue hook payload after {}", fallback.reason()))?;
     Ok(())
 }
 
+enum DaemonEnqueueOutcome {
+    Accepted,
+    Fallback(DaemonFallback),
+}
+
+enum DaemonFallback {
+    Fresh(String),
+    Idempotent { reason: String, key: String },
+}
+
+enum FallbackEnqueueIdentity<'a> {
+    Fresh,
+    Idempotent { key: &'a str },
+}
+
+impl DaemonFallback {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Fresh(reason) | Self::Idempotent { reason, .. } => reason,
+        }
+    }
+
+    fn identity(&self) -> FallbackEnqueueIdentity<'_> {
+        match self {
+            Self::Fresh(_) => FallbackEnqueueIdentity::Fresh,
+            Self::Idempotent { key, .. } => FallbackEnqueueIdentity::Idempotent { key },
+        }
+    }
+}
+
 #[cfg(unix)]
-fn try_enqueue_via_daemon(
-    mempal_home: &Path,
-    kind: &str,
-    payload: &str,
-) -> Option<crate::hook_ipc::HookIpcFallbackReason> {
-    match crate::hook_ipc::enqueue_with_default_timeout(mempal_home, kind, payload) {
-        crate::hook_ipc::HookIpcClientOutcome::Accepted => None,
-        crate::hook_ipc::HookIpcClientOutcome::Fallback(reason) => Some(reason),
+fn try_enqueue_via_daemon(mempal_home: &Path, kind: &str, payload: &str) -> DaemonEnqueueOutcome {
+    let request = crate::hook_ipc::HookIpcEnqueueRequest::new(kind, payload);
+    let idempotency_key = request.idempotency_key.clone();
+    match crate::hook_ipc::enqueue_with_default_timeout(mempal_home, request) {
+        crate::hook_ipc::HookIpcClientOutcome::Accepted => DaemonEnqueueOutcome::Accepted,
+        crate::hook_ipc::HookIpcClientOutcome::Fallback(reason) => match reason {
+            crate::hook_ipc::HookIpcFallbackReason::Timeout => {
+                DaemonEnqueueOutcome::Fallback(DaemonFallback::Idempotent {
+                    reason: reason.to_string(),
+                    key: idempotency_key,
+                })
+            }
+            reason => DaemonEnqueueOutcome::Fallback(DaemonFallback::Fresh(reason.to_string())),
+        },
     }
 }
 
 #[cfg(not(unix))]
-fn try_enqueue_via_daemon(_mempal_home: &Path, _kind: &str, _payload: &str) -> Option<String> {
-    Some("daemon IPC unsupported on this platform".to_string())
+fn try_enqueue_via_daemon(
+    _mempal_home: &Path,
+    _kind: &str,
+    _payload: &str,
+) -> DaemonEnqueueOutcome {
+    DaemonEnqueueOutcome::Fallback(DaemonFallback::Fresh(
+        "daemon IPC unsupported on this platform".to_string(),
+    ))
 }
 
 fn should_drop_hook_capture(event: HookEvent, bytes: &[u8], config: &Config) -> bool {

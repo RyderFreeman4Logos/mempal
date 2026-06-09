@@ -1,9 +1,11 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -12,11 +14,15 @@ pub(crate) const HOOK_IPC_TIMEOUT: Duration = Duration::from_millis(250);
 
 const SOCKET_FILE_NAME: &str = "daemon-hook.sock";
 const MAX_IPC_FRAME_BYTES: usize = 12 * 1024 * 1024;
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+
+static ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct HookIpcEnqueueRequest {
     pub kind: String,
     pub payload: String,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,6 +71,16 @@ impl SocketFileGuard {
     }
 }
 
+impl HookIpcEnqueueRequest {
+    pub(crate) fn new(kind: &str, payload: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            payload: payload.to_string(),
+            idempotency_key: new_idempotency_key(),
+        }
+    }
+}
+
 impl Drop for SocketFileGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -88,8 +104,7 @@ pub(crate) fn bind_listener(mempal_home: &Path) -> Result<(UnixListener, SocketF
 
 pub(crate) fn enqueue_with_default_timeout(
     mempal_home: &Path,
-    kind: &str,
-    payload: &str,
+    request: HookIpcEnqueueRequest,
 ) -> HookIpcClientOutcome {
     let path = socket_path(mempal_home);
     if !path.exists() {
@@ -109,10 +124,6 @@ pub(crate) fn enqueue_with_default_timeout(
         }
     };
 
-    let request = HookIpcEnqueueRequest {
-        kind: kind.to_string(),
-        payload: payload.to_string(),
-    };
     runtime.block_on(async move {
         match tokio::time::timeout(HOOK_IPC_TIMEOUT, enqueue_once(&path, request)).await {
             Ok(outcome) => outcome,
@@ -165,6 +176,15 @@ pub(crate) async fn read_enqueue_request(stream: &mut UnixStream) -> Result<Hook
     if request.payload.is_empty() {
         bail!("hook IPC request payload must not be empty");
     }
+    if request.idempotency_key.trim().is_empty() {
+        bail!("hook IPC request idempotency_key must not be empty");
+    }
+    if request.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+        bail!(
+            "hook IPC request idempotency_key exceeds {} bytes",
+            MAX_IDEMPOTENCY_KEY_BYTES
+        );
+    }
     Ok(request)
 }
 
@@ -213,4 +233,18 @@ fn trim_line_ending(frame: &[u8]) -> &[u8] {
         .unwrap_or(frame)
         .strip_suffix(b"\r")
         .unwrap_or_else(|| frame.strip_suffix(b"\n").unwrap_or(frame))
+}
+
+fn new_idempotency_key() -> String {
+    let now_ns = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos(),
+        Err(_) => 0,
+    };
+    let pid = std::process::id();
+    let counter = ATTEMPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Hasher::new();
+    hasher.update(&now_ns.to_le_bytes());
+    hasher.update(&pid.to_le_bytes());
+    hasher.update(&counter.to_le_bytes());
+    format!("hook-ipc-{}", hasher.finalize().to_hex())
 }
