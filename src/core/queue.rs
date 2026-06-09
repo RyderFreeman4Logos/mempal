@@ -1085,8 +1085,9 @@ fn next_id(prefix: &str) -> String {
         Ok(duration) => duration.as_millis(),
         Err(_) => 0,
     };
+    let pid = std::process::id();
     let counter = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{now_ms:016x}-{counter:016x}")
+    format!("{prefix}-{now_ms:016x}-{pid:08x}-{counter:016x}")
 }
 
 fn saturating_cutoff(now: i64, window_secs: i64) -> i64 {
@@ -1135,6 +1136,17 @@ mod tests {
     use super::*;
     use crate::core::db::Database;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn pending_message_ids_include_process_component() {
+        let id = next_id("msg");
+        let pid_component = format!("{:08x}", std::process::id());
+
+        assert!(
+            id.contains(&pid_component),
+            "pending message id {id} should include process component {pid_component}"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn async_claim_confirm_run_off_runtime() {

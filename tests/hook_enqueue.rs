@@ -1,7 +1,13 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::Duration;
 
 use mempal::core::db::Database;
 use rusqlite::Connection;
@@ -65,6 +71,31 @@ fn pending_message_count(db_path: &PathBuf) -> i64 {
     .expect("query pending count")
 }
 
+#[cfg(unix)]
+fn spawn_fake_daemon_ipc(
+    home: &TempDir,
+    response: &'static str,
+    response_delay: Option<Duration>,
+) -> thread::JoinHandle<String> {
+    let socket_path = home.path().join(".mempal").join("daemon-hook.sock");
+    let _ = fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon IPC socket");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept hook IPC connection");
+        let mut request = String::new();
+        let mut reader = BufReader::new(stream.try_clone().expect("clone IPC stream"));
+        reader
+            .read_line(&mut request)
+            .expect("read hook IPC request");
+        if let Some(delay) = response_delay {
+            thread::sleep(delay);
+        }
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        request
+    })
+}
+
 #[test]
 fn test_hook_post_tool_enqueues_to_queue() {
     let (home, db_path) = setup_home();
@@ -110,6 +141,98 @@ fn test_hook_post_tool_enqueues_to_queue() {
     let envelope_json: Value = serde_json::from_str(&envelope).expect("envelope json");
     assert_eq!(envelope_json["event"], "PostToolUse");
     assert_eq!(envelope_json["payload"], payload);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_daemon_ipc_success_does_not_open_sqlite_when_db_locked() {
+    let (home, db_path) = setup_home();
+    let lock_conn = Connection::open(&db_path).expect("open lock connection");
+    lock_conn
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold SQLite write lock");
+    let ipc = spawn_fake_daemon_ipc(&home, r#"{"status":"accepted"}"#, None);
+    let payload = r#"{"tool_name":"Bash","input":"printf ok","exit_code":0,"output":"ok"}"#;
+
+    let output = run_hook(&home, "hook_post_tool", payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "successful hook stderr must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    lock_conn.execute_batch("ROLLBACK;").expect("release lock");
+    assert_eq!(
+        pending_message_count(&db_path),
+        0,
+        "fake daemon ACK means hook must not fall back to direct SQLite enqueue"
+    );
+
+    let request = ipc.join().expect("fake daemon IPC thread");
+    let request_json: Value = serde_json::from_str(request.trim()).expect("request json");
+    assert_eq!(request_json["kind"], "hook_post_tool");
+    let envelope: Value =
+        serde_json::from_str(request_json["payload"].as_str().expect("payload string"))
+            .expect("envelope json");
+    assert_eq!(envelope["event"], "PostToolUse");
+    assert_eq!(envelope["payload"], payload);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ipc_timeout_falls_back_to_sqlite_enqueue() {
+    let (home, db_path) = setup_home();
+    let ipc = spawn_fake_daemon_ipc(
+        &home,
+        r#"{"status":"accepted"}"#,
+        Some(Duration::from_millis(700)),
+    );
+    let payload = r#"{"prompt":"timeout fallback persists"}"#;
+
+    let output = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "fallback success must stay quiet, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(pending_message_count(&db_path), 1);
+    let _ = ipc.join().expect("fake daemon IPC thread");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ipc_rejection_falls_back_to_sqlite_enqueue() {
+    let (home, db_path) = setup_home();
+    let ipc = spawn_fake_daemon_ipc(
+        &home,
+        r#"{"status":"error","message":"daemon hook IPC queue is full"}"#,
+        None,
+    );
+    let payload = r#"{"prompt":"queue full fallback persists"}"#;
+
+    let output = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "fallback success must stay quiet, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(pending_message_count(&db_path), 1);
+    let _ = ipc.join().expect("fake daemon IPC thread");
 }
 
 #[test]

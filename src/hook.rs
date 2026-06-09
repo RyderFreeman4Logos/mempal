@@ -100,9 +100,7 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
     }
 
     let db_path = expand_home_path(&config.db_path);
-    let db = Database::open(&db_path).context("failed to open database for hook enqueue")?;
-    let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
-    let mempal_home = mempal_home_from_db(db.path());
+    let mempal_home = mempal_home_from_db(&db_path);
 
     let captured = capture_stdin_payload(stdin, &mempal_home)?;
     let envelope = CapturedHookEnvelope {
@@ -134,10 +132,46 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
 
     let payload =
         serde_json::to_string(&envelope).context("failed to serialize hook capture envelope")?;
+    let fallback_reason = try_enqueue_via_daemon(&mempal_home, event.queue_kind(), &payload);
+    if fallback_reason.is_none() {
+        return Ok(());
+    }
+
+    let db = Database::open(&db_path).with_context(|| {
+        let reason = fallback_reason
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "daemon IPC unavailable".to_string());
+        format!("failed to open database for hook enqueue after {reason}")
+    })?;
+    let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
     store
         .enqueue(event.queue_kind(), &payload)
-        .context("failed to enqueue hook payload")?;
+        .with_context(|| {
+            let reason = fallback_reason
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "daemon IPC unavailable".to_string());
+            format!("failed to enqueue hook payload after {reason}")
+        })?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn try_enqueue_via_daemon(
+    mempal_home: &Path,
+    kind: &str,
+    payload: &str,
+) -> Option<crate::hook_ipc::HookIpcFallbackReason> {
+    match crate::hook_ipc::enqueue_with_default_timeout(mempal_home, kind, payload) {
+        crate::hook_ipc::HookIpcClientOutcome::Accepted => None,
+        crate::hook_ipc::HookIpcClientOutcome::Fallback(reason) => Some(reason),
+    }
+}
+
+#[cfg(not(unix))]
+fn try_enqueue_via_daemon(_mempal_home: &Path, _kind: &str, _payload: &str) -> Option<String> {
+    Some("daemon IPC unsupported on this platform".to_string())
 }
 
 fn should_drop_hook_capture(event: HookEvent, bytes: &[u8], config: &Config) -> bool {
