@@ -214,14 +214,14 @@ fn test_hook_ipc_timeout_falls_back_to_sqlite_enqueue() {
 
 #[cfg(unix)]
 #[test]
-fn test_hook_ipc_rejection_falls_back_to_sqlite_enqueue() {
+fn test_hook_ipc_persistence_error_falls_back_to_sqlite_enqueue() {
     let (home, db_path) = setup_home();
     let ipc = spawn_fake_daemon_ipc(
         &home,
-        r#"{"status":"error","message":"daemon hook IPC queue is full"}"#,
+        r#"{"status":"error","message":"failed to persist hook IPC capture: database is locked"}"#,
         None,
     );
-    let payload = r#"{"prompt":"queue full fallback persists"}"#;
+    let payload = r#"{"prompt":"persistence error fallback persists"}"#;
 
     let output = run_hook(&home, "hook_user_prompt", payload.as_bytes());
 

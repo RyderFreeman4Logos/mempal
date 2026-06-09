@@ -146,6 +146,15 @@ impl AsyncPendingMessageStore {
         self.run(move |store| store.enqueue(&kind, &payload)).await
     }
 
+    /// Enqueue without waiting on SQLite write locks.
+    ///
+    /// Use this when the caller owns a stricter fallback deadline than the
+    /// queue's normal busy timeout, such as daemon hook IPC ACK handling.
+    pub async fn enqueue_fail_fast(&self, kind: String, payload: String) -> Result<String> {
+        self.run(move |store| store.enqueue_fail_fast(&kind, &payload))
+            .await
+    }
+
     pub async fn claim_next(
         &self,
         worker_id: String,
@@ -283,11 +292,25 @@ impl PendingMessageStore {
     }
 
     pub fn enqueue(&self, kind: &str, payload: &str) -> Result<String> {
+        self.enqueue_with_busy_timeout(kind, payload, None)
+    }
+
+    /// Enqueue without waiting for SQLite busy locks.
+    pub fn enqueue_fail_fast(&self, kind: &str, payload: &str) -> Result<String> {
+        self.enqueue_with_busy_timeout(kind, payload, Some(Duration::ZERO))
+    }
+
+    fn enqueue_with_busy_timeout(
+        &self,
+        kind: &str,
+        payload: &str,
+        busy_timeout: Option<Duration>,
+    ) -> Result<String> {
         let id = next_id("msg");
         let created_at = now_secs();
         let source_hash = hash_source(kind, payload);
 
-        let conn = self.open_connection()?;
+        let conn = self.open_connection_with_busy_timeout(busy_timeout)?;
         conn.execute(
             r#"
             INSERT INTO pending_messages (
@@ -703,7 +726,17 @@ impl PendingMessageStore {
     }
 
     fn open_connection(&self) -> Result<Connection> {
+        self.open_connection_with_busy_timeout(None)
+    }
+
+    fn open_connection_with_busy_timeout(
+        &self,
+        busy_timeout: Option<Duration>,
+    ) -> Result<Connection> {
         let conn = Connection::open(&self.db_path)?;
+        if let Some(timeout) = busy_timeout {
+            conn.busy_timeout(timeout)?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(conn)

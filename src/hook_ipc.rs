@@ -9,8 +9,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 pub(crate) const HOOK_IPC_TIMEOUT: Duration = Duration::from_millis(250);
-pub(crate) const HOOK_IPC_QUEUE_CAPACITY: usize = 1024;
-pub(crate) const HOOK_IPC_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 const SOCKET_FILE_NAME: &str = "daemon-hook.sock";
 const MAX_IPC_FRAME_BYTES: usize = 12 * 1024 * 1024;

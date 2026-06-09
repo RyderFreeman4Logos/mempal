@@ -259,7 +259,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     }
 
     #[cfg(unix)]
-    hook_ipc_service.shutdown(DAEMON_DRAIN_BUDGET).await;
+    hook_ipc_service.shutdown().await;
 
     drain_hook_workers_with_budget(&mut hook_workers, DAEMON_DRAIN_BUDGET).await;
 
@@ -537,31 +537,17 @@ fn spawn_stall_watchdog(
 #[cfg(unix)]
 struct HookIpcServiceHandle {
     listener_task: Option<tokio::task::JoinHandle<()>>,
-    writer_task: Option<tokio::task::JoinHandle<()>>,
     socket_guard: Option<crate::hook_ipc::SocketFileGuard>,
 }
 
 #[cfg(unix)]
 impl HookIpcServiceHandle {
-    async fn shutdown(mut self, budget: Duration) {
+    async fn shutdown(mut self) {
         if let Some(listener_task) = self.listener_task.take() {
             listener_task.abort();
             let _ = listener_task.await;
         }
 
-        if let Some(writer_task) = self.writer_task.take() {
-            let mut writer_task = writer_task;
-            match tokio::time::timeout(budget, &mut writer_task).await {
-                Ok(_) => {}
-                Err(_) => {
-                    tracing::warn!(
-                        "hook IPC writer did not drain within shutdown budget; in-memory captures may be retried on the next hook fallback"
-                    );
-                    writer_task.abort();
-                    let _ = writer_task.await;
-                }
-            }
-        }
         self.socket_guard.take();
     }
 }
@@ -571,9 +557,6 @@ impl Drop for HookIpcServiceHandle {
     fn drop(&mut self) {
         if let Some(listener_task) = &self.listener_task {
             listener_task.abort();
-        }
-        if let Some(writer_task) = &self.writer_task {
-            writer_task.abort();
         }
         self.socket_guard.take();
     }
@@ -587,13 +570,10 @@ async fn spawn_hook_ipc_service(
 ) -> Result<HookIpcServiceHandle> {
     let (listener, socket_guard) = crate::hook_ipc::bind_listener(mempal_home)?;
     let socket_path = socket_guard.path().to_path_buf();
-    let (tx, rx) = mpsc::channel(crate::hook_ipc::HOOK_IPC_QUEUE_CAPACITY);
-    let listener_task = tokio::spawn(run_hook_ipc_listener(listener, tx));
-    let writer_task = tokio::spawn(run_hook_ipc_writer(rx, store, write_observer));
+    let listener_task = tokio::spawn(run_hook_ipc_listener(listener, store, write_observer));
     tracing::info!("daemon hook IPC listening on {}", socket_path.display());
     Ok(HookIpcServiceHandle {
         listener_task: Some(listener_task),
-        writer_task: Some(writer_task),
         socket_guard: Some(socket_guard),
     })
 }
@@ -601,7 +581,8 @@ async fn spawn_hook_ipc_service(
 #[cfg(unix)]
 async fn run_hook_ipc_listener(
     listener: tokio::net::UnixListener,
-    tx: mpsc::Sender<crate::hook_ipc::HookIpcEnqueueRequest>,
+    store: AsyncPendingMessageStore,
+    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
 ) {
     loop {
         if shutdown_requested() {
@@ -612,9 +593,10 @@ async fn run_hook_ipc_listener(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
-                        let tx = tx.clone();
+                        let store = store.clone();
+                        let write_observer = write_observer.clone();
                         tokio::spawn(async move {
-                            handle_hook_ipc_connection(stream, tx).await;
+                            handle_hook_ipc_connection(stream, store, write_observer).await;
                         });
                     }
                     Err(error) => {
@@ -631,22 +613,11 @@ async fn run_hook_ipc_listener(
 #[cfg(unix)]
 async fn handle_hook_ipc_connection(
     mut stream: tokio::net::UnixStream,
-    tx: mpsc::Sender<crate::hook_ipc::HookIpcEnqueueRequest>,
+    store: AsyncPendingMessageStore,
+    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
 ) {
     let response = match crate::hook_ipc::read_enqueue_request(&mut stream).await {
-        Ok(request) => match tx.try_send(request) {
-            Ok(()) => crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                crate::hook_ipc::HookIpcEnqueueResponse::Error {
-                    message: "daemon hook IPC queue is full".to_string(),
-                }
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                crate::hook_ipc::HookIpcEnqueueResponse::Error {
-                    message: "daemon hook IPC writer is stopped".to_string(),
-                }
-            }
-        },
+        Ok(request) => persist_hook_ipc_request(&store, &write_observer, request).await,
         Err(error) => crate::hook_ipc::HookIpcEnqueueResponse::Error {
             message: format!("invalid hook IPC request: {error}"),
         },
@@ -658,46 +629,25 @@ async fn handle_hook_ipc_connection(
 }
 
 #[cfg(unix)]
-async fn run_hook_ipc_writer(
-    mut rx: mpsc::Receiver<crate::hook_ipc::HookIpcEnqueueRequest>,
-    store: AsyncPendingMessageStore,
-    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
-) {
-    while let Some(request) = rx.recv().await {
-        persist_hook_ipc_request(&store, &write_observer, request).await;
-    }
-}
-
-#[cfg(unix)]
 async fn persist_hook_ipc_request(
     store: &AsyncPendingMessageStore,
     write_observer: &crate::daemon_bootstrap::DaemonWriteObserver,
     request: crate::hook_ipc::HookIpcEnqueueRequest,
-) {
-    let mut attempt = 0_u64;
-    loop {
-        attempt = attempt.saturating_add(1);
-        match store
-            .enqueue(request.kind.clone(), request.payload.clone())
-            .await
-        {
-            Ok(message_id) => {
-                tracing::debug!(message_id, kind = %request.kind, "persisted hook IPC capture");
-                write_observer.record_successful_write();
-                return;
-            }
-            Err(error) => {
-                write_observer.record_error(format!("failed to persist hook IPC capture: {error}"));
-                if attempt == 1 || attempt % 20 == 0 {
-                    tracing::warn!(
-                        ?error,
-                        attempt,
-                        kind = %request.kind,
-                        "failed to persist hook IPC capture; retrying"
-                    );
-                }
-                tokio::time::sleep(crate::hook_ipc::HOOK_IPC_RETRY_DELAY).await;
-            }
+) -> crate::hook_ipc::HookIpcEnqueueResponse {
+    match store
+        .enqueue_fail_fast(request.kind.clone(), request.payload.clone())
+        .await
+    {
+        Ok(message_id) => {
+            tracing::debug!(message_id, kind = %request.kind, "persisted hook IPC capture");
+            write_observer.record_successful_write();
+            crate::hook_ipc::HookIpcEnqueueResponse::Accepted
+        }
+        Err(error) => {
+            let message = format!("failed to persist hook IPC capture: {error}");
+            write_observer.record_error(message.clone());
+            tracing::warn!(?error, kind = %request.kind, "failed to persist hook IPC capture");
+            crate::hook_ipc::HookIpcEnqueueResponse::Error { message }
         }
     }
 }
@@ -2009,8 +1959,63 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn send_hook_ipc_request(
+        store: AsyncPendingMessageStore,
+        observer: crate::daemon_bootstrap::DaemonWriteObserver,
+        request: crate::hook_ipc::HookIpcEnqueueRequest,
+    ) -> crate::hook_ipc::HookIpcEnqueueResponse {
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
+        let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+        let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
+        frame.push(b'\n');
+        tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
+            .await
+            .expect("write request");
+        tokio::io::AsyncWriteExt::flush(&mut client)
+            .await
+            .expect("flush request");
+
+        let mut reader = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler.await.expect("handler task");
+        serde_json::from_str(line.trim()).expect("hook IPC response")
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn test_hook_ipc_writer_retries_until_sqlite_lock_releases() {
+    async fn test_hook_ipc_ack_requires_sqlite_persistence() {
+        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+
+        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+        let request = crate::hook_ipc::HookIpcEnqueueRequest {
+            kind: HookEvent::UserPromptSubmit.queue_kind().to_string(),
+            payload: r#"{"event":"UserPromptSubmit","payload":"durable before ack"}"#.to_string(),
+        };
+
+        let response = send_hook_ipc_request(store, observer, request).await;
+        assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
+        let (kind, payload): (String, String) = rusqlite::Connection::open(&db_path)
+            .expect("open sqlite")
+            .query_row(
+                "SELECT kind, payload FROM pending_messages ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query persisted IPC message");
+        assert_eq!(kind, HookEvent::UserPromptSubmit.queue_kind());
+        assert!(payload.contains("durable before ack"), "{payload}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hook_ipc_rejects_when_sqlite_persistence_fails() {
         super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
@@ -2024,39 +2029,35 @@ mod tests {
         let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
         let request = crate::hook_ipc::HookIpcEnqueueRequest {
             kind: HookEvent::UserPromptSubmit.queue_kind().to_string(),
-            payload: r#"{"event":"UserPromptSubmit","payload":"durable after lock"}"#.to_string(),
+            payload: r#"{"event":"UserPromptSubmit","payload":"not durable"}"#.to_string(),
         };
-        let writer = tokio::spawn(async move {
-            super::persist_hook_ipc_request(&store, &observer, request).await;
-        });
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let response = tokio::time::timeout(
+            crate::hook_ipc::HOOK_IPC_TIMEOUT,
+            send_hook_ipc_request(store, observer, request),
+        )
+        .await
+        .expect("locked SQLite persistence must reject before hook IPC timeout");
+        match response {
+            crate::hook_ipc::HookIpcEnqueueResponse::Accepted => {
+                panic!("IPC must not ACK before pending_messages persistence")
+            }
+            crate::hook_ipc::HookIpcEnqueueResponse::Error { message } => {
+                assert!(
+                    message.contains("failed to persist hook IPC capture"),
+                    "{message}"
+                );
+            }
+        }
         let count_while_locked: i64 = rusqlite::Connection::open(&db_path)
             .expect("open read connection")
             .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
                 row.get(0)
             })
             .expect("count pending while locked");
-        assert_eq!(
-            count_while_locked, 0,
-            "writer must keep the accepted IPC payload in memory while SQLite is locked"
-        );
+        assert_eq!(count_while_locked, 0);
 
         lock_conn.execute_batch("ROLLBACK;").expect("release lock");
-        tokio::time::timeout(Duration::from_secs(2), writer)
-            .await
-            .expect("writer should persist after lock release")
-            .expect("writer task should not panic");
-        let (kind, payload): (String, String) = rusqlite::Connection::open(&db_path)
-            .expect("open sqlite")
-            .query_row(
-                "SELECT kind, payload FROM pending_messages ORDER BY created_at DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("query persisted IPC message");
-        assert_eq!(kind, HookEvent::UserPromptSubmit.queue_kind());
-        assert!(payload.contains("durable after lock"), "{payload}");
     }
 
     #[cfg(unix)]
