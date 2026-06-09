@@ -146,7 +146,7 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
     })?;
     let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
     store
-        .enqueue(event.queue_kind(), &payload)
+        .enqueue_idempotent(event.queue_kind(), &payload)
         .with_context(|| {
             let reason = fallback_reason
                 .as_ref()

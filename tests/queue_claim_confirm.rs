@@ -147,6 +147,61 @@ fn test_confirm_deletes_row() {
 }
 
 #[test]
+fn test_idempotent_enqueue_collapses_pending_and_completed_capture() {
+    let (_tmp, db_path, store) = new_store();
+    let payload = r#"{"tool":"Bash"}"#;
+
+    let first_id = store
+        .enqueue_idempotent("hook_event", payload)
+        .expect("first idempotent enqueue");
+    let duplicate_id = store
+        .enqueue_idempotent("hook_event", payload)
+        .expect("duplicate idempotent enqueue");
+    assert_eq!(duplicate_id, first_id);
+
+    let pending_count: i64 = Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+            row.get(0)
+        })
+        .expect("count pending rows");
+    assert_eq!(pending_count, 1);
+
+    let claimed = store
+        .claim_next("worker-1", 60)
+        .expect("claim")
+        .expect("message");
+    assert_eq!(claimed.id, first_id);
+    store.confirm(&claimed).expect("confirm");
+
+    let completed_duplicate_id = store
+        .enqueue_idempotent("hook_event", payload)
+        .expect("idempotent enqueue after completion");
+    assert_eq!(completed_duplicate_id, first_id);
+
+    let (pending_count, completion_count): (i64, i64) = Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM pending_messages),
+                (SELECT COUNT(*) FROM pending_message_completions)
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("count queue rows");
+    assert_eq!(pending_count, 0);
+    assert_eq!(completion_count, 1);
+
+    let fresh_id = store.enqueue("hook_event", payload).expect("fresh enqueue");
+    let second_fresh_id = store
+        .enqueue("hook_event", payload)
+        .expect("second fresh enqueue");
+    assert_ne!(fresh_id, second_fresh_id);
+}
+
+#[test]
 fn test_confirm_llm_task_missing_row_is_benign() {
     let (_tmp, db_path, store) = new_store();
     let id = store
