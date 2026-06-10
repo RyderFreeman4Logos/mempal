@@ -132,25 +132,57 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
 
     let payload =
         serde_json::to_string(&envelope).context("failed to serialize hook capture envelope")?;
+    let event_name = event.display_name();
     let fallback = match try_enqueue_via_daemon(&mempal_home, event.queue_kind(), &payload) {
         DaemonEnqueueOutcome::Accepted => return Ok(()),
         DaemonEnqueueOutcome::Fallback(fallback) => fallback,
     };
 
-    let db = Database::open(&db_path).with_context(|| {
-        format!(
-            "failed to open database for hook enqueue after {}",
-            fallback.reason()
-        )
-    })?;
+    crate::hook_diagnostics::log_hook_failure(
+        &mempal_home,
+        event_name,
+        &crate::hook_diagnostics::HookOutcome::FallbackPersisted {
+            reason: fallback.reason().to_string(),
+        },
+    );
+
+    let db = match Database::open(&db_path) {
+        Ok(db) => db,
+        Err(error) => {
+            let msg = format!(
+                "failed to open database for hook enqueue after {}: {error:#}",
+                fallback.reason()
+            );
+            crate::hook_diagnostics::log_hook_failure(
+                &mempal_home,
+                event_name,
+                &crate::hook_diagnostics::HookOutcome::Dropped {
+                    error: format!("{error:#}"),
+                    stage: "db_open".to_string(),
+                },
+            );
+            anyhow::bail!(msg);
+        }
+    };
     let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
-    match fallback.identity() {
+    let enqueue_result = match fallback.identity() {
         FallbackEnqueueIdentity::Fresh => store.enqueue(event.queue_kind(), &payload),
         FallbackEnqueueIdentity::Idempotent { key } => {
             store.enqueue_idempotent_with_key(event.queue_kind(), &payload, key)
         }
+    };
+    if let Err(error) = &enqueue_result {
+        crate::hook_diagnostics::log_hook_failure(
+            &mempal_home,
+            event_name,
+            &crate::hook_diagnostics::HookOutcome::Dropped {
+                error: format!("{error:#}"),
+                stage: "enqueue".to_string(),
+            },
+        );
     }
-    .with_context(|| format!("failed to enqueue hook payload after {}", fallback.reason()))?;
+    enqueue_result
+        .with_context(|| format!("failed to enqueue hook payload after {}", fallback.reason()))?;
     Ok(())
 }
 

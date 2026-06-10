@@ -21,6 +21,7 @@ pub mod endpoint_health;
 pub mod factcheck;
 pub mod field_taxonomy;
 pub mod hook;
+pub mod hook_diagnostics;
 pub mod hook_install;
 #[cfg(unix)]
 pub(crate) mod hook_ipc;
