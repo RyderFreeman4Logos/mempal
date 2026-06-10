@@ -1,9 +1,15 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::Duration;
 
-use mempal::core::db::Database;
+use mempal::core::{db::Database, queue::PendingMessageStore};
 use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -65,6 +71,88 @@ fn pending_message_count(db_path: &PathBuf) -> i64 {
     .expect("query pending count")
 }
 
+#[cfg(unix)]
+fn spawn_fake_daemon_ipc(
+    home: &TempDir,
+    response: &'static str,
+    response_delay: Option<Duration>,
+) -> thread::JoinHandle<String> {
+    let socket_path = home.path().join(".mempal").join("daemon-hook.sock");
+    let _ = fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon IPC socket");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept hook IPC connection");
+        let mut request = String::new();
+        let mut reader = BufReader::new(stream.try_clone().expect("clone IPC stream"));
+        reader
+            .read_line(&mut request)
+            .expect("read hook IPC request");
+        if let Some(delay) = response_delay {
+            thread::sleep(delay);
+        }
+        let _ = stream.write_all(response.as_bytes());
+        if !response.as_bytes().ends_with(b"\n") {
+            let _ = stream.write_all(b"\n");
+        }
+        let _ = stream.flush();
+        request
+    })
+}
+
+#[cfg(unix)]
+fn spawn_fake_persisting_daemon_ipc(
+    home: &TempDir,
+    db_path: PathBuf,
+    response_delay: Duration,
+) -> thread::JoinHandle<String> {
+    spawn_fake_persisting_daemon_ipc_with_response(
+        home,
+        db_path,
+        response_delay,
+        Some(r#"{"status":"accepted"}"#),
+    )
+}
+
+#[cfg(unix)]
+fn spawn_fake_persisting_daemon_ipc_with_response(
+    home: &TempDir,
+    db_path: PathBuf,
+    response_delay: Duration,
+    response: Option<&'static str>,
+) -> thread::JoinHandle<String> {
+    let socket_path = home.path().join(".mempal").join("daemon-hook.sock");
+    let _ = fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon IPC socket");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept hook IPC connection");
+        let mut request = String::new();
+        let mut reader = BufReader::new(stream.try_clone().expect("clone IPC stream"));
+        reader
+            .read_line(&mut request)
+            .expect("read hook IPC request");
+        thread::sleep(response_delay);
+
+        let request_json: Value = serde_json::from_str(request.trim()).expect("request json");
+        let kind = request_json["kind"].as_str().expect("kind");
+        let payload = request_json["payload"].as_str().expect("payload");
+        let idempotency_key = request_json["idempotency_key"]
+            .as_str()
+            .expect("idempotency key");
+        PendingMessageStore::new_without_reclaim(&db_path)
+            .enqueue_idempotent_with_key(kind, payload, idempotency_key)
+            .expect("fake daemon persist");
+
+        if let Some(response) = response {
+            let _ = stream.write_all(response.as_bytes());
+            if !response.as_bytes().ends_with(b"\n") {
+                let _ = stream.write_all(b"\n");
+            }
+            let _ = stream.flush();
+        }
+        request
+    })
+}
+
 #[test]
 fn test_hook_post_tool_enqueues_to_queue() {
     let (home, db_path) = setup_home();
@@ -110,6 +198,182 @@ fn test_hook_post_tool_enqueues_to_queue() {
     let envelope_json: Value = serde_json::from_str(&envelope).expect("envelope json");
     assert_eq!(envelope_json["event"], "PostToolUse");
     assert_eq!(envelope_json["payload"], payload);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_daemon_ipc_success_does_not_open_sqlite_when_db_locked() {
+    let (home, db_path) = setup_home();
+    let lock_conn = Connection::open(&db_path).expect("open lock connection");
+    lock_conn
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold SQLite write lock");
+    let ipc = spawn_fake_daemon_ipc(&home, r#"{"status":"accepted"}"#, None);
+    let payload = r#"{"tool_name":"Bash","input":"printf ok","exit_code":0,"output":"ok"}"#;
+
+    let output = run_hook(&home, "hook_post_tool", payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "successful hook stderr must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    lock_conn.execute_batch("ROLLBACK;").expect("release lock");
+    assert_eq!(
+        pending_message_count(&db_path),
+        0,
+        "fake daemon ACK means hook must not fall back to direct SQLite enqueue"
+    );
+
+    let request = ipc.join().expect("fake daemon IPC thread");
+    let request_json: Value = serde_json::from_str(request.trim()).expect("request json");
+    assert_eq!(request_json["kind"], "hook_post_tool");
+    assert!(
+        request_json["idempotency_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty()),
+        "daemon IPC request must carry a per-attempt idempotency key"
+    );
+    let envelope: Value =
+        serde_json::from_str(request_json["payload"].as_str().expect("payload string"))
+            .expect("envelope json");
+    assert_eq!(envelope["event"], "PostToolUse");
+    assert_eq!(envelope["payload"], payload);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ipc_timeout_fallback_dedupes_with_slow_daemon_persist() {
+    let (home, db_path) = setup_home();
+    let ipc = spawn_fake_persisting_daemon_ipc(&home, db_path.clone(), Duration::from_millis(700));
+    let payload = r#"{"prompt":"timeout fallback persists"}"#;
+
+    let output = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "fallback success must stay quiet, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = ipc.join().expect("fake daemon IPC thread");
+    assert_eq!(
+        pending_message_count(&db_path),
+        1,
+        "slow daemon persist and timeout fallback must share the same attempt key"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ipc_lost_or_malformed_ack_fallback_dedupes_after_daemon_persist() {
+    let cases = [
+        ("lost response", None),
+        ("malformed response", Some("not-json")),
+    ];
+
+    for (label, response) in cases {
+        let (home, db_path) = setup_home();
+        let ipc = spawn_fake_persisting_daemon_ipc_with_response(
+            &home,
+            db_path.clone(),
+            Duration::from_millis(0),
+            response,
+        );
+        let payload = format!(r#"{{"prompt":"{label} fallback persists once"}}"#);
+
+        let output = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+
+        assert_eq!(output.status.code(), Some(0), "{label}");
+        assert!(
+            output.stdout.is_empty(),
+            "{label}: stdout must stay empty, got {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{label}: fallback success must stay quiet, got {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = ipc.join().expect("fake daemon IPC thread");
+        assert_eq!(
+            pending_message_count(&db_path),
+            1,
+            "{label}: daemon persist and fallback must share the same attempt key"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_no_daemon_direct_fallback_preserves_repeated_identical_captures() {
+    let (home, db_path) = setup_home();
+    let payload = r#"{"prompt":"same prompt repeated while daemon is down"}"#;
+
+    let first = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+    let second = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+
+    for output in [first, second] {
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            output.stdout.is_empty(),
+            "stdout must stay empty, got {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "direct fallback success must stay quiet, got {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let conn = Connection::open(db_path).expect("open sqlite");
+    let ids = conn
+        .prepare("SELECT id FROM pending_messages ORDER BY id")
+        .expect("prepare id query")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query ids")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect ids");
+    assert_eq!(ids.len(), 2, "direct fallback must keep both hook events");
+    assert!(
+        ids.iter().all(|id| !id.starts_with("msg-dedup-")),
+        "direct fallback must use fresh queue IDs, got {ids:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ipc_persistence_error_falls_back_to_sqlite_enqueue() {
+    let (home, db_path) = setup_home();
+    let ipc = spawn_fake_daemon_ipc(
+        &home,
+        r#"{"status":"error","message":"failed to persist hook IPC capture: database is locked"}"#,
+        None,
+    );
+    let payload = r#"{"prompt":"persistence error fallback persists"}"#;
+
+    let output = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "fallback success must stay quiet, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(pending_message_count(&db_path), 1);
+    let _ = ipc.join().expect("fake daemon IPC thread");
 }
 
 #[test]

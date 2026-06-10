@@ -146,6 +146,64 @@ impl AsyncPendingMessageStore {
         self.run(move |store| store.enqueue(&kind, &payload)).await
     }
 
+    /// Enqueue a capture once for a deterministic `kind + payload` identity.
+    ///
+    /// This is for retry/fallback paths where two writers may race to persist the
+    /// same already-captured event. Normal queue callers should use `enqueue` so
+    /// repeated logical events remain distinct messages.
+    pub async fn enqueue_idempotent(&self, kind: String, payload: String) -> Result<String> {
+        self.run(move |store| store.enqueue_idempotent(&kind, &payload))
+            .await
+    }
+
+    /// Enqueue a capture once for an explicit producer-owned idempotency key.
+    ///
+    /// Use this when the producer can name one delivery attempt across racing
+    /// writers. Do not use payload-derived idempotency for ordinary captures,
+    /// because repeated logical events with the same payload must remain
+    /// distinct queue messages.
+    pub async fn enqueue_idempotent_with_key(
+        &self,
+        kind: String,
+        payload: String,
+        idempotency_key: String,
+    ) -> Result<String> {
+        self.run(move |store| store.enqueue_idempotent_with_key(&kind, &payload, &idempotency_key))
+            .await
+    }
+
+    /// Enqueue without waiting on SQLite write locks.
+    ///
+    /// Use this when the caller owns a stricter fallback deadline than the
+    /// queue's normal busy timeout, such as daemon hook IPC ACK handling.
+    pub async fn enqueue_fail_fast(&self, kind: String, payload: String) -> Result<String> {
+        self.run(move |store| store.enqueue_fail_fast(&kind, &payload))
+            .await
+    }
+
+    /// Idempotent variant of `enqueue_fail_fast`.
+    pub async fn enqueue_idempotent_fail_fast(
+        &self,
+        kind: String,
+        payload: String,
+    ) -> Result<String> {
+        self.run(move |store| store.enqueue_idempotent_fail_fast(&kind, &payload))
+            .await
+    }
+
+    /// Idempotent-key variant of `enqueue_fail_fast`.
+    pub async fn enqueue_idempotent_with_key_fail_fast(
+        &self,
+        kind: String,
+        payload: String,
+        idempotency_key: String,
+    ) -> Result<String> {
+        self.run(move |store| {
+            store.enqueue_idempotent_with_key_fail_fast(&kind, &payload, &idempotency_key)
+        })
+        .await
+    }
+
     pub async fn claim_next(
         &self,
         worker_id: String,
@@ -283,26 +341,119 @@ impl PendingMessageStore {
     }
 
     pub fn enqueue(&self, kind: &str, payload: &str) -> Result<String> {
-        let id = next_id("msg");
+        self.enqueue_with_busy_timeout(kind, payload, None, EnqueueIdentity::Fresh)
+    }
+
+    /// Enqueue a capture once for a deterministic `kind + payload` identity.
+    pub fn enqueue_idempotent(&self, kind: &str, payload: &str) -> Result<String> {
+        self.enqueue_with_busy_timeout(kind, payload, None, EnqueueIdentity::SourceHash)
+    }
+
+    /// Enqueue a capture once for a producer-owned idempotency key.
+    pub fn enqueue_idempotent_with_key(
+        &self,
+        kind: &str,
+        payload: &str,
+        idempotency_key: &str,
+    ) -> Result<String> {
+        self.enqueue_with_busy_timeout(
+            kind,
+            payload,
+            None,
+            EnqueueIdentity::ExplicitKey(idempotency_key.to_string()),
+        )
+    }
+
+    /// Enqueue without waiting for SQLite busy locks.
+    pub fn enqueue_fail_fast(&self, kind: &str, payload: &str) -> Result<String> {
+        self.enqueue_with_busy_timeout(kind, payload, Some(Duration::ZERO), EnqueueIdentity::Fresh)
+    }
+
+    /// Idempotent variant of `enqueue_fail_fast`.
+    pub fn enqueue_idempotent_fail_fast(&self, kind: &str, payload: &str) -> Result<String> {
+        self.enqueue_with_busy_timeout(
+            kind,
+            payload,
+            Some(Duration::ZERO),
+            EnqueueIdentity::SourceHash,
+        )
+    }
+
+    /// Idempotent-key variant of `enqueue_fail_fast`.
+    pub fn enqueue_idempotent_with_key_fail_fast(
+        &self,
+        kind: &str,
+        payload: &str,
+        idempotency_key: &str,
+    ) -> Result<String> {
+        self.enqueue_with_busy_timeout(
+            kind,
+            payload,
+            Some(Duration::ZERO),
+            EnqueueIdentity::ExplicitKey(idempotency_key.to_string()),
+        )
+    }
+
+    fn enqueue_with_busy_timeout(
+        &self,
+        kind: &str,
+        payload: &str,
+        busy_timeout: Option<Duration>,
+        identity: EnqueueIdentity,
+    ) -> Result<String> {
         let created_at = now_secs();
         let source_hash = hash_source(kind, payload);
+        let id = match &identity {
+            EnqueueIdentity::Fresh => next_id("msg"),
+            EnqueueIdentity::SourceHash => idempotent_source_message_id(&source_hash),
+            EnqueueIdentity::ExplicitKey(idempotency_key) => {
+                idempotent_key_message_id(kind, idempotency_key)
+            }
+        };
 
-        let conn = self.open_connection()?;
-        conn.execute(
-            r#"
-            INSERT INTO pending_messages (
-                id,
-                kind,
-                source_hash,
-                status,
-                payload,
-                created_at,
-                next_attempt_at
-            )
-            VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?5)
-            "#,
-            params![id, kind, source_hash, payload, created_at],
-        )?;
+        let conn = self.open_connection_with_busy_timeout(busy_timeout)?;
+        match identity {
+            EnqueueIdentity::Fresh => {
+                conn.execute(
+                    r#"
+                    INSERT INTO pending_messages (
+                        id,
+                        kind,
+                        source_hash,
+                        status,
+                        payload,
+                        created_at,
+                        next_attempt_at
+                    )
+                    VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?5)
+                    "#,
+                    params![id, kind, source_hash, payload, created_at],
+                )?;
+            }
+            EnqueueIdentity::SourceHash | EnqueueIdentity::ExplicitKey(_) => {
+                conn.execute(
+                    r#"
+                    INSERT INTO pending_messages (
+                        id,
+                        kind,
+                        source_hash,
+                        status,
+                        payload,
+                        created_at,
+                        next_attempt_at
+                    )
+                    SELECT ?1, ?2, ?3, 'pending', ?4, ?5, ?5
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM pending_message_completions
+                        WHERE message_id = ?1
+                    )
+                    ON CONFLICT(id) DO NOTHING
+                    "#,
+                    params![id, kind, source_hash, payload, created_at],
+                )?;
+            }
+        }
 
         Ok(id)
     }
@@ -703,7 +854,17 @@ impl PendingMessageStore {
     }
 
     fn open_connection(&self) -> Result<Connection> {
+        self.open_connection_with_busy_timeout(None)
+    }
+
+    fn open_connection_with_busy_timeout(
+        &self,
+        busy_timeout: Option<Duration>,
+    ) -> Result<Connection> {
         let conn = Connection::open(&self.db_path)?;
+        if let Some(timeout) = busy_timeout {
+            conn.busy_timeout(timeout)?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(conn)
@@ -1066,6 +1227,27 @@ fn hash_source(kind: &str, payload: &str) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+fn idempotent_source_message_id(source_hash: &str) -> String {
+    format!("msg-dedup-{source_hash}")
+}
+
+fn idempotent_key_message_id(kind: &str, idempotency_key: &str) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"mempal queue idempotency key v1");
+    hasher.update(&[0]);
+    hasher.update(kind.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(idempotency_key.as_bytes());
+    format!("msg-dedup-{}", hasher.finalize().to_hex())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnqueueIdentity {
+    Fresh,
+    SourceHash,
+    ExplicitKey(String),
+}
+
 fn now_secs() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs() as i64,
@@ -1085,8 +1267,9 @@ fn next_id(prefix: &str) -> String {
         Ok(duration) => duration.as_millis(),
         Err(_) => 0,
     };
+    let pid = std::process::id();
     let counter = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{now_ms:016x}-{counter:016x}")
+    format!("{prefix}-{now_ms:016x}-{pid:08x}-{counter:016x}")
 }
 
 fn saturating_cutoff(now: i64, window_secs: i64) -> i64 {
@@ -1135,6 +1318,17 @@ mod tests {
     use super::*;
     use crate::core::db::Database;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn pending_message_ids_include_process_component() {
+        let id = next_id("msg");
+        let pid_component = format!("{:08x}", std::process::id());
+
+        assert!(
+            id.contains(&pid_component),
+            "pending message id {id} should include process component {pid_component}"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn async_claim_confirm_run_off_runtime() {

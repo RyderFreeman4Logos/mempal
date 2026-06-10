@@ -147,6 +147,15 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(unix)]
+    let hook_ipc_service = spawn_hook_ipc_service(
+        &context.mempal_home,
+        context.store.clone(),
+        context.write_observer.clone(),
+    )
+    .await
+    .context("failed to start daemon hook IPC service")?;
+
     let embedder = Arc::new(
         DaemonEmbedder::from_config(context.config.as_ref())
             .await
@@ -248,6 +257,9 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         );
         wait_for_hook_worker_or_tick(&mut hook_workers, poll_interval).await;
     }
+
+    #[cfg(unix)]
+    hook_ipc_service.shutdown().await;
 
     drain_hook_workers_with_budget(&mut hook_workers, DAEMON_DRAIN_BUDGET).await;
 
@@ -520,6 +532,136 @@ fn spawn_stall_watchdog(
             observer.maybe_log_stall(&store).await;
         }
     })
+}
+
+#[cfg(unix)]
+struct HookIpcServiceHandle {
+    listener_task: Option<tokio::task::JoinHandle<()>>,
+    socket_guard: Option<crate::hook_ipc::SocketFileGuard>,
+}
+
+#[cfg(unix)]
+impl HookIpcServiceHandle {
+    async fn shutdown(mut self) {
+        if let Some(listener_task) = self.listener_task.take() {
+            listener_task.abort();
+            let _ = listener_task.await;
+        }
+
+        self.socket_guard.take();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HookIpcServiceHandle {
+    fn drop(&mut self) {
+        if let Some(listener_task) = &self.listener_task {
+            listener_task.abort();
+        }
+        self.socket_guard.take();
+    }
+}
+
+#[cfg(unix)]
+async fn spawn_hook_ipc_service(
+    mempal_home: &Path,
+    store: AsyncPendingMessageStore,
+    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+) -> Result<HookIpcServiceHandle> {
+    let (listener, socket_guard) = crate::hook_ipc::bind_listener(mempal_home)?;
+    let socket_path = socket_guard.path().to_path_buf();
+    let listener_task = tokio::spawn(run_hook_ipc_listener(listener, store, write_observer));
+    tracing::info!("daemon hook IPC listening on {}", socket_path.display());
+    Ok(HookIpcServiceHandle {
+        listener_task: Some(listener_task),
+        socket_guard: Some(socket_guard),
+    })
+}
+
+#[cfg(unix)]
+async fn run_hook_ipc_listener(
+    listener: tokio::net::UnixListener,
+    store: AsyncPendingMessageStore,
+    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+) {
+    loop {
+        if shutdown_requested() {
+            break;
+        }
+
+        tokio::select! {
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        let store = store.clone();
+                        let write_observer = write_observer.clone();
+                        tokio::spawn(async move {
+                            handle_hook_ipc_connection(stream, store, write_observer).await;
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, "hook IPC accept failed");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            () = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn handle_hook_ipc_connection(
+    mut stream: tokio::net::UnixStream,
+    store: AsyncPendingMessageStore,
+    write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+) {
+    let request_result = tokio::time::timeout(
+        crate::hook_ipc::HOOK_IPC_READ_TIMEOUT,
+        crate::hook_ipc::read_enqueue_request(&mut stream),
+    )
+    .await;
+    let response = match request_result {
+        Ok(Ok(request)) => persist_hook_ipc_request(&store, &write_observer, request).await,
+        Ok(Err(error)) => crate::hook_ipc::HookIpcEnqueueResponse::Error {
+            message: format!("invalid hook IPC request: {error}"),
+        },
+        Err(_) => crate::hook_ipc::HookIpcEnqueueResponse::Error {
+            message: "invalid hook IPC request: timed out reading frame".to_string(),
+        },
+    };
+
+    if let Err(error) = crate::hook_ipc::write_enqueue_response(&mut stream, &response).await {
+        tracing::warn!(?error, "failed to write hook IPC response");
+    }
+}
+
+#[cfg(unix)]
+async fn persist_hook_ipc_request(
+    store: &AsyncPendingMessageStore,
+    write_observer: &crate::daemon_bootstrap::DaemonWriteObserver,
+    request: crate::hook_ipc::HookIpcEnqueueRequest,
+) -> crate::hook_ipc::HookIpcEnqueueResponse {
+    match store
+        .enqueue_idempotent_with_key_fail_fast(
+            request.kind.clone(),
+            request.payload.clone(),
+            request.idempotency_key.clone(),
+        )
+        .await
+    {
+        Ok(message_id) => {
+            tracing::debug!(message_id, kind = %request.kind, "persisted hook IPC capture");
+            write_observer.record_successful_write();
+            crate::hook_ipc::HookIpcEnqueueResponse::Accepted
+        }
+        Err(error) => {
+            let message = format!("failed to persist hook IPC capture: {error}");
+            write_observer.record_error(message.clone());
+            tracing::warn!(?error, kind = %request.kind, "failed to persist hook IPC capture");
+            crate::hook_ipc::HookIpcEnqueueResponse::Error { message }
+        }
+    }
 }
 
 trait ClaimNextSource {
@@ -1826,6 +1968,222 @@ mod tests {
                 panic!("expected claimed message on retry")
             }
         }
+    }
+
+    #[cfg(unix)]
+    async fn send_hook_ipc_request(
+        store: AsyncPendingMessageStore,
+        observer: crate::daemon_bootstrap::DaemonWriteObserver,
+        request: crate::hook_ipc::HookIpcEnqueueRequest,
+    ) -> crate::hook_ipc::HookIpcEnqueueResponse {
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
+        let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+        let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
+        frame.push(b'\n');
+        tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
+            .await
+            .expect("write request");
+        tokio::io::AsyncWriteExt::flush(&mut client)
+            .await
+            .expect("flush request");
+
+        let mut reader = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler.await.expect("handler task");
+        serde_json::from_str(line.trim()).expect("hook IPC response")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hook_ipc_ack_requires_sqlite_persistence() {
+        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+
+        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+        let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
+            HookEvent::UserPromptSubmit.queue_kind(),
+            r#"{"event":"UserPromptSubmit","payload":"durable before ack"}"#,
+        );
+
+        let response = send_hook_ipc_request(store, observer, request).await;
+        assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
+        let (kind, payload): (String, String) = rusqlite::Connection::open(&db_path)
+            .expect("open sqlite")
+            .query_row(
+                "SELECT kind, payload FROM pending_messages ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query persisted IPC message");
+        assert_eq!(kind, HookEvent::UserPromptSubmit.queue_kind());
+        assert!(payload.contains("durable before ack"), "{payload}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hook_ipc_rejects_when_sqlite_persistence_fails() {
+        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let lock_conn = rusqlite::Connection::open(&db_path).expect("open lock connection");
+        lock_conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold SQLite write lock");
+
+        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+        let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
+            HookEvent::UserPromptSubmit.queue_kind(),
+            r#"{"event":"UserPromptSubmit","payload":"not durable"}"#,
+        );
+
+        let response = tokio::time::timeout(
+            crate::hook_ipc::HOOK_IPC_TIMEOUT,
+            send_hook_ipc_request(store, observer, request),
+        )
+        .await
+        .expect("locked SQLite persistence must reject before hook IPC timeout");
+        match response {
+            crate::hook_ipc::HookIpcEnqueueResponse::Accepted => {
+                panic!("IPC must not ACK before pending_messages persistence")
+            }
+            crate::hook_ipc::HookIpcEnqueueResponse::Error { message } => {
+                assert!(
+                    message.contains("failed to persist hook IPC capture"),
+                    "{message}"
+                );
+            }
+        }
+        let count_while_locked: i64 = rusqlite::Connection::open(&db_path)
+            .expect("open read connection")
+            .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+                row.get(0)
+            })
+            .expect("count pending while locked");
+        assert_eq!(count_while_locked, 0);
+
+        lock_conn.execute_batch("ROLLBACK;").expect("release lock");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hook_ipc_stalled_request_times_out_without_persisting() {
+        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+
+        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+        let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
+        let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+
+        let mut reader = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        let bytes_read = tokio::time::timeout(
+            crate::hook_ipc::HOOK_IPC_READ_TIMEOUT + Duration::from_secs(1),
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+        )
+        .await
+        .expect("stalled request must receive timeout response")
+        .expect("read response");
+        assert!(bytes_read > 0, "daemon should write an error response");
+
+        handler.await.expect("handler task");
+        match serde_json::from_str::<crate::hook_ipc::HookIpcEnqueueResponse>(line.trim())
+            .expect("hook IPC response")
+        {
+            crate::hook_ipc::HookIpcEnqueueResponse::Accepted => {
+                panic!("stalled IPC request must not be accepted")
+            }
+            crate::hook_ipc::HookIpcEnqueueResponse::Error { message } => {
+                assert!(message.contains("timed out reading frame"), "{message}");
+            }
+        }
+
+        let count: i64 = rusqlite::Connection::open(&db_path)
+            .expect("open sqlite")
+            .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+                row.get(0)
+            })
+            .expect("count pending");
+        assert_eq!(count, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hook_ipc_timeout_fallback_is_idempotent_with_slow_daemon_persist() {
+        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+
+        let kind = HookEvent::UserPromptSubmit.queue_kind().to_string();
+        let payload =
+            r#"{"event":"UserPromptSubmit","payload":"timeout fallback same capture"}"#.to_string();
+        let request = crate::hook_ipc::HookIpcEnqueueRequest::new(&kind, &payload);
+        let idempotency_key = request.idempotency_key.clone();
+
+        let store = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_blocking_delay(crate::hook_ipc::HOOK_IPC_TIMEOUT + Duration::from_millis(200));
+        let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
+        let handler = tokio::spawn(super::handle_hook_ipc_connection(server, store, observer));
+
+        let mut frame = serde_json::to_vec(&request).expect("serialize hook IPC request");
+        frame.push(b'\n');
+        tokio::io::AsyncWriteExt::write_all(&mut client, &frame)
+            .await
+            .expect("write request");
+        tokio::io::AsyncWriteExt::flush(&mut client)
+            .await
+            .expect("flush request");
+
+        let timed_out = tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, async move {
+            let mut reader = tokio::io::BufReader::new(client);
+            let mut line = String::new();
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await
+        })
+        .await;
+        assert!(
+            timed_out.is_err(),
+            "client should time out before daemon persist"
+        );
+
+        let fallback_store = PendingMessageStore::new_without_reclaim(&db_path);
+        let fallback_id = fallback_store
+            .enqueue_idempotent_with_key(&kind, &payload, &idempotency_key)
+            .expect("fallback enqueue");
+
+        handler.await.expect("handler task");
+
+        let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+                row.get(0)
+            })
+            .expect("count pending");
+        assert_eq!(
+            count, 1,
+            "daemon and fallback must collapse the same capture"
+        );
+        let (stored_id, stored_kind, stored_payload): (String, String, String) = conn
+            .query_row(
+                "SELECT id, kind, payload FROM pending_messages LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read pending row");
+        assert_eq!(stored_id, fallback_id);
+        assert_eq!(stored_kind, kind);
+        assert_eq!(stored_payload, payload);
     }
 
     #[cfg(unix)]

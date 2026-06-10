@@ -22,6 +22,8 @@ pub mod factcheck;
 pub mod field_taxonomy;
 pub mod hook;
 pub mod hook_install;
+#[cfg(unix)]
+pub(crate) mod hook_ipc;
 pub mod hotpatch;
 pub mod importance;
 pub mod ingest;
