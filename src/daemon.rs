@@ -27,6 +27,7 @@ use crate::ingest::gating::{
 };
 use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -161,12 +162,33 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
             .await
             .context("failed to build daemon embedder")?,
     );
-    let prototype_classifier = Arc::new(
-        compile_classifier_from_embedder(embedder.as_ref(), &context.config.ingest_gating)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
-            .context("gating prototype init failed")?,
-    );
+    let prototype_classifier: Arc<ArcSwap<Option<PrototypeClassifier>>> =
+        Arc::new(ArcSwap::from_pointee(None));
+    {
+        let classifier_slot = Arc::clone(&prototype_classifier);
+        let embedder_for_init = Arc::clone(&embedder);
+        let gating_config = context.config.ingest_gating.clone();
+        tokio::spawn(async move {
+            loop {
+                match compile_classifier_from_embedder(embedder_for_init.as_ref(), &gating_config)
+                    .await
+                {
+                    Ok(classifier) => {
+                        classifier_slot.store(Arc::new(classifier));
+                        tracing::info!("gating prototype classifier initialized");
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "gating prototype init failed; retrying in 2s"
+                        );
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        });
+    }
     let worker_id = format!("mempal-daemon-{}", std::process::id());
     let claim_ttl_secs = context.config.hooks.daemon_claim_ttl_secs as i64;
     let poll_interval = Duration::from_millis(context.config.hooks.daemon_poll_interval_ms);
@@ -308,7 +330,7 @@ struct HookWorkerState {
     store: AsyncPendingMessageStore,
     worker_id: String,
     embedder: Arc<DaemonEmbedder>,
-    prototype_classifier: Arc<Option<PrototypeClassifier>>,
+    prototype_classifier: Arc<ArcSwap<Option<PrototypeClassifier>>>,
     config: Arc<crate::core::config::Config>,
     mempal_home: PathBuf,
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
@@ -380,6 +402,8 @@ async fn process_hook_worker_message(
         state.worker_id.clone(),
         hook_message_heartbeat_interval(claim_ttl_secs),
     );
+    let classifier_arc = state.prototype_classifier.load_full();
+    let classifier_ref = classifier_arc.as_ref().as_ref();
     let result = process_claimed_message_with_embedder(
         &state.async_db,
         &state.store,
@@ -387,7 +411,7 @@ async fn process_hook_worker_message(
         &message,
         state.embedder.as_ref(),
         DaemonIngestContext {
-            prototype_classifier: state.prototype_classifier.as_ref().as_ref(),
+            prototype_classifier: classifier_ref,
             config: state.config.as_ref(),
             mempal_home: &state.mempal_home,
         },
@@ -1878,6 +1902,7 @@ mod tests {
     };
     use crate::embed::{EmbedError, Embedder};
     use crate::hook::{CapturedHookEnvelope, HookEvent};
+    use arc_swap::ArcSwap;
     use std::pin::Pin;
 
     use super::{
@@ -2239,7 +2264,7 @@ mod tests {
                     primary: Box::new(StaticEmbedder),
                     fallback: None,
                 }),
-                prototype_classifier: Arc::new(None),
+                prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
@@ -2442,7 +2467,7 @@ mod tests {
                     }),
                     fallback: None,
                 }),
-                prototype_classifier: std::sync::Arc::new(None),
+                prototype_classifier: std::sync::Arc::new(ArcSwap::from_pointee(None)),
                 config: std::sync::Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
@@ -2533,7 +2558,7 @@ mod tests {
                     }),
                     fallback: None,
                 }),
-                prototype_classifier: Arc::new(None),
+                prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
@@ -2670,7 +2695,7 @@ mod tests {
                     }),
                     fallback: None,
                 }),
-                prototype_classifier: Arc::new(None),
+                prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
