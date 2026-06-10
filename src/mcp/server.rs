@@ -636,7 +636,13 @@ impl MempalMcpServer {
         }
 
         let peer = self.client_peer.lock().ok().and_then(|guard| guard.clone());
+        let client_supports_roots = peer
+            .as_ref()
+            .and_then(|p| p.peer_info())
+            .and_then(|info| info.capabilities.roots.clone())
+            .is_some();
         if let Some(peer) = peer
+            && client_supports_roots
             && let Ok(result) = peer.list_roots().await
             && let Some(project_id) = result
                 .roots
