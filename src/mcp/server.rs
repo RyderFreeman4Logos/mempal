@@ -11188,7 +11188,8 @@ enabled = true
 
     #[tokio::test]
     async fn test_mcp_operation_status_tracks_reclaim_and_completion() {
-        let db_path = PathBuf::from("/tmp/mempal-async-status.db");
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
         Database::open(&db_path).expect("open db");
 
         let server = MempalMcpServer::new_with_factory(
