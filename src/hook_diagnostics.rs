@@ -27,9 +27,6 @@ pub fn log_hook_failure(mempal_home: &Path, event: &str, outcome: &HookOutcome) 
 }
 
 fn try_log(path: &Path, event: &str, outcome: &HookOutcome) -> std::io::Result<()> {
-    prune_if_stale(path);
-    truncate_if_oversized(path);
-
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -44,33 +41,36 @@ fn try_log(path: &Path, event: &str, outcome: &HookOutcome) -> std::io::Result<(
         }
     };
 
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let should_reset = should_reset_log(path);
+    let mut file = if should_reset {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?
+    } else {
+        OpenOptions::new().create(true).append(true).open(path)?
+    };
     file.write_all(line.as_bytes())?;
     Ok(())
 }
 
-fn prune_if_stale(path: &Path) {
+fn should_reset_log(path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
-        return;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return;
-    };
-    let age = SystemTime::now()
-        .duration_since(modified)
-        .unwrap_or_default();
-    if age.as_secs() > TTL_SECS {
-        let _ = fs::remove_file(path);
-    }
-}
-
-fn truncate_if_oversized(path: &Path) {
-    let Ok(metadata) = fs::metadata(path) else {
-        return;
+        return false;
     };
     if metadata.len() > MAX_LOG_BYTES {
-        let _ = fs::remove_file(path);
+        return true;
     }
+    if let Ok(modified) = metadata.modified() {
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if age.as_secs() > TTL_SECS {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn diagnostic_log_path(mempal_home: &Path) -> PathBuf {

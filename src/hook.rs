@@ -164,7 +164,20 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
             anyhow::bail!(msg);
         }
     };
-    let store = PendingMessageStore::new(db.path()).context("failed to open pending queue")?;
+    let store = match PendingMessageStore::new(db.path()) {
+        Ok(store) => store,
+        Err(error) => {
+            crate::hook_diagnostics::log_hook_failure(
+                &mempal_home,
+                event_name,
+                &crate::hook_diagnostics::HookOutcome::Dropped {
+                    error: format!("{error:#}"),
+                    stage: "queue_init".to_string(),
+                },
+            );
+            return Err(error).context("failed to open pending queue");
+        }
+    };
     let enqueue_result = match fallback.identity() {
         FallbackEnqueueIdentity::Fresh => store.enqueue(event.queue_kind(), &payload),
         FallbackEnqueueIdentity::Idempotent { key } => {
