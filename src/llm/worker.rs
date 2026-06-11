@@ -211,7 +211,7 @@ pub async fn run_llm_worker(
                         message_id,
                         "LLM client unavailable after claim; releasing task for retry"
                     );
-                    if let Err(release_error) = store.release_claim(message.clone()).await {
+                    if let Err(release_error) = store.release_claim(message).await {
                         tracing::warn!(
                             ?release_error,
                             message_id,
@@ -763,7 +763,7 @@ threshold = 0.5
             DaemonWriteObserver::for_test(),
         ));
 
-        tokio::time::sleep(Duration::from_millis(650)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         std::fs::write(&config_path, worker_test_config(&new_base_url)).expect("write new config");
         ConfigHandle::harness_reload_from_path(&config_path);
 

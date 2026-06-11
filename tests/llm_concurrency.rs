@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use mempal::core::config::LlmConfig;
 use mempal::llm::client::LlmClient;
+use tokio::sync::Barrier;
 
 fn test_config(max_concurrent: usize) -> LlmConfig {
     LlmConfig {
@@ -45,6 +46,31 @@ async fn test_update_concurrency_noop_same_value() {
     client.update_concurrency(3).await;
     assert_eq!(client.current_max_concurrent(), 3);
     assert_eq!(client.available_permits(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_concurrent_update_concurrency_increase_is_serialized() {
+    let client = Arc::new(LlmClient::from_config(&test_config(2)).unwrap());
+    let workers = 32;
+    let barrier = Arc::new(Barrier::new(workers + 1));
+    let mut handles = Vec::new();
+
+    for _ in 0..workers {
+        let client = client.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            client.update_concurrency(4).await;
+        }));
+    }
+
+    barrier.wait().await;
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    assert_eq!(client.current_max_concurrent(), 4);
+    assert_eq!(client.available_permits(), 4);
 }
 
 #[tokio::test]

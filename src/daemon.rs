@@ -207,9 +207,9 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     let llm_worker_handles: Vec<tokio::task::JoinHandle<_>> = if context.config.llm.enabled {
         let llm_client_runtime = crate::llm::worker::LlmClientRuntime::new(&context.config.llm);
         let num_workers = context.config.llm.max_concurrent.max(1);
-        let llm_status = std::sync::Arc::new(crate::llm::LlmStatus::new(10));
-        let llm_store = std::sync::Arc::new(context.store.clone());
-        let llm_client_runtime = std::sync::Arc::new(Mutex::new(llm_client_runtime));
+        let llm_status = Arc::new(crate::llm::LlmStatus::new(10));
+        let llm_store = Arc::new(context.store.clone());
+        let llm_client_runtime = Arc::new(Mutex::new(llm_client_runtime));
         let async_db = context.async_db.clone();
         let write_observer = context.write_observer.clone();
         tracing::info!("spawning {num_workers} LLM worker tasks");
