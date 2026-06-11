@@ -820,6 +820,26 @@ impl MempalMcpServer {
         .await
     }
 
+    fn handle_search_database_error<R>(
+        &self,
+        error: anyhow::Error,
+        stage: &str,
+        response_warnings: &mut Vec<String>,
+        system_warnings: &mut Vec<SystemWarning>,
+    ) -> std::result::Result<Option<R>, ErrorData> {
+        if push_mcp_search_database_warning(
+            response_warnings,
+            system_warnings,
+            &self.db_path,
+            stage,
+            error.as_ref(),
+        ) {
+            return Ok(None);
+        }
+
+        Err(ErrorData::internal_error(error.to_string(), None))
+    }
+
     async fn system_warnings_with_stale_index_bounded(
         &self,
         deadline: Duration,
@@ -2456,10 +2476,9 @@ impl MempalMcpServer {
                     self.search_route_deadline,
                 )
                 .await
-                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
             {
-                Some(route) => route,
-                None => {
+                Ok(Some(route)) => route,
+                Ok(None) => {
                     push_mcp_timeout_warning(
                         &mut response_warnings,
                         &mut extra_warnings,
@@ -2468,6 +2487,15 @@ impl MempalMcpServer {
                     );
                     fallback_route
                 }
+                Err(error) => match self.handle_search_database_error(
+                    error,
+                    "search route resolution",
+                    &mut response_warnings,
+                    &mut extra_warnings,
+                )? {
+                    Some(route) => route,
+                    None => fallback_route,
+                },
             }
         };
         let embed_snapshot = global_embed_status().snapshot();
@@ -2487,10 +2515,9 @@ impl MempalMcpServer {
             match self
                 .run_bm25_search_bounded(query, route, scope, search_options, top_k)
                 .await
-                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
             {
-                Some(results) => results,
-                None => {
+                Ok(Some(results)) => results,
+                Ok(None) => {
                     push_mcp_timeout_warning(
                         &mut response_warnings,
                         &mut extra_warnings,
@@ -2499,6 +2526,14 @@ impl MempalMcpServer {
                     );
                     Vec::new()
                 }
+                Err(error) => self
+                    .handle_search_database_error(
+                        error,
+                        "BM25 fallback search",
+                        &mut response_warnings,
+                        &mut extra_warnings,
+                    )?
+                    .unwrap_or_default(),
             }
         } else {
             let embedder = match self.embedder_factory.build().await {
@@ -2555,10 +2590,9 @@ impl MempalMcpServer {
                                 self.search_db_deadline,
                             )
                             .await
-                            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
                         {
-                            Some(results) => results,
-                            None => {
+                            Ok(Some(results)) => results,
+                            Ok(None) => {
                                 search_mode = SearchMode::Bm25Only;
                                 push_mcp_timeout_warning(
                                     &mut response_warnings,
@@ -2579,11 +2613,9 @@ impl MempalMcpServer {
                                         top_k,
                                     )
                                     .await
-                                    .map_err(|error| {
-                                        ErrorData::internal_error(error.to_string(), None)
-                                    })? {
-                                    Some(results) => results,
-                                    None => {
+                                {
+                                    Ok(Some(results)) => results,
+                                    Ok(None) => {
                                         push_mcp_timeout_warning(
                                             &mut response_warnings,
                                             &mut extra_warnings,
@@ -2592,7 +2624,25 @@ impl MempalMcpServer {
                                         );
                                         Vec::new()
                                     }
+                                    Err(error) => self
+                                        .handle_search_database_error(
+                                            error,
+                                            "BM25 fallback search",
+                                            &mut response_warnings,
+                                            &mut extra_warnings,
+                                        )?
+                                        .unwrap_or_default(),
                                 }
+                            }
+                            Err(error) => {
+                                search_mode = SearchMode::Bm25Only;
+                                self.handle_search_database_error(
+                                    error,
+                                    "hybrid search",
+                                    &mut response_warnings,
+                                    &mut extra_warnings,
+                                )?
+                                .unwrap_or_default()
                             }
                         }
                     }
@@ -2614,16 +2664,9 @@ impl MempalMcpServer {
                         match self
                             .run_bm25_search_bounded(query, route, scope, search_options, top_k)
                             .await
-                            .map_err(|bm25_error| {
-                                ErrorData::internal_error(
-                                    format!(
-                                        "search failed after vector fallback: {error}; bm25 fallback failed: {bm25_error}"
-                                    ),
-                                    None,
-                                )
-                            })? {
-                            Some(results) => results,
-                            None => {
+                        {
+                            Ok(Some(results)) => results,
+                            Ok(None) => {
                                 push_mcp_timeout_warning(
                                     &mut response_warnings,
                                     &mut extra_warnings,
@@ -2631,6 +2674,18 @@ impl MempalMcpServer {
                                     self.search_db_deadline,
                                 );
                                 Vec::new()
+                            }
+                            Err(bm25_error) => {
+                                let bm25_error = anyhow::anyhow!(
+                                    "search failed after vector fallback: {error}; bm25 fallback failed: {bm25_error}"
+                                );
+                                self.handle_search_database_error(
+                                    bm25_error,
+                                    "BM25 fallback search",
+                                    &mut response_warnings,
+                                    &mut extra_warnings,
+                                )?
+                                .unwrap_or_default()
                             }
                         }
                     }
@@ -2651,14 +2706,9 @@ impl MempalMcpServer {
                         match self
                             .run_bm25_search_bounded(query, route, scope, search_options, top_k)
                             .await
-                            .map_err(|error| {
-                                ErrorData::internal_error(
-                                    format!("search deadline fallback failed: {error}"),
-                                    None,
-                                )
-                            })? {
-                            Some(results) => results,
-                            None => {
+                        {
+                            Ok(Some(results)) => results,
+                            Ok(None) => {
                                 push_mcp_timeout_warning(
                                     &mut response_warnings,
                                     &mut extra_warnings,
@@ -2666,6 +2716,17 @@ impl MempalMcpServer {
                                     self.search_db_deadline,
                                 );
                                 Vec::new()
+                            }
+                            Err(error) => {
+                                let error =
+                                    anyhow::anyhow!("search deadline fallback failed: {error}");
+                                self.handle_search_database_error(
+                                    error,
+                                    "BM25 fallback search",
+                                    &mut response_warnings,
+                                    &mut extra_warnings,
+                                )?
+                                .unwrap_or_default()
                             }
                         }
                     }
@@ -2678,14 +2739,9 @@ impl MempalMcpServer {
                 match self
                     .run_bm25_search_bounded(query, route, scope, search_options, top_k)
                     .await
-                    .map_err(|error| {
-                        ErrorData::internal_error(
-                            format!("search failed after embedder build fallback: {error}"),
-                            None,
-                        )
-                    })? {
-                    Some(results) => results,
-                    None => {
+                {
+                    Ok(Some(results)) => results,
+                    Ok(None) => {
                         push_mcp_timeout_warning(
                             &mut response_warnings,
                             &mut extra_warnings,
@@ -2693,6 +2749,17 @@ impl MempalMcpServer {
                             self.search_db_deadline,
                         );
                         Vec::new()
+                    }
+                    Err(error) => {
+                        let error =
+                            anyhow::anyhow!("search failed after embedder build fallback: {error}");
+                        self.handle_search_database_error(
+                            error,
+                            "BM25 fallback search",
+                            &mut response_warnings,
+                            &mut extra_warnings,
+                        )?
+                        .unwrap_or_default()
                     }
                 }
             }
@@ -2732,11 +2799,20 @@ impl MempalMcpServer {
                 });
             }
             Err(error) => {
-                system_warnings.push(SystemWarning {
-                    level: "warn".to_string(),
-                    message: format!("stale vector index check failed: {error}"),
-                    source: "vector_index".to_string(),
-                });
+                let handled = push_mcp_search_database_warning(
+                    &mut response_warnings,
+                    &mut system_warnings,
+                    &self.db_path,
+                    "stale vector index check",
+                    error.as_ref(),
+                );
+                if !handled {
+                    system_warnings.push(SystemWarning {
+                        level: "warn".to_string(),
+                        message: format!("stale vector index check failed: {error}"),
+                        source: "vector_index".to_string(),
+                    });
+                }
             }
         }
         if unresolved_scope && config.search.strict_project_isolation {
@@ -7527,6 +7603,31 @@ fn push_mcp_timeout_warning(
     });
 }
 
+fn push_mcp_search_database_warning(
+    response_warnings: &mut Vec<String>,
+    system_warnings: &mut Vec<SystemWarning>,
+    db_path: &Path,
+    stage: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> bool {
+    let diagnostic = status_database_diagnostic(db_path, stage, error);
+    if diagnostic.failure_kind == "unknown" {
+        return false;
+    }
+
+    let warning = format!(
+        "database diagnostic degraded at {}: {} ({}); mempal_search returned a bounded empty response instead of an internal MCP error. {}",
+        diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
+    );
+    response_warnings.push(warning.clone());
+    system_warnings.push(SystemWarning {
+        level: "warn".to_string(),
+        message: warning,
+        source: "database".to_string(),
+    });
+    true
+}
+
 fn push_db_holder_warnings(
     system_warnings: &mut Vec<SystemWarning>,
     report: &crate::process_diagnostics::DbHolderReport,
@@ -8829,6 +8930,77 @@ mod tests {
         assert_eq!(status_db_failure_kind(&busy), "locked_or_busy");
         assert_eq!(status_db_failure_kind(&permission), "path_or_permission");
         assert_eq!(status_db_failure_kind(&invalid), "corrupt_or_invalid");
+    }
+
+    #[test]
+    fn test_mcp_search_database_warning_classifies_sqlite_busy() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy,
+                extended_code: rusqlite::ffi::SQLITE_BUSY,
+            },
+            Some("database is locked".to_string()),
+        );
+        let mut response_warnings = Vec::new();
+        let mut system_warnings = Vec::new();
+
+        let handled = push_mcp_search_database_warning(
+            &mut response_warnings,
+            &mut system_warnings,
+            Path::new("/tmp/palace.db"),
+            "BM25 fallback search",
+            &busy,
+        );
+
+        assert!(handled);
+        assert!(
+            response_warnings
+                .iter()
+                .any(|warning| warning.contains("locked_or_busy")
+                    && warning.contains("bounded empty response")),
+            "response warning should expose locked DB diagnostic: {response_warnings:?}"
+        );
+        assert!(system_warnings.iter().any(|warning| {
+            warning.source == "database" && warning.message.contains("locked_or_busy")
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_search_returns_diagnostic_when_database_cannot_open() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        fs::create_dir(&db_path).expect("create directory at db path");
+        let server = MempalMcpServer::new_with_factory(
+            db_path,
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server");
+
+        let response = server
+            .mempal_search(Parameters(SearchRequest {
+                query: "open failure marker".to_string(),
+                top_k: Some(1),
+                disable_progressive: Some(true),
+                ..SearchRequest::default()
+            }))
+            .await
+            .expect("search should return an actionable diagnostic response")
+            .0;
+
+        assert_eq!(response.search_mode, SearchMode::Bm25Only.as_str());
+        assert!(response.results.is_empty());
+        assert!(
+            response.warnings.iter().any(|warning| {
+                warning.contains("path_or_permission") && warning.contains("bounded empty response")
+            }),
+            "response warning should expose database diagnostic: {:?}",
+            response.warnings
+        );
+        assert!(response.system_warnings.iter().any(|warning| {
+            warning.source == "database" && warning.message.contains("path_or_permission")
+        }));
     }
 
     #[tokio::test]
