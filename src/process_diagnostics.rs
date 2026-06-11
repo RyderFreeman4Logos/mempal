@@ -37,10 +37,79 @@ impl DbHolderReport {
 /// Conservative remediation plan for stale mempal-owned DB holders.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DbHolderRemediationPlan {
+    /// Holder identities that are safe to terminate automatically if they
+    /// still match immediately before signalling.
+    pub terminate_targets: Vec<DbHolderRemediationTarget>,
     /// PIDs that are safe to terminate automatically.
+    ///
+    /// This is a convenience projection for diagnostics and tests. Signal
+    /// paths must use `terminate_targets` so PID reuse is guarded by identity.
     pub terminate_pids: Vec<i32>,
     /// Holders that must remain under operator control.
     pub manual_holders: Vec<DbHolderProcess>,
+}
+
+/// Immutable identity of a stale mempal-owned DB holder selected for cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbHolderRemediationTarget {
+    pub pid: i32,
+    pub role: String,
+    pub classification: String,
+    pub opened_files: Vec<String>,
+    pub started_at_unix_secs: Option<u64>,
+}
+
+impl DbHolderRemediationTarget {
+    pub fn from_holder(holder: &DbHolderProcess) -> Self {
+        Self {
+            pid: holder.pid,
+            role: holder.role.clone(),
+            classification: holder.classification.clone(),
+            opened_files: holder.opened_files.clone(),
+            started_at_unix_secs: holder.started_at_unix_secs,
+        }
+    }
+
+    pub fn matches_holder(&self, holder: &DbHolderProcess) -> bool {
+        self.pid == holder.pid
+            && self.role == holder.role
+            && self.classification == holder.classification
+            && matches!(
+                self.classification.as_str(),
+                "stale_mcp_server" | "orphan_daemon"
+            )
+            && !holder.current_process
+            && !holder.current_daemon
+            && !holder.current_mcp_server
+            && self.matches_start_time(holder)
+            && self
+                .opened_files
+                .iter()
+                .all(|expected| holder.opened_files.contains(expected))
+    }
+
+    fn matches_start_time(&self, holder: &DbHolderProcess) -> bool {
+        match (self.started_at_unix_secs, holder.started_at_unix_secs) {
+            (Some(expected), Some(actual)) => expected == actual,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        let started = self
+            .started_at_unix_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!(
+            "pid={} role={} classification={} started_at={} files={}",
+            self.pid,
+            self.role,
+            self.classification,
+            started,
+            self.opened_files.join(",")
+        )
+    }
 }
 
 /// Plan cleanup for stale mempal-owned holders already proven to hold this DB.
@@ -49,7 +118,7 @@ pub struct DbHolderRemediationPlan {
 /// which roles are safe to remediate. It never selects `extra_holder`,
 /// `current_daemon`, `current_mcp_server`, or `current_process` entries.
 pub fn plan_stale_db_holder_remediation(report: &DbHolderReport) -> DbHolderRemediationPlan {
-    let mut terminate_pids = Vec::new();
+    let mut terminate_targets = Vec::new();
     let mut manual_holders = Vec::new();
 
     for holder in &report.holders {
@@ -59,17 +128,22 @@ pub fn plan_stale_db_holder_remediation(report: &DbHolderReport) -> DbHolderReme
                     && !holder.current_daemon
                     && !holder.current_mcp_server =>
             {
-                terminate_pids.push(holder.pid);
+                terminate_targets.push(DbHolderRemediationTarget::from_holder(holder));
             }
             _ => manual_holders.push(holder.clone()),
         }
     }
 
-    terminate_pids.sort_unstable();
-    terminate_pids.dedup();
+    terminate_targets.sort_by_key(|target| target.pid);
+    terminate_targets.dedup_by_key(|target| target.pid);
+    let terminate_pids = terminate_targets
+        .iter()
+        .map(|target| target.pid)
+        .collect::<Vec<_>>();
     manual_holders.sort_by_key(|holder| holder.pid);
 
     DbHolderRemediationPlan {
+        terminate_targets,
         terminate_pids,
         manual_holders,
     }
@@ -471,6 +545,15 @@ mod tests {
     use super::*;
 
     fn holder(pid: i32, role: &str, classification: &str) -> DbHolderProcess {
+        holder_with_start(pid, role, classification, None)
+    }
+
+    fn holder_with_start(
+        pid: i32,
+        role: &str,
+        classification: &str,
+        started_at_unix_secs: Option<u64>,
+    ) -> DbHolderProcess {
         DbHolderProcess {
             pid,
             role: role.to_string(),
@@ -481,7 +564,7 @@ mod tests {
                 _ => "other process".to_string(),
             },
             opened_files: vec!["db".to_string()],
-            started_at_unix_secs: None,
+            started_at_unix_secs,
             age_secs: None,
             current_process: classification == "current_process",
             current_daemon: classification == "current_daemon",
@@ -507,12 +590,60 @@ mod tests {
 
         assert_eq!(plan.terminate_pids, vec![11, 22]);
         assert_eq!(
+            plan.terminate_targets
+                .iter()
+                .map(|target| target.pid)
+                .collect::<Vec<_>>(),
+            vec![11, 22]
+        );
+        assert_eq!(
             plan.manual_holders
                 .iter()
                 .map(|holder| holder.pid)
                 .collect::<Vec<_>>(),
             vec![33, 44, 55]
         );
+    }
+
+    #[test]
+    fn test_db_holder_remediation_target_rejects_pid_reuse_identity_mismatch() {
+        let target = DbHolderRemediationTarget::from_holder(&holder_with_start(
+            77,
+            "mempal_mcp_server",
+            "stale_mcp_server",
+            Some(1_000),
+        ));
+
+        assert!(target.matches_holder(&holder_with_start(
+            77,
+            "mempal_mcp_server",
+            "stale_mcp_server",
+            Some(1_000),
+        )));
+        assert!(!target.matches_holder(&holder_with_start(
+            77,
+            "mempal_mcp_server",
+            "stale_mcp_server",
+            None,
+        )));
+        assert!(!target.matches_holder(&holder_with_start(
+            77,
+            "mempal_mcp_server",
+            "stale_mcp_server",
+            Some(2_000),
+        )));
+        assert!(!target.matches_holder(&holder_with_start(
+            77,
+            "other",
+            "extra_holder",
+            Some(1_000),
+        )));
+        assert!(!target.matches_holder(&holder_with_start(
+            77,
+            "mempal_mcp_server",
+            "current_mcp_server",
+            Some(1_000),
+        )));
     }
 
     #[test]
