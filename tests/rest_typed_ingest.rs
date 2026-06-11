@@ -46,6 +46,10 @@ enabled = false
 [search]
 bm25_fallback = true
 
+[embed.degradation]
+degrade_after_n_failures = 1
+block_writes_when_degraded = true
+
 [api]
 write_queue_capacity = 10
 write_drain_timeout_secs = 2
@@ -55,6 +59,7 @@ write_drain_timeout_secs = 2
         )
         .expect("write config");
         ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
+        global_embed_status().reset_for_tests();
         Self {
             _tmp: tmp,
             db_path,
@@ -338,6 +343,27 @@ async fn test_typed_ingest_invalid_memory_kind_returns_400() {
     .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_typed_ingest_invalid_memory_kind_returns_400_when_writes_degraded() {
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+    global_embed_status().record_failure(&"synthetic degraded state");
+    assert!(global_embed_status().should_block_writes());
+
+    let (status, body) = post_json(
+        state,
+        "/api/ingest",
+        json!({
+            "content": "Some content.",
+            "wing": "test",
+            "memory_kind": "invalid_kind",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
 }
 
 #[tokio::test]

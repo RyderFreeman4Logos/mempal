@@ -336,6 +336,68 @@ fn normalize_refs(values: Option<&[String]>) -> Vec<String> {
         .collect()
 }
 
+struct ValidatedIngestRequest {
+    source_type: SourceType,
+    confidence: f64,
+    typed_memory_kind: Option<MemoryKind>,
+    typed_domain: Option<MemoryDomain>,
+    typed_field: Option<String>,
+    typed_status: Option<KnowledgeStatus>,
+    typed_tier: Option<KnowledgeTier>,
+    typed_is_pinned: bool,
+    typed_statement: Option<String>,
+    typed_supporting_refs: Vec<String>,
+    typed_counterexample_refs: Vec<String>,
+    typed_teaching_refs: Vec<String>,
+    typed_verification_refs: Vec<String>,
+}
+
+fn validate_ingest_request(request: &IngestRequest) -> Result<ValidatedIngestRequest, ApiError> {
+    validate_temporal_param("valid_from", request.valid_from.as_deref())?;
+    validate_temporal_param("valid_until", request.valid_until.as_deref())?;
+    let source_type = parse_source_type_param(request.source_type.as_deref())?;
+    let confidence = resolve_confidence_param(source_type, request.confidence)?;
+    let typed_memory_kind = request
+        .memory_kind
+        .as_deref()
+        .map(parse_memory_kind)
+        .transpose()?;
+    let typed_domain = request.domain.as_deref().map(parse_domain).transpose()?;
+    let typed_field = request
+        .field
+        .as_deref()
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty());
+    let typed_status = request
+        .status
+        .as_deref()
+        .map(parse_status_opt)
+        .transpose()?;
+    let typed_tier = request.tier.as_deref().map(parse_tier_opt).transpose()?;
+    let typed_statement = request
+        .statement
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    Ok(ValidatedIngestRequest {
+        source_type,
+        confidence,
+        typed_memory_kind,
+        typed_domain,
+        typed_field,
+        typed_status,
+        typed_tier,
+        typed_is_pinned: request.is_pinned.unwrap_or(false),
+        typed_statement,
+        typed_supporting_refs: normalize_refs(request.supporting_refs.as_deref()),
+        typed_counterexample_refs: normalize_refs(request.counterexample_refs.as_deref()),
+        typed_teaching_refs: normalize_refs(request.teaching_refs.as_deref()),
+        typed_verification_refs: normalize_refs(request.verification_refs.as_deref()),
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     drawer_count: i64,
@@ -620,6 +682,7 @@ async fn ingest_handler(
     State(state): State<ApiState>,
     Json(request): Json<IngestRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validate_ingest_request(&request)?;
     if global_embed_status().should_block_writes() {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -645,10 +708,7 @@ async fn process_ingest_request(
         embedder_factory.build().await.map_err(internal_error)?;
     let db = Database::open(&db_path).map_err(internal_error)?;
     let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
-    validate_temporal_param("valid_from", request.valid_from.as_deref())?;
-    validate_temporal_param("valid_until", request.valid_until.as_deref())?;
-    let source_type = parse_source_type_param(request.source_type.as_deref())?;
-    let confidence = resolve_confidence_param(source_type, request.confidence)?;
+    let validated = validate_ingest_request(&request)?;
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
         .map_err(internal_error)?;
     let raw_turn = is_raw_turn(&request.wing, request.room.as_deref(), &config.turns);
@@ -665,36 +725,6 @@ async fn process_ingest_request(
     let drawer_importance =
         raw_turn_importance(&request.wing, request.room.as_deref(), &config.turns)
             .unwrap_or_else(|| request.importance.unwrap_or(0));
-
-    // Parse typed memory fields.
-    let typed_memory_kind = request
-        .memory_kind
-        .as_deref()
-        .map(parse_memory_kind)
-        .transpose()?;
-    let typed_domain = request.domain.as_deref().map(parse_domain).transpose()?;
-    let typed_field = request
-        .field
-        .as_deref()
-        .map(|f| f.trim().to_string())
-        .filter(|f| !f.is_empty());
-    let typed_status = request
-        .status
-        .as_deref()
-        .map(parse_status_opt)
-        .transpose()?;
-    let typed_tier = request.tier.as_deref().map(parse_tier_opt).transpose()?;
-    let typed_is_pinned = request.is_pinned.unwrap_or(false);
-    let typed_statement = request
-        .statement
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let typed_supporting_refs = normalize_refs(request.supporting_refs.as_deref());
-    let typed_counterexample_refs = normalize_refs(request.counterexample_refs.as_deref());
-    let typed_teaching_refs = normalize_refs(request.teaching_refs.as_deref());
-    let typed_verification_refs = normalize_refs(request.verification_refs.as_deref());
 
     // Chunk the content using the token-aware chunker (issue #57).
     let chunks =
@@ -744,7 +774,7 @@ async fn process_ingest_request(
             &request.wing,
             request.room.as_deref(),
             chunk,
-            &source_type,
+            &validated.source_type,
         );
         let drawer_id = db
             .resolve_available_drawer_id(&preferred_drawer_id)
@@ -756,7 +786,7 @@ async fn process_ingest_request(
                 &db,
                 project_id.as_deref(),
                 &config.ingest_gating.fact_check,
-                confidence,
+                validated.confidence,
             )
             .map_err(internal_error)?
         {
@@ -831,42 +861,43 @@ async fn process_ingest_request(
                 wing: request.wing.clone(),
                 room: request.room.clone(),
                 source_file: Some(source_file),
-                source_type,
+                source_type: validated.source_type,
                 added_at: iso_timestamp(),
                 chunk_index: Some(*chunk_idx as i64),
                 importance: drawer_importance,
             });
             let drawer = Drawer {
-                confidence,
+                confidence: validated.confidence,
                 normalize_version: CURRENT_NORMALIZE_VERSION,
-                memory_kind: typed_memory_kind.unwrap_or(base.memory_kind),
-                domain: typed_domain.unwrap_or(base.domain),
-                field: typed_field
+                memory_kind: validated.typed_memory_kind.unwrap_or(base.memory_kind),
+                domain: validated.typed_domain.unwrap_or(base.domain),
+                field: validated
+                    .typed_field
                     .clone()
                     .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
-                status: typed_status.clone().or(base.status),
-                tier: typed_tier.clone().or(base.tier),
-                is_pinned: typed_is_pinned,
-                statement: typed_statement.clone().or(base.statement),
-                supporting_refs: if typed_supporting_refs.is_empty() {
+                status: validated.typed_status.clone().or(base.status),
+                tier: validated.typed_tier.clone().or(base.tier),
+                is_pinned: validated.typed_is_pinned,
+                statement: validated.typed_statement.clone().or(base.statement),
+                supporting_refs: if validated.typed_supporting_refs.is_empty() {
                     base.supporting_refs
                 } else {
-                    typed_supporting_refs.clone()
+                    validated.typed_supporting_refs.clone()
                 },
-                counterexample_refs: if typed_counterexample_refs.is_empty() {
+                counterexample_refs: if validated.typed_counterexample_refs.is_empty() {
                     base.counterexample_refs
                 } else {
-                    typed_counterexample_refs.clone()
+                    validated.typed_counterexample_refs.clone()
                 },
-                teaching_refs: if typed_teaching_refs.is_empty() {
+                teaching_refs: if validated.typed_teaching_refs.is_empty() {
                     base.teaching_refs
                 } else {
-                    typed_teaching_refs.clone()
+                    validated.typed_teaching_refs.clone()
                 },
-                verification_refs: if typed_verification_refs.is_empty() {
+                verification_refs: if validated.typed_verification_refs.is_empty() {
                     base.verification_refs
                 } else {
-                    typed_verification_refs.clone()
+                    validated.typed_verification_refs.clone()
                 },
                 ..base
             };
