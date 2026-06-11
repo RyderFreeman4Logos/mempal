@@ -1933,6 +1933,10 @@ pub struct StatusResponse {
     /// Effective intelligence mode and local LLM health/degradation state.
     pub intelligence_status: IntelligenceStatusDto,
     pub turn_storage: TurnStorageStatusDto,
+    /// Present when status degraded because the database could not be opened or
+    /// queried. Write paths still fail closed; this is diagnostic-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_diagnostic: Option<DatabaseDiagnosticDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
 }
@@ -2108,6 +2112,15 @@ pub struct QueueStatsDto {
     pub avg_processing_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eta_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DatabaseDiagnosticDto {
+    pub path: String,
+    pub source: String,
+    pub failure_kind: String,
+    pub summary: String,
+    pub hint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

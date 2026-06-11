@@ -98,8 +98,8 @@ use super::tools::{
     CoworkBusDeliveryStatusDto, CoworkBusDoctorDto, CoworkBusEventDto, CoworkBusHandoffAgentDto,
     CoworkBusHandoffDto, CoworkBusHandoffFiltersDto, CoworkBusMessageDto, CoworkBusRequest,
     CoworkBusResponse, CoworkBusSessionDto, CoworkBusTmuxPeekDto, CoworkBusTmuxProbeDto,
-    CoworkPushRequest, CoworkPushResponse, DeleteRequest, DeleteResponse, DoctorMcpDto,
-    DoctorRequest, DoctorResponse, DoctorToolDto, DuplicateWarning, EmbedStatusDto,
+    CoworkPushRequest, CoworkPushResponse, DatabaseDiagnosticDto, DeleteRequest, DeleteResponse,
+    DoctorMcpDto, DoctorRequest, DoctorResponse, DoctorToolDto, DuplicateWarning, EmbedStatusDto,
     EmbedderCircuitDto, EndpointHealthDto, FactCheckRequest, FactCheckResponse,
     FieldTaxonomyEntryDto, FieldTaxonomyResponse, GatingRuntimeStatusDto, IngestControls,
     IngestOperationState, IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest,
@@ -559,8 +559,8 @@ impl MempalMcpServer {
         &self,
         project_scope: ProjectSearchScope,
         turns_config: crate::core::config::TurnsConfig,
-    ) -> std::result::Result<StatusDbSnapshot, ErrorData> {
-        let async_db = self.async_db().await.map_err(db_error)?;
+    ) -> anyhow::Result<StatusDbSnapshot> {
+        let async_db = self.async_db().await?;
         async_db
             .run_read_anyhow(move |db| {
                 let schema_version = db.schema_version()?;
@@ -628,7 +628,7 @@ impl MempalMcpServer {
                 })
             })
             .await
-            .map_err(db_error)
+            .context("status database snapshot failed")
     }
 
     pub(super) async fn resolve_mcp_project_id(
@@ -1294,6 +1294,7 @@ impl Drop for IngestDrainWorkerStartedGuard {
     }
 }
 
+#[derive(Default)]
 struct StatusDbSnapshot {
     schema_version: u32,
     fork_ext_version: u32,
@@ -1319,6 +1320,138 @@ struct StatusDbSnapshot {
     scopes: Vec<ScopeCount>,
     source_type_distribution: Vec<SourceTypeCount>,
     pinned_fact_counts: Vec<PinnedFactProjectCount>,
+}
+
+fn default_queue_stats() -> crate::core::queue::QueueStats {
+    crate::core::queue::QueueStats {
+        pending: 0,
+        claimed: 0,
+        failed: 0,
+        oldest_pending_age_secs: None,
+        rate_per_min: 0.0,
+        avg_processing_ms: None,
+        eta_secs: None,
+    }
+}
+
+fn status_error_summary(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(error) = source {
+        parts.push(error.to_string());
+        source = error.source();
+    }
+    parts.dedup();
+    parts.join(": ")
+}
+
+fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(sqlite) = error.downcast_ref::<rusqlite::Error>()
+            && let Some(kind) = status_rusqlite_failure_kind(sqlite)
+        {
+            return kind;
+        }
+        current = error.source();
+    }
+
+    let summary = status_error_summary(error).to_ascii_lowercase();
+    if summary.contains("database is locked")
+        || summary.contains("database locked")
+        || summary.contains("database is busy")
+        || summary.contains("database busy")
+        || summary.contains("sqlite_busy")
+        || summary.contains("sqlite_locked")
+    {
+        "locked_or_busy"
+    } else if summary.contains("permission denied")
+        || summary.contains("readonly")
+        || summary.contains("read-only")
+        || summary.contains("unable to open database file")
+        || summary.contains("no such file")
+        || summary.contains("not found")
+        || summary.contains("cannot open")
+    {
+        "path_or_permission"
+    } else if summary.contains("not a database")
+        || summary.contains("database disk image is malformed")
+        || summary.contains("malformed")
+        || summary.contains("corrupt")
+    {
+        "corrupt_or_invalid"
+    } else {
+        "unknown"
+    }
+}
+
+fn status_rusqlite_failure_kind(error: &rusqlite::Error) -> Option<&'static str> {
+    match error {
+        rusqlite::Error::SqliteFailure(sqlite, _) => match sqlite.code {
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
+                Some("locked_or_busy")
+            }
+            rusqlite::ErrorCode::CannotOpen
+            | rusqlite::ErrorCode::NotFound
+            | rusqlite::ErrorCode::PermissionDenied
+            | rusqlite::ErrorCode::ReadOnly => Some("path_or_permission"),
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+                Some("corrupt_or_invalid")
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn status_db_failure_hint(kind: &str) -> &'static str {
+    match kind {
+        "locked_or_busy" => {
+            "Check for stale daemon/MCP processes holding palace.db, wait for the writer to finish, then retry status."
+        }
+        "path_or_permission" => {
+            "Check that the configured database path exists, is a SQLite file, and is readable/writable by the current user."
+        }
+        "corrupt_or_invalid" => {
+            "Back up the database files, then inspect or restore palace.db before running repair or init commands."
+        }
+        _ => {
+            "Inspect daemon logs, database holders, file permissions, and SQLite integrity before retrying."
+        }
+    }
+}
+
+fn status_database_diagnostic(
+    db_path: &Path,
+    source: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> DatabaseDiagnosticDto {
+    let failure_kind = status_db_failure_kind(error);
+    DatabaseDiagnosticDto {
+        path: db_path.display().to_string(),
+        source: source.to_string(),
+        failure_kind: failure_kind.to_string(),
+        summary: status_error_summary(error),
+        hint: status_db_failure_hint(failure_kind).to_string(),
+    }
+}
+
+fn record_status_database_diagnostic(
+    system_warnings: &mut Vec<SystemWarning>,
+    database_diagnostic: &mut Option<DatabaseDiagnosticDto>,
+    diagnostic: DatabaseDiagnosticDto,
+) {
+    system_warnings.push(SystemWarning {
+        level: "warn".to_string(),
+        message: format!(
+            "database diagnostic degraded at {}: {} ({})",
+            diagnostic.source, diagnostic.summary, diagnostic.failure_kind
+        ),
+        source: "database".to_string(),
+    });
+    if database_diagnostic.is_none() {
+        *database_diagnostic = Some(diagnostic);
+    }
 }
 
 fn validate_temporal_param(name: &str, value: Option<&str>) -> std::result::Result<(), ErrorData> {
@@ -1955,16 +2088,39 @@ impl MempalMcpServer {
                 },
             },
         };
-        let queue_stats = self.async_queue.stats().await.map_err(|error| {
-            ErrorData::internal_error(format!("queue stats failed: {error}"), None)
-        })?;
-        let db_snapshot = self
+        let mut system_warnings = current_system_warnings();
+        let mut database_diagnostic = None;
+        let queue_stats = match self.async_queue.stats().await {
+            Ok(stats) => stats,
+            Err(error) => {
+                let diagnostic = status_database_diagnostic(&self.db_path, "queue_stats", &error);
+                record_status_database_diagnostic(
+                    &mut system_warnings,
+                    &mut database_diagnostic,
+                    diagnostic,
+                );
+                default_queue_stats()
+            }
+        };
+        let db_snapshot = match self
             .load_status_db_snapshot(project_scope, config.turns.clone())
-            .await?;
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let diagnostic =
+                    status_database_diagnostic(&self.db_path, "status_snapshot", error.as_ref());
+                record_status_database_diagnostic(
+                    &mut system_warnings,
+                    &mut database_diagnostic,
+                    diagnostic,
+                );
+                StatusDbSnapshot::default()
+            }
+        };
         let endpoint_health = crate::endpoint_health::probe_endpoints(config.as_ref()).await;
         let embed_snapshot = global_embed_status().snapshot();
         let intelligence_snapshot = crate::intelligence::global_intelligence_status().snapshot();
-        let mut system_warnings = current_system_warnings();
         let db_holders = crate::process_diagnostics::inspect_db_holders(&self.db_path);
         let vector_search_circuit =
             VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
@@ -2004,28 +2160,50 @@ impl MempalMcpServer {
             crate::core::queue::failure_headline_count(embed_snapshot.fail_count, &queue_stats);
         let config_for_gating_status = Arc::clone(&config);
         let restart_required_config_changes = ConfigHandle::restart_required_pending();
-        let async_db = self.async_db().await.map_err(|error| {
-            ErrorData::internal_error(format!("async db init failed: {error}"), None)
-        })?;
-        let ingest_gating_status = async_db
-            .run_read_anyhow(move |db| {
-                let gating_drop_counts = db
-                    .gating_drop_counts()
-                    .context("gating drop counts failed")?;
-                let dropped_total = gating_drop_counts
-                    .total
-                    .unwrap_or_else(|| gating_drop_counts.by_reason.values().copied().sum::<u64>());
-                crate::observability::gating_runtime_status(
-                    db,
-                    config_for_gating_status.as_ref(),
-                    dropped_total,
-                    restart_required_config_changes,
-                )
-            })
-            .await
-            .map_err(|error| {
-                ErrorData::internal_error(format!("ingest gating status failed: {error}"), None)
-            })?;
+        let ingest_gating_status = match self.async_db().await {
+            Ok(async_db) => match async_db
+                .run_read_anyhow(move |db| {
+                    let gating_drop_counts = db
+                        .gating_drop_counts()
+                        .context("gating drop counts failed")?;
+                    let dropped_total = gating_drop_counts.total.unwrap_or_else(|| {
+                        gating_drop_counts.by_reason.values().copied().sum::<u64>()
+                    });
+                    crate::observability::gating_runtime_status(
+                        db,
+                        config_for_gating_status.as_ref(),
+                        dropped_total,
+                        restart_required_config_changes,
+                    )
+                })
+                .await
+            {
+                Ok(status) => GatingRuntimeStatusDto::from(status),
+                Err(error) => {
+                    let diagnostic = status_database_diagnostic(
+                        &self.db_path,
+                        "ingest_gating_status",
+                        error.as_ref(),
+                    );
+                    record_status_database_diagnostic(
+                        &mut system_warnings,
+                        &mut database_diagnostic,
+                        diagnostic,
+                    );
+                    GatingRuntimeStatusDto::default()
+                }
+            },
+            Err(error) => {
+                let diagnostic =
+                    status_database_diagnostic(&self.db_path, "async_db", error.as_ref());
+                record_status_database_diagnostic(
+                    &mut system_warnings,
+                    &mut database_diagnostic,
+                    diagnostic,
+                );
+                GatingRuntimeStatusDto::default()
+            }
+        };
 
         Ok(Json(StatusResponse {
             schema_version: db_snapshot.schema_version,
@@ -2094,7 +2272,7 @@ impl MempalMcpServer {
                     .as_str()
                     .to_string(),
             },
-            ingest_gating_status: GatingRuntimeStatusDto::from(ingest_gating_status),
+            ingest_gating_status,
             queue_stats: QueueStatsDto {
                 pending: queue_stats.pending,
                 claimed: queue_stats.claimed,
@@ -2129,6 +2307,7 @@ impl MempalMcpServer {
                 raw_turn_wings: config.turns.raw_turn_wings.clone(),
                 raw_turn_rooms: config.turns.raw_turn_rooms.clone(),
             },
+            database_diagnostic,
             system_warnings,
         }))
     }
@@ -8481,6 +8660,75 @@ mod tests {
         assert!(json.get("embed_status").is_some());
         assert!(json.get("stale_drawer_count").is_some());
         assert!(json.get("system_warnings").is_some());
+    }
+
+    #[test]
+    fn test_status_database_diagnostic_classifies_sqlite_failures() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy,
+                extended_code: rusqlite::ffi::SQLITE_BUSY,
+            },
+            Some("database is locked".to_string()),
+        );
+        let permission = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::PermissionDenied,
+                extended_code: rusqlite::ffi::SQLITE_PERM,
+            },
+            Some("permission denied".to_string()),
+        );
+        let invalid = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::NotADatabase,
+                extended_code: rusqlite::ffi::SQLITE_NOTADB,
+            },
+            Some("file is not a database".to_string()),
+        );
+
+        assert_eq!(status_db_failure_kind(&busy), "locked_or_busy");
+        assert_eq!(status_db_failure_kind(&permission), "path_or_permission");
+        assert_eq!(status_db_failure_kind(&invalid), "corrupt_or_invalid");
+    }
+
+    #[tokio::test]
+    async fn test_mempal_status_returns_diagnostic_when_database_cannot_open() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        fs::create_dir(&db_path).expect("create directory at db path");
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server");
+
+        let status = server.mempal_status().await.expect("status").0;
+        let diagnostic = status
+            .database_diagnostic
+            .expect("database diagnostic should be present");
+
+        assert_eq!(diagnostic.path, db_path.display().to_string());
+        assert_eq!(diagnostic.failure_kind, "path_or_permission");
+        assert!(
+            diagnostic.summary.contains("failed")
+                || diagnostic.summary.contains("unable")
+                || diagnostic.summary.contains("directory"),
+            "diagnostic summary should include the underlying open failure: {}",
+            diagnostic.summary
+        );
+        assert!(!diagnostic.hint.is_empty());
+        assert_eq!(status.queue_stats.pending, 0);
+        assert_eq!(status.queue_stats.claimed, 0);
+        assert_eq!(status.queue_stats.failed, 0);
+        assert!(status.system_warnings.iter().any(|warning| {
+            warning.source == "database" && warning.message.contains("path_or_permission")
+        }));
+        assert!(
+            server.open_db().is_err(),
+            "diagnostic status must not make write/open paths succeed"
+        );
     }
 
     #[tokio::test]
