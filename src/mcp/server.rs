@@ -862,6 +862,32 @@ impl MempalMcpServer {
         }
     }
 
+    async fn ingest_system_warnings_with_stale_index_bounded(
+        &self,
+        deadline: Duration,
+    ) -> std::result::Result<Vec<SystemWarning>, ErrorData> {
+        match self
+            .run_read_anyhow_bounded(|db| Ok(system_warnings_with_stale_index(db)), deadline)
+            .await
+        {
+            Ok(Some(warnings)) => Ok(warnings),
+            Ok(None) => {
+                let mut warnings = current_system_warnings();
+                warnings.push(SystemWarning {
+                    level: "warn".to_string(),
+                    message: mcp_stage_timeout_warning("stale vector index check", deadline),
+                    source: "mcp_timeout".to_string(),
+                });
+                Ok(warnings)
+            }
+            Err(error) => Err(database_write_refused_error(
+                &self.db_path,
+                "stale vector index check",
+                error.as_ref(),
+            )),
+        }
+    }
+
     pub async fn search_json_for_test(
         &self,
         value: Value,
@@ -3478,20 +3504,26 @@ impl MempalMcpServer {
         request: IngestRequest,
         controls: IngestControls,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
-        self.spawn_ingest_drain_worker();
         let dry_run = request.dry_run.unwrap_or(false);
         if !dry_run && global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
         }
+        if !dry_run && let Err(error) = self.async_db().await {
+            return Err(database_write_refused_error(
+                &self.db_path,
+                "async_db",
+                error.as_ref(),
+            ));
+        }
+        self.spawn_ingest_drain_worker();
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let room = request.room.as_deref();
         // Snapshot the request-wide warnings once so every early-return path reports a
         // consistent set from a single `sqlite_master` read. A mid-request embed transition
-        // to degraded is not lost: the synchronous degraded-write guard below
-        // (`should_block_writes`) re-reads fresh status via `degraded_write_error()` and
-        // rejects before any success response that would carry this snapshot is built.
+        // to degraded is not lost: the degraded-write guards above reject before any
+        // success response that would carry this snapshot is built.
         let request_system_warnings = self
-            .system_warnings_with_stale_index_bounded(self.ingest_admission_deadline)
+            .ingest_system_warnings_with_stale_index_bounded(self.ingest_admission_deadline)
             .await?;
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
@@ -3575,6 +3607,13 @@ impl MempalMcpServer {
         let operation_id = match self.enqueue_ingest_operation(payload).await {
             Ok(operation_id) => operation_id,
             Err(error) => {
+                if let Some(error) = maybe_database_write_refused_error(
+                    &self.db_path,
+                    "enqueue_ingest_operation",
+                    error.as_ref(),
+                ) {
+                    return Err(error);
+                }
                 return Err(ErrorData::internal_error(
                     format!("failed to enqueue ingest operation: {error}"),
                     None,
@@ -3769,12 +3808,13 @@ impl MempalMcpServer {
         let scrubbed_content =
             config.scrub_content_with_compiled(&request.content, compiled_privacy.as_ref());
         let room = request.room.as_deref();
-        let db = self.open_db()?;
+        let db = Database::open(&self.db_path).map_err(|error| {
+            database_write_refused_error(&self.db_path, "sync_ingest_open_db", &error)
+        })?;
         // Snapshot the request-wide warnings once so every early-return path reports a
         // consistent set from a single `sqlite_master` read. A mid-request embed transition
-        // to degraded is not lost: the synchronous degraded-write guard below
-        // (`should_block_writes`) re-reads fresh status via `degraded_write_error()` and
-        // rejects before any success response that would carry this snapshot is built.
+        // to degraded is not lost: the degraded-write guard above rejects before any
+        // success response that would carry this snapshot is built.
         let request_system_warnings = system_warnings_with_stale_index(&db);
         let no_gate = controls.no_gate;
         let bypass_novelty = controls.bypass_novelty;
@@ -7536,8 +7576,57 @@ fn current_vector_dim(
 fn degraded_write_error() -> ErrorData {
     let warnings = current_system_warnings();
     let message = "mempal embed backend degraded; writes are paused until recovery. Read operations remain available.";
-    let data = serde_json::to_value(&warnings).ok();
+    let data = Some(serde_json::json!({
+        "reason": "embed_degraded",
+        "action": "write_refused",
+        "system_warnings": warnings,
+    }));
     ErrorData::internal_error(message, data)
+}
+
+fn maybe_database_write_refused_error(
+    db_path: &Path,
+    stage: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> Option<ErrorData> {
+    let diagnostic = status_database_diagnostic(db_path, stage, error);
+    if diagnostic.failure_kind == "unknown" {
+        return None;
+    }
+    Some(database_write_refused_error_from_diagnostic(diagnostic))
+}
+
+fn database_write_refused_error(
+    db_path: &Path,
+    stage: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> ErrorData {
+    let diagnostic = status_database_diagnostic(db_path, stage, error);
+    database_write_refused_error_from_diagnostic(diagnostic)
+}
+
+fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDto) -> ErrorData {
+    let warning = SystemWarning {
+        level: "warn".to_string(),
+        message: format!(
+            "database diagnostic degraded at {}: {} ({})",
+            diagnostic.source, diagnostic.summary, diagnostic.failure_kind
+        ),
+        source: "database".to_string(),
+    };
+    let message = format!(
+        "mempal database degraded; writes are refused to preserve memory integrity. {}: {} ({}). {}",
+        diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
+    );
+    ErrorData::internal_error(
+        message,
+        Some(serde_json::json!({
+            "reason": "database_degraded",
+            "action": "write_refused",
+            "database_diagnostic": diagnostic,
+            "system_warnings": [warning],
+        })),
+    )
 }
 
 pub(super) fn current_system_warnings() -> Vec<SystemWarning> {
@@ -8965,6 +9054,71 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn test_mcp_ingest_database_write_refused_error_classifies_sqlite_busy() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy,
+                extended_code: rusqlite::ffi::SQLITE_BUSY,
+            },
+            Some("database is locked".to_string()),
+        );
+
+        let error = database_write_refused_error(Path::new("/tmp/palace.db"), "async_db", &busy);
+
+        assert!(error.message.contains("writes are refused"));
+        assert!(error.message.contains("locked_or_busy"));
+        let data = error.data.expect("structured error data");
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("database_degraded")
+        );
+        assert_eq!(
+            data.get("action").and_then(Value::as_str),
+            Some("write_refused")
+        );
+        let diagnostic = data
+            .get("database_diagnostic")
+            .expect("database diagnostic payload");
+        assert_eq!(
+            diagnostic.get("path").and_then(Value::as_str),
+            Some("/tmp/palace.db")
+        );
+        assert_eq!(
+            diagnostic.get("source").and_then(Value::as_str),
+            Some("async_db")
+        );
+        assert_eq!(
+            diagnostic.get("failure_kind").and_then(Value::as_str),
+            Some("locked_or_busy")
+        );
+        assert!(
+            diagnostic
+                .get("summary")
+                .and_then(Value::as_str)
+                .is_some_and(|summary| summary.contains("database is locked")),
+            "diagnostic summary should include the SQLite lock message: {diagnostic}"
+        );
+        assert_eq!(
+            diagnostic.get("hint").and_then(Value::as_str),
+            Some(
+                "Check for stale daemon/MCP processes holding palace.db, wait for the writer to finish, then retry status."
+            )
+        );
+        assert!(
+            data.get("system_warnings")
+                .and_then(Value::as_array)
+                .is_some_and(|warnings| warnings.iter().any(|warning| {
+                    warning.get("source").and_then(Value::as_str) == Some("database")
+                        && warning
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .is_some_and(|message| message.contains("locked_or_busy"))
+                })),
+            "structured data should include database system warning: {data}"
+        );
+    }
+
     #[tokio::test]
     async fn test_mcp_search_returns_diagnostic_when_database_cannot_open() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -9040,6 +9194,71 @@ mod tests {
         assert!(
             server.open_db().is_err(),
             "diagnostic status must not make write/open paths succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_returns_structured_error_when_database_cannot_open() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        fs::create_dir(&db_path).expect("create directory at db path");
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server");
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "database-open failure should be transport-safe".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("diagnostic".to_string()),
+                dry_run: Some(false),
+                wait: Some(true),
+                wait_timeout_secs: Some(10),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(_) => panic!("ingest should return a structured MCP error"),
+            Err(error) => error,
+        };
+
+        assert!(error.message.contains("writes are refused"));
+        assert!(error.message.contains("path_or_permission"));
+        let data = error.data.expect("structured error data");
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("database_degraded")
+        );
+        assert_eq!(
+            data.get("action").and_then(Value::as_str),
+            Some("write_refused")
+        );
+        let diagnostic = data
+            .get("database_diagnostic")
+            .expect("database diagnostic payload");
+        assert_eq!(
+            diagnostic.get("path").and_then(Value::as_str),
+            Some(db_path.display().to_string()).as_deref()
+        );
+        assert_eq!(
+            diagnostic.get("failure_kind").and_then(Value::as_str),
+            Some("path_or_permission")
+        );
+        assert!(
+            data.get("system_warnings")
+                .and_then(Value::as_array)
+                .is_some_and(|warnings| warnings.iter().any(|warning| {
+                    warning.get("source").and_then(Value::as_str) == Some("database")
+                        && warning
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .is_some_and(|message| message.contains("path_or_permission"))
+                })),
+            "structured data should include database system warning: {data}"
         );
     }
 
