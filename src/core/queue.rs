@@ -13,6 +13,7 @@ use super::config::scrub_sensitive_text;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STARTUP_RECLAIM_STALE_SECS: i64 = 60;
 const COMPLETION_METRICS_WINDOW_MINS: u64 = 10;
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const LAST_ERROR_MAX_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error)]
@@ -338,6 +339,10 @@ impl PendingMessageStore {
         };
         store.reclaim_stale(STARTUP_RECLAIM_STALE_SECS)?;
         Ok(store)
+    }
+
+    pub fn idempotent_message_id(kind: &str, idempotency_key: &str) -> String {
+        idempotent_key_message_id(kind, idempotency_key)
     }
 
     pub fn enqueue(&self, kind: &str, payload: &str) -> Result<String> {
@@ -862,9 +867,7 @@ impl PendingMessageStore {
         busy_timeout: Option<Duration>,
     ) -> Result<Connection> {
         let conn = Connection::open(&self.db_path)?;
-        if let Some(timeout) = busy_timeout {
-            conn.busy_timeout(timeout)?;
-        }
+        conn.busy_timeout(busy_timeout.unwrap_or(DEFAULT_BUSY_TIMEOUT))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(conn)

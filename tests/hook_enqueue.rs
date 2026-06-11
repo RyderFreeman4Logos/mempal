@@ -5,6 +5,8 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 #[cfg(unix)]
+use std::sync::mpsc;
+#[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
 use std::time::Duration;
@@ -69,6 +71,23 @@ fn pending_message_count(db_path: &PathBuf) -> i64 {
         row.get(0)
     })
     .expect("query pending count")
+}
+
+#[cfg(unix)]
+fn hold_sqlite_write_lock(db_path: PathBuf, hold_for: Duration) -> thread::JoinHandle<()> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let conn = Connection::open(db_path).expect("open sqlite lock connection");
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold SQLite write lock");
+        ready_tx.send(()).expect("signal lock ready");
+        thread::sleep(hold_for);
+        conn.execute_batch("ROLLBACK;").expect("release lock");
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("SQLite write lock ready");
+    handle
 }
 
 #[cfg(unix)]
@@ -198,6 +217,34 @@ fn test_hook_post_tool_enqueues_to_queue() {
     let envelope_json: Value = serde_json::from_str(&envelope).expect("envelope json");
     assert_eq!(envelope_json["event"], "PostToolUse");
     assert_eq!(envelope_json["payload"], payload);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_direct_fallback_waits_for_transient_sqlite_busy() {
+    let (home, db_path) = setup_home();
+    let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_millis(300));
+    let payload = r#"{"prompt":"transient sqlite busy should be durable"}"#;
+
+    let output = run_hook(&home, "hook_user_prompt", payload.as_bytes());
+
+    lock.join().expect("lock thread");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must stay empty, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "fallback success must stay quiet, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        pending_message_count(&db_path),
+        1,
+        "hook fallback must persist after a transient SQLite write lock"
+    );
 }
 
 #[cfg(unix)]

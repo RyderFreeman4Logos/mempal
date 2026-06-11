@@ -664,7 +664,7 @@ async fn persist_hook_ipc_request(
     request: crate::hook_ipc::HookIpcEnqueueRequest,
 ) -> crate::hook_ipc::HookIpcEnqueueResponse {
     match store
-        .enqueue_idempotent_with_key_fail_fast(
+        .enqueue_idempotent_with_key(
             request.kind.clone(),
             request.payload.clone(),
             request.idempotency_key.clone(),
@@ -2067,7 +2067,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_hook_ipc_rejects_when_sqlite_persistence_fails() {
+    async fn test_hook_ipc_waits_for_sqlite_persistence_after_client_timeout() {
         super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
@@ -2081,26 +2081,17 @@ mod tests {
         let observer = crate::daemon_bootstrap::DaemonWriteObserver::for_test();
         let request = crate::hook_ipc::HookIpcEnqueueRequest::new(
             HookEvent::UserPromptSubmit.queue_kind(),
-            r#"{"event":"UserPromptSubmit","payload":"not durable"}"#,
+            r#"{"event":"UserPromptSubmit","payload":"durable after lock"}"#,
         );
 
-        let response = tokio::time::timeout(
-            crate::hook_ipc::HOOK_IPC_TIMEOUT,
-            send_hook_ipc_request(store, observer, request),
-        )
-        .await
-        .expect("locked SQLite persistence must reject before hook IPC timeout");
-        match response {
-            crate::hook_ipc::HookIpcEnqueueResponse::Accepted => {
-                panic!("IPC must not ACK before pending_messages persistence")
-            }
-            crate::hook_ipc::HookIpcEnqueueResponse::Error { message } => {
-                assert!(
-                    message.contains("failed to persist hook IPC capture"),
-                    "{message}"
-                );
-            }
-        }
+        let mut response_task =
+            tokio::spawn(async move { send_hook_ipc_request(store, observer, request).await });
+        assert!(
+            tokio::time::timeout(crate::hook_ipc::HOOK_IPC_TIMEOUT, &mut response_task)
+                .await
+                .is_err(),
+            "locked SQLite persistence must not ACK before durability"
+        );
         let count_while_locked: i64 = rusqlite::Connection::open(&db_path)
             .expect("open read connection")
             .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
@@ -2110,6 +2101,18 @@ mod tests {
         assert_eq!(count_while_locked, 0);
 
         lock_conn.execute_batch("ROLLBACK;").expect("release lock");
+        let response = response_task.await.expect("IPC response task");
+        assert_eq!(response, crate::hook_ipc::HookIpcEnqueueResponse::Accepted);
+        let (count_after_unlock, payload): (i64, String) = rusqlite::Connection::open(&db_path)
+            .expect("open read connection")
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(payload), '') FROM pending_messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query pending after unlock");
+        assert_eq!(count_after_unlock, 1);
+        assert!(payload.contains("durable after lock"), "{payload}");
     }
 
     #[cfg(unix)]

@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use crate::core::{
     config::{Config, ConfigHandle, TurnStorageMode, default_config_path},
-    db::Database,
     queue::PendingMessageStore,
     strata::is_raw_turn,
     utils::current_timestamp,
@@ -146,25 +145,7 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
         },
     );
 
-    let db = match Database::open(&db_path) {
-        Ok(db) => db,
-        Err(error) => {
-            let msg = format!(
-                "failed to open database for hook enqueue after {}: {error:#}",
-                fallback.reason()
-            );
-            crate::hook_diagnostics::log_hook_failure(
-                &mempal_home,
-                event_name,
-                &crate::hook_diagnostics::HookOutcome::Dropped {
-                    error: format!("{error:#}"),
-                    stage: "db_open".to_string(),
-                },
-            );
-            anyhow::bail!(msg);
-        }
-    };
-    let store = match PendingMessageStore::new(db.path()) {
+    let store = match PendingMessageStore::new(&db_path) {
         Ok(store) => store,
         Err(error) => {
             crate::hook_diagnostics::log_hook_failure(

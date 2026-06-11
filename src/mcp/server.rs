@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::adoption_analytics::build_runtime_adoption_analytics;
 use crate::brief::brief_from_context;
@@ -26,7 +26,7 @@ use crate::core::{
         runtime_adoption_instrumentation_policy, should_write_checked_record,
     },
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
-    queue::{AsyncPendingMessageStore, ClaimedMessage},
+    queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore},
     reindex::ReindexProgressStore,
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
@@ -137,6 +137,22 @@ const MCP_SEARCH_DB_DEADLINE: Duration = Duration::from_secs(30);
 const MCP_SEARCH_STALE_INDEX_DEADLINE: Duration = Duration::from_secs(2);
 const MCP_INGEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
+
+fn mcp_ingest_idempotency_key(payload: &str) -> String {
+    let now_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos(),
+        Err(_) => 0,
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mempal mcp ingest admission v1");
+    hasher.update(&[0]);
+    hasher.update(&now_ns.to_le_bytes());
+    hasher.update(&[0]);
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(&[0]);
+    hasher.update(payload.as_bytes());
+    format!("mcp-ingest-{}", hasher.finalize().to_hex())
+}
 
 #[derive(Clone)]
 pub struct MempalMcpServer {
@@ -3480,11 +3496,7 @@ impl MempalMcpServer {
         let payload = serde_json::to_string(&prepared).map_err(|error| {
             ErrorData::internal_error(format!("failed to serialize ingest request: {error}"), None)
         })?;
-        let operation_id = match self
-            .async_queue
-            .enqueue(INGEST_ASYNC_KIND.to_string(), payload)
-            .await
-        {
+        let operation_id = match self.enqueue_ingest_operation(payload).await {
             Ok(operation_id) => operation_id,
             Err(error) => {
                 return Err(ErrorData::internal_error(
@@ -3537,6 +3549,51 @@ impl MempalMcpServer {
         }
 
         Ok(Json(queued_response))
+    }
+
+    async fn enqueue_ingest_operation(&self, payload: String) -> anyhow::Result<String> {
+        let idempotency_key = mcp_ingest_idempotency_key(&payload);
+        if let Some(operation_id) = self
+            .try_enqueue_ingest_operation_via_daemon(payload.clone(), idempotency_key.clone())
+            .await?
+        {
+            return Ok(operation_id);
+        }
+
+        self.async_queue
+            .enqueue_idempotent_with_key(INGEST_ASYNC_KIND.to_string(), payload, idempotency_key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn try_enqueue_ingest_operation_via_daemon(
+        &self,
+        payload: String,
+        idempotency_key: String,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(mempal_home) = self.db_path.parent().map(Path::to_path_buf) else {
+            return Ok(None);
+        };
+        let operation_id =
+            PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &idempotency_key);
+        let request = crate::hook_ipc::HookIpcEnqueueRequest {
+            kind: INGEST_ASYNC_KIND.to_string(),
+            payload,
+            idempotency_key,
+        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::hook_ipc::enqueue_with_default_timeout(&mempal_home, request)
+        })
+        .await
+        .context("blocking daemon ingest enqueue IPC failed")?;
+
+        match outcome {
+            crate::hook_ipc::HookIpcClientOutcome::Accepted => Ok(Some(operation_id)),
+            crate::hook_ipc::HookIpcClientOutcome::Fallback(reason) => {
+                tracing::debug!(reason = %reason, "daemon ingest enqueue unavailable; using local queue");
+                Ok(None)
+            }
+        }
     }
 
     async fn prepare_async_ingest_operation(
@@ -7952,6 +8009,54 @@ mod tests {
         .expect("create MCP server")
         .with_async_db_for_test(async_db);
         (tempdir, db_path, server)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_mcp_ingest_admission_prefers_daemon_ipc_queue() {
+        let (tempdir, db_path, server) = setup_server();
+        let (listener, _socket_guard) =
+            crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
+            let request = crate::hook_ipc::read_enqueue_request(&mut stream)
+                .await
+                .expect("read daemon IPC request");
+            crate::hook_ipc::write_enqueue_response(
+                &mut stream,
+                &crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
+            )
+            .await
+            .expect("write daemon IPC response");
+            request
+        });
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "daemon-owned MCP queue admission".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("busy".to_string()),
+                wait: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("ingest admission should succeed")
+            .0;
+
+        let request = daemon.await.expect("daemon IPC task");
+        assert_eq!(request.kind, INGEST_ASYNC_KIND);
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        assert_eq!(
+            operation_id,
+            PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key)
+        );
+        let local_record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(operation_id)
+            .expect("query local queue");
+        assert!(
+            local_record.is_none(),
+            "MCP admission should not write the local queue when daemon IPC accepts"
+        );
     }
 
     #[tokio::test]
