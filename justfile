@@ -59,9 +59,9 @@ test-onnx:
 build:
     cargo build --release --all-features
 
-# Install mempal binary to /usr/local/bin.
+# Install mempal binary to /usr/local/bin with REST enabled.
 install:
-    CARGO_HOME=/usr/local cargo install --path . --force
+    CARGO_INSTALL_ROOT="${CARGO_INSTALL_ROOT:-/usr/local}"; cargo install --path . --locked --features rest --force --root "$CARGO_INSTALL_ROOT"
 
 # Bump patch version (requires cargo-edit).
 bump-patch:

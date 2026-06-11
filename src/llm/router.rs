@@ -65,7 +65,7 @@ impl LlmRouter {
         request: &LlmRequest,
         heartbeat: Option<&HeartbeatCallback>,
     ) -> Result<RoutedLlmResponse, LlmError> {
-        let mut last_retryable = None;
+        let mut last_non_cooldown_retryable = None;
         let mut earliest_retry_after: Option<Duration> = None;
         for endpoint in self.endpoints.iter() {
             if let Some(retry_after) = endpoint.temporary_unavailable_remaining().await {
@@ -96,13 +96,14 @@ impl LlmRouter {
                             Some(current) => current.min(retry_after),
                             None => retry_after,
                         });
+                    } else {
+                        last_non_cooldown_retryable = Some(error);
                     }
-                    last_retryable = Some(error);
                 }
                 Err(error) => return Err(error),
             }
         }
-        match (last_retryable, earliest_retry_after) {
+        match (last_non_cooldown_retryable, earliest_retry_after) {
             (Some(error), _) => Err(error),
             (None, Some(retry_after)) => Err(LlmError::TemporarilyUnavailable {
                 retry_after,
