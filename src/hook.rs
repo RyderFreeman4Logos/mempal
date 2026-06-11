@@ -146,25 +146,21 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
         },
     );
 
-    let db = match Database::open(&db_path) {
-        Ok(db) => db,
+    let database = match Database::open(&db_path) {
+        Ok(database) => database,
         Err(error) => {
-            let msg = format!(
-                "failed to open database for hook enqueue after {}: {error:#}",
-                fallback.reason()
-            );
             crate::hook_diagnostics::log_hook_failure(
                 &mempal_home,
                 event_name,
                 &crate::hook_diagnostics::HookOutcome::Dropped {
                     error: format!("{error:#}"),
-                    stage: "db_open".to_string(),
+                    stage: "db_init".to_string(),
                 },
             );
-            anyhow::bail!(msg);
+            return Err(error).context("failed to initialize pending queue database");
         }
     };
-    let store = match PendingMessageStore::new(db.path()) {
+    let store = match PendingMessageStore::new(&db_path) {
         Ok(store) => store,
         Err(error) => {
             crate::hook_diagnostics::log_hook_failure(
@@ -178,6 +174,7 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
             return Err(error).context("failed to open pending queue");
         }
     };
+    drop(database);
     let enqueue_result = match fallback.identity() {
         FallbackEnqueueIdentity::Fresh => store.enqueue(event.queue_kind(), &payload),
         FallbackEnqueueIdentity::Idempotent { key } => {
