@@ -367,6 +367,7 @@ fn test_fork_ext_v19_to_v20_backfills_op_state_and_normalizes_completion_created
         )
         VALUES
             ('comp-completed', 'hook_event', 1700000000000001, 1700000001, 1700000001234, 1234, 'drawer-1', 'queued', NULL, NULL, '{{"state":"completed"}}'),
+            ('comp-running-stale', 'hook_event', 1700000000000004, 1700000004, 1700000004234, 1234, 'drawer-2', 'running', NULL, NULL, '{{"state":"completed"}}'),
             ('comp-rejected', 'hook_event', 1700000000000002, 1700000002, 1700000002234, 1234, NULL, 'queued', 'policy', NULL, '{{"state":"rejected"}}'),
             ('comp-failed', 'hook_event', 1700000000000003, 1700000003, 1700000003234, 1234, NULL, 'queued', NULL, 'boom', '{{"state":"failed"}}');
 
@@ -397,6 +398,7 @@ fn test_fork_ext_v19_to_v20_backfills_op_state_and_normalizes_completion_created
 
     for (id, expected_op_state) in [
         ("comp-completed", "completed"),
+        ("comp-running-stale", "completed"),
         ("comp-rejected", "rejected"),
         ("comp-failed", "failed"),
     ] {
@@ -418,6 +420,15 @@ fn test_fork_ext_v19_to_v20_backfills_op_state_and_normalizes_completion_created
         )
         .expect("count queued completions");
     assert_eq!(queued_completions, 0);
+
+    let running_completions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_message_completions WHERE op_state = 'running'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count running completions");
+    assert_eq!(running_completions, 0);
 
     let (min_created_len, max_created_len): (i64, i64) = conn
         .query_row(
