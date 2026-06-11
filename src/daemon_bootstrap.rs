@@ -5,7 +5,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
@@ -17,8 +17,17 @@ use crate::core::{
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
+#[cfg(target_os = "linux")]
+use crate::process_diagnostics::{
+    DbHolderRemediationTarget, DbHolderReport, inspect_db_holders_for_startup_remediation,
+};
+
 const DAEMON_STALL_SECONDS: u64 = 5 * 60;
 const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
+#[cfg(target_os = "linux")]
+const DB_HOLDER_TERM_GRACE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const DB_HOLDER_TERM_POLL: Duration = Duration::from_millis(100);
 
 pub type SharedDatabase = Arc<AsyncMutex<Database>>;
 
@@ -240,9 +249,7 @@ fn bootstrap_inner(
 
     // harness-point: PR0
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::DbOpen);
-    let db = Database::open(&db_path).context("failed to open daemon database")?;
-    let async_db = AsyncDb::open(&db_path, 4).context("failed to open daemon async database")?;
-    let store = AsyncPendingMessageStore::new(db.path()).context("failed to open pending queue")?;
+    let (db, async_db, store) = open_daemon_storage_with_remediation(&db_path)?;
     let db = Arc::new(AsyncMutex::new(db));
     let write_observer = DaemonWriteObserver::new();
 
@@ -266,6 +273,313 @@ fn bootstrap_inner(
         _pid_guard: pid_guard,
         _lock_guard: lock_guard,
     })
+}
+
+fn open_daemon_storage_with_remediation(
+    db_path: &Path,
+) -> Result<(Database, AsyncDb, AsyncPendingMessageStore)> {
+    match open_daemon_storage_once(db_path) {
+        Ok(handles) => Ok(handles),
+        Err(error) if is_sqlite_lock_error(&error) => {
+            #[cfg(target_os = "linux")]
+            {
+                open_daemon_storage_after_stale_holder_cleanup(db_path, error)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn open_daemon_storage_once(
+    db_path: &Path,
+) -> Result<(Database, AsyncDb, AsyncPendingMessageStore)> {
+    let db = Database::open(db_path).context("failed to open daemon database")?;
+    let async_db = AsyncDb::open(db_path, 4).context("failed to open daemon async database")?;
+    let store = AsyncPendingMessageStore::new(db.path()).context("failed to open pending queue")?;
+    Ok((db, async_db, store))
+}
+
+fn is_sqlite_lock_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("database is locked")
+            || message.contains("database file is locked")
+            || message.contains("database is busy")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_daemon_storage_after_stale_holder_cleanup(
+    db_path: &Path,
+    first_error: anyhow::Error,
+) -> Result<(Database, AsyncDb, AsyncPendingMessageStore)> {
+    let before = inspect_db_holders_for_startup_remediation(db_path);
+    let plan = crate::process_diagnostics::plan_stale_db_holder_remediation(&before);
+    let mut remediation_errors = Vec::new();
+
+    let mut termination_outcome = DbHolderTerminationOutcome::default();
+    if !plan.terminate_targets.is_empty() {
+        termination_outcome = terminate_db_holder_targets(
+            db_path,
+            &plan.terminate_targets,
+            DB_HOLDER_TERM_GRACE,
+            DB_HOLDER_TERM_POLL,
+        );
+        remediation_errors.extend(termination_outcome.errors.clone());
+    }
+
+    match open_daemon_storage_once(db_path) {
+        Ok(handles) => Ok(handles),
+        Err(error) if is_sqlite_lock_error(&error) => {
+            let after = inspect_db_holders_for_startup_remediation(db_path);
+            let terminated_pids = termination_outcome.signaled;
+            Err(anyhow::anyhow!(
+                "{}",
+                crate::process_diagnostics::format_db_lock_remediation_hint(
+                    db_path,
+                    &format!(
+                        "{}; initial error: {}",
+                        format_error_chain(&error),
+                        format_error_chain(&first_error)
+                    ),
+                    &after,
+                    &terminated_pids,
+                    &remediation_errors,
+                )
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DbHolderTerminationOutcome {
+    signaled: Vec<i32>,
+    killed: Vec<i32>,
+    errors: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DbHolderSignalAttempt {
+    Signaled,
+    IdentityMismatch(String),
+    SignalFailed(String),
+}
+
+#[cfg(target_os = "linux")]
+trait DbHolderProcessOps {
+    fn inspect_holders(&mut self) -> DbHolderReport;
+    fn signal(&mut self, pid: i32, signal: i32) -> Result<()>;
+    fn is_running(&mut self, pid: i32) -> Result<bool>;
+    fn sleep(&mut self, duration: Duration);
+}
+
+#[cfg(target_os = "linux")]
+struct RealDbHolderProcessOps<'a> {
+    db_path: &'a Path,
+}
+
+#[cfg(target_os = "linux")]
+impl DbHolderProcessOps for RealDbHolderProcessOps<'_> {
+    fn inspect_holders(&mut self) -> DbHolderReport {
+        inspect_db_holders_for_startup_remediation(self.db_path)
+    }
+
+    fn signal(&mut self, pid: i32, signal: i32) -> Result<()> {
+        signal_pid(pid, signal)
+    }
+
+    fn is_running(&mut self, pid: i32) -> Result<bool> {
+        process_is_running(pid)
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_db_holder_targets(
+    db_path: &Path,
+    targets: &[DbHolderRemediationTarget],
+    grace: Duration,
+    poll: Duration,
+) -> DbHolderTerminationOutcome {
+    let mut ops = RealDbHolderProcessOps { db_path };
+    terminate_db_holder_targets_with_ops(targets, &mut ops, grace, poll)
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_db_holder_targets_with_ops(
+    targets: &[DbHolderRemediationTarget],
+    ops: &mut impl DbHolderProcessOps,
+    grace: Duration,
+    poll: Duration,
+) -> DbHolderTerminationOutcome {
+    let mut outcome = DbHolderTerminationOutcome::default();
+    let mut remaining = Vec::new();
+
+    for target in targets {
+        match signal_matching_db_holder(target, libc::SIGTERM, ops, "SIGTERM") {
+            DbHolderSignalAttempt::Signaled => {
+                outcome.signaled.push(target.pid);
+                remaining.push(target.clone());
+            }
+            DbHolderSignalAttempt::IdentityMismatch(error) => {
+                outcome.errors.push(error);
+            }
+            DbHolderSignalAttempt::SignalFailed(error) => {
+                outcome.errors.push(error);
+                remaining.push(target.clone());
+            }
+        }
+    }
+
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        let mut live = Vec::new();
+        for target in std::mem::take(&mut remaining) {
+            match ops.is_running(target.pid) {
+                Ok(true) => live.push(target),
+                Ok(false) => {}
+                Err(error) => {
+                    outcome
+                        .errors
+                        .push(format!("status pid {} failed: {error}", target.pid));
+                }
+            }
+        }
+        if live.is_empty() {
+            break;
+        }
+        remaining = live;
+        ops.sleep(poll);
+    }
+
+    for target in remaining {
+        match ops.is_running(target.pid) {
+            Ok(true) => match signal_matching_db_holder(&target, libc::SIGKILL, ops, "SIGKILL") {
+                DbHolderSignalAttempt::Signaled => outcome.killed.push(target.pid),
+                DbHolderSignalAttempt::IdentityMismatch(error)
+                | DbHolderSignalAttempt::SignalFailed(error) => outcome.errors.push(error),
+            },
+            Ok(false) => {}
+            Err(error) => outcome
+                .errors
+                .push(format!("status pid {} failed: {error}", target.pid)),
+        }
+    }
+
+    outcome
+}
+
+#[cfg(target_os = "linux")]
+fn signal_matching_db_holder(
+    target: &DbHolderRemediationTarget,
+    signal: i32,
+    ops: &mut impl DbHolderProcessOps,
+    stage: &str,
+) -> DbHolderSignalAttempt {
+    let report = ops.inspect_holders();
+    if !report
+        .holders
+        .iter()
+        .any(|holder| target.matches_holder(holder))
+    {
+        return DbHolderSignalAttempt::IdentityMismatch(format_identity_mismatch_error(
+            target, &report, stage,
+        ));
+    }
+
+    match ops.signal(target.pid, signal) {
+        Ok(()) => DbHolderSignalAttempt::Signaled,
+        Err(error) => DbHolderSignalAttempt::SignalFailed(format!(
+            "{stage} pid {} failed: {error}",
+            target.pid
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn format_identity_mismatch_error(
+    target: &DbHolderRemediationTarget,
+    report: &DbHolderReport,
+    stage: &str,
+) -> String {
+    let current = report
+        .holders
+        .iter()
+        .find(|holder| holder.pid == target.pid)
+        .map(describe_current_holder)
+        .unwrap_or_else(|| "no current holder for this DB".to_string());
+    format!(
+        "{stage} pid {} skipped: planned DB holder identity no longer matches; expected {}; current {}; retry daemon startup or inspect with `mempal status --full` before manual cleanup",
+        target.pid,
+        target.describe(),
+        current
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn describe_current_holder(holder: &crate::process_diagnostics::DbHolderProcess) -> String {
+    let started = holder
+        .started_at_unix_secs
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "pid={} role={} classification={} started_at={} files={}",
+        holder.pid,
+        holder.role,
+        holder.classification,
+        started,
+        holder.opened_files.join(",")
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pid(pid: i32, signal: i32) -> Result<()> {
+    // SAFETY: the PID list comes from exact DB-holder classification for this
+    // database. ESRCH means the process exited between planning and signal.
+    let rc = unsafe { libc::kill(pid, signal) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error).with_context(|| format!("failed to signal pid {pid}"))
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_running(pid: i32) -> Result<bool> {
+    // SAFETY: kill(pid, 0) performs a kernel liveness/permission check without
+    // delivering a signal or dereferencing Rust memory.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error).with_context(|| format!("failed to inspect pid {pid}")),
+    }
 }
 
 fn unix_secs() -> u64 {
@@ -468,6 +782,14 @@ mod tests {
     }
 
     #[test]
+    fn test_sqlite_lock_detection_checks_context_chain() {
+        let error = anyhow::anyhow!("database is locked: Error code 5")
+            .context("failed to open daemon database");
+
+        assert!(is_sqlite_lock_error(&error));
+    }
+
+    #[test]
     fn test_daemon_db_env_path_resolves_missing_relative_path_against_current_dir() -> Result<()> {
         let cwd = std::env::current_dir().context("read current working directory")?;
         let relative = PathBuf::from("tmp-mempal-daemon-db-path.db");
@@ -476,5 +798,177 @@ mod tests {
         assert!(resolved.is_absolute());
         assert_eq!(resolved, cwd.join(&relative));
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct FakeDbHolderOps {
+        reports: Vec<DbHolderReport>,
+        running: std::collections::BTreeMap<i32, bool>,
+        signals: Vec<(i32, i32)>,
+        term_ignored: std::collections::BTreeSet<i32>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DbHolderProcessOps for FakeDbHolderOps {
+        fn inspect_holders(&mut self) -> DbHolderReport {
+            if self.reports.len() > 1 {
+                self.reports.remove(0)
+            } else {
+                self.reports
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| db_holder_report(Vec::new()))
+            }
+        }
+
+        fn signal(&mut self, pid: i32, signal: i32) -> Result<()> {
+            self.signals.push((pid, signal));
+            if signal == libc::SIGKILL
+                || (signal == libc::SIGTERM && !self.term_ignored.contains(&pid))
+            {
+                self.running.insert(pid, false);
+            }
+            Ok(())
+        }
+
+        fn is_running(&mut self, pid: i32) -> Result<bool> {
+            Ok(self.running.get(&pid).copied().unwrap_or(false))
+        }
+
+        fn sleep(&mut self, _duration: Duration) {}
+    }
+
+    #[cfg(target_os = "linux")]
+    fn db_holder_report(
+        holders: Vec<crate::process_diagnostics::DbHolderProcess>,
+    ) -> DbHolderReport {
+        DbHolderReport {
+            db_path: "/tmp/palace.db".to_string(),
+            holder_count: holders.len(),
+            extra_holder_count: holders
+                .iter()
+                .filter(|holder| holder.classification == "extra_holder")
+                .count(),
+            stale_mcp_server_count: holders
+                .iter()
+                .filter(|holder| holder.classification == "stale_mcp_server")
+                .count(),
+            orphan_daemon_count: holders
+                .iter()
+                .filter(|holder| holder.classification == "orphan_daemon")
+                .count(),
+            error: None,
+            holders,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn db_holder(
+        pid: i32,
+        role: &str,
+        classification: &str,
+        started_at_unix_secs: u64,
+    ) -> crate::process_diagnostics::DbHolderProcess {
+        crate::process_diagnostics::DbHolderProcess {
+            pid,
+            role: role.to_string(),
+            classification: classification.to_string(),
+            command: match role {
+                "mempal_mcp_server" => "mempal serve".to_string(),
+                "mempal_daemon" => "mempal daemon".to_string(),
+                _ => "other process".to_string(),
+            },
+            opened_files: vec!["db".to_string()],
+            started_at_unix_secs: Some(started_at_unix_secs),
+            age_secs: None,
+            current_process: classification == "current_process",
+            current_daemon: classification == "current_daemon",
+            current_mcp_server: classification == "current_mcp_server",
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_db_holder_termination_skips_pid_reuse_before_sigterm() {
+        let original = db_holder(77, "mempal_mcp_server", "stale_mcp_server", 1_000);
+        let target = DbHolderRemediationTarget::from_holder(&original);
+        let reused = db_holder(77, "other", "extra_holder", 2_000);
+        let mut ops = FakeDbHolderOps {
+            reports: vec![db_holder_report(vec![reused])],
+            running: [(77, true)].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let outcome = terminate_db_holder_targets_with_ops(
+            &[target],
+            &mut ops,
+            Duration::ZERO,
+            Duration::from_millis(1),
+        );
+
+        assert!(ops.signals.is_empty());
+        assert!(outcome.signaled.is_empty());
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.errors[0].contains("SIGTERM pid 77 skipped"));
+        assert!(outcome.errors[0].contains("classification=stale_mcp_server"));
+        assert!(outcome.errors[0].contains("classification=extra_holder"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_db_holder_termination_skips_pid_reuse_before_sigkill() {
+        let original = db_holder(88, "mempal_daemon", "orphan_daemon", 1_000);
+        let target = DbHolderRemediationTarget::from_holder(&original);
+        let reused = db_holder(88, "mempal_mcp_server", "current_mcp_server", 2_000);
+        let mut ops = FakeDbHolderOps {
+            reports: vec![
+                db_holder_report(vec![original]),
+                db_holder_report(vec![reused]),
+            ],
+            running: [(88, true)].into_iter().collect(),
+            term_ignored: [88].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let outcome = terminate_db_holder_targets_with_ops(
+            &[target],
+            &mut ops,
+            Duration::ZERO,
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(ops.signals, vec![(88, libc::SIGTERM)]);
+        assert_eq!(outcome.signaled, vec![88]);
+        assert!(outcome.killed.is_empty());
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.errors[0].contains("SIGKILL pid 88 skipped"));
+        assert!(outcome.errors[0].contains("classification=orphan_daemon"));
+        assert!(outcome.errors[0].contains("classification=current_mcp_server"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_db_holder_termination_preserves_matching_stale_holder_reap() {
+        let original = db_holder(99, "mempal_mcp_server", "stale_mcp_server", 1_000);
+        let target = DbHolderRemediationTarget::from_holder(&original);
+        let mut ops = FakeDbHolderOps {
+            reports: vec![db_holder_report(vec![original])],
+            running: [(99, true)].into_iter().collect(),
+            term_ignored: [99].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let outcome = terminate_db_holder_targets_with_ops(
+            &[target],
+            &mut ops,
+            Duration::ZERO,
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(ops.signals, vec![(99, libc::SIGTERM), (99, libc::SIGKILL)]);
+        assert_eq!(outcome.signaled, vec![99]);
+        assert_eq!(outcome.killed, vec![99]);
+        assert!(outcome.errors.is_empty());
     }
 }
