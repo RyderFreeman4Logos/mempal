@@ -8,7 +8,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::core::config::LlmConfig;
 
@@ -73,7 +73,7 @@ impl LlmError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
@@ -81,6 +81,7 @@ pub struct LlmClient {
     extra_body: Option<Value>,
     semaphore: Arc<Semaphore>,
     current_max: Arc<AtomicUsize>,
+    concurrency_update_lock: Mutex<()>,
 }
 
 impl LlmClient {
@@ -133,10 +134,12 @@ impl LlmClient {
             extra_body: config.extra_body.clone(),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             current_max: Arc::new(AtomicUsize::new(max_concurrent)),
+            concurrency_update_lock: Mutex::new(()),
         })
     }
 
     pub async fn update_concurrency(&self, new_max: usize) {
+        let _guard = self.concurrency_update_lock.lock().await;
         let new_max = new_max.max(1);
         let old_max = self.current_max.load(Ordering::SeqCst);
         if new_max == old_max {

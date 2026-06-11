@@ -163,41 +163,84 @@ enabled = true
 fn test_llm_restart_required_fields() {
     let config = Config::default();
     let mut changed = config.clone();
+    changed.llm.enabled = true;
+    changed.llm.backend = "other_backend".to_string();
     changed.llm.base_url = Some("http://localhost:8317/v1".to_string());
     changed.llm.model = Some("qwen35-35b-a3b".to_string());
+    changed.llm.api_key = Some("direct-key".to_string());
     changed.llm.api_key_env = Some("LOCAL_ROUTER_API_KEY".to_string());
+    changed.llm.extra_body = Some(serde_json::json!({"foo": "bar"}));
 
     let fields = config.restart_required_fields_changed(&changed);
 
-    assert!(fields.contains(&"llm.base_url"));
-    // llm.model is now hot-reloadable
+    assert!(fields.contains(&"llm.enabled"));
+    assert!(fields.contains(&"llm.backend"));
+    // LLM endpoint/client request fields are hot-reloadable.
+    assert!(!fields.contains(&"llm.base_url"));
     assert!(!fields.contains(&"llm.model"));
-    assert!(fields.contains(&"llm.api_key_env"));
+    assert!(!fields.contains(&"llm.api_key"));
+    assert!(!fields.contains(&"llm.api_key_env"));
+    assert!(!fields.contains(&"llm.extra_body"));
 }
 
 #[test]
 fn test_llm_runtime_allowed_fields_hot_reload() {
     let mut current = Config::default();
+    current.llm.enabled = true;
+    current.llm.backend = "openai_compat".to_string();
     current.llm.base_url = Some("http://localhost:8317/v1".to_string());
     current.llm.model = Some("qwen35-35b-a3b".to_string());
+    current.llm.api_key = Some("direct-key".to_string());
     current.llm.api_key_env = Some("LOCAL_ROUTER_API_KEY".to_string());
 
     let mut candidate = current.clone();
     candidate.llm.base_url = Some("http://localhost:9000/v1".to_string());
     candidate.llm.model = Some("other-model".to_string());
+    candidate.llm.api_key = Some("other-direct-key".to_string());
     candidate.llm.api_key_env = Some("OTHER_KEY".to_string());
+    candidate.llm.extra_body =
+        Some(serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}}));
     candidate.llm.max_concurrent = 4;
     candidate.llm.enabled_for = vec!["gating".to_string(), "distill".to_string()];
 
     let effective = current.merge_runtime_allowed(&candidate);
 
-    assert_eq!(effective.llm.base_url, current.llm.base_url);
-    // llm.model is hot-reloadable — candidate value takes effect
+    assert_eq!(effective.llm.enabled, current.llm.enabled);
+    assert_eq!(effective.llm.backend, current.llm.backend);
+    assert_eq!(effective.llm.base_url, candidate.llm.base_url);
     assert_eq!(effective.llm.model, candidate.llm.model);
-    assert_eq!(effective.llm.api_key_env, current.llm.api_key_env);
+    assert_eq!(effective.llm.api_key, candidate.llm.api_key);
+    assert_eq!(effective.llm.api_key_env, candidate.llm.api_key_env);
+    assert_eq!(effective.llm.extra_body, candidate.llm.extra_body);
     assert_eq!(effective.llm.max_concurrent, 4);
     assert_eq!(
         effective.llm.enabled_for,
         vec!["gating".to_string(), "distill".to_string()]
     );
+}
+
+#[test]
+fn test_llm_lifecycle_change_preserves_live_client_config() {
+    let mut current = Config::default();
+    current.llm.enabled = true;
+    current.llm.backend = "openai_compat".to_string();
+    current.llm.base_url = Some("http://localhost:8317/v1".to_string());
+    current.llm.model = Some("qwen35-35b-a3b".to_string());
+    current.llm.api_key = Some("direct-key".to_string());
+    current.llm.api_key_env = Some("LOCAL_ROUTER_API_KEY".to_string());
+    current.llm.max_concurrent = 2;
+
+    let mut candidate = current.clone();
+    candidate.llm.enabled = false;
+    candidate.llm.base_url = None;
+    candidate.llm.model = None;
+    candidate.llm.api_key = None;
+    candidate.llm.api_key_env = None;
+    candidate.llm.extra_body = None;
+    candidate.llm.max_concurrent = 4;
+    candidate.llm.enabled_for = vec!["distill".to_string()];
+
+    let effective = current.merge_runtime_allowed(&candidate);
+
+    assert_eq!(effective.llm, current.llm);
 }

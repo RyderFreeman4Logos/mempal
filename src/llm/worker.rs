@@ -1,16 +1,17 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::core::AsyncDb;
-use crate::core::config::ConfigHandle;
+use crate::core::config::{Config, ConfigHandle, LlmConfig};
 use crate::core::db::Database;
 use crate::core::queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore};
 use crate::daemon_bootstrap::DaemonWriteObserver;
 
-use super::client::{LlmClient, LlmMessage, LlmRequest};
+use super::client::{LlmClient, LlmError, LlmMessage, LlmRequest};
 use super::retry::{self, HeartbeatCallback};
 use super::status::LlmStatus;
 
@@ -21,6 +22,106 @@ const LLM_VERDICT_KEEP: &str = "keep";
 const LLM_VERDICT_REJECT: &str = "reject";
 
 pub const DEFAULT_GATING_JUDGE_PROMPT: &str = "You are a memory importance judge for a software engineering project memory system.\n\nGiven a piece of content captured from a coding session, determine if it contains IMPORTANT information worth storing long-term. Score from 0.0 to 1.0.\n\nIMPORTANT (score >= 0.7):\n- Architecture or design decisions and their rationale\n- Bug root cause analysis and fix strategies\n- User preferences, workflow choices, or explicit feedback\n- Configuration decisions and why they were made\n- Trade-off evaluations between approaches\n- Security concerns or mitigation strategies\n- Project milestones, status changes, or completion records\n- Integration decisions (which tools, which APIs, why)\n\nNOT IMPORTANT (score < 0.4):\n- Raw tool output (file listings, grep results, git status)\n- Routine code edits without design rationale\n- Build/test output logs\n- Boilerplate file content\n- Simple command execution without decision context\n- Repetitive status checks\n\nRespond with ONLY a JSON object: {\"score\": 0.0-1.0, \"reason\": \"brief explanation\"}";
+
+#[derive(Debug, Clone, PartialEq)]
+struct LlmClientConfigSignature {
+    backend: String,
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    api_key_env: Option<String>,
+    extra_body: Option<Value>,
+    request_timeout_secs: u64,
+}
+
+impl From<&LlmConfig> for LlmClientConfigSignature {
+    fn from(config: &LlmConfig) -> Self {
+        Self {
+            backend: config.backend.clone(),
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+            api_key: config.api_key.clone(),
+            api_key_env: config.api_key_env.clone(),
+            extra_body: config.extra_body.clone(),
+            request_timeout_secs: config.request_timeout_secs,
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct LlmClientRuntime {
+    client: Option<Arc<LlmClient>>,
+    signature: LlmClientConfigSignature,
+}
+
+impl LlmClientRuntime {
+    pub fn new(config: &LlmConfig) -> Self {
+        let client = match LlmClient::from_config(config) {
+            Ok(client) => Some(Arc::new(client)),
+            Err(error) => {
+                tracing::warn!(%error, "LLM client unavailable at startup; worker will retry");
+                None
+            }
+        };
+        Self {
+            client,
+            signature: LlmClientConfigSignature::from(config),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn client_for_config(&mut self, config: &LlmConfig) -> Result<Arc<LlmClient>, LlmError> {
+        let signature = LlmClientConfigSignature::from(config);
+        if self.client.is_none() || self.signature != signature {
+            self.client = Some(Arc::new(LlmClient::from_config(config)?));
+            self.signature = signature;
+            tracing::info!("LLM client rebuilt after config hot-reload");
+        }
+        self.client.as_ref().map(Arc::clone).ok_or_else(|| {
+            LlmError::MissingConfiguration("LLM client unavailable after rebuild".to_string())
+        })
+    }
+}
+
+pub type SharedLlmClientRuntime = Arc<Mutex<LlmClientRuntime>>;
+
+async fn client_for_claimed_generation(
+    client_runtime: &SharedLlmClientRuntime,
+    llm_gen_rx: &mut tokio::sync::watch::Receiver<u64>,
+) -> Result<(Arc<LlmClient>, Arc<Config>), LlmError> {
+    loop {
+        let snapshot = ConfigHandle::current_llm_runtime_snapshot();
+        if !crate::daemon::llm_worker_claim_enabled(snapshot.config.as_ref()) {
+            return Err(LlmError::MissingConfiguration(
+                "LLM worker claim disabled by current config".to_string(),
+            ));
+        }
+
+        let client = {
+            let mut runtime = client_runtime
+                .lock()
+                .expect("LLM client runtime mutex poisoned");
+            runtime.client_for_config(&snapshot.config.llm)
+        }?;
+
+        let new_max = snapshot.config.llm.max_concurrent.max(1);
+        if client.current_max_concurrent() != new_max {
+            client.update_concurrency(new_max).await;
+            tracing::info!("LLM worker: concurrency updated to {new_max}");
+        }
+
+        let observed_generation = *llm_gen_rx.borrow_and_update();
+        if observed_generation == snapshot.generation {
+            return Ok((client, snapshot.config));
+        }
+
+        tracing::info!(
+            from_generation = snapshot.generation,
+            to_generation = observed_generation,
+            "LLM config changed while preparing claimed task; rebuilding client"
+        );
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmTaskPayload {
@@ -37,7 +138,7 @@ pub struct LlmTaskPayload {
 
 pub async fn run_llm_worker(
     store: Arc<AsyncPendingMessageStore>,
-    client: Arc<LlmClient>,
+    client_runtime: SharedLlmClientRuntime,
     status: Arc<LlmStatus>,
     db: AsyncDb,
     write_observer: DaemonWriteObserver,
@@ -59,8 +160,9 @@ pub async fn run_llm_worker(
     }
 
     // Subscribe to LLM config generation changes. When a hot-reloadable LLM
-    // field changes (e.g. model), the receiver value is bumped and any
-    // in-flight task is cancelled so the worker restarts with the new config.
+    // field changes (endpoint, credentials, model, etc.), the receiver value
+    // is bumped and any in-flight task is cancelled so the worker restarts
+    // with the new config.
     let mut llm_gen_rx = ConfigHandle::subscribe_llm_gen();
 
     loop {
@@ -69,18 +171,13 @@ pub async fn run_llm_worker(
             break;
         }
 
-        // Re-read config at the start of each claim cycle so model/timeout
-        // changes are picked up without a full daemon restart.
+        // Re-read config at the start of each claim cycle so runtime-disabled
+        // subsystems stop claiming promptly. The LLM client itself is prepared
+        // only after a task is claimed, using the then-current LLM generation.
         let config = ConfigHandle::current();
         if !crate::daemon::llm_worker_claim_enabled(config.as_ref()) {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
-        }
-
-        let new_max = config.llm.max_concurrent.max(1);
-        if client.current_max_concurrent() != new_max {
-            client.update_concurrency(new_max).await;
-            tracing::info!("LLM worker: concurrency updated to {new_max}");
         }
 
         let message = match store
@@ -103,9 +200,30 @@ pub async fn run_llm_worker(
             }
         };
 
-        // Mark the current generation as seen AFTER claiming so that `changed()`
-        // only fires for changes that happen while THIS task is in-flight.
-        let _ = llm_gen_rx.borrow_and_update();
+        let (client, config) =
+            match client_for_claimed_generation(&client_runtime, &mut llm_gen_rx).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    status.record_failure(&error);
+                    let message_id = message.id.clone();
+                    tracing::warn!(
+                        %error,
+                        message_id,
+                        "LLM client unavailable after claim; releasing task for retry"
+                    );
+                    if let Err(release_error) = store.release_claim(message).await {
+                        tracing::warn!(
+                            ?release_error,
+                            message_id,
+                            "failed to release claimed LLM task after client preparation failure; \
+                             task will be reclaimed by TTL or next startup"
+                        );
+                    }
+                    let retry_interval = ConfigHandle::current().llm.retry_interval_secs.max(1);
+                    tokio::time::sleep(Duration::from_secs(retry_interval)).await;
+                    continue;
+                }
+            };
 
         let message_id = message.id.clone();
         tracing::info!("LLM worker claimed task {message_id}");
@@ -133,11 +251,11 @@ pub async fn run_llm_worker(
         // with the fresh config snapshot.
         let task_result = tokio::select! {
             result = process_llm_task_shared(
-                &client,
+                client.as_ref(),
                 &status,
                 &db,
                 &message.payload,
-                &config,
+                config.as_ref(),
                 Some(heartbeat.as_ref()),
             ) => Some(result),
             _ = llm_gen_rx.changed() => None,
@@ -432,12 +550,15 @@ fn parse_gating_verdict(content: &str) -> (String, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::{Config, IngestGatingConfig, LlmJudgeConfig};
+    use crate::core::config::{Config, ConfigHandle, IngestGatingConfig, LlmJudgeConfig};
+    use crate::core::queue::{AsyncPendingMessageStore, PendingMessageStore};
     use crate::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
+    use crate::daemon_bootstrap::DaemonWriteObserver;
     use crate::ingest::gating::GatingDecision;
     use rusqlite::params;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     fn spawn_runtime_ticker() -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
         let ticks = Arc::new(AtomicU64::new(0));
@@ -504,6 +625,73 @@ mod tests {
         }
     }
 
+    fn worker_test_config(base_url: &str) -> String {
+        format!(
+            r#"
+[config_hot_reload]
+enabled = false
+
+[llm]
+enabled = true
+base_url = "{base_url}"
+model = "test-model"
+enabled_for = ["gating"]
+max_concurrent = 1
+retry_interval_secs = 1
+request_timeout_secs = 5
+
+[ingest_gating.llm_judge]
+enabled = true
+threshold = 0.5
+"#
+        )
+    }
+
+    async fn spawn_counting_llm_server(
+        count: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Json, Router, routing::post};
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let count = Arc::clone(&count);
+                let notify = Arc::clone(&notify);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    notify.notify_waiters();
+                    Json(serde_json::json!({
+                        "id": "test",
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "{\"verdict\":\"keep\",\"score\":0.9}"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "model": "test-model",
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test LLM server");
+        let addr = listener.local_addr().expect("test LLM server address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test LLM server");
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
     fn gating_task(id: &str) -> LlmTaskPayload {
         LlmTaskPayload {
             task_type: "gating".to_string(),
@@ -522,6 +710,86 @@ mod tests {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
             )
             .expect("read LLM audit verdict")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_worker_uses_reloaded_client_when_generation_changes_before_claim_returns() {
+        let _guard = crate::core::config::global_config_test_lock()
+            .lock_owned()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let db_path = tmp.path().join("palace.db");
+
+        let old_count = Arc::new(AtomicUsize::new(0));
+        let new_count = Arc::new(AtomicUsize::new(0));
+        let old_notify = Arc::new(Notify::new());
+        let new_notify = Arc::new(Notify::new());
+        let (old_base_url, old_server) =
+            spawn_counting_llm_server(Arc::clone(&old_count), Arc::clone(&old_notify)).await;
+        let (new_base_url, new_server) =
+            spawn_counting_llm_server(Arc::clone(&new_count), Arc::clone(&new_notify)).await;
+
+        std::fs::write(&config_path, worker_test_config(&old_base_url)).expect("write old config");
+        ConfigHandle::bootstrap_quiet(&config_path).expect("bootstrap old config");
+
+        let db = Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let task = LlmTaskPayload {
+            task_type: "gating".to_string(),
+            drawer_id: "claim-after-reload-drawer".to_string(),
+            drawer_ids: vec![],
+            content: "claim-after-reload content".to_string(),
+            system_prompt: None,
+        };
+        store
+            .enqueue(
+                LLM_TASK_KIND,
+                &serde_json::to_string(&task).expect("serialize task"),
+            )
+            .expect("enqueue LLM task");
+
+        let async_store = AsyncPendingMessageStore::from_store(store)
+            .with_blocking_delay(Duration::from_millis(500));
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
+            &ConfigHandle::current().llm,
+        )));
+        let worker = tokio::spawn(run_llm_worker(
+            Arc::new(async_store),
+            client_runtime,
+            Arc::new(LlmStatus::new(5)),
+            async_db,
+            DaemonWriteObserver::for_test(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::write(&config_path, worker_test_config(&new_base_url)).expect("write new config");
+        ConfigHandle::harness_reload_from_path(&config_path);
+
+        let observed_endpoint = tokio::select! {
+            _ = new_notify.notified() => "new",
+            _ = old_notify.notified() => "old",
+            _ = tokio::time::sleep(Duration::from_secs(5)) => "timeout",
+        };
+
+        worker.abort();
+        let _ = worker.await;
+        old_server.abort();
+        new_server.abort();
+        let _ = old_server.await;
+        let _ = new_server.await;
+
+        assert_eq!(
+            observed_endpoint, "new",
+            "task claimed after LLM generation reload must use the fresh client"
+        );
+        assert_eq!(
+            old_count.load(Ordering::SeqCst),
+            0,
+            "stale pre-reload client must not process a claim returned after reload"
+        );
+        assert_eq!(new_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

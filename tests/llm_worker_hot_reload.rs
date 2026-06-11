@@ -11,7 +11,7 @@ use mempal::core::db::Database;
 use mempal::core::queue::{ClaimedMessage, PendingMessageStore};
 use mempal::llm::client::LlmClient;
 use mempal::llm::status::LlmStatus;
-use mempal::llm::worker::confirm_llm_task;
+use mempal::llm::worker::{LlmClientRuntime, confirm_llm_task};
 use mempal::llm::{LlmError, LlmTaskPayload};
 use tokio::sync::Notify;
 
@@ -197,6 +197,50 @@ model = "model-b"
 }
 
 #[test]
+fn test_llm_gen_increments_on_endpoint_change() {
+    let _guard = TEST_LOCK.lock().expect("test lock");
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+[llm]
+enabled = true
+base_url = "http://127.0.0.1:19999/v1"
+model = "model-stable"
+"#,
+    )
+    .expect("write config");
+    ConfigHandle::bootstrap(&config_path).expect("bootstrap");
+
+    let mut rx = ConfigHandle::subscribe_llm_gen();
+    let gen_before = *rx.borrow_and_update();
+
+    std::fs::write(
+        &config_path,
+        r#"
+[llm]
+enabled = true
+base_url = "http://127.0.0.1:20000/v1"
+model = "model-stable"
+"#,
+    )
+    .expect("write config");
+    ConfigHandle::harness_reload_from_path(&config_path);
+
+    let gen_after = *rx.borrow_and_update();
+    assert!(
+        gen_after > gen_before,
+        "generation must increment when llm.base_url changes (before={gen_before}, after={gen_after})"
+    );
+    assert_eq!(
+        ConfigHandle::current().llm.base_url.as_deref(),
+        Some("http://127.0.0.1:20000/v1")
+    );
+}
+
+#[test]
 fn test_llm_gen_does_not_increment_on_unrelated_change() {
     let _guard = TEST_LOCK.lock().expect("test lock");
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -238,6 +282,54 @@ preview_chars = 200
         gen_after, gen_before,
         "generation must NOT change for non-LLM config changes"
     );
+}
+
+#[test]
+fn test_llm_client_runtime_rebuilds_on_endpoint_change() {
+    let config = LlmConfig {
+        enabled: true,
+        base_url: Some("http://127.0.0.1:19999/v1".to_string()),
+        model: Some("model-stable".to_string()),
+        ..Default::default()
+    };
+    let mut runtime = LlmClientRuntime::new(&config);
+    let first = runtime
+        .client_for_config(&config)
+        .expect("load initial client");
+
+    let mut changed = config.clone();
+    changed.base_url = Some("http://127.0.0.1:20000/v1".to_string());
+    let second = runtime
+        .client_for_config(&changed)
+        .expect("rebuild changed client");
+
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "endpoint changes must rebuild LLM client"
+    );
+}
+
+#[test]
+fn test_llm_client_runtime_recovers_after_invalid_initial_config() {
+    let invalid = LlmConfig {
+        enabled: true,
+        base_url: None,
+        model: Some("model-stable".to_string()),
+        ..Default::default()
+    };
+    let mut runtime = LlmClientRuntime::new(&invalid);
+    assert!(
+        runtime.client_for_config(&invalid).is_err(),
+        "invalid initial config should be retried from the worker loop"
+    );
+
+    let mut fixed = invalid.clone();
+    fixed.base_url = Some("http://127.0.0.1:19999/v1".to_string());
+    let client = runtime
+        .client_for_config(&fixed)
+        .expect("fixed config should build a client");
+
+    assert_eq!(client.current_max_concurrent(), fixed.max_concurrent.max(1));
 }
 
 // ── tokio::select! cancellation ───────────────────────────────────────────────
