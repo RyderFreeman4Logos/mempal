@@ -90,6 +90,35 @@ async fn mcp_stdio_initializes() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn mcp_stdio_initialize_does_not_wait_for_busy_db_or_noop_llm() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let mempal_home = tmp.path().join(".mempal");
+    fs::create_dir_all(&mempal_home)?;
+    let db_path = mempal_home.join("palace.db");
+    Database::open(&db_path)?;
+
+    let lock_conn = rusqlite::Connection::open(&db_path)?;
+    lock_conn.execute_batch("BEGIN EXCLUSIVE;")?;
+
+    let mut client = McpStdio::start(
+        &db_path,
+        HashMap::from([
+            (
+                "MEMPAL_TEST_LLM_BASE_URL".to_string(),
+                "http://127.0.0.1:9/v1".to_string(),
+            ),
+            ("MEMPAL_TEST_LLM_ENABLED_FOR".to_string(), "[]".to_string()),
+        ]),
+    )
+    .await?;
+    let server_info = tokio::time::timeout(Duration::from_secs(2), client.initialize()).await??;
+    assert!(!server_info.server_info.name.trim().is_empty());
+    client.shutdown().await?;
+    lock_conn.execute_batch("ROLLBACK;")?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn harness_integration_smoke() -> Result<()> {
     let tmp = TempDir::new()?;
