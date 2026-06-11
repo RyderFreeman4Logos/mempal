@@ -62,6 +62,165 @@ enabled_for = ["gating", "distill", "compress"]
 }
 
 #[test]
+fn test_llm_config_legacy_scalar_config_yields_one_effective_endpoint() {
+    let config = Config::parse(
+        r#"
+[llm]
+enabled = true
+base_url = "http://localhost:8317/v1"
+model = "qwen35-35b-a3b"
+api_key_env = "LOCAL_ROUTER_API_KEY"
+request_timeout_secs = 45
+max_concurrent = 8
+"#,
+    )
+    .expect("legacy llm config should parse");
+
+    let endpoints = config
+        .llm
+        .effective_endpoints()
+        .expect("legacy endpoint should normalize");
+
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(endpoints[0].id, "legacy");
+    assert_eq!(endpoints[0].base_url, "http://localhost:8317/v1");
+    assert_eq!(endpoints[0].model, "qwen35-35b-a3b");
+    assert_eq!(
+        endpoints[0].api_key_env.as_deref(),
+        Some("LOCAL_ROUTER_API_KEY")
+    );
+    assert_eq!(endpoints[0].request_timeout_secs, 45);
+    assert_eq!(endpoints[0].max_concurrent, 8);
+}
+
+#[test]
+fn test_llm_config_endpoint_list_yields_stable_effective_endpoint_ids() {
+    let config = Config::parse(
+        r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+base_url = "http://primary.local:8317/v1/"
+model = "primary-model"
+
+[[llm.endpoints]]
+id = "lan.backup-1"
+base_url = "http://backup.local:8317/v1"
+model = "backup-model"
+request_timeout_secs = 12
+max_concurrent = 3
+"#,
+    )
+    .expect("endpoint list should parse");
+
+    let endpoints = config
+        .llm
+        .effective_endpoints()
+        .expect("endpoint list should normalize");
+
+    assert_eq!(endpoints.len(), 2);
+    assert_eq!(endpoints[0].id, "endpoint-1");
+    assert_eq!(endpoints[0].base_url, "http://primary.local:8317/v1");
+    assert_eq!(endpoints[0].model, "primary-model");
+    assert_eq!(endpoints[0].request_timeout_secs, 30);
+    assert_eq!(endpoints[0].max_concurrent, 16);
+    assert_eq!(endpoints[1].id, "lan.backup-1");
+    assert_eq!(endpoints[1].request_timeout_secs, 12);
+    assert_eq!(endpoints[1].max_concurrent, 3);
+}
+
+#[test]
+fn test_llm_config_endpoint_list_reports_effective_status_summaries() {
+    let config = Config::parse(
+        r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "primary"
+base_url = "http://primary.local:8317/v1"
+model = "primary-model"
+
+[[llm.endpoints]]
+id = "secondary"
+base_url = "http://secondary.local:8317/v1"
+model = "secondary-model"
+"#,
+    )
+    .expect("endpoint list should parse");
+
+    assert_eq!(
+        config.llm.effective_model_summary().as_deref(),
+        Some("primary=primary-model, secondary=secondary-model")
+    );
+    assert_eq!(
+        config.llm.effective_base_url_summary().as_deref(),
+        Some("primary=http://primary.local:8317/v1, secondary=http://secondary.local:8317/v1")
+    );
+}
+
+#[test]
+fn test_endpoint_pool_external_llm_base_url_warns_but_does_not_block_config() {
+    let config = Config::parse(
+        r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "local"
+base_url = "http://localhost:8317/v1"
+model = "local-model"
+
+[[llm.endpoints]]
+id = "cloud"
+base_url = "https://api.example.com/v1"
+model = "operator-owned-model"
+"#,
+    )
+    .expect("external endpoint pool warning must not block config parsing");
+
+    let warnings = config.collect_runtime_warnings();
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.source == "llm"
+                && warning.message.contains("llm.endpoints[cloud].base_url")
+                && warning.message.contains("api.example.com")
+        }),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn test_llm_config_scalar_and_endpoint_list_conflict_fails_validation() {
+    let err = Config::parse(
+        r#"
+[llm]
+enabled = true
+base_url = "http://localhost:8317/v1"
+model = "legacy-model"
+
+[[llm.endpoints]]
+base_url = "http://backup.local:8317/v1"
+model = "backup-model"
+"#,
+    )
+    .expect_err("scalar endpoint and endpoint list must conflict");
+
+    match err {
+        ConfigError::Validation(message) => {
+            assert!(
+                message.contains("legacy scalar endpoint fields"),
+                "{message}"
+            );
+            assert!(message.contains("base_url"), "{message}");
+            assert!(message.contains("model"), "{message}");
+        }
+        other => panic!("expected ConfigError::Validation, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_memory_intelligence_config_parse_full() {
     let config = Config::parse(
         r#"
@@ -96,6 +255,133 @@ extra_body = { chat_template_kwargs = { enable_thinking = false } }
             .and_then(|value| value.as_bool()),
         Some(false)
     );
+}
+
+#[test]
+fn test_llm_config_memory_intelligence_inherits_endpoint_pool_with_request_overrides() {
+    let config = Config::parse(
+        r#"
+[llm]
+enabled = true
+request_timeout_secs = 30
+
+[[llm.endpoints]]
+id = "primary"
+base_url = "http://primary.local:8317/v1"
+model = "primary-model"
+
+[[llm.endpoints]]
+id = "secondary"
+base_url = "http://secondary.local:8317/v1"
+model = "secondary-model"
+
+[memory_intelligence]
+mode = "local_llm"
+
+[memory_intelligence.llm]
+api_key = "mi-direct-key"
+api_key_env = "MI_LLM_API_KEY"
+timeout_secs = 7
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+"#,
+    )
+    .expect("memory intelligence endpoint-pool overlay should parse");
+
+    assert!(
+        config
+            .memory_intelligence
+            .has_effective_llm_endpoint(&config.llm)
+    );
+    let effective = config.memory_intelligence.effective_llm_config(&config.llm);
+    let endpoints = effective
+        .effective_endpoints()
+        .expect("memory intelligence endpoint pool should normalize");
+
+    assert_eq!(endpoints.len(), 2);
+    assert_eq!(endpoints[0].id, "primary");
+    assert_eq!(endpoints[0].base_url, "http://primary.local:8317/v1");
+    assert_eq!(endpoints[0].model, "primary-model");
+    assert_eq!(endpoints[1].id, "secondary");
+    assert_eq!(endpoints[1].base_url, "http://secondary.local:8317/v1");
+    assert_eq!(endpoints[1].model, "secondary-model");
+    for endpoint in endpoints {
+        assert_eq!(endpoint.api_key.as_deref(), Some("mi-direct-key"));
+        assert_eq!(endpoint.api_key_env.as_deref(), Some("MI_LLM_API_KEY"));
+        assert_eq!(endpoint.request_timeout_secs, 7);
+        assert_eq!(
+            endpoint
+                .extra_body
+                .as_ref()
+                .and_then(|body| body.pointer("/chat_template_kwargs/enable_thinking"))
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+}
+
+#[test]
+fn test_llm_config_memory_intelligence_api_key_env_override_replaces_inherited_direct_key() {
+    let config = Config::parse(
+        r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "primary"
+base_url = "http://primary.local:8317/v1"
+model = "primary-model"
+api_key = "base-direct-key"
+
+[memory_intelligence]
+mode = "local_llm"
+
+[memory_intelligence.llm]
+api_key_env = "MI_LLM_API_KEY"
+"#,
+    )
+    .expect("memory intelligence api_key_env overlay should parse");
+
+    let effective = config.memory_intelligence.effective_llm_config(&config.llm);
+    let endpoints = effective
+        .effective_endpoints()
+        .expect("memory intelligence endpoint pool should normalize");
+
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(endpoints[0].api_key, None);
+    assert_eq!(endpoints[0].api_key_env.as_deref(), Some("MI_LLM_API_KEY"));
+}
+
+#[test]
+fn test_llm_config_memory_intelligence_endpoint_identity_override_replaces_base_endpoint_pool() {
+    let config = Config::parse(
+        r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "base"
+base_url = "http://base.local:8317/v1"
+model = "base-model"
+
+[memory_intelligence]
+mode = "local_llm"
+
+[memory_intelligence.llm]
+base_url = "http://mi.local:18009/v1"
+model = "mi-model"
+"#,
+    )
+    .expect("memory intelligence endpoint identity override should parse");
+
+    let effective = config.memory_intelligence.effective_llm_config(&config.llm);
+    let endpoints = effective
+        .effective_endpoints()
+        .expect("memory intelligence identity endpoint should normalize");
+
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(endpoints[0].id, "legacy");
+    assert_eq!(endpoints[0].base_url, "http://mi.local:18009/v1");
+    assert_eq!(endpoints[0].model, "mi-model");
 }
 
 #[test]

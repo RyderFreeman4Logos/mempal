@@ -14,7 +14,7 @@ use crate::core::types::{
 };
 use crate::core::utils::current_timestamp;
 use crate::intelligence::global_intelligence_status;
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::llm::{LlmMessage, LlmRequest, LlmRouter};
 
 #[derive(Debug, Error)]
 pub enum CrystallizeError {
@@ -140,7 +140,7 @@ async fn run_crystallization_inner(
             .has_effective_llm_endpoint(&config.llm)
             .then(|| {
                 let llm_config = config.memory_intelligence.effective_llm_config(&config.llm);
-                LlmClient::from_config(&llm_config)
+                LlmRouter::from_config(&llm_config)
             })
             .transpose()?
     } else {
@@ -504,7 +504,7 @@ fn stable_card_id(source_drawer_ids: &[String]) -> String {
 }
 
 async fn enhance_candidate_with_llm(
-    client: &LlmClient,
+    router: &LlmRouter,
     candidate: &CrystallizeCandidate,
 ) -> Result<CardDraft> {
     let payload = serde_json::json!({
@@ -513,7 +513,7 @@ async fn enhance_candidate_with_llm(
         "deterministic_statement": candidate.card.statement,
         "deterministic_content": candidate.card.content,
     });
-    let response = client
+    let response = router
         .chat_completion(&LlmRequest {
             messages: vec![
                 LlmMessage {
@@ -528,8 +528,9 @@ async fn enhance_candidate_with_llm(
             model: None,
             temperature: Some(0.0),
             max_tokens: Some(1024),
-        })
+        }, None)
         .await?;
+    let response = response.response;
     let decoded: LlmCardDraft = serde_json::from_str(response.content.trim())?;
     validate_llm_draft(candidate, decoded)
 }
@@ -614,7 +615,8 @@ fn stable_prefixed_id(prefix: &str, parts: &[&str]) -> String {
 mod tests {
     use super::*;
     use crate::core::config::Config;
-    use crate::core::types::{BootstrapEvidenceArgs, SourceType};
+    use crate::core::types::{BootstrapEvidenceArgs, IntelligenceMode, SourceType};
+    use mockito::Server;
     use tempfile::TempDir;
 
     fn new_db() -> (TempDir, Database) {
@@ -775,5 +777,85 @@ mod tests {
 
         assert_eq!(summary.cards_created, 0);
         assert_eq!(db.knowledge_card_count().expect("card count"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_crystallize_uses_endpoint_pool_fallback() {
+        let (_tmp, db) = new_db();
+        seed_related_drawers(&db);
+        let mut primary = Server::new_async().await;
+        let mut secondary = Server::new_async().await;
+        let primary_mock = primary
+            .mock("POST", "/v1/chat/completions")
+            .with_status(500)
+            .with_body("primary unavailable")
+            .create_async()
+            .await;
+        let draft = serde_json::json!({
+            "statement": "Rust memory cards preserve citations.",
+            "content": "LLM-drafted card that still preserves all source ids.",
+            "source_drawer_ids": ["drawer_1", "drawer_2", "drawer_3", "drawer_4", "drawer_5"]
+        });
+        let secondary_mock = secondary
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "model": "secondary-model",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": draft.to_string()
+                            }
+                        }
+                    ]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let mut config = config();
+        config.memory_intelligence.mode = IntelligenceMode::LocalLlm;
+        config.llm = Config::parse(&format!(
+            r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "primary"
+base_url = "{}/v1"
+model = "primary-model"
+
+[[llm.endpoints]]
+id = "secondary"
+base_url = "{}/v1"
+model = "secondary-model"
+"#,
+            primary.url(),
+            secondary.url()
+        ))
+        .expect("parse endpoint pool")
+        .llm;
+
+        let summary = run_crystallization(
+            &db,
+            &config,
+            CrystallizeOptions {
+                dry_run: true,
+                project_id: None,
+                use_llm: true,
+            },
+        )
+        .await
+        .expect("crystallize");
+
+        primary_mock.assert_async().await;
+        secondary_mock.assert_async().await;
+        assert!(summary.used_llm);
+        assert_eq!(
+            summary.candidates[0].card.statement,
+            "Rust memory cards preserve citations."
+        );
     }
 }

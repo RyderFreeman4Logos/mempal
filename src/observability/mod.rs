@@ -226,7 +226,7 @@ pub fn gating_runtime_status(
                 .llm_judge
                 .as_ref()
                 .is_some_and(|judge| judge.enabled),
-        llm_model: config.llm.model.clone(),
+        llm_model: config.llm.effective_model_summary(),
         tier2_threshold: config.ingest_gating.embedding_classifier.threshold,
         llm_threshold: config
             .ingest_gating

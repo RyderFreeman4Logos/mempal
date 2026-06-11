@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use tokio::time::timeout;
 
-use crate::core::config::Config;
+use crate::core::config::{Config, EffectiveLlmEndpoint};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -88,19 +88,32 @@ async fn probe_llm(config: &Config) -> ProbeStatus {
     if !effective_llm.enabled {
         return ProbeStatus::unreachable("disabled".to_string());
     }
-    let Some(base_url) = effective_llm
-        .base_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return ProbeStatus::unreachable("missing base_url".to_string());
+    let endpoints = match effective_llm.effective_endpoints() {
+        Ok(endpoints) if !endpoints.is_empty() => endpoints,
+        Ok(_) => return ProbeStatus::unreachable("missing base_url".to_string()),
+        Err(error) => return ProbeStatus::unreachable(error.to_string()),
     };
-    probe_models_endpoint(
-        base_url,
-        effective_llm.api_key_env.as_deref(),
-        effective_llm.api_key.as_deref(),
-    )
-    .await
+    probe_llm_endpoints(&endpoints).await
+}
+
+async fn probe_llm_endpoints(endpoints: &[EffectiveLlmEndpoint]) -> ProbeStatus {
+    let mut failures = Vec::new();
+    for endpoint in endpoints {
+        let status = probe_models_endpoint(
+            &endpoint.base_url,
+            endpoint.api_key_env.as_deref(),
+            endpoint.api_key.as_deref(),
+        )
+        .await;
+        if status.reachable {
+            return ProbeStatus::reachable(
+                status.latency_ms,
+                format!("http probe via {}", endpoint.id),
+            );
+        }
+        failures.push(format!("{}: {}", endpoint.id, status.detail));
+    }
+    ProbeStatus::unreachable(failures.join("; "))
 }
 
 async fn probe_models_endpoint(
