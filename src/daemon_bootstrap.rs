@@ -5,7 +5,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
@@ -19,6 +19,10 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 const DAEMON_STALL_SECONDS: u64 = 5 * 60;
 const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
+#[cfg(target_os = "linux")]
+const DB_HOLDER_TERM_GRACE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const DB_HOLDER_TERM_POLL: Duration = Duration::from_millis(100);
 
 pub type SharedDatabase = Arc<AsyncMutex<Database>>;
 
@@ -240,9 +244,7 @@ fn bootstrap_inner(
 
     // harness-point: PR0
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::DbOpen);
-    let db = Database::open(&db_path).context("failed to open daemon database")?;
-    let async_db = AsyncDb::open(&db_path, 4).context("failed to open daemon async database")?;
-    let store = AsyncPendingMessageStore::new(db.path()).context("failed to open pending queue")?;
+    let (db, async_db, store) = open_daemon_storage_with_remediation(&db_path)?;
     let db = Arc::new(AsyncMutex::new(db));
     let write_observer = DaemonWriteObserver::new();
 
@@ -266,6 +268,172 @@ fn bootstrap_inner(
         _pid_guard: pid_guard,
         _lock_guard: lock_guard,
     })
+}
+
+fn open_daemon_storage_with_remediation(
+    db_path: &Path,
+) -> Result<(Database, AsyncDb, AsyncPendingMessageStore)> {
+    match open_daemon_storage_once(db_path) {
+        Ok(handles) => Ok(handles),
+        Err(error) if is_sqlite_lock_error(&error) => {
+            #[cfg(target_os = "linux")]
+            {
+                open_daemon_storage_after_stale_holder_cleanup(db_path, error)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn open_daemon_storage_once(
+    db_path: &Path,
+) -> Result<(Database, AsyncDb, AsyncPendingMessageStore)> {
+    let db = Database::open(db_path).context("failed to open daemon database")?;
+    let async_db = AsyncDb::open(db_path, 4).context("failed to open daemon async database")?;
+    let store = AsyncPendingMessageStore::new(db.path()).context("failed to open pending queue")?;
+    Ok((db, async_db, store))
+}
+
+fn is_sqlite_lock_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("database is locked")
+            || message.contains("database file is locked")
+            || message.contains("database is busy")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_daemon_storage_after_stale_holder_cleanup(
+    db_path: &Path,
+    first_error: anyhow::Error,
+) -> Result<(Database, AsyncDb, AsyncPendingMessageStore)> {
+    let before = crate::process_diagnostics::inspect_db_holders(db_path);
+    let plan = crate::process_diagnostics::plan_stale_db_holder_remediation(&before);
+    let mut remediation_errors = Vec::new();
+
+    if !plan.terminate_pids.is_empty() {
+        if let Err(error) = terminate_db_holder_pids(
+            &plan.terminate_pids,
+            DB_HOLDER_TERM_GRACE,
+            DB_HOLDER_TERM_POLL,
+        ) {
+            remediation_errors.push(error.to_string());
+        }
+    }
+
+    match open_daemon_storage_once(db_path) {
+        Ok(handles) => Ok(handles),
+        Err(error) if is_sqlite_lock_error(&error) => {
+            let after = crate::process_diagnostics::inspect_db_holders(db_path);
+            let terminated_pids = plan.terminate_pids;
+            Err(anyhow::anyhow!(
+                "{}",
+                crate::process_diagnostics::format_db_lock_remediation_hint(
+                    db_path,
+                    &format!(
+                        "{}; initial error: {}",
+                        format_error_chain(&error),
+                        format_error_chain(&first_error)
+                    ),
+                    &after,
+                    &terminated_pids,
+                    &remediation_errors,
+                )
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_db_holder_pids(pids: &[i32], grace: Duration, poll: Duration) -> Result<()> {
+    let mut remaining = pids.to_vec();
+    let mut errors = Vec::new();
+
+    for pid in &remaining {
+        if let Err(error) = signal_pid(*pid, libc::SIGTERM) {
+            errors.push(format!("SIGTERM pid {pid} failed: {error}"));
+        }
+    }
+
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        remaining.retain(|pid| match process_is_running(*pid) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(error) => {
+                errors.push(format!("status pid {pid} failed: {error}"));
+                false
+            }
+        });
+        if remaining.is_empty() {
+            break;
+        }
+        std::thread::sleep(poll);
+    }
+
+    for pid in remaining {
+        match process_is_running(pid) {
+            Ok(true) => {
+                if let Err(error) = signal_pid(pid, libc::SIGKILL) {
+                    errors.push(format!("SIGKILL pid {pid} failed: {error}"));
+                }
+            }
+            Ok(false) => {}
+            Err(error) => errors.push(format!("status pid {pid} failed: {error}")),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{}", errors.join("; ")))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pid(pid: i32, signal: i32) -> Result<()> {
+    // SAFETY: the PID list comes from exact DB-holder classification for this
+    // database. ESRCH means the process exited between planning and signal.
+    let rc = unsafe { libc::kill(pid, signal) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error).with_context(|| format!("failed to signal pid {pid}"))
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_running(pid: i32) -> Result<bool> {
+    // SAFETY: kill(pid, 0) performs a kernel liveness/permission check without
+    // delivering a signal or dereferencing Rust memory.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error).with_context(|| format!("failed to inspect pid {pid}")),
+    }
 }
 
 fn unix_secs() -> u64 {
@@ -465,6 +633,14 @@ mod tests {
         observer.force_last_successful_write_for_test(now.saturating_sub(DAEMON_STALL_SECONDS));
 
         assert_eq!(observer.stall_diagnostic(&store, now).await, None);
+    }
+
+    #[test]
+    fn test_sqlite_lock_detection_checks_context_chain() {
+        let error = anyhow::anyhow!("database is locked: Error code 5")
+            .context("failed to open daemon database");
+
+        assert!(is_sqlite_lock_error(&error));
     }
 
     #[test]

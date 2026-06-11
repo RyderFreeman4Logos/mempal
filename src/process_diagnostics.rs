@@ -34,6 +34,107 @@ impl DbHolderReport {
     }
 }
 
+/// Conservative remediation plan for stale mempal-owned DB holders.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DbHolderRemediationPlan {
+    /// PIDs that are safe to terminate automatically.
+    pub terminate_pids: Vec<i32>,
+    /// Holders that must remain under operator control.
+    pub manual_holders: Vec<DbHolderProcess>,
+}
+
+/// Plan cleanup for stale mempal-owned holders already proven to hold this DB.
+///
+/// The report is keyed to one SQLite DB identity, so this function only decides
+/// which roles are safe to remediate. It never selects `extra_holder`,
+/// `current_daemon`, `current_mcp_server`, or `current_process` entries.
+pub fn plan_stale_db_holder_remediation(report: &DbHolderReport) -> DbHolderRemediationPlan {
+    let mut terminate_pids = Vec::new();
+    let mut manual_holders = Vec::new();
+
+    for holder in &report.holders {
+        match holder.classification.as_str() {
+            "stale_mcp_server" | "orphan_daemon"
+                if !holder.current_process
+                    && !holder.current_daemon
+                    && !holder.current_mcp_server =>
+            {
+                terminate_pids.push(holder.pid);
+            }
+            _ => manual_holders.push(holder.clone()),
+        }
+    }
+
+    terminate_pids.sort_unstable();
+    terminate_pids.dedup();
+    manual_holders.sort_by_key(|holder| holder.pid);
+
+    DbHolderRemediationPlan {
+        terminate_pids,
+        manual_holders,
+    }
+}
+
+/// Build an actionable daemon-startup lock diagnostic without exposing argv.
+pub fn format_db_lock_remediation_hint(
+    db_path: &Path,
+    error: &str,
+    report: &DbHolderReport,
+    terminated_pids: &[i32],
+    remediation_errors: &[String],
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "failed to open daemon database {}: {error}",
+        db_path.display()
+    ));
+
+    if !terminated_pids.is_empty() {
+        lines.push(format!(
+            "automatically terminated stale mempal-owned DB holders: {}",
+            format_pid_list(terminated_pids)
+        ));
+    }
+    if !remediation_errors.is_empty() {
+        lines.push(format!(
+            "automatic cleanup encountered errors: {}",
+            remediation_errors.join("; ")
+        ));
+    }
+    if report.holders.is_empty() {
+        lines.push(
+            "no live DB holders were visible in process diagnostics after cleanup".to_string(),
+        );
+    } else {
+        lines.push("live DB holders after cleanup:".to_string());
+        for holder in &report.holders {
+            lines.push(format!(
+                "- pid={} role={} classification={} files={} command={}",
+                holder.pid,
+                holder.role,
+                holder.classification,
+                holder.opened_files.join(","),
+                holder.command
+            ));
+        }
+    }
+
+    lines.push(
+        "remediation: mempal only auto-terminates stale_mcp_server and orphan_daemon holders for \
+         this exact DB; stop extra/current holder processes manually or run `mempal daemon status` \
+         before retrying daemon startup"
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn format_pid_list(pids: &[i32]) -> String {
+    pids.iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// One live process with an open fd to `palace.db`, `palace.db-wal`, or
 /// `palace.db-shm`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -367,6 +468,80 @@ fn clock_ticks_per_second() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn holder(pid: i32, role: &str, classification: &str) -> DbHolderProcess {
+        DbHolderProcess {
+            pid,
+            role: role.to_string(),
+            classification: classification.to_string(),
+            command: match role {
+                "mempal_mcp_server" => "mempal serve".to_string(),
+                "mempal_daemon" => "mempal daemon".to_string(),
+                _ => "other process".to_string(),
+            },
+            opened_files: vec!["db".to_string()],
+            started_at_unix_secs: None,
+            age_secs: None,
+            current_process: classification == "current_process",
+            current_daemon: classification == "current_daemon",
+            current_mcp_server: classification == "current_mcp_server",
+        }
+    }
+
+    #[test]
+    fn test_plan_stale_db_holder_remediation_only_targets_stale_mempal_roles() {
+        let report = build_report(
+            Path::new("/tmp/palace.db"),
+            vec![
+                holder(11, "mempal_mcp_server", "stale_mcp_server"),
+                holder(22, "mempal_daemon", "orphan_daemon"),
+                holder(33, "other", "extra_holder"),
+                holder(44, "mempal_daemon", "current_daemon"),
+                holder(55, "mempal_mcp_server", "current_mcp_server"),
+            ],
+            None,
+        );
+
+        let plan = plan_stale_db_holder_remediation(&report);
+
+        assert_eq!(plan.terminate_pids, vec![11, 22]);
+        assert_eq!(
+            plan.manual_holders
+                .iter()
+                .map(|holder| holder.pid)
+                .collect::<Vec<_>>(),
+            vec![33, 44, 55]
+        );
+    }
+
+    #[test]
+    fn test_format_db_lock_remediation_hint_reports_roles_pids_and_hints() {
+        let report = build_report(
+            Path::new("/tmp/palace.db"),
+            vec![
+                holder(33, "other", "extra_holder"),
+                holder(44, "mempal_daemon", "current_daemon"),
+            ],
+            None,
+        );
+
+        let message = format_db_lock_remediation_hint(
+            Path::new("/tmp/palace.db"),
+            "database is locked",
+            &report,
+            &[11, 22],
+            &["SIGTERM pid 22 failed: permission denied".to_string()],
+        );
+
+        assert!(message.contains("failed to open daemon database /tmp/palace.db"));
+        assert!(message.contains("automatically terminated stale mempal-owned DB holders: 11, 22"));
+        assert!(message.contains("pid=33 role=other classification=extra_holder"));
+        assert!(message.contains("pid=44 role=mempal_daemon classification=current_daemon"));
+        assert!(message.contains("mempal only auto-terminates stale_mcp_server and orphan_daemon"));
+        assert!(message.contains("mempal daemon status"));
+    }
+
     #[cfg(target_os = "linux")]
     mod linux {
         use super::super::*;
