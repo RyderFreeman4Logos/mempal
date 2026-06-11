@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Auto-install mempal after merges that change the binary source.
+# Uses `just install` so the post-merge path stays feature-identical to manual installs.
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
@@ -9,7 +10,7 @@ if ! git rev-parse --verify ORIG_HEAD >/dev/null 2>&1; then
 fi
 
 changed_files=$(git diff-tree -r --name-only ORIG_HEAD HEAD 2>/dev/null || true)
-if ! grep -Eq '^(src/|Cargo\.toml$|crates/)' <<<"$changed_files"; then
+if ! grep -Eq '^(src/|Cargo\.toml$|Cargo\.lock$|justfile$|scripts/hooks/post-merge\.sh$|crates/)' <<<"$changed_files"; then
   exit 0
 fi
 
@@ -28,7 +29,7 @@ repo_root=$1
 
 printf "\n[%s] post-merge install started in %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_root"
 cd "$repo_root"
-CARGO_HOME=/usr/local cargo install --path . --force
+just install
 printf "[%s] post-merge install finished\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ' mempal-post-merge-install "$repo_root" >>"$log_file" 2>&1 </dev/null &
 

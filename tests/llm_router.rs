@@ -137,7 +137,7 @@ async fn test_llm_router_all_temporarily_unavailable_remains_retryable() {
     let primary_mock = primary
         .mock("POST", "/v1/chat/completions")
         .with_status(429)
-        .with_header("retry-after", "2")
+        .with_header("retry-after", "5")
         .with_body("primary rate limited")
         .expect(1)
         .create_async()
@@ -145,7 +145,7 @@ async fn test_llm_router_all_temporarily_unavailable_remains_retryable() {
     let secondary_mock = secondary
         .mock("POST", "/v1/chat/completions")
         .with_status(429)
-        .with_header("retry-after", "2")
+        .with_header("retry-after", "60")
         .with_body("secondary rate limited")
         .expect(1)
         .create_async()
@@ -164,15 +164,61 @@ async fn test_llm_router_all_temporarily_unavailable_remains_retryable() {
 
     primary_mock.assert_async().await;
     secondary_mock.assert_async().await;
+    assert!(matches!(
+        first,
+        LlmError::TemporarilyUnavailable {
+            retry_after,
+            ..
+        } if retry_after == std::time::Duration::from_secs(5)
+    ));
     assert!(first.is_retryable());
     assert!(matches!(
         second,
         LlmError::TemporarilyUnavailable {
             retry_after,
             ..
-        } if retry_after <= std::time::Duration::from_secs(2)
+        } if retry_after <= std::time::Duration::from_secs(5)
     ));
     assert!(second.is_retryable());
+}
+
+#[tokio::test]
+async fn test_llm_router_mixed_5xx_then_rate_limit_uses_non_cooldown_retry_policy() {
+    let mut primary = Server::new_async().await;
+    let mut secondary = Server::new_async().await;
+    let primary_mock = primary
+        .mock("POST", "/v1/chat/completions")
+        .with_status(500)
+        .with_body("primary server error")
+        .expect(1)
+        .create_async()
+        .await;
+    let secondary_mock = secondary
+        .mock("POST", "/v1/chat/completions")
+        .with_status(429)
+        .with_header("retry-after", "60")
+        .with_body("secondary rate limited")
+        .expect(1)
+        .create_async()
+        .await;
+    let config = endpoint_pool_config(&primary, &secondary);
+    let router = LlmRouter::from_config(&config).expect("build router");
+
+    let error = router
+        .chat_completion(&request(), None)
+        .await
+        .expect_err("ordinary retryable failure should win over endpoint cooldown");
+
+    primary_mock.assert_async().await;
+    secondary_mock.assert_async().await;
+    assert!(matches!(
+        error,
+        LlmError::HttpStatus {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            ..
+        }
+    ));
+    assert!(error.is_retryable());
 }
 
 #[tokio::test]

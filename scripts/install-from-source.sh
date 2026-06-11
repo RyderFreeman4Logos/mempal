@@ -14,7 +14,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 git pull --ff-only origin main
-CARGO_HOME="${CARGO_HOME:-/usr/local}" cargo install --path crates/mempal-cli --force --locked
+install_root="${CARGO_INSTALL_ROOT:-/usr/local}"
+cargo install --path . --force --locked --features rest --root "$install_root"
 
 echo "--- verifying schema match ---"
-"${CARGO_HOME:-/usr/local}/bin/mempal" status | grep -E "schema_version|fork_ext_version"
+"$install_root/bin/mempal" status | grep -E "schema_version|fork_ext_version"
