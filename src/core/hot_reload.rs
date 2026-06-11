@@ -109,9 +109,10 @@ pub struct HotReloadState {
     // harness-point: PR0 — counts successful reload applications (version changes)
     reload_count: Arc<AtomicUsize>,
     runtime_prototypes: ArcSwap<Vec<String>>,
-    /// Incremented whenever a hot-reloadable LLM field changes (model,
-    /// retry_interval_secs, enabled_for, max_concurrent). LLM workers subscribe
-    /// to this to cancel in-flight requests and restart with the new config.
+    /// Incremented whenever a hot-reloadable LLM field changes (endpoint,
+    /// credentials, model, extra body, timeout, retry_interval_secs,
+    /// enabled_for, max_concurrent). LLM workers subscribe to this to cancel
+    /// in-flight requests and restart with the new config.
     llm_gen_tx: tokio::sync::watch::Sender<u64>,
 }
 
@@ -272,11 +273,14 @@ impl HotReloadState {
     /// Subscribe to LLM generation changes.
     ///
     /// The channel value is a monotonically-increasing counter that is bumped
-    /// whenever a hot-reloadable LLM field (model, retry_interval_secs,
-    /// enabled_for, max_concurrent) changes. LLM workers use this to detect
-    /// config changes and cancel in-flight requests.
+    /// whenever a hot-reloadable LLM field changes. LLM workers use this to
+    /// detect config changes and cancel in-flight requests.
     pub fn subscribe_llm_gen(&self) -> tokio::sync::watch::Receiver<u64> {
         self.llm_gen_tx.subscribe()
+    }
+
+    pub fn current_llm_generation(&self) -> u64 {
+        *self.llm_gen_tx.borrow()
     }
 
     /// Trigger a reload from the given path without going through the watcher.
@@ -469,7 +473,12 @@ impl HotReloadState {
         }
 
         // Compute LLM gen change before `effective` is consumed by from_config.
-        let llm_hot_changed = previous.config.llm.model != effective.llm.model
+        let llm_hot_changed = previous.config.llm.base_url != effective.llm.base_url
+            || previous.config.llm.model != effective.llm.model
+            || previous.config.llm.api_key != effective.llm.api_key
+            || previous.config.llm.api_key_env != effective.llm.api_key_env
+            || previous.config.llm.extra_body != effective.llm.extra_body
+            || previous.config.llm.request_timeout_secs != effective.llm.request_timeout_secs
             || previous.config.llm.max_concurrent != effective.llm.max_concurrent
             || previous.config.llm.retry_interval_secs != effective.llm.retry_interval_secs
             || previous.config.llm.enabled_for != effective.llm.enabled_for;

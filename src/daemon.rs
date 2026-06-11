@@ -1,9 +1,9 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{future::Future, pin::Pin};
 
@@ -205,40 +205,37 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     );
 
     let llm_worker_handles: Vec<tokio::task::JoinHandle<_>> = if context.config.llm.enabled {
-        match crate::llm::LlmClient::from_config(&context.config.llm) {
-            Ok(llm_client) => {
-                let num_workers = context.config.llm.max_concurrent.max(1);
-                let llm_status = std::sync::Arc::new(crate::llm::LlmStatus::new(10));
-                let llm_store = std::sync::Arc::new(context.store.clone());
-                let llm_client = std::sync::Arc::new(llm_client);
-                let async_db = context.async_db.clone();
-                let write_observer = context.write_observer.clone();
-                tracing::info!("spawning {num_workers} LLM worker tasks");
-                (0..num_workers)
-                    .map(|i| {
-                        let store = llm_store.clone();
-                        let client = llm_client.clone();
-                        let status = llm_status.clone();
-                        let db = async_db.clone();
-                        let observer = write_observer.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = crate::llm::worker::run_llm_worker(
-                                store, client, status, db, observer,
-                            )
-                            .await
-                            {
-                                tracing::error!("LLM worker {i} fatal error: {e:#}");
-                            }
-                            Ok::<(), anyhow::Error>(())
-                        })
-                    })
-                    .collect()
-            }
-            Err(error) => {
-                tracing::warn!("LLM client init failed, skipping LLM worker: {error}");
-                vec![]
-            }
-        }
+        let llm_client_runtime = crate::llm::worker::LlmClientRuntime::new(&context.config.llm);
+        let num_workers = context.config.llm.max_concurrent.max(1);
+        let llm_status = std::sync::Arc::new(crate::llm::LlmStatus::new(10));
+        let llm_store = std::sync::Arc::new(context.store.clone());
+        let llm_client_runtime = std::sync::Arc::new(Mutex::new(llm_client_runtime));
+        let async_db = context.async_db.clone();
+        let write_observer = context.write_observer.clone();
+        tracing::info!("spawning {num_workers} LLM worker tasks");
+        (0..num_workers)
+            .map(|i| {
+                let store = llm_store.clone();
+                let client_runtime = llm_client_runtime.clone();
+                let status = llm_status.clone();
+                let db = async_db.clone();
+                let observer = write_observer.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::llm::worker::run_llm_worker(
+                        store,
+                        client_runtime,
+                        status,
+                        db,
+                        observer,
+                    )
+                    .await
+                    {
+                        tracing::error!("LLM worker {i} fatal error: {e:#}");
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+            })
+            .collect()
     } else {
         vec![]
     };

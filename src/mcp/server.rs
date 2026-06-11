@@ -7836,14 +7836,15 @@ mod tests {
     /// resets it to defaults on Drop so other parallel tests do not see leaked
     /// overrides.
     struct ConfigOverrideGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tokio::sync::OwnedMutexGuard<()>,
         _tempdir: TempDir,
     }
 
     impl ConfigOverrideGuard {
-        fn install(toml_contents: &str) -> Self {
-            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let lock = LOCK.lock().expect("config override lock poisoned");
+        async fn install(toml_contents: &str) -> Self {
+            let lock = crate::core::config::global_config_test_lock()
+                .lock_owned()
+                .await;
             let tempdir = tempfile::tempdir().expect("config override tempdir");
             let path = tempdir.path().join("override.toml");
             fs::write(&path, toml_contents).expect("write config override");
@@ -9043,7 +9044,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_context_include_cards_omitted_uses_config_default() {
-        let _guard = ConfigOverrideGuard::install("[context]\ninclude_cards_default = true\n");
+        let _guard =
+            ConfigOverrideGuard::install("[context]\ninclude_cards_default = true\n").await;
         let (_tempdir, db_path, server) = setup_server();
         insert_drawer(
             &db_path,
@@ -11136,7 +11138,8 @@ db_path = "{}"
 enabled = true
 "#,
             config_db_path.display()
-        ));
+        ))
+        .await;
 
         let (_tempdir, db_path, server) = setup_server();
         let raw_secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCD";
@@ -11330,7 +11333,8 @@ enabled = true
 reject_on_contradiction = true
 "#,
             db_path.display()
-        ));
+        ))
+        .await;
         insert_triple(
             &db_path,
             "Bob",
@@ -11446,7 +11450,8 @@ enabled = false
 enabled = false
 "#,
             db_path.display()
-        ));
+        ))
+        .await;
         let gate = Arc::new(Notify::new());
         let call_count = Arc::new(AtomicUsize::new(0));
         let server = MempalMcpServer::new_with_factory(

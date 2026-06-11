@@ -601,20 +601,12 @@ impl Config {
         if self.llm.enabled != other.llm.enabled {
             fields.push("llm.enabled");
         }
-        if self.llm.base_url != other.llm.base_url {
-            fields.push("llm.base_url");
+        if self.llm.backend != other.llm.backend {
+            fields.push("llm.backend");
         }
-        // llm.model is just a request parameter — safe to hot-reload
-
-        if self.llm.api_key != other.llm.api_key {
-            fields.push("llm.api_key");
-        }
-        if self.llm.api_key_env != other.llm.api_key_env {
-            fields.push("llm.api_key_env");
-        }
-        if self.llm.extra_body != other.llm.extra_body {
-            fields.push("llm.extra_body");
-        }
+        // LLM endpoint/client request fields are safe to hot-reload: workers
+        // cancel in-flight tasks on generation bump and rebuild the client for
+        // the next claim cycle.
         if self.daemon.log_path != other.daemon.log_path {
             fields.push("daemon.log_path");
         }
@@ -633,11 +625,14 @@ impl Config {
         effective.embed.base_url = self.embed.base_url.clone();
         effective.embed.api_model = self.embed.api_model.clone();
         effective.embed.openai_compat = self.embed.openai_compat.clone();
-        effective.llm.base_url = self.llm.base_url.clone();
-        // llm.model is hot-reloadable — don't pin it
-        effective.llm.api_key = self.llm.api_key.clone();
-        effective.llm.api_key_env = self.llm.api_key_env.clone();
-        effective.llm.extra_body = self.llm.extra_body.clone();
+        if self.llm.enabled != candidate.llm.enabled || self.llm.backend != candidate.llm.backend {
+            effective.llm = self.llm.clone();
+        } else {
+            effective.llm.enabled = self.llm.enabled;
+            effective.llm.backend = self.llm.backend.clone();
+            // LLM endpoint/client request fields are hot-reloadable; keep the
+            // candidate values so new workers/requests use the latest endpoint.
+        }
         effective.daemon.log_path = self.daemon.log_path.clone();
         effective.mcp.log_path = self.mcp.log_path.clone();
         effective
@@ -1626,6 +1621,12 @@ pub struct ConfigSnapshotMeta {
     pub loaded_at_unix_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct LlmRuntimeSnapshot {
+    pub config: Arc<Config>,
+    pub generation: u64,
+}
+
 pub struct ConfigHandle;
 
 impl ConfigHandle {
@@ -1647,6 +1648,13 @@ impl ConfigHandle {
 
     pub fn current_privacy_snapshot() -> (Arc<Config>, Arc<CompiledPrivacyConfig>) {
         super::hot_reload::global_hot_reload_state().current_privacy_snapshot()
+    }
+
+    pub fn current_llm_runtime_snapshot() -> LlmRuntimeSnapshot {
+        let state = super::hot_reload::global_hot_reload_state();
+        let generation = state.current_llm_generation();
+        let config = state.current();
+        LlmRuntimeSnapshot { config, generation }
     }
 
     pub fn scrub_content(input: &str) -> String {
@@ -1718,8 +1726,9 @@ impl ConfigHandle {
 
     /// Subscribe to LLM config generation changes.
     ///
-    /// The counter increments whenever a hot-reloadable LLM field (model,
-    /// retry_interval_secs, enabled_for, max_concurrent) changes via hot-reload.
+    /// The counter increments whenever a hot-reloadable LLM field (endpoint,
+    /// credentials, model, retry_interval_secs, enabled_for, max_concurrent)
+    /// changes via hot-reload.
     /// LLM workers subscribe here to cancel in-flight requests on config change.
     pub fn subscribe_llm_gen() -> tokio::sync::watch::Receiver<u64> {
         super::hot_reload::global_hot_reload_state().subscribe_llm_gen()
@@ -1741,6 +1750,12 @@ impl ConfigHandle {
 fn global_scrub_stats() -> &'static Mutex<ScrubStats> {
     static SCRUB_STATS: OnceLock<Mutex<ScrubStats>> = OnceLock::new();
     SCRUB_STATS.get_or_init(|| Mutex::new(ScrubStats::default()))
+}
+
+#[cfg(test)]
+pub(crate) fn global_config_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
 }
 
 /// Parameters for time-decay and retrieval-boost of `effective_importance`.
