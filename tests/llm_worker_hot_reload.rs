@@ -241,6 +241,62 @@ model = "model-stable"
 }
 
 #[test]
+fn test_llm_gen_increments_on_endpoint_list_change() {
+    let _guard = TEST_LOCK.lock().expect("test lock");
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+base_url = "http://127.0.0.1:19999/v1"
+model = "model-a"
+"#,
+    )
+    .expect("write config");
+    ConfigHandle::bootstrap(&config_path).expect("bootstrap");
+
+    let mut rx = ConfigHandle::subscribe_llm_gen();
+    let gen_before = *rx.borrow_and_update();
+    let version_before = ConfigHandle::version();
+
+    std::fs::write(
+        &config_path,
+        r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+base_url = "http://127.0.0.1:19999/v1"
+model = "model-a"
+
+[[llm.endpoints]]
+base_url = "http://127.0.0.1:20000/v1"
+model = "model-b"
+"#,
+    )
+    .expect("write config");
+    ConfigHandle::harness_reload_from_path(&config_path);
+
+    let gen_after = *rx.borrow_and_update();
+    let version_after = ConfigHandle::version();
+    assert!(
+        gen_after > gen_before,
+        "generation must increment when llm.endpoints changes (before={gen_before}, after={gen_after})"
+    );
+    assert_ne!(
+        version_after, version_before,
+        "config hash must change when llm.endpoints changes"
+    );
+    assert_eq!(version_after.len(), 12);
+    assert_eq!(ConfigHandle::current().llm.endpoints.len(), 2);
+}
+
+#[test]
 fn test_llm_gen_does_not_increment_on_unrelated_change() {
     let _guard = TEST_LOCK.lock().expect("test lock");
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -294,18 +350,66 @@ fn test_llm_client_runtime_rebuilds_on_endpoint_change() {
     };
     let mut runtime = LlmClientRuntime::new(&config);
     let first = runtime
-        .client_for_config(&config)
-        .expect("load initial client");
+        .router_for_config(&config)
+        .expect("load initial router");
 
     let mut changed = config.clone();
     changed.base_url = Some("http://127.0.0.1:20000/v1".to_string());
     let second = runtime
-        .client_for_config(&changed)
-        .expect("rebuild changed client");
+        .router_for_config(&changed)
+        .expect("rebuild changed router");
 
     assert!(
         !Arc::ptr_eq(&first, &second),
-        "endpoint changes must rebuild LLM client"
+        "endpoint changes must rebuild LLM router"
+    );
+}
+
+#[test]
+fn test_llm_client_runtime_rebuilds_on_endpoint_list_change() {
+    let config = Config::parse(
+        r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "primary"
+base_url = "http://127.0.0.1:19999/v1"
+model = "model-a"
+"#,
+    )
+    .expect("parse initial endpoint list")
+    .llm;
+    let mut runtime = LlmClientRuntime::new(&config);
+    let first = runtime
+        .router_for_config(&config)
+        .expect("load initial router");
+
+    let changed = Config::parse(
+        r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "primary"
+base_url = "http://127.0.0.1:19999/v1"
+model = "model-a"
+
+[[llm.endpoints]]
+id = "secondary"
+base_url = "http://127.0.0.1:20000/v1"
+model = "model-b"
+"#,
+    )
+    .expect("parse changed endpoint list")
+    .llm;
+    let second = runtime
+        .router_for_config(&changed)
+        .expect("rebuild changed endpoint list router");
+
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "endpoint list changes must rebuild LLM router runtime"
     );
 }
 
@@ -319,17 +423,17 @@ fn test_llm_client_runtime_recovers_after_invalid_initial_config() {
     };
     let mut runtime = LlmClientRuntime::new(&invalid);
     assert!(
-        runtime.client_for_config(&invalid).is_err(),
+        runtime.router_for_config(&invalid).is_err(),
         "invalid initial config should be retried from the worker loop"
     );
 
     let mut fixed = invalid.clone();
     fixed.base_url = Some("http://127.0.0.1:19999/v1".to_string());
-    let client = runtime
-        .client_for_config(&fixed)
-        .expect("fixed config should build a client");
+    let router = runtime
+        .router_for_config(&fixed)
+        .expect("fixed config should build a router");
 
-    assert_eq!(client.current_max_concurrent(), fixed.max_concurrent.max(1));
+    assert_eq!(router.endpoint_count(), 1);
 }
 
 // ── tokio::select! cancellation ───────────────────────────────────────────────

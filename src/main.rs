@@ -97,7 +97,7 @@ use mempal::knowledge_gate::{
 use mempal::knowledge_lifecycle::{
     DemoteRequest, PromoteRequest, demote_knowledge, promote_knowledge,
 };
-use mempal::llm::{DEFAULT_GATING_JUDGE_PROMPT, LlmClient, LlmMessage, LlmRequest};
+use mempal::llm::{DEFAULT_GATING_JUDGE_PROMPT, LlmMessage, LlmRequest, LlmRouter};
 use mempal::mcp::{
     IngestControls, IngestOperationState, IngestRequest, IngestResponse, MempalMcpServer,
     OperationStatusRequest,
@@ -9422,11 +9422,11 @@ fn config_intelligence_command(config: &Config) -> Result<()> {
     println!("  mode: {}", config.memory_intelligence.mode);
     println!("  llm_state: {llm_state}");
     println!("  llm_backend: {}", effective_llm.backend);
-    match effective_llm.model.as_deref() {
+    match effective_llm.effective_model_summary().as_deref() {
         Some(model) => println!("  llm_model: {model}"),
         None => println!("  llm_model: none"),
     }
-    match effective_llm.base_url.as_deref() {
+    match effective_llm.effective_base_url_summary().as_deref() {
         Some(base_url) => println!("  llm_base_url: {base_url}"),
         None => println!("  llm_base_url: none"),
     }
@@ -9803,8 +9803,11 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     println!("  enabled: {}", config.llm.enabled);
     if config.llm.enabled {
         println!("  backend: {}", config.llm.backend);
-        if let Some(model) = config.llm.model.as_deref() {
+        if let Some(model) = config.llm.effective_model_summary().as_deref() {
             println!("  model: {model}");
+        }
+        if let Some(base_url) = config.llm.effective_base_url_summary().as_deref() {
+            println!("  base_url: {base_url}");
         }
         println!("  max_concurrent: {}", config.llm.max_concurrent);
         let llm_pending = queue_stats.pending;
@@ -12311,15 +12314,15 @@ async fn maintenance_rejudge_command(
         )
         .context("failed to load historical rejudge candidates")?;
     let config_version = historical_rejudge_config_version(config);
-    let llm_client = historical_rejudge_llm_client(config);
-    let judge_model = llm_client
+    let llm_router = historical_rejudge_llm_router(config);
+    let judge_model = llm_router
         .as_ref()
-        .and(config.llm.model.clone())
-        .or_else(|| Some("deterministic".to_string()).filter(|_| llm_client.is_none()));
+        .and_then(|_| config.llm.effective_model_summary())
+        .or_else(|| Some("deterministic".to_string()).filter(|_| llm_router.is_none()));
 
     let mut decisions = Vec::with_capacity(rows.len());
     for row in &rows {
-        let decision = evaluate_historical_drawer(row, config, llm_client.as_ref()).await;
+        let decision = evaluate_historical_drawer(row, config, llm_router.as_ref()).await;
         decisions.push((row, decision));
     }
 
@@ -13409,7 +13412,7 @@ fn print_historical_rejudge_restore_report(
 async fn evaluate_historical_drawer(
     row: &mempal::core::db::HistoricalRejudgeCandidate,
     config: &Config,
-    llm_client: Option<&LlmClient>,
+    llm_router: Option<&LlmRouter>,
 ) -> HistoricalRejudgeDecision {
     let drawer = &row.drawer;
     if let Some(reason) = historical_protection_reason(drawer) {
@@ -13434,8 +13437,8 @@ async fn evaluate_historical_drawer(
         };
     }
 
-    if let Some(client) = llm_client {
-        match request_historical_llm_score(client, drawer, config).await {
+    if let Some(router) = llm_router {
+        match request_historical_llm_score(router, drawer, config).await {
             Ok((score, reason)) => {
                 let threshold = config
                     .ingest_gating
@@ -13584,7 +13587,7 @@ fn protected_historical_decision(reason: String) -> HistoricalRejudgeDecision {
     }
 }
 
-fn historical_rejudge_llm_client(config: &Config) -> Option<LlmClient> {
+fn historical_rejudge_llm_router(config: &Config) -> Option<LlmRouter> {
     if !config.llm.enabled || !config.llm.enabled_for.iter().any(|item| item == "gating") {
         return None;
     }
@@ -13592,11 +13595,11 @@ fn historical_rejudge_llm_client(config: &Config) -> Option<LlmClient> {
     if !judge.enabled {
         return None;
     }
-    LlmClient::from_config(&config.llm).ok()
+    LlmRouter::from_config(&config.llm).ok()
 }
 
 async fn request_historical_llm_score(
-    client: &LlmClient,
+    router: &LlmRouter,
     drawer: &Drawer,
     config: &Config,
 ) -> Result<(f64, String)> {
@@ -13621,10 +13624,11 @@ async fn request_historical_llm_score(
         temperature: Some(0.0),
         max_tokens: Some(512),
     };
-    let response = client
-        .chat_completion(&request)
+    let response = router
+        .chat_completion(&request, None)
         .await
         .context("historical rejudge LLM request failed")?;
+    let response = response.response;
     Ok(parse_historical_llm_score(&response.content))
 }
 
@@ -13680,9 +13684,12 @@ fn historical_rejudge_config_version(config: &Config) -> String {
         "gating": config.ingest_gating,
         "llm": {
             "enabled": config.llm.enabled,
-            "model": config.llm.model,
-            "enabled_for": config.llm.enabled_for,
+            "backend": config.llm.backend.clone(),
+            "endpoints": config.llm.effective_endpoint_fingerprints(),
+            "enabled_for": config.llm.enabled_for.clone(),
             "max_concurrent": config.llm.max_concurrent,
+            "request_timeout_secs": config.llm.request_timeout_secs,
+            "retry_interval_secs": config.llm.retry_interval_secs,
         }
     });
     let bytes = serde_json::to_vec(&relevant).unwrap_or_default();
@@ -14895,6 +14902,59 @@ mod historical_rejudge_tests {
 
     fn test_config() -> Config {
         Config::parse("[gating]\nenabled = true\n").expect("parse config")
+    }
+
+    #[test]
+    fn historical_rejudge_config_version_includes_endpoint_pool_identity() {
+        let primary = Config::parse(
+            r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "judge-a"
+base_url = "http://judge-a.local:8317/v1"
+model = "judge-model-a"
+
+[[llm.endpoints]]
+id = "judge-b"
+base_url = "http://judge-b.local:8317/v1"
+model = "judge-model-b"
+
+[gating]
+enabled = true
+"#,
+        )
+        .expect("parse primary config");
+        let changed = Config::parse(
+            r#"
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "judge-a"
+base_url = "http://judge-a.local:8317/v1"
+model = "judge-model-a"
+
+[[llm.endpoints]]
+id = "judge-b"
+base_url = "http://judge-b.local:8317/v1"
+model = "judge-model-c"
+
+[gating]
+enabled = true
+"#,
+        )
+        .expect("parse changed config");
+
+        assert_ne!(
+            historical_rejudge_config_version(&primary),
+            historical_rejudge_config_version(&changed)
+        );
+        assert_eq!(
+            primary.llm.effective_model_summary().as_deref(),
+            Some("judge-a=judge-model-a, judge-b=judge-model-b")
+        );
     }
 
     fn insert_drawer(db: &Database, id: &str, content: &str, wing: &str, room: Option<&str>) {

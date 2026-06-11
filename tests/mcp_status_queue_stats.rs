@@ -68,6 +68,65 @@ fn insert_drawer_with_source_type(db_path: &Path, id: &str, source_type: SourceT
     db.insert_drawer(&drawer).expect("insert drawer");
 }
 
+#[tokio::test]
+async fn test_mcp_status_reports_llm_endpoint_pool() {
+    let (tmp, db_path) = setup_home();
+    let mempal_home = tmp.path().join(".mempal");
+    let config_path = mempal_home.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+db_path = "{}"
+
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "primary"
+base_url = "http://primary.local:8317/v1"
+model = "primary-model"
+max_concurrent = 2
+
+[[llm.endpoints]]
+id = "secondary"
+base_url = "http://secondary.local:8317/v1"
+model = "secondary-model"
+max_concurrent = 3
+
+[gating]
+enabled = true
+
+[gating.llm_judge]
+enabled = true
+"#,
+            db_path.display()
+        ),
+    )
+    .expect("write endpoint-pool config");
+    ConfigHandle::bootstrap(&config_path).expect("bootstrap endpoint-pool config");
+    let config = Config::load_from(&config_path).expect("load endpoint-pool config");
+
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
+    let response = server.mempal_status().await.expect("status").0;
+
+    assert_eq!(
+        response.llm_status.model.as_deref(),
+        Some("primary=primary-model, secondary=secondary-model")
+    );
+    assert_eq!(
+        response.ingest_gating_status.llm_model.as_deref(),
+        Some("primary=primary-model, secondary=secondary-model")
+    );
+    assert_eq!(response.llm_status.endpoints.len(), 2);
+    assert_eq!(response.llm_status.endpoints[0].id, "primary");
+    assert_eq!(
+        response.llm_status.endpoints[0].base_url,
+        "http://primary.local:8317/v1"
+    );
+    assert_eq!(response.llm_status.endpoints[1].model, "secondary-model");
+}
+
 #[cfg(feature = "integration")]
 async fn spawn_models_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let app = Router::new().route(

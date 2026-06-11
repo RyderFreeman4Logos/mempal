@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::core::config::Config;
 use crate::core::types::{IntelligenceMode, SearchResult, Triple};
 use crate::core::utils::{build_triple_id, current_timestamp};
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::llm::{LlmMessage, LlmRequest, LlmRouter};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnhancedContent {
@@ -125,7 +125,7 @@ impl IntelligenceRouter {
             .has_effective_llm_endpoint(&config.llm)
         {
             let llm_config = config.memory_intelligence.effective_llm_config(&config.llm);
-            LlmClient::from_config(&llm_config)
+            LlmRouter::from_config(&llm_config)
                 .ok()
                 .map(LlmIntelligenceEnhancer::new)
         } else {
@@ -252,12 +252,12 @@ impl IntelligenceEnhancer for DeterministicIntelligenceEnhancer {
 }
 
 pub struct LlmIntelligenceEnhancer {
-    client: LlmClient,
+    router: LlmRouter,
 }
 
 impl LlmIntelligenceEnhancer {
-    pub fn new(client: LlmClient) -> Self {
-        Self { client }
+    pub fn new(router: LlmRouter) -> Self {
+        Self { router }
     }
 }
 
@@ -265,7 +265,7 @@ impl LlmIntelligenceEnhancer {
 impl IntelligenceEnhancer for LlmIntelligenceEnhancer {
     async fn enhance_ingest(&self, raw_content: &str) -> Result<EnhancedContent> {
         let response = self
-            .client
+            .router
             .chat_completion(&LlmRequest {
                 messages: vec![
                     LlmMessage {
@@ -280,8 +280,9 @@ impl IntelligenceEnhancer for LlmIntelligenceEnhancer {
                 model: None,
                 temperature: Some(0.0),
                 max_tokens: Some(512),
-            })
+            }, None)
             .await?;
+        let response = response.response;
         let decoded: LlmEnhancedContent = parse_llm_json(&response.content)?;
         validate_enhanced_content(raw_content, decoded)
     }
@@ -298,7 +299,7 @@ impl IntelligenceEnhancer for LlmIntelligenceEnhancer {
             .collect::<Vec<_>>()
             .join("\n---\n");
         let response = self
-            .client
+            .router
             .chat_completion(&LlmRequest {
                 messages: vec![
                     LlmMessage {
@@ -313,15 +314,16 @@ impl IntelligenceEnhancer for LlmIntelligenceEnhancer {
                 model: None,
                 temperature: Some(0.0),
                 max_tokens: Some(1024),
-            })
+            }, None)
             .await?;
+        let response = response.response;
         let decoded: LlmEnhancedResults = parse_llm_json(&response.content)?;
         validate_search_results(results, decoded)
     }
 
     async fn extract_kg_triples(&self, content: &str) -> Result<Vec<Triple>> {
         let response = self
-            .client
+            .router
             .chat_completion(&LlmRequest {
                 messages: vec![
                     LlmMessage {
@@ -336,15 +338,16 @@ impl IntelligenceEnhancer for LlmIntelligenceEnhancer {
                 model: None,
                 temperature: Some(0.0),
                 max_tokens: Some(512),
-            })
+            }, None)
             .await?;
+        let response = response.response;
         let decoded: LlmTriples = parse_llm_json(&response.content)?;
         validate_triples(content, decoded)
     }
 
     async fn explain_contradiction(&self, a: &str, b: &str) -> Result<String> {
         let response = self
-            .client
+            .router
             .chat_completion(&LlmRequest {
                 messages: vec![
                     LlmMessage {
@@ -359,8 +362,9 @@ impl IntelligenceEnhancer for LlmIntelligenceEnhancer {
                 model: None,
                 temperature: Some(0.0),
                 max_tokens: Some(256),
-            })
+            }, None)
             .await?;
+        let response = response.response;
         let decoded: LlmExplanation = parse_llm_json(&response.content)?;
         let explanation = decoded.explanation.trim();
         if explanation.is_empty() {

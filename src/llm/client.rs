@@ -3,14 +3,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use reqwest::StatusCode;
-use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::core::config::LlmConfig;
+use crate::core::config::{EffectiveLlmEndpoint, LlmConfig, validate_llm_base_url};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmMessage {
@@ -58,6 +57,11 @@ pub enum LlmError {
     },
     #[error("LLM request timed out")]
     Timeout,
+    #[error("all LLM endpoints are temporarily unavailable: {reason}")]
+    TemporarilyUnavailable {
+        retry_after: Duration,
+        reason: String,
+    },
     #[error("missing LLM configuration: {0}")]
     MissingConfiguration(String),
 }
@@ -65,7 +69,7 @@ pub enum LlmError {
 impl LlmError {
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::HttpRequest { .. } | Self::Timeout => true,
+            Self::HttpRequest { .. } | Self::Timeout | Self::TemporarilyUnavailable { .. } => true,
             Self::HttpStatus { status, .. } => status.is_server_error(),
             Self::ClientError { status, .. } => *status == StatusCode::TOO_MANY_REQUESTS,
             Self::DecodeResponse(_) | Self::MissingConfiguration(_) => false,
@@ -86,30 +90,26 @@ pub struct LlmClient {
 
 impl LlmClient {
     pub fn from_config(config: &LlmConfig) -> Result<Self, LlmError> {
-        let base_url = config
-            .base_url
-            .as_deref()
-            .filter(|base_url| !base_url.trim().is_empty())
-            .ok_or_else(|| {
-                LlmError::MissingConfiguration(
-                    "llm.base_url is required for backend=openai_compat; example: http://127.0.0.1:8317/v1"
-                        .to_string(),
-                )
-            })?
-            .trim_end_matches('/')
-            .to_string();
-        validate_base_url(&base_url)?;
+        let mut endpoints = config
+            .effective_endpoints()
+            .map_err(|error| LlmError::MissingConfiguration(error.to_string()))?;
+        let endpoint = if endpoints.is_empty() {
+            return Err(LlmError::MissingConfiguration(
+                "llm.base_url is required for backend=openai_compat; example: http://127.0.0.1:8317/v1"
+                    .to_string(),
+            ));
+        } else {
+            endpoints.remove(0)
+        };
+        Self::from_endpoint(&endpoint)
+    }
 
-        let model = config
-            .model
-            .as_deref()
-            .filter(|model| !model.trim().is_empty())
-            .ok_or_else(|| LlmError::MissingConfiguration("llm.model".to_string()))?
-            .to_string();
+    pub fn from_endpoint(endpoint: &EffectiveLlmEndpoint) -> Result<Self, LlmError> {
+        validate_base_url(&endpoint.base_url)?;
 
         let mut headers = HeaderMap::new();
         let resolved_key =
-            resolve_api_key(config.api_key.as_deref(), config.api_key_env.as_deref())?;
+            resolve_api_key(endpoint.api_key.as_deref(), endpoint.api_key_env.as_deref())?;
         if let Some(api_key) = resolved_key {
             let header_value =
                 HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|error| {
@@ -122,16 +122,16 @@ impl LlmClient {
 
         let http = reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .timeout(Duration::from_secs(endpoint.request_timeout_secs))
             .build()
             .map_err(|source| LlmError::HttpRequest { source })?;
 
-        let max_concurrent = config.max_concurrent.max(1);
+        let max_concurrent = endpoint.max_concurrent.max(1);
         Ok(Self {
             http,
-            base_url,
-            model,
-            extra_body: config.extra_body.clone(),
+            base_url: endpoint.base_url.clone(),
+            model: endpoint.model.clone(),
+            extra_body: endpoint.extra_body.clone(),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             current_max: Arc::new(AtomicUsize::new(max_concurrent)),
             concurrency_update_lock: Mutex::new(()),
@@ -285,27 +285,7 @@ fn read_api_key(api_key_env: Option<&str>) -> Result<Option<String>, LlmError> {
 }
 
 fn validate_base_url(base_url: &str) -> Result<(), LlmError> {
-    let parsed = Url::parse(base_url).map_err(|error| {
-        LlmError::MissingConfiguration(format!("invalid llm.base_url `{base_url}`: {error}"))
-    })?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(LlmError::MissingConfiguration(
-            "llm.base_url must not include userinfo credentials; use api_key_env instead"
-                .to_string(),
-        ));
-    }
-    if parsed.query().is_some() {
-        return Err(LlmError::MissingConfiguration(
-            "llm.base_url must not include query parameters; move secrets to api_key_env"
-                .to_string(),
-        ));
-    }
-    if parsed.fragment().is_some() {
-        return Err(LlmError::MissingConfiguration(
-            "llm.base_url must not include URL fragments".to_string(),
-        ));
-    }
-    Ok(())
+    validate_llm_base_url(base_url).map_err(LlmError::MissingConfiguration)
 }
 
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {

@@ -1998,6 +1998,16 @@ pub struct LlmStatusDto {
     pub backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<LlmEndpointStatusDto>,
+    pub max_concurrent: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct LlmEndpointStatusDto {
+    pub id: String,
+    pub base_url: String,
+    pub model: String,
     pub max_concurrent: usize,
 }
 

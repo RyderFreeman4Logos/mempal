@@ -478,6 +478,7 @@ impl HotReloadState {
             || previous.config.llm.api_key != effective.llm.api_key
             || previous.config.llm.api_key_env != effective.llm.api_key_env
             || previous.config.llm.extra_body != effective.llm.extra_body
+            || previous.config.llm.endpoints != effective.llm.endpoints
             || previous.config.llm.request_timeout_secs != effective.llm.request_timeout_secs
             || previous.config.llm.max_concurrent != effective.llm.max_concurrent
             || previous.config.llm.retry_interval_secs != effective.llm.retry_interval_secs

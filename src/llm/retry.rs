@@ -58,6 +58,10 @@ where
 }
 
 fn retry_after_from_error(error: &LlmError, default_secs: u64) -> Duration {
+    if let LlmError::TemporarilyUnavailable { retry_after, .. } = error {
+        let capped = retry_after.as_secs().min(MAX_RETRY_AFTER_SECS);
+        return Duration::from_secs(capped);
+    }
     if let LlmError::ClientError {
         retry_after: Some(header_duration),
         ..

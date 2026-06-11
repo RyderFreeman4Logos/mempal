@@ -178,6 +178,7 @@ impl Config {
 
     pub fn parse(contents: &str) -> Result<Self, ConfigError> {
         let root: toml::Value = toml::from_str(contents)?;
+        validate_llm_endpoint_pool_toml(&root)?;
         let mut config: Self = toml::from_str(contents)?;
         if root.get("embed").is_none() && root.get("embedder").is_none() {
             config.embed.backend = "model2vec".to_string();
@@ -297,13 +298,8 @@ impl Config {
                 "embed.retry.search_deadline_secs must be greater than 0".to_string(),
             ));
         }
-        if self.llm.enabled
-            && self
-                .llm
-                .base_url
-                .as_deref()
-                .is_none_or(|base_url| base_url.trim().is_empty())
-        {
+        self.llm.validate_endpoint_pool()?;
+        if self.llm.enabled && self.llm.effective_endpoints()?.is_empty() {
             return Err(ConfigError::Validation(
                 "llm.base_url must be set when llm.enabled is true".to_string(),
             ));
@@ -666,32 +662,58 @@ impl Config {
     }
 
     fn llm_base_url_locality_warnings(&self) -> Vec<RuntimeWarning> {
-        [
-            ("llm.base_url", self.llm.base_url.as_deref()),
-            (
-                "memory_intelligence.llm.base_url",
-                self.memory_intelligence.llm.base_url.as_deref(),
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(setting, base_url)| {
-            let base_url = base_url?.trim();
+        let mut warnings = Vec::new();
+        warnings.extend(llm_endpoint_locality_warnings(
+            "llm",
+            self.llm
+                .effective_endpoints()
+                .ok()
+                .as_deref()
+                .unwrap_or(&[]),
+        ));
+        if self.memory_intelligence.llm.defines_endpoint() {
+            let effective = self.memory_intelligence.effective_llm_config(&self.llm);
+            warnings.extend(llm_endpoint_locality_warnings(
+                "memory_intelligence.llm",
+                effective
+                    .effective_endpoints()
+                    .ok()
+                    .as_deref()
+                    .unwrap_or(&[]),
+            ));
+        }
+        warnings
+    }
+}
+
+fn llm_endpoint_locality_warnings(
+    setting: &str,
+    endpoints: &[EffectiveLlmEndpoint],
+) -> Vec<RuntimeWarning> {
+    endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let base_url = endpoint.base_url.trim();
             if base_url.is_empty() || llm_base_url_is_local_or_lan(base_url) {
                 return None;
             }
             let host = llm_base_url_host(base_url)
                 .map(|host| format!(" host `{host}`"))
                 .unwrap_or_default();
+            let field = if endpoint.id == "legacy" {
+                format!("{setting}.base_url")
+            } else {
+                format!("{setting}.endpoints[{}].base_url", endpoint.id)
+            };
             Some(RuntimeWarning {
                 level: "warn",
                 source: "llm",
                 message: format!(
-                    "{setting}{host} appears outside localhost/LAN; mempal assumes user-configured LLM endpoints are local or private network and does not block operation"
+                    "{field}{host} appears outside localhost/LAN; mempal assumes user-configured LLM endpoints are local or private network and does not block operation"
                 ),
             })
         })
         .collect()
-    }
 }
 
 fn llm_base_url_is_local_or_lan(base_url: &str) -> bool {
@@ -716,6 +738,97 @@ fn llm_base_url_host(base_url: &str) -> Option<String> {
     Url::parse(base_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
+}
+
+fn validate_llm_endpoint_pool_toml(root: &toml::Value) -> Result<(), ConfigError> {
+    let Some(llm) = root.get("llm").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    if !llm.contains_key("endpoints") {
+        return Ok(());
+    }
+    let scalar_keys = ["base_url", "model", "api_key", "api_key_env", "extra_body"];
+    let conflicts = scalar_keys
+        .into_iter()
+        .filter(|key| llm.contains_key(*key))
+        .collect::<Vec<_>>();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    Err(ConfigError::Validation(format!(
+        "llm endpoint list cannot be combined with legacy scalar endpoint fields: {}",
+        conflicts.join(", ")
+    )))
+}
+
+fn normalize_llm_endpoint_id(
+    configured: Option<&str>,
+    index: usize,
+) -> Result<String, ConfigError> {
+    let id = configured
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("endpoint-{}", index + 1));
+    if id.len() > 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        return Err(ConfigError::Validation(format!(
+            "llm endpoint id `{id}` must match [A-Za-z0-9_.-]{{1,64}}"
+        )));
+    }
+    Ok(id)
+}
+
+fn normalize_llm_endpoint_base_url(
+    base_url: Option<&str>,
+    field: &str,
+) -> Result<String, ConfigError> {
+    let base_url = base_url
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+        .ok_or_else(|| ConfigError::Validation(format!("{field} must not be empty")))?
+        .trim_end_matches('/')
+        .to_string();
+    validate_llm_base_url(&base_url).map_err(ConfigError::Validation)?;
+    Ok(base_url)
+}
+
+fn normalize_llm_endpoint_model(model: Option<&str>, field: &str) -> Result<String, ConfigError> {
+    model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ConfigError::Validation(format!("{field} must not be empty")))
+}
+
+pub fn validate_llm_base_url(base_url: &str) -> Result<(), String> {
+    let parsed = Url::parse(base_url)
+        .map_err(|error| format!("invalid llm.base_url `{base_url}`: {error}"))?;
+    if parsed.scheme().is_empty() {
+        return Err("llm.base_url must include a URL scheme".to_string());
+    }
+    if parsed.host_str().is_none() {
+        return Err("llm.base_url must include a host".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "llm.base_url must not include userinfo credentials; use api_key_env instead"
+                .to_string(),
+        );
+    }
+    if parsed.query().is_some() {
+        return Err(
+            "llm.base_url must not include query parameters; move secrets to api_key_env"
+                .to_string(),
+        );
+    }
+    if parsed.fragment().is_some() {
+        return Err("llm.base_url must not include URL fragments".to_string());
+    }
+    Ok(())
 }
 
 pub(crate) fn scrub_sensitive_text(input: &str) -> String {
@@ -963,6 +1076,7 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub extra_body: Option<serde_json::Value>,
+    pub endpoints: Vec<LlmEndpointConfig>,
     #[serde(alias = "timeout_secs")]
     pub request_timeout_secs: u64,
     pub retry_interval_secs: u64,
@@ -980,12 +1094,210 @@ impl Default for LlmConfig {
             api_key: None,
             api_key_env: None,
             extra_body: None,
+            endpoints: Vec::new(),
             request_timeout_secs: DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
             retry_interval_secs: DEFAULT_LLM_RETRY_INTERVAL_SECS,
             max_concurrent: DEFAULT_LLM_MAX_CONCURRENT,
             enabled_for: vec!["gating".to_string()],
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct LlmEndpointConfig {
+    pub id: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
+    pub extra_body: Option<serde_json::Value>,
+    #[serde(alias = "timeout_secs")]
+    pub request_timeout_secs: Option<u64>,
+    pub max_concurrent: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveLlmEndpoint {
+    pub id: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
+    pub extra_body: Option<serde_json::Value>,
+    pub request_timeout_secs: u64,
+    pub max_concurrent: usize,
+}
+
+impl EffectiveLlmEndpoint {
+    pub fn model_label(&self) -> String {
+        format!("{}={}", self.id, self.model)
+    }
+
+    pub fn base_url_label(&self) -> String {
+        format!("{}={}", self.id, self.base_url)
+    }
+}
+
+impl LlmConfig {
+    pub fn effective_endpoints(&self) -> Result<Vec<EffectiveLlmEndpoint>, ConfigError> {
+        self.validate_endpoint_pool()?;
+        if self.endpoints.is_empty() {
+            return self
+                .legacy_effective_endpoint()
+                .map(|endpoint| endpoint.into_iter().collect::<Vec<EffectiveLlmEndpoint>>());
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        self.endpoints
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint)| {
+                let id = normalize_llm_endpoint_id(endpoint.id.as_deref(), index)?;
+                if !seen.insert(id.clone()) {
+                    return Err(ConfigError::Validation(format!(
+                        "llm.endpoints id `{id}` must be unique"
+                    )));
+                }
+                let base_url = normalize_llm_endpoint_base_url(
+                    endpoint.base_url.as_deref(),
+                    format!("llm.endpoints[{index}].base_url").as_str(),
+                )?;
+                let model = normalize_llm_endpoint_model(
+                    endpoint.model.as_deref(),
+                    format!("llm.endpoints[{index}].model").as_str(),
+                )?;
+                Ok(EffectiveLlmEndpoint {
+                    id,
+                    base_url,
+                    model,
+                    api_key: endpoint.api_key.clone(),
+                    api_key_env: endpoint.api_key_env.clone(),
+                    extra_body: endpoint.extra_body.clone(),
+                    request_timeout_secs: endpoint
+                        .request_timeout_secs
+                        .unwrap_or(self.request_timeout_secs),
+                    max_concurrent: endpoint
+                        .max_concurrent
+                        .unwrap_or(self.max_concurrent)
+                        .max(1),
+                })
+            })
+            .collect()
+    }
+
+    pub fn validate_endpoint_pool(&self) -> Result<(), ConfigError> {
+        if self.endpoints.is_empty() {
+            return Ok(());
+        }
+        if self.has_legacy_endpoint_definition() {
+            return Err(ConfigError::Validation(
+                "llm endpoint list cannot be combined with legacy scalar endpoint fields"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn effective_model_summary(&self) -> Option<String> {
+        summarize_effective_endpoints(
+            self,
+            |endpoint| endpoint.model.clone(),
+            EffectiveLlmEndpoint::model_label,
+        )
+    }
+
+    pub fn effective_base_url_summary(&self) -> Option<String> {
+        summarize_effective_endpoints(
+            self,
+            |endpoint| endpoint.base_url.clone(),
+            EffectiveLlmEndpoint::base_url_label,
+        )
+    }
+
+    pub fn effective_endpoint_fingerprints(&self) -> Vec<serde_json::Value> {
+        self.effective_endpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|endpoint| {
+                serde_json::json!({
+                    "id": endpoint.id,
+                    "base_url": endpoint.base_url,
+                    "model": endpoint.model,
+                    "api_key_env": endpoint.api_key_env,
+                    "extra_body": endpoint.extra_body,
+                    "request_timeout_secs": endpoint.request_timeout_secs,
+                    "max_concurrent": endpoint.max_concurrent,
+                })
+            })
+            .collect()
+    }
+
+    fn legacy_effective_endpoint(&self) -> Result<Option<EffectiveLlmEndpoint>, ConfigError> {
+        let has_base_url = self
+            .base_url
+            .as_deref()
+            .is_some_and(|base_url| !base_url.trim().is_empty());
+        let has_model = self
+            .model
+            .as_deref()
+            .is_some_and(|model| !model.trim().is_empty());
+        if !has_base_url && !has_model {
+            return Ok(None);
+        }
+        let base_url = normalize_llm_endpoint_base_url(self.base_url.as_deref(), "llm.base_url")?;
+        let model = normalize_llm_endpoint_model(self.model.as_deref(), "llm.model")?;
+        Ok(Some(EffectiveLlmEndpoint {
+            id: "legacy".to_string(),
+            base_url,
+            model,
+            api_key: self.api_key.clone(),
+            api_key_env: self.api_key_env.clone(),
+            extra_body: self.extra_body.clone(),
+            request_timeout_secs: self.request_timeout_secs,
+            max_concurrent: self.max_concurrent.max(1),
+        }))
+    }
+
+    fn has_legacy_endpoint_definition(&self) -> bool {
+        self.base_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .model
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .api_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .api_key_env
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self.extra_body.is_some()
+    }
+}
+
+fn summarize_effective_endpoints(
+    config: &LlmConfig,
+    single_label: fn(&EffectiveLlmEndpoint) -> String,
+    multi_label: fn(&EffectiveLlmEndpoint) -> String,
+) -> Option<String> {
+    let endpoints = config.effective_endpoints().ok()?;
+    if endpoints.is_empty() {
+        return None;
+    }
+    if endpoints.len() == 1 {
+        return endpoints.first().map(single_label);
+    }
+    Some(
+        endpoints
+            .iter()
+            .map(multi_label)
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1008,39 +1320,55 @@ impl MemoryIntelligenceConfig {
     pub fn effective_llm_config(&self, base: &LlmConfig) -> LlmConfig {
         let mut config = base.clone();
         config.enabled = self.mode.uses_llm();
+        let overlay_defines_endpoint_identity = self.llm.defines_endpoint_identity();
+        if overlay_defines_endpoint_identity {
+            config.endpoints.clear();
+        }
         if self.llm.base_url.is_some() {
             config.base_url = self.llm.base_url.clone();
         }
         if self.llm.model.is_some() {
             config.model = self.llm.model.clone();
         }
-        if self.llm.api_key.is_some() {
-            config.api_key = self.llm.api_key.clone();
-        }
-        if self.llm.api_key_env.is_some() {
-            config.api_key_env = self.llm.api_key_env.clone();
-        }
-        if self.llm.extra_body.is_some() {
-            config.extra_body = self.llm.extra_body.clone();
-        }
         config.request_timeout_secs = self.llm.timeout_secs;
+        if !overlay_defines_endpoint_identity && !config.endpoints.is_empty() {
+            for endpoint in &mut config.endpoints {
+                if self.llm.api_key.is_some() {
+                    endpoint.api_key = self.llm.api_key.clone();
+                }
+                if self.llm.api_key_env.is_some() {
+                    if self.llm.api_key.is_none() {
+                        endpoint.api_key = None;
+                    }
+                    endpoint.api_key_env = self.llm.api_key_env.clone();
+                }
+                if self.llm.extra_body.is_some() {
+                    endpoint.extra_body = self.llm.extra_body.clone();
+                }
+            }
+        } else {
+            if self.llm.api_key.is_some() {
+                config.api_key = self.llm.api_key.clone();
+            }
+            if self.llm.api_key_env.is_some() {
+                if self.llm.api_key.is_none() {
+                    config.api_key = None;
+                }
+                config.api_key_env = self.llm.api_key_env.clone();
+            }
+            if self.llm.extra_body.is_some() {
+                config.extra_body = self.llm.extra_body.clone();
+            }
+        }
         config
     }
 
     pub fn has_effective_llm_endpoint(&self, base: &LlmConfig) -> bool {
+        let effective = self.effective_llm_config(base);
         self.mode.uses_llm()
-            && self
-                .llm
-                .base_url
-                .as_deref()
-                .or(base.base_url.as_deref())
-                .is_some_and(|value| !value.trim().is_empty())
-            && self
-                .llm
-                .model
-                .as_deref()
-                .or(base.model.as_deref())
-                .is_some_and(|value| !value.trim().is_empty())
+            && effective
+                .effective_endpoints()
+                .is_ok_and(|endpoints| !endpoints.is_empty())
     }
 }
 
@@ -1053,6 +1381,37 @@ pub struct MemoryIntelligenceLlmConfig {
     pub api_key_env: Option<String>,
     pub timeout_secs: u64,
     pub extra_body: Option<serde_json::Value>,
+}
+
+impl MemoryIntelligenceLlmConfig {
+    fn defines_endpoint_identity(&self) -> bool {
+        self.base_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .model
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    pub fn defines_endpoint(&self) -> bool {
+        self.base_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .model
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .api_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .api_key_env
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self.extra_body.is_some()
+    }
 }
 
 impl Default for MemoryIntelligenceLlmConfig {

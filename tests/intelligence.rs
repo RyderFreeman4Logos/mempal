@@ -35,6 +35,34 @@ extra_body = {{ chat_template_kwargs = {{ enable_thinking = false }} }}
     .expect("parse config")
 }
 
+fn endpoint_pool_config_for(primary: &Server, secondary: &Server, mode: &str) -> Config {
+    Config::parse(&format!(
+        r#"
+[memory_intelligence]
+mode = "{mode}"
+
+[memory_intelligence.llm]
+timeout_secs = 1
+
+[llm]
+enabled = true
+
+[[llm.endpoints]]
+id = "primary"
+base_url = "{}/v1"
+model = "primary-model"
+
+[[llm.endpoints]]
+id = "secondary"
+base_url = "{}/v1"
+model = "secondary-model"
+"#,
+        primary.url(),
+        secondary.url()
+    ))
+    .expect("parse endpoint pool config")
+}
+
 #[test]
 fn test_intelligence_mode_config_parsing() {
     for (raw, expected) in [
@@ -94,6 +122,40 @@ async fn test_auto_mode_fallback() {
     assert_eq!(enhanced.raw_content, "Alice works at Acme");
     assert!(enhanced.candidate_facts.is_empty());
     assert!(enhanced.fallback_reason.is_some());
+}
+
+#[tokio::test]
+async fn test_memory_intelligence_uses_endpoint_pool_fallback() {
+    let mut primary = Server::new_async().await;
+    let mut secondary = Server::new_async().await;
+    let primary_mock = primary
+        .mock("POST", "/v1/chat/completions")
+        .with_status(500)
+        .with_body("primary unavailable")
+        .create_async()
+        .await;
+    let supported = serde_json::json!({
+        "candidate_facts": ["Alice works at Acme"],
+        "tags": ["employment"],
+        "contradiction": false,
+        "correction": false
+    })
+    .to_string();
+    let secondary_mock = secondary
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body(llm_response(&supported))
+        .create_async()
+        .await;
+    let config = endpoint_pool_config_for(&primary, &secondary, "local_llm");
+    let router = IntelligenceRouter::from_config(&config);
+
+    let enhanced = router.enhance_ingest("Alice works at Acme").await;
+
+    primary_mock.assert_async().await;
+    secondary_mock.assert_async().await;
+    assert!(enhanced.used_llm);
+    assert_eq!(enhanced.candidate_facts, vec!["Alice works at Acme"]);
 }
 
 #[tokio::test]

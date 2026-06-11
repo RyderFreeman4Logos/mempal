@@ -11,8 +11,9 @@ use crate::core::db::Database;
 use crate::core::queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore};
 use crate::daemon_bootstrap::DaemonWriteObserver;
 
-use super::client::{LlmClient, LlmError, LlmMessage, LlmRequest};
+use super::client::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse};
 use super::retry::{self, HeartbeatCallback};
+use super::router::LlmRouter;
 use super::status::LlmStatus;
 
 const LLM_TASK_KIND: &str = "llm_task";
@@ -31,7 +32,9 @@ struct LlmClientConfigSignature {
     api_key: Option<String>,
     api_key_env: Option<String>,
     extra_body: Option<Value>,
+    endpoints: Vec<crate::core::config::LlmEndpointConfig>,
     request_timeout_secs: u64,
+    max_concurrent: usize,
 }
 
 impl From<&LlmConfig> for LlmClientConfigSignature {
@@ -43,42 +46,44 @@ impl From<&LlmConfig> for LlmClientConfigSignature {
             api_key: config.api_key.clone(),
             api_key_env: config.api_key_env.clone(),
             extra_body: config.extra_body.clone(),
+            endpoints: config.endpoints.clone(),
             request_timeout_secs: config.request_timeout_secs,
+            max_concurrent: config.max_concurrent,
         }
     }
 }
 
 #[doc(hidden)]
 pub struct LlmClientRuntime {
-    client: Option<Arc<LlmClient>>,
+    router: Option<Arc<LlmRouter>>,
     signature: LlmClientConfigSignature,
 }
 
 impl LlmClientRuntime {
     pub fn new(config: &LlmConfig) -> Self {
-        let client = match LlmClient::from_config(config) {
-            Ok(client) => Some(Arc::new(client)),
+        let router = match LlmRouter::from_config(config) {
+            Ok(router) => Some(Arc::new(router)),
             Err(error) => {
-                tracing::warn!(%error, "LLM client unavailable at startup; worker will retry");
+                tracing::warn!(%error, "LLM router unavailable at startup; worker will retry");
                 None
             }
         };
         Self {
-            client,
+            router,
             signature: LlmClientConfigSignature::from(config),
         }
     }
 
     #[doc(hidden)]
-    pub fn client_for_config(&mut self, config: &LlmConfig) -> Result<Arc<LlmClient>, LlmError> {
+    pub fn router_for_config(&mut self, config: &LlmConfig) -> Result<Arc<LlmRouter>, LlmError> {
         let signature = LlmClientConfigSignature::from(config);
-        if self.client.is_none() || self.signature != signature {
-            self.client = Some(Arc::new(LlmClient::from_config(config)?));
+        if self.router.is_none() || self.signature != signature {
+            self.router = Some(Arc::new(LlmRouter::from_config(config)?));
             self.signature = signature;
-            tracing::info!("LLM client rebuilt after config hot-reload");
+            tracing::info!("LLM router rebuilt after config hot-reload");
         }
-        self.client.as_ref().map(Arc::clone).ok_or_else(|| {
-            LlmError::MissingConfiguration("LLM client unavailable after rebuild".to_string())
+        self.router.as_ref().map(Arc::clone).ok_or_else(|| {
+            LlmError::MissingConfiguration("LLM router unavailable after rebuild".to_string())
         })
     }
 }
@@ -88,7 +93,7 @@ pub type SharedLlmClientRuntime = Arc<Mutex<LlmClientRuntime>>;
 async fn client_for_claimed_generation(
     client_runtime: &SharedLlmClientRuntime,
     llm_gen_rx: &mut tokio::sync::watch::Receiver<u64>,
-) -> Result<(Arc<LlmClient>, Arc<Config>), LlmError> {
+) -> Result<(Arc<LlmRouter>, Arc<Config>), LlmError> {
     loop {
         let snapshot = ConfigHandle::current_llm_runtime_snapshot();
         if !crate::daemon::llm_worker_claim_enabled(snapshot.config.as_ref()) {
@@ -97,22 +102,16 @@ async fn client_for_claimed_generation(
             ));
         }
 
-        let client = {
+        let router = {
             let mut runtime = client_runtime
                 .lock()
                 .expect("LLM client runtime mutex poisoned");
-            runtime.client_for_config(&snapshot.config.llm)
+            runtime.router_for_config(&snapshot.config.llm)
         }?;
-
-        let new_max = snapshot.config.llm.max_concurrent.max(1);
-        if client.current_max_concurrent() != new_max {
-            client.update_concurrency(new_max).await;
-            tracing::info!("LLM worker: concurrency updated to {new_max}");
-        }
 
         let observed_generation = *llm_gen_rx.borrow_and_update();
         if observed_generation == snapshot.generation {
-            return Ok((client, snapshot.config));
+            return Ok((router, snapshot.config));
         }
 
         tracing::info!(
@@ -200,7 +199,7 @@ pub async fn run_llm_worker(
             }
         };
 
-        let (client, config) =
+        let (router, config) =
             match client_for_claimed_generation(&client_runtime, &mut llm_gen_rx).await {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -251,7 +250,7 @@ pub async fn run_llm_worker(
         // with the fresh config snapshot.
         let task_result = tokio::select! {
             result = process_llm_task_shared(
-                client.as_ref(),
+                router.as_ref(),
                 &status,
                 &db,
                 &message.payload,
@@ -341,7 +340,7 @@ pub fn confirm_llm_task(store: &PendingMessageStore, claim: &ClaimedMessage) -> 
 }
 
 async fn process_llm_task_shared(
-    client: &LlmClient,
+    router: &LlmRouter,
     status: &LlmStatus,
     db: &AsyncDb,
     payload: &str,
@@ -352,20 +351,20 @@ async fn process_llm_task_shared(
         serde_json::from_str(payload).context("failed to decode LLM task payload")?;
 
     match task.task_type.as_str() {
-        "gating" => process_gating_task(client, status, db, &task, config, heartbeat).await,
+        "gating" => process_gating_task(router, status, db, &task, config, heartbeat).await,
         other => anyhow::bail!("unknown LLM task type: {other}"),
     }
 }
 
 async fn process_gating_task(
-    client: &LlmClient,
+    router: &LlmRouter,
     status: &LlmStatus,
     db: &AsyncDb,
     task: &LlmTaskPayload,
     config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
 ) -> Result<()> {
-    let (verdict, score) = request_gating_verdict(client, status, task, config, heartbeat).await?;
+    let (verdict, score) = request_gating_verdict(router, status, task, config, heartbeat).await?;
     apply_gating_verdict_async(db, task.clone(), config.clone(), verdict, score).await
 }
 
@@ -394,7 +393,8 @@ pub async fn process_llm_task(
     match task.task_type.as_str() {
         "gating" => {
             let (verdict, score) =
-                request_gating_verdict(client, status, &task, config, heartbeat).await?;
+                request_gating_verdict_with_client(client, status, &task, config, heartbeat)
+                    .await?;
             apply_gating_verdict(db, &task, config, &verdict, score)
         }
         other => anyhow::bail!("unknown LLM task type: {other}"),
@@ -402,18 +402,49 @@ pub async fn process_llm_task(
 }
 
 async fn request_gating_verdict(
+    router: &LlmRouter,
+    status: &LlmStatus,
+    task: &LlmTaskPayload,
+    config: &crate::core::config::Config,
+    heartbeat: Option<&HeartbeatCallback>,
+) -> Result<(String, f64)> {
+    let request = gating_request(task);
+    let retry_interval = config.llm.retry_interval_secs;
+    let response = retry::retry_llm_operation(retry_interval, heartbeat, || async {
+        router
+            .chat_completion(&request, heartbeat)
+            .await
+            .map(|routed| routed.response)
+    })
+    .await;
+
+    record_gating_response(status, response)
+}
+
+async fn request_gating_verdict_with_client(
     client: &LlmClient,
     status: &LlmStatus,
     task: &LlmTaskPayload,
     config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
 ) -> Result<(String, f64)> {
+    let request = gating_request(task);
+    let retry_interval = config.llm.retry_interval_secs;
+    let response = retry::retry_llm_operation(retry_interval, heartbeat, || {
+        client.chat_completion(&request)
+    })
+    .await;
+
+    record_gating_response(status, response)
+}
+
+fn gating_request(task: &LlmTaskPayload) -> LlmRequest {
     let system_prompt = task
         .system_prompt
         .as_deref()
         .unwrap_or(DEFAULT_GATING_JUDGE_PROMPT);
 
-    let request = LlmRequest {
+    LlmRequest {
         messages: vec![
             LlmMessage {
                 role: "system".to_string(),
@@ -427,14 +458,13 @@ async fn request_gating_verdict(
         model: None,
         temperature: Some(0.0),
         max_tokens: Some(1024),
-    };
+    }
+}
 
-    let retry_interval = config.llm.retry_interval_secs;
-    let response = retry::retry_llm_operation(retry_interval, heartbeat, || {
-        client.chat_completion(&request)
-    })
-    .await;
-
+fn record_gating_response(
+    status: &LlmStatus,
+    response: Result<LlmResponse, LlmError>,
+) -> Result<(String, f64)> {
     match response {
         Ok(response) => {
             status.record_success();
@@ -647,6 +677,36 @@ threshold = 0.5
         )
     }
 
+    fn worker_endpoint_pool_config(primary_base_url: &str, secondary_base_url: &str) -> String {
+        format!(
+            r#"
+[config_hot_reload]
+enabled = false
+
+[llm]
+enabled = true
+enabled_for = ["gating"]
+max_concurrent = 1
+retry_interval_secs = 1
+request_timeout_secs = 5
+
+[[llm.endpoints]]
+id = "primary"
+base_url = "{primary_base_url}"
+model = "primary-model"
+
+[[llm.endpoints]]
+id = "secondary"
+base_url = "{secondary_base_url}"
+model = "secondary-model"
+
+[ingest_gating.llm_judge]
+enabled = true
+threshold = 0.5
+"#
+        )
+    }
+
     async fn spawn_counting_llm_server(
         count: Arc<AtomicUsize>,
         notify: Arc<Notify>,
@@ -692,6 +752,38 @@ threshold = 0.5
         (format!("http://{addr}/v1"), handle)
     }
 
+    async fn spawn_failing_llm_server(
+        count: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let count = Arc::clone(&count);
+                let notify = Arc::clone(&notify);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    notify.notify_waiters();
+                    (StatusCode::INTERNAL_SERVER_ERROR, "server error")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing test LLM server");
+        let addr = listener
+            .local_addr()
+            .expect("failing test LLM server address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve failing test LLM server");
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
     fn gating_task(id: &str) -> LlmTaskPayload {
         LlmTaskPayload {
             task_type: "gating".to_string(),
@@ -710,6 +802,23 @@ threshold = 0.5
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
             )
             .expect("read LLM audit verdict")
+    }
+
+    fn maybe_llm_audit_verdict(db: &Database, id: &str) -> Option<(String, f64)> {
+        let (verdict, score) = db
+            .conn()
+            .query_row(
+                "SELECT llm_verdict, llm_score FROM gating_audit WHERE drawer_id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<f64>>(1)?,
+                    ))
+                },
+            )
+            .expect("read optional LLM audit verdict");
+        verdict.zip(score)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -790,6 +899,105 @@ threshold = 0.5
             "stale pre-reload client must not process a claim returned after reload"
         );
         assert_eq!(new_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_worker_gating_uses_endpoint_pool_fallback() {
+        let _guard = crate::core::config::global_config_test_lock()
+            .lock_owned()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let db_path = tmp.path().join("palace.db");
+
+        let primary_count = Arc::new(AtomicUsize::new(0));
+        let secondary_count = Arc::new(AtomicUsize::new(0));
+        let primary_notify = Arc::new(Notify::new());
+        let secondary_notify = Arc::new(Notify::new());
+        let (primary_base_url, primary_server) =
+            spawn_failing_llm_server(Arc::clone(&primary_count), Arc::clone(&primary_notify)).await;
+        let (secondary_base_url, secondary_server) =
+            spawn_counting_llm_server(Arc::clone(&secondary_count), Arc::clone(&secondary_notify))
+                .await;
+
+        std::fs::write(
+            &config_path,
+            worker_endpoint_pool_config(&primary_base_url, &secondary_base_url),
+        )
+        .expect("write endpoint pool config");
+        ConfigHandle::bootstrap_quiet(&config_path).expect("bootstrap endpoint pool config");
+
+        let db = Database::open(&db_path).expect("open db");
+        let drawer_id = "endpoint-pool-fallback-drawer";
+        insert_drawer(&db, drawer_id);
+        record_pending_llm_audit(&db, drawer_id);
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let task = gating_task(drawer_id);
+        store
+            .enqueue(
+                LLM_TASK_KIND,
+                &serde_json::to_string(&task).expect("serialize task"),
+            )
+            .expect("enqueue LLM task");
+
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let client_runtime = Arc::new(Mutex::new(LlmClientRuntime::new(
+            &ConfigHandle::current().llm,
+        )));
+        let worker = tokio::spawn(run_llm_worker(
+            Arc::new(async_store),
+            client_runtime,
+            Arc::new(LlmStatus::new(5)),
+            async_db,
+            DaemonWriteObserver::for_test(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), secondary_notify.notified())
+            .await
+            .expect("secondary endpoint should be used");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some((verdict, score)) = maybe_llm_audit_verdict(&db, drawer_id)
+                    && verdict == LLM_VERDICT_KEEP
+                    && score >= 0.9
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("LLM audit should be updated by worker");
+
+        worker.abort();
+        let _ = worker.await;
+        primary_server.abort();
+        secondary_server.abort();
+        let _ = primary_server.await;
+        let _ = secondary_server.await;
+
+        assert_eq!(
+            primary_count.load(Ordering::SeqCst),
+            1,
+            "production worker should try the primary endpoint first"
+        );
+        assert_eq!(
+            secondary_count.load(Ordering::SeqCst),
+            1,
+            "production worker should fall back to the secondary endpoint"
+        );
+        assert!(
+            !drawer_is_deleted(&db, drawer_id),
+            "keep verdict from fallback endpoint must retain the drawer"
+        );
+        assert!(
+            store
+                .claim_next_by_kind("after-fallback-worker", 1, LLM_TASK_KIND)
+                .expect("claim after worker fallback")
+                .is_none(),
+            "completed fallback task must be confirmed"
+        );
     }
 
     #[test]

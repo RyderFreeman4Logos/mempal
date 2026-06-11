@@ -10,7 +10,7 @@ use crate::context::assemble_context_with_vector;
 use crate::core::{
     AsyncDb,
     anchor::{self, DerivedAnchor},
-    config::ConfigHandle,
+    config::{Config, ConfigHandle},
     db::{
         CURRENT_VECTOR_INDEX_VERSION, Database, NoveltyAuditInsert, VECTOR_DISTANCE_METRIC,
         read_fork_ext_version,
@@ -36,8 +36,8 @@ use crate::core::{
         SearchResult, SourceType, TriggerHints, Triple, default_confidence,
     },
     utils::{
-        build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp, iso_timestamp,
-        knowledge_source_file, link_superseded_drawer, normalize_rfc3339_timestamp,
+        build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp, expand_home,
+        iso_timestamp, knowledge_source_file, link_superseded_drawer, normalize_rfc3339_timestamp,
         source_file_or_synthetic,
     },
 };
@@ -108,18 +108,29 @@ use super::tools::{
     KnowledgeDistillRequest, KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse,
     KnowledgePolicyResponse, KnowledgePromoteRequest, KnowledgePromoteResponse,
     KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest,
-    LeaseResponse, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS,
-    OperationStatusRequest, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto,
-    Phase3Request, Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest,
-    PinnedFactsResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest,
-    ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto,
-    RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto,
-    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, SkillDto,
-    SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, StatusDetail, StatusRequest,
-    StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto, TaxonomyRequest,
-    TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto, TunnelsRequest,
-    TunnelsResponse, TurnStorageStatusDto,
+    LeaseResponse, LlmEndpointStatusDto, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT,
+    MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest, PeekMessageDto, PeekPartnerRequest,
+    PeekPartnerResponse, Phase3GateDto, Phase3Request, Phase3Response, PinnedFactDto,
+    PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse, QueueStatsDto,
+    ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
+    ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto, RollbackRequest,
+    RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto,
+    SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
+    SkillSummaryDto, SourceTypeCount, StatusDetail, StatusRequest, StatusResponse, StatusScope,
+    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
+    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
+
+fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
+    let config_db_path = expand_home(&config.db_path);
+    if config_db_path == server_db_path {
+        return true;
+    }
+    match (config_db_path.canonicalize(), server_db_path.canonicalize()) {
+        (Ok(config_db_path), Ok(server_db_path)) => config_db_path == server_db_path,
+        _ => false,
+    }
+}
 
 const MCP_SEARCH_ROUTE_DEADLINE: Duration = Duration::from_secs(5);
 const MCP_SEARCH_DB_DEADLINE: Duration = Duration::from_secs(30);
@@ -130,6 +141,7 @@ const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct MempalMcpServer {
     db_path: PathBuf,
+    initial_config: Arc<Config>,
     async_db: Arc<OnceCell<AsyncDb>>,
     async_queue: AsyncPendingMessageStore,
     gating_runtime: Arc<GatingRuntime>,
@@ -175,12 +187,14 @@ impl MempalMcpServer {
 
     pub fn new_with_factory_and_config(
         db_path: PathBuf,
-        config: crate::core::config::Config,
+        config: Config,
         embedder_factory: Arc<dyn EmbedderFactory>,
     ) -> anyhow::Result<Self> {
         let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+        let initial_config = Arc::new(config.clone());
         Ok(Self {
             db_path,
+            initial_config,
             async_db: Arc::new(OnceCell::new()),
             async_queue,
             gating_runtime: Arc::new(GatingRuntime::new(config, Arc::clone(&embedder_factory))),
@@ -199,6 +213,15 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             ingest_processing_delay: None,
         })
+    }
+
+    fn status_config_snapshot(&self) -> Arc<Config> {
+        let current = ConfigHandle::current();
+        if config_db_path_matches_server(current.as_ref(), &self.db_path) {
+            current
+        } else {
+            Arc::clone(&self.initial_config)
+        }
     }
 
     #[cfg(any(test, feature = "db-test-seam"))]
@@ -2070,7 +2093,7 @@ impl MempalMcpServer {
             StatusDetail::Full => StatusScope::All,
         });
         let cfg_meta = ConfigHandle::snapshot_meta();
-        let config = ConfigHandle::current();
+        let config = self.status_config_snapshot();
         let project_id = self
             .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
             .await?;
@@ -2290,7 +2313,19 @@ impl MempalMcpServer {
             llm_status: LlmStatusDto {
                 enabled: config.llm.enabled,
                 backend: Some(config.llm.backend.clone()),
-                model: config.llm.model.clone(),
+                model: config.llm.effective_model_summary(),
+                endpoints: config
+                    .llm
+                    .effective_endpoints()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|endpoint| LlmEndpointStatusDto {
+                        id: endpoint.id,
+                        base_url: endpoint.base_url,
+                        model: endpoint.model,
+                        max_concurrent: endpoint.max_concurrent,
+                    })
+                    .collect(),
                 max_concurrent: config.llm.max_concurrent,
             },
             intelligence_status: IntelligenceStatusDto {
