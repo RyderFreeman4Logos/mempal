@@ -18,7 +18,9 @@ use anyhow::{Context, Result};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 #[cfg(target_os = "linux")]
-use crate::process_diagnostics::{DbHolderRemediationTarget, DbHolderReport, inspect_db_holders};
+use crate::process_diagnostics::{
+    DbHolderRemediationTarget, DbHolderReport, inspect_db_holders_for_startup_remediation,
+};
 
 const DAEMON_STALL_SECONDS: u64 = 5 * 60;
 const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
@@ -315,7 +317,7 @@ fn open_daemon_storage_after_stale_holder_cleanup(
     db_path: &Path,
     first_error: anyhow::Error,
 ) -> Result<(Database, AsyncDb, AsyncPendingMessageStore)> {
-    let before = crate::process_diagnostics::inspect_db_holders(db_path);
+    let before = inspect_db_holders_for_startup_remediation(db_path);
     let plan = crate::process_diagnostics::plan_stale_db_holder_remediation(&before);
     let mut remediation_errors = Vec::new();
 
@@ -333,7 +335,7 @@ fn open_daemon_storage_after_stale_holder_cleanup(
     match open_daemon_storage_once(db_path) {
         Ok(handles) => Ok(handles),
         Err(error) if is_sqlite_lock_error(&error) => {
-            let after = crate::process_diagnostics::inspect_db_holders(db_path);
+            let after = inspect_db_holders_for_startup_remediation(db_path);
             let terminated_pids = termination_outcome.signaled;
             Err(anyhow::anyhow!(
                 "{}",
@@ -395,7 +397,7 @@ struct RealDbHolderProcessOps<'a> {
 #[cfg(target_os = "linux")]
 impl DbHolderProcessOps for RealDbHolderProcessOps<'_> {
     fn inspect_holders(&mut self) -> DbHolderReport {
-        inspect_db_holders(self.db_path)
+        inspect_db_holders_for_startup_remediation(self.db_path)
     }
 
     fn signal(&mut self, pid: i32, signal: i32) -> Result<()> {

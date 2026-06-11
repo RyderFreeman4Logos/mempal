@@ -252,12 +252,66 @@ pub fn inspect_db_holders(db_path: &Path) -> DbHolderReport {
     }
 }
 
+/// Inspect live DB holders for daemon-startup remediation after the singleton
+/// daemon lock has already been acquired.
+///
+/// A process named by `daemon.pid` is protected in status output, but once the
+/// new daemon owns `daemon.lock`, a pidfile-only daemon holder is stale and can
+/// be classified as an `orphan_daemon` for the cleanup path.
+#[cfg(target_os = "linux")]
+pub(crate) fn inspect_db_holders_for_startup_remediation(db_path: &Path) -> DbHolderReport {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    inspect_db_holders_in_proc_for_startup_remediation(
+        db_path,
+        Path::new("/proc"),
+        now_secs,
+        clock_ticks_per_second(),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn inspect_db_holders_in_proc(
     db_path: &Path,
     proc_root: &Path,
     now_secs: u64,
     clock_ticks_per_second: u64,
+) -> DbHolderReport {
+    inspect_db_holders_in_proc_with_daemon_pid_protection(
+        db_path,
+        proc_root,
+        now_secs,
+        clock_ticks_per_second,
+        true,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_db_holders_in_proc_for_startup_remediation(
+    db_path: &Path,
+    proc_root: &Path,
+    now_secs: u64,
+    clock_ticks_per_second: u64,
+) -> DbHolderReport {
+    inspect_db_holders_in_proc_with_daemon_pid_protection(
+        db_path,
+        proc_root,
+        now_secs,
+        clock_ticks_per_second,
+        false,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_db_holders_in_proc_with_daemon_pid_protection(
+    db_path: &Path,
+    proc_root: &Path,
+    now_secs: u64,
+    clock_ticks_per_second: u64,
+    protect_daemon_pid: bool,
 ) -> DbHolderReport {
     let current_pid = std::process::id() as i32;
     let daemon_pid = read_daemon_pid(db_path);
@@ -293,7 +347,8 @@ fn inspect_db_holders_in_proc(
         let argv = read_cmdline(&pid_dir.join("cmdline"));
         let role = classify_role(&argv, &binary_name);
         let current_process = pid == current_pid;
-        let current_daemon = daemon_pid == Some(pid) && role == "mempal_daemon";
+        let current_daemon =
+            protect_daemon_pid && daemon_pid == Some(pid) && role == "mempal_daemon";
         let stat_path = pid_dir.join("stat");
         let parent_pid = read_parent_pid(&stat_path);
         let current_mcp_server = current_process && role == "mempal_mcp_server";
@@ -845,6 +900,68 @@ mod tests {
             assert_eq!(report.holders[1].age_secs, Some(98));
             assert_eq!(report.holders[2].classification, "orphan_daemon");
             assert_eq!(report.holders[3].classification, "extra_holder");
+        }
+
+        #[test]
+        fn test_startup_remediation_treats_stale_daemon_pidfile_as_orphan() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let proc_root = tmp.path().join("proc");
+            fs::create_dir_all(&proc_root).expect("create proc");
+            fs::write(proc_root.join("stat"), "cpu 0 0 0 0\nbtime 1000\n").expect("write stat");
+
+            let mempal_home = tmp.path().join(".mempal");
+            fs::create_dir_all(&mempal_home).expect("create mempal home");
+            let db_path = mempal_home.join("palace.db");
+            fs::write(mempal_home.join("daemon.pid"), "42042\n").expect("write pidfile");
+
+            write_process(
+                &proc_root,
+                42042,
+                &["mempal", "daemon", "--foreground"],
+                &[db_path.as_path()],
+            );
+            write_process_with_parent(
+                &proc_root,
+                7777,
+                1234,
+                &["/usr/local/bin/mempal", "serve"],
+                &[db_path.as_path()],
+            );
+
+            let report =
+                inspect_db_holders_in_proc_for_startup_remediation(&db_path, &proc_root, 1100, 100);
+
+            assert_eq!(report.holder_count, 2);
+            assert_eq!(report.orphan_daemon_count, 1);
+            assert_eq!(report.stale_mcp_server_count, 0);
+            assert_eq!(report.extra_holder_count, 1);
+            let daemon_holder = report
+                .holders
+                .iter()
+                .find(|holder| holder.pid == 42042)
+                .expect("daemon holder");
+            assert_eq!(daemon_holder.role, "mempal_daemon");
+            assert_eq!(daemon_holder.classification, "orphan_daemon");
+            assert!(!daemon_holder.current_daemon);
+
+            let mcp_holder = report
+                .holders
+                .iter()
+                .find(|holder| holder.pid == 7777)
+                .expect("mcp holder");
+            assert_eq!(mcp_holder.role, "mempal_mcp_server");
+            assert_eq!(mcp_holder.classification, "extra_holder");
+
+            let plan = plan_stale_db_holder_remediation(&report);
+            assert_eq!(plan.terminate_pids, vec![42042]);
+            assert!(plan.terminate_targets[0].matches_holder(daemon_holder));
+            assert_eq!(
+                plan.manual_holders
+                    .iter()
+                    .map(|holder| holder.pid)
+                    .collect::<Vec<_>>(),
+                vec![7777]
+            );
         }
 
         #[test]
