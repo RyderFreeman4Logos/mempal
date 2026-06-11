@@ -347,6 +347,55 @@ fn test_status_command_shows_queue_stats() {
 }
 
 #[test]
+fn test_status_command_live_queue_counts_ignore_stale_completion_op_state() {
+    let (home, db_path) = setup_home();
+    let store = PendingMessageStore::new(&db_path).expect("create store");
+    let failed_id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
+    let failed = store
+        .claim_next("worker-failed", 60)
+        .expect("claim")
+        .expect("failed row");
+    assert_eq!(failed.id, failed_id);
+    store
+        .mark_failed_with_disposition(&failed, "boom", QueueFailureDisposition::Terminal)
+        .expect("mark terminal failed");
+
+    Connection::open(&db_path)
+        .expect("open sqlite")
+        .execute_batch(
+            r#"
+            INSERT INTO pending_message_completions (
+                message_id,
+                kind,
+                created_at,
+                claimed_at,
+                completed_at,
+                processing_ms,
+                op_state
+            )
+            VALUES
+                ('history-running', 'hook_event', 1700000000, 1700000001, 1700000002, 1000, 'running'),
+                ('history-queued', 'hook_event', 1700000003, 1700000004, 1700000005, 1000, 'queued');
+            "#,
+        )
+        .expect("insert stale completion history");
+
+    let output = Command::new(mempal_bin())
+        .arg("status")
+        .env("HOME", home.path())
+        .output()
+        .expect("run mempal status");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
+    assert!(stdout.contains("Queue:"), "{stdout}");
+    assert!(stdout.contains("pending: 0"), "{stdout}");
+    assert!(stdout.contains("claimed: 0"), "{stdout}");
+    assert!(stdout.contains("failed: 1"), "{stdout}");
+    assert!(stdout.contains("embed_fail_count: 1"), "{stdout}");
+}
+
+#[test]
 fn test_status_command_shows_vector_index_stale_flag() {
     let (home, db_path) = setup_home();
     recreate_vectors_with_metric(&db_path, "l2");

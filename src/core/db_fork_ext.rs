@@ -90,7 +90,7 @@ SET op_state = CASE
     WHEN rejected_reason IS NOT NULL THEN 'rejected'
     ELSE 'completed'
 END
-WHERE op_state = 'queued';
+WHERE op_state IN ('queued', 'running');
 
 UPDATE pending_message_completions
 SET created_at = CAST(created_at / 1000 AS INTEGER)

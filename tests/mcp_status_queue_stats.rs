@@ -236,6 +236,60 @@ async fn test_mcp_status_headline_reflects_failed_queue() {
 }
 
 #[tokio::test]
+async fn test_mcp_status_live_queue_counts_ignore_stale_completion_op_state() {
+    let (_tmp, db_path, config) = setup_env();
+    let store = PendingMessageStore::with_config(
+        &db_path,
+        QueueConfig {
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            max_retries: 0,
+        },
+    )
+    .expect("create store");
+    let failed_id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
+    let failed = store
+        .claim_next("worker-failed", 60)
+        .expect("claim")
+        .expect("failed row");
+    assert_eq!(failed.id, failed_id);
+    store
+        .mark_failed_with_disposition(&failed, "boom", QueueFailureDisposition::Terminal)
+        .expect("mark terminal failed");
+
+    let db = Database::open(&db_path).expect("open db");
+    db.conn()
+        .execute_batch(
+            r#"
+            INSERT INTO pending_message_completions (
+                message_id,
+                kind,
+                created_at,
+                claimed_at,
+                completed_at,
+                processing_ms,
+                op_state
+            )
+            VALUES
+                ('history-running', 'hook_event', 1700000000, 1700000001, 1700000002, 1000, 'running'),
+                ('history-queued', 'hook_event', 1700000003, 1700000004, 1700000005, 1000, 'queued');
+            "#,
+        )
+        .expect("insert stale completion history");
+    drop(db);
+
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
+    let response = server.mempal_status().await.expect("status").0;
+
+    assert_eq!(response.queue_stats.pending, 0);
+    assert_eq!(response.queue_stats.claimed, 0);
+    assert_eq!(response.queue_stats.failed, 1);
+    assert_eq!(response.embed_status.pending_count, 0);
+    assert_eq!(response.embed_status.claimed_count, 0);
+    assert_eq!(response.embed_status.failed_count, 1);
+}
+
+#[tokio::test]
 async fn test_mcp_status_surfaces_source_type_distribution() {
     let (_tmp, db_path, config) = setup_env();
     insert_drawer_with_source_type(&db_path, "drawer-user", SourceType::UserExplicit);
