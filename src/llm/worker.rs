@@ -72,7 +72,7 @@ pub async fn run_llm_worker(
         // Re-read config at the start of each claim cycle so model/timeout
         // changes are picked up without a full daemon restart.
         let config = ConfigHandle::current();
-        if !config.llm.enabled {
+        if !crate::daemon::llm_worker_claim_enabled(config.as_ref()) {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }

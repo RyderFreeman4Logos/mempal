@@ -1790,6 +1790,10 @@ fn should_enqueue_llm_gating(
     }
 }
 
+pub(crate) fn llm_worker_claim_enabled(config: &crate::core::config::Config) -> bool {
+    config.llm.enabled && !config.llm.enabled_for.is_empty()
+}
+
 struct DaemonEmbedder {
     primary: Box<dyn Embedder>,
     fallback: Option<Box<dyn Embedder>>,
@@ -1907,8 +1911,8 @@ mod tests {
 
     use super::{
         ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext, HookWorkerState,
-        build_drawer_records, poll_claim_next, process_claimed_message_with_embedder,
-        run_hook_worker, wing_from_cwd,
+        build_drawer_records, llm_worker_claim_enabled, poll_claim_next,
+        process_claimed_message_with_embedder, run_hook_worker, wing_from_cwd,
     };
 
     struct StubClaimSource {
@@ -1921,6 +1925,20 @@ mod tests {
                 responses: Mutex::new(VecDeque::from(responses)),
             }
         }
+    }
+
+    #[test]
+    fn test_llm_worker_spawn_and_claim_gates_are_separate() {
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.llm.base_url = Some("http://127.0.0.1:9/v1".to_string());
+        config.llm.enabled_for.clear();
+
+        assert!(config.llm.enabled);
+        assert!(!llm_worker_claim_enabled(&config));
+
+        config.llm.enabled_for.push("gating".to_string());
+        assert!(llm_worker_claim_enabled(&config));
     }
 
     impl ClaimNextSource for StubClaimSource {

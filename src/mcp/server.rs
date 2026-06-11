@@ -239,23 +239,45 @@ impl MempalMcpServer {
         self.gating_runtime
             .validate_config_shape()
             .context("failed to validate ingest gating config")?;
-        match self.reconcile_reindex_progress() {
-            Ok(0) => {}
-            Ok(updated) => {
-                tracing::info!(
-                    db_path = %self.db_path.display(),
-                    updated,
-                    "reconciled orphan reindex progress rows on startup"
-                );
+        let background = self.clone();
+        let service = self
+            .serve(rmcp::transport::stdio())
+            .await
+            .context("failed to initialize MCP stdio transport")?;
+        background.spawn_stdio_background_tasks();
+        Ok(service)
+    }
+
+    fn spawn_stdio_background_tasks(&self) {
+        let reconcile = self.clone();
+        let db_path = self.db_path.clone();
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || reconcile.reconcile_reindex_progress()).await
+            {
+                Ok(Ok(0)) => {}
+                Ok(Ok(updated)) => {
+                    tracing::info!(
+                        db_path = %db_path.display(),
+                        updated,
+                        "reconciled orphan reindex progress rows after MCP startup"
+                    );
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        db_path = %db_path.display(),
+                        error = %error,
+                        "failed to reconcile orphan reindex progress rows after MCP startup"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        db_path = %db_path.display(),
+                        error = %error,
+                        "reindex progress reconciliation task failed after MCP startup"
+                    );
+                }
             }
-            Err(error) => {
-                tracing::warn!(
-                    db_path = %self.db_path.display(),
-                    error = %error,
-                    "failed to reconcile orphan reindex progress rows on startup"
-                );
-            }
-        }
+        });
         self.spawn_ingest_drain_worker();
         let _gating_init_task =
             self.gating_runtime
@@ -266,9 +288,6 @@ impl MempalMcpServer {
                         .retry
                         .search_deadline_secs,
                 ));
-        self.serve(rmcp::transport::stdio())
-            .await
-            .context("failed to initialize MCP stdio transport")
     }
 
     fn reconcile_reindex_progress(&self) -> anyhow::Result<usize> {

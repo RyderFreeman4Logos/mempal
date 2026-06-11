@@ -2585,6 +2585,10 @@ fn run() -> Result<()> {
 
     ConfigHandle::bootstrap(&config_path).context("failed to bootstrap config hot reload")?;
     let config = ConfigHandle::current();
+    if let Commands::Serve { mcp } = &cli.command {
+        return block_on_result(serve_command(config.as_ref(), *mcp));
+    }
+
     let db_path = expand_home(&config.db_path);
     let dashboard_mode = is_dashboard_command(&cli.command);
     if dashboard_mode && !db_path.exists() {

@@ -56,6 +56,10 @@ backend = "model2vec"
 "#
             .to_string()
         };
+        let llm_enabled_for = extra_env
+            .get("MEMPAL_TEST_LLM_ENABLED_FOR")
+            .map(|value| format!("enabled_for = {value}\n"))
+            .unwrap_or_default();
         let llm_section = llm_base_url
             .map(|llm_base_url| {
                 format!(
@@ -64,8 +68,9 @@ backend = "model2vec"
 enabled = true
 base_url = "{}"
 model = "test-llm"
+{}
 "#,
-                    llm_base_url
+                    llm_base_url, llm_enabled_for
                 )
             })
             .unwrap_or_default();
