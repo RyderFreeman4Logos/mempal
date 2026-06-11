@@ -294,11 +294,19 @@ fn inspect_db_holders_in_proc(
         let role = classify_role(&argv, &binary_name);
         let current_process = pid == current_pid;
         let current_daemon = daemon_pid == Some(pid) && role == "mempal_daemon";
+        let stat_path = pid_dir.join("stat");
+        let parent_pid = read_parent_pid(&stat_path);
         let current_mcp_server = current_process && role == "mempal_mcp_server";
-        let classification =
-            classify_holder(role, current_process, current_daemon, current_mcp_server);
+        let orphan_mcp_server = role == "mempal_mcp_server" && parent_pid == Some(1);
+        let classification = classify_holder(
+            role,
+            current_process,
+            current_daemon,
+            current_mcp_server,
+            orphan_mcp_server,
+        );
         let started_at_unix_secs = boot_time.and_then(|btime| {
-            read_start_ticks(&pid_dir.join("stat")).map(|ticks| {
+            read_start_ticks(&stat_path).map(|ticks| {
                 btime.saturating_add(ticks.saturating_div(clock_ticks_per_second.max(1)))
             })
         });
@@ -436,6 +444,7 @@ fn classify_holder(
     current_process: bool,
     current_daemon: bool,
     current_mcp_server: bool,
+    orphan_mcp_server: bool,
 ) -> &'static str {
     if current_daemon {
         "current_daemon"
@@ -443,7 +452,7 @@ fn classify_holder(
         "current_mcp_server"
     } else if current_process {
         "current_process"
-    } else if role == "mempal_mcp_server" {
+    } else if orphan_mcp_server {
         "stale_mcp_server"
     } else if role == "mempal_daemon" {
         "orphan_daemon"
@@ -498,6 +507,22 @@ fn read_boot_time(proc_root: &Path) -> Option<u64> {
 fn read_start_ticks(path: &Path) -> Option<u64> {
     let content = fs::read(path).ok()?;
     parse_start_ticks(&content)
+}
+
+#[cfg(target_os = "linux")]
+fn read_parent_pid(path: &Path) -> Option<i32> {
+    let content = fs::read(path).ok()?;
+    parse_parent_pid(&content)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_parent_pid(stat: &[u8]) -> Option<i32> {
+    let close = stat.windows(2).rposition(|window| window == b") ")?;
+    let parent_pid = stat[close + 2..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(1)?;
+    std::str::from_utf8(parent_pid).ok()?.parse::<i32>().ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -683,13 +708,23 @@ mod tests {
         use std::path::PathBuf;
 
         fn write_process(proc_root: &Path, pid: i32, argv: &[&str], db_files: &[&Path]) {
+            write_process_with_parent(proc_root, pid, 0, argv, db_files);
+        }
+
+        fn write_process_with_parent(
+            proc_root: &Path,
+            pid: i32,
+            parent_pid: i32,
+            argv: &[&str],
+            db_files: &[&Path],
+        ) {
             let pid_dir = proc_root.join(pid.to_string());
             let fd_dir = pid_dir.join("fd");
             fs::create_dir_all(&fd_dir).expect("create fake fd dir");
             fs::write(pid_dir.join("cmdline"), argv.join("\0")).expect("write cmdline");
             fs::write(
                 pid_dir.join("stat"),
-                format!("{pid} (mempal) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 250"),
+                format!("{pid} (mempal) S {parent_pid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 250"),
             )
             .expect("write stat");
             for (index, file) in db_files.iter().enumerate() {
@@ -776,9 +811,10 @@ mod tests {
                 &["mempal", "daemon", "--foreground"],
                 &[db_path.as_path()],
             );
-            write_process(
+            write_process_with_parent(
                 &proc_root,
                 77,
+                1,
                 &["/usr/local/bin/mempal", "serve"],
                 &[db_path.as_path(), wal_path.as_path(), shm_path.as_path()],
             );
@@ -809,6 +845,40 @@ mod tests {
             assert_eq!(report.holders[1].age_secs, Some(98));
             assert_eq!(report.holders[2].classification, "orphan_daemon");
             assert_eq!(report.holders[3].classification, "extra_holder");
+        }
+
+        #[test]
+        fn test_inspect_db_holders_keeps_supervised_mcp_manual() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let proc_root = tmp.path().join("proc");
+            fs::create_dir_all(&proc_root).expect("create proc");
+            fs::write(proc_root.join("stat"), "cpu 0 0 0 0\nbtime 1000\n").expect("write stat");
+
+            let db_path = tmp.path().join("palace.db");
+            write_process_with_parent(
+                &proc_root,
+                77,
+                1234,
+                &["/usr/local/bin/mempal", "serve"],
+                &[db_path.as_path()],
+            );
+
+            let report = inspect_db_holders_in_proc(&db_path, &proc_root, 1100, 100);
+
+            assert_eq!(report.holder_count, 1);
+            assert_eq!(report.stale_mcp_server_count, 0);
+            assert_eq!(report.extra_holder_count, 1);
+            assert_eq!(report.holders[0].role, "mempal_mcp_server");
+            assert_eq!(report.holders[0].classification, "extra_holder");
+            let plan = plan_stale_db_holder_remediation(&report);
+            assert!(plan.terminate_pids.is_empty());
+            assert_eq!(
+                plan.manual_holders
+                    .iter()
+                    .map(|holder| holder.pid)
+                    .collect::<Vec<_>>(),
+                vec![77]
+            );
         }
 
         #[test]
