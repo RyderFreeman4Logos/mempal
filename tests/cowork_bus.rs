@@ -2128,6 +2128,20 @@ fn test_cli_maintenance_runbook_json() {
 }
 
 #[test]
+fn test_cli_maintenance_rejudge_help_verbose() {
+    let home = TempDir::new().expect("home");
+    let output = run_mempal(&home, &["maintenance", "rejudge", "--help-verbose"]);
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("Historical Rejudge / Forget Sweep"), "{out}");
+    assert!(out.contains("dry-run first"), "{out}");
+    assert!(out.contains("--all --execute --backup-dir"), "{out}");
+    assert!(out.contains("--resume"), "{out}");
+    assert!(out.contains("mempal maintenance rejudge restore"), "{out}");
+    assert!(!home.path().join(".mempal").exists());
+}
+
+#[test]
 
 fn test_cli_maintenance_runbook_rejects_invalid_format() {
     let home = TempDir::new().expect("home");

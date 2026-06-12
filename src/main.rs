@@ -2093,6 +2093,9 @@ enum MaintenanceCommands {
     Rejudge {
         #[command(subcommand)]
         command: Option<MaintenanceRejudgeCommands>,
+        /// Print the historical rejudge / forget sweep runbook and exit.
+        #[arg(long = "help-verbose", default_value_t = false)]
+        help_verbose: bool,
         /// Mutate storage. Omit for dry-run.
         #[arg(long, default_value_t = false)]
         execute: bool,
@@ -2813,6 +2816,14 @@ fn run() -> Result<()> {
             return maintenance_runbook_command(format.clone());
         }
         Commands::Maintenance {
+            command:
+                MaintenanceCommands::Rejudge {
+                    help_verbose: true, ..
+                },
+        } => {
+            return maintenance_rejudge_help_verbose_command();
+        }
+        Commands::Maintenance {
             command: MaintenanceCommands::GuidedRun { format },
         } => {
             return maintenance_guided_run_command(format.clone());
@@ -3251,6 +3262,7 @@ fn run() -> Result<()> {
             command:
                 MaintenanceCommands::Rejudge {
                     command: None,
+                    help_verbose: false,
                     execute,
                     hard_delete,
                     backup_dir,
@@ -12792,6 +12804,64 @@ Mempal Maintenance Runbook
         }
         other => bail!("unknown format: {other}"),
     }
+}
+
+fn maintenance_rejudge_help_verbose_command() -> Result<()> {
+    const HELP: &str = "\
+Historical Rejudge / Forget Sweep
+==================================
+
+Purpose
+-------
+Re-run the current retention policy over existing active drawers and identify
+records that should no longer be retained. This is the operational cleanup path
+for migrations/imports or periods when passive memory filtering was too loose.
+
+Safety model
+------------
+- Run a dry-run first: omit --execute to preview decisions without mutating the
+  database, backup files, or checkpoint state.
+- Full sweeps use --all and a bounded historical snapshot so concurrent new
+  writes are handled by a future sweep instead of drifting into the current run.
+- Execution requires --backup-dir unless you explicitly combine --hard-delete
+  with --unsafe-no-backup. Prefer the default auditable soft-delete path.
+- Backup-before-delete is mandatory for normal execution: records are exported
+  before active rows and embeddings/index rows are removed or marked forgotten.
+- Resume interrupted full sweeps with --resume using the same database and
+  compatible options.
+- Restore forgotten drawers with the restore subcommand, then run reindex if
+  embeddings/search indexes need to be rebuilt.
+
+Typical commands
+----------------
+Dry-run a bounded batch:
+  mempal maintenance rejudge --limit 100 --format plain
+
+Dry-run the full active database, oldest-to-newest snapshot:
+  mempal maintenance rejudge --all --page-size 500 --format plain
+
+Execute the full forget sweep with an explicit backup directory:
+  mempal maintenance rejudge --all --execute --backup-dir /ssd/mirror-rootfs/home/obj/bak/mempal/
+
+Resume an interrupted execute sweep:
+  mempal maintenance rejudge --all --resume --execute --backup-dir /ssd/mirror-rootfs/home/obj/bak/mempal/
+
+Restore from a backup file:
+  mempal maintenance rejudge restore --backup /path/to/rejudge-backup.sqlite --execute
+
+Operational notes
+-----------------
+- Configure LLM/text retention judges through [llm] / memory-intelligence config
+  before running the sweep. The command records the effective judge model and
+  config version in the report/backup metadata.
+- Do not put API keys in command lines. Use configured environment variables or
+  local/LAN endpoints; mempal rejects URL userinfo/query secrets.
+- If a provider/model fails during execute, stop and resume later rather than
+  deleting based on uncertain fallback judgments.
+- Use --hard-delete only when you intentionally want irreversible deletion.
+- Use --help for the concise flag list; use --help-verbose for this runbook.";
+    println!("{HELP}");
+    Ok(())
 }
 
 fn maintenance_guided_run_command(format: String) -> Result<()> {
