@@ -188,8 +188,12 @@ pub async fn build_rest_doctor_report(endpoint: &str, db_path: Option<&Path>) ->
     let endpoint_reachable = routes.iter().any(|route| route.http_status.is_some());
     let missing_routes = routes
         .iter()
-        .filter(|route| !route.available)
+        .filter(|route| is_missing_rest_route(route))
         .map(|route| format!("{} {}", route.method, route.path))
+        .collect::<Vec<_>>();
+    let unhealthy_routes = routes
+        .iter()
+        .filter_map(unhealthy_rest_route_detail)
         .collect::<Vec<_>>();
 
     let mut warnings = Vec::new();
@@ -233,13 +237,23 @@ pub async fn build_rest_doctor_report(endpoint: &str, db_path: Option<&Path>) ->
         _ => {}
     }
 
-    if !missing_routes.is_empty() {
+    if endpoint_reachable && !missing_routes.is_empty() {
         warnings.push(format!(
             "REST endpoint is reachable but required route(s) are missing: {}",
             missing_routes.join(", ")
         ));
         recommendations.push(
             "Reinstall mempal with `--features rest` and restart the daemon serving this endpoint."
+                .to_string(),
+        );
+    }
+    if endpoint_reachable && !unhealthy_routes.is_empty() {
+        warnings.push(format!(
+            "REST endpoint is reachable but required route(s) returned unhealthy response(s): {}",
+            unhealthy_routes.join(", ")
+        ));
+        recommendations.push(
+            "Inspect the REST daemon logs and fix the failing route handler or database/profile configuration."
                 .to_string(),
         );
     }
@@ -269,6 +283,8 @@ pub async fn build_rest_doctor_report(endpoint: &str, db_path: Option<&Path>) ->
         "daemon_not_running"
     } else if !endpoint_reachable {
         "port_conflict"
+    } else if !unhealthy_routes.is_empty() {
+        "routes_unhealthy"
     } else if !missing_routes.is_empty() {
         "routes_missing"
     } else {
@@ -436,15 +452,13 @@ async fn probe_rest_routes(endpoint: &str) -> Vec<RestRouteReport> {
         match request.send().await {
             Ok(response) => {
                 let status = response.status();
+                let (available, error) = classify_rest_route_probe(method, path, status);
                 reports.push(RestRouteReport {
                     method: (*method).to_string(),
                     path: (*path).to_string(),
-                    available: !matches!(
-                        status,
-                        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
-                    ),
+                    available,
                     http_status: Some(status.as_u16()),
-                    error: None,
+                    error,
                 });
             }
             Err(error) => reports.push(RestRouteReport {
@@ -457,6 +471,56 @@ async fn probe_rest_routes(endpoint: &str) -> Vec<RestRouteReport> {
         }
     }
     reports
+}
+
+fn classify_rest_route_probe(
+    method: &str,
+    path: &str,
+    status: reqwest::StatusCode,
+) -> (bool, Option<String>) {
+    if status.is_success() || is_expected_ingest_validation(method, path, status) {
+        return (true, None);
+    }
+    if matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+    ) {
+        return (false, None);
+    }
+    if status.is_server_error() {
+        return (
+            false,
+            Some(format!("server error HTTP {}", status.as_u16())),
+        );
+    }
+    (
+        false,
+        Some(format!("unexpected HTTP status {}", status.as_u16())),
+    )
+}
+
+fn is_expected_ingest_validation(method: &str, path: &str, status: reqwest::StatusCode) -> bool {
+    method == "POST" && path == "/api/ingest" && status == reqwest::StatusCode::BAD_REQUEST
+}
+
+fn is_missing_rest_route(route: &RestRouteReport) -> bool {
+    matches!(route.http_status, Some(404 | 405))
+}
+
+fn unhealthy_rest_route_detail(route: &RestRouteReport) -> Option<String> {
+    if route.available || is_missing_rest_route(route) {
+        return None;
+    }
+    let status = route
+        .http_status
+        .map(|status| format!("HTTP {status}"))
+        .unwrap_or_else(|| "no HTTP response".to_string());
+    let detail = route
+        .error
+        .as_deref()
+        .map(|error| format!("{status} ({error})"))
+        .unwrap_or(status);
+    Some(format!("{} {} {detail}", route.method, route.path))
 }
 
 fn route_probe_url(endpoint: &str, path: &str) -> String {

@@ -80,6 +80,76 @@ fn test_doctor_rest_reports_required_routes_and_feature_state() {
 }
 
 #[test]
+fn test_doctor_rest_reports_server_error_routes_as_unhealthy() {
+    let home = temp_home();
+    let mut server = Server::new();
+    let _status = server
+        .mock("GET", "/api/status")
+        .with_status(500)
+        .with_body("status failed")
+        .create();
+    let _search = server
+        .mock("GET", "/api/search")
+        .match_query(Matcher::Any)
+        .with_status(500)
+        .with_body("search failed")
+        .create();
+    let _ingest = server
+        .mock("POST", "/api/ingest")
+        .match_body(Matcher::PartialJson(serde_json::json!({})))
+        .with_status(500)
+        .with_body("ingest failed")
+        .create();
+    let _timeline = server
+        .mock("GET", "/api/timeline")
+        .match_query(Matcher::Any)
+        .with_status(500)
+        .with_body("timeline failed")
+        .create();
+    let _pinned = server
+        .mock("GET", "/api/pinned_facts")
+        .match_query(Matcher::Any)
+        .with_status(500)
+        .with_body("pinned facts failed")
+        .create();
+
+    let output = run_doctor_rest(&home, &["--addr", &server.url(), "--format", "json"]);
+
+    assert!(
+        output.status.success(),
+        "doctor rest failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor rest json");
+    assert_ne!(report["status"], "ok");
+    if cfg!(feature = "rest") {
+        assert_eq!(report["status"], "routes_unhealthy");
+    }
+    assert_eq!(report["endpoint_reachable"], true);
+    let routes = report["routes"].as_array().expect("routes");
+    assert_eq!(routes.len(), 5);
+    assert!(
+        routes.iter().all(|route| route["available"] == false
+            && route["http_status"] == 500
+            && route["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("server error"))),
+        "server-error routes should be unavailable with route errors: {report:#}"
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("server error"))),
+        "warnings should mention server route failures: {report:#}"
+    );
+}
+
+#[test]
 fn test_doctor_rest_distinguishes_daemon_not_running_from_missing_rest_feature() {
     let home = temp_home();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
