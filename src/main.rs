@@ -2429,6 +2429,8 @@ struct HistoricalRejudgeBackupIntegrity {
 const DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE: usize = 500;
 const HISTORICAL_REJUDGE_CHECKPOINT_KEY: &str = "maintenance.rejudge.checkpoint";
 const HISTORICAL_REJUDGE_WORK_TABLE: &str = "historical_rejudge_work_items";
+static HISTORICAL_REJUDGE_RUN_ID_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn default_historical_rejudge_page_size() -> usize {
     DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE
@@ -13209,11 +13211,7 @@ fn start_historical_rejudge_checkpoint(
         .context("failed to snapshot historical rejudge max rowid")?
         .unwrap_or(0);
     let started_at = iso_timestamp();
-    let run_id = format!(
-        "historical-rejudge-{}-{}",
-        started_at.replace([':', '-'], ""),
-        &options_hash[..12]
-    );
+    let run_id = historical_rejudge_run_id(&started_at, &options_hash);
     reset_historical_rejudge_work_items(db, &run_id)?;
     let snapshot_count = insert_historical_rejudge_work_items(
         db,
@@ -13261,6 +13259,26 @@ fn start_historical_rejudge_checkpoint(
     };
     save_historical_rejudge_checkpoint(db, &checkpoint)?;
     Ok(checkpoint)
+}
+
+fn historical_rejudge_run_id(started_at: &str, options_hash: &str) -> String {
+    let sequence =
+        HISTORICAL_REJUDGE_RUN_ID_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let entropy = format!("{}:{nanos}:{sequence}", std::process::id());
+    let unique_suffix = &sha256_hex(entropy.as_bytes())[..12];
+    let options_prefix = if options_hash.len() >= 12 {
+        &options_hash[..12]
+    } else {
+        options_hash
+    };
+    format!(
+        "historical-rejudge-{}-{options_prefix}-{unique_suffix}",
+        started_at.replace([':', '-'], "")
+    )
 }
 
 async fn process_historical_rejudge_work_page(
@@ -16899,6 +16917,74 @@ enabled = true
         }
     }
 
+    fn historical_rejudge_work_item_count(db: &Database, run_id: &str) -> i64 {
+        db.conn()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {HISTORICAL_REJUDGE_WORK_TABLE} WHERE run_id = ?1"),
+                [run_id],
+                |row| row.get(0),
+            )
+            .expect("count historical rejudge work items")
+    }
+
+    #[test]
+    fn historical_rejudge_run_id_is_unique_for_same_second_identical_options() {
+        let options_hash = "a".repeat(64);
+        let started_at = "2026-06-12T01:02:03Z";
+
+        let first = historical_rejudge_run_id(started_at, &options_hash);
+        let second = historical_rejudge_run_id(started_at, &options_hash);
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("historical-rejudge-20260612T010203Z-aaaaaaaaaaaa-"));
+        assert!(second.starts_with("historical-rejudge-20260612T010203Z-aaaaaaaaaaaa-"));
+    }
+
+    #[test]
+    fn historical_rejudge_same_second_resnapshot_keeps_active_protected_work_distinct() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_high_importance_drawer(&db, "important");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let rowid = drawer_rowid(&db, "important");
+        let backups = backup_dir(&tmp);
+        let config = test_config();
+        let config_version = historical_rejudge_config_version(&config);
+        let options = full_rejudge_options(true, Some(&backups), 1);
+        let options_hash =
+            historical_rejudge_options_hash(options, None, &config_version).expect("options hash");
+        let started_at = "2026-06-12T01:02:03Z";
+
+        let first_run_id = historical_rejudge_run_id(started_at, &options_hash);
+        reset_historical_rejudge_work_items(&db, &first_run_id).expect("reset first work items");
+        assert_eq!(
+            insert_historical_rejudge_work_items(&db, &first_run_id, None, None, None, rowid)
+                .expect("insert first work snapshot"),
+            1
+        );
+        mark_historical_rejudge_work_item_processed(
+            &db,
+            &first_run_id,
+            rowid,
+            "keep",
+            "soft_delete",
+        )
+        .expect("mark protected work item processed");
+
+        let second_run_id = historical_rejudge_run_id(started_at, &options_hash);
+        assert_ne!(first_run_id, second_run_id);
+        reset_historical_rejudge_work_items(&db, &second_run_id).expect("reset second work items");
+        assert_eq!(
+            insert_historical_rejudge_work_items(&db, &second_run_id, None, None, None, rowid)
+                .expect("insert second work snapshot"),
+            1
+        );
+
+        assert_eq!(active_drawer_count(&db), 1);
+        assert_eq!(historical_rejudge_work_item_count(&db, &first_run_id), 0);
+        assert_eq!(historical_rejudge_work_item_count(&db, &second_run_id), 1);
+    }
+
     #[test]
     fn deterministic_historical_decision_preserves_explicit_high_importance() {
         let drawer = Drawer {
@@ -18207,6 +18293,45 @@ enabled = true
         assert!(
             backup_files(&backups).is_empty(),
             "dry-run full sweep must not create backup files"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_all_repeated_non_resume_sweeps_keep_protected_drawer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_high_importance_drawer(&db, "important");
+        let backups = backup_dir(&tmp);
+        let config = test_config();
+
+        maintenance_rejudge_command(&db, &config, full_rejudge_options(true, Some(&backups), 1))
+            .await
+            .expect("execute first full rejudge");
+        let first_checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load first checkpoint")
+            .expect("first checkpoint");
+        assert_eq!(first_checkpoint.status, "done");
+        assert_eq!(first_checkpoint.protected_count, 1);
+        assert_eq!(first_checkpoint.mutated_count, 0);
+
+        maintenance_rejudge_command(&db, &config, full_rejudge_options(true, Some(&backups), 1))
+            .await
+            .expect("execute second full rejudge");
+        let second_checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load second checkpoint")
+            .expect("second checkpoint");
+
+        assert_ne!(first_checkpoint.run_id, second_checkpoint.run_id);
+        assert_eq!(active_drawer_count(&db), 1);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_eq!(audit_count(&db), 2);
+        assert_eq!(
+            historical_rejudge_work_item_count(&db, &first_checkpoint.run_id),
+            0
+        );
+        assert_eq!(
+            historical_rejudge_work_item_count(&db, &second_checkpoint.run_id),
+            1
         );
     }
 
