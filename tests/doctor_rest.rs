@@ -80,6 +80,72 @@ fn test_doctor_rest_reports_required_routes_and_feature_state() {
 }
 
 #[test]
+fn test_doctor_rest_accepts_axum_ingest_validation_response() {
+    let home = temp_home();
+    let mut server = Server::new();
+    let _status = server
+        .mock("GET", "/api/status")
+        .with_status(200)
+        .with_body("{}")
+        .create();
+    let _search = server
+        .mock("GET", "/api/search")
+        .match_query(Matcher::Any)
+        .with_status(200)
+        .with_body("[]")
+        .create();
+    let _ingest = server
+        .mock("POST", "/api/ingest")
+        .match_body(Matcher::PartialJson(serde_json::json!({})))
+        .with_status(422)
+        .with_body(r#"{"error":"missing field `content`"}"#)
+        .create();
+    let _timeline = server
+        .mock("GET", "/api/timeline")
+        .match_query(Matcher::Any)
+        .with_status(200)
+        .with_body("[]")
+        .create();
+    let _pinned = server
+        .mock("GET", "/api/pinned_facts")
+        .match_query(Matcher::Any)
+        .with_status(200)
+        .with_body("[]")
+        .create();
+
+    let output = run_doctor_rest(&home, &["--addr", &server.url(), "--format", "json"]);
+
+    assert!(
+        output.status.success(),
+        "doctor rest failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor rest json");
+    if cfg!(feature = "rest") {
+        assert_eq!(report["status"], "ok");
+    }
+    assert_eq!(report["endpoint_reachable"], true);
+    let ingest_route = report["routes"]
+        .as_array()
+        .expect("routes")
+        .iter()
+        .find(|route| route["method"] == "POST" && route["path"] == "/api/ingest")
+        .expect("ingest route");
+    assert_eq!(ingest_route["available"], true);
+    assert_eq!(ingest_route["http_status"], 422);
+    assert_eq!(ingest_route["error"], Value::Null);
+    assert!(
+        report["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .all(|route| route["available"] == true),
+        "all required routes should be available: {report:#}"
+    );
+}
+
+#[test]
 fn test_doctor_rest_reports_server_error_routes_as_unhealthy() {
     let home = temp_home();
     let mut server = Server::new();

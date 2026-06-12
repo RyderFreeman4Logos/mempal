@@ -500,7 +500,12 @@ fn classify_rest_route_probe(
 }
 
 fn is_expected_ingest_validation(method: &str, path: &str, status: reqwest::StatusCode) -> bool {
-    method == "POST" && path == "/api/ingest" && status == reqwest::StatusCode::BAD_REQUEST
+    method == "POST"
+        && path == "/api/ingest"
+        && matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        )
 }
 
 fn is_missing_rest_route(route: &RestRouteReport) -> bool {
