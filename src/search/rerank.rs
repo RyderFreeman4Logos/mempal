@@ -16,6 +16,8 @@ use crate::core::config::{
 };
 use crate::core::types::SearchResult;
 
+const MAX_RERANKER_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RerankOutcome {
     pub results: Vec<SearchResult>,
@@ -51,8 +53,16 @@ pub enum RerankError {
         #[source]
         source: reqwest::Error,
     },
-    #[error("reranker endpoint returned error status {status}: {body}")]
-    HttpStatus { status: StatusCode, body: String },
+    #[error("reranker endpoint returned error status {status}")]
+    HttpStatus { status: StatusCode },
+    #[error(
+        "reranker endpoint response body exceeded {limit} bytes (status {status}, received {received} bytes)"
+    )]
+    ResponseBodyTooLarge {
+        status: StatusCode,
+        limit: u64,
+        received: u64,
+    },
     #[error("failed to decode reranker response: {0}")]
     DecodeResponse(String),
     #[error("invalid reranker response: {0}")]
@@ -145,15 +155,52 @@ impl Reranker for HttpReranker {
             .map_err(map_reqwest_error)?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.map_err(map_reqwest_error)?;
-            return Err(RerankError::HttpStatus { status, body });
+            read_limited_response_body(response).await?;
+            return Err(RerankError::HttpStatus { status });
         }
-        let response = response
-            .json::<RerankResponse>()
-            .await
+        let body = read_limited_response_body(response).await?;
+        let response = serde_json::from_slice::<RerankResponse>(&body)
             .map_err(|source| RerankError::DecodeResponse(source.to_string()))?;
         reorder_results(results, response.items())
     }
+}
+
+async fn read_limited_response_body(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, RerankError> {
+    let status = response.status();
+    let limit = max_reranker_response_body_bytes_u64();
+    if let Some(content_length) = response.content_length()
+        && content_length > limit
+    {
+        return Err(RerankError::ResponseBodyTooLarge {
+            status,
+            limit,
+            received: content_length,
+        });
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
+        let next_len = body.len().saturating_add(chunk.len());
+        if next_len > MAX_RERANKER_RESPONSE_BODY_BYTES {
+            return Err(RerankError::ResponseBodyTooLarge {
+                status,
+                limit,
+                received: usize_to_u64(next_len),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn max_reranker_response_body_bytes_u64() -> u64 {
+    usize_to_u64(MAX_RERANKER_RESPONSE_BODY_BYTES)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn map_reqwest_error(source: reqwest::Error) -> RerankError {
@@ -331,6 +378,16 @@ mod tests {
         }
     }
 
+    fn result_with_content(id: &str, content: &str) -> SearchResult {
+        let mut result = result(id);
+        result.content = content.to_string();
+        result
+    }
+
+    fn warning_text(outcome: &RerankOutcome) -> String {
+        outcome.warnings.join("\n")
+    }
+
     #[test]
     fn reorder_results_sorts_by_score_and_appends_unscored_candidates() {
         let results = vec![result("a"), result("b"), result("c")];
@@ -432,9 +489,107 @@ mod tests {
 
         mock.assert_async().await;
         assert_eq!(ids(&outcome.results), vec!["a", "b"]);
-        assert!(outcome.warnings.iter().any(|warning| {
-            warning.contains("reranker unavailable") && warning.contains("original search ranking")
-        }));
+        let warnings = warning_text(&outcome);
+        assert!(warnings.contains("reranker unavailable"));
+        assert!(warnings.contains("original search ranking"));
+        assert!(warnings.contains("500 Internal Server Error"));
+        assert!(!warnings.contains("reranker down"));
+    }
+
+    #[tokio::test]
+    async fn reranker_http_error_body_echoing_candidate_is_not_warned() {
+        let raw_drawer_content = "UNIQUE_RAW_DRAWER_CONTENT_SHOULD_NOT_LEAK";
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/rerank")
+            .with_status(400)
+            .with_body(format!("invalid document: {raw_drawer_content}"))
+            .create_async()
+            .await;
+
+        let outcome = maybe_rerank_with_config(
+            &config(Some(server.url())),
+            "query",
+            vec![
+                result_with_content("a", raw_drawer_content),
+                result_with_content("b", "ordinary candidate"),
+            ],
+        )
+        .await;
+
+        mock.assert_async().await;
+        assert_eq!(ids(&outcome.results), vec!["a", "b"]);
+        let warnings = warning_text(&outcome);
+        assert!(warnings.contains("400 Bad Request"));
+        assert!(!warnings.contains(raw_drawer_content));
+        assert!(!warnings.contains("invalid document"));
+    }
+
+    #[tokio::test]
+    async fn oversized_reranker_error_body_preserves_order_without_warning_body() {
+        let raw_drawer_content = "OVERSIZED_ERROR_ECHO_SHOULD_NOT_LEAK";
+        let oversized_body = format!(
+            "{raw_drawer_content}{}",
+            "x".repeat(MAX_RERANKER_RESPONSE_BODY_BYTES + 1)
+        );
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/rerank")
+            .with_status(503)
+            .with_body(oversized_body)
+            .create_async()
+            .await;
+
+        let outcome = maybe_rerank_with_config(
+            &config(Some(server.url())),
+            "query",
+            vec![
+                result_with_content("a", raw_drawer_content),
+                result_with_content("b", "ordinary candidate"),
+            ],
+        )
+        .await;
+
+        mock.assert_async().await;
+        assert_eq!(ids(&outcome.results), vec!["a", "b"]);
+        let warnings = warning_text(&outcome);
+        assert!(warnings.contains("response body exceeded"));
+        assert!(warnings.contains("503 Service Unavailable"));
+        assert!(!warnings.contains(raw_drawer_content));
+    }
+
+    #[tokio::test]
+    async fn oversized_reranker_success_body_preserves_order_without_warning_body() {
+        let raw_drawer_content = "OVERSIZED_SUCCESS_ECHO_SHOULD_NOT_LEAK";
+        let oversized_invalid_json = format!(
+            "{{\"echo\":\"{raw_drawer_content}\",\"padding\":\"{}",
+            "x".repeat(MAX_RERANKER_RESPONSE_BODY_BYTES + 1)
+        );
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/rerank")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(oversized_invalid_json)
+            .create_async()
+            .await;
+
+        let outcome = maybe_rerank_with_config(
+            &config(Some(server.url())),
+            "query",
+            vec![
+                result_with_content("a", raw_drawer_content),
+                result_with_content("b", "ordinary candidate"),
+            ],
+        )
+        .await;
+
+        mock.assert_async().await;
+        assert_eq!(ids(&outcome.results), vec!["a", "b"]);
+        let warnings = warning_text(&outcome);
+        assert!(warnings.contains("response body exceeded"));
+        assert!(warnings.contains("200 OK"));
+        assert!(!warnings.contains(raw_drawer_content));
     }
 
     #[tokio::test]
