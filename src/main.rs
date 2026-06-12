@@ -2085,7 +2085,8 @@ enum MaintenanceCommands {
         /// Irreversibly delete candidates instead of auditable soft-delete.
         #[arg(long = "hard-delete", default_value_t = false)]
         hard_delete: bool,
-        /// Absolute directory for atomic rejudge backup files.
+        /// Absolute directory for atomic rejudge backup files. Required with --execute unless
+        /// --hard-delete --unsafe-no-backup is set; host-specific paths must be passed explicitly.
         #[arg(long = "backup-dir")]
         backup_dir: Option<PathBuf>,
         /// Allow hard-delete execution without a backup.
@@ -2426,7 +2427,6 @@ struct HistoricalRejudgeBackupIntegrity {
 }
 
 const DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE: usize = 500;
-const DEFAULT_HISTORICAL_REJUDGE_BACKUP_DIR: &str = "/ssd/mirror-rootfs/home/obj/bak/mempal";
 const HISTORICAL_REJUDGE_CHECKPOINT_KEY: &str = "maintenance.rejudge.checkpoint";
 const HISTORICAL_REJUDGE_WORK_TABLE: &str = "historical_rejudge_work_items";
 
@@ -2461,6 +2461,13 @@ struct HistoricalRejudgeCheckpoint {
 struct HistoricalRejudgeWorkItem {
     drawer_rowid: i64,
     drawer_id: String,
+}
+
+struct PreparedHistoricalRejudgeWorkItem {
+    work_item: HistoricalRejudgeWorkItem,
+    row: Option<mempal::core::db::HistoricalRejudgeCandidate>,
+    decision: Option<HistoricalRejudgeDecision>,
+    backup_item: Option<HistoricalRejudgeBackupItem>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -12772,7 +12779,12 @@ async fn maintenance_rejudge_limited_command(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let backup_dir = historical_rejudge_effective_backup_dir(options)?;
+    let backup_dir = historical_rejudge_effective_backup_dir(
+        options,
+        options.execute
+            && !candidate_backup_items.is_empty()
+            && !(options.hard_delete && options.unsafe_no_backup),
+    )?;
     let backup_path = if options.execute
         && !candidate_backup_items.is_empty()
         && let Some(backup_dir) = backup_dir.as_deref()
@@ -12905,13 +12917,16 @@ fn record_historical_rejudge_decision_audit(
 
 fn historical_rejudge_effective_backup_dir(
     options: HistoricalRejudgeOptions<'_>,
+    backup_required: bool,
 ) -> Result<Option<PathBuf>> {
     if let Some(backup_dir) = options.backup_dir {
         validate_absolute_path(backup_dir, "--backup-dir")?;
         return Ok(Some(backup_dir.to_path_buf()));
     }
-    if options.execute && !(options.hard_delete && options.unsafe_no_backup) {
-        return Ok(Some(PathBuf::from(DEFAULT_HISTORICAL_REJUDGE_BACKUP_DIR)));
+    if backup_required {
+        bail!(
+            "--backup-dir is required with --execute unless --hard-delete --unsafe-no-backup is set; pass an absolute backup directory"
+        );
     }
     Ok(None)
 }
@@ -12929,7 +12944,10 @@ async fn maintenance_rejudge_all_command(
         .as_ref()
         .and_then(|_| config.llm.effective_model_summary())
         .or_else(|| Some("deterministic".to_string()).filter(|_| llm_router.is_none()));
-    let backup_dir = historical_rejudge_effective_backup_dir(options)?;
+    let backup_dir = historical_rejudge_effective_backup_dir(
+        options,
+        options.execute && !(options.hard_delete && options.unsafe_no_backup),
+    )?;
 
     if !options.execute {
         let report = dry_run_historical_rejudge_all(
@@ -12981,27 +12999,32 @@ async fn maintenance_rejudge_all_command(
             break;
         }
 
-        for work_item in page {
-            if let Err(error) = process_historical_rejudge_work_item(
-                db,
-                config,
-                options,
-                &mut checkpoint,
-                &work_item,
-                llm_router.as_ref(),
-            )
-            .await
-            {
-                checkpoint.status = "failed".to_string();
-                checkpoint.updated_at = iso_timestamp();
-                save_historical_rejudge_checkpoint(db, &checkpoint)?;
-                return Err(error).with_context(|| {
-                    format!(
-                        "historical rejudge stopped at rowid {}; rerun with `mempal maintenance rejudge --all --resume --execute`",
-                        work_item.drawer_rowid
-                    )
-                });
-            }
+        if let Err(error) = process_historical_rejudge_work_page(
+            db,
+            config,
+            options,
+            &mut checkpoint,
+            &page,
+            llm_router.as_ref(),
+        )
+        .await
+        {
+            let page_start = page
+                .first()
+                .map(|work_item| work_item.drawer_rowid)
+                .unwrap_or_default();
+            let page_end = page
+                .last()
+                .map(|work_item| work_item.drawer_rowid)
+                .unwrap_or(page_start);
+            checkpoint.status = "failed".to_string();
+            checkpoint.updated_at = iso_timestamp();
+            save_historical_rejudge_checkpoint(db, &checkpoint)?;
+            return Err(error).with_context(|| {
+                format!(
+                    "historical rejudge stopped while processing rowids {page_start}..={page_end}; rerun with `mempal maintenance rejudge --all --resume --execute`"
+                )
+            });
         }
     }
 
@@ -13242,14 +13265,31 @@ fn start_historical_rejudge_checkpoint(
     Ok(checkpoint)
 }
 
-async fn process_historical_rejudge_work_item(
+async fn process_historical_rejudge_work_page(
     db: &Database,
     config: &Config,
     options: HistoricalRejudgeOptions<'_>,
     checkpoint: &mut HistoricalRejudgeCheckpoint,
-    work_item: &HistoricalRejudgeWorkItem,
+    page: &[HistoricalRejudgeWorkItem],
     llm_router: Option<&LlmRouter>,
 ) -> Result<()> {
+    let mut prepared = Vec::with_capacity(page.len());
+    for work_item in page {
+        prepared.push(
+            prepare_historical_rejudge_work_item(db, config, options, work_item, llm_router)
+                .await?,
+        );
+    }
+    process_prepared_historical_rejudge_work_items(db, options, checkpoint, &prepared)
+}
+
+async fn prepare_historical_rejudge_work_item(
+    db: &Database,
+    config: &Config,
+    options: HistoricalRejudgeOptions<'_>,
+    work_item: &HistoricalRejudgeWorkItem,
+    llm_router: Option<&LlmRouter>,
+) -> Result<PreparedHistoricalRejudgeWorkItem> {
     let row = db
         .historical_rejudge_candidate_by_rowid(work_item.drawer_rowid, &work_item.drawer_id)
         .with_context(|| {
@@ -13259,29 +13299,17 @@ async fn process_historical_rejudge_work_item(
             )
         })?;
     let Some(row) = row else {
-        let mut next_checkpoint = checkpoint.clone();
-        next_checkpoint.scanned_count += 1;
-        next_checkpoint.last_processed_rowid = Some(work_item.drawer_rowid);
-        next_checkpoint.updated_at = iso_timestamp();
-        with_historical_rejudge_transaction(db, None, || {
-            mark_historical_rejudge_work_item_processed(
-                db,
-                &next_checkpoint.run_id,
-                work_item.drawer_rowid,
-                "missing",
-                "none",
-            )?;
-            save_historical_rejudge_checkpoint(db, &next_checkpoint)?;
-            Ok(())
-        })?;
-        *checkpoint = next_checkpoint;
-        return Ok(());
+        return Ok(PreparedHistoricalRejudgeWorkItem {
+            work_item: work_item.clone(),
+            row: None,
+            decision: None,
+            backup_item: None,
+        });
     };
 
     let decision = evaluate_historical_drawer(&row, config, llm_router).await?;
-    let mut backup_items = Vec::new();
-    if decision.delete_candidate {
-        if let Some(item) = build_historical_rejudge_backup_item(
+    let backup_item = if decision.delete_candidate {
+        build_historical_rejudge_backup_item(
             db,
             &row,
             &decision,
@@ -13290,10 +13318,28 @@ async fn process_historical_rejudge_work_item(
             } else {
                 "soft_delete"
             },
-        )? {
-            backup_items.push(item);
-        }
-    }
+        )?
+    } else {
+        None
+    };
+    Ok(PreparedHistoricalRejudgeWorkItem {
+        work_item: work_item.clone(),
+        row: Some(row),
+        decision: Some(decision),
+        backup_item,
+    })
+}
+
+fn process_prepared_historical_rejudge_work_items(
+    db: &Database,
+    options: HistoricalRejudgeOptions<'_>,
+    checkpoint: &mut HistoricalRejudgeCheckpoint,
+    prepared: &[PreparedHistoricalRejudgeWorkItem],
+) -> Result<()> {
+    let backup_items = prepared
+        .iter()
+        .filter_map(|item| item.backup_item.clone())
+        .collect::<Vec<_>>();
     let backup_path = if backup_items.is_empty() {
         None
     } else if let Some(backup_path) = checkpoint.backup_path.as_deref() {
@@ -13311,44 +13357,53 @@ async fn process_historical_rejudge_work_item(
         } else {
             RejudgeBackupTarget::None
         };
-        let mutated_count = if decision.delete_candidate && !backup_items.is_empty() {
+        let mutated_count = if backup_items.is_empty() {
+            0
+        } else {
             delete_rejudge_backup_items_by_version_inner(
                 db,
                 &backup_items,
                 options.hard_delete,
                 backup_target,
             )
-            .context("failed to delete historical rejudge candidate")?
-        } else {
-            0
+            .context("failed to delete historical rejudge candidates")?
         };
 
-        record_historical_rejudge_decision_audit(
-            db,
-            &row,
-            &decision,
-            next_checkpoint.judge_model.as_deref(),
-            &next_checkpoint.config_version,
-            &next_checkpoint.mutation,
-        )?;
-        update_historical_rejudge_checkpoint_stats(
-            &mut next_checkpoint,
-            &row,
-            &decision,
-            mutated_count,
-        );
-        mark_historical_rejudge_work_item_processed(
-            db,
-            &next_checkpoint.run_id,
-            work_item.drawer_rowid,
-            if decision.delete_candidate {
-                "skip"
+        for item in prepared {
+            if let (Some(row), Some(decision)) = (item.row.as_ref(), item.decision.as_ref()) {
+                record_historical_rejudge_decision_audit(
+                    db,
+                    row,
+                    decision,
+                    next_checkpoint.judge_model.as_deref(),
+                    &next_checkpoint.config_version,
+                    &next_checkpoint.mutation,
+                )?;
+                update_historical_rejudge_checkpoint_stats(&mut next_checkpoint, row, decision, 0);
+                mark_historical_rejudge_work_item_processed(
+                    db,
+                    &next_checkpoint.run_id,
+                    item.work_item.drawer_rowid,
+                    if decision.delete_candidate {
+                        "skip"
+                    } else {
+                        "keep"
+                    },
+                    &next_checkpoint.mutation,
+                )?;
             } else {
-                "keep"
-            },
-            &next_checkpoint.mutation,
-        )?;
-        next_checkpoint.last_processed_rowid = Some(work_item.drawer_rowid);
+                next_checkpoint.scanned_count += 1;
+                mark_historical_rejudge_work_item_processed(
+                    db,
+                    &next_checkpoint.run_id,
+                    item.work_item.drawer_rowid,
+                    "missing",
+                    "none",
+                )?;
+            }
+            next_checkpoint.last_processed_rowid = Some(item.work_item.drawer_rowid);
+        }
+        next_checkpoint.mutated_count += mutated_count;
         next_checkpoint.updated_at = iso_timestamp();
         save_historical_rejudge_checkpoint(db, &next_checkpoint)?;
         Ok(())
@@ -17192,6 +17247,68 @@ enabled = true
     }
 
     #[tokio::test]
+    async fn historical_rejudge_execute_requires_explicit_backup_dir() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+
+        let error = maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: None,
+                unsafe_no_backup: false,
+                limit: 100,
+                all: false,
+                resume: false,
+                page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect_err("execute without explicit backup dir must fail");
+
+        assert!(
+            error.to_string().contains("--backup-dir is required"),
+            "{error}"
+        );
+        assert!(db.get_drawer("low").expect("load drawer").is_some());
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_eq!(audit_count(&db), 0);
+    }
+
+    #[test]
+    fn historical_rejudge_accepts_explicit_absolute_backup_dir_option() {
+        let explicit = Path::new("/ssd/mirror-rootfs/home/obj/bak/mempal");
+
+        let resolved = historical_rejudge_effective_backup_dir(
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(explicit),
+                unsafe_no_backup: false,
+                limit: 100,
+                all: false,
+                resume: false,
+                page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+            true,
+        )
+        .expect("explicit absolute backup dir is accepted");
+
+        assert_eq!(resolved.as_deref(), Some(explicit));
+    }
+
+    #[tokio::test]
     async fn historical_rejudge_hard_delete_unsafe_override_skips_backup() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
@@ -17848,6 +17965,44 @@ enabled = true
     }
 
     #[tokio::test]
+    async fn historical_rejudge_all_soft_delete_batches_trigger_ddl_once_per_page() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        for index in 0..3 {
+            insert_drawer(
+                &db,
+                &format!("low-{index}"),
+                &format!("allbatchddlneedle-{index}"),
+                "notes",
+                None,
+            );
+        }
+        let backups = backup_dir(&tmp);
+        create_rejudge_softdelete_fts_trigger(&db)
+            .expect("seed legacy soft-delete trigger before counting DDL");
+        start_rejudge_softdelete_trigger_ddl_count(&db);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            full_rejudge_options(true, Some(&backups), 3),
+        )
+        .await
+        .expect("execute full rejudge page");
+
+        assert_eq!(active_drawer_count(&db), 0);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 3);
+        assert_eq!(
+            rejudge_softdelete_trigger_ddl_counts(&db),
+            (1, 1),
+            "full sweep page must drop and recreate the FTS trigger once"
+        );
+        let backup = read_historical_rejudge_backup(&only_backup_file(&backups))
+            .expect("read full sweep backup");
+        assert_eq!(backup.items.len(), 3);
+    }
+
+    #[tokio::test]
     async fn historical_rejudge_all_dry_run_mutates_nothing() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
@@ -17896,12 +18051,12 @@ enabled = true
             .expect("load first page")
             .pop()
             .expect("first item");
-        process_historical_rejudge_work_item(
+        process_historical_rejudge_work_page(
             &db,
             &config,
             full_rejudge_options(true, Some(&backups), 1),
             &mut checkpoint,
-            &first,
+            std::slice::from_ref(&first),
             None,
         )
         .await
@@ -17977,12 +18132,12 @@ enabled = true
             ))
             .expect("create failure trigger");
 
-        let error = process_historical_rejudge_work_item(
+        let error = process_historical_rejudge_work_page(
             &db,
             &config,
             full_rejudge_options(true, Some(&backups), 1),
             &mut checkpoint,
-            &work_item,
+            std::slice::from_ref(&work_item),
             None,
         )
         .await
