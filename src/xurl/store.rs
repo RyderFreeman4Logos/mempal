@@ -149,6 +149,17 @@ pub fn turn_id_for(turn: &RawTurn) -> String {
     generate_turn_id(&turn.session_id, turn.tool.as_str(), turn.turn_index)
 }
 
+struct ExistingTurn {
+    id: String,
+    content: String,
+    timestamp_epoch: f64,
+    project_path: Option<String>,
+    git_branch: Option<String>,
+    is_csa_delegated: bool,
+    provenance: Provenance,
+    metadata: TurnMetadata,
+}
+
 fn storage_turn_index(turn: &RawTurn) -> u32 {
     if turn.tool == Tool::Hermes {
         if let (Some(profile), Some(message_id)) = (
@@ -168,7 +179,7 @@ fn storage_turn_index(turn: &RawTurn) -> u32 {
     turn.turn_index
 }
 
-fn find_existing_turn(conn: &Connection, turn: &RawTurn) -> XurlResult<Option<(String, String)>> {
+fn find_existing_turn(conn: &Connection, turn: &RawTurn) -> XurlResult<Option<ExistingTurn>> {
     if turn.tool == Tool::Hermes {
         if let (Some(profile), Some(message_id)) = (
             turn.metadata.hermes_profile.as_deref(),
@@ -176,10 +187,13 @@ fn find_existing_turn(conn: &Connection, turn: &RawTurn) -> XurlResult<Option<(S
         ) {
             return conn
                 .query_row(
-                    "SELECT id, content FROM conversation_turns \
+                    "SELECT id, content, timestamp_epoch, project_path, git_branch, \
+                     is_csa_delegated, provenance, hermes_profile, session_title, session_source, \
+                     message_id, tool_name, tool_call_id, previous_message_id, next_message_id \
+                     FROM conversation_turns \
                      WHERE tool = ?1 AND hermes_profile = ?2 AND session_id = ?3 AND message_id = ?4",
                     params![turn.tool.as_str(), profile, &turn.session_id, message_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    existing_turn_from_row,
                 )
                 .optional()
                 .map_err(XurlError::Database);
@@ -188,13 +202,49 @@ fn find_existing_turn(conn: &Connection, turn: &RawTurn) -> XurlResult<Option<(S
 
     let turn_index = storage_turn_index(turn);
     conn.query_row(
-        "SELECT id, content FROM conversation_turns \
+        "SELECT id, content, timestamp_epoch, project_path, git_branch, \
+         is_csa_delegated, provenance, hermes_profile, session_title, session_source, \
+         message_id, tool_name, tool_call_id, previous_message_id, next_message_id \
+         FROM conversation_turns \
          WHERE session_id=?1 AND tool=?2 AND turn_index=?3",
         params![&turn.session_id, turn.tool.as_str(), turn_index],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        existing_turn_from_row,
     )
     .optional()
     .map_err(XurlError::Database)
+}
+
+fn existing_turn_from_row(row: &Row<'_>) -> rusqlite::Result<ExistingTurn> {
+    let is_csa: i64 = row.get(5)?;
+    let provenance_str: String = row.get(6)?;
+    Ok(ExistingTurn {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        timestamp_epoch: row.get(2)?,
+        project_path: row.get(3)?,
+        git_branch: row.get(4)?,
+        is_csa_delegated: is_csa != 0,
+        provenance: parse_provenance(&provenance_str),
+        metadata: TurnMetadata {
+            hermes_profile: row.get(7)?,
+            session_title: row.get(8)?,
+            session_source: row.get(9)?,
+            message_id: row.get(10)?,
+            tool_name: row.get(11)?,
+            tool_call_id: row.get(12)?,
+            previous_message_id: row.get(13)?,
+            next_message_id: row.get(14)?,
+        },
+    })
+}
+
+fn stored_metadata_matches(existing: &ExistingTurn, turn: &RawTurn) -> bool {
+    existing.timestamp_epoch.to_bits() == turn.timestamp_epoch.to_bits()
+        && existing.project_path == turn.project_path
+        && existing.git_branch == turn.git_branch
+        && existing.is_csa_delegated == turn.is_csa_delegated
+        && existing.provenance == turn.provenance
+        && existing.metadata == turn.metadata
 }
 
 /// Count turns that still lack a vector (no row in `conversation_turn_vectors`).
@@ -310,7 +360,8 @@ tool_call_id, previous_message_id, next_message_id";
 
 /// Insert or update a batch of turns. For each turn:
 /// - If no row with (session_id, tool, turn_index) exists: INSERT.
-/// - If a row exists with identical content: skip (no write).
+/// - If a row exists with identical content and metadata: skip (no write).
+/// - If a row exists with identical content but changed metadata: UPDATE metadata only.
 /// - If a row exists with different content: UPDATE content and metadata fields.
 ///
 /// Returns stats for the batch.
@@ -361,19 +412,24 @@ pub fn insert_turns(conn: &Connection, turns: &[RawTurn]) -> XurlResult<InsertSt
                     .map_err(XurlError::Database)?;
                     stats.inserted += 1;
                 }
-                Some((_, ref existing_content)) if existing_content == &turn.content => {
-                    stats.skipped += 1;
+                Some(existing) if existing.content == turn.content => {
+                    if stored_metadata_matches(&existing, turn) {
+                        stats.skipped += 1;
+                    } else {
+                        update_turn_metadata(conn, &existing.id, turn)?;
+                        stats.updated += 1;
+                    }
                 }
-                Some((existing_id, _)) => {
+                Some(existing) => {
                     conn.execute(
                         "UPDATE conversation_turns SET \
                          content=?2, timestamp_epoch=?3, token_count=?4, \
                          project_path=?5, git_branch=?6, is_csa_delegated=?7, provenance=?8, \
                          hermes_profile=?9, session_title=?10, session_source=?11, message_id=?12, \
                          tool_name=?13, tool_call_id=?14, previous_message_id=?15, next_message_id=?16 \
-                         WHERE id=?1",
+                        WHERE id=?1",
                         params![
-                            existing_id,
+                            &existing.id,
                             &turn.content,
                             turn.timestamp_epoch,
                             Option::<i64>::None,
@@ -394,7 +450,7 @@ pub fn insert_turns(conn: &Connection, turns: &[RawTurn]) -> XurlResult<InsertSt
                     .map_err(XurlError::Database)?;
                     conn.execute(
                         "DELETE FROM conversation_turn_vectors WHERE turn_id = ?1",
-                        params![existing_id],
+                        params![&existing.id],
                     )
                     .map_err(XurlError::Database)?;
                     stats.updated += 1;
@@ -413,6 +469,34 @@ pub fn insert_turns(conn: &Connection, turns: &[RawTurn]) -> XurlResult<InsertSt
     }
 
     Ok(stats)
+}
+
+fn update_turn_metadata(conn: &Connection, id: &str, turn: &RawTurn) -> XurlResult<()> {
+    conn.execute(
+        "UPDATE conversation_turns SET \
+         timestamp_epoch=?2, project_path=?3, git_branch=?4, is_csa_delegated=?5, provenance=?6, \
+         hermes_profile=?7, session_title=?8, session_source=?9, message_id=?10, \
+         tool_name=?11, tool_call_id=?12, previous_message_id=?13, next_message_id=?14 \
+         WHERE id=?1",
+        params![
+            id,
+            turn.timestamp_epoch,
+            &turn.project_path,
+            &turn.git_branch,
+            turn.is_csa_delegated as i64,
+            turn.provenance.as_str(),
+            &turn.metadata.hermes_profile,
+            &turn.metadata.session_title,
+            &turn.metadata.session_source,
+            &turn.metadata.message_id,
+            &turn.metadata.tool_name,
+            &turn.metadata.tool_call_id,
+            &turn.metadata.previous_message_id,
+            &turn.metadata.next_message_id,
+        ],
+    )
+    .map_err(XurlError::Database)?;
+    Ok(())
 }
 
 /// Query stored turns with optional filtering and pagination.

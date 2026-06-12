@@ -422,15 +422,27 @@ fn matches_cwd_filter(project_path: Option<&str>, cwd_filter: Option<&str>) -> b
 
 fn link_neighbor_message_ids(turns: &mut [RawTurn]) {
     for index in 0..turns.len() {
-        let prev = index
-            .checked_sub(1)
-            .and_then(|prev| same_session_message_id(&turns[prev], &turns[index]));
-        let next = turns
-            .get(index + 1)
-            .and_then(|next| same_session_message_id(next, &turns[index]));
+        let prev = previous_session_message_id(turns, index);
+        let next = next_session_message_id(turns, index);
         turns[index].metadata.previous_message_id = prev;
         turns[index].metadata.next_message_id = next;
     }
+}
+
+fn previous_session_message_id(turns: &[RawTurn], index: usize) -> Option<String> {
+    let current = turns.get(index)?;
+    turns[..index]
+        .iter()
+        .rev()
+        .find_map(|candidate| same_session_message_id(candidate, current))
+}
+
+fn next_session_message_id(turns: &[RawTurn], index: usize) -> Option<String> {
+    let current = turns.get(index)?;
+    turns
+        .get(index + 1..)?
+        .iter()
+        .find_map(|candidate| same_session_message_id(candidate, current))
 }
 
 fn same_session_message_id(candidate: &RawTurn, current: &RawTurn) -> Option<String> {
@@ -785,5 +797,56 @@ mod tests {
         assert_eq!(turns[0].metadata.message_id.as_deref(), Some("msg-1"));
         assert_eq!(turns[0].metadata.tool_name.as_deref(), Some("mktd"));
         assert_eq!(turns[0].project_path.as_deref(), Some("/repo/mempal"));
+    }
+
+    #[test]
+    fn hermes_neighbor_links_skip_interleaved_sessions() {
+        let lines = [
+            serde_json::json!({
+                "id": "a1",
+                "session_id": "session-a",
+                "role": "user",
+                "content": "first A",
+                "timestamp": 1.0
+            }),
+            serde_json::json!({
+                "id": "b1",
+                "session_id": "session-b",
+                "role": "user",
+                "content": "first B",
+                "timestamp": 2.0
+            }),
+            serde_json::json!({
+                "id": "a2",
+                "session_id": "session-a",
+                "role": "assistant",
+                "content": "second A",
+                "timestamp": 3.0
+            }),
+            serde_json::json!({
+                "id": "b2",
+                "session_id": "session-b",
+                "role": "assistant",
+                "content": "second B",
+                "timestamp": 4.0
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let options = HermesParseOptions::new("fallback", "default", false);
+        let turns = parse_hermes_jsonl_export(&lines, &options).unwrap();
+
+        assert_eq!(turns.len(), 4);
+        assert_eq!(turns[0].metadata.previous_message_id, None);
+        assert_eq!(turns[0].metadata.next_message_id.as_deref(), Some("a2"));
+        assert_eq!(turns[1].metadata.previous_message_id, None);
+        assert_eq!(turns[1].metadata.next_message_id.as_deref(), Some("b2"));
+        assert_eq!(turns[2].metadata.previous_message_id.as_deref(), Some("a1"));
+        assert_eq!(turns[2].metadata.next_message_id, None);
+        assert_eq!(turns[3].metadata.previous_message_id.as_deref(), Some("b1"));
+        assert_eq!(turns[3].metadata.next_message_id, None);
     }
 }

@@ -40,6 +40,24 @@ fn make_raw_turn(session_id: &str, turn_index: u32, role: Role, content: &str) -
     }
 }
 
+fn make_hermes_turn(session_id: &str, message_id: &str, content: &str) -> RawTurn {
+    let mut turn = make_raw_turn(session_id, 0, Role::Assistant, content);
+    turn.tool = Tool::Hermes;
+    turn.timestamp_epoch = 2_000.0;
+    turn.project_path = Some("/repo/old".to_string());
+    turn.metadata = TurnMetadata {
+        hermes_profile: Some("default".to_string()),
+        session_title: Some("Old title".to_string()),
+        session_source: Some("old-source".to_string()),
+        message_id: Some(message_id.to_string()),
+        tool_name: Some("old-tool".to_string()),
+        tool_call_id: Some("old-call".to_string()),
+        previous_message_id: None,
+        next_message_id: None,
+    };
+    turn
+}
+
 #[tokio::test]
 async fn insert_turns_idempotent_same_content() {
     let db = open_temp_db_at_fork_ext(16);
@@ -69,6 +87,74 @@ async fn insert_turns_updates_changed_content() {
         )
         .unwrap();
     assert_eq!(content, "Hello v2");
+}
+
+#[test]
+fn insert_turns_updates_changed_metadata_without_deleting_vectors() {
+    let db = open_temp_db_at_fork_ext(16);
+    let turn = make_hermes_turn("sess1", "msg1", "Hello");
+    store::insert_turns(db.conn(), std::slice::from_ref(&turn)).unwrap();
+    let turn_id = store::turn_id_for(&turn);
+    db.conn()
+        .execute(
+            "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) VALUES (?1, 0, ?2)",
+            rusqlite::params![&turn_id, vec![1_u8, 2, 3, 4]],
+        )
+        .unwrap();
+
+    let mut updated = make_hermes_turn("sess1", "msg1", "Hello");
+    updated.timestamp_epoch = 3_000.0;
+    updated.project_path = Some("/repo/new".to_string());
+    updated.metadata.session_title = Some("New title".to_string());
+    updated.metadata.session_source = Some("new-source".to_string());
+    updated.metadata.tool_name = Some("new-tool".to_string());
+    updated.metadata.previous_message_id = Some("msg0".to_string());
+    updated.metadata.next_message_id = Some("msg2".to_string());
+
+    let stats = store::insert_turns(db.conn(), std::slice::from_ref(&updated)).unwrap();
+
+    assert_eq!(stats.inserted, 0);
+    assert_eq!(stats.updated, 1);
+    assert_eq!(stats.skipped, 0);
+    let stored = store::get_turns(
+        db.conn(),
+        TurnFilter {
+            tool: Some(Tool::Hermes),
+            session_id: Some("sess1".to_string()),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, turn_id);
+    assert_eq!(stored[0].content, "Hello");
+    assert_eq!(stored[0].timestamp_epoch, 3_000.0);
+    assert_eq!(stored[0].project_path.as_deref(), Some("/repo/new"));
+    assert_eq!(
+        stored[0].metadata.session_title.as_deref(),
+        Some("New title")
+    );
+    assert_eq!(
+        stored[0].metadata.session_source.as_deref(),
+        Some("new-source")
+    );
+    assert_eq!(stored[0].metadata.tool_name.as_deref(), Some("new-tool"));
+    assert_eq!(
+        stored[0].metadata.previous_message_id.as_deref(),
+        Some("msg0")
+    );
+    assert_eq!(stored[0].metadata.next_message_id.as_deref(), Some("msg2"));
+
+    let vector_count: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM conversation_turn_vectors WHERE turn_id = ?1",
+            rusqlite::params![&turn_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(vector_count, 1);
 }
 
 #[test]
