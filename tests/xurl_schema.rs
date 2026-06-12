@@ -42,13 +42,19 @@ fn fork_ext_v16_unique_constraint() {
     let db = open_temp_db_at_fork_ext(16);
     db.conn()
         .execute(
-            "INSERT INTO conversation_turns VALUES ('id1','sess1','cc',0,'user','hello',1.0,5,NULL,NULL,0,'human')",
+            "INSERT INTO conversation_turns
+             (id, session_id, tool, turn_index, role, content, timestamp_epoch,
+              token_count, project_path, git_branch, is_csa_delegated, provenance)
+             VALUES ('id1','sess1','cc',0,'user','hello',1.0,5,NULL,NULL,0,'human')",
             [],
         )
         .unwrap();
     // Same (session_id, tool, turn_index) must fail
     let result = db.conn().execute(
-        "INSERT INTO conversation_turns VALUES ('id2','sess1','cc',0,'user','world',1.0,5,NULL,NULL,0,'human')",
+        "INSERT INTO conversation_turns
+         (id, session_id, tool, turn_index, role, content, timestamp_epoch,
+          token_count, project_path, git_branch, is_csa_delegated, provenance)
+         VALUES ('id2','sess1','cc',0,'user','world',1.0,5,NULL,NULL,0,'human')",
         [],
     );
     assert!(result.is_err());

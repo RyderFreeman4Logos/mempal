@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 20;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 21;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
@@ -95,6 +95,22 @@ WHERE op_state IN ('queued', 'running');
 UPDATE pending_message_completions
 SET created_at = CAST(created_at / 1000 AS INTEGER)
 WHERE created_at BETWEEN 1000000000000000 AND 9999999999999999;
+"#;
+
+pub const FORK_EXT_V21_SCHEMA_SQL: &str = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ct_hermes_message_identity
+    ON conversation_turns(hermes_profile, session_id, message_id)
+    WHERE tool = 'hermes'
+      AND hermes_profile IS NOT NULL
+      AND message_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ct_hermes_profile
+    ON conversation_turns(hermes_profile, timestamp_epoch DESC)
+    WHERE tool = 'hermes';
+
+CREATE INDEX IF NOT EXISTS idx_ct_session_source
+    ON conversation_turns(session_source, timestamp_epoch DESC)
+    WHERE session_source IS NOT NULL;
 "#;
 
 pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
@@ -419,6 +435,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 20,
             up: apply_v20,
         },
+        Migration {
+            version: 21,
+            up: apply_v21,
+        },
     ]
 }
 
@@ -601,6 +621,18 @@ fn apply_v19(conn: &Connection) -> rusqlite::Result<()> {
 
 fn apply_v20(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(FORK_EXT_V20_SCHEMA_SQL)
+}
+
+fn apply_v21(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_nullable_column(conn, "conversation_turns", "hermes_profile", "TEXT")?;
+    ensure_nullable_column(conn, "conversation_turns", "session_title", "TEXT")?;
+    ensure_nullable_column(conn, "conversation_turns", "session_source", "TEXT")?;
+    ensure_nullable_column(conn, "conversation_turns", "message_id", "TEXT")?;
+    ensure_nullable_column(conn, "conversation_turns", "tool_name", "TEXT")?;
+    ensure_nullable_column(conn, "conversation_turns", "tool_call_id", "TEXT")?;
+    ensure_nullable_column(conn, "conversation_turns", "previous_message_id", "TEXT")?;
+    ensure_nullable_column(conn, "conversation_turns", "next_message_id", "TEXT")?;
+    conn.execute_batch(FORK_EXT_V21_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {

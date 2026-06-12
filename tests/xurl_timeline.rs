@@ -1,5 +1,5 @@
 use mempal::core::db::Database;
-use mempal::xurl::model::{Provenance, RawTurn, Role, Tool};
+use mempal::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
 use mempal::xurl::store::{self, TurnFilter};
 use rusqlite::params;
 use serde_json::Value;
@@ -169,6 +169,7 @@ fn make_raw_turn(
         is_csa_delegated: false,
         provenance: Provenance::Human,
         turn_index,
+        metadata: TurnMetadata::default(),
     }
 }
 

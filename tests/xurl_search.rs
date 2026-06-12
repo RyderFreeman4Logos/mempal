@@ -1,6 +1,6 @@
 use mempal::core::db::Database;
 use mempal::embed::Embedder;
-use mempal::xurl::model::{Provenance, RawTurn, Role, Tool};
+use mempal::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
 use mempal::xurl::search::{self, SearchOptions};
 use mempal::xurl::store::{self, TurnFilter};
 use std::path::Path;
@@ -151,6 +151,7 @@ fn make_turn(session_id: &str, tool: Tool, turn_index: u32, role: Role, content:
         is_csa_delegated: false,
         provenance: Provenance::Human,
         turn_index,
+        metadata: TurnMetadata::default(),
     }
 }
 
@@ -659,6 +660,14 @@ fn markdown_keeps_confident_match_output_free_of_sub_floor_hint() {
             timestamp_epoch: 1_748_000_000.0,
             score: 0.910,
             source_path: None,
+            hermes_profile: None,
+            session_title: None,
+            session_source: None,
+            message_id: None,
+            tool_name: None,
+            tool_call_id: None,
+            previous_message_id: None,
+            next_message_id: None,
         }],
         passing_total: 1,
         best_score_below_floor: Some(0.645),

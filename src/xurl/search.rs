@@ -3,12 +3,27 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-/// Internal per-turn accumulator: (score, session_id, tool, role, content, timestamp, source_path).
-type TurnBestEntry = (f32, String, String, String, String, f64, Option<String>);
+struct TurnBestEntry {
+    score: f32,
+    session_id: String,
+    tool: String,
+    role: String,
+    content: String,
+    timestamp_epoch: f64,
+    source_path: Option<String>,
+    hermes_profile: Option<String>,
+    session_title: Option<String>,
+    session_source: Option<String>,
+    message_id: Option<String>,
+    tool_name: Option<String>,
+    tool_call_id: Option<String>,
+    previous_message_id: Option<String>,
+    next_message_id: Option<String>,
+}
 
 use crate::core::db::Database;
 use crate::embed::Embedder;
-use crate::xurl::store::TurnFilter;
+use crate::xurl::store::{TurnFilter, push_filter_conditions};
 use crate::xurl::{XurlError, XurlResult};
 
 #[derive(Debug, Serialize)]
@@ -21,6 +36,14 @@ pub struct SearchHit {
     pub timestamp_epoch: f64,
     pub score: f32,
     pub source_path: Option<String>,
+    pub hermes_profile: Option<String>,
+    pub session_title: Option<String>,
+    pub session_source: Option<String>,
+    pub message_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub previous_message_id: Option<String>,
+    pub next_message_id: Option<String>,
 }
 
 /// Aggregated result returned by [`search`].
@@ -131,20 +154,13 @@ pub async fn search<E: Embedder + ?Sized>(
     if !include_agent_prompts {
         conditions.push("ct.provenance = 'human'".into());
     }
-    if let Some(ref tool) = filter.tool {
-        conditions.push(format!("ct.tool = ?{pidx}"));
-        param_values.push(Box::new(tool.as_str().to_string()));
-        pidx += 1;
-    }
-    if let Some(ref sid) = filter.session_id {
-        conditions.push(format!("ct.session_id = ?{pidx}"));
-        param_values.push(Box::new(sid.clone()));
-        pidx += 1;
-    }
-    if let Some(since) = filter.since_epoch {
-        conditions.push(format!("ct.timestamp_epoch >= ?{pidx}"));
-        param_values.push(Box::new(since));
-    }
+    push_filter_conditions(
+        &filter,
+        Some("ct"),
+        &mut conditions,
+        &mut param_values,
+        &mut pidx,
+    );
 
     let where_clause = if conditions.is_empty() {
         String::new()
@@ -154,7 +170,9 @@ pub async fn search<E: Embedder + ?Sized>(
 
     let sql = format!(
         "SELECT ctv.turn_id, ctv.vector, \
-         ct.session_id, ct.tool, ct.role, ct.content, ct.timestamp_epoch, ct.project_path \
+         ct.session_id, ct.tool, ct.role, ct.content, ct.timestamp_epoch, ct.project_path, \
+         ct.hermes_profile, ct.session_title, ct.session_source, ct.message_id, \
+         ct.tool_name, ct.tool_call_id, ct.previous_message_id, ct.next_message_id \
          FROM conversation_turn_vectors ctv \
          JOIN conversation_turns ct ON ct.id = ctv.turn_id \
          {where_clause}"
@@ -169,6 +187,14 @@ pub async fn search<E: Embedder + ?Sized>(
         content: String,
         timestamp_epoch: f64,
         project_path: Option<String>,
+        hermes_profile: Option<String>,
+        session_title: Option<String>,
+        session_source: Option<String>,
+        message_id: Option<String>,
+        tool_name: Option<String>,
+        tool_call_id: Option<String>,
+        previous_message_id: Option<String>,
+        next_message_id: Option<String>,
     }
 
     let refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
@@ -184,6 +210,14 @@ pub async fn search<E: Embedder + ?Sized>(
                 content: row.get(5)?,
                 timestamp_epoch: row.get(6)?,
                 project_path: row.get(7)?,
+                hermes_profile: row.get(8)?,
+                session_title: row.get(9)?,
+                session_source: row.get(10)?,
+                message_id: row.get(11)?,
+                tool_name: row.get(12)?,
+                tool_call_id: row.get(13)?,
+                previous_message_id: row.get(14)?,
+                next_message_id: row.get(15)?,
             })
         })
         .map_err(XurlError::Database)?
@@ -196,37 +230,51 @@ pub async fn search<E: Embedder + ?Sized>(
     for row in rows {
         let vec = deserialize_vector(&row.vector);
         let score = cosine_similarity(&query_vec, &vec);
-        let entry = best_by_turn.entry(row.turn_id.clone()).or_insert((
-            -1.0,
-            row.session_id,
-            row.tool,
-            row.role,
-            row.content,
-            row.timestamp_epoch,
-            row.project_path,
-        ));
-        if score > entry.0 {
-            entry.0 = score;
+        let entry = best_by_turn
+            .entry(row.turn_id.clone())
+            .or_insert(TurnBestEntry {
+                score: -1.0,
+                session_id: row.session_id,
+                tool: row.tool,
+                role: row.role,
+                content: row.content,
+                timestamp_epoch: row.timestamp_epoch,
+                source_path: row.project_path,
+                hermes_profile: row.hermes_profile,
+                session_title: row.session_title,
+                session_source: row.session_source,
+                message_id: row.message_id,
+                tool_name: row.tool_name,
+                tool_call_id: row.tool_call_id,
+                previous_message_id: row.previous_message_id,
+                next_message_id: row.next_message_id,
+            });
+        if score > entry.score {
+            entry.score = score;
         }
     }
 
     // Convert to SearchHit and sort by descending score.
     let mut all_hits: Vec<SearchHit> = best_by_turn
         .into_iter()
-        .map(
-            |(turn_id, (score, session_id, tool, role, content, timestamp_epoch, source_path))| {
-                SearchHit {
-                    turn_id,
-                    session_id,
-                    tool,
-                    role,
-                    content,
-                    timestamp_epoch,
-                    score,
-                    source_path,
-                }
-            },
-        )
+        .map(|(turn_id, entry)| SearchHit {
+            turn_id,
+            session_id: entry.session_id,
+            tool: entry.tool,
+            role: entry.role,
+            content: entry.content,
+            timestamp_epoch: entry.timestamp_epoch,
+            score: entry.score,
+            source_path: entry.source_path,
+            hermes_profile: entry.hermes_profile,
+            session_title: entry.session_title,
+            session_source: entry.session_source,
+            message_id: entry.message_id,
+            tool_name: entry.tool_name,
+            tool_call_id: entry.tool_call_id,
+            previous_message_id: entry.previous_message_id,
+            next_message_id: entry.next_message_id,
+        })
         .collect();
 
     all_hits.sort_by(|a, b| {
@@ -362,6 +410,33 @@ pub fn format_hits_markdown(result: &SearchResult) -> String {
         output.push('\n');
         if let Some(ref path) = hit.source_path {
             output.push_str(&format!("  source: {path}\n"));
+        }
+        if hit.tool == "hermes" {
+            let mut parts = Vec::new();
+            if let Some(ref profile) = hit.hermes_profile {
+                parts.push(format!("profile={profile}"));
+            }
+            parts.push(format!("session={}", hit.session_id));
+            if let Some(ref message_id) = hit.message_id {
+                parts.push(format!("message={message_id}"));
+            }
+            if let Some(ref source) = hit.session_source {
+                parts.push(format!("source={source}"));
+            }
+            if let Some(ref title) = hit.session_title {
+                parts.push(format!("title={title}"));
+            }
+            output.push_str(&format!("  citation: hermes {}\n", parts.join(" ")));
+            if hit.previous_message_id.is_some() || hit.next_message_id.is_some() {
+                output.push_str(&format!(
+                    "  neighbors: prev={} next={}\n",
+                    hit.previous_message_id.as_deref().unwrap_or("-"),
+                    hit.next_message_id.as_deref().unwrap_or("-")
+                ));
+            }
+            if let Some(ref tool_name) = hit.tool_name {
+                output.push_str(&format!("  tool: {tool_name}\n"));
+            }
         }
         output.push('\n');
         output.push_str(hit.content.trim());

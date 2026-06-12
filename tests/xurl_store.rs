@@ -1,6 +1,7 @@
 use mempal::core::db::Database;
-use mempal::xurl::model::{Provenance, RawTurn, Role, Tool};
+use mempal::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
 use mempal::xurl::store::{self, TurnFilter};
+use std::collections::BTreeSet;
 use tempfile::TempDir;
 
 struct TestDb {
@@ -36,7 +37,26 @@ fn make_raw_turn(session_id: &str, turn_index: u32, role: Role, content: &str) -
         is_csa_delegated: false,
         provenance: Provenance::Human,
         turn_index,
+        metadata: TurnMetadata::default(),
     }
+}
+
+fn make_hermes_turn(session_id: &str, message_id: &str, content: &str) -> RawTurn {
+    let mut turn = make_raw_turn(session_id, 0, Role::Assistant, content);
+    turn.tool = Tool::Hermes;
+    turn.timestamp_epoch = 2_000.0;
+    turn.project_path = Some("/repo/old".to_string());
+    turn.metadata = TurnMetadata {
+        hermes_profile: Some("default".to_string()),
+        session_title: Some("Old title".to_string()),
+        session_source: Some("old-source".to_string()),
+        message_id: Some(message_id.to_string()),
+        tool_name: Some("old-tool".to_string()),
+        tool_call_id: Some("old-call".to_string()),
+        previous_message_id: None,
+        next_message_id: None,
+    };
+    turn
 }
 
 #[tokio::test]
@@ -68,6 +88,199 @@ async fn insert_turns_updates_changed_content() {
         )
         .unwrap();
     assert_eq!(content, "Hello v2");
+}
+
+#[test]
+fn insert_turns_updates_changed_metadata_without_deleting_vectors() {
+    let db = open_temp_db_at_fork_ext(16);
+    let turn = make_hermes_turn("sess1", "msg1", "Hello");
+    store::insert_turns(db.conn(), std::slice::from_ref(&turn)).unwrap();
+    let turn_id = store::turn_id_for(&turn);
+    db.conn()
+        .execute(
+            "INSERT INTO conversation_turn_vectors (turn_id, chunk_index, vector) VALUES (?1, 0, ?2)",
+            rusqlite::params![&turn_id, vec![1_u8, 2, 3, 4]],
+        )
+        .unwrap();
+
+    let mut updated = make_hermes_turn("sess1", "msg1", "Hello");
+    updated.timestamp_epoch = 3_000.0;
+    updated.project_path = Some("/repo/new".to_string());
+    updated.metadata.session_title = Some("New title".to_string());
+    updated.metadata.session_source = Some("new-source".to_string());
+    updated.metadata.tool_name = Some("new-tool".to_string());
+    updated.metadata.previous_message_id = Some("msg0".to_string());
+    updated.metadata.next_message_id = Some("msg2".to_string());
+
+    let stats = store::insert_turns(db.conn(), std::slice::from_ref(&updated)).unwrap();
+
+    assert_eq!(stats.inserted, 0);
+    assert_eq!(stats.updated, 1);
+    assert_eq!(stats.skipped, 0);
+    let stored = store::get_turns(
+        db.conn(),
+        TurnFilter {
+            tool: Some(Tool::Hermes),
+            session_id: Some("sess1".to_string()),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, turn_id);
+    assert_eq!(stored[0].content, "Hello");
+    assert_eq!(stored[0].timestamp_epoch, 3_000.0);
+    assert_eq!(stored[0].project_path.as_deref(), Some("/repo/new"));
+    assert_eq!(
+        stored[0].metadata.session_title.as_deref(),
+        Some("New title")
+    );
+    assert_eq!(
+        stored[0].metadata.session_source.as_deref(),
+        Some("new-source")
+    );
+    assert_eq!(stored[0].metadata.tool_name.as_deref(), Some("new-tool"));
+    assert_eq!(
+        stored[0].metadata.previous_message_id.as_deref(),
+        Some("msg0")
+    );
+    assert_eq!(stored[0].metadata.next_message_id.as_deref(), Some("msg2"));
+
+    let vector_count: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM conversation_turn_vectors WHERE turn_id = ?1",
+            rusqlite::params![&turn_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(vector_count, 1);
+}
+
+#[test]
+fn insert_turns_updates_pre_v21_hermes_row_instead_of_duplicating() {
+    let db = open_temp_db_at_fork_ext(16);
+    let legacy_id = "turn_legacy_pre_v21";
+    db.conn()
+        .execute(
+            "INSERT INTO conversation_turns \
+             (id, session_id, tool, turn_index, role, content, timestamp_epoch, \
+              project_path, is_csa_delegated, provenance) \
+             VALUES (?1, ?2, 'hermes', 0, 'assistant', ?3, ?4, ?5, 0, 'human')",
+            rusqlite::params![legacy_id, "sess-upgrade", "Hello", 1_000.0, "/repo/old"],
+        )
+        .unwrap();
+
+    let mut updated = make_hermes_turn("sess-upgrade", "msg-upgrade", "Hello");
+    updated.timestamp_epoch = 2_500.0;
+    updated.project_path = Some("/repo/new".to_string());
+    updated.metadata.session_title = Some("Upgraded title".to_string());
+    updated.metadata.session_source = Some("cli".to_string());
+    updated.metadata.tool_name = Some("review".to_string());
+    updated.metadata.previous_message_id = Some("msg-before".to_string());
+    updated.metadata.next_message_id = Some("msg-after".to_string());
+
+    let stats = store::insert_turns(db.conn(), std::slice::from_ref(&updated)).unwrap();
+
+    assert_eq!(stats.inserted, 0);
+    assert_eq!(stats.updated, 1);
+    assert_eq!(stats.skipped, 0);
+    assert_eq!(stats.turn_ids, vec![legacy_id.to_string()]);
+
+    let stored = store::get_turns(
+        db.conn(),
+        TurnFilter {
+            tool: Some(Tool::Hermes),
+            session_id: Some("sess-upgrade".to_string()),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, legacy_id);
+    assert_eq!(stored[0].content, "Hello");
+    assert_eq!(stored[0].timestamp_epoch, 2_500.0);
+    assert_eq!(stored[0].project_path.as_deref(), Some("/repo/new"));
+    assert_eq!(
+        stored[0].metadata.hermes_profile.as_deref(),
+        Some("default")
+    );
+    assert_eq!(
+        stored[0].metadata.message_id.as_deref(),
+        Some("msg-upgrade")
+    );
+    assert_eq!(
+        stored[0].metadata.session_title.as_deref(),
+        Some("Upgraded title")
+    );
+    assert_eq!(stored[0].metadata.session_source.as_deref(), Some("cli"));
+    assert_eq!(stored[0].metadata.tool_name.as_deref(), Some("review"));
+    assert_eq!(
+        stored[0].metadata.previous_message_id.as_deref(),
+        Some("msg-before")
+    );
+    assert_eq!(
+        stored[0].metadata.next_message_id.as_deref(),
+        Some("msg-after")
+    );
+
+    let second = store::insert_turns(db.conn(), std::slice::from_ref(&updated)).unwrap();
+    assert_eq!(second.inserted, 0);
+    assert_eq!(second.updated, 0);
+    assert_eq!(second.skipped, 1);
+    let count: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM conversation_turns WHERE session_id = 'sess-upgrade'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn cwd_filter_treats_sql_wildcards_as_literal_path_characters() {
+    let db = open_temp_db_at_fork_ext(16);
+    let cwd = r"/repo/a_b%literal\root";
+    let rows = [
+        ("exact", cwd, "exact match"),
+        ("child", r"/repo/a_b%literal\root/child", "descendant match"),
+        (
+            "underscore-sibling",
+            r"/repo/axb%literal\root/child",
+            "underscore wildcard sibling",
+        ),
+        (
+            "percent-sibling",
+            r"/repo/a_bZZliteral\root/child",
+            "percent wildcard sibling",
+        ),
+    ];
+
+    for (index, (session_id, project_path, content)) in rows.iter().enumerate() {
+        let mut turn = make_raw_turn(session_id, index as u32, Role::User, content);
+        turn.project_path = Some((*project_path).to_string());
+        store::insert_turns(db.conn(), std::slice::from_ref(&turn)).unwrap();
+    }
+
+    let turns = store::get_turns(
+        db.conn(),
+        TurnFilter {
+            cwd: Some(cwd.to_string()),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let sessions = turns
+        .iter()
+        .map(|turn| turn.session_id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(sessions, BTreeSet::from(["child", "exact"]));
 }
 
 #[test]

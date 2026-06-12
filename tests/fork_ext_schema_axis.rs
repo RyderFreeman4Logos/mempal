@@ -452,6 +452,80 @@ fn test_fork_ext_v19_to_v20_backfills_op_state_and_normalizes_completion_created
 }
 
 #[test]
+fn test_fork_ext_v20_to_v21_adds_hermes_metadata_idempotently() {
+    let conn = Connection::open_in_memory().expect("open sqlite connection");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE fork_ext_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO fork_ext_meta (key, value) VALUES ('fork_ext_version', '20');
+        CREATE TABLE conversation_turns (
+            id              TEXT PRIMARY KEY,
+            session_id      TEXT NOT NULL,
+            tool            TEXT NOT NULL,
+            turn_index      INTEGER NOT NULL,
+            role            TEXT NOT NULL,
+            content         TEXT NOT NULL,
+            timestamp_epoch REAL NOT NULL,
+            token_count     INTEGER,
+            project_path    TEXT,
+            git_branch      TEXT,
+            is_csa_delegated BOOLEAN NOT NULL DEFAULT FALSE,
+            provenance       TEXT NOT NULL DEFAULT 'human',
+            UNIQUE(session_id, tool, turn_index)
+        );
+        "#,
+    )
+    .expect("create v20 xurl schema");
+
+    apply_fork_ext_migrations_to(&conn, 21).expect("first v21 migration");
+    apply_fork_ext_migrations_to(&conn, 21).expect("second v21 migration");
+
+    let columns = table_columns(&conn, "conversation_turns");
+    for name in [
+        "hermes_profile",
+        "session_title",
+        "session_source",
+        "message_id",
+        "tool_name",
+        "tool_call_id",
+        "previous_message_id",
+        "next_message_id",
+    ] {
+        assert!(has_column(&columns, name, "TEXT"), "missing {name}");
+    }
+
+    conn.execute(
+        "INSERT INTO conversation_turns
+         (id, session_id, tool, turn_index, role, content, timestamp_epoch,
+          is_csa_delegated, provenance, hermes_profile, message_id)
+         VALUES ('h1', 'sess', 'hermes', 0, 'user', 'hello', 1.0, 0, 'human', 'default', 'msg-1')",
+        [],
+    )
+    .expect("insert first Hermes turn");
+    let duplicate = conn.execute(
+        "INSERT INTO conversation_turns
+         (id, session_id, tool, turn_index, role, content, timestamp_epoch,
+          is_csa_delegated, provenance, hermes_profile, message_id)
+         VALUES ('h2', 'sess', 'hermes', 1, 'user', 'hello again', 2.0, 0, 'human', 'default', 'msg-1')",
+        [],
+    );
+    assert!(duplicate.is_err());
+    conn.execute(
+        "INSERT INTO conversation_turns
+         (id, session_id, tool, turn_index, role, content, timestamp_epoch,
+          is_csa_delegated, provenance, hermes_profile, message_id)
+         VALUES ('h3', 'sess', 'hermes', 2, 'user', 'work profile', 3.0, 0, 'human', 'work', 'msg-1')",
+        [],
+    )
+    .expect("same message id may exist in another profile");
+
+    assert_eq!(read_fork_ext_version(&conn).expect("read version"), 21);
+}
+
+#[test]
 fn test_fork_ext_meta_table_exists_after_init() {
     let (_tmp, _db_path, db) = new_test_db();
 

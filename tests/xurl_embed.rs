@@ -1,7 +1,7 @@
 use mempal::core::db::{CURRENT_VECTOR_INDEX_VERSION, Database};
 use mempal::embed::Embedder;
 use mempal::xurl::embed;
-use mempal::xurl::model::{Provenance, RawTurn, Role, Tool};
+use mempal::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
 use mempal::xurl::store;
 use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
@@ -312,6 +312,7 @@ fn make_raw_turn(session_id: &str, turn_index: u32, content: &str) -> RawTurn {
         is_csa_delegated: false,
         provenance: Provenance::Human,
         turn_index,
+        metadata: TurnMetadata::default(),
     }
 }
 

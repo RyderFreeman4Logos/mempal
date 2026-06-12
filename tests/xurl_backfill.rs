@@ -3,7 +3,7 @@ use std::process::Command;
 
 use mempal::core::db::Database;
 use mempal::xurl::backfill::{self, BackfillOptions, BackfillSourceConfig};
-use mempal::xurl::model::{Provenance, RawTurn, Role, Tool};
+use mempal::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
 use mempal::xurl::store::{self, TurnFilter};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -47,6 +47,7 @@ fn make_turn(session_id: &str, turn_index: u32, project_path: Option<&str>) -> R
         is_csa_delegated: false,
         provenance: Provenance::Human,
         turn_index,
+        metadata: TurnMetadata::default(),
     }
 }
 

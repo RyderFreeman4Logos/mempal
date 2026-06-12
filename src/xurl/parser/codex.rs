@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::xurl::XurlResult;
-use crate::xurl::model::{Provenance, RawTurn, Role, Tool};
+use crate::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
 
 /// Parse a Codex rollout JSONL file into screen-visible turns.
 ///
@@ -84,6 +84,7 @@ pub fn parse_codex_jsonl(
                             is_csa_delegated,
                             provenance: Provenance::Human,
                             turn_index,
+                            metadata: TurnMetadata::default(),
                         });
                         turn_index += 1;
                     }
@@ -108,6 +109,7 @@ pub fn parse_codex_jsonl(
                             is_csa_delegated,
                             provenance: Provenance::Human,
                             turn_index,
+                            metadata: TurnMetadata::default(),
                         });
                         turn_index += 1;
                     }
@@ -157,6 +159,7 @@ pub fn parse_codex_jsonl(
                     is_csa_delegated,
                     provenance: Provenance::Human,
                     turn_index,
+                    metadata: TurnMetadata::default(),
                 });
                 turn_index += 1;
             }
