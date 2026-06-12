@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import tempfile
 import time
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +12,16 @@ if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
 from mempal import MempalMemoryProvider, _LLMClient, _IntelligenceEnhancer  # noqa: E402
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_user_plugin_marker_is_visible_to_hermes_scan_window(self) -> None:
+        init_path = os.path.join(PLUGIN_DIR, "mempal", "__init__.py")
+        with open(init_path, encoding="utf-8") as handle:
+            scan_window = handle.read(8192)
+
+        self.assertIn("register_memory_provider", scan_window)
+        self.assertIn("MemoryProvider", scan_window)
 
 
 class RecordingProvider(MempalMemoryProvider):
@@ -327,6 +338,69 @@ class SearchResultTests(unittest.TestCase):
         result = json.loads(provider.handle_tool_call("mempal_profile", {"limit": 5}))
         self.assertEqual(result["results"][0]["drawer_id"], "d1")
         self.assertEqual(result["results"][0]["importance"], 3)
+
+
+class SafeModeTests(unittest.TestCase):
+    def test_search_filters_low_importance_raw_evidence_and_labels_background(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.responses["/api/search"] = [
+            {"content": "low raw turn", "drawer_id": "raw1", "memory_kind": "evidence", "importance": 1},
+            {"content": "durable fact", "drawer_id": "fact1", "memory_kind": "profile_fact", "importance": 1},
+            {"content": "important evidence", "drawer_id": "ev1", "memory_kind": "evidence", "importance": 4},
+        ]
+
+        result = json.loads(provider.handle_tool_call("mempal_search", {"query": "memory"}))
+
+        drawer_ids = [item["drawer_id"] for item in result["results"]]
+        self.assertNotIn("raw1", drawer_ids)
+        self.assertEqual(drawer_ids, ["ev1", "fact1"])
+        self.assertEqual(result["results"][0]["authority"], "evidence/background")
+        self.assertFalse(provider.gets[-1][1]["include_raw_turns"])
+
+    def test_search_labels_pinned_and_canonical_as_authoritative(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.responses["/api/search"] = [
+            {"content": "canonical rule", "drawer_id": "c1", "status": "canonical", "memory_kind": "evidence", "importance": 0},
+            {"content": "pinned rule", "drawer_id": "p1", "is_pinned": True, "memory_kind": "evidence", "importance": 0},
+        ]
+
+        result = json.loads(provider.handle_tool_call("mempal_search", {"query": "rule"}))
+
+        self.assertEqual([item["authority"] for item in result["results"]], ["authoritative", "authoritative"])
+
+    def test_prefetch_preserves_citations_and_budget(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider._safe_context_budget_chars = 140
+        provider.responses["/api/search"] = [
+            {"content": "important cited memory", "drawer_id": "d1", "source": "source-a", "memory_kind": "evidence", "importance": 4},
+            {"content": "second important memory that should exceed the tiny budget", "drawer_id": "d2", "source": "source-b", "memory_kind": "evidence", "importance": 4},
+        ]
+
+        provider.queue_prefetch("memory", session_id="session-a")
+        block = provider.prefetch("memory", session_id="session-a")
+
+        self.assertIn("drawer_id: d1", block)
+        self.assertIn("source: source-a", block)
+        self.assertNotIn("drawer_id: d2", block)
+        self.assertIn("evidence/background", block)
+
+    def test_safe_mode_can_be_disabled_by_config(self) -> None:
+        with tempfile.TemporaryDirectory() as hermes_home:
+            with open(os.path.join(hermes_home, "mempal.json"), "w", encoding="utf-8") as handle:
+                json.dump({"safe_mode": {"enabled": False, "include_raw_turns": True}}, handle)
+            provider = RecordingProvider()
+            provider.initialize("session-a", hermes_home=hermes_home, user_id="alice", profile="work")
+            provider.responses["/api/search"] = [
+                {"content": "low raw turn", "drawer_id": "raw1", "memory_kind": "evidence", "importance": 0},
+            ]
+
+            result = json.loads(provider.handle_tool_call("mempal_search", {"query": "raw"}))
+
+            self.assertEqual(result["results"][0]["drawer_id"], "raw1")
+            self.assertTrue(provider.gets[-1][1]["include_raw_turns"])
 
 
 class PinnedFactsTests(unittest.TestCase):
