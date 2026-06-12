@@ -13822,6 +13822,14 @@ fn create_historical_rejudge_sqlite_backup(
         "#,
     )
     .with_context(|| format!("failed to initialize backup {}", final_path.display()))?;
+    let initial_payload_hash = historical_rejudge_backup_payload_hash(&HistoricalRejudgeBackup {
+        version: 2,
+        metadata: metadata.clone(),
+        items: Vec::new(),
+        integrity: HistoricalRejudgeBackupIntegrity {
+            payload_sha256: String::new(),
+        },
+    })?;
     for (key, value) in [
         ("version", "2".to_string()),
         ("created_at", metadata.created_at.clone()),
@@ -13835,6 +13843,7 @@ fn create_historical_rejudge_sqlite_backup(
         ),
         ("judge_model", serde_json::to_string(&metadata.judge_model)?),
         ("config_version", metadata.config_version.clone()),
+        ("payload_sha256", initial_payload_hash),
     ] {
         conn.execute(
             "INSERT INTO rejudge_backup_metadata (key, value) VALUES (?1, ?2)",
@@ -13958,6 +13967,24 @@ fn append_historical_rejudge_backup_items_durable(
                 .with_context(|| format!("failed to write backup item {}", item.drawer.id))?;
         }
     }
+    let payload_sha256 = historical_rejudge_sqlite_payload_hash_in_transaction(&transaction)
+        .with_context(|| {
+            format!(
+                "failed to compute historical rejudge backup payload hash for {}",
+                backup_path.display()
+            )
+        })?;
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO rejudge_backup_metadata (key, value) VALUES ('payload_sha256', ?1)",
+            [payload_sha256.as_str()],
+        )
+        .with_context(|| {
+            format!(
+                "failed to write historical rejudge backup payload hash for {}",
+                backup_path.display()
+            )
+        })?;
     transaction.commit().with_context(|| {
         format!(
             "failed to commit historical rejudge backup {}",
@@ -14246,6 +14273,75 @@ fn historical_rejudge_backup_payload_hash(backup: &HistoricalRejudgeBackup) -> R
     Ok(sha256_hex(&serde_json::to_vec(&payload)?))
 }
 
+fn historical_rejudge_sqlite_payload_hash_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<String> {
+    let version = sqlite_backup_metadata_value_in_transaction(transaction, "version")?
+        .parse::<u32>()
+        .context("invalid rejudge SQLite backup version")?;
+    let created_at = sqlite_backup_metadata_value_in_transaction(transaction, "created_at")?;
+    let source_db_path = PathBuf::from(sqlite_backup_metadata_value_in_transaction(
+        transaction,
+        "source_db_path",
+    )?);
+    let command_args = serde_json::from_str::<HistoricalRejudgeCommandArgs>(
+        &sqlite_backup_metadata_value_in_transaction(transaction, "command_args")?,
+    )
+    .context("failed to parse rejudge SQLite backup command args")?;
+    let judge_model = serde_json::from_str::<Option<String>>(
+        &sqlite_backup_metadata_value_in_transaction(transaction, "judge_model")?,
+    )
+    .context("failed to parse rejudge SQLite backup judge model")?;
+    let config_version =
+        sqlite_backup_metadata_value_in_transaction(transaction, "config_version")?;
+    let mut statement = transaction
+        .prepare("SELECT item_json FROM rejudge_backup_items ORDER BY rowid ASC")
+        .context("failed to prepare rejudge SQLite backup item hash query")?;
+    let items = statement
+        .query_map([], |row| {
+            let raw = row.get::<_, String>(0)?;
+            parse_historical_rejudge_backup_item_json(&raw)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to load rejudge SQLite backup items for payload hash")?;
+
+    historical_rejudge_backup_payload_hash(&HistoricalRejudgeBackup {
+        version,
+        metadata: HistoricalRejudgeBackupMetadata {
+            created_at,
+            source_db_path,
+            command_args,
+            judge_model,
+            config_version,
+        },
+        items,
+        integrity: HistoricalRejudgeBackupIntegrity {
+            payload_sha256: String::new(),
+        },
+    })
+}
+
+fn sqlite_backup_metadata_value_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> Result<String> {
+    transaction
+        .query_row(
+            "SELECT value FROM rejudge_backup_metadata WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("missing rejudge SQLite backup metadata: {key}"))
+}
+
+fn parse_historical_rejudge_backup_item_json(
+    raw: &str,
+) -> rusqlite::Result<HistoricalRejudgeBackupItem> {
+    serde_json::from_str::<HistoricalRejudgeBackupItem>(raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -14392,6 +14488,7 @@ fn read_historical_rejudge_sqlite_backup(path: &Path) -> Result<HistoricalRejudg
     )?)
     .context("failed to parse rejudge SQLite backup judge model")?;
     let config_version = sqlite_backup_metadata_value(&conn, "config_version")?;
+    let payload_sha256 = sqlite_backup_metadata_value(&conn, "payload_sha256")?;
     let mut statement = conn
         .prepare("SELECT item_json FROM rejudge_backup_items ORDER BY rowid ASC")
         .context("failed to prepare rejudge SQLite backup item query")?;
@@ -14399,12 +14496,11 @@ fn read_historical_rejudge_sqlite_backup(path: &Path) -> Result<HistoricalRejudg
         .query_map([], |row| row.get::<_, String>(0))?
         .map(|raw| {
             let raw = raw?;
-            serde_json::from_str::<HistoricalRejudgeBackupItem>(&raw)
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            parse_historical_rejudge_backup_item_json(&raw)
         })
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to load rejudge SQLite backup items")?;
-    let mut backup = HistoricalRejudgeBackup {
+    let backup = HistoricalRejudgeBackup {
         version,
         metadata: HistoricalRejudgeBackupMetadata {
             created_at,
@@ -14414,11 +14510,8 @@ fn read_historical_rejudge_sqlite_backup(path: &Path) -> Result<HistoricalRejudg
             config_version,
         },
         items,
-        integrity: HistoricalRejudgeBackupIntegrity {
-            payload_sha256: String::new(),
-        },
+        integrity: HistoricalRejudgeBackupIntegrity { payload_sha256 },
     };
-    backup.integrity.payload_sha256 = historical_rejudge_backup_payload_hash(&backup)?;
     validate_historical_rejudge_backup(backup)
 }
 
@@ -14441,9 +14534,10 @@ fn validate_historical_rejudge_backup(
         );
     }
     let expected_payload_hash = historical_rejudge_backup_payload_hash(&backup)?;
-    if !backup.integrity.payload_sha256.is_empty()
-        && backup.integrity.payload_sha256 != expected_payload_hash
-    {
+    if backup.integrity.payload_sha256.is_empty() {
+        bail!("historical rejudge backup missing payload integrity hash");
+    }
+    if backup.integrity.payload_sha256 != expected_payload_hash {
         bail!("historical rejudge backup integrity mismatch");
     }
     for item in &backup.items {
@@ -17929,6 +18023,72 @@ enabled = true
         .expect_err("tampered backup must fail");
 
         assert!(error.to_string().contains("integrity mismatch"), "{error}");
+        assert!(db.get_drawer("low").expect("load drawer").is_none());
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_sqlite_restore_blocks_item_json_metadata_tamper() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                all: false,
+                resume: false,
+                page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("execute rejudge");
+        let backup_path = only_backup_file(&backups);
+        let conn = rusqlite::Connection::open(&backup_path).expect("open SQLite backup");
+        let raw_item: String = conn
+            .query_row(
+                "SELECT item_json FROM rejudge_backup_items WHERE drawer_id = 'low'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load backup item");
+        let mut item_json =
+            serde_json::from_str::<serde_json::Value>(&raw_item).expect("parse backup item json");
+        item_json["raw_drawer_row"]["source_file"] =
+            serde_json::Value::String("tampered-source.json".to_string());
+        let tampered_item =
+            serde_json::to_string(&item_json).expect("serialize tampered backup item");
+        conn.execute(
+            "UPDATE rejudge_backup_items SET item_json = ?1 WHERE drawer_id = 'low'",
+            [tampered_item.as_str()],
+        )
+        .expect("tamper backup item without updating payload hash");
+
+        let error = maintenance_rejudge_restore_command(
+            &db,
+            &backup_path,
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect_err("tampered SQLite backup must fail");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("integrity mismatch")),
+            "{error:?}"
+        );
         assert!(db.get_drawer("low").expect("load drawer").is_none());
     }
 
