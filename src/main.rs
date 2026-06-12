@@ -12824,6 +12824,9 @@ async fn maintenance_rejudge_limited_command(
                     mutation,
                 )?;
             }
+            if mutated_count > 0 {
+                rebuild_rejudge_fts_from_active_drawers(db)?;
+            }
             Ok(mutated_count)
         })?
     } else {
@@ -13003,6 +13006,10 @@ async fn maintenance_rejudge_all_command(
                 });
             }
         }
+    }
+
+    if checkpoint.mutated_count > 0 {
+        rebuild_rejudge_fts_from_active_drawers(db)?;
     }
 
     checkpoint.status = "done".to_string();
@@ -14093,6 +14100,7 @@ fn delete_rejudge_backup_items_by_version_inner(
                 })?;
         }
         if hard_delete {
+            delete_rejudge_fts_row_for_drawer(db, &item.drawer.id)?;
             db.conn()
                 .execute(
                     "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
@@ -14108,9 +14116,9 @@ fn delete_rejudge_backup_items_by_version_inner(
                     [item.drawer.id.as_str()],
                 )
                 .with_context(|| format!("failed to hard-delete drawer {}", item.drawer.id))?;
-            rebuild_rejudge_fts_from_active_drawers(db)?;
         } else {
             let softdelete_trigger_dropped = drop_rejudge_softdelete_fts_trigger(db)?;
+            delete_rejudge_fts_row_for_drawer(db, &item.drawer.id)?;
             mutated_total += db
                 .conn()
                 .execute(
@@ -14121,7 +14129,6 @@ fn delete_rejudge_backup_items_by_version_inner(
             if softdelete_trigger_dropped {
                 create_rejudge_softdelete_fts_trigger(db)?;
             }
-            rebuild_rejudge_fts_from_active_drawers(db)?;
         }
     }
     Ok(mutated_total)
@@ -14237,6 +14244,9 @@ fn maintenance_rejudge_restore_command(
     }
 
     if execute {
+        if report.restored_count > 0 {
+            rebuild_rejudge_fts_from_active_drawers(db)?;
+        }
         append_audit_entry(
             db,
             "maintenance-rejudge-restore",
@@ -14479,6 +14489,7 @@ fn delete_drawer_for_restore(db: &Database, drawer_id: &str) -> Result<usize> {
             .execute("DELETE FROM drawer_vectors WHERE id = ?1", [drawer_id])
             .with_context(|| format!("failed to delete vector row for drawer {drawer_id}"))?;
     }
+    delete_rejudge_fts_row_for_drawer(db, drawer_id)?;
     db.conn()
         .execute(
             "UPDATE triples SET source_drawer = NULL WHERE source_drawer = ?1",
@@ -14547,7 +14558,7 @@ fn restore_soft_deleted_rejudge_drawer(
             item.drawer.id
         );
     }
-    rebuild_rejudge_fts_from_active_drawers(db)
+    insert_rejudge_fts_row_for_drawer(db, &item.drawer.id)
 }
 
 fn json_value_to_sqlite_value(value: &serde_json::Value) -> Result<rusqlite::types::Value> {
@@ -14573,18 +14584,71 @@ fn json_value_to_sqlite_value(value: &serde_json::Value) -> Result<rusqlite::typ
     }
 }
 
-fn rebuild_rejudge_fts_from_active_drawers(db: &Database) -> Result<()> {
-    if !db
-        .conn()
+fn rejudge_fts_table_exists(db: &Database) -> Result<bool> {
+    db.conn()
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawers_fts')",
             [],
             |row| row.get::<_, bool>(0),
         )
-        .context("failed to query FTS table presence")?
-    {
+        .context("failed to query FTS table presence")
+}
+
+fn delete_rejudge_fts_row_for_drawer(db: &Database, drawer_id: &str) -> Result<()> {
+    use rusqlite::OptionalExtension;
+
+    if !rejudge_fts_table_exists(db)? {
         return Ok(());
     }
+    let row = db
+        .conn()
+        .query_row(
+            "SELECT rowid, content FROM drawers WHERE id = ?1",
+            [drawer_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .with_context(|| format!("failed to load FTS row for drawer {drawer_id}"))?;
+    let Some((rowid, content)) = row else {
+        return Ok(());
+    };
+    let tokenized = fts_tokenize_content(&content);
+    db.conn()
+        .execute(
+            "INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', ?1, ?2)",
+            rusqlite::params![rowid, tokenized],
+        )
+        .with_context(|| format!("failed to delete FTS row for drawer {drawer_id}"))?;
+    Ok(())
+}
+
+fn insert_rejudge_fts_row_for_drawer(db: &Database, drawer_id: &str) -> Result<()> {
+    if !rejudge_fts_table_exists(db)? {
+        return Ok(());
+    }
+    let (rowid, content): (i64, String) = db
+        .conn()
+        .query_row(
+            "SELECT rowid, content FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+            [drawer_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .with_context(|| format!("failed to load restored FTS row for drawer {drawer_id}"))?;
+    let tokenized = fts_tokenize_content(&content);
+    db.conn()
+        .execute(
+            "INSERT INTO drawers_fts(rowid, content) VALUES (?1, ?2)",
+            rusqlite::params![rowid, tokenized],
+        )
+        .with_context(|| format!("failed to insert FTS row for drawer {drawer_id}"))?;
+    Ok(())
+}
+
+fn rebuild_rejudge_fts_from_active_drawers(db: &Database) -> Result<()> {
+    if !rejudge_fts_table_exists(db)? {
+        return Ok(());
+    }
+    record_rejudge_fts_rebuild_for_test(db)?;
 
     // Rejudge temporarily disables FTS triggers around drawer mutations, then
     // rebuilds from active rows so external-content FTS cannot retain stale
@@ -14616,6 +14680,32 @@ fn rebuild_rejudge_fts_from_active_drawers(db: &Database) -> Result<()> {
                 rusqlite::params![rowid, tokenized],
             )
             .with_context(|| format!("failed to rebuild FTS row {rowid}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn record_rejudge_fts_rebuild_for_test(_db: &Database) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn record_rejudge_fts_rebuild_for_test(db: &Database) -> Result<()> {
+    let exists = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='rejudge_fts_rebuild_counter')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to query test FTS rebuild counter")?;
+    if exists {
+        db.conn()
+            .execute(
+                "INSERT INTO temp.rejudge_fts_rebuild_counter DEFAULT VALUES",
+                [],
+            )
+            .context("failed to record test FTS rebuild")?;
     }
     Ok(())
 }
@@ -14739,7 +14829,6 @@ fn restore_rejudge_backup_item(db: &Database, item: &HistoricalRejudgeBackupItem
     }
     restore_rejudge_backup_vector(db, &item.drawer.id, item.vector.as_ref())?;
     restore_rejudge_source_drawer_triples(db, item)?;
-    rebuild_rejudge_fts_from_active_drawers(db)?;
     Ok(())
 }
 
@@ -16563,6 +16652,25 @@ enabled = true
             .expect("query raw FTS matches")
     }
 
+    fn start_rejudge_fts_rebuild_count(db: &Database) {
+        db.conn()
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS rejudge_fts_rebuild_counter (id INTEGER PRIMARY KEY); \
+                 DELETE FROM temp.rejudge_fts_rebuild_counter;",
+            )
+            .expect("create FTS rebuild counter");
+    }
+
+    fn rejudge_fts_rebuild_count(db: &Database) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM temp.rejudge_fts_rebuild_counter",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count FTS rebuilds")
+    }
+
     fn sqlite_backup_item_count(path: &Path) -> i64 {
         let conn =
             rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -17134,6 +17242,77 @@ enabled = true
     }
 
     #[tokio::test]
+    async fn historical_rejudge_restore_batch_rebuilds_fts_once() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        for index in 0..3 {
+            insert_drawer(
+                &db,
+                &format!("low-{index}"),
+                &format!("restorebatchneedle-{index}"),
+                "notes",
+                None,
+            );
+        }
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                all: false,
+                resume: false,
+                page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("execute soft-delete rejudge");
+        start_rejudge_fts_rebuild_count(&db);
+
+        maintenance_rejudge_restore_command(
+            &db,
+            &only_backup_file(&backups),
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect("restore batch");
+
+        assert_eq!(
+            rejudge_fts_rebuild_count(&db),
+            1,
+            "bulk restore must rebuild the full FTS table once, not per item"
+        );
+        for index in 0..3 {
+            let restored_matches = db
+                .search_fts(
+                    &format!("restorebatchneedle-{index}"),
+                    None,
+                    None,
+                    "all",
+                    None,
+                    10,
+                )
+                .expect("search restored payload through FTS");
+            assert!(
+                restored_matches
+                    .iter()
+                    .any(|(id, _)| id == &format!("low-{index}")),
+                "restored drawer must be BM25-searchable: {restored_matches:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn historical_rejudge_restore_preserves_kg_source_drawer() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
@@ -17545,9 +17724,16 @@ enabled = true
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
         for index in 0..5 {
-            insert_drawer(&db, &format!("low-{index}"), "ok", "notes", None);
+            insert_drawer(
+                &db,
+                &format!("low-{index}"),
+                &format!("allbatchneedle-{index}"),
+                "notes",
+                None,
+            );
         }
         let backups = backup_dir(&tmp);
+        start_rejudge_fts_rebuild_count(&db);
 
         maintenance_rejudge_command(
             &db,
@@ -17557,8 +17743,20 @@ enabled = true
         .await
         .expect("execute full rejudge");
 
+        assert_eq!(
+            rejudge_fts_rebuild_count(&db),
+            1,
+            "full sweep must rebuild the full FTS table once, not per work item"
+        );
         assert_eq!(active_drawer_count(&db), 0);
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 5);
+        let stale_matches = db
+            .search_fts("allbatchneedle-0", None, None, "all", None, 10)
+            .expect("search deleted payload through FTS");
+        assert!(
+            stale_matches.is_empty(),
+            "full sweep deletions must not remain BM25-searchable: {stale_matches:?}"
+        );
         let backup = read_historical_rejudge_backup(&only_backup_file(&backups))
             .expect("read full sweep backup");
         assert_eq!(backup.items.len(), 5);
