@@ -29,8 +29,9 @@ use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
 use crate::search::{
     SearchMode, SearchOptions, VectorSearchCircuit, bm25_fallback_warning_degraded,
     bm25_fallback_warning_dimension_mismatch, bm25_fallback_warning_embed_error,
-    bm25_fallback_warning_missing_query_vector, bm25_fallback_warning_timeout, resolve_route,
-    search_bm25_only_with_options, search_with_vector_and_scope_options,
+    bm25_fallback_warning_missing_query_vector, bm25_fallback_warning_timeout,
+    maybe_rerank_search_results, resolve_route, search_bm25_only_with_options,
+    search_with_vector_and_scope_options,
 };
 use axum::{
     Json, Router,
@@ -658,6 +659,9 @@ async fn search_handler(
         search_bm25_only_with_options(&db, &query.q, route, &scope, search_options, top_k)
             .map_err(internal_error)?
     };
+    let rerank_outcome = maybe_rerank_search_results(&query.q, results).await;
+    warnings.extend(rerank_outcome.warnings);
+    let results = rerank_outcome.results;
 
     let mut response = Json(
         results

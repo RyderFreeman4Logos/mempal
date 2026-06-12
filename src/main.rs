@@ -103,7 +103,7 @@ use mempal::mcp::{
     OperationStatusRequest,
 };
 use mempal::observability;
-use mempal::search::{SearchFilters, SearchOptions, search_with_all_options};
+use mempal::search::{SearchFilters, SearchOptions, search_with_all_options_outcome};
 use mempal::sleep::{
     NremSummary, RemSummary, SalienceSummary, SleepCycleSummary, SleepPhaseSelection,
     SleepRunOptions, run_sleep_cycle,
@@ -5218,7 +5218,7 @@ async fn search_command(
         config.search.strict_project_isolation,
     );
     let embedder = build_embedder(config).await?;
-    let results = search_with_all_options(
+    let outcome = search_with_all_options_outcome(
         db,
         &*embedder,
         options.query,
@@ -5234,7 +5234,11 @@ async fn search_command(
         options.top_k,
     )
     .await?;
-    let results = results
+    for warning in &outcome.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let results = outcome
+        .results
         .into_iter()
         .map(build_cli_search_result)
         .collect::<Vec<_>>();

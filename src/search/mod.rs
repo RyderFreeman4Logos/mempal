@@ -165,6 +165,26 @@ impl SearchOutcome {
     }
 }
 
+pub async fn maybe_rerank_search_results(
+    query: &str,
+    results: Vec<SearchResult>,
+) -> rerank::RerankOutcome {
+    let config = crate::core::config::ConfigHandle::current();
+    rerank::maybe_rerank_with_config(&config.search.reranker, query, results).await
+}
+
+async fn apply_optional_reranker_to_outcome(
+    query: &str,
+    mut outcome: SearchOutcome,
+) -> SearchOutcome {
+    let config = crate::core::config::ConfigHandle::current();
+    let rerank_outcome =
+        rerank::maybe_rerank_with_config(&config.search.reranker, query, outcome.results).await;
+    outcome.results = rerank_outcome.results;
+    outcome.warnings.extend(rerank_outcome.warnings);
+    outcome
+}
+
 #[derive(Debug, Error)]
 pub enum SearchError {
     #[error("failed to embed search query")]
@@ -312,7 +332,7 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
 
     let vector_search_circuit = VectorSearchCircuit::current();
     if vector_search_circuit.bm25_fallback_enabled && vector_search_circuit.open {
-        return bm25_fallback_outcome(
+        let outcome = bm25_fallback_outcome(
             db,
             query,
             route,
@@ -320,13 +340,14 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
             options,
             top_k,
             bm25_fallback_warning_degraded(vector_search_circuit.failure_count),
-        );
+        )?;
+        return Ok(apply_optional_reranker_to_outcome(query, outcome).await);
     }
 
     let embeddings = match embedder.embed(&[query]).await {
         Ok(embeddings) => embeddings,
         Err(error) if vector_search_circuit.bm25_fallback_enabled => {
-            return bm25_fallback_outcome(
+            let outcome = bm25_fallback_outcome(
                 db,
                 query,
                 route,
@@ -336,13 +357,14 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
                 bm25_fallback_warning_embed_error(&crate::core::config::scrub_sensitive_text(
                     &error.to_string(),
                 )),
-            );
+            )?;
+            return Ok(apply_optional_reranker_to_outcome(query, outcome).await);
         }
         Err(error) => return Err(SearchError::EmbedQuery(error)),
     };
     let Some(query_vector) = embeddings.into_iter().next() else {
         if vector_search_circuit.bm25_fallback_enabled {
-            return bm25_fallback_outcome(
+            let outcome = bm25_fallback_outcome(
                 db,
                 query,
                 route,
@@ -350,7 +372,8 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
                 options,
                 top_k,
                 bm25_fallback_warning_missing_query_vector(),
-            );
+            )?;
+            return Ok(apply_optional_reranker_to_outcome(query, outcome).await);
         }
         return Err(SearchError::MissingQueryVector);
     };
@@ -358,7 +381,7 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
         && current_dim != query_vector.len()
     {
         if vector_search_circuit.bm25_fallback_enabled {
-            return bm25_fallback_outcome(
+            let outcome = bm25_fallback_outcome(
                 db,
                 query,
                 route,
@@ -366,7 +389,8 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
                 options,
                 top_k,
                 bm25_fallback_warning_dimension_mismatch(query_vector.len(), current_dim),
-            );
+            )?;
+            return Ok(apply_optional_reranker_to_outcome(query, outcome).await);
         }
         return Err(SearchError::VectorDimensionMismatch {
             current_dim,
@@ -374,7 +398,7 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
         });
     }
 
-    Ok(SearchOutcome::hybrid(search_with_vector_and_scope_options(
+    let outcome = SearchOutcome::hybrid(search_with_vector_and_scope_options(
         db,
         query,
         &query_vector,
@@ -382,7 +406,8 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
         scope,
         options,
         top_k,
-    )?))
+    )?);
+    Ok(apply_optional_reranker_to_outcome(query, outcome).await)
 }
 
 fn bm25_fallback_outcome(

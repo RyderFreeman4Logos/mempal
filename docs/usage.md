@@ -66,6 +66,13 @@ db_path = "~/.mempal/palace.db"
 [embed]
 backend = "model2vec"
 # model = "minishlab/potion-multilingual-128M" # default multilingual model
+
+[search.reranker]
+enabled = false
+# endpoint = "http://gb10:18003/v1/rerank"
+# model = "qwen3-reranker"
+# timeout_secs = 2
+# top_k = 20
 ```
 
 Use local ONNX instead of the default model2vec backend:
@@ -95,6 +102,13 @@ Notes:
 - First use of `model2vec` or `onnx` may download model assets.
 - If `config.toml` is missing, `mempal` still works with defaults.
 - The benchmark and search commands use whatever embedder backend is configured here.
+- Reranking is disabled by default. To use a local/LAN reranker, set
+  `[search.reranker] enabled = true`, `endpoint`, `model`, `timeout_secs`, and
+  `top_k`. A bare endpoint like `gb10:18003` is normalized to
+  `http://gb10:18003/v1/rerank`; do not put secrets in the endpoint URL.
+- If the reranker is absent, disabled, times out, or returns an error, search
+  keeps the existing BM25/vector ranking and reports a warning instead of
+  failing the request.
 
 ## Command Cheat Sheet
 

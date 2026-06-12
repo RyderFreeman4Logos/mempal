@@ -37,6 +37,8 @@ const DEFAULT_SEARCH_DECAY_HALF_LIFE_DAYS: u64 = 90;
 const DEFAULT_SEARCH_DECAY_STEP_FULL_DAYS: u64 = 30;
 const DEFAULT_SEARCH_DECAY_STEP_REDUCED_WEIGHT: f64 = 0.5;
 const DEFAULT_SEARCH_BM25_FALLBACK: bool = true;
+const DEFAULT_SEARCH_RERANKER_TIMEOUT_SECS: u64 = 2;
+const DEFAULT_SEARCH_RERANKER_TOP_K: usize = 20;
 const DEFAULT_TURN_STORAGE_MODE: TurnStorageMode = TurnStorageMode::RawEvidence;
 const DEFAULT_TURN_IMPORTANCE: i32 = 0;
 const DEFAULT_ALERT_EVERY_N_FAILURES: u64 = 100;
@@ -338,6 +340,36 @@ impl Config {
             return Err(ConfigError::InvalidConfig(
                 "search.tunnel_penalty must be a finite value in 0.0..=1.0".to_string(),
             ));
+        }
+        if self.search.reranker.timeout_secs == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "search.reranker.timeout_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.search.reranker.top_k == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "search.reranker.top_k must be greater than 0".to_string(),
+            ));
+        }
+        if self.search.reranker.enabled {
+            normalize_reranker_endpoint_url(
+                self.search.reranker.endpoint.as_deref().unwrap_or_default(),
+            )
+            .map_err(ConfigError::Validation)?;
+            if self
+                .search
+                .reranker
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .is_none()
+            {
+                return Err(ConfigError::Validation(
+                    "search.reranker.model must not be empty when search.reranker.enabled is true"
+                        .to_string(),
+                ));
+            }
         }
         if self.search.decay.half_life_days == 0 {
             return Err(ConfigError::InvalidConfig(
@@ -682,6 +714,23 @@ impl Config {
                     .unwrap_or(&[]),
             ));
         }
+        if self.search.reranker.enabled
+            && let Ok(endpoint) = normalize_reranker_endpoint_url(
+                self.search.reranker.endpoint.as_deref().unwrap_or_default(),
+            )
+            && !llm_base_url_is_local_or_lan(&endpoint)
+        {
+            let host = llm_base_url_host(&endpoint)
+                .map(|host| format!(" host `{host}`"))
+                .unwrap_or_default();
+            warnings.push(RuntimeWarning {
+                level: "warn",
+                source: "reranker",
+                message: format!(
+                    "search.reranker.endpoint{host} appears outside localhost/LAN; mempal assumes user-configured reranker endpoints are local or private network and does not block operation"
+                ),
+            });
+        }
         warnings
     }
 }
@@ -829,6 +878,41 @@ pub fn validate_llm_base_url(base_url: &str) -> Result<(), String> {
         return Err("llm.base_url must not include URL fragments".to_string());
     }
     Ok(())
+}
+
+pub fn normalize_reranker_endpoint_url(endpoint: &str) -> Result<String, String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(
+            "search.reranker.endpoint must not be empty when reranker is enabled".to_string(),
+        );
+    }
+    let raw = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+    let mut parsed = Url::parse(&raw)
+        .map_err(|error| format!("invalid search.reranker.endpoint `{endpoint}`: {error}"))?;
+    if parsed.host_str().is_none() {
+        return Err("search.reranker.endpoint must include a host".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "search.reranker.endpoint must not include userinfo credentials; run rerankers on trusted local/LAN endpoints"
+                .to_string(),
+        );
+    }
+    if parsed.query().is_some() {
+        return Err(
+            "search.reranker.endpoint must not include query parameters; configure a plain local/LAN endpoint URL"
+                .to_string(),
+        );
+    }
+    if parsed.path().is_empty() || parsed.path() == "/" {
+        parsed.set_path("/v1/rerank");
+    }
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
 pub(crate) fn scrub_sensitive_text(input: &str) -> String {
@@ -1635,6 +1719,7 @@ pub struct SearchConfig {
     /// `1.0` disables the penalty. Default `0.7` deprioritizes cross-project rows
     /// when their raw embedding score clusters near direct in-project matches.
     pub tunnel_penalty: f32,
+    pub reranker: SearchRerankerConfig,
     pub decay: DecayConfig,
 }
 
@@ -1649,7 +1734,30 @@ impl Default for SearchConfig {
             tunnel_fanout_cap: DEFAULT_SEARCH_TUNNEL_FANOUT_CAP,
             tunnel_hints_display_cap: DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP,
             tunnel_penalty: DEFAULT_SEARCH_TUNNEL_PENALTY,
+            reranker: SearchRerankerConfig::default(),
             decay: DecayConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SearchRerankerConfig {
+    pub enabled: bool,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub timeout_secs: u64,
+    pub top_k: usize,
+}
+
+impl Default for SearchRerankerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            model: None,
+            timeout_secs: DEFAULT_SEARCH_RERANKER_TIMEOUT_SECS,
+            top_k: DEFAULT_SEARCH_RERANKER_TOP_K,
         }
     }
 }
@@ -2390,6 +2498,100 @@ mod tests {
         assert_eq!(config.search.decay.half_life_days, 90);
         assert_eq!(config.search.decay.step_full_days, 30);
         assert_eq!(config.search.decay.step_reduced_weight, 0.5);
+        assert!(!config.search.reranker.enabled);
+        assert!(config.search.reranker.endpoint.is_none());
+        assert!(config.search.reranker.model.is_none());
+    }
+
+    #[test]
+    fn search_reranker_config_parses_nested_section() {
+        let config = Config::parse(
+            r#"
+            [search.reranker]
+            enabled = true
+            endpoint = "gb10:18003"
+            model = "qwen3-reranker"
+            timeout_secs = 3
+            top_k = 12
+            "#,
+        )
+        .expect("reranker config should parse");
+
+        assert!(config.search.reranker.enabled);
+        assert_eq!(
+            super::normalize_reranker_endpoint_url(
+                config
+                    .search
+                    .reranker
+                    .endpoint
+                    .as_deref()
+                    .expect("endpoint")
+            )
+            .expect("normalize endpoint"),
+            "http://gb10:18003/v1/rerank"
+        );
+        assert_eq!(
+            config.search.reranker.model.as_deref(),
+            Some("qwen3-reranker")
+        );
+        assert_eq!(config.search.reranker.timeout_secs, 3);
+        assert_eq!(config.search.reranker.top_k, 12);
+    }
+
+    #[test]
+    fn search_reranker_config_rejects_invalid_enabled_config() {
+        let err = Config::parse(
+            r#"
+            [search.reranker]
+            enabled = true
+            model = "qwen3-reranker"
+            "#,
+        )
+        .expect_err("enabled reranker without endpoint must be rejected");
+        assert!(
+            err.to_string().contains("search.reranker.endpoint"),
+            "unexpected error: {err}"
+        );
+
+        let err = Config::parse(
+            r#"
+            [search.reranker]
+            enabled = true
+            endpoint = "gb10:18003"
+            "#,
+        )
+        .expect_err("enabled reranker without model must be rejected");
+        assert!(
+            err.to_string().contains("search.reranker.model"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn search_reranker_config_rejects_invalid_timeout_and_top_k() {
+        let err = Config::parse(
+            r#"
+            [search.reranker]
+            timeout_secs = 0
+            "#,
+        )
+        .expect_err("zero timeout must be rejected");
+        assert!(
+            err.to_string().contains("search.reranker.timeout_secs"),
+            "unexpected error: {err}"
+        );
+
+        let err = Config::parse(
+            r#"
+            [search.reranker]
+            top_k = 0
+            "#,
+        )
+        .expect_err("zero top_k must be rejected");
+        assert!(
+            err.to_string().contains("search.reranker.top_k"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

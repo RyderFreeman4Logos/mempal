@@ -53,6 +53,13 @@ db_path = "~/.mempal/palace.db"
 [embed]
 backend = "model2vec"                          # default, zero native deps
 # model = "minishlab/potion-multilingual-128M" # default multilingual model (1024d)
+
+[search.reranker]
+enabled = false                                # default: no reranker call
+# endpoint = "http://gb10:18003/v1/rerank"     # local/LAN reranker endpoint
+# model = "qwen3-reranker"
+# timeout_secs = 2
+# top_k = 20
 ```
 
 Other backends:
