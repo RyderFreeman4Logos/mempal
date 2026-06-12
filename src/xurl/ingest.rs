@@ -154,16 +154,8 @@ fn parse_and_store_hermes_source(
         ));
     }
 
-    let fallback_session_id = options
-        .session_id
-        .as_deref()
-        .unwrap_or("hermes-session")
-        .to_string();
-    let mut parse_options = HermesParseOptions::new(&fallback_session_id, &options.profile, false);
-    parse_options.session_id_filter = options.session_id.clone();
-    parse_options.cwd = options.cwd.clone();
-
     let (name, turns) = if let Some(path) = &options.export_jsonl {
+        let parse_options = hermes_parse_options(options, "jsonl", path);
         let content = fs::read_to_string(path).map_err(XurlError::Io)?;
         let name = path
             .file_name()
@@ -175,6 +167,7 @@ fn parse_and_store_hermes_source(
         let path = options.db_path.clone().unwrap_or_else(|| {
             default_hermes_db_path(&options.profile, options.hermes_home.as_deref())
         });
+        let parse_options = hermes_parse_options(options, "db", &path);
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
@@ -187,6 +180,46 @@ fn parse_and_store_hermes_source(
     let turn_ids: Vec<String> = turns.iter().map(store::turn_id_for).collect();
     let insert_stats = store::insert_turns(db.conn(), &turns)?;
     Ok((name, turns_parsed, insert_stats, turn_ids))
+}
+
+fn hermes_parse_options(
+    options: &HermesIngestOptions,
+    source_kind: &str,
+    path: &Path,
+) -> HermesParseOptions {
+    let fallback_session_id = options.session_id.clone().unwrap_or_else(|| {
+        let source_identity = stable_source_identity(path);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(options.profile.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(source_kind.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(source_identity.as_bytes());
+        let digest = hasher.finalize().to_hex().to_string();
+        format!(
+            "hermes-fallback:{}:{}:{}",
+            options.profile,
+            source_kind,
+            &digest[..12]
+        )
+    });
+    let mut parse_options = HermesParseOptions::new(&fallback_session_id, &options.profile, false);
+    parse_options.session_id_filter = options.session_id.clone();
+    parse_options.cwd = options.cwd.clone();
+    parse_options
+}
+
+fn stable_source_identity(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    });
+    resolved.to_string_lossy().into_owned()
 }
 
 pub fn default_hermes_db_path(profile: &str, hermes_home: Option<&Path>) -> PathBuf {

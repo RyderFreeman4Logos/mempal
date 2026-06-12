@@ -5,6 +5,7 @@ use mempal::xurl::ingest;
 use mempal::xurl::model::Tool;
 use mempal::xurl::search::{self, SearchOptions};
 use mempal::xurl::store::{self, TurnFilter};
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 struct TestDb {
@@ -309,6 +310,76 @@ fn write_hermes_export(dir: &TempDir, session_id: &str, cwd: &str) -> PathBuf {
     path
 }
 
+fn write_metadata_less_hermes_export(dir: &TempDir, name: &str, marker: &str) -> PathBuf {
+    let lines = [
+        serde_json::json!({
+            "role": "user",
+            "content": format!("metadata-less {marker} user turn"),
+            "timestamp": "2026-06-01T00:00:00Z"
+        }),
+        serde_json::json!({
+            "role": "assistant",
+            "content": format!("metadata-less {marker} assistant turn"),
+            "timestamp": "2026-06-01T00:01:00Z"
+        }),
+    ];
+    let path = dir.path().join(name);
+    let content = lines
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&path, content).expect("write metadata-less Hermes export");
+    path
+}
+
+fn write_metadata_less_hermes_db(dir: &TempDir, name: &str, marker: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    let conn = Connection::open(&path).expect("open Hermes fixture db");
+    conn.execute_batch(
+        "CREATE TABLE messages (
+            role      TEXT NOT NULL,
+            content   TEXT NOT NULL,
+            timestamp REAL NOT NULL
+        );",
+    )
+    .expect("create Hermes fixture table");
+    conn.execute(
+        "INSERT INTO messages (role, content, timestamp) VALUES (?1, ?2, ?3)",
+        params!["user", format!("metadata-less {marker} db user turn"), 1.0],
+    )
+    .expect("insert user row");
+    conn.execute(
+        "INSERT INTO messages (role, content, timestamp) VALUES (?1, ?2, ?3)",
+        params![
+            "assistant",
+            format!("metadata-less {marker} db assistant turn"),
+            2.0
+        ],
+    )
+    .expect("insert assistant row");
+    path
+}
+
+async fn ingest_hermes_options(
+    db: &Database,
+    embedder: &MockEmbedder,
+    options: ingest::HermesIngestOptions,
+) -> ingest::IngestStats {
+    ingest::ingest_hermes_with_vector_fingerprint(
+        db,
+        embedder,
+        &options,
+        "mock:64",
+        ingest::IngestCallbacks {
+            on_file_parsed: None,
+            on_embed_progress: None,
+        },
+    )
+    .await
+    .expect("ingest Hermes source")
+}
+
 #[tokio::test]
 async fn ingest_hermes_jsonl_is_idempotent_by_profile_session_message() {
     let dir = TempDir::new().unwrap();
@@ -407,6 +478,146 @@ async fn ingest_hermes_jsonl_is_idempotent_by_profile_session_message() {
         default_turns[0].metadata.session_title.as_deref(),
         Some("Issue 399 recall")
     );
+}
+
+#[tokio::test]
+async fn ingest_metadata_less_hermes_jsonl_uses_source_scoped_fallback_session() {
+    let dir = TempDir::new().unwrap();
+    let db = open_temp_db_at_fork_ext(21);
+    let embedder = MockEmbedder::new_fixed_dim(64);
+    let first_export = write_metadata_less_hermes_export(&dir, "first.jsonl", "alpha");
+    let second_export = write_metadata_less_hermes_export(&dir, "second.jsonl", "beta");
+
+    let first = ingest_hermes_options(
+        &db.inner,
+        &embedder,
+        ingest::HermesIngestOptions {
+            profile: "default".to_string(),
+            export_jsonl: Some(first_export.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let second = ingest_hermes_options(
+        &db.inner,
+        &embedder,
+        ingest::HermesIngestOptions {
+            profile: "default".to_string(),
+            export_jsonl: Some(second_export),
+            ..Default::default()
+        },
+    )
+    .await;
+    let first_again = ingest_hermes_options(
+        &db.inner,
+        &embedder,
+        ingest::HermesIngestOptions {
+            profile: "default".to_string(),
+            export_jsonl: Some(first_export),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert_eq!(first.turns_inserted, 2);
+    assert_eq!(second.turns_inserted, 2);
+    assert_eq!(second.turns_updated, 0);
+    assert_eq!(first_again.turns_inserted, 0);
+    assert_eq!(first_again.turns_skipped, 2);
+
+    let turns = store::get_turns_filtered(
+        db.conn(),
+        TurnFilter {
+            tool: Some(Tool::Hermes),
+            hermes_profile: Some("default".to_string()),
+            limit: 10,
+            ..Default::default()
+        },
+        false,
+        false,
+    )
+    .unwrap();
+    let mut sessions = turns
+        .iter()
+        .map(|turn| turn.session_id.as_str())
+        .collect::<Vec<_>>();
+    sessions.sort_unstable();
+    sessions.dedup();
+
+    assert_eq!(turns.len(), 4);
+    assert_eq!(sessions.len(), 2);
+    assert!(turns.iter().any(|turn| turn.content.contains("alpha")));
+    assert!(turns.iter().any(|turn| turn.content.contains("beta")));
+}
+
+#[tokio::test]
+async fn ingest_metadata_less_hermes_dbs_use_source_scoped_fallback_session() {
+    let dir = TempDir::new().unwrap();
+    let db = open_temp_db_at_fork_ext(21);
+    let embedder = MockEmbedder::new_fixed_dim(64);
+    let first_db = write_metadata_less_hermes_db(&dir, "first-state.db", "alpha");
+    let second_db = write_metadata_less_hermes_db(&dir, "second-state.db", "beta");
+
+    let first = ingest_hermes_options(
+        &db.inner,
+        &embedder,
+        ingest::HermesIngestOptions {
+            profile: "default".to_string(),
+            db_path: Some(first_db.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let second = ingest_hermes_options(
+        &db.inner,
+        &embedder,
+        ingest::HermesIngestOptions {
+            profile: "default".to_string(),
+            db_path: Some(second_db),
+            ..Default::default()
+        },
+    )
+    .await;
+    let first_again = ingest_hermes_options(
+        &db.inner,
+        &embedder,
+        ingest::HermesIngestOptions {
+            profile: "default".to_string(),
+            db_path: Some(first_db),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert_eq!(first.turns_inserted, 2);
+    assert_eq!(second.turns_inserted, 2);
+    assert_eq!(second.turns_updated, 0);
+    assert_eq!(first_again.turns_inserted, 0);
+    assert_eq!(first_again.turns_skipped, 2);
+
+    let turns = store::get_turns_filtered(
+        db.conn(),
+        TurnFilter {
+            tool: Some(Tool::Hermes),
+            hermes_profile: Some("default".to_string()),
+            limit: 10,
+            ..Default::default()
+        },
+        false,
+        false,
+    )
+    .unwrap();
+    let mut sessions = turns
+        .iter()
+        .map(|turn| turn.session_id.as_str())
+        .collect::<Vec<_>>();
+    sessions.sort_unstable();
+    sessions.dedup();
+
+    assert_eq!(turns.len(), 4);
+    assert_eq!(sessions.len(), 2);
+    assert!(turns.iter().any(|turn| turn.content.contains("alpha")));
+    assert!(turns.iter().any(|turn| turn.content.contains("beta")));
 }
 
 #[tokio::test]
