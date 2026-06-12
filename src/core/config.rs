@@ -53,6 +53,7 @@ const DEFAULT_SESSION_REVIEW_MIN_LENGTH: usize = 100;
 const DEFAULT_SESSION_REVIEW_TRAILING_MESSAGES: usize = 1;
 const DEFAULT_API_WRITE_QUEUE_CAPACITY: usize = 1_000;
 const DEFAULT_API_WRITE_DRAIN_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_API_SEARCH_DB_DEADLINE_SECS: u64 = 30;
 const DEFAULT_HOTPATCH_MIN_IMPORTANCE_STARS: i32 = 4;
 const DEFAULT_HOTPATCH_MAX_SUGGESTION_LENGTH: usize = 80;
 const DEFAULT_IMPORTANCE_DECAY_RATE: f64 = 0.01;
@@ -327,6 +328,11 @@ impl Config {
         if self.api.write_drain_timeout_secs == 0 {
             return Err(ConfigError::InvalidConfig(
                 "api.write_drain_timeout_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.api.search_db_deadline_secs == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "api.search_db_deadline_secs must be greater than 0".to_string(),
             ));
         }
         if !(0..=5).contains(&self.turns.default_importance) {
@@ -1001,6 +1007,9 @@ pub struct ApiConfig {
     pub write_queue_capacity: usize,
     /// Maximum time to wait for queued REST writes during graceful shutdown.
     pub write_drain_timeout_secs: u64,
+    /// Maximum time a REST search may spend in synchronous database work before
+    /// returning a partial/fallback response.
+    pub search_db_deadline_secs: u64,
 }
 
 impl Default for ApiConfig {
@@ -1010,6 +1019,7 @@ impl Default for ApiConfig {
             addr: "127.0.0.1:3080".to_string(),
             write_queue_capacity: DEFAULT_API_WRITE_QUEUE_CAPACITY,
             write_drain_timeout_secs: DEFAULT_API_WRITE_DRAIN_TIMEOUT_SECS,
+            search_db_deadline_secs: DEFAULT_API_SEARCH_DB_DEADLINE_SECS,
         }
     }
 }

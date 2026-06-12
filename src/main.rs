@@ -11930,8 +11930,105 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
     }
     let db_holders = mempal::process_diagnostics::inspect_db_holders(db_path);
     print_db_holder_report("db_holders", &db_holders, "");
+    #[cfg(feature = "rest")]
+    if let Ok(config) = Config::load()
+        && config.api.enabled
+        && let Ok(Some(telemetry)) =
+            block_on_result(fetch_daemon_search_telemetry(&config.api.addr))
+    {
+        print_daemon_search_telemetry(&telemetry);
+    }
     Ok(())
 }
+
+#[cfg(feature = "rest")]
+async fn fetch_daemon_search_telemetry(addr: &str) -> Result<Option<Value>> {
+    let endpoint = normalize_rest_endpoint(addr);
+    let url = format!("{endpoint}/api/status");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("failed to build REST status client")?;
+    let response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let body = response
+        .json::<Value>()
+        .await
+        .context("failed to parse REST status JSON")?;
+    Ok(body.get("search_telemetry").cloned())
+}
+
+#[cfg(feature = "rest")]
+fn normalize_rest_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+#[cfg(feature = "rest")]
+fn print_daemon_search_telemetry(telemetry: &Value) {
+    println!(
+        "search.active: {}",
+        telemetry
+            .get("active_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    );
+    if let Some(active_searches) = telemetry.get("active_searches").and_then(Value::as_array) {
+        for item in active_searches {
+            println!(
+                "search.active_search: id={} client={} scope={} stage={} elapsed_ms={} deadline_ms={}",
+                json_u64(item, "id"),
+                json_str(item, "client"),
+                json_str(item, "scope"),
+                json_str(item, "stage"),
+                json_u64(item, "elapsed_ms"),
+                json_u64(item, "deadline_ms")
+            );
+        }
+    }
+    if let Some(slow_queries) = telemetry.get("slow_queries").and_then(Value::as_array) {
+        for item in slow_queries.iter().take(5) {
+            println!(
+                "search.slow_query: id={} client={} scope={} mode={} elapsed_ms={} db_ms={} route_ms={} embed_ms={} rerank_ms={} lock_wait_ms={} results={} warnings={} partial={}",
+                json_u64(item, "id"),
+                json_str(item, "client"),
+                json_str(item, "scope"),
+                json_str(item, "search_mode"),
+                json_u64(item, "elapsed_ms"),
+                json_u64(item, "db_ms"),
+                json_u64(item, "route_ms"),
+                json_u64(item, "embed_ms"),
+                json_u64(item, "rerank_ms"),
+                json_u64(item, "lock_wait_ms"),
+                json_u64(item, "result_count"),
+                json_u64(item, "warning_count"),
+                item.get("partial")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            );
+        }
+    }
+}
+
+#[cfg(feature = "rest")]
+fn json_str<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+#[cfg(feature = "rest")]
+fn json_u64(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
 fn prime_embedder_degraded() -> bool {
     if std::env::var_os("MEMPAL_TEST_EMBED_DEGRADED").is_some() {
         return true;
