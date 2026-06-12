@@ -417,6 +417,8 @@ struct StatusResponse {
     source_type_distribution: Vec<SourceTypeCount>,
     turn_storage: TurnStorageStatus,
     search_telemetry: SearchTelemetrySnapshot,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    status_warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -467,6 +469,7 @@ struct TurnStorageStatus {
     raw_turn_rooms: Vec<String>,
 }
 
+#[derive(Default)]
 struct StatusDbSnapshot {
     drawer_count: i64,
     taxonomy_count: i64,
@@ -1314,7 +1317,8 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
     let turns_config = config.turns.clone();
     let db_deadline = Duration::from_secs(config.api.search_db_deadline_secs);
-    let db_snapshot = state
+    let search_telemetry = state.search_telemetry().snapshot();
+    let (db_snapshot, status_warnings) = match state
         .run_read_anyhow_bounded(
             move |db| {
                 let drawer_count = db.drawer_count()?;
@@ -1350,13 +1354,20 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
             db_deadline,
         )
         .await
-        .map_err(internal_error)?
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::GATEWAY_TIMEOUT,
-                rest_search_timeout_warning("status database snapshot", db_deadline),
-            )
-        })?;
+    {
+        Ok(Some(snapshot)) => (snapshot, Vec::new()),
+        Ok(None) => (
+            StatusDbSnapshot::default(),
+            vec![rest_search_timeout_warning(
+                "status database snapshot",
+                db_deadline,
+            )],
+        ),
+        Err(error) => (
+            StatusDbSnapshot::default(),
+            vec![status_database_snapshot_error_warning(error)],
+        ),
+    };
 
     Ok(Json(StatusResponse {
         drawer_count: db_snapshot.drawer_count,
@@ -1388,8 +1399,14 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
             raw_turn_wings: config.turns.raw_turn_wings.clone(),
             raw_turn_rooms: config.turns.raw_turn_rooms.clone(),
         },
-        search_telemetry: state.search_telemetry().snapshot(),
+        search_telemetry,
+        status_warnings,
     }))
+}
+
+fn status_database_snapshot_error_warning(error: impl std::fmt::Display) -> String {
+    let detail = crate::core::config::scrub_sensitive_text(&error.to_string());
+    format!("status database snapshot unavailable; returning partial status: {detail}")
 }
 
 fn current_embedding_status(snapshot: &crate::embed::EmbedHealthSnapshot) -> &'static str {

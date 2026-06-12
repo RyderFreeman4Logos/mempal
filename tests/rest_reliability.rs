@@ -268,6 +268,20 @@ fn insert_search_drawer(db: &Database) {
     db.insert_drawer(&drawer).expect("insert drawer");
 }
 
+#[cfg(feature = "db-test-seam")]
+async fn wait_for_active_searches(state: &ApiState, expected: usize) {
+    let mut latest_active_count = 0;
+    for _ in 0..100 {
+        let telemetry = state.search_telemetry_snapshot_for_test();
+        latest_active_count = telemetry.active_count;
+        if latest_active_count >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected at least {expected} active searches, saw {latest_active_count}");
+}
+
 #[tokio::test]
 async fn test_shutdown_drain_completes_pending() {
     let _guard = TEST_LOCK.lock().await;
@@ -541,6 +555,74 @@ async fn test_search_db_deadline_returns_partial_warning_and_telemetry() {
     assert_eq!(telemetry.slow_queries[0].warning_count, 3);
 }
 
+#[cfg(feature = "db-test-seam")]
+#[tokio::test]
+async fn test_status_returns_telemetry_when_search_db_pool_is_saturated() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new_with_api_search_deadline_secs(1);
+    insert_search_drawer(&env.db());
+    let async_db = AsyncDb::open(&env.db_path, 4)
+        .expect("open async db")
+        .with_read_delay(Duration::from_secs(5));
+    let state = env
+        .state(Arc::new(FailingEmbedderFactory))
+        .with_async_db_for_test(async_db);
+
+    let mut requests = Vec::new();
+    for _ in 0..4 {
+        let request_state = state.clone();
+        requests.push(tokio::spawn(async move {
+            get_json(request_state, "/api/search?q=alpha&scope=global&top_k=5").await
+        }));
+    }
+    wait_for_active_searches(&state, 4).await;
+
+    let (status, _headers, body) = get_json(state.clone(), "/api/status").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["drawer_count"].as_i64(), Some(0));
+    assert_eq!(body["taxonomy_count"].as_i64(), Some(0));
+    assert_eq!(body["db_size_bytes"].as_u64(), Some(0));
+    assert_eq!(body["turn_storage"]["raw_turn_count"].as_i64(), Some(0));
+    assert!(
+        body["wings"].as_array().expect("wings").is_empty(),
+        "partial status should not report stale scope counts"
+    );
+    assert!(
+        body["source_type_distribution"]
+            .as_array()
+            .expect("source type distribution")
+            .is_empty(),
+        "partial status should not report stale source counts"
+    );
+    let warnings = body["status_warnings"].as_array().expect("status warnings");
+    assert_eq!(warnings.len(), 1);
+    let warning = warnings[0].as_str().expect("status warning");
+    assert!(
+        warning.contains("status database snapshot deadline exceeded after 1s"),
+        "warning={warning}"
+    );
+    assert!(
+        !warning.contains("alpha"),
+        "status warning must not leak query text: {warning}"
+    );
+    let telemetry = body["search_telemetry"]
+        .as_object()
+        .expect("search telemetry");
+    assert!(
+        telemetry
+            .get("active_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count >= 4),
+        "search telemetry={telemetry:#?}"
+    );
+
+    for request in requests {
+        request.abort();
+        let _ = request.await;
+    }
+}
+
 #[tokio::test]
 async fn test_feature_flags_in_status() {
     let _guard = TEST_LOCK.lock().await;
@@ -566,6 +648,7 @@ async fn test_feature_flags_in_status() {
     assert_eq!(queue.get("pending").and_then(Value::as_u64), Some(0));
     assert!(queue.contains_key("completed"));
     assert!(queue.contains_key("failed"));
+    assert!(body.get("status_warnings").is_none());
 }
 
 #[tokio::test]
