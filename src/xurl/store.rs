@@ -27,6 +27,7 @@ pub struct InsertStats {
     pub inserted: usize,
     pub skipped: usize,
     pub updated: usize,
+    pub turn_ids: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -128,10 +129,10 @@ fn generate_turn_id(session_id: &str, tool: &str, turn_index: u32) -> String {
     generate_turn_id_from_parts(&[session_id, tool, &turn_index])
 }
 
-/// Deterministic turn ID for a raw turn, matching the key `insert_turns` uses.
+/// Deterministic turn ID for newly inserted raw turns.
 ///
-/// Lets callers (e.g. a single-file ingest) compute the IDs of just-stored
-/// turns so the embed pass can be scoped to them without re-scanning the table.
+/// Existing legacy rows may keep their historical IDs when `insert_turns`
+/// updates them; use `InsertStats::turn_ids` when callers need actual row IDs.
 pub fn turn_id_for(turn: &RawTurn) -> String {
     if turn.tool == Tool::Hermes {
         if let (Some(profile), Some(message_id)) = (
@@ -185,7 +186,7 @@ fn find_existing_turn(conn: &Connection, turn: &RawTurn) -> XurlResult<Option<Ex
             turn.metadata.hermes_profile.as_deref(),
             turn.metadata.message_id.as_deref(),
         ) {
-            return conn
+            let existing = conn
                 .query_row(
                     "SELECT id, content, timestamp_epoch, project_path, git_branch, \
                      is_csa_delegated, provenance, hermes_profile, session_title, session_source, \
@@ -196,7 +197,12 @@ fn find_existing_turn(conn: &Connection, turn: &RawTurn) -> XurlResult<Option<Ex
                     existing_turn_from_row,
                 )
                 .optional()
-                .map_err(XurlError::Database);
+                .map_err(XurlError::Database)?;
+            if existing.is_some() {
+                return Ok(existing);
+            }
+
+            return find_existing_legacy_hermes_turn(conn, turn);
         }
     }
 
@@ -208,6 +214,24 @@ fn find_existing_turn(conn: &Connection, turn: &RawTurn) -> XurlResult<Option<Ex
          FROM conversation_turns \
          WHERE session_id=?1 AND tool=?2 AND turn_index=?3",
         params![&turn.session_id, turn.tool.as_str(), turn_index],
+        existing_turn_from_row,
+    )
+    .optional()
+    .map_err(XurlError::Database)
+}
+
+fn find_existing_legacy_hermes_turn(
+    conn: &Connection,
+    turn: &RawTurn,
+) -> XurlResult<Option<ExistingTurn>> {
+    conn.query_row(
+        "SELECT id, content, timestamp_epoch, project_path, git_branch, \
+         is_csa_delegated, provenance, hermes_profile, session_title, session_source, \
+         message_id, tool_name, tool_call_id, previous_message_id, next_message_id \
+         FROM conversation_turns \
+         WHERE session_id=?1 AND tool=?2 AND turn_index=?3 \
+           AND hermes_profile IS NULL AND message_id IS NULL",
+        params![&turn.session_id, turn.tool.as_str(), turn.turn_index],
         existing_turn_from_row,
     )
     .optional()
@@ -359,7 +383,7 @@ hermes_profile, session_title, session_source, message_id, tool_name, \
 tool_call_id, previous_message_id, next_message_id";
 
 /// Insert or update a batch of turns. For each turn:
-/// - If no row with (session_id, tool, turn_index) exists: INSERT.
+/// - If no row with the tool-specific identity exists: INSERT.
 /// - If a row exists with identical content and metadata: skip (no write).
 /// - If a row exists with identical content but changed metadata: UPDATE metadata only.
 /// - If a row exists with different content: UPDATE content and metadata fields.
@@ -410,9 +434,11 @@ pub fn insert_turns(conn: &Connection, turns: &[RawTurn]) -> XurlResult<InsertSt
                         ],
                     )
                     .map_err(XurlError::Database)?;
+                    stats.turn_ids.push(id);
                     stats.inserted += 1;
                 }
                 Some(existing) if existing.content == turn.content => {
+                    stats.turn_ids.push(existing.id.clone());
                     if stored_metadata_matches(&existing, turn) {
                         stats.skipped += 1;
                     } else {
@@ -421,6 +447,7 @@ pub fn insert_turns(conn: &Connection, turns: &[RawTurn]) -> XurlResult<InsertSt
                     }
                 }
                 Some(existing) => {
+                    stats.turn_ids.push(existing.id.clone());
                     conn.execute(
                         "UPDATE conversation_turns SET \
                          content=?2, timestamp_epoch=?3, token_count=?4, \
@@ -664,16 +691,9 @@ pub(crate) fn push_filter_conditions(
         let cwd = normalize_cwd_filter(cwd);
         if !cwd.is_empty() {
             let project_col = filter_column(column_prefix, "project_path");
-            conditions.push(format!(
-                "({project_col} = ?{} OR {project_col} LIKE ?{} OR ?{} LIKE {project_col} || '/%')",
-                *idx,
-                *idx + 1,
-                *idx + 2
-            ));
-            params_vec.push(Box::new(cwd.clone()));
-            params_vec.push(Box::new(descendant_like_pattern(&cwd)));
+            conditions.push(cwd_filter_condition(&project_col, *idx, &cwd));
             params_vec.push(Box::new(cwd));
-            *idx += 3;
+            *idx += 1;
         }
     }
     if let Some(ref profile) = filter.hermes_profile {
@@ -732,12 +752,18 @@ pub(crate) fn normalize_cwd_filter(cwd: &str) -> String {
     }
 }
 
-fn descendant_like_pattern(cwd: &str) -> String {
+fn cwd_filter_condition(project_col: &str, param_idx: usize, cwd: &str) -> String {
     if cwd == "/" {
-        "/%".to_string()
-    } else {
-        format!("{cwd}/%")
+        return format!("substr({project_col}, 1, 1) = ?{param_idx}");
     }
+
+    format!(
+        "({project_col} = ?{param_idx} \
+         OR (substr({project_col}, 1, length(?{param_idx})) = ?{param_idx} \
+             AND substr({project_col}, length(?{param_idx}) + 1, 1) = '/') \
+         OR (substr(?{param_idx}, 1, length({project_col})) = {project_col} \
+             AND substr(?{param_idx}, length({project_col}) + 1, 1) = '/'))"
+    )
 }
 
 /// Per-tool aggregate statistics.

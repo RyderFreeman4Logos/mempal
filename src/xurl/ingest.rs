@@ -95,7 +95,7 @@ fn home_dir() -> PathBuf {
 /// Parse a file and insert turns into the DB. Does not embed.
 ///
 /// Returns `(filename, turns_parsed, insert_stats, turn_ids)` where `turn_ids`
-/// are the deterministic IDs of every parsed turn — used to scope a single-file
+/// are the actual stored IDs of every parsed turn — used to scope a single-file
 /// embed pass to just this file's turns.
 fn parse_and_store_file(
     db: &Database,
@@ -139,8 +139,8 @@ fn parse_and_store_file(
         .unwrap_or("unknown")
         .to_string();
     let turns_parsed = turns.len();
-    let turn_ids: Vec<String> = turns.iter().map(store::turn_id_for).collect();
     let insert_stats = store::insert_turns(db.conn(), &turns)?;
+    let turn_ids = insert_stats.turn_ids.clone();
     Ok((filename, turns_parsed, insert_stats, turn_ids))
 }
 
@@ -177,8 +177,8 @@ fn parse_and_store_hermes_source(
     };
 
     let turns_parsed = turns.len();
-    let turn_ids: Vec<String> = turns.iter().map(store::turn_id_for).collect();
     let insert_stats = store::insert_turns(db.conn(), &turns)?;
+    let turn_ids = insert_stats.turn_ids.clone();
     Ok((name, turns_parsed, insert_stats, turn_ids))
 }
 
