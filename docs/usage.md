@@ -733,6 +733,7 @@ For daemon profiles, configure the REST address in `~/.mempal/config.toml`:
 [api]
 enabled = true
 addr = "127.0.0.1:3080"
+search_db_deadline_secs = 30
 ```
 
 If you run multiple mempal daemons, assign each profile a different loopback
@@ -740,10 +741,18 @@ port such as `127.0.0.1:3081`. `mempal doctor rest` reports whether the binary
 has REST support, whether the endpoint is reachable, which required routes are
 present, and which process owns the configured port when there is a collision.
 
+REST search runs inside the daemon process and uses the daemon-owned async
+database pool. Explicit full-corpus searches should use `scope=global` (or
+`scope=all_projects`) and remain bounded by `api.search_db_deadline_secs`: if a
+database stage exceeds the deadline, the response returns partial/fallback
+results with `mempal-warnings` and `search-mode` headers instead of hanging.
+Automatic hooks and Hermes provider prefetches should continue to pass
+project/profile filters and avoid implicit global searches.
+
 Endpoints:
 
 - `GET /api/status`
-- `GET /api/search?q=...&wing=...&room=...&top_k=...`
+- `GET /api/search?q=...&wing=...&room=...&top_k=...&scope=project|all_wings|project_plus_global|global|all_projects`
 - `POST /api/ingest`
 - `GET /api/taxonomy`
 - `GET /api/timeline`
@@ -754,6 +763,7 @@ Examples:
 ```bash
 curl 'http://127.0.0.1:3080/api/status'
 curl 'http://127.0.0.1:3080/api/search?q=clerk&wing=myapp'
+curl 'http://127.0.0.1:3080/api/search?q=Hermes+Agent+local+embedding&scope=global&top_k=10'
 curl -X POST 'http://127.0.0.1:3080/api/ingest' \
   -H 'content-type: application/json' \
   -d '{"content":"decided to use Clerk","wing":"myapp","room":"auth"}'

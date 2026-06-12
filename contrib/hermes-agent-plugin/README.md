@@ -6,7 +6,7 @@ Three complementary integration paths — use any combination:
 |------|-------------|-------------|------|
 | **MemoryProvider** | Memory plugin | Mirror/sync hermes built-in memory to mempal, expose search/conclude tools | No |
 | **Hooks** | General plugin | Inject deep mempal context per turn, capture tool observations | No |
-| **MCP** | Config entry | Give hermes LLM direct access to all mempal tools | No |
+| **MCP** | Config entry | Debug-only direct access to all mempal tools | No |
 
 All three work without forking hermes-agent. When hermes upstream resolves
 [#25526](https://github.com/NousResearch/hermes-agent/issues/25526) and
@@ -20,7 +20,7 @@ MemoryProvider — the hooks plugin gracefully becomes redundant.
    ```bash
    cargo build --features rest
    mempal doctor rest
-   mempal serve   # starts MCP + REST on 127.0.0.1:3080
+   mempal serve   # starts MCP + REST on 127.0.0.1:3080 for local testing
    ```
    Or start the daemon (auto-starts REST when built with `rest` feature):
    ```bash
@@ -191,15 +191,23 @@ After allowlisted tool calls (bash, web_search, python, etc.), the `post_tool_ca
 
 These low-importance observations enrich future searches without cluttering high-priority memory.
 
-## Path 3: MCP server (full tool access)
+## Path 3: MCP server (debug-only full tool access)
 
-Register mempal's MCP server directly with hermes, giving the LLM access to
-**all** mempal tools (context, knowledge cards, timeline, kg, etc.) — far
-beyond the 3 tools the MemoryProvider interface allows.
+For routine Hermes use, prefer Path 1 (MemoryProvider) and Path 2 (hooks) against
+the daemon REST API. That path is daemon-owned, keeps automatic searches scoped,
+and does not create extra SQLite holders.
 
-### Setup
+Direct MCP registration gives the LLM access to **all** mempal tools (context,
+knowledge cards, timeline, kg, etc.), but it is currently a debug/admin path:
+long-lived stdio MCP servers can hold `palace.db` open, and Hermes HTTP MCP
+against the daemon `/mcp` endpoint is not treated as production-supported until
+that transport has dedicated coverage.
 
-Add to hermes `~/.hermes/config.yaml`:
+### Temporary stdio setup
+
+Only use this for a short debugging session, then remove it from
+`~/.hermes/config.yaml` so Hermes does not keep a second mempal server process
+alive:
 
 ```yaml
 mcp_servers:
@@ -207,15 +215,6 @@ mcp_servers:
     transport: stdio
     command: "mempal"
     args: ["mcp"]
-```
-
-Or if mempal runs as a daemon with REST+MCP:
-
-```yaml
-mcp_servers:
-  mempal:
-    transport: http
-    url: "http://127.0.0.1:3080/mcp"
 ```
 
 Hermes discovers all mempal MCP tools at startup and makes them available to
