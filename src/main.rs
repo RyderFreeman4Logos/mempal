@@ -2489,6 +2489,7 @@ struct HistoricalRejudgeWorkItemSnapshot {
     normalize_version: i64,
 }
 
+#[derive(Clone)]
 struct PreparedHistoricalRejudgeWorkItem {
     work_item: HistoricalRejudgeWorkItem,
     row: Option<mempal::core::db::HistoricalRejudgeCandidate>,
@@ -13348,10 +13349,8 @@ async fn process_historical_rejudge_work_page(
 ) -> Result<()> {
     let mut prepared = Vec::with_capacity(page.len());
     for work_item in page {
-        prepared.push(
-            prepare_historical_rejudge_work_item(db, config, options, work_item, llm_router)
-                .await?,
-        );
+        prepared
+            .push(prepare_historical_rejudge_work_item(db, config, work_item, llm_router).await?);
     }
     process_prepared_historical_rejudge_work_items(db, options, checkpoint, &prepared)
 }
@@ -13359,7 +13358,6 @@ async fn process_historical_rejudge_work_page(
 async fn prepare_historical_rejudge_work_item(
     db: &Database,
     config: &Config,
-    options: HistoricalRejudgeOptions<'_>,
     work_item: &HistoricalRejudgeWorkItem,
     llm_router: Option<&LlmRouter>,
 ) -> Result<PreparedHistoricalRejudgeWorkItem> {
@@ -13391,25 +13389,11 @@ async fn prepare_historical_rejudge_work_item(
     }
 
     let decision = evaluate_historical_drawer(&row, config, llm_router).await?;
-    let backup_item = if decision.delete_candidate {
-        build_historical_rejudge_backup_item(
-            db,
-            &row,
-            &decision,
-            if options.hard_delete {
-                "hard_delete"
-            } else {
-                "soft_delete"
-            },
-        )?
-    } else {
-        None
-    };
     Ok(PreparedHistoricalRejudgeWorkItem {
         work_item: work_item.clone(),
         row: Some(row),
         decision: Some(decision),
-        backup_item,
+        backup_item: None,
         terminal_decision: None,
     })
 }
@@ -13446,7 +13430,8 @@ fn process_prepared_historical_rejudge_work_items(
     checkpoint: &mut HistoricalRejudgeCheckpoint,
     prepared: &[PreparedHistoricalRejudgeWorkItem],
 ) -> Result<()> {
-    let backup_items = prepared
+    let finalized = finalize_prepared_historical_rejudge_work_items(db, options, prepared)?;
+    let backup_items = finalized
         .iter()
         .filter_map(|item| item.backup_item.clone())
         .collect::<Vec<_>>();
@@ -13473,7 +13458,7 @@ fn process_prepared_historical_rejudge_work_items(
                 .context("failed to delete historical rejudge candidates")?
         };
 
-        for item in prepared {
+        for item in &finalized {
             if let (Some(row), Some(decision)) = (item.row.as_ref(), item.decision.as_ref()) {
                 record_historical_rejudge_decision_audit(
                     db,
@@ -13515,6 +13500,39 @@ fn process_prepared_historical_rejudge_work_items(
     })?;
     *checkpoint = next_checkpoint;
     Ok(())
+}
+
+fn finalize_prepared_historical_rejudge_work_items(
+    db: &Database,
+    options: HistoricalRejudgeOptions<'_>,
+    prepared: &[PreparedHistoricalRejudgeWorkItem],
+) -> Result<Vec<PreparedHistoricalRejudgeWorkItem>> {
+    let mutation = if options.hard_delete {
+        "hard_delete"
+    } else {
+        "soft_delete"
+    };
+    let mut finalized = Vec::with_capacity(prepared.len());
+    for item in prepared {
+        let mut item = item.clone();
+        item.backup_item = None;
+        if let (Some(row), Some(decision)) = (item.row.as_ref(), item.decision.as_ref())
+            && decision.delete_candidate
+        {
+            match build_historical_rejudge_backup_item(db, row, decision, mutation)? {
+                Some(backup_item) => {
+                    item.backup_item = Some(backup_item);
+                }
+                None => {
+                    item.row = None;
+                    item.decision = None;
+                    item.terminal_decision = Some("changed");
+                }
+            }
+        }
+        finalized.push(item);
+    }
+    Ok(finalized)
 }
 
 fn ensure_historical_rejudge_checkpoint_storage(db: &Database) -> Result<()> {
@@ -14279,13 +14297,57 @@ fn raw_drawer_row_matches_scored_candidate(
     json_string_field(raw_drawer_row, "id").as_deref() == Some(row.drawer.id.as_str())
         && json_string_field(raw_drawer_row, "content").as_deref()
             == Some(row.drawer.content.as_str())
+        && json_string_field(raw_drawer_row, "wing").as_deref() == Some(row.drawer.wing.as_str())
+        && json_string_field(raw_drawer_row, "room") == row.drawer.room
+        && json_string_field(raw_drawer_row, "source_file") == row.drawer.source_file
+        && json_string_field(raw_drawer_row, "source_type").as_deref()
+            == Some(row.drawer.source_type.as_str())
+        && json_string_field(raw_drawer_row, "added_at").as_deref()
+            == Some(row.drawer.added_at.as_str())
         && json_string_field(raw_drawer_row, "project_id") == row.project_id
+        && json_i64_field(raw_drawer_row, "chunk_index") == row.drawer.chunk_index
+        && json_i64_field(raw_drawer_row, "normalize_version")
+            == Some(i64::from(row.drawer.normalize_version))
         && raw_drawer_row.get("deleted_at") == Some(&serde_json::Value::Null)
         && json_string_field(raw_drawer_row, "content_hash").is_none_or(|hash| {
             hash == blake3::hash(row.drawer.content.as_bytes())
                 .to_hex()
                 .as_str()
         })
+        && raw_drawer_row_matches_historical_retention_input(raw_drawer_row, &row.drawer)
+}
+
+fn raw_drawer_row_matches_historical_retention_input(
+    raw_drawer_row: &BTreeMap<String, serde_json::Value>,
+    drawer: &Drawer,
+) -> bool {
+    let raw_importance = json_i64_field(raw_drawer_row, "importance").unwrap_or(0);
+    let raw_is_pinned = json_bool_field(raw_drawer_row, "is_pinned").unwrap_or(false);
+    let raw_effective_importance = interpreted_effective_importance(raw_drawer_row);
+
+    raw_importance == i64::from(drawer.importance)
+        && raw_is_pinned == drawer.is_pinned
+        && floats_equal(raw_effective_importance, drawer.effective_importance)
+        && json_string_field(raw_drawer_row, "memory_kind").as_deref()
+            == Some(memory_kind_slug(&drawer.memory_kind))
+        && json_string_field(raw_drawer_row, "status").as_deref()
+            == drawer.status.as_ref().map(knowledge_status_slug)
+}
+
+fn interpreted_effective_importance(raw_drawer_row: &BTreeMap<String, serde_json::Value>) -> f64 {
+    let raw_effective_importance = json_f64_field(raw_drawer_row, "effective_importance");
+    if let Some(value) = raw_effective_importance
+        && value != 0.0
+    {
+        return value;
+    }
+    let importance = json_f64_field(raw_drawer_row, "importance").unwrap_or(0.0);
+    let stale_penalty = json_f64_field(raw_drawer_row, "stale_penalty_applied").unwrap_or(1.0);
+    importance * stale_penalty
+}
+
+fn floats_equal(left: f64, right: f64) -> bool {
+    (left - right).abs() <= f64::EPSILON
 }
 
 fn load_source_drawer_triple_ids(db: &Database, drawer_id: &str) -> Result<Vec<String>> {
@@ -14329,6 +14391,22 @@ fn json_string_field(row: &BTreeMap<String, serde_json::Value>, field: &str) -> 
     row.get(field)
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn json_i64_field(row: &BTreeMap<String, serde_json::Value>, field: &str) -> Option<i64> {
+    row.get(field).and_then(serde_json::Value::as_i64)
+}
+
+fn json_f64_field(row: &BTreeMap<String, serde_json::Value>, field: &str) -> Option<f64> {
+    row.get(field).and_then(serde_json::Value::as_f64)
+}
+
+fn json_bool_field(row: &BTreeMap<String, serde_json::Value>, field: &str) -> Option<bool> {
+    row.get(field).and_then(|value| {
+        value
+            .as_bool()
+            .or_else(|| value.as_i64().map(|raw| raw != 0))
+    })
 }
 
 fn load_rejudge_backup_vector(
@@ -17017,6 +17095,24 @@ enabled = true
             .expect("load drawer rowid")
     }
 
+    fn protect_rejudge_candidate_metadata(db: &Database, drawer_id: &str) {
+        db.conn()
+            .execute(
+                r#"
+                UPDATE drawers
+                SET importance = 5,
+                    effective_importance = 5.0,
+                    is_pinned = 1,
+                    memory_kind = 'knowledge',
+                    status = 'promoted',
+                    updated_at = ?1
+                WHERE id = ?2
+                "#,
+                rusqlite::params![current_timestamp(), drawer_id],
+            )
+            .expect("protect rejudge candidate metadata");
+    }
+
     fn fts_doc_indexed(db: &Database, rowid: i64) -> bool {
         db.conn()
             .execute_batch(
@@ -17558,6 +17654,114 @@ enabled = true
             .expect("changed drawer must not be deleted");
         assert_eq!(drawer.content, changed_content);
         assert_eq!(drawer.importance, 5);
+    }
+
+    #[test]
+    fn historical_rejudge_backup_item_rejects_protection_metadata_changed_after_scoring() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "limitedprotectmetadataneedle", "notes", None);
+        let rows = db
+            .historical_rejudge_candidates(None, None, None, 100)
+            .expect("load candidates");
+        let row = rows
+            .iter()
+            .find(|row| row.drawer.id == "low")
+            .expect("low candidate");
+        let decision = deterministic_historical_decision(&row.drawer);
+        assert!(decision.delete_candidate);
+
+        protect_rejudge_candidate_metadata(&db, "low");
+
+        let item = build_historical_rejudge_backup_item(&db, row, &decision, "soft_delete")
+            .expect("stale metadata check must not error");
+        assert!(
+            item.is_none(),
+            "backup/delete preparation must reject a stale low-importance decision"
+        );
+        assert!(
+            db.get_drawer("low")
+                .expect("load protected drawer")
+                .is_some(),
+            "protected drawer must remain active"
+        );
+        let matches = db
+            .search_fts("limitedprotectmetadataneedle", None, None, "all", None, 10)
+            .expect("search active protected drawer");
+        assert!(
+            matches.iter().any(|(id, _)| id == "low"),
+            "metadata-protected drawer must remain BM25-searchable: {matches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_all_marks_changed_when_protection_metadata_changes_after_prepare() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "low", "fullprotectmetadataneedle", "notes", None);
+        let backups = backup_dir(&tmp);
+        let config = test_config();
+        let config_version = historical_rejudge_config_version(&config);
+        let options = full_rejudge_options(true, Some(&backups), 1);
+        let mut checkpoint = prepare_historical_rejudge_checkpoint(
+            &db,
+            options,
+            None,
+            &config_version,
+            Some("deterministic".to_string()),
+            Some(&backups),
+        )
+        .expect("prepare full rejudge checkpoint");
+        let page = next_historical_rejudge_work_items(&db, &checkpoint.run_id, 1)
+            .expect("load first work page");
+        assert_eq!(page.len(), 1);
+        let prepared = prepare_historical_rejudge_work_item(&db, &config, &page[0], None)
+            .await
+            .expect("prepare stale deletion decision");
+        assert!(
+            prepared
+                .decision
+                .as_ref()
+                .expect("prepared decision")
+                .delete_candidate
+        );
+
+        protect_rejudge_candidate_metadata(&db, "low");
+
+        process_prepared_historical_rejudge_work_items(&db, options, &mut checkpoint, &[prepared])
+            .expect("process rejudge page");
+
+        assert_eq!(
+            historical_rejudge_work_item_decision(&db, &checkpoint.run_id, page[0].drawer_rowid),
+            Some("changed".to_string())
+        );
+        assert_eq!(
+            checkpoint.mutated_count, 0,
+            "stale protection decision must not delete"
+        );
+        assert!(
+            db.get_drawer("low")
+                .expect("load protected drawer")
+                .is_some(),
+            "protected drawer must remain active"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        let backup_path = checkpoint
+            .backup_path
+            .as_ref()
+            .expect("full rejudge backup file");
+        assert_eq!(
+            sqlite_backup_item_count(backup_path),
+            0,
+            "changed work item must not be backed up as a deletion candidate"
+        );
+        let matches = db
+            .search_fts("fullprotectmetadataneedle", None, None, "all", None, 10)
+            .expect("search active protected drawer");
+        assert!(
+            matches.iter().any(|(id, _)| id == "low"),
+            "metadata-protected drawer must remain BM25-searchable: {matches:?}"
+        );
     }
 
     #[test]
