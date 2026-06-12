@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct TestEnv {
     _tmp: TempDir,
     db_path: PathBuf,
@@ -228,6 +230,7 @@ fn insert_pinned_drawer(db: &Database, args: PinnedDrawerArgs<'_>) {
 
 #[tokio::test]
 async fn test_typed_ingest_persists_memory_kind() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
 
@@ -263,6 +266,7 @@ async fn test_typed_ingest_persists_memory_kind() {
 
 #[tokio::test]
 async fn test_typed_ingest_status_and_tier() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
 
@@ -298,6 +302,7 @@ async fn test_typed_ingest_status_and_tier() {
 
 #[tokio::test]
 async fn test_typed_ingest_defaults_unchanged() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
 
@@ -328,6 +333,7 @@ async fn test_typed_ingest_defaults_unchanged() {
 
 #[tokio::test]
 async fn test_typed_ingest_invalid_memory_kind_returns_400() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
 
@@ -347,6 +353,7 @@ async fn test_typed_ingest_invalid_memory_kind_returns_400() {
 
 #[tokio::test]
 async fn test_typed_ingest_invalid_memory_kind_returns_400_when_writes_degraded() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
     global_embed_status().record_failure(&"synthetic degraded state");
@@ -368,6 +375,7 @@ async fn test_typed_ingest_invalid_memory_kind_returns_400_when_writes_degraded(
 
 #[tokio::test]
 async fn test_pinned_facts_endpoint_returns_pinned_drawers() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let db = env.db();
     insert_pinned_drawer(
@@ -413,6 +421,7 @@ async fn test_pinned_facts_endpoint_returns_pinned_drawers() {
 
 #[tokio::test]
 async fn test_pinned_facts_wing_filter() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let db = env.db();
     insert_pinned_drawer(
@@ -456,6 +465,7 @@ async fn test_pinned_facts_wing_filter() {
 
 #[tokio::test]
 async fn test_pinned_facts_domain_filter() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let db = env.db();
     insert_pinned_drawer(
@@ -497,6 +507,7 @@ async fn test_pinned_facts_domain_filter() {
 
 #[tokio::test]
 async fn test_pinned_facts_response_includes_metadata() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let db = env.db();
     insert_pinned_drawer(
@@ -532,6 +543,7 @@ async fn test_pinned_facts_response_includes_metadata() {
 
 #[tokio::test]
 async fn test_search_response_includes_typed_fields() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let db = env.db();
     let source_type = SourceType::UserExplicit;
@@ -576,6 +588,7 @@ async fn test_search_response_includes_typed_fields() {
 
 #[tokio::test]
 async fn test_delete_soft_deletes_drawer() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
 
@@ -621,6 +634,7 @@ async fn test_delete_soft_deletes_drawer() {
 
 #[tokio::test]
 async fn test_delete_not_found_returns_404() {
+    let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
 

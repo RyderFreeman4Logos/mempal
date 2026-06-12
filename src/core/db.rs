@@ -302,6 +302,7 @@ pub struct HistoricalRejudgeAudit<'a> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoricalRejudgeCandidate {
+    pub rowid: i64,
     pub drawer: Drawer,
     pub project_id: Option<String>,
 }
@@ -3404,7 +3405,7 @@ impl Database {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut sql = format!(
             r#"
-            SELECT {DRAWER_SELECT_COLUMNS}, project_id
+            SELECT {DRAWER_SELECT_COLUMNS}, project_id, rowid
             FROM drawers
             WHERE deleted_at IS NULL
             "#
@@ -3429,12 +3430,109 @@ impl Database {
         let rows = statement
             .query_map(params_from_iter(values), |row| {
                 Ok(HistoricalRejudgeCandidate {
+                    rowid: row.get(33)?,
                     drawer: drawer_from_row(row).map_err(row_decode_error)?,
                     project_id: row.get(32)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn historical_rejudge_scope_max_rowid(
+        &self,
+        wing: Option<&str>,
+        room: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Option<i64>, DbError> {
+        let mut sql = String::from("SELECT MAX(rowid) FROM drawers WHERE deleted_at IS NULL");
+        let mut values: Vec<SqlValue> = Vec::new();
+        append_drawers_since_filters(&mut sql, &mut values, wing, room, project_id);
+        Ok(self
+            .conn
+            .query_row(&sql, params_from_iter(values), |row| row.get(0))?)
+    }
+
+    pub fn historical_rejudge_scope_count_until(
+        &self,
+        wing: Option<&str>,
+        room: Option<&str>,
+        project_id: Option<&str>,
+        max_rowid: i64,
+    ) -> Result<usize, DbError> {
+        let mut sql =
+            String::from("SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL AND rowid <= ?1");
+        let mut values: Vec<SqlValue> = vec![SqlValue::Integer(max_rowid)];
+        append_drawers_since_filters(&mut sql, &mut values, wing, room, project_id);
+        let count: i64 = self
+            .conn
+            .query_row(&sql, params_from_iter(values), |row| row.get(0))?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    pub fn historical_rejudge_candidates_page(
+        &self,
+        wing: Option<&str>,
+        room: Option<&str>,
+        project_id: Option<&str>,
+        after_rowid: i64,
+        max_rowid: i64,
+        limit: usize,
+    ) -> Result<Vec<HistoricalRejudgeCandidate>, DbError> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut sql = format!(
+            r#"
+            SELECT {DRAWER_SELECT_COLUMNS}, project_id, rowid
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND rowid > ?1
+              AND rowid <= ?2
+            "#
+        );
+        let mut values: Vec<SqlValue> =
+            vec![SqlValue::Integer(after_rowid), SqlValue::Integer(max_rowid)];
+        append_drawers_since_filters(&mut sql, &mut values, wing, room, project_id);
+        values.push(SqlValue::Integer(limit_i64));
+        sql.push_str(&format!(" ORDER BY rowid ASC LIMIT ?{}", values.len()));
+
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(values), |row| {
+                Ok(HistoricalRejudgeCandidate {
+                    rowid: row.get(33)?,
+                    drawer: drawer_from_row(row).map_err(row_decode_error)?,
+                    project_id: row.get(32)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn historical_rejudge_candidate_by_rowid(
+        &self,
+        drawer_rowid: i64,
+        drawer_id: &str,
+    ) -> Result<Option<HistoricalRejudgeCandidate>, DbError> {
+        let sql = format!(
+            r#"
+            SELECT {DRAWER_SELECT_COLUMNS}, project_id, rowid
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND rowid = ?1
+              AND id = ?2
+            "#
+        );
+        let row = self
+            .conn
+            .query_row(&sql, params![drawer_rowid, drawer_id], |row| {
+                Ok(HistoricalRejudgeCandidate {
+                    rowid: row.get(33)?,
+                    drawer: drawer_from_row(row).map_err(row_decode_error)?,
+                    project_id: row.get(32)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
     }
 
     pub fn timeline_drawers(
