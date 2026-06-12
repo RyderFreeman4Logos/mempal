@@ -716,14 +716,29 @@ Lists both inbox targets (`claude` and `codex`) for the given cwd along with mes
 Build with `--features rest` to enable REST:
 
 ```bash
+cargo install --path . --locked --features rest --force --root ~/.local
+mempal doctor rest
 mempal serve
 ```
 
 With REST enabled:
 
 - MCP still runs over stdio
-- REST listens on `127.0.0.1:3080`
+- REST listens on `127.0.0.1:3080` by default
 - CORS only allows localhost origins
+
+For daemon profiles, configure the REST address in `~/.mempal/config.toml`:
+
+```toml
+[api]
+enabled = true
+addr = "127.0.0.1:3080"
+```
+
+If you run multiple mempal daemons, assign each profile a different loopback
+port such as `127.0.0.1:3081`. `mempal doctor rest` reports whether the binary
+has REST support, whether the endpoint is reachable, which required routes are
+present, and which process owns the configured port when there is a collision.
 
 Endpoints:
 
@@ -731,6 +746,8 @@ Endpoints:
 - `GET /api/search?q=...&wing=...&room=...&top_k=...`
 - `POST /api/ingest`
 - `GET /api/taxonomy`
+- `GET /api/timeline`
+- `GET /api/pinned_facts`
 
 Examples:
 

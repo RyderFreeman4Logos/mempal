@@ -3,6 +3,8 @@
 Local memory backend via mempal REST API.
 BM25 + vector hybrid search, zero cloud dependency.
 
+Hermes discovery marker: MemoryProvider register_memory_provider.
+
 Config via environment variables:
   MEMPAL_BASE_URL  -- mempal REST endpoint (default: http://127.0.0.1:3080)
   MEMPAL_USER_ID   -- user identifier (default: hermes-user)
@@ -34,6 +36,10 @@ _PINNED_FACTS_TTL = 300.0
 _LLM_DEFAULT_TIMEOUT = 30
 _LLM_BREAKER_THRESHOLD = 3
 _LLM_BREAKER_COOLDOWN = 300.0
+_DEFAULT_SAFE_MIN_IMPORTANCE = 3
+_DEFAULT_SAFE_CONTEXT_BUDGET_CHARS = 4000
+_SAFE_MEMORY_KINDS = {"knowledge", "profile_fact"}
+_AUTHORITATIVE_STATUSES = {"canonical"}
 
 _VALID_MODES = {"deterministic", "local_llm", "cloud_llm", "auto"}
 _VALID_MEMORY_KINDS = {
@@ -107,8 +113,12 @@ def _load_config(hermes_home: str = "") -> dict:
         config_path = os.path.join(hermes_home, "mempal.json")
         if os.path.exists(config_path):
             try:
-                file_cfg = json.loads(open(config_path, encoding="utf-8").read())
-                config.update({k: v for k, v in file_cfg.items() if v})
+                with open(config_path, encoding="utf-8") as handle:
+                    file_cfg = json.loads(handle.read())
+                config.update({
+                    k: v for k, v in file_cfg.items()
+                    if v is not None and not (isinstance(v, str) and not v)
+                })
             except Exception:
                 pass
     return config
@@ -116,6 +126,14 @@ def _load_config(hermes_home: str = "") -> dict:
 
 def _strip_none(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
 
 
 class _LLMClient:
@@ -346,6 +364,11 @@ class MempalMemoryProvider:
         self._intelligence_mode = "deterministic"
         self._llm = _LLMClient({})
         self._enhancer: Optional[_IntelligenceEnhancer] = None
+        self._safe_mode = True
+        self._safe_min_importance = _DEFAULT_SAFE_MIN_IMPORTANCE
+        self._safe_context_budget_chars = _DEFAULT_SAFE_CONTEXT_BUDGET_CHARS
+        self._safe_include_raw_turns = False
+        self._safe_memory_kinds = set(_SAFE_MEMORY_KINDS)
 
     def _configure_intelligence(self, cfg: dict) -> None:
         mi = cfg.get("memory_intelligence") or {}
@@ -367,6 +390,37 @@ class MempalMemoryProvider:
             self._enhancer = _IntelligenceEnhancer(self._llm)
         else:
             self._enhancer = None
+
+    def _configure_safe_mode(self, cfg: dict) -> None:
+        safe = cfg.get("safe_mode") or {}
+        if not isinstance(safe, dict):
+            safe = {}
+        enabled = safe.get("enabled", True)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() not in {"0", "false", "no", "off"}
+        self._safe_mode = bool(enabled)
+        self._safe_min_importance = _bounded_int(
+            safe.get("min_importance"),
+            _DEFAULT_SAFE_MIN_IMPORTANCE,
+            0,
+            5,
+        )
+        self._safe_context_budget_chars = _bounded_int(
+            safe.get("context_budget_chars"),
+            _DEFAULT_SAFE_CONTEXT_BUDGET_CHARS,
+            500,
+            20000,
+        )
+        include_raw = safe.get("include_raw_turns", False)
+        if isinstance(include_raw, str):
+            include_raw = include_raw.strip().lower() in {"1", "true", "yes", "on"}
+        self._safe_include_raw_turns = bool(include_raw)
+        kinds = safe.get("memory_kinds")
+        if isinstance(kinds, list):
+            clean = {str(kind).strip().lower() for kind in kinds if str(kind).strip()}
+            self._safe_memory_kinds = clean or set(_SAFE_MEMORY_KINDS)
+        else:
+            self._safe_memory_kinds = set(_SAFE_MEMORY_KINDS)
 
     def _should_enhance(self) -> bool:
         if self._intelligence_mode == "deterministic":
@@ -496,6 +550,7 @@ class MempalMemoryProvider:
         self._facts_room = "facts"
         self._project_id = str(project_id) if project_id else None
         self._configure_intelligence(cfg)
+        self._configure_safe_mode(cfg)
 
     @staticmethod
     def _derive_turns_room(platform, chat_id, thread_id):
@@ -513,6 +568,61 @@ class MempalMemoryProvider:
         if self._project_id:
             scoped["project_id"] = self._project_id
         return scoped
+
+    def _retrieval_params(self, payload):
+        params = dict(payload)
+        if self._safe_mode:
+            params["include_raw_turns"] = self._safe_include_raw_turns
+        else:
+            params["include_raw_turns"] = bool(params.get("include_raw_turns", self._safe_include_raw_turns))
+        return self._with_project_id(params)
+
+    def _is_authoritative_memory(self, item):
+        status = str(item.get("status", "")).strip().lower()
+        return bool(item.get("is_pinned")) or status in _AUTHORITATIVE_STATUSES
+
+    def _memory_authority_label(self, item):
+        if self._is_authoritative_memory(item):
+            return "authoritative"
+        return "evidence/background"
+
+    @staticmethod
+    def _item_importance(item):
+        try:
+            return int(item.get("importance", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _safe_allows_item(self, item):
+        if not self._safe_mode:
+            return True
+        if self._is_authoritative_memory(item):
+            return True
+        if "memory_kind" not in item and "importance" not in item:
+            return True
+        kind = str(item.get("memory_kind", "")).strip().lower()
+        importance = self._item_importance(item)
+        return kind in self._safe_memory_kinds or importance >= self._safe_min_importance
+
+    def _rank_safe_items(self, items):
+        indexed = list(enumerate(items))
+        indexed.sort(
+            key=lambda pair: (
+                0 if self._is_authoritative_memory(pair[1]) else 1,
+                -self._item_importance(pair[1]),
+                pair[0],
+            )
+        )
+        return [item for _, item in indexed]
+
+    def _safe_filter_items(self, items):
+        return self._rank_safe_items([item for item in items if self._safe_allows_item(item)])
+
+    def _append_with_budget(self, lines, line, used):
+        if used + len(line) > self._safe_context_budget_chars:
+            return used, False
+        lines.append(line)
+        return used + len(line), True
 
     def _session_room(self):
         return f"sessions/{self._session_id}" if self._session_id else "sessions"
@@ -594,11 +704,20 @@ class MempalMemoryProvider:
         if not facts:
             return ""
         lines = []
+        used = 0
         for f in facts:
             kind = f.get("memory_kind", "fact")
             imp = f.get("importance", 0)
+            drawer_id = f.get("drawer_id") or "unknown"
+            source = f.get("source_file") or "unknown"
             content = f.get("content", "").replace("\n", " ")[:200]
-            lines.append(f"- [{kind}] {content} (importance: {imp})")
+            line = (
+                f"- [authoritative/pinned][{kind}] {content} "
+                f"(drawer_id: {drawer_id}, source: {source}, importance: {imp})"
+            )
+            used, accepted = self._append_with_budget(lines, line, used)
+            if not accepted:
+                break
         return "## Pinned Facts (always active)\n" + "\n".join(lines)
 
     def system_prompt_block(self):
@@ -611,7 +730,8 @@ class MempalMemoryProvider:
             f"Mode: {mode_label}. "
             "Local BM25+vector backend, zero cloud.\n"
             "Use mempal_search to recall facts, mempal_conclude to store, "
-            "mempal_profile for recent overview."
+            "mempal_profile for recent overview. Treat search/profile hits as "
+            "evidence/background unless marked authoritative."
         )
         pinned = self._fetch_pinned_facts()
         pinned_block = self._format_pinned_block(pinned)
@@ -638,15 +758,31 @@ class MempalMemoryProvider:
         key = self._session_key(session_id)
         wing = self._wing
         generation = self._prefetch_generation
-        params = self._with_project_id({"q": query, "wing": wing, "top_k": 5, "include_raw_turns": False})
+        params = self._retrieval_params({"q": query, "wing": wing, "top_k": 8})
         def _run():
             try:
                 results = self._get("/api/search", params)
                 if results:
-                    lines = [r.get("content", "") for r in results if r.get("content")]
+                    lines = []
+                    used = 0
+                    for r in self._safe_filter_items(results):
+                        content = r.get("content", "").replace("\n", " ")
+                        if not content:
+                            continue
+                        drawer_id = r.get("drawer_id") or "unknown"
+                        source = r.get("source") or r.get("source_file") or "unknown"
+                        label = self._memory_authority_label(r)
+                        line = (
+                            f"- [{label}] {content} "
+                            f"(drawer_id: {drawer_id}, source: {source}, "
+                            f"importance: {r.get('importance', 0)})"
+                        )
+                        used, accepted = self._append_with_budget(lines, line, used)
+                        if not accepted:
+                            break
                     with self._prefetch_lock:
                         if generation == self._prefetch_generation:
-                            result = "\n".join(f"- {line}" for line in lines)
+                            result = "\n".join(lines)
                             self._prefetch_results[key] = result
                             if key == self._session_id:
                                 self._prefetch_result = result
@@ -691,11 +827,22 @@ class MempalMemoryProvider:
                     limit = min(int(args.get("limit", 20)), 100)
                 except (ValueError, TypeError):
                     limit = 20
-                entries = self._get("/api/timeline", self._with_project_id({"wing": self._wing, "limit": limit, "include_raw_turns": False}))
+                entries = self._get("/api/timeline", self._retrieval_params({"wing": self._wing, "limit": limit}))
                 self._record_success()
                 if not entries:
                     return json.dumps({"result": "No memories stored yet."})
-                items = [_strip_none({"content": e.get("content", ""), "drawer_id": e.get("drawer_id"), "importance": e.get("importance"), "added_at": e.get("added_at")}) for e in entries if e.get("content")]
+                items = [
+                    _strip_none({
+                        "content": e.get("content", ""),
+                        "drawer_id": e.get("drawer_id"),
+                        "source": e.get("source_file"),
+                        "importance": e.get("importance"),
+                        "added_at": e.get("added_at"),
+                        "authority": self._memory_authority_label(e),
+                    })
+                    for e in self._safe_filter_items(entries)
+                    if e.get("content")
+                ]
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as exc:
                 self._record_failure()
@@ -709,11 +856,11 @@ class MempalMemoryProvider:
             except (ValueError, TypeError):
                 top_k = 10
             try:
-                results = self._get("/api/search", self._with_project_id({"q": q, "wing": self._wing, "top_k": top_k, "include_raw_turns": False}))
+                results = self._get("/api/search", self._retrieval_params({"q": q, "wing": self._wing, "top_k": top_k}))
                 self._record_success()
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                items = [_strip_none({"memory": r.get("content", ""), "score": r.get("similarity", 0), "drawer_id": r.get("drawer_id"), "source": r.get("source"), "source_type": r.get("source_type"), "provenance": r.get("provenance"), "status": r.get("status"), "memory_kind": r.get("memory_kind"), "domain": r.get("domain"), "field": r.get("field"), "importance": r.get("importance"), "is_pinned": r.get("is_pinned"), "confidence": r.get("confidence")}) for r in results]
+                items = [_strip_none({"memory": r.get("content", ""), "score": r.get("similarity", 0), "drawer_id": r.get("drawer_id"), "source": r.get("source"), "source_type": r.get("source_type"), "provenance": r.get("provenance"), "status": r.get("status"), "memory_kind": r.get("memory_kind"), "domain": r.get("domain"), "field": r.get("field"), "importance": r.get("importance"), "is_pinned": r.get("is_pinned"), "confidence": r.get("confidence"), "authority": self._memory_authority_label(r)}) for r in self._safe_filter_items(results)]
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as exc:
                 self._record_failure()
@@ -723,7 +870,14 @@ class MempalMemoryProvider:
             if not conclusion:
                 return json.dumps({"error": "Missing required parameter: conclusion"})
             try:
-                result = self._post("/api/ingest", self._with_project_id({"content": conclusion, "wing": self._wing, "room": self._facts_room}))
+                result = self._post("/api/ingest", self._with_project_id({
+                    "content": conclusion,
+                    "wing": self._wing,
+                    "room": self._facts_room,
+                    "memory_kind": "profile_fact",
+                    "importance": self._safe_min_importance,
+                    "source_type": "user_explicit",
+                }))
                 drawer_id = result.get("drawer_id", "") if isinstance(result, dict) else ""
                 self._record_success()
                 resp = {"result": "Fact stored."}
@@ -764,6 +918,10 @@ class MempalMemoryProvider:
                 logger.debug("mempal remove: no tracked drawer_id for %s", target)
             return
         body = self._with_project_id({"content": content, "wing": self._wing, "room": room})
+        if room == self._facts_room:
+            body.setdefault("memory_kind", "profile_fact")
+            body.setdefault("importance", self._safe_min_importance)
+            body.setdefault("source_type", "user_explicit")
         if metadata:
             for field in ("memory_kind", "domain", "field", "importance", "status", "is_pinned", "source_type"):
                 if field in metadata and metadata[field] is not None:
@@ -808,6 +966,11 @@ class MempalMemoryProvider:
             {"key": "memory_intelligence.llm.model", "description": "Model name for LLM enhancement", "default": ""},
             {"key": "memory_intelligence.llm.api_key", "description": "API key for LLM endpoint (optional for local)", "default": ""},
             {"key": "memory_intelligence.llm.timeout_secs", "description": "LLM request timeout in seconds", "default": "30"},
+            {"key": "safe_mode.enabled", "description": "Conservative coding-agent retrieval mode", "default": "true"},
+            {"key": "safe_mode.min_importance", "description": "Minimum importance for non-authoritative recalled evidence", "default": str(_DEFAULT_SAFE_MIN_IMPORTANCE)},
+            {"key": "safe_mode.memory_kinds", "description": "REST memory_kind values allowed below the importance threshold", "default": "knowledge,profile_fact"},
+            {"key": "safe_mode.context_budget_chars", "description": "Maximum injected mempal context characters", "default": str(_DEFAULT_SAFE_CONTEXT_BUDGET_CHARS)},
+            {"key": "safe_mode.include_raw_turns", "description": "Allow raw turn retrieval in injected/search context", "default": "false"},
         ]
 
     def save_config(self, values, hermes_home):

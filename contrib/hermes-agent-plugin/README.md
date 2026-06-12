@@ -19,6 +19,7 @@ MemoryProvider — the hooks plugin gracefully becomes redundant.
 1. mempal built with `--features rest` and running:
    ```bash
    cargo build --features rest
+   mempal doctor rest
    mempal serve   # starts MCP + REST on 127.0.0.1:3080
    ```
    Or start the daemon (auto-starts REST when built with `rest` feature):
@@ -35,10 +36,14 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
 
 ### Setup
 
-1. Copy or symlink into hermes-agent's memory plugin search path:
+1. Copy or symlink into hermes-agent's user plugin search path:
    ```bash
-   cp -r contrib/hermes-agent-plugin/mempal  /path/to/hermes-agent/plugins/memory/mempal
+   mkdir -p "$HERMES_HOME/plugins"
+   cp -r contrib/hermes-agent-plugin/mempal "$HERMES_HOME/plugins/mempal"
    ```
+   The provider keeps Hermes' `MemoryProvider` / `register_memory_provider`
+   discovery markers in the first 8192 bytes of `__init__.py`, so user plugin
+   discovery works without copying into Hermes' bundled provider directory.
 
 2. Configure hermes-agent:
    ```yaml
@@ -56,7 +61,15 @@ Replaces mem0 with a fully local BM25 + vector hybrid backend — no cloud API c
    ```json
    {
      "base_url": "http://127.0.0.1:3080",
-     "user_id": "your-username"
+     "user_id": "your-username",
+     "memory_intelligence": { "mode": "deterministic" },
+     "safe_mode": {
+       "enabled": true,
+       "min_importance": 3,
+       "memory_kinds": ["knowledge", "profile_fact"],
+       "context_budget_chars": 4000,
+       "include_raw_turns": false
+     }
    }
    ```
 
@@ -104,6 +117,38 @@ Optional LLM-enhanced memory classification. Configure in `$HERMES_HOME/mempal.j
 | `local_llm` | Use a local OpenAI-compatible endpoint for metadata extraction, fact extraction from turns, and session summaries. |
 | `cloud_llm` | Use a paid/cloud endpoint for the same enhancements. |
 | `auto` | Try configured LLM, fall back to deterministic on failure or missing config. |
+
+### Safe mode for coding-agent workflows
+
+Safe mode is enabled by default. It keeps Hermes on the low-risk path:
+
+- deterministic memory intelligence unless explicitly configured otherwise
+- pinned/canonical facts are shown first and labeled authoritative
+- search/profile hits keep `drawer_id`, source, importance, typed metadata, and
+  are labeled `evidence/background` unless pinned or canonical
+- low-importance raw evidence is filtered unless it passes `min_importance` or
+  `memory_kinds`
+- raw-turn retrieval is disabled unless `safe_mode.include_raw_turns=true`
+- injected prefetch/pinned context is capped by `safe_mode.context_budget_chars`
+
+Do not enable the separate `mempal-hooks` plugin for per-turn injection unless
+you explicitly want raw turn capture/injection behavior beyond the conservative
+MemoryProvider path.
+
+### Multi-profile REST ports
+
+Each mempal daemon profile should use a distinct local REST address. Keep the
+host loopback-only:
+
+```toml
+[api]
+enabled = true
+addr = "127.0.0.1:3081"
+```
+
+Run `mempal doctor rest --addr 127.0.0.1:3081` to verify the binary feature,
+endpoint reachability, required routes, and port owner before pointing Hermes at
+that profile.
 
 ## Path 2: Hooks plugin (deep context injection)
 

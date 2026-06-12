@@ -65,7 +65,7 @@ use mempal::cowork::{
     SendOperation, SendRequest,
 };
 use mempal::crystallize::{CrystallizeOptions, CrystallizeSummary, run_crystallization};
-use mempal::doctor::build_doctor_report;
+use mempal::doctor::{RestDoctorReport, build_doctor_report, build_rest_doctor_report};
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
 use mempal::field_taxonomy::{FieldTaxonomyEntry, field_taxonomy};
@@ -1018,6 +1018,8 @@ enum Commands {
     },
     /// System health check (schema version, install path, warnings).
     Doctor {
+        #[command(subcommand)]
+        command: Option<DoctorCommands>,
         #[arg(long, default_value = "plain")]
         format: String,
     },
@@ -1038,6 +1040,18 @@ enum OperationCommands {
         operation_id: String,
         #[arg(long = "timeout-secs", default_value_t = 30)]
         timeout_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum DoctorCommands {
+    /// Diagnose REST feature, endpoint readiness, routes, and port ownership.
+    Rest {
+        /// REST endpoint or host:port to probe. Defaults to config api.addr.
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
     },
 }
 
@@ -2806,7 +2820,20 @@ fn run() -> Result<()> {
         Commands::ReleaseReadiness { format } => {
             return release_readiness_command(format.clone());
         }
-        Commands::Doctor { format } => {
+        Commands::Doctor {
+            command:
+                Some(DoctorCommands::Rest {
+                    addr,
+                    format: rest_format,
+                }),
+            ..
+        } => {
+            return block_on_result(doctor_rest_command(addr.clone(), rest_format.clone()));
+        }
+        Commands::Doctor {
+            command: None,
+            format,
+        } => {
             return doctor_command(format.clone());
         }
         _ => {}
@@ -15949,6 +15976,68 @@ fn doctor_command(format: String) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn doctor_rest_command(addr: Option<String>, format: String) -> Result<()> {
+    if !matches!(format.as_str(), "plain" | "json") {
+        bail!("unsupported doctor rest format: {format}");
+    }
+    let config = Config::load().ok();
+    let endpoint = addr
+        .or_else(|| config.as_ref().map(|config| config.api.addr.clone()))
+        .unwrap_or_else(|| "127.0.0.1:3080".to_string());
+    let db_path = config
+        .as_ref()
+        .map(|config| expand_home(&config.db_path))
+        .unwrap_or_else(|| mempal_home().join("palace.db"));
+    let report = build_rest_doctor_report(&endpoint, Some(&db_path)).await;
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+        _ => print_rest_doctor_plain(&report),
+    }
+    Ok(())
+}
+
+fn print_rest_doctor_plain(report: &RestDoctorReport) {
+    println!("rest_feature_enabled={}", report.rest_feature_enabled);
+    println!("endpoint={}", report.endpoint);
+    println!("endpoint_reachable={}", report.endpoint_reachable);
+    println!("status={}", report.status);
+    if let Some(port) = &report.port {
+        println!("port_addr={}", port.addr);
+        println!("port_bind_available={}", port.bind_available);
+        if let Some(error) = port.error.as_deref() {
+            println!("port_error={error}");
+        }
+        if let Some(owner) = &port.owner {
+            println!("port_owner_pid={}", owner.pid);
+            println!("port_owner_command={}", owner.command);
+        } else {
+            println!("port_owner=unknown");
+        }
+    } else {
+        println!("port=unresolved");
+    }
+    println!("routes:");
+    for route in &report.routes {
+        let status = route
+            .http_status
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        println!(
+            "  {} {} available={} http_status={}",
+            route.method, route.path, route.available, status
+        );
+        if let Some(error) = route.error.as_deref() {
+            println!("    error={error}");
+        }
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    for recommendation in &report.recommendations {
+        println!("recommendation: {recommendation}");
+    }
 }
 
 fn print_db_holder_report(
