@@ -2459,6 +2459,16 @@ struct HistoricalRejudgeCheckpoint {
     backup_path: Option<PathBuf>,
 }
 
+struct HistoricalRejudgeCheckpointStart<'a> {
+    db: &'a Database,
+    options: HistoricalRejudgeOptions<'a>,
+    project_id: Option<&'a str>,
+    config_version: &'a str,
+    judge_model: Option<String>,
+    backup_dir: Option<&'a Path>,
+    options_hash: String,
+}
+
 #[derive(Debug, Clone)]
 struct HistoricalRejudgeWorkItem {
     drawer_rowid: i64,
@@ -13206,21 +13216,36 @@ fn start_historical_rejudge_checkpoint(
     backup_dir: Option<&Path>,
     options_hash: String,
 ) -> Result<HistoricalRejudgeCheckpoint> {
-    let snapshot_max_rowid = db
-        .historical_rejudge_scope_max_rowid(options.wing, options.room, project_id)
-        .context("failed to snapshot historical rejudge max rowid")?
-        .unwrap_or(0);
+    start_historical_rejudge_checkpoint_with_observer(
+        HistoricalRejudgeCheckpointStart {
+            db,
+            options,
+            project_id,
+            config_version,
+            judge_model,
+            backup_dir,
+            options_hash,
+        },
+        |_| Ok(()),
+    )
+}
+
+fn start_historical_rejudge_checkpoint_with_observer(
+    input: HistoricalRejudgeCheckpointStart<'_>,
+    after_snapshot_bound: impl FnOnce(i64) -> Result<()>,
+) -> Result<HistoricalRejudgeCheckpoint> {
+    let HistoricalRejudgeCheckpointStart {
+        db,
+        options,
+        project_id,
+        config_version,
+        judge_model,
+        backup_dir,
+        options_hash,
+    } = input;
+
     let started_at = iso_timestamp();
     let run_id = historical_rejudge_run_id(&started_at, &options_hash);
-    reset_historical_rejudge_work_items(db, &run_id)?;
-    let snapshot_count = insert_historical_rejudge_work_items(
-        db,
-        &run_id,
-        options.wing,
-        options.room,
-        project_id,
-        snapshot_max_rowid,
-    )?;
     let backup_path = backup_dir
         .map(|dir| {
             create_historical_rejudge_sqlite_backup(
@@ -13232,33 +13257,50 @@ fn start_historical_rejudge_checkpoint(
             )
         })
         .transpose()?;
-    let checkpoint = HistoricalRejudgeCheckpoint {
-        run_id,
-        status: "running".to_string(),
-        options_hash,
-        started_at: started_at.clone(),
-        updated_at: started_at,
-        snapshot_max_rowid,
-        snapshot_count,
-        last_processed_rowid: None,
-        scanned_count: 0,
-        candidate_count: 0,
-        kept_count: 0,
-        protected_count: 0,
-        mutated_count: 0,
-        estimated_bytes_reclaimed: 0,
-        mutation: if options.hard_delete {
-            "hard_delete".to_string()
-        } else {
-            "soft_delete".to_string()
-        },
-        page_size: options.page_size,
-        judge_model,
-        config_version: config_version.to_string(),
-        backup_path,
-    };
-    save_historical_rejudge_checkpoint(db, &checkpoint)?;
-    Ok(checkpoint)
+
+    with_historical_rejudge_transaction(db, || {
+        let snapshot_max_rowid = db
+            .historical_rejudge_scope_max_rowid(options.wing, options.room, project_id)
+            .context("failed to snapshot historical rejudge max rowid")?
+            .unwrap_or(0);
+        after_snapshot_bound(snapshot_max_rowid)?;
+        reset_historical_rejudge_work_items(db, &run_id)?;
+        let snapshot_count = insert_historical_rejudge_work_items(
+            db,
+            &run_id,
+            options.wing,
+            options.room,
+            project_id,
+            snapshot_max_rowid,
+        )?;
+        let checkpoint = HistoricalRejudgeCheckpoint {
+            run_id,
+            status: "running".to_string(),
+            options_hash,
+            started_at: started_at.clone(),
+            updated_at: started_at,
+            snapshot_max_rowid,
+            snapshot_count,
+            last_processed_rowid: None,
+            scanned_count: 0,
+            candidate_count: 0,
+            kept_count: 0,
+            protected_count: 0,
+            mutated_count: 0,
+            estimated_bytes_reclaimed: 0,
+            mutation: if options.hard_delete {
+                "hard_delete".to_string()
+            } else {
+                "soft_delete".to_string()
+            },
+            page_size: options.page_size,
+            judge_model,
+            config_version: config_version.to_string(),
+            backup_path,
+        };
+        save_historical_rejudge_checkpoint(db, &checkpoint)?;
+        Ok(checkpoint)
+    })
 }
 
 fn historical_rejudge_run_id(started_at: &str, options_hash: &str) -> String {
@@ -16927,6 +16969,20 @@ enabled = true
             .expect("count historical rejudge work items")
     }
 
+    fn historical_rejudge_work_item_drawer_ids(db: &Database, run_id: &str) -> Vec<String> {
+        let mut statement = db
+            .conn()
+            .prepare(&format!(
+                "SELECT drawer_id FROM {HISTORICAL_REJUDGE_WORK_TABLE} WHERE run_id = ?1 ORDER BY drawer_rowid"
+            ))
+            .expect("prepare historical rejudge work item ids");
+        statement
+            .query_map([run_id], |row| row.get::<_, String>(0))
+            .expect("query historical rejudge work item ids")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect historical rejudge work item ids")
+    }
+
     #[test]
     fn historical_rejudge_run_id_is_unique_for_same_second_identical_options() {
         let options_hash = "a".repeat(64);
@@ -18655,6 +18711,114 @@ enabled = true
         assert_eq!(checkpoint.snapshot_count, 2);
         assert_eq!(checkpoint.scanned_count, 2);
         assert_eq!(checkpoint.mutated_count, 2);
+    }
+
+    #[test]
+    fn historical_rejudge_all_snapshot_blocks_rowid_reuse_writer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        insert_drawer(&db, "old-0", "ok", "notes", None);
+        insert_drawer(&db, "old-max", "ok", "notes", None);
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let old_max_rowid = drawer_rowid(&db, "old-max");
+        let second_db = Database::open(&db_path).expect("open second db");
+        second_db
+            .conn()
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("set fail-fast busy timeout");
+        let backups = backup_dir(&tmp);
+        let config = test_config();
+        let config_version = historical_rejudge_config_version(&config);
+        let options = full_rejudge_options(true, Some(&backups), 2);
+        let options_hash =
+            historical_rejudge_options_hash(options, None, &config_version).expect("options hash");
+        let writer_blocked = std::cell::Cell::new(false);
+
+        let checkpoint = start_historical_rejudge_checkpoint_with_observer(
+            HistoricalRejudgeCheckpointStart {
+                db: &db,
+                options,
+                project_id: None,
+                config_version: &config_version,
+                judge_model: Some("deterministic".to_string()),
+                backup_dir: Some(&backups),
+                options_hash,
+            },
+            |snapshot_max_rowid| {
+                assert_eq!(snapshot_max_rowid, old_max_rowid);
+                let result = second_db.conn().execute_batch(
+                    r#"
+                    BEGIN IMMEDIATE;
+                    DELETE FROM drawers WHERE id = 'old-max';
+                    INSERT INTO drawers (id, content, wing, source_file, source_type, added_at)
+                    VALUES (
+                        'post-start-reused',
+                        'poststartrowidreuseneedle',
+                        'notes',
+                        'post-start-reused.json',
+                        'agent_inference',
+                        '2026-01-01T00:00:01Z'
+                    );
+                    COMMIT;
+                    "#,
+                );
+                let error = result.expect_err("concurrent writer must wait for snapshot lock");
+                match error {
+                    rusqlite::Error::SqliteFailure(sqlite_error, _) => assert!(
+                        matches!(
+                            sqlite_error.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        ),
+                        "unexpected sqlite error code: {:?}",
+                        sqlite_error.code
+                    ),
+                    other => panic!("unexpected sqlite error: {other:?}"),
+                }
+                let _ = second_db.conn().execute_batch("ROLLBACK;");
+                writer_blocked.set(true);
+                Ok(())
+            },
+        )
+        .expect("prepare checkpoint");
+
+        assert!(writer_blocked.get());
+        assert_eq!(checkpoint.snapshot_max_rowid, old_max_rowid);
+        assert_eq!(checkpoint.snapshot_count, 2);
+        assert_eq!(
+            historical_rejudge_work_item_drawer_ids(&db, &checkpoint.run_id),
+            vec!["old-0".to_string(), "old-max".to_string()]
+        );
+
+        second_db
+            .conn()
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .expect("restore busy timeout");
+        second_db
+            .conn()
+            .execute("DELETE FROM drawers WHERE id = ?1", ["old-max"])
+            .expect("delete old max after snapshot");
+        insert_drawer(
+            &second_db,
+            "post-start-reused",
+            "poststartrowidreuseneedle",
+            "notes",
+            None,
+        );
+        assert_eq!(
+            drawer_rowid(&second_db, "post-start-reused"),
+            old_max_rowid,
+            "SQLite should be able to reuse the deleted max rowid after the snapshot lock releases"
+        );
+        assert_eq!(
+            historical_rejudge_work_item_drawer_ids(&db, &checkpoint.run_id),
+            vec!["old-0".to_string(), "old-max".to_string()]
+        );
+        let persisted_checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(persisted_checkpoint.run_id, checkpoint.run_id);
+        assert_eq!(persisted_checkpoint.snapshot_count, 2);
     }
 
     #[tokio::test]
