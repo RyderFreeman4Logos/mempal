@@ -2473,6 +2473,20 @@ struct HistoricalRejudgeCheckpointStart<'a> {
 struct HistoricalRejudgeWorkItem {
     drawer_rowid: i64,
     drawer_id: String,
+    snapshot: HistoricalRejudgeWorkItemSnapshot,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalRejudgeWorkItemSnapshot {
+    content_hash: String,
+    added_at: String,
+    wing: String,
+    room: Option<String>,
+    source_file: Option<String>,
+    source_type: String,
+    project_id: Option<String>,
+    chunk_index: Option<i64>,
+    normalize_version: i64,
 }
 
 struct PreparedHistoricalRejudgeWorkItem {
@@ -2480,6 +2494,7 @@ struct PreparedHistoricalRejudgeWorkItem {
     row: Option<mempal::core::db::HistoricalRejudgeCandidate>,
     decision: Option<HistoricalRejudgeDecision>,
     backup_item: Option<HistoricalRejudgeBackupItem>,
+    terminal_decision: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -13362,8 +13377,18 @@ async fn prepare_historical_rejudge_work_item(
             row: None,
             decision: None,
             backup_item: None,
+            terminal_decision: Some("missing"),
         });
     };
+    if !historical_rejudge_work_item_matches_snapshot(work_item, &row) {
+        return Ok(PreparedHistoricalRejudgeWorkItem {
+            work_item: work_item.clone(),
+            row: None,
+            decision: None,
+            backup_item: None,
+            terminal_decision: Some("changed"),
+        });
+    }
 
     let decision = evaluate_historical_drawer(&row, config, llm_router).await?;
     let backup_item = if decision.delete_candidate {
@@ -13385,7 +13410,34 @@ async fn prepare_historical_rejudge_work_item(
         row: Some(row),
         decision: Some(decision),
         backup_item,
+        terminal_decision: None,
     })
+}
+
+fn historical_rejudge_work_item_matches_snapshot(
+    work_item: &HistoricalRejudgeWorkItem,
+    row: &mempal::core::db::HistoricalRejudgeCandidate,
+) -> bool {
+    if work_item.snapshot.content_hash.is_empty()
+        || work_item.snapshot.added_at.is_empty()
+        || work_item.snapshot.wing.is_empty()
+        || work_item.snapshot.source_type.is_empty()
+    {
+        return false;
+    }
+
+    let current_content_hash = blake3::hash(row.drawer.content.as_bytes())
+        .to_hex()
+        .to_string();
+    work_item.snapshot.content_hash == current_content_hash
+        && work_item.snapshot.added_at == row.drawer.added_at
+        && work_item.snapshot.wing == row.drawer.wing
+        && work_item.snapshot.room == row.drawer.room
+        && work_item.snapshot.source_file == row.drawer.source_file
+        && work_item.snapshot.source_type == row.drawer.source_type.as_str()
+        && work_item.snapshot.project_id == row.project_id
+        && work_item.snapshot.chunk_index == row.drawer.chunk_index
+        && work_item.snapshot.normalize_version == i64::from(row.drawer.normalize_version)
 }
 
 fn process_prepared_historical_rejudge_work_items(
@@ -13445,11 +13497,12 @@ fn process_prepared_historical_rejudge_work_items(
                 )?;
             } else {
                 next_checkpoint.scanned_count += 1;
+                let decision = item.terminal_decision.unwrap_or("missing");
                 mark_historical_rejudge_work_item_processed(
                     db,
                     &next_checkpoint.run_id,
                     item.work_item.drawer_rowid,
-                    "missing",
+                    decision,
                     "none",
                 )?;
             }
@@ -13471,6 +13524,15 @@ fn ensure_historical_rejudge_checkpoint_storage(db: &Database) -> Result<()> {
             run_id TEXT NOT NULL,
             drawer_rowid INTEGER NOT NULL,
             drawer_id TEXT NOT NULL,
+            snapshot_content_hash TEXT NOT NULL,
+            snapshot_added_at TEXT NOT NULL,
+            snapshot_wing TEXT NOT NULL,
+            snapshot_room TEXT,
+            snapshot_source_file TEXT,
+            snapshot_source_type TEXT NOT NULL,
+            snapshot_project_id TEXT,
+            snapshot_chunk_index INTEGER,
+            snapshot_normalize_version INTEGER NOT NULL,
             processed_at TEXT,
             decision TEXT,
             mutation TEXT,
@@ -13483,6 +13545,19 @@ fn ensure_historical_rejudge_checkpoint_storage(db: &Database) -> Result<()> {
     db.conn()
         .execute_batch(&sql)
         .context("failed to ensure historical rejudge work table")?;
+    ensure_historical_rejudge_work_column(db, "snapshot_content_hash", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_historical_rejudge_work_column(db, "snapshot_added_at", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_historical_rejudge_work_column(db, "snapshot_wing", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_historical_rejudge_work_column(db, "snapshot_room", "TEXT")?;
+    ensure_historical_rejudge_work_column(db, "snapshot_source_file", "TEXT")?;
+    ensure_historical_rejudge_work_column(db, "snapshot_source_type", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_historical_rejudge_work_column(db, "snapshot_project_id", "TEXT")?;
+    ensure_historical_rejudge_work_column(db, "snapshot_chunk_index", "INTEGER")?;
+    ensure_historical_rejudge_work_column(
+        db,
+        "snapshot_normalize_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     db.conn()
         .execute_batch(
             r#"
@@ -13493,6 +13568,30 @@ fn ensure_historical_rejudge_checkpoint_storage(db: &Database) -> Result<()> {
             "#,
         )
         .context("failed to ensure fork_ext_meta for historical rejudge checkpoint")?;
+    Ok(())
+}
+
+fn ensure_historical_rejudge_work_column(
+    db: &Database,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let exists: bool = db
+        .conn()
+        .query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{HISTORICAL_REJUDGE_WORK_TABLE}') WHERE name = ?1)"),
+            [column],
+            |row| row.get(0),
+        )
+        .context("failed to inspect historical rejudge work table")?;
+    if exists {
+        return Ok(());
+    }
+    db.conn()
+        .execute_batch(&format!(
+            "ALTER TABLE {HISTORICAL_REJUDGE_WORK_TABLE} ADD COLUMN {column} {definition};"
+        ))
+        .with_context(|| format!("failed to add historical rejudge work column {column}"))?;
     Ok(())
 }
 
@@ -13514,8 +13613,33 @@ fn insert_historical_rejudge_work_items(
 ) -> Result<usize> {
     let mut sql = format!(
         r#"
-        INSERT INTO {HISTORICAL_REJUDGE_WORK_TABLE} (run_id, drawer_rowid, drawer_id)
-        SELECT ?1, rowid, id
+        INSERT INTO {HISTORICAL_REJUDGE_WORK_TABLE} (
+            run_id,
+            drawer_rowid,
+            drawer_id,
+            snapshot_content_hash,
+            snapshot_added_at,
+            snapshot_wing,
+            snapshot_room,
+            snapshot_source_file,
+            snapshot_source_type,
+            snapshot_project_id,
+            snapshot_chunk_index,
+            snapshot_normalize_version
+        )
+        SELECT
+            ?1,
+            rowid,
+            id,
+            COALESCE(content_hash, ''),
+            added_at,
+            wing,
+            room,
+            source_file,
+            source_type,
+            project_id,
+            chunk_index,
+            COALESCE(normalize_version, 0)
         FROM drawers
         WHERE deleted_at IS NULL
           AND rowid <= ?2
@@ -13556,7 +13680,18 @@ fn next_historical_rejudge_work_items(
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let sql = format!(
         r#"
-        SELECT drawer_rowid, drawer_id
+        SELECT
+            drawer_rowid,
+            drawer_id,
+            snapshot_content_hash,
+            snapshot_added_at,
+            snapshot_wing,
+            snapshot_room,
+            snapshot_source_file,
+            snapshot_source_type,
+            snapshot_project_id,
+            snapshot_chunk_index,
+            snapshot_normalize_version
         FROM {HISTORICAL_REJUDGE_WORK_TABLE}
         WHERE run_id = ?1
           AND processed_at IS NULL
@@ -13573,6 +13708,17 @@ fn next_historical_rejudge_work_items(
             Ok(HistoricalRejudgeWorkItem {
                 drawer_rowid: row.get(0)?,
                 drawer_id: row.get(1)?,
+                snapshot: HistoricalRejudgeWorkItemSnapshot {
+                    content_hash: row.get(2)?,
+                    added_at: row.get(3)?,
+                    wing: row.get(4)?,
+                    room: row.get(5)?,
+                    source_file: row.get(6)?,
+                    source_type: row.get(7)?,
+                    project_id: row.get(8)?,
+                    chunk_index: row.get(9)?,
+                    normalize_version: row.get(10)?,
+                },
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -16983,6 +17129,22 @@ enabled = true
             .expect("collect historical rejudge work item ids")
     }
 
+    fn historical_rejudge_work_item_decision(
+        db: &Database,
+        run_id: &str,
+        drawer_rowid: i64,
+    ) -> Option<String> {
+        db.conn()
+            .query_row(
+                &format!(
+                    "SELECT decision FROM {HISTORICAL_REJUDGE_WORK_TABLE} WHERE run_id = ?1 AND drawer_rowid = ?2"
+                ),
+                rusqlite::params![run_id, drawer_rowid],
+                |row| row.get(0),
+            )
+            .expect("load historical rejudge work item decision")
+    }
+
     #[test]
     fn historical_rejudge_run_id_is_unique_for_same_second_identical_options() {
         let options_hash = "a".repeat(64);
@@ -18713,8 +18875,8 @@ enabled = true
         assert_eq!(checkpoint.mutated_count, 2);
     }
 
-    #[test]
-    fn historical_rejudge_all_snapshot_blocks_rowid_reuse_writer() {
+    #[tokio::test]
+    async fn historical_rejudge_all_snapshot_blocks_rowid_reuse_writer() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -18800,13 +18962,13 @@ enabled = true
             .expect("delete old max after snapshot");
         insert_drawer(
             &second_db,
-            "post-start-reused",
-            "poststartrowidreuseneedle",
+            "old-max",
+            "poststartsameidrowidreuseneedle",
             "notes",
             None,
         );
         assert_eq!(
-            drawer_rowid(&second_db, "post-start-reused"),
+            drawer_rowid(&second_db, "old-max"),
             old_max_rowid,
             "SQLite should be able to reuse the deleted max rowid after the snapshot lock releases"
         );
@@ -18819,6 +18981,51 @@ enabled = true
             .expect("checkpoint");
         assert_eq!(persisted_checkpoint.run_id, checkpoint.run_id);
         assert_eq!(persisted_checkpoint.snapshot_count, 2);
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..options
+            },
+        )
+        .await
+        .expect("resume full rejudge");
+
+        assert!(db.get_drawer("old-0").expect("load old-0").is_none());
+        let reused = db
+            .get_drawer("old-max")
+            .expect("load reused same-id row")
+            .expect("reused same-id row remains active");
+        assert_eq!(reused.content, "poststartsameidrowidreuseneedle");
+        assert_eq!(
+            historical_rejudge_work_item_decision(&db, &checkpoint.run_id, old_max_rowid),
+            Some("changed".to_string())
+        );
+        let reused_matches = db
+            .search_fts(
+                "poststartsameidrowidreuseneedle",
+                None,
+                None,
+                "all",
+                None,
+                10,
+            )
+            .expect("search reused row through FTS");
+        assert!(
+            reused_matches.iter().any(|(id, _)| id == "old-max"),
+            "reused same-id row must remain BM25-searchable: {reused_matches:?}"
+        );
+        let backup = read_historical_rejudge_backup(&only_backup_file(&backups))
+            .expect("read snapshot backup");
+        assert_eq!(backup.items.len(), 1);
+        let completed_checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load completed checkpoint")
+            .expect("checkpoint");
+        assert_eq!(completed_checkpoint.snapshot_count, 2);
+        assert_eq!(completed_checkpoint.scanned_count, 2);
+        assert_eq!(completed_checkpoint.mutated_count, 1);
     }
 
     #[tokio::test]
