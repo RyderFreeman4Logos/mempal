@@ -76,7 +76,8 @@ use crate::knowledge_lifecycle::{
 use crate::search::{
     SearchFilters, SearchMode, SearchOptions, VectorSearchCircuit, bm25_fallback_warning_degraded,
     bm25_fallback_warning_embed_error, bm25_fallback_warning_timeout, dispatch_access_update,
-    resolve_route, search_bm25_only_with_options, search_with_vector_and_scope_options,
+    maybe_rerank_search_results, resolve_route, search_bm25_only_with_options,
+    search_with_vector_and_scope_options,
 };
 use anyhow::Context;
 use rmcp::{
@@ -2790,6 +2791,17 @@ impl MempalMcpServer {
                 }
             }
         };
+
+        let rerank_outcome = maybe_rerank_search_results(&request.query, results).await;
+        for warning in &rerank_outcome.warnings {
+            response_warnings.push(warning.clone());
+            extra_warnings.push(SystemWarning {
+                level: "warn".to_string(),
+                message: warning.clone(),
+                source: "reranker".to_string(),
+            });
+        }
+        let results = rerank_outcome.results;
 
         // Track hit drawer IDs for session-ingest boost (P13).
         let hit_ids: Vec<String> = results.iter().map(|r| r.drawer_id.clone()).collect();
