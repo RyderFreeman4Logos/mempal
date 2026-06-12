@@ -50,6 +50,7 @@ use super::state::{ApiState, SearchTelemetryOutcome, SearchTelemetrySnapshot};
 pub const DEFAULT_REST_ADDR: &str = "127.0.0.1:3080";
 const HERMES_COMPAT_VERSION: &str = "mempal-hermes-compat/1";
 const REST_SEARCH_WARNING_HEADER: &str = "mempal-warnings";
+const STATUS_DB_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(1);
 
 pub async fn serve(listener: tokio::net::TcpListener, state: ApiState) -> std::io::Result<()> {
     serve_with_shutdown(listener, state, shutdown_signal()).await
@@ -1316,7 +1317,7 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
     let vector_search_circuit =
         VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
     let turns_config = config.turns.clone();
-    let db_deadline = Duration::from_secs(config.api.search_db_deadline_secs);
+    let db_deadline = STATUS_DB_SNAPSHOT_DEADLINE;
     let search_telemetry = state.search_telemetry().snapshot();
     let (db_snapshot, status_warnings) = match state
         .run_read_anyhow_bounded(

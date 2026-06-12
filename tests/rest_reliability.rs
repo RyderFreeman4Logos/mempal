@@ -282,6 +282,24 @@ async fn wait_for_active_searches(state: &ApiState, expected: usize) {
     panic!("expected at least {expected} active searches, saw {latest_active_count}");
 }
 
+#[cfg(feature = "db-test-seam")]
+async fn wait_for_active_search_stage(state: &ApiState, expected: usize, stage: &str) {
+    let mut latest_stage_count = 0;
+    for _ in 0..100 {
+        let telemetry = state.search_telemetry_snapshot_for_test();
+        latest_stage_count = telemetry
+            .active_searches
+            .iter()
+            .filter(|search| search.stage == stage)
+            .count();
+        if latest_stage_count >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected at least {expected} active searches in {stage}, saw {latest_stage_count}");
+}
+
 #[tokio::test]
 async fn test_shutdown_drain_completes_pending() {
     let _guard = TEST_LOCK.lock().await;
@@ -559,7 +577,7 @@ async fn test_search_db_deadline_returns_partial_warning_and_telemetry() {
 #[tokio::test]
 async fn test_status_returns_telemetry_when_search_db_pool_is_saturated() {
     let _guard = TEST_LOCK.lock().await;
-    let env = TestEnv::new_with_api_search_deadline_secs(1);
+    let env = TestEnv::new();
     insert_search_drawer(&env.db());
     let async_db = AsyncDb::open(&env.db_path, 4)
         .expect("open async db")
@@ -576,8 +594,15 @@ async fn test_status_returns_telemetry_when_search_db_pool_is_saturated() {
         }));
     }
     wait_for_active_searches(&state, 4).await;
+    wait_for_active_search_stage(&state, 4, "routing").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let (status, _headers, body) = get_json(state.clone(), "/api/status").await;
+    let (status, _headers, body) = tokio::time::timeout(
+        Duration::from_millis(1_800),
+        get_json(state.clone(), "/api/status"),
+    )
+    .await
+    .expect("status should return before daemon status 2s timeout");
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["drawer_count"].as_i64(), Some(0));
@@ -615,6 +640,18 @@ async fn test_status_returns_telemetry_when_search_db_pool_is_saturated() {
             .and_then(Value::as_u64)
             .is_some_and(|count| count >= 4),
         "search telemetry={telemetry:#?}"
+    );
+    let active_searches = telemetry["active_searches"]
+        .as_array()
+        .expect("active searches");
+    assert!(
+        active_searches.iter().all(|search| {
+            search
+                .get("deadline_ms")
+                .and_then(Value::as_u64)
+                .is_some_and(|deadline_ms| deadline_ms >= 30_000)
+        }),
+        "active searches should retain the configured search deadline: {active_searches:#?}"
     );
 
     for request in requests {
