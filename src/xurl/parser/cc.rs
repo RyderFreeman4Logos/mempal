@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::xurl::XurlResult;
-use crate::xurl::model::{Provenance, RawTurn, Role, Tool};
+use crate::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
 
 const SESSION_ID_SCAN_LIMIT: usize = 64;
 
@@ -85,6 +85,7 @@ pub fn parse_cc_jsonl(
                     is_csa_delegated,
                     provenance,
                     turn_index,
+                    metadata: TurnMetadata::default(),
                 });
                 turn_index += 1;
             }
@@ -117,6 +118,7 @@ pub fn parse_cc_jsonl(
                     is_csa_delegated,
                     provenance: Provenance::Human,
                     turn_index,
+                    metadata: TurnMetadata::default(),
                 });
                 turn_index += 1;
             }

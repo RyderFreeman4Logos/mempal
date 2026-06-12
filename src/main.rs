@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::adoption_analytics::build_runtime_adoption_analytics;
 #[cfg(feature = "rest")]
@@ -381,6 +381,16 @@ enum Commands {
         include_raw_turns: bool,
         #[arg(long = "include-expired")]
         include_expired: bool,
+    },
+    /// Ingest and search Hermes Agent sessions.
+    Hermes {
+        #[command(subcommand)]
+        command: HermesCommands,
+    },
+    /// Recall agent transcripts through provider-specific semantic indexes.
+    Recall {
+        #[command(subcommand)]
+        command: RecallCommands,
     },
     /// Assemble tiered context for a query.
     Context {
@@ -1218,10 +1228,105 @@ enum XurlTool {
     Hermes,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum XurlFormat {
     Markdown,
     Json,
+}
+
+#[derive(Subcommand)]
+enum HermesCommands {
+    /// Ingest Hermes state.db or a Hermes JSONL export.
+    Ingest(HermesIngestArgs),
+    /// Semantic search over indexed Hermes turns.
+    Search(HermesQueryArgs),
+    /// Alias for search with recall-oriented flags.
+    Recall(HermesQueryArgs),
+}
+
+#[derive(Subcommand)]
+enum RecallCommands {
+    /// Semantic recall over indexed Hermes turns.
+    Hermes(HermesQueryArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct HermesIngestArgs {
+    /// Hermes profile name. `default` maps to ~/.hermes/state.db.
+    #[arg(long, default_value = "default")]
+    profile: String,
+    /// Override Hermes home directory. Defaults to HERMES_HOME or ~/.hermes.
+    #[arg(long = "hermes-home")]
+    hermes_home: Option<PathBuf>,
+    /// Read this state.db instead of resolving one from --profile.
+    #[arg(long = "db")]
+    db_path: Option<PathBuf>,
+    /// Ingest a Hermes CLI JSONL export instead of state.db.
+    #[arg(long = "export-jsonl")]
+    export_jsonl: Option<PathBuf>,
+    /// Restrict ingest to one Hermes session id.
+    #[arg(long = "session-id", alias = "session")]
+    session_id: Option<String>,
+    /// Restrict/tag ingest to this cwd. Defaults to source metadata when omitted.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Print result as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct HermesQueryArgs {
+    /// Search query string.
+    query: Option<String>,
+    /// Search query string, useful for `mempal recall hermes --query ...`.
+    #[arg(long = "query")]
+    query_flag: Option<String>,
+    /// Hermes profile name.
+    #[arg(long, default_value = "default")]
+    profile: String,
+    /// Restrict recall to this cwd. Defaults to the process cwd.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Disable the default cwd filter.
+    #[arg(long = "all-cwd")]
+    all_cwd: bool,
+    /// Restrict recall to one Hermes session id.
+    #[arg(long = "session-id", alias = "session")]
+    session_id: Option<String>,
+    /// Restrict recall to a Hermes session source such as cli or telegram.
+    #[arg(long = "session-source")]
+    session_source: Option<String>,
+    /// Restrict recall to an exact Hermes session title.
+    #[arg(long = "session-title")]
+    session_title: Option<String>,
+    /// Prefer the newest matching session when no session id is supplied.
+    #[arg(long)]
+    latest: bool,
+    /// Only return turns newer than this duration (e.g. 7d, 24h, 10m).
+    #[arg(long)]
+    since: Option<String>,
+    /// Only return turns older than this duration window endpoint.
+    #[arg(long)]
+    until: Option<String>,
+    /// Maximum number of results to return.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+    /// Page number (0-based).
+    #[arg(long, default_value_t = 0)]
+    page: usize,
+    /// Also include CSA-delegated turns.
+    #[arg(long)]
+    include_csa: bool,
+    /// Also include agent-generated user prompts.
+    #[arg(long)]
+    include_agent_prompts: bool,
+    /// Minimum cosine similarity score (0.0-1.0).
+    #[arg(long, default_value_t = 0.70)]
+    min_score: f32,
+    /// Output format: markdown (default) or json.
+    #[arg(long, value_enum, default_value_t = XurlFormat::Markdown)]
+    format: XurlFormat,
 }
 
 #[derive(Serialize)]
@@ -2737,6 +2842,12 @@ fn run() -> Result<()> {
                 include_expired,
             },
         )),
+        Commands::Hermes { command } => {
+            block_on_result(hermes_command(&db, config.as_ref(), command))
+        }
+        Commands::Recall { command } => {
+            block_on_result(recall_command(&db, config.as_ref(), command))
+        }
         Commands::Context {
             query,
             field,
@@ -10106,6 +10217,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 since_epoch,
                 limit,
                 offset: page * limit,
+                ..Default::default()
             };
             let embedder = build_embedder(config).await?;
             let result = mempal::xurl::search::search(
@@ -10154,6 +10266,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                 since_epoch,
                 limit,
                 offset: page * limit,
+                ..Default::default()
             };
             let turns = mempal::xurl::store::get_turns_filtered(
                 db.conn(),
@@ -10417,6 +10530,189 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
             Ok(())
         }
     }
+}
+
+async fn hermes_command(db: &Database, config: &Config, command: HermesCommands) -> Result<()> {
+    match command {
+        HermesCommands::Ingest(args) => hermes_ingest_command(db, config, args).await,
+        HermesCommands::Search(args) | HermesCommands::Recall(args) => {
+            hermes_query_command(db, config, args).await
+        }
+    }
+}
+
+async fn recall_command(db: &Database, config: &Config, command: RecallCommands) -> Result<()> {
+    match command {
+        RecallCommands::Hermes(args) => hermes_query_command(db, config, args).await,
+    }
+}
+
+async fn hermes_ingest_command(
+    db: &Database,
+    config: &Config,
+    args: HermesIngestArgs,
+) -> Result<()> {
+    let embedder = build_embedder(config).await?;
+    let vector_fingerprint = config
+        .embed
+        .current_vector_embedder_fingerprint(embedder.dimensions());
+    let cwd = args
+        .cwd
+        .as_deref()
+        .map(resolve_cli_cwd)
+        .transpose()
+        .context("failed to resolve Hermes cwd filter")?;
+    let options = mempal::xurl::ingest::HermesIngestOptions {
+        profile: args.profile,
+        db_path: args.db_path,
+        export_jsonl: args.export_jsonl,
+        hermes_home: args.hermes_home,
+        session_id: args.session_id,
+        cwd,
+    };
+    let parse_cb = |name: &str, turns: usize| {
+        if args.json {
+            eprintln!(
+                "{}",
+                serde_json::json!({"phase":"parse","file":name,"turns":turns})
+            );
+        } else {
+            eprintln!("[parse] hermes: {name} ({turns} turns)");
+        }
+    };
+    let embed_cb = |done: usize, total: usize| {
+        if args.json {
+            eprintln!(
+                "{}",
+                serde_json::json!({"phase":"embed","done":done,"total":total})
+            );
+        } else {
+            eprintln!("[embed] {done}/{total} Hermes turns vectorized");
+        }
+    };
+    let stats = mempal::xurl::ingest::ingest_hermes_with_vector_fingerprint(
+        db,
+        embedder.as_ref(),
+        &options,
+        &vector_fingerprint,
+        mempal::xurl::ingest::IngestCallbacks {
+            on_file_parsed: Some(&parse_cb),
+            on_embed_progress: Some(&embed_cb),
+        },
+    )
+    .await
+    .context("Hermes ingest failed")?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&stats).context("json serialize")?
+        );
+    } else {
+        println!("turns parsed:   {}", stats.turns_parsed);
+        println!("turns inserted: {}", stats.turns_inserted);
+        println!("turns skipped:  {}", stats.turns_skipped);
+        println!("turns updated:  {}", stats.turns_updated);
+        println!("vectors created:{}", stats.vectors_created);
+    }
+    Ok(())
+}
+
+async fn hermes_query_command(db: &Database, config: &Config, args: HermesQueryArgs) -> Result<()> {
+    let query = resolve_hermes_query(&args)?;
+    let cwd = if args.all_cwd {
+        None
+    } else {
+        Some(match args.cwd.as_deref() {
+            Some(path) => resolve_cli_cwd(path)?,
+            None => env::current_dir()
+                .context("failed to read current directory for Hermes cwd filter")?
+                .to_string_lossy()
+                .to_string(),
+        })
+    };
+    let since_epoch = args
+        .since
+        .as_deref()
+        .map(parse_since_to_epoch)
+        .transpose()?;
+    let until_epoch = args
+        .until
+        .as_deref()
+        .map(parse_since_to_epoch)
+        .transpose()?;
+    let mut filter = mempal::xurl::store::TurnFilter {
+        tool: Some(mempal::xurl::model::Tool::Hermes),
+        session_id: args.session_id.clone(),
+        cwd,
+        hermes_profile: Some(args.profile),
+        session_title: args.session_title,
+        session_source: args.session_source,
+        since_epoch,
+        until_epoch,
+        limit: args.limit,
+        offset: args.page * args.limit,
+    };
+    if args.latest && filter.session_id.is_none() {
+        filter.session_id = mempal::xurl::store::latest_session_id(
+            db.conn(),
+            &filter,
+            args.include_csa,
+            args.include_agent_prompts,
+        )
+        .context("failed to resolve latest Hermes session")?;
+    }
+
+    let embedder = build_embedder(config).await?;
+    let result = mempal::xurl::search::search(
+        db,
+        embedder.as_ref(),
+        &query,
+        mempal::xurl::search::SearchOptions {
+            limit: args.limit,
+            filter: Some(filter),
+            include_csa: args.include_csa,
+            include_agent_prompts: args.include_agent_prompts,
+            min_score: Some(args.min_score),
+        },
+    )
+    .await
+    .context("Hermes recall failed")?;
+
+    match args.format {
+        XurlFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&result).context("json serialize")?
+            );
+        }
+        XurlFormat::Markdown => {
+            mempal::xurl::search::print_hits_markdown(&result);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_hermes_query(args: &HermesQueryArgs) -> Result<String> {
+    match (&args.query, &args.query_flag) {
+        (Some(_), Some(_)) => {
+            bail!("provide the Hermes query once, not both positional and --query")
+        }
+        (Some(query), None) | (None, Some(query)) => Ok(query.clone()),
+        (None, None) => bail!("Hermes recall requires a query string or --query"),
+    }
+}
+
+fn resolve_cli_cwd(path: &Path) -> Result<String> {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to read current directory")?
+            .join(path)
+    };
+    let canonical = resolved.canonicalize().unwrap_or(resolved);
+    Ok(canonical.to_string_lossy().to_string())
 }
 
 async fn build_embedder(config: &Config) -> Result<Box<dyn Embedder>> {

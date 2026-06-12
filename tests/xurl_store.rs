@@ -1,5 +1,5 @@
 use mempal::core::db::Database;
-use mempal::xurl::model::{Provenance, RawTurn, Role, Tool};
+use mempal::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
 use mempal::xurl::store::{self, TurnFilter};
 use tempfile::TempDir;
 
@@ -36,6 +36,7 @@ fn make_raw_turn(session_id: &str, turn_index: u32, role: Role, content: &str) -
         is_csa_delegated: false,
         provenance: Provenance::Human,
         turn_index,
+        metadata: TurnMetadata::default(),
     }
 }
 

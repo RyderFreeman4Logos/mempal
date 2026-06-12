@@ -93,9 +93,24 @@ api_model = "nomic-embed-text"
 | `mempal cowork-drain --target <claude\|codex>` | Drain inbox messages (for hook use; exits 0 on any failure) |
 | `mempal cowork-status --cwd <PATH>` | Read-only view of both inboxes at `<PATH>` |
 | `mempal fact-check [PATH\|-] [--wing W] [--room R] [--now <UNIX_SECS>]` | Offline contradiction check against KG triples + known entities |
+| `mempal hermes ingest/search/recall` | Cwd-scoped semantic recall over Hermes Agent sessions |
 | `mempal bench longmemeval <FILE>` | LongMemEval retrieval benchmark |
 
 > **Heads-up — two different `xurl`s.** `mempal xurl` is a mempal subcommand: an `ingest` / `search` / `timeline` / `stats` / `reindex` / `backfill` pipeline over agent session transcripts. It is **not** the standalone `xurl` CLI (Xuanwo's "Resolve and read code-agent threads", invoked as `xurl …` with `agents://` URIs). The two are independent projects that happen to share a name — neither is an alias for the other.
+
+### Hermes Session Recall
+
+Hermes transcripts are indexed through the xurl conversation store but exposed as first-class commands:
+
+```bash
+mempal hermes ingest --profile default --cwd /path/to/repo
+mempal hermes ingest --profile work --export-jsonl hermes-session.jsonl
+mempal hermes search --cwd . --query "mktd Step 7 failure recovery"
+mempal recall hermes --session-id <hermes-session-id> --query "review verdict PASS"
+mempal recall hermes --cwd . --latest --query "what is the current issue queue?"
+```
+
+Default profile reads `~/.hermes/state.db`; named profiles read `~/.hermes/profiles/<profile>/state.db` unless `--db` or `--export-jsonl` is supplied. Searches default to the process cwd, preserve Hermes profile boundaries, and return `profile/session/message` citations so exact pages can be fetched later through Hermes or xurl.
 
 ## MCP Server (11 tools)
 

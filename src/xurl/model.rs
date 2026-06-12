@@ -48,6 +48,18 @@ impl Provenance {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnMetadata {
+    pub hermes_profile: Option<String>,
+    pub session_title: Option<String>,
+    pub session_source: Option<String>,
+    pub message_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub previous_message_id: Option<String>,
+    pub next_message_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RawTurn {
     pub session_id: String,
@@ -61,6 +73,7 @@ pub struct RawTurn {
     pub provenance: Provenance,
     /// 0-based monotonic index within the session (counting only kept turns).
     pub turn_index: u32,
+    pub metadata: TurnMetadata,
 }
 
 #[cfg(test)]

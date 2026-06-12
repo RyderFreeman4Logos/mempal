@@ -7,7 +7,14 @@ use crate::core::db::Database;
 use crate::embed::Embedder;
 use crate::xurl::embed;
 use crate::xurl::model::Tool;
-use crate::xurl::parser::{cc::parse_cc_jsonl, codex::parse_codex_jsonl, hermes::parse_hermes_db};
+use crate::xurl::parser::{
+    cc::parse_cc_jsonl,
+    codex::parse_codex_jsonl,
+    hermes::{
+        HermesParseOptions, parse_hermes_db, parse_hermes_db_with_options,
+        parse_hermes_jsonl_export,
+    },
+};
 use crate::xurl::store;
 use crate::xurl::{XurlError, XurlResult};
 
@@ -34,6 +41,29 @@ pub struct AutoScanConfig {
     pub cc_root: PathBuf,
     pub codex_root: PathBuf,
     pub hermes_db: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HermesIngestOptions {
+    pub profile: String,
+    pub db_path: Option<PathBuf>,
+    pub export_jsonl: Option<PathBuf>,
+    pub hermes_home: Option<PathBuf>,
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+}
+
+impl Default for HermesIngestOptions {
+    fn default() -> Self {
+        Self {
+            profile: "default".to_string(),
+            db_path: None,
+            export_jsonl: None,
+            hermes_home: None,
+            session_id: None,
+            cwd: None,
+        }
+    }
 }
 
 impl Default for AutoScanConfig {
@@ -114,6 +144,63 @@ fn parse_and_store_file(
     Ok((filename, turns_parsed, insert_stats, turn_ids))
 }
 
+fn parse_and_store_hermes_source(
+    db: &Database,
+    options: &HermesIngestOptions,
+) -> XurlResult<(String, usize, store::InsertStats, Vec<String>)> {
+    if options.db_path.is_some() && options.export_jsonl.is_some() {
+        return Err(XurlError::Parse(
+            "Hermes ingest accepts either --db or --export-jsonl, not both".to_string(),
+        ));
+    }
+
+    let fallback_session_id = options
+        .session_id
+        .as_deref()
+        .unwrap_or("hermes-session")
+        .to_string();
+    let mut parse_options = HermesParseOptions::new(&fallback_session_id, &options.profile, false);
+    parse_options.session_id_filter = options.session_id.clone();
+    parse_options.cwd = options.cwd.clone();
+
+    let (name, turns) = if let Some(path) = &options.export_jsonl {
+        let content = fs::read_to_string(path).map_err(XurlError::Io)?;
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("hermes-export.jsonl")
+            .to_string();
+        (name, parse_hermes_jsonl_export(&content, &parse_options)?)
+    } else {
+        let path = options.db_path.clone().unwrap_or_else(|| {
+            default_hermes_db_path(&options.profile, options.hermes_home.as_deref())
+        });
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("state.db")
+            .to_string();
+        (name, parse_hermes_db_with_options(&path, &parse_options)?)
+    };
+
+    let turns_parsed = turns.len();
+    let turn_ids: Vec<String> = turns.iter().map(store::turn_id_for).collect();
+    let insert_stats = store::insert_turns(db.conn(), &turns)?;
+    Ok((name, turns_parsed, insert_stats, turn_ids))
+}
+
+pub fn default_hermes_db_path(profile: &str, hermes_home: Option<&Path>) -> PathBuf {
+    let root = hermes_home
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HERMES_HOME").map(PathBuf::from))
+        .unwrap_or_else(|| home_dir().join(".hermes"));
+    if profile == "default" {
+        root.join("state.db")
+    } else {
+        root.join("profiles").join(profile).join("state.db")
+    }
+}
+
 /// Ingest a single file (or SQLite DB for Hermes) and embed any newly inserted turns.
 ///
 /// `on_file_parsed` is called after parsing with `(filename, turns_parsed)`.
@@ -161,6 +248,36 @@ pub async fn ingest_file_with_vector_fingerprint<E: Embedder + ?Sized>(
         callbacks,
     )
     .await
+}
+
+pub async fn ingest_hermes_with_vector_fingerprint<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    options: &HermesIngestOptions,
+    vector_fingerprint: &str,
+    callbacks: IngestCallbacks<'_>,
+) -> XurlResult<IngestStats> {
+    let (filename, turns_parsed, insert_stats, turn_ids) =
+        parse_and_store_hermes_source(db, options)?;
+    if let Some(callback) = callbacks.on_file_parsed {
+        callback(&filename, turns_parsed);
+    }
+    let embed_stats = embed::embed_unindexed_turns_scoped_with_fingerprint(
+        db,
+        embedder,
+        &turn_ids,
+        vector_fingerprint,
+        callbacks.on_embed_progress,
+    )
+    .await?;
+
+    Ok(IngestStats {
+        turns_parsed,
+        turns_inserted: insert_stats.inserted,
+        turns_skipped: insert_stats.skipped,
+        turns_updated: insert_stats.updated,
+        vectors_created: embed_stats.embedded,
+    })
 }
 
 async fn ingest_file_inner<E: Embedder + ?Sized>(
