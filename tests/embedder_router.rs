@@ -7,7 +7,7 @@ use mempal::embed::{
     ConfiguredEmbedderFactory, EmbedError, EmbedderFactory, router::EmbeddingRouter,
 };
 use mockito::{Matcher, Server};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Notify};
 
 fn embedding_body(vector: &[f32]) -> String {
     serde_json::json!({
@@ -155,6 +155,100 @@ async fn spawn_counting_embedding_server(
     (format!("http://{addr}/v1"), count, handle)
 }
 
+async fn spawn_first_request_gated_embedding_server() -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+    Arc<Notify>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{Json, Router, routing::post};
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let count_for_handler = Arc::clone(&count);
+    let first_started_for_handler = Arc::clone(&first_started);
+    let release_first_for_handler = Arc::clone(&release_first);
+    let app = Router::new().route(
+        "/v1/embeddings",
+        post(move || {
+            let count = Arc::clone(&count_for_handler);
+            let first_started = Arc::clone(&first_started_for_handler);
+            let release_first = Arc::clone(&release_first_for_handler);
+            async move {
+                let request_index = count.fetch_add(1, Ordering::SeqCst);
+                if request_index == 0 {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                }
+                Json(serde_json::json!({
+                    "data": [
+                        {
+                            "embedding": [0.1, 0.2, 0.3]
+                        }
+                    ]
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gated embedding server");
+    let addr = listener.local_addr().expect("server addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve gated embedding server");
+    });
+    (
+        format!("http://{addr}/v1"),
+        count,
+        first_started,
+        release_first,
+        handle,
+    )
+}
+
+async fn spawn_embedding_cooldown_server() -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{Router, http::StatusCode, routing::post};
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let called = Arc::new(Notify::new());
+    let count_for_handler = Arc::clone(&count);
+    let called_for_handler = Arc::clone(&called);
+    let app = Router::new().route(
+        "/v1/embeddings",
+        post(move || {
+            let count = Arc::clone(&count_for_handler);
+            let called = Arc::clone(&called_for_handler);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                called.notify_one();
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"error":{"code":"model_cooldown","reset_seconds":60}}"#,
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind embedding cooldown server");
+    let addr = listener.local_addr().expect("server addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve embedding cooldown server");
+    });
+    (format!("http://{addr}/v1"), count, called, handle)
+}
+
 #[tokio::test]
 async fn test_embedding_router_same_priority_uses_each_endpoint_capacity_concurrently() {
     let (gb10_url, gb10_count, gb10_server) =
@@ -186,6 +280,46 @@ async fn test_embedding_router_same_priority_uses_each_endpoint_capacity_concurr
 
     assert_eq!(gb10_count.load(Ordering::SeqCst), 4);
     assert_eq!(spark_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_embedding_router_waits_for_saturated_healthy_endpoint_before_cooldown() {
+    let (primary_url, primary_count, first_started, release_first, primary_server) =
+        spawn_first_request_gated_embedding_server().await;
+    let (cooldown_url, cooldown_count, cooldown_called, cooldown_server) =
+        spawn_embedding_cooldown_server().await;
+    let config = pool_config(&[
+        ("primary", &primary_url, 0, 1),
+        ("cooldown", &cooldown_url, 10, 1),
+    ]);
+    let router = Arc::new(EmbeddingRouter::from_config(&config).expect("build embedding router"));
+    let first_router = Arc::clone(&router);
+    let first_task = tokio::spawn(async move { first_router.embed_routed(&["first"], None).await });
+    first_started.notified().await;
+
+    let second_router = Arc::clone(&router);
+    let second_task =
+        tokio::spawn(async move { second_router.embed_routed(&["second"], None).await });
+    cooldown_called.notified().await;
+    release_first.notify_one();
+
+    first_task
+        .await
+        .expect("first join")
+        .expect("first embedding response");
+    let second = tokio::time::timeout(Duration::from_secs(2), second_task)
+        .await
+        .expect("second request should complete after primary permit frees")
+        .expect("second join")
+        .expect("second embedding response");
+    primary_server.abort();
+    cooldown_server.abort();
+    let _ = primary_server.await;
+    let _ = cooldown_server.await;
+
+    assert_eq!(second.endpoint_id, "primary");
+    assert_eq!(primary_count.load(Ordering::SeqCst), 2);
+    assert_eq!(cooldown_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

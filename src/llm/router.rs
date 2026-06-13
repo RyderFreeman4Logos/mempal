@@ -105,10 +105,7 @@ impl LlmRouter {
             }
         }
 
-        if let Some(endpoint) = first_saturated_endpoint
-            && earliest_retry_after.is_none()
-            && last_retryable.is_none()
-        {
+        if let Some(endpoint) = first_saturated_endpoint {
             refresh_heartbeat(heartbeat)?;
             let response = endpoint.client.chat_completion(request).await?;
             return Ok(RoutedLlmResponse {

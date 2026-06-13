@@ -126,10 +126,7 @@ impl EmbeddingRouter {
             }
         }
 
-        if let Some(endpoint) = first_saturated_endpoint
-            && earliest_retry_after.is_none()
-            && last_retryable.is_none()
-        {
+        if let Some(endpoint) = first_saturated_endpoint {
             refresh_heartbeat(heartbeat)?;
             let vectors = endpoint.client.embed_with_permit(texts).await?;
             endpoint.mark_available().await;

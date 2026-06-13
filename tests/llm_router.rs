@@ -5,7 +5,7 @@ use std::time::Duration;
 use mempal::core::config::Config;
 use mempal::llm::{LlmError, LlmMessage, LlmRequest, LlmRouter};
 use mockito::{Matcher, Server};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Notify};
 
 fn request() -> LlmRequest {
     LlmRequest {
@@ -295,6 +295,114 @@ async fn spawn_counting_server(
     (format!("http://{addr}/v1"), count, handle)
 }
 
+async fn spawn_first_request_gated_server(
+    model: &'static str,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+    Arc<Notify>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{Json, Router, routing::post};
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let count_for_handler = Arc::clone(&count);
+    let first_started_for_handler = Arc::clone(&first_started);
+    let release_first_for_handler = Arc::clone(&release_first);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let count = Arc::clone(&count_for_handler);
+            let first_started = Arc::clone(&first_started_for_handler);
+            let release_first = Arc::clone(&release_first_for_handler);
+            async move {
+                let request_index = count.fetch_add(1, Ordering::SeqCst);
+                if request_index == 0 {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                }
+                Json(serde_json::json!({
+                    "model": model,
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "ok"
+                        }
+                    }],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gated LLM server");
+    let addr = listener.local_addr().expect("server addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve gated LLM server");
+    });
+    (
+        format!("http://{addr}/v1"),
+        count,
+        first_started,
+        release_first,
+        handle,
+    )
+}
+
+async fn spawn_llm_cooldown_server() -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{
+        Router,
+        http::{StatusCode, header},
+        routing::post,
+    };
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let called = Arc::new(Notify::new());
+    let count_for_handler = Arc::clone(&count);
+    let called_for_handler = Arc::clone(&called);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let count = Arc::clone(&count_for_handler);
+            let called = Arc::clone(&called_for_handler);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                called.notify_one();
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, "60")],
+                    "cooling down",
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind LLM cooldown server");
+    let addr = listener.local_addr().expect("server addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve LLM cooldown server");
+    });
+    (format!("http://{addr}/v1"), count, called, handle)
+}
+
 fn pool_config(entries: &[(&str, &str, &str, i32, usize)]) -> mempal::core::config::LlmConfig {
     let mut toml = String::from("[llm]\nenabled = true\n");
     for (id, base_url, model, priority, max_concurrent) in entries {
@@ -347,6 +455,48 @@ async fn test_llm_router_same_priority_uses_each_endpoint_capacity_concurrently(
 
     assert_eq!(qwen_count.load(Ordering::SeqCst), 4);
     assert_eq!(spark_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_llm_router_waits_for_saturated_healthy_endpoint_before_cooldown() {
+    let (primary_url, primary_count, first_started, release_first, primary_server) =
+        spawn_first_request_gated_server("primary-model").await;
+    let (cooldown_url, cooldown_count, cooldown_called, cooldown_server) =
+        spawn_llm_cooldown_server().await;
+    let config = pool_config(&[
+        ("primary", &primary_url, "primary-model", 0, 1),
+        ("cooldown", &cooldown_url, "cooldown-model", 10, 1),
+    ]);
+    let router = Arc::new(LlmRouter::from_config(&config).expect("build router"));
+    let first_router = Arc::clone(&router);
+    let first_task =
+        tokio::spawn(async move { first_router.chat_completion(&request(), None).await });
+    first_started.notified().await;
+
+    let second_router = Arc::clone(&router);
+    let second_task =
+        tokio::spawn(async move { second_router.chat_completion(&request(), None).await });
+    cooldown_called.notified().await;
+    release_first.notify_one();
+
+    first_task
+        .await
+        .expect("first join")
+        .expect("first LLM response");
+    let second = tokio::time::timeout(Duration::from_secs(2), second_task)
+        .await
+        .expect("second request should complete after primary permit frees")
+        .expect("second join")
+        .expect("second LLM response");
+    primary_server.abort();
+    cooldown_server.abort();
+    let _ = primary_server.await;
+    let _ = cooldown_server.await;
+
+    assert_eq!(second.endpoint_id, "primary");
+    assert_eq!(second.endpoint_model, "primary-model");
+    assert_eq!(primary_count.load(Ordering::SeqCst), 2);
+    assert_eq!(cooldown_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
