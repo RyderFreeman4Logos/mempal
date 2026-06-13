@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::core::config::{EffectiveLlmEndpoint, LlmConfig};
 
-use super::client::{LlmClient, LlmError, LlmRequest, LlmResponse};
+use super::client::{LlmClient, LlmError, LlmRequest, LlmResponse, MAX_REMOTE_RETRY_HINT};
 use super::retry::HeartbeatCallback;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +192,11 @@ impl RoutedEndpoint {
 
     async fn mark_temporarily_unavailable(&self, retry_after: Duration) {
         let mut guard = self.unavailable_until.lock().await;
-        *guard = Some(Instant::now() + retry_after);
+        let now = Instant::now();
+        *guard = Some(
+            now.checked_add(retry_after)
+                .unwrap_or_else(|| now + MAX_REMOTE_RETRY_HINT),
+        );
     }
 }
 

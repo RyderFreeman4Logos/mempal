@@ -185,6 +185,35 @@ async fn test_llm_router_all_temporarily_unavailable_remains_retryable() {
 }
 
 #[tokio::test]
+async fn test_llm_router_clamps_absurd_retry_after_before_cooldown() {
+    let mut server = Server::new_async().await;
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(429)
+        .with_header("retry-after", "18446744073709551615")
+        .with_body("rate limited")
+        .expect(1)
+        .create_async()
+        .await;
+    let config = pool_config(&[("primary", &format!("{}/v1", server.url()), "model-a", 0, 1)]);
+    let router = LlmRouter::from_config(&config).expect("build router");
+
+    let error = router
+        .chat_completion(&request(), None)
+        .await
+        .expect_err("rate limit should cool down without panicking");
+
+    mock.assert_async().await;
+    assert!(matches!(
+        error,
+        LlmError::TemporarilyUnavailable {
+            retry_after,
+            ..
+        } if retry_after == Duration::from_secs(60)
+    ));
+}
+
+#[tokio::test]
 async fn test_llm_router_all_5xx_reports_configured_retry_interval() {
     let mut primary = Server::new_async().await;
     let mut secondary = Server::new_async().await;

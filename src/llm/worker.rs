@@ -36,6 +36,7 @@ struct LlmClientConfigSignature {
     extra_body: Option<Value>,
     endpoints: Vec<crate::core::config::LlmEndpointConfig>,
     request_timeout_secs: u64,
+    retry_interval_secs: u64,
     max_concurrent: usize,
 }
 
@@ -50,6 +51,7 @@ impl From<&LlmConfig> for LlmClientConfigSignature {
             extra_body: config.extra_body.clone(),
             endpoints: config.endpoints.clone(),
             request_timeout_secs: config.request_timeout_secs,
+            retry_interval_secs: config.retry_interval_secs,
             max_concurrent: config.max_concurrent,
         }
     }

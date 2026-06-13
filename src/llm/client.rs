@@ -11,6 +11,9 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::core::config::{EffectiveLlmEndpoint, LlmConfig, validate_llm_base_url};
 
+pub(crate) const MAX_REMOTE_RETRY_HINT: Duration = Duration::from_secs(60);
+const MAX_REMOTE_RETRY_HINT_SECS: u64 = 60;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: String,
@@ -324,12 +327,16 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
+        .map(clamp_remote_retry_hint_secs)
 }
 
 fn parse_reset_seconds(body: &str) -> Option<Duration> {
     let value = serde_json::from_str::<Value>(body).ok()?;
-    find_reset_seconds(&value).map(Duration::from_secs)
+    find_reset_seconds(&value).map(clamp_remote_retry_hint_secs)
+}
+
+fn clamp_remote_retry_hint_secs(secs: u64) -> Duration {
+    Duration::from_secs(secs.min(MAX_REMOTE_RETRY_HINT_SECS))
 }
 
 fn find_reset_seconds(value: &Value) -> Option<u64> {

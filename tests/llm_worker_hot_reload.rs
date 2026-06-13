@@ -241,6 +241,48 @@ model = "model-stable"
 }
 
 #[test]
+fn test_llm_gen_increments_on_legacy_retry_interval_change() {
+    let _guard = TEST_LOCK.lock().expect("test lock");
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+[llm]
+enabled = true
+base_url = "http://127.0.0.1:19999/v1"
+model = "model-stable"
+retry_interval_secs = 1
+"#,
+    )
+    .expect("write config");
+    ConfigHandle::bootstrap(&config_path).expect("bootstrap");
+
+    let mut rx = ConfigHandle::subscribe_llm_gen();
+    let gen_before = *rx.borrow_and_update();
+
+    std::fs::write(
+        &config_path,
+        r#"
+[llm]
+enabled = true
+base_url = "http://127.0.0.1:19999/v1"
+model = "model-stable"
+retry_interval_secs = 9
+"#,
+    )
+    .expect("write config");
+    ConfigHandle::harness_reload_from_path(&config_path);
+
+    let gen_after = *rx.borrow_and_update();
+    assert!(
+        gen_after > gen_before,
+        "generation must increment when legacy scalar llm.retry_interval_secs changes (before={gen_before}, after={gen_after})"
+    );
+}
+
+#[test]
 fn test_llm_gen_increments_on_endpoint_list_change() {
     let _guard = TEST_LOCK.lock().expect("test lock");
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -362,6 +404,32 @@ fn test_llm_client_runtime_rebuilds_on_endpoint_change() {
     assert!(
         !Arc::ptr_eq(&first, &second),
         "endpoint changes must rebuild LLM router"
+    );
+}
+
+#[test]
+fn test_llm_client_runtime_rebuilds_on_legacy_retry_interval_change() {
+    let config = LlmConfig {
+        enabled: true,
+        base_url: Some("http://127.0.0.1:19999/v1".to_string()),
+        model: Some("model-stable".to_string()),
+        retry_interval_secs: 1,
+        ..Default::default()
+    };
+    let mut runtime = LlmClientRuntime::new(&config);
+    let first = runtime
+        .router_for_config(&config)
+        .expect("load initial router");
+
+    let mut changed = config.clone();
+    changed.retry_interval_secs = 9;
+    let second = runtime
+        .router_for_config(&changed)
+        .expect("rebuild changed retry interval router");
+
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "legacy scalar llm.retry_interval_secs changes must rebuild LLM router runtime"
     );
 }
 
