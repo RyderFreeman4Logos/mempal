@@ -1,7 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::core::config::{
-    AutoFactCheckConfig, Config, EmbeddingClassifierConfig, GatingRuleConfig, IngestGatingConfig,
+    AutoFactCheckConfig, Config, EmbeddingClassifierConfig, GatingQualityPolicy, GatingRuleConfig,
+    IngestGatingConfig,
 };
 use crate::core::db::{Database, DbError};
 use crate::embed::{EmbedError, Embedder, EmbedderFactory, build_backend_from_name};
@@ -81,6 +82,49 @@ impl GatingDecision {
         } else {
             None
         }
+    }
+}
+
+pub fn llm_judge_active(config: &Config) -> bool {
+    config.ingest_gating.enabled
+        && config.llm.enabled
+        && config.llm.enabled_for.iter().any(|item| item == "gating")
+        && config
+            .ingest_gating
+            .llm_judge
+            .as_ref()
+            .is_some_and(|judge| judge.enabled)
+}
+
+pub fn should_route_to_llm_judge(
+    config: &Config,
+    gating_decision: &Option<GatingDecision>,
+) -> bool {
+    if !llm_judge_active(config) {
+        return false;
+    }
+
+    let Some(judge) = config.ingest_gating.llm_judge.as_ref() else {
+        return false;
+    };
+
+    match gating_decision {
+        Some(decision) if decision.label.as_deref() == Some("llm_pending") => true,
+        Some(decision) if decision.tier <= 1 && decision.label.is_some() => false,
+        Some(decision)
+            if decision.is_rejected()
+                && decision.gating_reason.as_deref() != Some("prototype_below_threshold") =>
+        {
+            false
+        }
+        Some(decision)
+            if judge.quality_policy == GatingQualityPolicy::Tiered
+                && decision.gating_reason.as_deref() != Some("prototype_below_threshold") =>
+        {
+            false
+        }
+        Some(_) => true,
+        None => false,
     }
 }
 

@@ -10305,6 +10305,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         Some(threshold) => println!("  llm_threshold: {threshold}"),
         None => println!("  llm_threshold: none"),
     }
+    println!("  quality_policy: {}", ingest_gating_status.quality_policy);
     println!("  rules_count: {}", ingest_gating_status.rules_count);
     println!(
         "  tier1_skip_events: {}",
@@ -10317,6 +10318,34 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     println!("  tier2_kept: {}", gating_stats.tier2_kept);
     println!("  tier2_skipped: {}", gating_stats.tier2_skipped);
     println!("  unclassified: {}", gating_stats.unclassified);
+    println!(
+        "  recent_window_secs: {}",
+        ingest_gating_status.recent_window_secs
+    );
+    println!(
+        "  recent_tier1_count: {}",
+        ingest_gating_status.recent_tier1_count
+    );
+    println!(
+        "  recent_tier2_count: {}",
+        ingest_gating_status.recent_tier2_count
+    );
+    println!(
+        "  recent_llm_pending_count: {}",
+        ingest_gating_status.recent_llm_pending_count
+    );
+    println!(
+        "  recent_llm_verdict_count: {}",
+        ingest_gating_status.recent_llm_verdict_count
+    );
+    println!(
+        "  recent_llm_keep_count: {}",
+        ingest_gating_status.recent_llm_keep_count
+    );
+    println!(
+        "  recent_llm_reject_count: {}",
+        ingest_gating_status.recent_llm_reject_count
+    );
     let nonzero = gating_drop_counts
         .by_reason
         .iter()

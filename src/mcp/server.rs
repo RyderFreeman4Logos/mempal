@@ -52,7 +52,7 @@ use crate::ingest::{
     IngestError,
     gating::{
         GatingDecision, GatingRuntime, IngestCandidate, evaluate_fact_check_gate, evaluate_tier1,
-        evaluate_tier2,
+        evaluate_tier2, should_route_to_llm_judge,
     },
     normalize::CURRENT_NORMALIZE_VERSION,
     novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty},
@@ -4103,19 +4103,13 @@ impl MempalMcpServer {
                     )
                     .await;
                     first_vector = tier2.vector;
-                    // Tier 3: intercept uncertain Tier 2 results ("prototype_below_threshold")
-                    // and route to LLM judge when enabled (fail-open: store now, judge async).
-                    let llm_judge_active = superseded_drawer_id.is_none()
-                        && config.llm.enabled
-                        && config.llm.enabled_for.contains(&"gating".to_string())
-                        && config
-                            .ingest_gating
-                            .llm_judge
-                            .as_ref()
-                            .is_some_and(|j| j.enabled);
-                    let is_unclassified = tier2.decision.gating_reason.as_deref()
-                        == Some("prototype_below_threshold");
-                    if llm_judge_active && is_unclassified {
+                    // Tier 3: route calibrated candidates to LLM judge when enabled
+                    // (fail-open: store now, judge async). The routing helper preserves
+                    // mechanical Tier 1 skips while allowing quality policies such as
+                    // llm_first to judge Tier 2 keeps.
+                    if superseded_drawer_id.is_none()
+                        && should_route_to_llm_judge(&config, &Some(tier2.decision.clone()))
+                    {
                         let llm_decision =
                             GatingDecision::accepted(0, Some("llm_pending".to_string()), None);
                         db.record_gating_audit(

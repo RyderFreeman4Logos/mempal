@@ -1936,6 +1936,53 @@ fn pending_llm_task_count(db: &Database) -> i64 {
         .unwrap_or(0)
 }
 
+fn llm_task_payloads(db: &Database) -> Vec<serde_json::Value> {
+    let mut statement = db
+        .conn()
+        .prepare(
+            "SELECT payload FROM pending_messages WHERE kind = 'llm_task' ORDER BY created_at ASC",
+        )
+        .expect("prepare pending LLM payloads");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query pending LLM payloads")
+        .map(|payload| {
+            serde_json::from_str::<serde_json::Value>(&payload.expect("payload row"))
+                .expect("payload json")
+        })
+        .collect()
+}
+
+#[test]
+fn test_llm_judge_quality_policy_parses() {
+    let _guard = test_guard_blocking();
+    let config = Config::parse(
+        r#"
+[llm]
+enabled = true
+base_url = "http://localhost:18317/v1"
+model = "test-model"
+enabled_for = ["gating"]
+
+[gating]
+enabled = true
+
+[gating.llm_judge]
+enabled = true
+quality_policy = "llm_first"
+"#,
+    )
+    .expect("parse config");
+
+    let policy = config
+        .ingest_gating
+        .llm_judge
+        .as_ref()
+        .expect("llm judge")
+        .quality_policy;
+    assert_eq!(policy.to_string(), "llm_first");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gating_tier3_only_for_unclassified() {
     let _guard = test_guard().await;
@@ -2012,6 +2059,105 @@ enabled = true
         1,
         "tier2 unclassified must enqueue exactly one LLM task"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_llm_first_routes_tier2_keep_to_llm() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(
+        r#"
+[llm]
+enabled = true
+base_url = "http://localhost:18317/v1"
+model = "test-model"
+enabled_for = ["gating"]
+
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.8
+prototypes = ["valuable", "noise"]
+
+[gating.llm_judge]
+enabled = true
+quality_policy = "llm_first"
+threshold = 0.5
+"#,
+    );
+    let config = env.config();
+    let server = MempalMcpServer::new_with_factory_and_config(
+        env.db_path.clone(),
+        config,
+        deterministic_factory(
+            &[
+                ("valuable", vec![1.0, 0.0]),
+                ("noise", vec![0.0, 1.0]),
+                ("high value tier2 keep", vec![0.99, 0.01]),
+            ],
+            vec![0.2, 0.2],
+            &[],
+        ),
+    )
+    .expect("create MCP server");
+
+    let response = ingest_mcp(&server, "high value tier2 keep").await;
+    let rows = gating_rows(&env.db());
+    let payloads = llm_task_payloads(&env.db());
+
+    assert!(
+        !response.dropped,
+        "quality mode must fail-open while LLM judges async"
+    );
+    assert_eq!(pending_llm_task_count(&env.db()), 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].decision, "keep");
+    assert_eq!(rows[0].tier, 0);
+    assert_eq!(rows[0].label.as_deref(), Some("llm_pending"));
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0]["task_type"], "gating");
+    assert_eq!(payloads[0]["content"], "high value tier2 keep");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_llm_first_preserves_tier1_mechanical_skip() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(
+        r#"
+[llm]
+enabled = true
+base_url = "http://localhost:18317/v1"
+model = "test-model"
+enabled_for = ["gating"]
+
+[gating]
+enabled = true
+
+[gating.llm_judge]
+enabled = true
+quality_policy = "llm_first"
+"#,
+    );
+
+    let config = env.config();
+    let decision = evaluate_tier1(
+        &IngestCandidate {
+            content: "long enough mechanical output".to_string(),
+            event: Some("PostToolUse".to_string()),
+            tool_name: Some("Bash".to_string()),
+            exit_code: Some(0),
+        },
+        &config.ingest_gating,
+    )
+    .expect("tier1 mechanical decision");
+
+    assert!(decision.is_rejected());
+    assert_eq!(decision.tier, 1);
+    assert!(!mempal::ingest::gating::should_route_to_llm_judge(
+        &config,
+        &Some(decision)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2127,6 +2273,14 @@ threshold = 0.42
     assert_eq!(gate.llm_model.as_deref(), Some("test-model"));
     assert_eq!(gate.llm_threshold, Some(0.42));
     assert_eq!(gate.tier2_threshold, 0.8);
+    assert_eq!(gate.quality_policy, "tiered");
+    assert_eq!(gate.recent_window_secs, 86_400);
+    assert_eq!(gate.recent_tier1_count, 1);
+    assert_eq!(gate.recent_tier2_count, 1);
+    assert_eq!(gate.recent_llm_pending_count, 0);
+    assert_eq!(gate.recent_llm_verdict_count, 0);
+    assert_eq!(gate.recent_llm_keep_count, 0);
+    assert_eq!(gate.recent_llm_reject_count, 0);
     assert_eq!(gate.kept_total, 1);
     assert_eq!(gate.skipped_total, 1);
     assert_eq!(gate.dropped_total, 1);
@@ -2156,6 +2310,7 @@ threshold = 0.42
     let db = env.db();
 
     let audit_created_at = 1_700_000_000;
+    let recent_audit_created_at = now_unix_secs();
     let llm_completed_at = 1_800_000_123_456;
     let llm_failed_at = 1_900_000_654_000;
 
@@ -2193,6 +2348,23 @@ threshold = 0.42
         .expect("upsert reject verdict");
     db.soft_delete_drawer("llm-rejected-drawer")
         .expect("soft delete rejected drawer");
+
+    insert_status_drawer(&db, "recent-llm-keep-drawer");
+    insert_gating_audit_row(
+        &db,
+        GatingAuditSeed {
+            candidate_hash: "recent-llm-keep-candidate".to_string(),
+            drawer_id: Some("recent-llm-keep-drawer".to_string()),
+            decision: "keep",
+            tier: 3,
+            label: Some("llm_pending".to_string()),
+            reason: None,
+            score: Some(0.95),
+            created_at: recent_audit_created_at,
+        },
+    );
+    db.upsert_llm_verdict("recent-llm-keep-drawer", "keep", Some(0.95))
+        .expect("upsert recent keep verdict");
 
     insert_status_drawer(&db, "manual-delete-drawer");
     db.soft_delete_drawer("manual-delete-drawer")
@@ -2235,6 +2407,13 @@ threshold = 0.42
 
     assert_eq!(gate.last_llm_success_at, Some(llm_completed_at));
     assert_eq!(gate.last_llm_failure_at, Some(llm_failed_at));
+    assert_eq!(
+        gate.recent_llm_pending_count, 0,
+        "completed LLM verdict rows must not remain counted as pending"
+    );
+    assert_eq!(gate.recent_llm_verdict_count, 1);
+    assert_eq!(gate.recent_llm_keep_count, 1);
+    assert_eq!(gate.recent_llm_reject_count, 0);
     assert_eq!(gate.soft_deleted_total, 1);
 }
 

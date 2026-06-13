@@ -1235,6 +1235,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     }
     if let Some(decision) = gating_decision.as_ref()
         && decision.is_rejected()
+        && !should_enqueue_llm_gating(context.daemon.config, &gating_decision)
     {
         record_gating_audit_async(
             context.db,
@@ -1286,19 +1287,33 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 .embedding_classifier
                 .threshold,
         );
-        record_gating_audit_async(
-            context.db,
-            &drawer_id,
-            &decision,
-            record.project_id.clone(),
-            &candidate.content,
-        )
-        .await?;
-        gating_audit_recorded = true;
-        if decision.is_rejected() {
-            return Ok(drawer_id);
+        if should_enqueue_llm_gating(context.daemon.config, &Some(decision.clone())) {
+            let llm_decision = GatingDecision::accepted(0, Some("llm_pending".to_string()), None);
+            record_gating_audit_async(
+                context.db,
+                &drawer_id,
+                &llm_decision,
+                record.project_id.clone(),
+                &candidate.content,
+            )
+            .await?;
+            gating_audit_recorded = true;
+            gating_decision = Some(llm_decision);
+        } else {
+            record_gating_audit_async(
+                context.db,
+                &drawer_id,
+                &decision,
+                record.project_id.clone(),
+                &candidate.content,
+            )
+            .await?;
+            gating_audit_recorded = true;
+            if decision.is_rejected() {
+                return Ok(drawer_id);
+            }
+            gating_decision = Some(decision);
         }
-        gating_decision = Some(decision);
         vector = Some(candidate_vector);
     }
     if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
@@ -1768,23 +1783,7 @@ fn should_enqueue_llm_gating(
     config: &crate::core::config::Config,
     gating_decision: &Option<GatingDecision>,
 ) -> bool {
-    if !config.llm.enabled {
-        return false;
-    }
-    if !config.llm.enabled_for.iter().any(|s| s == "gating") {
-        return false;
-    }
-    let Some(judge) = config.ingest_gating.llm_judge.as_ref() else {
-        return false;
-    };
-    if !judge.enabled {
-        return false;
-    }
-    match gating_decision {
-        Some(decision) if decision.is_rejected() => false,
-        Some(decision) if decision.tier <= 1 && decision.label.is_some() => false,
-        _ => true,
-    }
+    crate::ingest::gating::should_route_to_llm_judge(config, gating_decision)
 }
 
 pub(crate) fn llm_worker_claim_enabled(config: &crate::core::config::Config) -> bool {
@@ -1992,8 +1991,8 @@ mod tests {
 
     use super::{
         ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext, HookWorkerState,
-        build_drawer_records, llm_worker_claim_enabled, poll_claim_next,
-        process_claimed_message_with_embedder, run_hook_worker, wing_from_cwd,
+        build_drawer_records, compile_classifier_from_embedder, llm_worker_claim_enabled,
+        poll_claim_next, process_claimed_message_with_embedder, run_hook_worker, wing_from_cwd,
     };
 
     struct StubClaimSource {
@@ -2020,6 +2019,33 @@ mod tests {
 
         config.llm.enabled_for.push("gating".to_string());
         assert!(llm_worker_claim_enabled(&config));
+    }
+
+    #[test]
+    fn test_daemon_llm_enqueue_requires_a_gating_decision() {
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.llm.enabled_for = vec!["gating".to_string()];
+        config.ingest_gating.enabled = true;
+        config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+
+        assert!(
+            !super::should_enqueue_llm_gating(&config, &None),
+            "daemon must not enqueue LLM gating tasks before Tier 2 produced an auditable decision"
+        );
+
+        let llm_pending = crate::ingest::gating::GatingDecision::accepted(
+            0,
+            Some("llm_pending".to_string()),
+            None,
+        );
+        assert!(super::should_enqueue_llm_gating(
+            &config,
+            &Some(llm_pending)
+        ));
     }
 
     impl ClaimNextSource for StubClaimSource {
@@ -2928,9 +2954,9 @@ mod tests {
         let store = PendingMessageStore::new(db.path()).expect("open queue");
         let async_store = AsyncPendingMessageStore::from_store(store.clone());
         let hook_payload = serde_json::json!({
-            "tool_name": "Bash",
-            "input": "printf race",
-            "output": "durable before llm",
+            "tool_name": "DesignCapture",
+            "input": "record durable llm enqueue order",
+            "output": "The daemon must durably insert the drawer and vector before exposing the local LLM gating task to the worker queue.",
             "exit_code": 0
         })
         .to_string();
@@ -2958,10 +2984,21 @@ mod tests {
 
         let mut config = Config::default();
         config.llm.enabled = true;
+        config.llm.enabled_for = vec!["gating".to_string()];
+        config.ingest_gating.enabled = true;
+        config.ingest_gating.embedding_classifier.enabled = true;
+        config.ingest_gating.embedding_classifier.threshold = 1.1;
+        config.ingest_gating.embedding_classifier.prototypes = vec!["keep".to_string()];
         config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
             enabled: true,
             ..LlmJudgeConfig::default()
         });
+        let classifier_embedder = StaticEmbedder;
+        let classifier =
+            compile_classifier_from_embedder(&classifier_embedder, &config.ingest_gating)
+                .await
+                .expect("compile classifier")
+                .expect("classifier enabled");
         let embedder = LlmClaimRaceProbeEmbedder {
             store: store.clone(),
             embed_calls: AtomicUsize::new(0),
@@ -2973,7 +3010,7 @@ mod tests {
             &message,
             &embedder,
             DaemonIngestContext {
-                prototype_classifier: None,
+                prototype_classifier: Some(&classifier),
                 config: &config,
                 mempal_home: tmp.path(),
             },
@@ -3006,6 +3043,131 @@ mod tests {
         let task: crate::llm::LlmTaskPayload =
             serde_json::from_str(&llm_task.payload).expect("decode llm task");
         assert_eq!(task.drawer_id, drawer_id);
+    }
+
+    #[tokio::test]
+    async fn test_daemon_routes_tier2_unclassified_to_llm_before_skipping() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let hook_payload = serde_json::json!({
+            "tool_name": "DesignCapture",
+            "input": "record calibrated gating behavior",
+            "output": "Retain this calibrated high-signal design note about local LLM judging so the next agent can continue the forget safety work without losing context.",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        let queued_id = store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("llm-unclassified-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+        assert_eq!(message.id, queued_id);
+
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.ingest_gating.enabled = true;
+        config.ingest_gating.embedding_classifier.enabled = true;
+        config.ingest_gating.embedding_classifier.threshold = 1.1;
+        config.ingest_gating.embedding_classifier.prototypes = vec!["keep".to_string()];
+        config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+        let embedder = StaticEmbedder;
+        let classifier = compile_classifier_from_embedder(&embedder, &config.ingest_gating)
+            .await
+            .expect("compile classifier")
+            .expect("classifier enabled");
+
+        let drawer_id = process_claimed_message_with_embedder(
+            &async_db,
+            &async_store,
+            "llm-unclassified-worker",
+            &message,
+            &embedder,
+            DaemonIngestContext {
+                prototype_classifier: Some(&classifier),
+                config: &config,
+                mempal_home: tmp.path(),
+            },
+        )
+        .await
+        .expect("process hook envelope");
+
+        assert!(
+            db.drawer_exists(&drawer_id).expect("drawer exists query"),
+            "unclassified Tier 2 candidates should be stored fail-open for local LLM judge"
+        );
+        let llm_task = store
+            .claim_next_by_kind("llm-unclassified-final", 60, "llm_task")
+            .expect("claim llm task")
+            .expect("unclassified Tier 2 candidate should be queued for LLM judge");
+        let task: crate::llm::LlmTaskPayload =
+            serde_json::from_str(&llm_task.payload).expect("decode llm task");
+        assert_eq!(task.drawer_id, drawer_id);
+
+        let (audit_decision, label, audit_drawer_id, content_preview): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = db
+            .conn()
+            .query_row(
+                "SELECT decision, label, drawer_id, content_preview FROM gating_audit WHERE candidate_hash = ?1",
+                [drawer_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("query daemon gating audit");
+        assert_eq!(audit_decision, "keep");
+        assert_eq!(label.as_deref(), Some("llm_pending"));
+        assert_eq!(audit_drawer_id.as_deref(), Some(drawer_id.as_str()));
+        assert!(
+            content_preview.is_none(),
+            "fail-open LLM-pending audit rows must not retain raw content previews"
+        );
+        let dropped_total: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM fork_ext_meta WHERE key = 'gating.dropped.total'), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query dropped counter");
+        assert_eq!(
+            dropped_total, 0,
+            "fail-open LLM-pending candidates must not increment drop counters"
+        );
+        db.upsert_llm_verdict(&drawer_id, "keep", Some(0.9))
+            .expect("upsert llm verdict");
+        let llm_verdict: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT llm_verdict FROM gating_audit WHERE candidate_hash = ?1",
+                [drawer_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("query llm verdict");
+        assert_eq!(llm_verdict.as_deref(), Some("keep"));
     }
 
     #[test]

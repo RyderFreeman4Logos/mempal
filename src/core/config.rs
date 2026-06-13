@@ -2401,8 +2401,29 @@ fn default_tier1_skip_events() -> Vec<String> {
 pub struct LlmJudgeConfig {
     pub enabled: bool,
     pub allow_fallback_worse_memory: bool,
+    pub quality_policy: GatingQualityPolicy,
     pub system_prompt: Option<String>,
     pub threshold: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatingQualityPolicy {
+    #[default]
+    Tiered,
+    LlmFirst,
+    LlmRequiredForKeep,
+}
+
+impl std::fmt::Display for GatingQualityPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Tiered => "tiered",
+            Self::LlmFirst => "llm_first",
+            Self::LlmRequiredForKeep => "llm_required_for_keep",
+        };
+        f.write_str(value)
+    }
 }
 
 impl Default for LlmJudgeConfig {
@@ -2410,6 +2431,7 @@ impl Default for LlmJudgeConfig {
         Self {
             enabled: false,
             allow_fallback_worse_memory: false,
+            quality_policy: GatingQualityPolicy::default(),
             system_prompt: None,
             threshold: 0.3,
         }

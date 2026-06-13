@@ -126,15 +126,18 @@ enabled = true
 
 [ingest_gating.llm_judge]
 enabled = true
+quality_policy = "tiered"        # default; set "llm_first" for local-LLM-first quality mode
 system_prompt = "You are a quality judge..."
 threshold = 0.6                 # LLM 返回的 score >= threshold 才 Keep
 ```
 
 - Tier 3 仅在 `[llm].enabled = true` 且 `"gating"` 在 `enabled_for` 中 且 `[ingest_gating.llm_judge].enabled = true` 时激活
-- Tier 1/2 已 Skip 的 → 不进 Tier 3（短路）
-- Tier 1/2 已 Keep 的 → 也不进 Tier 3（已经决定保留）
-- 仅 Tier 2 `Unclassified` 的候选进入 Tier 3（模糊地带由 LLM 裁决）
+- Tier 1 机械 skip 仍短路，不进 Tier 3（短文本、低价值工具输出等高精度过滤保持低成本）
+- 默认 `quality_policy = "tiered"`：仅 Tier 2 `Unclassified`（`prototype_below_threshold`）候选进入 Tier 3，保持兼容行为
+- `quality_policy = "llm_first"`：Tier 2 keep 与 unclassified 都异步进入本地 LLM judge；用于 forget/rejudge 前的高质量模式，避免静态原型分数成为最终质量判定
+- `quality_policy = "llm_required_for_keep"` 是保留的严格策略枚举，当前同 `llm_first` 路由语义一致，供后续同步 fail-closed/execute 前计划使用
 - Gating 中 Tier 3 是 **异步非阻塞**：先 `Keep` 放行（fail-open），同时入队 LLM 任务；LLM 结果回来后异步更新 `gating_audit` 表的 `llm_verdict`
+- `mempal status` / MCP `mempal_status` 暴露 `quality_policy`、最近 24h Tier1/Tier2/LLM pending/verdict 聚合计数，便于发现 "recent LLM judge=0" 的质量门失效
 - 后续可通过 `mempal gating stats` 查看 LLM judge 的判决分布，作为调参依据
 
 ### Degraded 状态
