@@ -19,6 +19,7 @@ const FOLLOW_POLL_SECS: u64 = 2;
 const FOLLOW_DEBOUNCE_MS: u64 = 250;
 const FOLLOW_SILENCE_TIMEOUT_MS: u64 = 3_000;
 const PREVIEW_CHARS: usize = 120;
+const GATING_STATUS_RECENT_WINDOW_SECS: u64 = 86_400;
 
 pub struct TailOptions<'a> {
     pub limit: usize,
@@ -184,10 +185,18 @@ pub struct GatingRuntimeStatus {
     pub tier2_active: bool,
     pub llm_active: bool,
     pub llm_model: Option<String>,
+    pub quality_policy: String,
     pub tier2_threshold: f32,
     pub llm_threshold: Option<f64>,
     pub tier1_skip_events: Vec<String>,
     pub rules_count: usize,
+    pub recent_window_secs: u64,
+    pub recent_tier1_count: u64,
+    pub recent_tier2_count: u64,
+    pub recent_llm_pending_count: u64,
+    pub recent_llm_verdict_count: u64,
+    pub recent_llm_keep_count: u64,
+    pub recent_llm_reject_count: u64,
     pub kept_total: usize,
     pub skipped_total: usize,
     pub dropped_total: u64,
@@ -208,6 +217,7 @@ pub fn gating_runtime_status(
 ) -> Result<GatingRuntimeStatus> {
     let kept_total = gating_decision_count(db, "keep")?;
     let skipped_total = gating_decision_count(db, "skip")?;
+    let recent_since = now_unix_secs().saturating_sub(GATING_STATUS_RECENT_WINDOW_SECS as i64);
     Ok(GatingRuntimeStatus {
         enabled: config.ingest_gating.enabled,
         tier1_active: config.ingest_gating.enabled,
@@ -227,6 +237,12 @@ pub fn gating_runtime_status(
                 .as_ref()
                 .is_some_and(|judge| judge.enabled),
         llm_model: config.llm.effective_model_summary(),
+        quality_policy: config
+            .ingest_gating
+            .llm_judge
+            .as_ref()
+            .map(|judge| judge.quality_policy.to_string())
+            .unwrap_or_else(|| "tiered".to_string()),
         tier2_threshold: config.ingest_gating.embedding_classifier.threshold,
         llm_threshold: config
             .ingest_gating
@@ -235,6 +251,13 @@ pub fn gating_runtime_status(
             .map(|judge| judge.threshold),
         tier1_skip_events: config.ingest_gating.tier1_skip_events.clone(),
         rules_count: config.ingest_gating.rules.len(),
+        recent_window_secs: GATING_STATUS_RECENT_WINDOW_SECS,
+        recent_tier1_count: recent_gating_tier_count(db, recent_since, 1)?,
+        recent_tier2_count: recent_gating_tier_count(db, recent_since, 2)?,
+        recent_llm_pending_count: recent_gating_label_count(db, recent_since, "llm_pending")?,
+        recent_llm_verdict_count: recent_gating_llm_verdict_count(db, recent_since, None)?,
+        recent_llm_keep_count: recent_gating_llm_verdict_count(db, recent_since, Some("keep"))?,
+        recent_llm_reject_count: recent_gating_llm_verdict_count(db, recent_since, Some("reject"))?,
         kept_total,
         skipped_total,
         dropped_total: dropped_total.max(skipped_total as u64),
@@ -246,6 +269,73 @@ pub fn gating_runtime_status(
         last_llm_failure_at: last_failed_llm_task_at(db)?,
         restart_required_config_changes,
     })
+}
+
+fn recent_gating_tier_count(db: &Database, since_unix_secs: i64, tier: i64) -> Result<u64> {
+    if !table_has_column(db, "gating_audit", "tier")?
+        || !table_has_column(db, "gating_audit", "created_at")?
+    {
+        return Ok(0);
+    }
+    let count = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM gating_audit WHERE created_at >= ?1 AND tier = ?2",
+            params![since_unix_secs, tier],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("failed to count recent gating tiers")?;
+    u64::try_from(count).context("recent gating tier count was negative")
+}
+
+fn recent_gating_label_count(db: &Database, since_unix_secs: i64, label: &str) -> Result<u64> {
+    if !table_has_column(db, "gating_audit", "label")?
+        || !table_has_column(db, "gating_audit", "created_at")?
+    {
+        return Ok(0);
+    }
+    let count = if label == "llm_pending" && table_has_column(db, "gating_audit", "llm_verdict")? {
+        db.conn().query_row(
+            "SELECT COUNT(*) FROM gating_audit WHERE created_at >= ?1 AND label = ?2 AND llm_verdict IS NULL",
+            params![since_unix_secs, label],
+            |row| row.get::<_, i64>(0),
+        )
+    } else {
+        db.conn().query_row(
+            "SELECT COUNT(*) FROM gating_audit WHERE created_at >= ?1 AND label = ?2",
+            params![since_unix_secs, label],
+            |row| row.get::<_, i64>(0),
+        )
+    }
+    .context("failed to count recent gating labels")?;
+    u64::try_from(count).context("recent gating label count was negative")
+}
+
+fn recent_gating_llm_verdict_count(
+    db: &Database,
+    since_unix_secs: i64,
+    verdict: Option<&str>,
+) -> Result<u64> {
+    if !table_has_column(db, "gating_audit", "llm_verdict")?
+        || !table_has_column(db, "gating_audit", "created_at")?
+    {
+        return Ok(0);
+    }
+    let count = if let Some(verdict) = verdict {
+        db.conn().query_row(
+            "SELECT COUNT(*) FROM gating_audit WHERE created_at >= ?1 AND llm_verdict = ?2",
+            params![since_unix_secs, verdict],
+            |row| row.get::<_, i64>(0),
+        )
+    } else {
+        db.conn().query_row(
+            "SELECT COUNT(*) FROM gating_audit WHERE created_at >= ?1 AND llm_verdict IS NOT NULL",
+            params![since_unix_secs],
+            |row| row.get::<_, i64>(0),
+        )
+    }
+    .context("failed to count recent gating LLM verdicts")?;
+    u64::try_from(count).context("recent gating LLM verdict count was negative")
 }
 
 fn gating_decision_count(db: &Database, decision: &str) -> Result<usize> {
