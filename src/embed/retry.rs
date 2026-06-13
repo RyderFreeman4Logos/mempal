@@ -26,18 +26,26 @@ where
                 if !error.is_retryable() {
                     return Err(error);
                 }
+                let retry_after = error
+                    .retry_after()
+                    .unwrap_or_else(|| Duration::from_secs(status.retry_interval_secs()));
                 refresh_heartbeat(heartbeat);
-                wait_for_next_retry(status, heartbeat).await;
+                wait_for_next_retry(status, heartbeat, retry_after).await;
             }
         }
     }
 }
 
-async fn wait_for_next_retry(status: &EmbedStatus, heartbeat: Option<&HeartbeatCallback>) {
+async fn wait_for_next_retry(
+    status: &EmbedStatus,
+    heartbeat: Option<&HeartbeatCallback>,
+    retry_after: Duration,
+) {
     let started_at = tokio::time::Instant::now();
     let tick = Duration::from_millis(50);
     loop {
-        let retry_after = Duration::from_secs(status.retry_interval_secs());
+        let configured_retry_after = Duration::from_secs(status.retry_interval_secs());
+        let retry_after = retry_after.max(configured_retry_after);
         let elapsed = started_at.elapsed();
         if elapsed >= retry_after {
             refresh_heartbeat(heartbeat);

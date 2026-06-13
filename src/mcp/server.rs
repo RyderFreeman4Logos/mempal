@@ -100,20 +100,20 @@ use super::tools::{
     CoworkBusHandoffDto, CoworkBusHandoffFiltersDto, CoworkBusMessageDto, CoworkBusRequest,
     CoworkBusResponse, CoworkBusSessionDto, CoworkBusTmuxPeekDto, CoworkBusTmuxProbeDto,
     CoworkPushRequest, CoworkPushResponse, DatabaseDiagnosticDto, DeleteRequest, DeleteResponse,
-    DoctorMcpDto, DoctorRequest, DoctorResponse, DoctorToolDto, DuplicateWarning, EmbedStatusDto,
-    EmbedderCircuitDto, EndpointHealthDto, FactCheckRequest, FactCheckResponse,
-    FieldTaxonomyEntryDto, FieldTaxonomyResponse, GatingRuntimeStatusDto, IngestControls,
-    IngestOperationState, IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest,
-    KgResponse, KgStatsDto, KnowledgeCardDto, KnowledgeCardEventDto, KnowledgeCardsRequest,
-    KnowledgeCardsResponse, KnowledgeDemoteRequest, KnowledgeDemoteResponse,
-    KnowledgeDistillRequest, KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse,
-    KnowledgePolicyResponse, KnowledgePromoteRequest, KnowledgePromoteResponse,
-    KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest,
-    LeaseResponse, LlmEndpointStatusDto, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT,
-    MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest, PeekMessageDto, PeekPartnerRequest,
-    PeekPartnerResponse, Phase3GateDto, Phase3Request, Phase3Response, PinnedFactDto,
-    PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse, QueueStatsDto,
-    ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
+    DoctorMcpDto, DoctorRequest, DoctorResponse, DoctorToolDto, DuplicateWarning,
+    EmbedEndpointStatusDto, EmbedStatusDto, EmbedderCircuitDto, EndpointHealthDto,
+    FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto, FieldTaxonomyResponse,
+    GatingRuntimeStatusDto, IngestControls, IngestOperationState, IngestRequest, IngestResponse,
+    IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto, KnowledgeCardDto,
+    KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse, KnowledgeDemoteRequest,
+    KnowledgeDemoteResponse, KnowledgeDistillRequest, KnowledgeDistillResponse,
+    KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse, KnowledgePromoteRequest,
+    KnowledgePromoteResponse, KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse,
+    LeaseInfoDto, LeaseRequest, LeaseResponse, LlmEndpointStatusDto, LlmStatusDto,
+    MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest,
+    PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
+    Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
+    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
     ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto, RollbackRequest,
     RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto,
     SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
@@ -2206,6 +2206,11 @@ impl MempalMcpServer {
         };
         let endpoint_health = crate::endpoint_health::probe_endpoints(config.as_ref()).await;
         let embed_snapshot = global_embed_status().snapshot();
+        let embed_endpoint_runtime = global_embed_status()
+            .endpoint_runtime_snapshots()
+            .into_iter()
+            .map(|snapshot| (snapshot.id.clone(), snapshot))
+            .collect::<BTreeMap<_, _>>();
         let intelligence_snapshot = crate::intelligence::global_intelligence_status().snapshot();
         let db_holders = crate::process_diagnostics::inspect_db_holders(&self.db_path);
         let vector_search_circuit =
@@ -2344,6 +2349,37 @@ impl MempalMcpServer {
                     .embed
                     .resolved_openai_base_url()
                     .map(ToOwned::to_owned),
+                model: config.embed.effective_model_summary(),
+                endpoints: config
+                    .embed
+                    .effective_endpoints()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|endpoint| {
+                        let runtime = embed_endpoint_runtime.get(&endpoint.id);
+                        EmbedEndpointStatusDto {
+                            id: endpoint.id,
+                            backend: endpoint.backend,
+                            base_url: endpoint.base_url,
+                            model: endpoint.model,
+                            priority: endpoint.priority,
+                            retry_interval_secs: endpoint.retry_interval_secs,
+                            request_timeout_secs: endpoint.request_timeout_secs,
+                            max_concurrent: endpoint.max_concurrent,
+                            dimensions: endpoint.dimensions,
+                            cooldown_remaining_secs: runtime
+                                .and_then(|state| state.cooldown_remaining_secs),
+                            cooldown_until_unix_ms: runtime
+                                .and_then(|state| state.cooldown_until_unix_ms),
+                            last_failure_at_unix_ms: runtime
+                                .and_then(|state| state.last_failure_at_unix_ms),
+                            last_success_at_unix_ms: runtime
+                                .and_then(|state| state.last_success_at_unix_ms),
+                            last_error: runtime.and_then(|state| state.last_error.clone()),
+                        }
+                    })
+                    .collect(),
+                max_concurrent: config.embed.pool_capacity(),
                 pending_count: queue_stats.pending,
                 claimed_count: queue_stats.claimed,
                 failed_count: queue_stats.failed,

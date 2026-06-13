@@ -10152,6 +10152,45 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     if let Some(last_success_at) = embed_status.last_success_at_unix_ms {
         println!("embed_last_success_at_unix_ms: {last_success_at}");
     }
+    let embed_endpoint_runtime = global_embed_status()
+        .endpoint_runtime_snapshots()
+        .into_iter()
+        .map(|snapshot| (snapshot.id.clone(), snapshot))
+        .collect::<BTreeMap<_, _>>();
+    println!("Embedding:");
+    println!("  backend: {}", config.embed.backend);
+    if let Some(model) = config.embed.effective_model_summary().as_deref() {
+        println!("  model: {model}");
+    }
+    if let Some(base_url) = config.embed.effective_base_url_summary().as_deref() {
+        println!("  base_url: {base_url}");
+    }
+    println!("  pool_capacity: {}", config.embed.pool_capacity());
+    let endpoints = config.embed.effective_endpoints().unwrap_or_default();
+    if endpoints.is_empty() {
+        println!("  endpoints: none");
+    } else {
+        println!("  endpoints:");
+        for endpoint in endpoints {
+            let runtime = embed_endpoint_runtime.get(&endpoint.id);
+            let cooldown = runtime
+                .and_then(|state| state.cooldown_remaining_secs)
+                .map(|secs| secs.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "    {}: backend={} model={} base_url={} priority={} max_concurrent={} retry_interval_secs={} dim={} cooldown_remaining_secs={}",
+                endpoint.id,
+                endpoint.backend,
+                endpoint.model,
+                endpoint.base_url,
+                endpoint.priority,
+                endpoint.max_concurrent,
+                endpoint.retry_interval_secs,
+                endpoint.dimensions,
+                cooldown
+            );
+        }
+    }
     match &endpoint_health {
         Some(health) => {
             println!("Endpoints:");
@@ -11137,12 +11176,26 @@ async fn build_embedder(config: &Config) -> Result<Box<dyn Embedder>> {
         .context("failed to initialize embedder")
 }
 async fn build_specific_embedder(config: &Config, backend: &str) -> Result<Box<dyn Embedder>> {
+    if same_embed_backend(config.embed.backend.as_str(), backend) {
+        return build_embedder(config).await;
+    }
     let mut selected = config.clone();
     selected.embed.backend = backend.to_string();
     selected.embed.fallback = None;
     build_backend_from_name(&selected, backend)
         .await
         .context("failed to initialize requested embedder")
+}
+
+fn same_embed_backend(left: &str, right: &str) -> bool {
+    normalize_embed_backend_alias(left) == normalize_embed_backend_alias(right)
+}
+
+fn normalize_embed_backend_alias(backend: &str) -> &str {
+    match backend {
+        "api" => "openai_compat",
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -16723,6 +16776,36 @@ fn doctor_command(format: String) -> Result<()> {
                 "path_matches_current_exe={:?}",
                 report.install.path_matches_current_exe
             );
+            println!("embedding_backend={}", report.embedding.backend);
+            println!(
+                "embedding_model={}",
+                report.embedding.model.as_deref().unwrap_or("none")
+            );
+            println!("embedding_pool_capacity={}", report.embedding.pool_capacity);
+            println!(
+                "embedding_queue=pending:{} claimed:{} failed:{}",
+                report.embedding.queue.pending,
+                report.embedding.queue.claimed,
+                report.embedding.queue.failed
+            );
+            if report.embedding.endpoints.is_empty() {
+                println!("embedding_endpoints=none");
+            } else {
+                for endpoint in &report.embedding.endpoints {
+                    println!(
+                        "embedding_endpoint={} model={} base_url={} priority={} max_concurrent={} cooldown_remaining_secs={}",
+                        endpoint.id,
+                        endpoint.model,
+                        endpoint.base_url,
+                        endpoint.priority,
+                        endpoint.max_concurrent,
+                        endpoint
+                            .cooldown_remaining_secs
+                            .map(|secs| secs.to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    );
+                }
+            }
             if report.restart_required_config_changes.is_empty() {
                 println!("restart_required_config_changes=none");
             } else {
@@ -17407,6 +17490,13 @@ mod tests {
             vec!["stale".to_string()],
             "drawer with current fingerprint is excluded"
         );
+    }
+
+    #[test]
+    fn embed_backend_aliases_match_for_shared_pool() {
+        assert!(same_embed_backend("api", "openai_compat"));
+        assert!(same_embed_backend("openai_compat", "api"));
+        assert!(!same_embed_backend("model2vec", "openai_compat"));
     }
 
     #[cfg(feature = "model2vec")]

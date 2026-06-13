@@ -65,12 +65,16 @@ impl ApiEmbedder {
             .map_err(|source| EmbedError::HttpRequest {
                 endpoint: endpoint.clone(),
                 source,
-            })?
-            .error_for_status()
-            .map_err(|source| EmbedError::HttpStatus {
-                endpoint: endpoint.clone(),
-                source,
-            })?
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(EmbedError::HttpStatus {
+                endpoint,
+                status,
+                retry_after: None,
+            });
+        }
+        let response = response
             .json::<OpenAiEmbeddingsResponse>()
             .await
             .map_err(|source| EmbedError::DecodeResponse { endpoint, source })?;
@@ -101,18 +105,23 @@ impl ApiEmbedder {
                 .map_err(|source| EmbedError::HttpRequest {
                     endpoint: endpoint.clone(),
                     source,
-                })?
-                .error_for_status()
-                .map_err(|source| EmbedError::HttpStatus {
-                    endpoint: endpoint.clone(),
-                    source,
-                })?
-                .json::<Value>()
-                .await
-                .map_err(|source| EmbedError::DecodeResponse {
-                    endpoint: endpoint.clone(),
-                    source,
                 })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(EmbedError::HttpStatus {
+                    endpoint,
+                    status,
+                    retry_after: None,
+                });
+            }
+            let response =
+                response
+                    .json::<Value>()
+                    .await
+                    .map_err(|source| EmbedError::DecodeResponse {
+                        endpoint: endpoint.clone(),
+                        source,
+                    })?;
 
             let embedding = response
                 .get("embedding")

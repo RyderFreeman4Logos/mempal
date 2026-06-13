@@ -2140,6 +2140,12 @@ pub struct EmbedStatusDto {
     pub backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<EmbedEndpointStatusDto>,
+    #[serde(default)]
+    pub max_concurrent: usize,
     pub pending_count: u64,
     pub claimed_count: u64,
     pub failed_count: u64,
@@ -2150,6 +2156,29 @@ pub struct EmbedStatusDto {
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_success_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct EmbedEndpointStatusDto {
+    pub id: String,
+    pub backend: String,
+    pub base_url: String,
+    pub model: String,
+    pub priority: i32,
+    pub retry_interval_secs: u64,
+    pub request_timeout_secs: u64,
+    pub max_concurrent: usize,
+    pub dimensions: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_remaining_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

@@ -6,8 +6,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
-use crate::core::config::ConfigHandle;
+use crate::core::config::{Config, ConfigHandle};
 use crate::core::db::CURRENT_SCHEMA_VERSION;
+use crate::core::queue::{QueueStats, queue_stats_readonly};
 use crate::process_diagnostics::{DbHolderReport, inspect_db_holders};
 
 pub const REQUIRED_MCP_TOOLS: &[&str] = &[
@@ -76,9 +77,44 @@ pub struct DoctorReport {
     pub db: DoctorDbReport,
     pub db_holders: DbHolderReport,
     pub install: DoctorInstallReport,
+    pub embedding: DoctorEmbeddingReport,
     pub restart_required_config_changes: Vec<String>,
     pub warnings: Vec<String>,
     pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DoctorEmbeddingReport {
+    pub backend: String,
+    pub model: Option<String>,
+    pub pool_capacity: usize,
+    pub endpoints: Vec<DoctorEmbeddingEndpointReport>,
+    pub queue: DoctorEmbeddingQueueReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorEmbeddingEndpointReport {
+    pub id: String,
+    pub backend: String,
+    pub base_url: String,
+    pub model: String,
+    pub priority: i32,
+    pub retry_interval_secs: u64,
+    pub request_timeout_secs: u64,
+    pub max_concurrent: usize,
+    pub dimensions: usize,
+    pub cooldown_remaining_secs: Option<u64>,
+    pub cooldown_until_unix_ms: Option<u64>,
+    pub last_failure_at_unix_ms: Option<u64>,
+    pub last_success_at_unix_ms: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DoctorEmbeddingQueueReport {
+    pub pending: u64,
+    pub claimed: u64,
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +172,8 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
     let db = inspect_db(db_path);
     let db_holders = inspect_db_holders(db_path);
     let install = inspect_install();
+    let config = Config::load().ok();
+    let embedding = build_embedding_report(config.as_ref(), db_path);
     let restart_required_config_changes = ConfigHandle::restart_required_pending();
     let mut warnings = Vec::new();
     let mut recommendations = vec![
@@ -175,9 +213,64 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
         db,
         db_holders,
         install,
+        embedding,
         restart_required_config_changes,
         warnings,
         recommendations,
+    }
+}
+
+fn build_embedding_report(config: Option<&Config>, db_path: &Path) -> DoctorEmbeddingReport {
+    let Some(config) = config else {
+        return DoctorEmbeddingReport::default();
+    };
+    let endpoint_runtime = crate::embed::global_embed_status()
+        .endpoint_runtime_snapshots()
+        .into_iter()
+        .map(|snapshot| (snapshot.id.clone(), snapshot))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let endpoints = config
+        .embed
+        .effective_endpoints()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|endpoint| {
+            let runtime = endpoint_runtime.get(&endpoint.id);
+            DoctorEmbeddingEndpointReport {
+                id: endpoint.id,
+                backend: endpoint.backend,
+                base_url: endpoint.base_url,
+                model: endpoint.model,
+                priority: endpoint.priority,
+                retry_interval_secs: endpoint.retry_interval_secs,
+                request_timeout_secs: endpoint.request_timeout_secs,
+                max_concurrent: endpoint.max_concurrent,
+                dimensions: endpoint.dimensions,
+                cooldown_remaining_secs: runtime.and_then(|state| state.cooldown_remaining_secs),
+                cooldown_until_unix_ms: runtime.and_then(|state| state.cooldown_until_unix_ms),
+                last_failure_at_unix_ms: runtime.and_then(|state| state.last_failure_at_unix_ms),
+                last_success_at_unix_ms: runtime.and_then(|state| state.last_success_at_unix_ms),
+                last_error: runtime.and_then(|state| state.last_error.clone()),
+            }
+        })
+        .collect();
+    let queue = queue_stats_readonly(db_path)
+        .map(queue_report_from_stats)
+        .unwrap_or_default();
+    DoctorEmbeddingReport {
+        backend: config.embed.backend.clone(),
+        model: config.embed.effective_model_summary(),
+        pool_capacity: config.embed.pool_capacity(),
+        endpoints,
+        queue,
+    }
+}
+
+fn queue_report_from_stats(stats: QueueStats) -> DoctorEmbeddingQueueReport {
+    DoctorEmbeddingQueueReport {
+        pending: stats.pending,
+        claimed: stats.claimed,
+        failed: stats.failed,
     }
 }
 

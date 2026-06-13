@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
+use mempal::core::config::Config;
 use mempal::core::db::CURRENT_VECTOR_INDEX_VERSION;
 use mempal::core::db::Database;
 use mempal::core::reindex::ReindexProgressStore;
@@ -365,11 +366,9 @@ async fn test_reindex_progress_reconciliation_finalizes_orphan_running_row() {
     assert_eq!(running, "running");
     let before = read_reindex_progress_status_counts(&db);
 
-    let target_fingerprint = format!(
-        "openai_compat:Qwen/Qwen3-Embedding-8B:{}:{}",
-        server.base_url.trim_end_matches('/'),
-        3
-    );
+    let config =
+        Config::load_from(&home.join(".mempal").join("config.toml")).expect("load reindex config");
+    let target_fingerprint = config.embed.current_vector_embedder_fingerprint(3);
     let reconciled = progress
         .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, &target_fingerprint)
         .expect("reconcile orphan running row");

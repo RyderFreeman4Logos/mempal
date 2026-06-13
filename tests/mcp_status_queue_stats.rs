@@ -141,6 +141,66 @@ enabled = true
     );
 }
 
+#[tokio::test]
+async fn test_mcp_status_reports_embedding_endpoint_pool() {
+    let (tmp, db_path) = setup_home();
+    let mempal_home = tmp.path().join(".mempal");
+    let config_path = mempal_home.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+db_path = "{}"
+
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "gb10"
+base_url = "http://gb10.local:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 4096
+priority = 0
+max_concurrent = 4
+retry_interval_secs = 2
+
+[[embed.endpoints]]
+id = "spark"
+base_url = "http://spark.local:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 4096
+priority = 0
+max_concurrent = 2
+retry_interval_secs = 5
+"#,
+            db_path.display()
+        ),
+    )
+    .expect("write embedding endpoint-pool config");
+    ConfigHandle::bootstrap(&config_path).expect("bootstrap embedding endpoint-pool config");
+    let config = Config::load_from(&config_path).expect("load embedding endpoint-pool config");
+
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
+    let response = server.mempal_status().await.expect("status").0;
+
+    assert_eq!(response.embed_status.endpoints.len(), 2);
+    assert_eq!(response.embed_status.endpoints[0].id, "gb10");
+    assert_eq!(
+        response.embed_status.endpoints[0].base_url,
+        "http://gb10.local:18002/v1"
+    );
+    assert_eq!(response.embed_status.endpoints[0].priority, 0);
+    assert_eq!(response.embed_status.endpoints[0].max_concurrent, 4);
+    assert_eq!(response.embed_status.endpoints[0].dimensions, 4096);
+    assert_eq!(response.embed_status.endpoints[1].id, "spark");
+    assert_eq!(response.embed_status.endpoints[1].retry_interval_secs, 5);
+    assert_eq!(response.embed_status.max_concurrent, 6);
+    assert_eq!(
+        response.embed_status.model.as_deref(),
+        Some("gb10=Qwen/Qwen3-Embedding-8B, spark=Qwen/Qwen3-Embedding-8B")
+    );
+}
+
 #[cfg(feature = "integration")]
 async fn spawn_models_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let app = Router::new().route(

@@ -114,6 +114,10 @@ pub struct HotReloadState {
     /// enabled_for, max_concurrent). LLM workers subscribe to this to cancel
     /// in-flight requests and restart with the new config.
     llm_gen_tx: tokio::sync::watch::Sender<u64>,
+    /// Incremented when hot-reload applies embedding endpoint runtime changes
+    /// that preserve vector identity. Long-lived embedding clients rebuild on
+    /// the next request and keep sharing the configured endpoint pool.
+    embed_gen_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl HotReloadState {
@@ -122,6 +126,7 @@ impl HotReloadState {
         let snapshot =
             ConfigSnapshot::from_config(initial.clone()).expect("default config is valid");
         let (llm_gen_tx, _) = tokio::sync::watch::channel(0u64);
+        let (embed_gen_tx, _) = tokio::sync::watch::channel(0u64);
         Self {
             snapshot: ArcSwap::from_pointee(snapshot),
             runtime: Mutex::new(None),
@@ -133,6 +138,7 @@ impl HotReloadState {
                 initial.ingest_gating.embedding_classifier.prototypes,
             ),
             llm_gen_tx,
+            embed_gen_tx,
         }
     }
 
@@ -281,6 +287,19 @@ impl HotReloadState {
 
     pub fn current_llm_generation(&self) -> u64 {
         *self.llm_gen_tx.borrow()
+    }
+
+    /// Subscribe to embedding endpoint generation changes.
+    ///
+    /// The channel value is a monotonically-increasing counter that is bumped
+    /// when hot-reload applies endpoint pool runtime fields without changing
+    /// the embedding vector identity.
+    pub fn subscribe_embed_gen(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.embed_gen_tx.subscribe()
+    }
+
+    pub fn current_embed_generation(&self) -> u64 {
+        *self.embed_gen_tx.borrow()
     }
 
     /// Trigger a reload from the given path without going through the watcher.
@@ -483,6 +502,9 @@ impl HotReloadState {
             || previous.config.llm.max_concurrent != effective.llm.max_concurrent
             || previous.config.llm.retry_interval_secs != effective.llm.retry_interval_secs
             || previous.config.llm.enabled_for != effective.llm.enabled_for;
+        let embed_hot_changed = previous.config.embed.endpoints != effective.embed.endpoints
+            || previous.config.embed.max_concurrent != effective.embed.max_concurrent
+            || previous.config.embed.retry != effective.embed.retry;
 
         let next_snapshot = match ConfigSnapshot::from_config(effective) {
             Ok(snapshot) => snapshot,
@@ -504,6 +526,14 @@ impl HotReloadState {
             let _ = self.llm_gen_tx.send(prev_gen.wrapping_add(1));
             self.push_event(format!(
                 "config hot-reload: LLM config changed, generation bumped to {}",
+                prev_gen.wrapping_add(1)
+            ));
+        }
+        if embed_hot_changed {
+            let prev_gen = *self.embed_gen_tx.borrow();
+            let _ = self.embed_gen_tx.send(prev_gen.wrapping_add(1));
+            self.push_event(format!(
+                "config hot-reload: embedding endpoint pool changed, generation bumped to {}",
                 prev_gen.wrapping_add(1)
             ));
         }
