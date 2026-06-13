@@ -206,7 +206,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
 
     let llm_worker_handles: Vec<tokio::task::JoinHandle<_>> = if context.config.llm.enabled {
         let llm_client_runtime = crate::llm::worker::LlmClientRuntime::new(&context.config.llm);
-        let num_workers = context.config.llm.max_concurrent.max(1);
+        let num_workers = context.config.llm.pool_capacity();
         let llm_status = Arc::new(crate::llm::LlmStatus::new(10));
         let llm_store = Arc::new(context.store.clone());
         let llm_client_runtime = Arc::new(Mutex::new(llm_client_runtime));

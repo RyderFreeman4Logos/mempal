@@ -86,12 +86,15 @@ enabled = true
 id = "primary"
 base_url = "http://primary.local:8317/v1"
 model = "primary-model"
+priority = 10
 max_concurrent = 2
+retry_interval_secs = 3
 
 [[llm.endpoints]]
 id = "secondary"
 base_url = "http://secondary.local:8317/v1"
 model = "secondary-model"
+priority = 10
 max_concurrent = 3
 
 [gating]
@@ -124,7 +127,18 @@ enabled = true
         response.llm_status.endpoints[0].base_url,
         "http://primary.local:8317/v1"
     );
+    assert_eq!(response.llm_status.endpoints[0].priority, 10);
+    assert_eq!(response.llm_status.endpoints[0].retry_interval_secs, 3);
     assert_eq!(response.llm_status.endpoints[1].model, "secondary-model");
+    assert_eq!(response.llm_status.endpoints[1].priority, 10);
+    assert_eq!(response.llm_status.max_concurrent, 5);
+    assert!(
+        response.system_warnings.iter().any(|warning| {
+            warning.source == "llm" && warning.message.contains("no judge endpoint is reachable")
+        }),
+        "{:?}",
+        response.system_warnings
+    );
 }
 
 #[cfg(feature = "integration")]
@@ -233,6 +247,13 @@ async fn test_mcp_status_headline_reflects_failed_queue() {
     assert_eq!(response.embed_status.failed_count, 1);
     assert_eq!(response.embed_status.fail_count, 1);
     assert_eq!(response.embed_status.failure_count, 1);
+    assert!(
+        response.system_warnings.iter().any(|warning| {
+            warning.source == "queue" && warning.message.contains("mempal reindex --failed")
+        }),
+        "{:?}",
+        response.system_warnings
+    );
 }
 
 #[tokio::test]

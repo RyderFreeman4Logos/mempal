@@ -5,7 +5,6 @@ use super::client::{LlmError, LlmResponse};
 pub type HeartbeatCallback = dyn Fn() -> Result<(), LlmError> + Send + Sync;
 
 const MAX_HEARTBEAT_REFRESH_SECS: u64 = 5;
-const MAX_RETRY_AFTER_SECS: u64 = 60;
 
 pub async fn retry_llm_operation<F, Fut>(
     retry_interval_secs: u64,
@@ -59,16 +58,14 @@ where
 
 fn retry_after_from_error(error: &LlmError, default_secs: u64) -> Duration {
     if let LlmError::TemporarilyUnavailable { retry_after, .. } = error {
-        let capped = retry_after.as_secs().min(MAX_RETRY_AFTER_SECS);
-        return Duration::from_secs(capped);
+        return *retry_after;
     }
     if let LlmError::ClientError {
         retry_after: Some(header_duration),
         ..
     } = error
     {
-        let capped = header_duration.as_secs().min(MAX_RETRY_AFTER_SECS);
-        return Duration::from_secs(capped);
+        return *header_duration;
     }
     Duration::from_secs(default_secs)
 }

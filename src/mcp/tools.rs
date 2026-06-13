@@ -2008,6 +2008,8 @@ pub struct LlmEndpointStatusDto {
     pub id: String,
     pub base_url: String,
     pub model: String,
+    pub priority: i32,
+    pub retry_interval_secs: u64,
     pub max_concurrent: usize,
 }
 

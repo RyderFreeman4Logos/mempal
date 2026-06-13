@@ -83,6 +83,9 @@ pub struct QueueConfig {
 pub enum QueueFailureDisposition {
     /// Retry with queue backoff without converting the item to a terminal dead-letter.
     Retryable,
+    /// Retry after an explicit producer-provided delay, such as a model router
+    /// cooldown hint. This keeps retry intent durable without holding a worker.
+    RetryableAfter { delay_ms: i64 },
     /// Move directly to the failed/dead-letter state without another attempt.
     Terminal,
 }
@@ -694,11 +697,11 @@ impl PendingMessageStore {
             u32::try_from(next_retry).map_err(|_| QueueError::RetryCountOverflow {
                 id: claim.id.clone(),
             })?;
-        let terminal = disposition == QueueFailureDisposition::Terminal;
-        let backoff_ms = if terminal {
-            0
-        } else {
-            self.compute_backoff_ms(next_retry_u32)
+        let terminal = matches!(disposition, QueueFailureDisposition::Terminal);
+        let backoff_ms = match disposition {
+            QueueFailureDisposition::Terminal => 0,
+            QueueFailureDisposition::Retryable => self.compute_backoff_ms(next_retry_u32),
+            QueueFailureDisposition::RetryableAfter { delay_ms } => delay_ms.max(0),
         };
         let next_attempt_at = if terminal {
             now_secs()
