@@ -169,6 +169,178 @@ model = "secondary-model"
 }
 
 #[test]
+fn test_embed_config_endpoint_pool_yields_effective_endpoints() {
+    let config = Config::parse(
+        r#"
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "gb10"
+base_url = "http://gb10.local:18002/v1/"
+model = "Qwen/Qwen3-Embedding-8B"
+priority = 0
+max_concurrent = 4
+
+[[embed.endpoints]]
+id = "spark"
+base_url = "http://spark.local:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+priority = 0
+request_timeout_secs = 7
+retry_interval_secs = 3
+max_concurrent = 2
+"#,
+    )
+    .expect("embedding endpoint list should parse");
+
+    let endpoints = config
+        .embed
+        .effective_endpoints()
+        .expect("embedding endpoint list should normalize");
+
+    assert_eq!(endpoints.len(), 2);
+    assert_eq!(endpoints[0].id, "gb10");
+    assert_eq!(endpoints[0].base_url, "http://gb10.local:18002/v1");
+    assert_eq!(endpoints[0].model, "Qwen/Qwen3-Embedding-8B");
+    assert_eq!(endpoints[0].dimensions, 4096);
+    assert_eq!(endpoints[0].priority, 0);
+    assert_eq!(endpoints[0].request_timeout_secs, 30);
+    assert_eq!(endpoints[0].retry_interval_secs, 2);
+    assert_eq!(endpoints[0].max_concurrent, 4);
+    assert_eq!(endpoints[1].id, "spark");
+    assert_eq!(endpoints[1].request_timeout_secs, 7);
+    assert_eq!(endpoints[1].retry_interval_secs, 3);
+    assert_eq!(endpoints[1].max_concurrent, 2);
+    assert_eq!(config.embed.pool_capacity(), 6);
+    assert_eq!(
+        config.embed.effective_model_summary().as_deref(),
+        Some("gb10=Qwen/Qwen3-Embedding-8B, spark=Qwen/Qwen3-Embedding-8B")
+    );
+}
+
+#[test]
+fn test_embed_endpoint_pool_rejects_mixed_vector_identity() {
+    let error = Config::parse(
+        r#"
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "gb10"
+base_url = "http://gb10.local:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 4096
+
+[[embed.endpoints]]
+id = "spark"
+base_url = "http://spark.local:18002/v1"
+model = "other-embedding-model"
+dim = 4096
+"#,
+    )
+    .expect_err("mixed embedding models must not parse");
+
+    assert!(
+        error
+            .to_string()
+            .contains("embed endpoints must share one vector identity"),
+        "{error}"
+    );
+}
+
+#[test]
+fn test_embed_endpoint_pool_runtime_fields_hot_reload_when_identity_matches() {
+    let current = Config::parse(
+        r#"
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "gb10"
+base_url = "http://gb10.local:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 4096
+max_concurrent = 1
+"#,
+    )
+    .expect("current config");
+    let candidate = Config::parse(
+        r#"
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "gb10"
+base_url = "http://spark.local:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 4096
+max_concurrent = 3
+retry_interval_secs = 5
+"#,
+    )
+    .expect("candidate config");
+
+    assert!(
+        !current
+            .restart_required_fields_changed(&candidate)
+            .contains(&"embedder.endpoints.vector_identity")
+    );
+    let effective = current.merge_runtime_allowed(&candidate);
+    let endpoints = effective
+        .embed
+        .effective_endpoints()
+        .expect("effective endpoints");
+
+    assert_eq!(endpoints[0].base_url, "http://spark.local:18002/v1");
+    assert_eq!(endpoints[0].max_concurrent, 3);
+    assert_eq!(endpoints[0].retry_interval_secs, 5);
+}
+
+#[test]
+fn test_embed_endpoint_pool_vector_identity_change_requires_restart() {
+    let current = Config::parse(
+        r#"
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "gb10"
+base_url = "http://gb10.local:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 4096
+"#,
+    )
+    .expect("current config");
+    let candidate = Config::parse(
+        r#"
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "gb10"
+base_url = "http://gb10.local:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 1024
+"#,
+    )
+    .expect("candidate config");
+
+    assert!(
+        current
+            .restart_required_fields_changed(&candidate)
+            .contains(&"embedder.endpoints.vector_identity")
+    );
+    let effective = current.merge_runtime_allowed(&candidate);
+    let endpoints = effective
+        .embed
+        .effective_endpoints()
+        .expect("effective endpoints");
+
+    assert_eq!(endpoints[0].dimensions, 4096);
+}
+
+#[test]
 fn test_endpoint_pool_external_llm_base_url_warns_but_does_not_block_config() {
     let config = Config::parse(
         r#"

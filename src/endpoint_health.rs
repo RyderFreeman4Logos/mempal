@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use tokio::time::timeout;
 
-use crate::core::config::{Config, EffectiveLlmEndpoint};
+use crate::core::config::{Config, EffectiveEmbedEndpoint, EffectiveLlmEndpoint};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -66,13 +66,31 @@ pub fn probe_endpoints_blocking(config: &Config) -> Result<EndpointHealthSnapsho
 async fn probe_embedding(config: &Config) -> ProbeStatus {
     match config.embed.backend.as_str() {
         "openai_compat" | "api" => {
-            let Some(base_url) = config.embed.resolved_openai_base_url() else {
-                return ProbeStatus::unreachable("missing base_url".to_string());
+            let endpoints = match config.embed.effective_endpoints() {
+                Ok(endpoints) if !endpoints.is_empty() => endpoints,
+                Ok(_) => return ProbeStatus::unreachable("missing base_url".to_string()),
+                Err(error) => return ProbeStatus::unreachable(error.to_string()),
             };
-            probe_models_endpoint(base_url, config.embed.resolved_api_key_env(), None).await
+            probe_embedding_endpoints(&endpoints).await
         }
         backend => ProbeStatus::reachable(None, format!("local backend: {backend}")),
     }
+}
+
+async fn probe_embedding_endpoints(endpoints: &[EffectiveEmbedEndpoint]) -> ProbeStatus {
+    let mut failures = Vec::new();
+    for endpoint in endpoints {
+        let status =
+            probe_models_endpoint(&endpoint.base_url, endpoint.api_key_env.as_deref(), None).await;
+        if status.reachable {
+            return ProbeStatus::reachable(
+                status.latency_ms,
+                format!("http probe via {}", endpoint.id),
+            );
+        }
+        failures.push(format!("{}: {}", endpoint.id, status.detail));
+    }
+    ProbeStatus::unreachable(failures.join("; "))
 }
 
 async fn probe_llm(config: &Config) -> ProbeStatus {

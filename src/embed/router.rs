@@ -4,67 +4,80 @@ use std::time::{Duration, Instant};
 use reqwest::StatusCode;
 use tokio::sync::Mutex;
 
-use crate::core::config::{EffectiveLlmEndpoint, LlmConfig};
+use crate::core::config::{EffectiveEmbedEndpoint, EmbedConfig};
 
-use super::client::{LlmClient, LlmError, LlmRequest, LlmResponse, MAX_REMOTE_RETRY_HINT};
+use super::openai_compat::{MAX_REMOTE_RETRY_HINT, OpenAiCompatibleEmbedder};
 use super::retry::HeartbeatCallback;
+use super::{EmbedError, Embedder, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoutedLlmResponse {
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutedEmbeddingResponse {
     pub endpoint_id: String,
     pub endpoint_model: String,
-    pub response: LlmResponse,
+    pub vectors: Vec<Vec<f32>>,
 }
 
 #[derive(Debug)]
 struct RoutedEndpoint {
-    config: EffectiveLlmEndpoint,
-    client: LlmClient,
+    config: EffectiveEmbedEndpoint,
+    client: OpenAiCompatibleEmbedder,
     unavailable_until: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct LlmRouter {
+pub struct EmbeddingRouter {
     endpoints: Arc<Vec<Arc<RoutedEndpoint>>>,
+    dimensions: usize,
+    name: String,
+    max_input_tokens: Option<usize>,
 }
 
-impl LlmRouter {
-    pub fn from_config(config: &LlmConfig) -> Result<Self, LlmError> {
+impl EmbeddingRouter {
+    pub fn from_config(config: &EmbedConfig) -> Result<Self> {
         let endpoints = config
             .effective_endpoints()
-            .map_err(|error| LlmError::MissingConfiguration(error.to_string()))?;
+            .map_err(|error| EmbedError::InvalidConfiguration(error.to_string()))?;
         Self::from_endpoints(endpoints)
     }
 
-    pub fn from_endpoints(endpoints: Vec<EffectiveLlmEndpoint>) -> Result<Self, LlmError> {
+    pub fn from_endpoints(endpoints: Vec<EffectiveEmbedEndpoint>) -> Result<Self> {
         if endpoints.is_empty() {
-            return Err(LlmError::MissingConfiguration(
-                "llm endpoints must not be empty".to_string(),
+            return Err(EmbedError::MissingConfiguration(
+                "embedding endpoints must not be empty".to_string(),
             ));
         }
+        let dimensions = endpoints[0].dimensions;
+        let name = endpoints[0].backend.clone();
+        let max_input_tokens = endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.max_input_tokens)
+            .min();
         let mut endpoints = endpoints.into_iter().enumerate().collect::<Vec<_>>();
         endpoints.sort_by_key(|(index, endpoint)| (endpoint.priority, *index));
         let routed = endpoints
             .into_iter()
             .map(|(_, config)| {
-                let client = LlmClient::from_endpoint(&config)?;
+                let client = OpenAiCompatibleEmbedder::from_endpoint(&config)?;
                 Ok(Arc::new(RoutedEndpoint {
                     config,
                     client,
                     unavailable_until: Mutex::new(None),
                 }))
             })
-            .collect::<Result<Vec<_>, LlmError>>()?;
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             endpoints: Arc::new(routed),
+            dimensions,
+            name,
+            max_input_tokens,
         })
     }
 
-    pub async fn chat_completion(
+    pub async fn embed_routed(
         &self,
-        request: &LlmRequest,
+        texts: &[&str],
         heartbeat: Option<&HeartbeatCallback>,
-    ) -> Result<RoutedLlmResponse, LlmError> {
+    ) -> Result<RoutedEmbeddingResponse> {
         let mut last_retryable = None;
         let mut earliest_retry_after: Option<Duration> = None;
         let mut first_saturated_endpoint: Option<Arc<RoutedEndpoint>> = None;
@@ -78,12 +91,15 @@ impl LlmRouter {
                 continue;
             }
             refresh_heartbeat(heartbeat)?;
-            match endpoint.client.try_chat_completion(request).await {
-                Ok(Some(response)) => {
-                    return Ok(RoutedLlmResponse {
+            match endpoint.client.try_embed(texts).await {
+                Ok(Some(vectors)) => {
+                    endpoint.mark_available().await;
+                    crate::embed::global_embed_status()
+                        .record_endpoint_success(&endpoint.config.id);
+                    return Ok(RoutedEmbeddingResponse {
                         endpoint_id: endpoint.config.id.clone(),
                         endpoint_model: endpoint.config.model.clone(),
-                        response,
+                        vectors,
                     });
                 }
                 Ok(None) => {
@@ -94,6 +110,11 @@ impl LlmRouter {
                 Err(error) if should_try_next_endpoint(&error) => {
                     if let Some(retry_after) = endpoint.retry_after_for_error(&error) {
                         endpoint.mark_temporarily_unavailable(retry_after).await;
+                        crate::embed::global_embed_status().record_endpoint_cooldown(
+                            &endpoint.config.id,
+                            retry_after,
+                            &error,
+                        );
                         earliest_retry_after = Some(match earliest_retry_after {
                             Some(current) => current.min(retry_after),
                             None => retry_after,
@@ -107,32 +128,29 @@ impl LlmRouter {
 
         if let Some(endpoint) = first_saturated_endpoint {
             refresh_heartbeat(heartbeat)?;
-            let response = endpoint.client.chat_completion(request).await?;
-            return Ok(RoutedLlmResponse {
+            let vectors = endpoint.client.embed_with_permit(texts).await?;
+            endpoint.mark_available().await;
+            crate::embed::global_embed_status().record_endpoint_success(&endpoint.config.id);
+            return Ok(RoutedEmbeddingResponse {
                 endpoint_id: endpoint.config.id.clone(),
                 endpoint_model: endpoint.config.model.clone(),
-                response,
+                vectors,
             });
         }
 
         match (last_retryable, earliest_retry_after) {
-            (None, Some(retry_after)) => Err(LlmError::TemporarilyUnavailable {
-                retry_after,
-                reason: format!(
-                    "{} endpoint(s) are cooling down after retryable failures",
-                    self.endpoints.len()
-                ),
-            }),
-            (Some(_error), Some(retry_after)) => Err(LlmError::TemporarilyUnavailable {
-                retry_after,
-                reason: format!(
-                    "{} endpoint(s) are cooling down after retryable failures",
-                    self.endpoints.len()
-                ),
-            }),
+            (None, Some(retry_after)) | (Some(_), Some(retry_after)) => {
+                Err(EmbedError::TemporarilyUnavailable {
+                    retry_after,
+                    reason: format!(
+                        "{} embedding endpoint(s) are cooling down after retryable failures",
+                        self.endpoints.len()
+                    ),
+                })
+            }
             (Some(error), _) => Err(error),
-            (None, None) => Err(LlmError::MissingConfiguration(
-                "no LLM endpoint is currently available".to_string(),
+            (None, None) => Err(EmbedError::MissingConfiguration(
+                "no embedding endpoint is currently available".to_string(),
             )),
         }
     }
@@ -149,6 +167,27 @@ impl LlmRouter {
     }
 }
 
+#[async_trait::async_trait]
+impl Embedder for EmbeddingRouter {
+    async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.embed_routed(texts, None)
+            .await
+            .map(|response| response.vectors)
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn max_input_tokens(&self) -> Option<usize> {
+        self.max_input_tokens
+    }
+}
+
 impl RoutedEndpoint {
     async fn temporary_unavailable_remaining(&self) -> Option<Duration> {
         let mut guard = self.unavailable_until.lock().await;
@@ -158,32 +197,32 @@ impl RoutedEndpoint {
             }
             Some(_) => {
                 *guard = None;
+                crate::embed::global_embed_status().clear_endpoint_cooldown(&self.config.id);
                 None
             }
             None => None,
         }
     }
 
-    fn retry_after_for_error(&self, error: &LlmError) -> Option<Duration> {
+    fn retry_after_for_error(&self, error: &EmbedError) -> Option<Duration> {
         match error {
-            LlmError::ClientError {
+            EmbedError::HttpStatus {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 retry_after,
                 ..
             } => Some(
                 retry_after.unwrap_or_else(|| Duration::from_secs(self.config.retry_interval_secs)),
             ),
-            LlmError::TemporarilyUnavailable { retry_after, .. } => Some(*retry_after),
-            LlmError::HttpRequest { .. } | LlmError::Timeout => {
+            EmbedError::TemporarilyUnavailable { retry_after, .. } => Some(*retry_after),
+            EmbedError::HttpRequest { .. }
+            | EmbedError::Runtime(_)
+            | EmbedError::WorkerPanic(_) => {
                 Some(Duration::from_secs(self.config.retry_interval_secs))
             }
-            LlmError::HttpStatus { status, .. } if status.is_server_error() => {
+            EmbedError::HttpStatus { status, .. } if status.is_server_error() => {
                 Some(Duration::from_secs(self.config.retry_interval_secs))
             }
-            LlmError::HttpStatus { .. }
-            | LlmError::ClientError { .. }
-            | LlmError::DecodeResponse(_)
-            | LlmError::MissingConfiguration(_) => None,
+            _ => None,
         }
     }
 
@@ -195,20 +234,29 @@ impl RoutedEndpoint {
                 .unwrap_or_else(|| now + MAX_REMOTE_RETRY_HINT),
         );
     }
-}
 
-fn should_try_next_endpoint(error: &LlmError) -> bool {
-    match error {
-        LlmError::HttpRequest { .. }
-        | LlmError::Timeout
-        | LlmError::TemporarilyUnavailable { .. } => true,
-        LlmError::HttpStatus { status, .. } => status.is_server_error(),
-        LlmError::ClientError { status, .. } => *status == StatusCode::TOO_MANY_REQUESTS,
-        LlmError::DecodeResponse(_) | LlmError::MissingConfiguration(_) => false,
+    async fn mark_available(&self) {
+        let mut guard = self.unavailable_until.lock().await;
+        *guard = None;
     }
 }
 
-fn refresh_heartbeat(heartbeat: Option<&HeartbeatCallback>) -> Result<(), LlmError> {
+fn should_try_next_endpoint(error: &EmbedError) -> bool {
+    match error {
+        EmbedError::HttpRequest { .. }
+        | EmbedError::Runtime(_)
+        | EmbedError::WorkerPanic(_)
+        | EmbedError::TemporarilyUnavailable { .. } => true,
+        EmbedError::HttpStatus { status, .. } => {
+            status.is_server_error()
+                || *status == StatusCode::REQUEST_TIMEOUT
+                || *status == StatusCode::TOO_MANY_REQUESTS
+        }
+        _ => false,
+    }
+}
+
+fn refresh_heartbeat(heartbeat: Option<&HeartbeatCallback>) -> Result<()> {
     if let Some(callback) = heartbeat {
         callback()?;
     }

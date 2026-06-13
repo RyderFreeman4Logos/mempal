@@ -23,6 +23,8 @@ const DEFAULT_HOT_RELOAD_POLL_FALLBACK_SECS: u64 = 5;
 const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_OPENAI_DIM: usize = 4096;
 const DEFAULT_RETRY_INTERVAL_SECS: u64 = 2;
+const DEFAULT_EMBED_MAX_CONCURRENT: usize = 16;
+const DEFAULT_EMBED_ENDPOINT_PRIORITY: i32 = 0;
 const DEFAULT_LLM_BACKEND: &str = "openai_compat";
 const DEFAULT_LLM_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_LLM_RETRY_INTERVAL_SECS: u64 = 2;
@@ -302,6 +304,7 @@ impl Config {
                 "embed.retry.search_deadline_secs must be greater than 0".to_string(),
             ));
         }
+        self.embed.validate_endpoint_pool()?;
         self.llm.validate_endpoint_pool()?;
         self.validate_llm_judge_guardrails()?;
         if self.llm.enabled && self.llm.effective_endpoints()?.is_empty() {
@@ -634,6 +637,9 @@ impl Config {
         if self.embed.openai_compat.dim != other.embed.openai_compat.dim {
             fields.push("embedder.openai_compat.dim");
         }
+        if self.embed.endpoint_vector_identity() != other.embed.endpoint_vector_identity() {
+            fields.push("embedder.endpoints.vector_identity");
+        }
         if self.llm.enabled != other.llm.enabled {
             fields.push("llm.enabled");
         }
@@ -661,6 +667,15 @@ impl Config {
         effective.embed.base_url = self.embed.base_url.clone();
         effective.embed.api_model = self.embed.api_model.clone();
         effective.embed.openai_compat = self.embed.openai_compat.clone();
+        if self.embed.endpoint_vector_identity() == candidate.embed.endpoint_vector_identity() {
+            effective.embed.endpoints = candidate.embed.endpoints.clone();
+            effective.embed.max_concurrent = candidate.embed.max_concurrent;
+            effective.embed.retry = candidate.embed.retry.clone();
+        } else {
+            effective.embed.endpoints = self.embed.endpoints.clone();
+            effective.embed.max_concurrent = self.embed.max_concurrent;
+            effective.embed.retry = self.embed.retry.clone();
+        }
         if self.llm.enabled != candidate.llm.enabled || self.llm.backend != candidate.llm.backend {
             effective.llm = self.llm.clone();
         } else {
@@ -858,9 +873,24 @@ fn validate_llm_endpoint_pool_toml(root: &toml::Value) -> Result<(), ConfigError
     )))
 }
 
+fn normalize_embed_endpoint_id(
+    configured: Option<&str>,
+    index: usize,
+) -> Result<String, ConfigError> {
+    normalize_endpoint_id(configured, index, "embed endpoints")
+}
+
 fn normalize_llm_endpoint_id(
     configured: Option<&str>,
     index: usize,
+) -> Result<String, ConfigError> {
+    normalize_endpoint_id(configured, index, "llm endpoint")
+}
+
+fn normalize_endpoint_id(
+    configured: Option<&str>,
+    index: usize,
+    label: &str,
 ) -> Result<String, ConfigError> {
     let id = configured
         .map(str::trim)
@@ -873,10 +903,43 @@ fn normalize_llm_endpoint_id(
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
     {
         return Err(ConfigError::Validation(format!(
-            "llm endpoint id `{id}` must match [A-Za-z0-9_.-]{{1,64}}"
+            "{label} id `{id}` must match [A-Za-z0-9_.-]{{1,64}}"
         )));
     }
     Ok(id)
+}
+
+fn normalize_embed_endpoint_backend(backend: &str, field: &str) -> Result<String, ConfigError> {
+    let backend = backend.trim();
+    if backend.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{field} must not be empty"
+        )));
+    }
+    match backend {
+        "openai_compat" | "api" => Ok("openai_compat".to_string()),
+        other => Err(ConfigError::Validation(format!(
+            "{field}={other:?} is not supported in embed endpoint pools; use openai_compat-compatible HTTP endpoints"
+        ))),
+    }
+}
+
+fn embed_backend_is_http(backend: &str) -> bool {
+    matches!(backend, "openai_compat" | "api")
+}
+
+fn normalize_embed_endpoint_base_url(
+    base_url: Option<&str>,
+    field: &str,
+) -> Result<String, ConfigError> {
+    let base_url = base_url
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+        .ok_or_else(|| ConfigError::Validation(format!("{field} must not be empty")))?
+        .trim_end_matches('/')
+        .to_string();
+    validate_embed_base_url(&base_url, field).map_err(ConfigError::Validation)?;
+    Ok(base_url)
 }
 
 fn normalize_llm_endpoint_base_url(
@@ -893,7 +956,15 @@ fn normalize_llm_endpoint_base_url(
     Ok(base_url)
 }
 
+fn normalize_embed_endpoint_model(model: Option<&str>, field: &str) -> Result<String, ConfigError> {
+    normalize_required_model(model, field)
+}
+
 fn normalize_llm_endpoint_model(model: Option<&str>, field: &str) -> Result<String, ConfigError> {
+    normalize_required_model(model, field)
+}
+
+fn normalize_required_model(model: Option<&str>, field: &str) -> Result<String, ConfigError> {
     model
         .map(str::trim)
         .filter(|model| !model.is_empty())
@@ -901,29 +972,52 @@ fn normalize_llm_endpoint_model(model: Option<&str>, field: &str) -> Result<Stri
         .ok_or_else(|| ConfigError::Validation(format!("{field} must not be empty")))
 }
 
+fn validate_embed_base_url(base_url: &str, field: &str) -> Result<(), String> {
+    validate_base_url(base_url, field, "api_key_env")
+}
+
 pub fn validate_llm_base_url(base_url: &str) -> Result<(), String> {
-    let parsed = Url::parse(base_url)
-        .map_err(|error| format!("invalid llm.base_url `{base_url}`: {error}"))?;
+    validate_base_url(base_url, "llm.base_url", "api_key_env")
+}
+
+fn validate_base_url(base_url: &str, field: &str, credential_hint: &str) -> Result<(), String> {
+    let parsed =
+        Url::parse(base_url).map_err(|error| format!("invalid {field} `{base_url}`: {error}"))?;
     if parsed.scheme().is_empty() {
-        return Err("llm.base_url must include a URL scheme".to_string());
+        return Err(format!("{field} must include a URL scheme"));
     }
     if parsed.host_str().is_none() {
-        return Err("llm.base_url must include a host".to_string());
+        return Err(format!("{field} must include a host"));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(
-            "llm.base_url must not include userinfo credentials; use api_key_env instead"
-                .to_string(),
-        );
+        return Err(format!(
+            "{field} must not include userinfo credentials; use {credential_hint} instead"
+        ));
     }
     if parsed.query().is_some() {
-        return Err(
-            "llm.base_url must not include query parameters; move secrets to api_key_env"
-                .to_string(),
-        );
+        return Err(format!(
+            "{field} must not include query parameters; move secrets to {credential_hint}"
+        ));
     }
     if parsed.fragment().is_some() {
-        return Err("llm.base_url must not include URL fragments".to_string());
+        return Err(format!("{field} must not include URL fragments"));
+    }
+    Ok(())
+}
+
+fn validate_embed_endpoint_vector_identity(
+    endpoints: &[EffectiveEmbedEndpoint],
+) -> Result<(), ConfigError> {
+    let Some(first) = endpoints.first().map(EmbedVectorIdentity::from) else {
+        return Ok(());
+    };
+    for endpoint in endpoints.iter().skip(1) {
+        let identity = EmbedVectorIdentity::from(endpoint);
+        if identity != first {
+            return Err(ConfigError::Validation(
+                "embed endpoints must share one vector identity (backend, model, dim); configure separate reindex targets for different embedding models".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1128,6 +1222,8 @@ pub struct EmbedConfig {
     pub base_url: Option<String>,
     pub api_model: Option<String>,
     pub openai_compat: OpenAiCompatConfig,
+    pub endpoints: Vec<EmbedEndpointConfig>,
+    pub max_concurrent: usize,
     pub retry: RetryConfig,
     pub alert: AlertConfig,
     pub degradation: DegradationConfig,
@@ -1142,6 +1238,8 @@ impl Default for EmbedConfig {
             base_url: None,
             api_model: None,
             openai_compat: OpenAiCompatConfig::default(),
+            endpoints: Vec::new(),
+            max_concurrent: DEFAULT_EMBED_MAX_CONCURRENT,
             retry: RetryConfig::default(),
             alert: AlertConfig::default(),
             degradation: DegradationConfig::default(),
@@ -1151,6 +1249,11 @@ impl Default for EmbedConfig {
 
 impl EmbedConfig {
     pub fn vector_embedder_fingerprint(&self, backend: &str, dim: usize) -> String {
+        if backend == self.backend
+            && let Some(identity) = self.endpoint_vector_identity()
+        {
+            return identity.fingerprint();
+        }
         let base_url = self
             .resolved_openai_base_url()
             .unwrap_or_default()
@@ -1199,6 +1302,245 @@ impl EmbedConfig {
 
     pub fn resolved_openai_dim(&self) -> usize {
         self.openai_compat.dim.unwrap_or(DEFAULT_OPENAI_DIM)
+    }
+
+    pub fn effective_endpoints(&self) -> Result<Vec<EffectiveEmbedEndpoint>, ConfigError> {
+        let endpoints = self.effective_endpoints_without_validation()?;
+        validate_embed_endpoint_vector_identity(&endpoints)?;
+        Ok(endpoints)
+    }
+
+    pub fn validate_endpoint_pool(&self) -> Result<(), ConfigError> {
+        if self.endpoints.is_empty() {
+            return Ok(());
+        }
+        validate_embed_endpoint_vector_identity(&self.effective_endpoints_without_validation()?)
+    }
+
+    pub fn pool_capacity(&self) -> usize {
+        self.effective_endpoints()
+            .ok()
+            .filter(|endpoints| !endpoints.is_empty())
+            .map(|endpoints| {
+                endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint.max_concurrent.max(1))
+                    .sum::<usize>()
+            })
+            .unwrap_or_else(|| self.max_concurrent.max(1))
+    }
+
+    pub fn effective_model_summary(&self) -> Option<String> {
+        summarize_effective_embed_endpoints(
+            self,
+            |endpoint| endpoint.model.clone(),
+            EffectiveEmbedEndpoint::model_label,
+        )
+    }
+
+    pub fn effective_base_url_summary(&self) -> Option<String> {
+        summarize_effective_embed_endpoints(
+            self,
+            |endpoint| endpoint.base_url.clone(),
+            EffectiveEmbedEndpoint::base_url_label,
+        )
+    }
+
+    pub fn effective_endpoint_fingerprints(&self) -> Vec<serde_json::Value> {
+        self.effective_endpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|endpoint| {
+                serde_json::json!({
+                    "id": endpoint.id,
+                    "backend": endpoint.backend,
+                    "base_url": endpoint.base_url,
+                    "model": endpoint.model,
+                    "api_key_env": endpoint.api_key_env,
+                    "priority": endpoint.priority,
+                    "request_timeout_secs": endpoint.request_timeout_secs,
+                    "retry_interval_secs": endpoint.retry_interval_secs,
+                    "max_concurrent": endpoint.max_concurrent,
+                    "dimensions": endpoint.dimensions,
+                    "max_input_tokens": endpoint.max_input_tokens,
+                })
+            })
+            .collect()
+    }
+
+    fn legacy_effective_endpoint(&self) -> Result<Option<EffectiveEmbedEndpoint>, ConfigError> {
+        let backend = normalize_embed_endpoint_backend(&self.backend, "embed.backend")?;
+        if !embed_backend_is_http(&backend) {
+            return Ok(None);
+        }
+        let has_base_url = self
+            .resolved_openai_base_url()
+            .is_some_and(|base_url| !base_url.trim().is_empty());
+        let has_model = self
+            .resolved_openai_model()
+            .is_some_and(|model| !model.trim().is_empty());
+        if !has_base_url && !has_model {
+            return Ok(None);
+        }
+        let base_url =
+            normalize_embed_endpoint_base_url(self.resolved_openai_base_url(), "embed.base_url")?;
+        let model = normalize_embed_endpoint_model(self.resolved_openai_model(), "embed.model")?;
+        Ok(Some(EffectiveEmbedEndpoint {
+            id: "legacy".to_string(),
+            backend,
+            base_url,
+            model,
+            api_key_env: self.openai_compat.api_key_env.clone(),
+            priority: DEFAULT_EMBED_ENDPOINT_PRIORITY,
+            request_timeout_secs: self.openai_compat.request_timeout_secs.max(1),
+            retry_interval_secs: self.retry.interval_secs.max(1),
+            max_concurrent: self.max_concurrent.max(1),
+            dimensions: self.resolved_openai_dim(),
+            max_input_tokens: self.openai_compat.max_input_tokens,
+        }))
+    }
+
+    fn endpoint_vector_identity(&self) -> Option<EmbedVectorIdentity> {
+        self.effective_endpoints()
+            .ok()
+            .and_then(|endpoints| endpoints.first().map(EmbedVectorIdentity::from))
+    }
+
+    fn effective_endpoints_without_validation(
+        &self,
+    ) -> Result<Vec<EffectiveEmbedEndpoint>, ConfigError> {
+        if self.endpoints.is_empty() {
+            return self.legacy_effective_endpoint().map(|endpoint| {
+                endpoint
+                    .into_iter()
+                    .collect::<Vec<EffectiveEmbedEndpoint>>()
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        self.endpoints
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint)| {
+                let id = normalize_embed_endpoint_id(endpoint.id.as_deref(), index)?;
+                if !seen.insert(id.clone()) {
+                    return Err(ConfigError::Validation(format!(
+                        "embed endpoints id `{id}` must be unique"
+                    )));
+                }
+                Ok(EffectiveEmbedEndpoint {
+                    id,
+                    backend: normalize_embed_endpoint_backend(
+                        endpoint.backend.as_deref().unwrap_or(self.backend.as_str()),
+                        format!("embed.endpoints[{index}].backend").as_str(),
+                    )?,
+                    base_url: normalize_embed_endpoint_base_url(
+                        endpoint
+                            .base_url
+                            .as_deref()
+                            .or_else(|| self.resolved_openai_base_url()),
+                        format!("embed.endpoints[{index}].base_url").as_str(),
+                    )?,
+                    model: normalize_embed_endpoint_model(
+                        endpoint
+                            .model
+                            .as_deref()
+                            .or_else(|| self.resolved_openai_model()),
+                        format!("embed.endpoints[{index}].model").as_str(),
+                    )?,
+                    api_key_env: endpoint
+                        .api_key_env
+                        .clone()
+                        .or_else(|| self.openai_compat.api_key_env.clone()),
+                    priority: endpoint.priority.unwrap_or(DEFAULT_EMBED_ENDPOINT_PRIORITY),
+                    request_timeout_secs: endpoint
+                        .request_timeout_secs
+                        .unwrap_or(self.openai_compat.request_timeout_secs)
+                        .max(1),
+                    retry_interval_secs: endpoint
+                        .retry_interval_secs
+                        .unwrap_or(self.retry.interval_secs)
+                        .max(1),
+                    max_concurrent: endpoint
+                        .max_concurrent
+                        .unwrap_or(self.max_concurrent)
+                        .max(1),
+                    dimensions: endpoint
+                        .dim
+                        .or(self.openai_compat.dim)
+                        .unwrap_or(DEFAULT_OPENAI_DIM),
+                    max_input_tokens: endpoint
+                        .max_input_tokens
+                        .or(self.openai_compat.max_input_tokens),
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct EmbedEndpointConfig {
+    pub id: Option<String>,
+    pub backend: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
+    /// Lower numbers are tried first. Equal priority endpoints share active load
+    /// according to each endpoint's `max_concurrent` capacity.
+    pub priority: Option<i32>,
+    #[serde(alias = "timeout_secs")]
+    pub request_timeout_secs: Option<u64>,
+    pub retry_interval_secs: Option<u64>,
+    pub max_concurrent: Option<usize>,
+    pub dim: Option<usize>,
+    pub max_input_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveEmbedEndpoint {
+    pub id: String,
+    pub backend: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: Option<String>,
+    pub priority: i32,
+    pub request_timeout_secs: u64,
+    pub retry_interval_secs: u64,
+    pub max_concurrent: usize,
+    pub dimensions: usize,
+    pub max_input_tokens: Option<usize>,
+}
+
+impl EffectiveEmbedEndpoint {
+    pub fn model_label(&self) -> String {
+        format!("{}={}", self.id, self.model)
+    }
+
+    pub fn base_url_label(&self) -> String {
+        format!("{}={}", self.id, self.base_url)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmbedVectorIdentity {
+    backend: String,
+    model: String,
+    dimensions: usize,
+}
+
+impl EmbedVectorIdentity {
+    fn fingerprint(&self) -> String {
+        format!("{}:{}:pool:{}", self.backend, self.model, self.dimensions)
+    }
+}
+
+impl From<&EffectiveEmbedEndpoint> for EmbedVectorIdentity {
+    fn from(endpoint: &EffectiveEmbedEndpoint) -> Self {
+        Self {
+            backend: endpoint.backend.clone(),
+            model: endpoint.model.clone(),
+            dimensions: endpoint.dimensions,
+        }
     }
 }
 
@@ -1447,6 +1789,27 @@ fn summarize_effective_endpoints(
     config: &LlmConfig,
     single_label: fn(&EffectiveLlmEndpoint) -> String,
     multi_label: fn(&EffectiveLlmEndpoint) -> String,
+) -> Option<String> {
+    let endpoints = config.effective_endpoints().ok()?;
+    if endpoints.is_empty() {
+        return None;
+    }
+    if endpoints.len() == 1 {
+        return endpoints.first().map(single_label);
+    }
+    Some(
+        endpoints
+            .iter()
+            .map(multi_label)
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+fn summarize_effective_embed_endpoints(
+    config: &EmbedConfig,
+    single_label: fn(&EffectiveEmbedEndpoint) -> String,
+    multi_label: fn(&EffectiveEmbedEndpoint) -> String,
 ) -> Option<String> {
     let endpoints = config.effective_endpoints().ok()?;
     if endpoints.is_empty() {
@@ -2206,6 +2569,10 @@ impl ConfigHandle {
         LlmRuntimeSnapshot { config, generation }
     }
 
+    pub fn current_embed_generation() -> u64 {
+        super::hot_reload::global_hot_reload_state().current_embed_generation()
+    }
+
     pub fn scrub_content(input: &str) -> String {
         let (config, compiled) = Self::current_privacy_snapshot();
         config.scrub_content_with_compiled(input, compiled.as_ref())
@@ -2281,6 +2648,14 @@ impl ConfigHandle {
     /// LLM workers subscribe here to cancel in-flight requests on config change.
     pub fn subscribe_llm_gen() -> tokio::sync::watch::Receiver<u64> {
         super::hot_reload::global_hot_reload_state().subscribe_llm_gen()
+    }
+
+    /// Subscribe to embedding endpoint generation changes.
+    ///
+    /// The counter increments when hot-reload applies endpoint pool runtime
+    /// fields while preserving embedding vector identity.
+    pub fn subscribe_embed_gen() -> tokio::sync::watch::Receiver<u64> {
+        super::hot_reload::global_hot_reload_state().subscribe_embed_gen()
     }
 
     #[doc(hidden)]

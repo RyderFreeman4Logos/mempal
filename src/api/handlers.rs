@@ -408,6 +408,7 @@ struct StatusResponse {
     taxonomy_count: i64,
     db_size_bytes: u64,
     embedding_status: String,
+    embedding_endpoints: Vec<ApiEmbeddingEndpointStatus>,
     search_mode: String,
     embedder_circuit: EmbedderCircuitStatus,
     write_queue: WriteQueueStats,
@@ -420,6 +421,24 @@ struct StatusResponse {
     search_telemetry: SearchTelemetrySnapshot,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     status_warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiEmbeddingEndpointStatus {
+    id: String,
+    backend: String,
+    base_url: String,
+    model: String,
+    priority: i32,
+    retry_interval_secs: u64,
+    request_timeout_secs: u64,
+    max_concurrent: usize,
+    dimensions: usize,
+    cooldown_remaining_secs: Option<u64>,
+    cooldown_until_unix_ms: Option<u64>,
+    last_failure_at_unix_ms: Option<u64>,
+    last_success_at_unix_ms: Option<u64>,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1314,6 +1333,11 @@ async fn taxonomy_handler(
 async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResponse>, ApiError> {
     let config = ConfigHandle::current();
     let embed_snapshot = crate::embed::global_embed_status().snapshot();
+    let endpoint_runtime = crate::embed::global_embed_status()
+        .endpoint_runtime_snapshots()
+        .into_iter()
+        .map(|snapshot| (snapshot.id.clone(), snapshot))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let vector_search_circuit =
         VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
     let turns_config = config.turns.clone();
@@ -1375,6 +1399,34 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         taxonomy_count: db_snapshot.taxonomy_count,
         db_size_bytes: db_snapshot.db_size_bytes,
         embedding_status: current_embedding_status(&embed_snapshot).to_string(),
+        embedding_endpoints: config
+            .embed
+            .effective_endpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|endpoint| {
+                let runtime = endpoint_runtime.get(&endpoint.id);
+                ApiEmbeddingEndpointStatus {
+                    id: endpoint.id,
+                    backend: endpoint.backend,
+                    base_url: endpoint.base_url,
+                    model: endpoint.model,
+                    priority: endpoint.priority,
+                    retry_interval_secs: endpoint.retry_interval_secs,
+                    request_timeout_secs: endpoint.request_timeout_secs,
+                    max_concurrent: endpoint.max_concurrent,
+                    dimensions: endpoint.dimensions,
+                    cooldown_remaining_secs: runtime
+                        .and_then(|state| state.cooldown_remaining_secs),
+                    cooldown_until_unix_ms: runtime.and_then(|state| state.cooldown_until_unix_ms),
+                    last_failure_at_unix_ms: runtime
+                        .and_then(|state| state.last_failure_at_unix_ms),
+                    last_success_at_unix_ms: runtime
+                        .and_then(|state| state.last_success_at_unix_ms),
+                    last_error: runtime.and_then(|state| state.last_error.clone()),
+                }
+            })
+            .collect(),
         search_mode: vector_search_circuit
             .vector_search_mode
             .as_str()

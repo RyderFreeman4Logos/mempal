@@ -1792,8 +1792,20 @@ pub(crate) fn llm_worker_claim_enabled(config: &crate::core::config::Config) -> 
 }
 
 struct DaemonEmbedder {
-    primary: Box<dyn Embedder>,
-    fallback: Option<Box<dyn Embedder>>,
+    name: String,
+    runtime: Mutex<DaemonEmbedderRuntime>,
+}
+
+struct DaemonEmbedderRuntime {
+    generation: u64,
+    primary: Arc<dyn Embedder>,
+    fallback: Option<Arc<dyn Embedder>>,
+}
+
+#[derive(Clone)]
+struct DaemonEmbedderRuntimeSnapshot {
+    primary: Arc<dyn Embedder>,
+    fallback: Option<Arc<dyn Embedder>>,
 }
 
 #[cfg(unix)]
@@ -1840,22 +1852,63 @@ pub fn shutdown_requested() -> bool {
 
 impl DaemonEmbedder {
     async fn from_config(config: &crate::core::config::Config) -> crate::embed::Result<Self> {
-        let primary = build_backend_from_name(config, config.embed.backend.as_str()).await?;
-        let fallback = match config.embed.fallback.as_deref() {
-            Some(name) if name.eq_ignore_ascii_case(config.embed.backend.as_str()) => None,
-            Some(name) => Some(build_backend_from_name(config, name).await?),
-            None => None,
+        let generation = crate::core::config::ConfigHandle::current_embed_generation();
+        let runtime = DaemonEmbedderRuntime::from_config(config, generation).await?;
+        let name = runtime.primary.name().to_string();
+        Ok(Self {
+            name,
+            runtime: Mutex::new(runtime),
+        })
+    }
+
+    async fn runtime_snapshot(&self) -> crate::embed::Result<DaemonEmbedderRuntimeSnapshot> {
+        let generation = crate::core::config::ConfigHandle::current_embed_generation();
+        if let Some(snapshot) = self.snapshot_if_generation(generation) {
+            return Ok(snapshot);
+        }
+
+        let config = crate::core::config::ConfigHandle::current();
+        let replacement = DaemonEmbedderRuntime::from_config(config.as_ref(), generation).await?;
+        let mut guard = self
+            .runtime
+            .lock()
+            .expect("daemon embedder runtime mutex poisoned");
+        if guard.generation != generation {
+            *guard = replacement;
+        }
+        Ok(guard.snapshot())
+    }
+
+    fn snapshot_if_generation(&self, generation: u64) -> Option<DaemonEmbedderRuntimeSnapshot> {
+        let guard = self
+            .runtime
+            .lock()
+            .expect("daemon embedder runtime mutex poisoned");
+        (guard.generation == generation).then(|| guard.snapshot())
+    }
+
+    #[cfg(test)]
+    fn from_primary_for_test(primary: Box<dyn Embedder>) -> Self {
+        let name = primary.name().to_string();
+        let runtime = DaemonEmbedderRuntime {
+            generation: crate::core::config::ConfigHandle::current_embed_generation(),
+            primary: Arc::from(primary),
+            fallback: None,
         };
-        Ok(Self { primary, fallback })
+        Self {
+            name,
+            runtime: Mutex::new(runtime),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl Embedder for DaemonEmbedder {
     async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+        let runtime = self.runtime_snapshot().await?;
         let status = global_embed_status();
-        if let Some(fallback) = &self.fallback {
-            match self.primary.embed(texts).await {
+        if let Some(fallback) = &runtime.fallback {
+            match runtime.primary.embed(texts).await {
                 Ok(vectors) => {
                     status.record_primary_success();
                     Ok(vectors)
@@ -1864,7 +1917,7 @@ impl Embedder for DaemonEmbedder {
                     status.record_failure(&primary_error);
                     let message = format!(
                         "embedder fallback active: {} failed, using {}",
-                        self.primary.name(),
+                        runtime.primary.name(),
                         fallback.name()
                     );
                     let vectors = fallback.embed(texts).await?;
@@ -1873,16 +1926,47 @@ impl Embedder for DaemonEmbedder {
                 }
             }
         } else {
-            self.primary.embed(texts).await
+            runtime.primary.embed(texts).await
         }
     }
 
     fn dimensions(&self) -> usize {
-        self.primary.dimensions()
+        self.runtime
+            .lock()
+            .expect("daemon embedder runtime mutex poisoned")
+            .primary
+            .dimensions()
     }
 
     fn name(&self) -> &str {
-        self.primary.name()
+        &self.name
+    }
+}
+
+impl DaemonEmbedderRuntime {
+    async fn from_config(
+        config: &crate::core::config::Config,
+        generation: u64,
+    ) -> crate::embed::Result<Self> {
+        let primary: Arc<dyn Embedder> =
+            Arc::from(build_backend_from_name(config, config.embed.backend.as_str()).await?);
+        let fallback = match config.embed.fallback.as_deref() {
+            Some(name) if name.eq_ignore_ascii_case(config.embed.backend.as_str()) => None,
+            Some(name) => Some(Arc::from(build_backend_from_name(config, name).await?)),
+            None => None,
+        };
+        Ok(Self {
+            generation,
+            primary,
+            fallback,
+        })
+    }
+
+    fn snapshot(&self) -> DaemonEmbedderRuntimeSnapshot {
+        DaemonEmbedderRuntimeSnapshot {
+            primary: Arc::clone(&self.primary),
+            fallback: self.fallback.as_ref().map(Arc::clone),
+        }
     }
 }
 
@@ -2278,10 +2362,9 @@ mod tests {
                 async_db,
                 store: async_store,
                 worker_id: "bounded-continuation-worker".to_string(),
-                embedder: Arc::new(DaemonEmbedder {
-                    primary: Box::new(StaticEmbedder),
-                    fallback: None,
-                }),
+                embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
+                    StaticEmbedder,
+                ))),
                 prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
                 config: Arc::new(config),
                 mempal_home,
@@ -2476,15 +2559,14 @@ mod tests {
                 async_db,
                 store: async_store,
                 worker_id: worker_id.to_string(),
-                embedder: std::sync::Arc::new(DaemonEmbedder {
-                    primary: Box::new(HeartbeatProbeEmbedder {
+                embedder: std::sync::Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
+                    HeartbeatProbeEmbedder {
                         db_path,
                         message_id: message.id.clone(),
                         stale_heartbeat_at,
                         attempts: AtomicUsize::new(0),
-                    }),
-                    fallback: None,
-                }),
+                    },
+                ))),
                 prototype_classifier: std::sync::Arc::new(ArcSwap::from_pointee(None)),
                 config: std::sync::Arc::new(config),
                 mempal_home,
@@ -2569,13 +2651,12 @@ mod tests {
                 async_db,
                 store: async_store,
                 worker_id: "merge-conflict-worker".to_string(),
-                embedder: Arc::new(DaemonEmbedder {
-                    primary: Box::new(MergeConflictProbeEmbedder {
+                embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
+                    MergeConflictProbeEmbedder {
                         db_path: db_path.clone(),
                         injected: Arc::clone(&injected),
-                    }),
-                    fallback: None,
-                }),
+                    },
+                ))),
                 prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
                 config: Arc::new(config),
                 mempal_home,
@@ -2707,12 +2788,11 @@ mod tests {
                 async_db,
                 store: async_store.clone(),
                 worker_id: worker_id.to_string(),
-                embedder: Arc::new(DaemonEmbedder {
-                    primary: Box::new(SlowEmbedder {
+                embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
+                    SlowEmbedder {
                         delay: Duration::from_secs(3),
-                    }),
-                    fallback: None,
-                }),
+                    },
+                ))),
                 prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
                 config: Arc::new(config),
                 mempal_home,

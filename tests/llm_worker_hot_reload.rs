@@ -383,6 +383,121 @@ preview_chars = 200
 }
 
 #[test]
+fn test_embed_gen_increments_on_endpoint_runtime_change() {
+    let _guard = TEST_LOCK.lock().expect("test lock");
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "primary"
+base_url = "http://127.0.0.1:19999/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 3
+max_concurrent = 1
+"#,
+    )
+    .expect("write config");
+    ConfigHandle::bootstrap(&config_path).expect("bootstrap");
+
+    let mut rx = ConfigHandle::subscribe_embed_gen();
+    let gen_before = *rx.borrow_and_update();
+
+    std::fs::write(
+        &config_path,
+        r#"
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "primary"
+base_url = "http://127.0.0.1:20000/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 3
+max_concurrent = 2
+"#,
+    )
+    .expect("write config");
+    ConfigHandle::harness_reload_from_path(&config_path);
+
+    let gen_after = *rx.borrow_and_update();
+    assert!(
+        gen_after > gen_before,
+        "embedding generation must increment when endpoint runtime fields change (before={gen_before}, after={gen_after})"
+    );
+    let endpoints = ConfigHandle::current()
+        .embed
+        .effective_endpoints()
+        .expect("effective embed endpoints");
+    assert_eq!(endpoints[0].base_url, "http://127.0.0.1:20000/v1");
+    assert_eq!(endpoints[0].max_concurrent, 2);
+}
+
+#[test]
+fn test_embed_gen_does_not_increment_on_endpoint_vector_identity_change() {
+    let _guard = TEST_LOCK.lock().expect("test lock");
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "primary"
+base_url = "http://127.0.0.1:19999/v1"
+model = "model-a"
+dim = 3
+"#,
+    )
+    .expect("write config");
+    ConfigHandle::bootstrap(&config_path).expect("bootstrap");
+
+    let mut rx = ConfigHandle::subscribe_embed_gen();
+    let gen_before = *rx.borrow_and_update();
+
+    std::fs::write(
+        &config_path,
+        r#"
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "primary"
+base_url = "http://127.0.0.1:19999/v1"
+model = "model-b"
+dim = 3
+"#,
+    )
+    .expect("write config");
+    ConfigHandle::harness_reload_from_path(&config_path);
+
+    let gen_after = *rx.borrow_and_update();
+    assert_eq!(
+        gen_after, gen_before,
+        "embedding generation must NOT increment when vector identity change requires restart"
+    );
+    let endpoints = ConfigHandle::current()
+        .embed
+        .effective_endpoints()
+        .expect("effective embed endpoints");
+    assert_eq!(endpoints[0].model, "model-a");
+    assert!(
+        ConfigHandle::restart_required_pending()
+            .iter()
+            .any(|event| event.contains("embedder.endpoints.vector_identity")),
+        "vector identity changes must remain restart-required"
+    );
+}
+
+#[test]
 fn test_llm_client_runtime_rebuilds_on_endpoint_change() {
     let config = LlmConfig {
         enabled: true,

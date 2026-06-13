@@ -1,6 +1,7 @@
 #![warn(clippy::all)]
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::core::config::Config;
 use thiserror::Error;
@@ -14,10 +15,12 @@ pub mod model2vec;
 pub mod onnx;
 pub mod openai_compat;
 pub mod retry;
+pub mod router;
 pub mod status;
 pub mod stub;
 
 pub use factory::{ConfiguredEmbedderFactory, EmbedderFactory};
+pub use router::EmbeddingRouter;
 pub use status::{EmbedHealthSnapshot, EmbedStatus, global_embed_status};
 
 pub type Result<T> = std::result::Result<T, EmbedError>;
@@ -83,11 +86,11 @@ pub enum EmbedError {
         #[source]
         source: reqwest::Error,
     },
-    #[error("embedding endpoint returned error status {endpoint}")]
+    #[error("embedding endpoint returned error status {status} from {endpoint}")]
     HttpStatus {
         endpoint: String,
-        #[source]
-        source: reqwest::Error,
+        status: reqwest::StatusCode,
+        retry_after: Option<Duration>,
     },
     #[error("failed to decode embedding response from {endpoint}")]
     DecodeResponse {
@@ -109,6 +112,11 @@ pub enum EmbedError {
     MissingConfiguration(String),
     #[error("invalid embed configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("embedding endpoints are temporarily unavailable: {reason}")]
+    TemporarilyUnavailable {
+        retry_after: Duration,
+        reason: String,
+    },
     #[error("failed to read embed API key from env var {var}")]
     ReadApiKeyEnv {
         var: String,
@@ -121,13 +129,13 @@ impl EmbedError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::HttpRequest { source, .. } => source.status().is_none_or(is_retryable_status),
-            Self::HttpStatus { source, .. } | Self::DownloadStatus { source, .. } => {
-                source.status().is_some_and(is_retryable_status)
-            }
+            Self::HttpStatus { status, .. } => is_retryable_status(*status),
+            Self::DownloadStatus { source, .. } => source.status().is_some_and(is_retryable_status),
             Self::Download { .. }
             | Self::ReadDownloadBody { .. }
             | Self::Runtime(_)
-            | Self::WorkerPanic(_) => true,
+            | Self::WorkerPanic(_)
+            | Self::TemporarilyUnavailable { .. } => true,
             Self::CreateModelDir { .. }
             | Self::CheckPathExists { .. }
             | Self::WriteFile { .. }
@@ -151,6 +159,14 @@ impl EmbedError {
             Self::HttpRequest { endpoint, .. }
             | Self::HttpStatus { endpoint, .. }
             | Self::DecodeResponse { endpoint, .. } => Some(endpoint.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::HttpStatus { retry_after, .. } => *retry_after,
+            Self::TemporarilyUnavailable { retry_after, .. } => Some(*retry_after),
             _ => None,
         }
     }
@@ -217,9 +233,9 @@ pub async fn build_backend_from_name(config: &Config, backend: &str) -> Result<B
         }
         #[cfg(feature = "onnx")]
         "onnx" => Ok(Box::new(onnx::OnnxEmbedder::new_or_download().await?)),
-        "openai_compat" | "api" => Ok(Box::new(
-            openai_compat::OpenAiCompatibleEmbedder::from_config(config)?,
-        )),
+        "openai_compat" | "api" => Ok(Box::new(router::EmbeddingRouter::from_config(
+            &config.embed,
+        )?)),
         "stub" => {
             let dim = config
                 .embed

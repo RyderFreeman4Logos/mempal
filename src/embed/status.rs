@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 
@@ -35,6 +37,24 @@ pub struct RetryConfigSnapshot {
     pub alert_enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedEndpointRuntimeSnapshot {
+    pub id: String,
+    pub cooldown_until_unix_ms: Option<u64>,
+    pub cooldown_remaining_secs: Option<u64>,
+    pub last_error: Option<String>,
+    pub last_failure_at_unix_ms: Option<u64>,
+    pub last_success_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EmbedEndpointRuntimeState {
+    cooldown_until_unix_ms: Option<u64>,
+    last_error: Option<String>,
+    last_failure_at_unix_ms: Option<u64>,
+    last_success_at_unix_ms: Option<u64>,
+}
+
 pub struct EmbedStatus {
     fail_count: AtomicU64,
     degraded: AtomicBool,
@@ -48,6 +68,7 @@ pub struct EmbedStatus {
     last_success_at_unix_ms: AtomicU64,
     fallback_warning: ArcSwapOption<String>,
     audit_db_path: ArcSwapOption<PathBuf>,
+    endpoint_states: Mutex<BTreeMap<String, EmbedEndpointRuntimeState>>,
 }
 
 impl Default for EmbedStatus {
@@ -76,6 +97,7 @@ impl EmbedStatus {
             last_success_at_unix_ms: AtomicU64::new(0),
             fallback_warning: ArcSwapOption::from(None),
             audit_db_path: ArcSwapOption::from(None),
+            endpoint_states: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -171,6 +193,74 @@ impl EmbedStatus {
             .store(now_unix_ms(), Ordering::SeqCst);
     }
 
+    pub fn record_endpoint_success(&self, id: &str) {
+        let now = now_unix_ms();
+        let mut states = self
+            .endpoint_states
+            .lock()
+            .expect("embed endpoint state mutex poisoned");
+        let state = states.entry(id.to_string()).or_default();
+        state.cooldown_until_unix_ms = None;
+        state.last_error = None;
+        state.last_success_at_unix_ms = Some(now);
+    }
+
+    pub fn record_endpoint_cooldown(
+        &self,
+        id: &str,
+        retry_after: Duration,
+        error: &super::EmbedError,
+    ) {
+        let now = now_unix_ms();
+        let retry_ms = u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX);
+        let cooldown_until = now.saturating_add(retry_ms);
+        let mut states = self
+            .endpoint_states
+            .lock()
+            .expect("embed endpoint state mutex poisoned");
+        let state = states.entry(id.to_string()).or_default();
+        state.cooldown_until_unix_ms = Some(cooldown_until);
+        state.last_error = Some(crate::core::config::scrub_sensitive_text(
+            &error.to_string(),
+        ));
+        state.last_failure_at_unix_ms = Some(now);
+    }
+
+    pub fn clear_endpoint_cooldown(&self, id: &str) {
+        let mut states = self
+            .endpoint_states
+            .lock()
+            .expect("embed endpoint state mutex poisoned");
+        if let Some(state) = states.get_mut(id) {
+            state.cooldown_until_unix_ms = None;
+        }
+    }
+
+    pub fn endpoint_runtime_snapshots(&self) -> Vec<EmbedEndpointRuntimeSnapshot> {
+        let now = now_unix_ms();
+        let states = self
+            .endpoint_states
+            .lock()
+            .expect("embed endpoint state mutex poisoned");
+        states
+            .iter()
+            .map(|(id, state)| {
+                let cooldown_until = state
+                    .cooldown_until_unix_ms
+                    .filter(|cooldown_until| *cooldown_until > now);
+                EmbedEndpointRuntimeSnapshot {
+                    id: id.clone(),
+                    cooldown_until_unix_ms: cooldown_until,
+                    cooldown_remaining_secs: cooldown_until
+                        .map(|cooldown_until| cooldown_until.saturating_sub(now).div_ceil(1000)),
+                    last_error: state.last_error.clone(),
+                    last_failure_at_unix_ms: state.last_failure_at_unix_ms,
+                    last_success_at_unix_ms: state.last_success_at_unix_ms,
+                }
+            })
+            .collect()
+    }
+
     pub fn record_fallback_success(&self, message: String) {
         self.sync_from_config();
         self.fail_count.store(0, Ordering::SeqCst);
@@ -232,6 +322,10 @@ impl EmbedStatus {
         self.last_success_at_unix_ms.store(0, Ordering::SeqCst);
         self.fallback_warning.store(None);
         self.audit_db_path.store(None);
+        self.endpoint_states
+            .lock()
+            .expect("embed endpoint state mutex poisoned")
+            .clear();
     }
 
     pub fn set_audit_db_path(&self, db_path: Option<PathBuf>) {
