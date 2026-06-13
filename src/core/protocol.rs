@@ -391,7 +391,7 @@ pub const DEFAULT_IDENTITY_HINT: &str = "(identity not set — create ~/.mempal/
 
 #[cfg(test)]
 mod tests {
-    use crate::core::db::Database;
+    use crate::core::db::{CURRENT_SCHEMA_VERSION, Database};
 
     use super::MEMORY_PROTOCOL;
 
@@ -661,6 +661,9 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("create temp dir");
         let db_path = tempdir.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
-        assert_eq!(db.schema_version().expect("schema version"), 17);
+        assert_eq!(
+            db.schema_version().expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
     }
 }

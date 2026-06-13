@@ -1,4 +1,4 @@
-use mempal::core::db::Database;
+use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use mempal::embed::{Embedder, EmbedderFactory};
 use mempal::ingest::lock::{acquire_source_lock, source_key};
@@ -377,7 +377,10 @@ fn test_migration_v6_to_v7_stamps_normalize_version_1() {
 
     let db = Database::open(&db_path).expect("migrate v6 db");
 
-    assert_eq!(db.schema_version().expect("schema version"), 17);
+    assert_eq!(
+        db.schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
     assert_eq!(db.drawer_count().expect("drawer count"), 20);
     assert_eq!(count_normalize_version(&db, 1), 20);
 }

@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::thread;
 
-use mempal::core::db::Database;
+use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use mempal::core::types::{
     AnchorKind, Drawer, KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole,
     KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance, RuntimeAdoptionEvent,
@@ -291,7 +291,10 @@ fn read_include_cards_default(home: &TempDir) -> bool {
 fn test_runtime_adoption_event_roundtrip_db() {
     let tmp = TempDir::new().expect("tempdir");
     let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
-    assert_eq!(db.schema_version().expect("schema version"), 17);
+    assert_eq!(
+        db.schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
 
     let event = RuntimeAdoptionEvent {
         id: "adoption_test".to_string(),

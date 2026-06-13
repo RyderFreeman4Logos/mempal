@@ -40,7 +40,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 17;
+pub const CURRENT_SCHEMA_VERSION: u32 = 18;
 pub const CURRENT_VECTOR_INDEX_VERSION: &str = "v2";
 pub const VECTOR_DISTANCE_METRIC: &str = "cosine";
 /// SQLite page cache budget for issue #311's large-DB stale reindex path.
@@ -6155,6 +6155,35 @@ CREATE VIRTUAL TABLE IF NOT EXISTS drawers_fts USING fts5(
 );
 "#;
 
+const V18_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS design_insights (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL CHECK(source IN ('user_idea', 'review_finding', 'tool_friction', 'incident', 'research')),
+    scope TEXT NOT NULL CHECK(scope IN ('project', 'cross_project', 'repo', 'issue')),
+    target_artifact TEXT NOT NULL CHECK(target_artifact IN ('memory', 'skill', 'agents_rule', 'agents_rules_ref', 'codex_skill', 'github_issue', 'mempal_knowledge')),
+    evidence_ref TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    rule_text TEXT,
+    priority INTEGER NOT NULL CHECK(priority BETWEEN 1 AND 5),
+    status TEXT NOT NULL CHECK(status IN ('open', 'resolved')) DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_by TEXT,
+    resolution_note TEXT,
+    redaction_count INTEGER NOT NULL DEFAULT 0,
+    project_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_design_insights_status_priority
+    ON design_insights(status, priority DESC, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_design_insights_target_status
+    ON design_insights(target_artifact, status, priority DESC);
+
+CREATE INDEX IF NOT EXISTS idx_design_insights_project_status
+    ON design_insights(project_id, status, priority DESC);
+"#;
+
 const V12_COMPACTION_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
     ON drawers(compacted_into)
@@ -6305,6 +6334,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 17,
             sql: V17_MIGRATION_SQL,
+        },
+        Migration {
+            version: 18,
+            sql: V18_MIGRATION_SQL,
         },
     ];
     MIGRATIONS

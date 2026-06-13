@@ -100,26 +100,27 @@ use super::tools::{
     CoworkBusHandoffDto, CoworkBusHandoffFiltersDto, CoworkBusMessageDto, CoworkBusRequest,
     CoworkBusResponse, CoworkBusSessionDto, CoworkBusTmuxPeekDto, CoworkBusTmuxProbeDto,
     CoworkPushRequest, CoworkPushResponse, DatabaseDiagnosticDto, DeleteRequest, DeleteResponse,
-    DoctorMcpDto, DoctorRequest, DoctorResponse, DoctorToolDto, DuplicateWarning,
-    EmbedEndpointStatusDto, EmbedStatusDto, EmbedderCircuitDto, EndpointHealthDto,
-    FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto, FieldTaxonomyResponse,
-    GatingRuntimeStatusDto, IngestControls, IngestOperationState, IngestRequest, IngestResponse,
-    IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto, KnowledgeCardDto,
-    KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse, KnowledgeDemoteRequest,
-    KnowledgeDemoteResponse, KnowledgeDistillRequest, KnowledgeDistillResponse,
-    KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse, KnowledgePromoteRequest,
-    KnowledgePromoteResponse, KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse,
-    LeaseInfoDto, LeaseRequest, LeaseResponse, LlmEndpointStatusDto, LlmStatusDto,
-    MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest,
-    PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
-    Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
-    QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
-    ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto, RollbackRequest,
-    RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto,
-    SearchRequest, SearchResponse, SearchResultDto, SkillDto, SkillRequest, SkillResponse,
-    SkillSummaryDto, SourceTypeCount, StatusDetail, StatusRequest, StatusResponse, StatusScope,
-    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
-    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    DesignInsightStatusDto, DoctorMcpDto, DoctorRequest, DoctorResponse, DoctorToolDto,
+    DuplicateWarning, EmbedEndpointStatusDto, EmbedStatusDto, EmbedderCircuitDto,
+    EndpointHealthDto, FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto,
+    FieldTaxonomyResponse, GatingRuntimeStatusDto, IngestControls, IngestOperationState,
+    IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto,
+    KnowledgeCardDto, KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse,
+    KnowledgeDemoteRequest, KnowledgeDemoteResponse, KnowledgeDistillRequest,
+    KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse,
+    KnowledgePromoteRequest, KnowledgePromoteResponse, KnowledgePublishAnchorRequest,
+    KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest, LeaseResponse,
+    LlmEndpointStatusDto, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS,
+    OperationStatusRequest, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto,
+    Phase3Request, Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest,
+    PinnedFactsResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest,
+    ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto,
+    RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto,
+    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, SkillDto,
+    SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, StatusDetail, StatusRequest,
+    StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto, TaxonomyRequest,
+    TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto, TunnelsRequest,
+    TunnelsResponse, TurnStorageStatusDto,
 };
 
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
@@ -613,6 +614,8 @@ impl MempalMcpServer {
                 let consolidation_stats = db.consolidation_stats()?;
                 let pending_card_count = db.pending_auto_generated_knowledge_card_count()?;
                 let last_crystallization_at = db.last_crystallization_at()?;
+                let design_insight_summary =
+                    crate::core::design_insights::unresolved_design_insight_summary(db.conn())?;
                 let raw_turn_count = count_raw_turn_drawers(db, &turns_config)?;
                 let null_project_backfill_pending = db.null_project_backfill_pending_count()?;
                 let taxonomy_count = db.taxonomy_count()?;
@@ -657,6 +660,7 @@ impl MempalMcpServer {
                     sleep_conflicts_resolved: consolidation_stats.sleep_conflicts_resolved,
                     pending_card_count,
                     last_crystallization_at,
+                    design_insight_summary,
                     raw_turn_count,
                     null_project_backfill_pending,
                     taxonomy_count,
@@ -1398,6 +1402,7 @@ struct StatusDbSnapshot {
     sleep_conflicts_resolved: u64,
     pending_card_count: i64,
     last_crystallization_at: Option<String>,
+    design_insight_summary: crate::core::design_insights::DesignInsightSummary,
     raw_turn_count: i64,
     null_project_backfill_pending: i64,
     taxonomy_count: i64,
@@ -2238,6 +2243,16 @@ impl MempalMcpServer {
                 source: "vector_index".to_string(),
             });
         }
+        if db_snapshot.design_insight_summary.high_value_open > 0 {
+            system_warnings.push(SystemWarning {
+                level: "warn".to_string(),
+                message: format!(
+                    "{} unresolved high-value design insight(s) need draining; run `mempal insight list --status open --min-priority 4`",
+                    db_snapshot.design_insight_summary.high_value_open
+                ),
+                source: "design_insights".to_string(),
+            });
+        }
         if unresolved_project_scope && config.search.strict_project_isolation {
             system_warnings.push(SystemWarning {
                 level: "warn".to_string(),
@@ -2321,6 +2336,11 @@ impl MempalMcpServer {
             sleep_conflicts_resolved: db_snapshot.sleep_conflicts_resolved,
             pending_card_count: db_snapshot.pending_card_count,
             last_crystallization_at: db_snapshot.last_crystallization_at,
+            design_insights: DesignInsightStatusDto {
+                open_total: db_snapshot.design_insight_summary.open_total,
+                high_value_open: db_snapshot.design_insight_summary.high_value_open,
+                open_by_target: db_snapshot.design_insight_summary.open_by_target,
+            },
             taxonomy_count: db_snapshot.taxonomy_count,
             db_size_bytes: db_snapshot.db_size_bytes,
             diary_rollup_days: db_snapshot.diary_rollup_days,
