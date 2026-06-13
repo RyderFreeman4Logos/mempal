@@ -2142,6 +2142,17 @@ fn test_cli_maintenance_rejudge_help_verbose() {
 }
 
 #[test]
+fn test_cli_maintenance_rejudge_help_shows_progress_file() {
+    let home = TempDir::new().expect("home");
+    let output = run_mempal(&home, &["maintenance", "rejudge", "--help"]);
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("--progress-file"), "{out}");
+    assert!(out.contains("JSONL progress"), "{out}");
+    assert!(!home.path().join(".mempal").exists());
+}
+
+#[test]
 
 fn test_cli_maintenance_runbook_rejects_invalid_format() {
     let home = TempDir::new().expect("home");

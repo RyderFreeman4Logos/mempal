@@ -2125,6 +2125,9 @@ enum MaintenanceCommands {
         /// Number of snapshot rows to process per full-sweep page.
         #[arg(long = "page-size", default_value_t = DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE)]
         page_size: usize,
+        /// Write content-free JSONL progress telemetry to this file.
+        #[arg(long = "progress-file")]
+        progress_file: Option<PathBuf>,
         #[arg(long)]
         wing: Option<String>,
         #[arg(long)]
@@ -2288,6 +2291,7 @@ struct HistoricalRejudgeOptions<'a> {
     all: bool,
     resume: bool,
     page_size: usize,
+    progress_file: Option<&'a Path>,
     wing: Option<&'a str>,
     room: Option<&'a str>,
     project: Option<&'a str>,
@@ -2313,6 +2317,7 @@ struct HistoricalRejudgeReport {
     elapsed_ms: u128,
     judge_model: Option<String>,
     config_version: String,
+    progress_file: Option<PathBuf>,
     backup_path: Option<PathBuf>,
     backup_format: Option<String>,
     wings_rooms: Vec<HistoricalRejudgeScopeCount>,
@@ -2333,6 +2338,7 @@ struct HistoricalRejudgeReportInput<'a> {
     elapsed_ms: u128,
     judge_model: Option<String>,
     config_version: String,
+    progress_file: Option<PathBuf>,
     backup_path: Option<PathBuf>,
     backup_format: Option<String>,
     decisions: &'a [(
@@ -2453,6 +2459,60 @@ fn default_historical_rejudge_page_size() -> usize {
     DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE
 }
 
+fn build_historical_rejudge_progress_event(
+    input: HistoricalRejudgeProgressEventInput<'_>,
+) -> HistoricalRejudgeProgressEvent<'_> {
+    let elapsed_secs = input.started.elapsed().as_secs_f64();
+    let eta_secs = historical_rejudge_eta_secs(
+        input.snapshot_count,
+        input.counts.scanned_count,
+        elapsed_secs,
+    );
+    HistoricalRejudgeProgressEvent {
+        job: "maintenance_rejudge",
+        status: input.status,
+        dry_run: input.dry_run,
+        execute: !input.dry_run,
+        all: input.all,
+        bounded: !input.all,
+        limit: input.limit,
+        page_size: input.page_size,
+        snapshot_count: input.snapshot_count,
+        snapshot_max_rowid: input.snapshot_max_rowid,
+        scanned_count: input.counts.scanned_count,
+        processed_count: input.counts.scanned_count,
+        candidate_count: input.counts.candidate_count,
+        delete_candidate_count: input.counts.candidate_count,
+        kept_count: input.counts.kept_count,
+        protected_count: input.counts.protected_count,
+        mutated_count: input.counts.mutated_count,
+        estimated_bytes_reclaimed: input.counts.estimated_bytes_reclaimed,
+        current_rowid: input.cursor_rowid,
+        last_cursor_rowid: input.cursor_rowid,
+        remaining_count: input.remaining_count,
+        judge_model: input.judge_model,
+        config_version: input.config_version,
+        elapsed_secs,
+        eta_secs,
+        timestamp: iso_timestamp(),
+        last_successful_page_at: input.last_successful_page_at,
+        error: input.error,
+    }
+}
+
+fn historical_rejudge_eta_secs(
+    snapshot_count: Option<usize>,
+    scanned_count: usize,
+    elapsed_secs: f64,
+) -> Option<f64> {
+    let snapshot_count = snapshot_count?;
+    if snapshot_count == 0 || scanned_count == 0 {
+        return None;
+    }
+    let remaining = snapshot_count.saturating_sub(scanned_count);
+    Some((elapsed_secs / scanned_count as f64) * remaining as f64)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistoricalRejudgeCheckpoint {
     run_id: String,
@@ -2525,6 +2585,144 @@ struct HistoricalRejudgeProgressSummary {
     estimated_bytes_reclaimed: usize,
     wings_rooms: BTreeMap<(String, Option<String>), usize>,
     examples: Vec<HistoricalRejudgeExample>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HistoricalRejudgeProgressCounts {
+    scanned_count: usize,
+    candidate_count: usize,
+    kept_count: usize,
+    protected_count: usize,
+    mutated_count: usize,
+    estimated_bytes_reclaimed: usize,
+}
+
+impl HistoricalRejudgeProgressCounts {
+    fn from_checkpoint(checkpoint: &HistoricalRejudgeCheckpoint) -> Self {
+        Self {
+            scanned_count: checkpoint.scanned_count,
+            candidate_count: checkpoint.candidate_count,
+            kept_count: checkpoint.kept_count,
+            protected_count: checkpoint.protected_count,
+            mutated_count: checkpoint.mutated_count,
+            estimated_bytes_reclaimed: checkpoint.estimated_bytes_reclaimed,
+        }
+    }
+
+    fn from_summary(summary: &HistoricalRejudgeProgressSummary) -> Self {
+        Self {
+            scanned_count: summary.scanned_count,
+            candidate_count: summary.candidate_count,
+            kept_count: summary.kept_count,
+            protected_count: summary.protected_count,
+            mutated_count: summary.mutated_count,
+            estimated_bytes_reclaimed: summary.estimated_bytes_reclaimed,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HistoricalRejudgeProgressEvent<'a> {
+    job: &'static str,
+    status: &'static str,
+    dry_run: bool,
+    execute: bool,
+    all: bool,
+    bounded: bool,
+    limit: Option<usize>,
+    page_size: usize,
+    snapshot_count: Option<usize>,
+    snapshot_max_rowid: Option<i64>,
+    scanned_count: usize,
+    processed_count: usize,
+    candidate_count: usize,
+    delete_candidate_count: usize,
+    kept_count: usize,
+    protected_count: usize,
+    mutated_count: usize,
+    estimated_bytes_reclaimed: usize,
+    current_rowid: Option<i64>,
+    last_cursor_rowid: Option<i64>,
+    remaining_count: Option<usize>,
+    judge_model: Option<&'a str>,
+    config_version: &'a str,
+    elapsed_secs: f64,
+    eta_secs: Option<f64>,
+    timestamp: String,
+    last_successful_page_at: Option<&'a str>,
+    error: Option<&'a str>,
+}
+
+struct HistoricalRejudgeProgressEventInput<'a> {
+    status: &'static str,
+    dry_run: bool,
+    all: bool,
+    limit: Option<usize>,
+    page_size: usize,
+    snapshot_count: Option<usize>,
+    snapshot_max_rowid: Option<i64>,
+    counts: HistoricalRejudgeProgressCounts,
+    cursor_rowid: Option<i64>,
+    remaining_count: Option<usize>,
+    judge_model: Option<&'a str>,
+    config_version: &'a str,
+    started: std::time::Instant,
+    last_successful_page_at: Option<&'a str>,
+    error: Option<&'a str>,
+}
+
+struct HistoricalRejudgeProgressWriter {
+    path: PathBuf,
+    file: fs::File,
+}
+
+impl HistoricalRejudgeProgressWriter {
+    fn create(path: Option<&Path>) -> Result<Option<Self>> {
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "failed to open historical rejudge progress file {}",
+                    path.display()
+                )
+            })?;
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            file,
+        }))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn write_event(&mut self, event: HistoricalRejudgeProgressEvent<'_>) -> Result<()> {
+        serde_json::to_writer(&mut self.file, &event).with_context(|| {
+            format!(
+                "failed to write historical rejudge progress event to {}",
+                self.path.display()
+            )
+        })?;
+        writeln!(self.file).with_context(|| {
+            format!(
+                "failed to terminate historical rejudge progress event in {}",
+                self.path.display()
+            )
+        })?;
+        self.file.flush().with_context(|| {
+            format!(
+                "failed to flush historical rejudge progress file {}",
+                self.path.display()
+            )
+        })?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3271,6 +3469,7 @@ fn run() -> Result<()> {
                     all,
                     resume,
                     page_size,
+                    progress_file,
                     wing,
                     room,
                     project,
@@ -3288,6 +3487,7 @@ fn run() -> Result<()> {
                 all,
                 resume,
                 page_size,
+                progress_file: progress_file.as_deref(),
                 wing: wing.as_deref(),
                 room: room.as_deref(),
                 project: project.as_deref(),
@@ -12840,6 +13040,9 @@ Dry-run a bounded batch:
 Dry-run the full active database, oldest-to-newest snapshot:
   mempal maintenance rejudge --all --page-size 500 --format plain
 
+Dry-run with machine-readable progress telemetry:
+  mempal maintenance rejudge --all --page-size 500 --progress-file /tmp/mempal-rejudge-progress.jsonl --format json
+
 Execute the full forget sweep with an explicit backup directory:
   mempal maintenance rejudge --all --execute --backup-dir /ssd/mirror-rootfs/home/obj/bak/mempal/
 
@@ -12856,6 +13059,9 @@ Operational notes
   config version in the report/backup metadata.
 - Do not put API keys in command lines. Use configured environment variables or
   local/LAN endpoints; mempal rejects URL userinfo/query secrets.
+- Progress files are JSONL sidecars containing counts, cursors, ETA, model
+  summary, and config version only; they do not include drawer content, prompts,
+  raw LLM responses, or provider credentials.
 - If a provider/model fails during execute, stop and resume later rather than
   deleting based on uncertain fallback judgments.
 - Use --hard-delete only when you intentionally want irreversible deletion.
@@ -12918,12 +13124,14 @@ async fn maintenance_rejudge_command(
     } else {
         None
     };
+    let mut progress = HistoricalRejudgeProgressWriter::create(options.progress_file)?;
 
     if options.all {
-        return maintenance_rejudge_all_command(db, config, options, project_id).await;
+        return maintenance_rejudge_all_command(db, config, options, project_id, progress.as_mut())
+            .await;
     }
 
-    maintenance_rejudge_limited_command(db, config, options, project_id).await
+    maintenance_rejudge_limited_command(db, config, options, project_id, progress.as_mut()).await
 }
 
 fn validate_historical_rejudge_options(options: HistoricalRejudgeOptions<'_>) -> Result<()> {
@@ -12953,6 +13161,7 @@ async fn maintenance_rejudge_limited_command(
     config: &Config,
     options: HistoricalRejudgeOptions<'_>,
     project_id: Option<String>,
+    mut progress: Option<&mut HistoricalRejudgeProgressWriter>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let rows = db
@@ -12970,9 +13179,58 @@ async fn maintenance_rejudge_limited_command(
         .and_then(|_| config.llm.effective_model_summary())
         .or_else(|| Some("deterministic".to_string()).filter(|_| llm_router.is_none()));
 
+    if let Some(writer) = progress.as_mut() {
+        writer.write_event(build_historical_rejudge_progress_event(
+            HistoricalRejudgeProgressEventInput {
+                status: "started",
+                dry_run: !options.execute,
+                all: false,
+                limit: Some(options.limit),
+                page_size: rows.len(),
+                snapshot_count: Some(rows.len()),
+                snapshot_max_rowid: rows.last().map(|row| row.rowid),
+                counts: HistoricalRejudgeProgressCounts::default(),
+                cursor_rowid: None,
+                remaining_count: Some(rows.len()),
+                judge_model: judge_model.as_deref(),
+                config_version: &config_version,
+                started,
+                last_successful_page_at: None,
+                error: None,
+            },
+        ))?;
+    }
+
     let mut decisions = Vec::with_capacity(rows.len());
     for row in &rows {
-        let decision = evaluate_historical_drawer(row, config, llm_router.as_ref()).await?;
+        let decision = match evaluate_historical_drawer(row, config, llm_router.as_ref()).await {
+            Ok(decision) => decision,
+            Err(error) => {
+                if let Some(writer) = progress.as_mut() {
+                    let counts = historical_rejudge_progress_counts_from_decisions(&decisions, 0);
+                    writer.write_event(build_historical_rejudge_progress_event(
+                        HistoricalRejudgeProgressEventInput {
+                            status: "failed",
+                            dry_run: !options.execute,
+                            all: false,
+                            limit: Some(options.limit),
+                            page_size: rows.len(),
+                            snapshot_count: Some(rows.len()),
+                            snapshot_max_rowid: rows.last().map(|row| row.rowid),
+                            counts,
+                            cursor_rowid: decisions.last().map(|(row, _)| row.rowid),
+                            remaining_count: Some(rows.len().saturating_sub(counts.scanned_count)),
+                            judge_model: judge_model.as_deref(),
+                            config_version: &config_version,
+                            started,
+                            last_successful_page_at: None,
+                            error: Some("historical_rejudge_failed"),
+                        },
+                    ))?;
+                }
+                return Err(error);
+            }
+        };
         decisions.push((row, decision));
     }
 
@@ -13103,10 +13361,37 @@ async fn maintenance_rejudge_limited_command(
         elapsed_ms: started.elapsed().as_millis(),
         judge_model,
         config_version,
+        progress_file: progress.as_ref().map(|writer| writer.path().to_path_buf()),
         backup_format: backup_path.as_ref().map(|_| "sqlite".to_string()),
         backup_path,
         decisions: &decisions,
     });
+    if let Some(writer) = progress.as_mut() {
+        let counts =
+            historical_rejudge_progress_counts_from_decisions(&decisions, report.mutated_count);
+        let page_at = iso_timestamp();
+        for status in ["page_completed", "completed"] {
+            writer.write_event(build_historical_rejudge_progress_event(
+                HistoricalRejudgeProgressEventInput {
+                    status,
+                    dry_run: !options.execute,
+                    all: false,
+                    limit: Some(options.limit),
+                    page_size: rows.len(),
+                    snapshot_count: Some(rows.len()),
+                    snapshot_max_rowid: rows.last().map(|row| row.rowid),
+                    counts,
+                    cursor_rowid: rows.last().map(|row| row.rowid),
+                    remaining_count: Some(0),
+                    judge_model: report.judge_model.as_deref(),
+                    config_version: &report.config_version,
+                    started,
+                    last_successful_page_at: Some(&page_at),
+                    error: None,
+                },
+            ))?;
+        }
+    }
     print_historical_rejudge_report(&report, options.format)
 }
 
@@ -13160,6 +13445,7 @@ async fn maintenance_rejudge_all_command(
     config: &Config,
     options: HistoricalRejudgeOptions<'_>,
     project_id: Option<String>,
+    mut progress: Option<&mut HistoricalRejudgeProgressWriter>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let config_version = historical_rejudge_config_version(config);
@@ -13184,6 +13470,7 @@ async fn maintenance_rejudge_all_command(
                 judge_model,
                 config_version,
                 started,
+                progress: progress.as_deref_mut(),
             },
         )
         .await?;
@@ -13200,6 +13487,32 @@ async fn maintenance_rejudge_all_command(
     )
     .context("failed to prepare historical rejudge checkpoint")?;
 
+    if let Some(writer) = progress.as_mut() {
+        writer.write_event(build_historical_rejudge_progress_event(
+            HistoricalRejudgeProgressEventInput {
+                status: "started",
+                dry_run: false,
+                all: true,
+                limit: None,
+                page_size: checkpoint.page_size,
+                snapshot_count: Some(checkpoint.snapshot_count),
+                snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
+                counts: HistoricalRejudgeProgressCounts::from_checkpoint(&checkpoint),
+                cursor_rowid: checkpoint.last_processed_rowid,
+                remaining_count: Some(
+                    checkpoint
+                        .snapshot_count
+                        .saturating_sub(checkpoint.scanned_count),
+                ),
+                judge_model: checkpoint.judge_model.as_deref(),
+                config_version: &checkpoint.config_version,
+                started,
+                last_successful_page_at: None,
+                error: None,
+            },
+        ))?;
+    }
+
     if checkpoint.status == "done" {
         let remaining = historical_rejudge_remaining_work_count(db, &checkpoint.run_id)?;
         let report = historical_rejudge_report_from_checkpoint(
@@ -13208,7 +13521,29 @@ async fn maintenance_rejudge_all_command(
             true,
             remaining,
             started.elapsed().as_millis(),
+            progress.as_ref().map(|writer| writer.path().to_path_buf()),
         );
+        if let Some(writer) = progress.as_mut() {
+            writer.write_event(build_historical_rejudge_progress_event(
+                HistoricalRejudgeProgressEventInput {
+                    status: "completed",
+                    dry_run: false,
+                    all: true,
+                    limit: None,
+                    page_size: checkpoint.page_size,
+                    snapshot_count: Some(checkpoint.snapshot_count),
+                    snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
+                    counts: HistoricalRejudgeProgressCounts::from_checkpoint(&checkpoint),
+                    cursor_rowid: checkpoint.last_processed_rowid,
+                    remaining_count: Some(remaining),
+                    judge_model: checkpoint.judge_model.as_deref(),
+                    config_version: &checkpoint.config_version,
+                    started,
+                    last_successful_page_at: Some(&checkpoint.updated_at),
+                    error: None,
+                },
+            ))?;
+        }
         return print_historical_rejudge_report(&report, options.format);
     }
 
@@ -13244,11 +13579,61 @@ async fn maintenance_rejudge_all_command(
             checkpoint.status = "failed".to_string();
             checkpoint.updated_at = iso_timestamp();
             save_historical_rejudge_checkpoint(db, &checkpoint)?;
+            if let Some(writer) = progress.as_mut() {
+                writer.write_event(build_historical_rejudge_progress_event(
+                    HistoricalRejudgeProgressEventInput {
+                        status: "failed",
+                        dry_run: false,
+                        all: true,
+                        limit: None,
+                        page_size: checkpoint.page_size,
+                        snapshot_count: Some(checkpoint.snapshot_count),
+                        snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
+                        counts: HistoricalRejudgeProgressCounts::from_checkpoint(&checkpoint),
+                        cursor_rowid: checkpoint.last_processed_rowid,
+                        remaining_count: Some(
+                            checkpoint
+                                .snapshot_count
+                                .saturating_sub(checkpoint.scanned_count),
+                        ),
+                        judge_model: checkpoint.judge_model.as_deref(),
+                        config_version: &checkpoint.config_version,
+                        started,
+                        last_successful_page_at: None,
+                        error: Some("historical_rejudge_failed"),
+                    },
+                ))?;
+            }
             return Err(error).with_context(|| {
                 format!(
                     "historical rejudge stopped while processing rowids {page_start}..={page_end}; rerun with `mempal maintenance rejudge --all --resume --execute`"
                 )
             });
+        }
+        if let Some(writer) = progress.as_mut() {
+            writer.write_event(build_historical_rejudge_progress_event(
+                HistoricalRejudgeProgressEventInput {
+                    status: "page_completed",
+                    dry_run: false,
+                    all: true,
+                    limit: None,
+                    page_size: checkpoint.page_size,
+                    snapshot_count: Some(checkpoint.snapshot_count),
+                    snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
+                    counts: HistoricalRejudgeProgressCounts::from_checkpoint(&checkpoint),
+                    cursor_rowid: checkpoint.last_processed_rowid,
+                    remaining_count: Some(
+                        checkpoint
+                            .snapshot_count
+                            .saturating_sub(checkpoint.scanned_count),
+                    ),
+                    judge_model: checkpoint.judge_model.as_deref(),
+                    config_version: &checkpoint.config_version,
+                    started,
+                    last_successful_page_at: Some(&checkpoint.updated_at),
+                    error: None,
+                },
+            ))?;
         }
     }
 
@@ -13282,7 +13667,29 @@ async fn maintenance_rejudge_all_command(
         true,
         remaining,
         started.elapsed().as_millis(),
+        progress.as_ref().map(|writer| writer.path().to_path_buf()),
     );
+    if let Some(writer) = progress.as_mut() {
+        writer.write_event(build_historical_rejudge_progress_event(
+            HistoricalRejudgeProgressEventInput {
+                status: "completed",
+                dry_run: false,
+                all: true,
+                limit: None,
+                page_size: checkpoint.page_size,
+                snapshot_count: Some(checkpoint.snapshot_count),
+                snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
+                counts: HistoricalRejudgeProgressCounts::from_checkpoint(&checkpoint),
+                cursor_rowid: checkpoint.last_processed_rowid,
+                remaining_count: Some(remaining),
+                judge_model: checkpoint.judge_model.as_deref(),
+                config_version: &checkpoint.config_version,
+                started,
+                last_successful_page_at: Some(&checkpoint.updated_at),
+                error: None,
+            },
+        ))?;
+    }
     print_historical_rejudge_report(&report, options.format)
 }
 
@@ -13290,7 +13697,7 @@ async fn dry_run_historical_rejudge_all(
     db: &Database,
     config: &Config,
     options: HistoricalRejudgeOptions<'_>,
-    context: HistoricalRejudgeDryRunContext<'_>,
+    mut context: HistoricalRejudgeDryRunContext<'_>,
 ) -> Result<HistoricalRejudgeReport> {
     let max_rowid = db
         .historical_rejudge_scope_max_rowid(options.wing, options.room, context.project_id)
@@ -13306,6 +13713,29 @@ async fn dry_run_historical_rejudge_all(
         .context("failed to count historical rejudge snapshot")?;
     let mut cursor = 0_i64;
     let mut summary = HistoricalRejudgeProgressSummary::default();
+    let mut last_successful_page_at: Option<String> = None;
+
+    if let Some(writer) = context.progress.as_mut() {
+        writer.write_event(build_historical_rejudge_progress_event(
+            HistoricalRejudgeProgressEventInput {
+                status: "started",
+                dry_run: true,
+                all: true,
+                limit: None,
+                page_size: options.page_size,
+                snapshot_count: Some(snapshot_count),
+                snapshot_max_rowid: Some(max_rowid),
+                counts: HistoricalRejudgeProgressCounts::default(),
+                cursor_rowid: None,
+                remaining_count: Some(snapshot_count),
+                judge_model: context.judge_model.as_deref(),
+                config_version: &context.config_version,
+                started: context.started,
+                last_successful_page_at: None,
+                error: None,
+            },
+        ))?;
+    }
 
     loop {
         let rows = db
@@ -13322,13 +13752,64 @@ async fn dry_run_historical_rejudge_all(
             break;
         }
         for row in &rows {
-            let decision = evaluate_historical_drawer(row, config, context.llm_router).await?;
+            let decision = match evaluate_historical_drawer(row, config, context.llm_router).await {
+                Ok(decision) => decision,
+                Err(error) => {
+                    if let Some(writer) = context.progress.as_mut() {
+                        writer.write_event(build_historical_rejudge_progress_event(
+                            HistoricalRejudgeProgressEventInput {
+                                status: "failed",
+                                dry_run: true,
+                                all: true,
+                                limit: None,
+                                page_size: options.page_size,
+                                snapshot_count: Some(snapshot_count),
+                                snapshot_max_rowid: Some(max_rowid),
+                                counts: HistoricalRejudgeProgressCounts::from_summary(&summary),
+                                cursor_rowid: (cursor > 0).then_some(cursor),
+                                remaining_count: Some(
+                                    snapshot_count.saturating_sub(summary.scanned_count),
+                                ),
+                                judge_model: context.judge_model.as_deref(),
+                                config_version: &context.config_version,
+                                started: context.started,
+                                last_successful_page_at: None,
+                                error: Some("historical_rejudge_failed"),
+                            },
+                        ))?;
+                    }
+                    return Err(error);
+                }
+            };
             record_historical_rejudge_summary(&mut summary, row, &decision, 0);
             cursor = row.rowid;
         }
+        if let Some(writer) = context.progress.as_mut() {
+            let page_at = iso_timestamp();
+            last_successful_page_at = Some(page_at.clone());
+            writer.write_event(build_historical_rejudge_progress_event(
+                HistoricalRejudgeProgressEventInput {
+                    status: "page_completed",
+                    dry_run: true,
+                    all: true,
+                    limit: None,
+                    page_size: options.page_size,
+                    snapshot_count: Some(snapshot_count),
+                    snapshot_max_rowid: Some(max_rowid),
+                    counts: HistoricalRejudgeProgressCounts::from_summary(&summary),
+                    cursor_rowid: (cursor > 0).then_some(cursor),
+                    remaining_count: Some(snapshot_count.saturating_sub(summary.scanned_count)),
+                    judge_model: context.judge_model.as_deref(),
+                    config_version: &context.config_version,
+                    started: context.started,
+                    last_successful_page_at: Some(&page_at),
+                    error: None,
+                },
+            ))?;
+        }
     }
 
-    Ok(historical_rejudge_report_from_summary(
+    let report = historical_rejudge_report_from_summary(
         summary,
         HistoricalRejudgeReportEnvelope {
             dry_run: true,
@@ -13346,10 +13827,43 @@ async fn dry_run_historical_rejudge_all(
             elapsed_ms: context.started.elapsed().as_millis(),
             judge_model: context.judge_model,
             config_version: context.config_version,
+            progress_file: context
+                .progress
+                .as_ref()
+                .map(|writer| writer.path().to_path_buf()),
             backup_path: None,
             backup_format: None,
         },
-    ))
+    );
+    if let Some(writer) = context.progress.as_mut() {
+        writer.write_event(build_historical_rejudge_progress_event(
+            HistoricalRejudgeProgressEventInput {
+                status: "completed",
+                dry_run: true,
+                all: true,
+                limit: None,
+                page_size: options.page_size,
+                snapshot_count: Some(snapshot_count),
+                snapshot_max_rowid: Some(max_rowid),
+                counts: HistoricalRejudgeProgressCounts {
+                    scanned_count: report.scanned_count,
+                    candidate_count: report.candidate_count,
+                    kept_count: report.kept_count,
+                    protected_count: report.protected_count,
+                    mutated_count: report.mutated_count,
+                    estimated_bytes_reclaimed: report.estimated_bytes_reclaimed,
+                },
+                cursor_rowid: report.cursor_rowid,
+                remaining_count: Some(0),
+                judge_model: report.judge_model.as_deref(),
+                config_version: &report.config_version,
+                started: context.started,
+                last_successful_page_at: last_successful_page_at.as_deref(),
+                error: None,
+            },
+        ))?;
+    }
+    Ok(report)
 }
 
 struct HistoricalRejudgeDryRunContext<'a> {
@@ -13358,6 +13872,7 @@ struct HistoricalRejudgeDryRunContext<'a> {
     judge_model: Option<String>,
     config_version: String,
     started: std::time::Instant,
+    progress: Option<&'a mut HistoricalRejudgeProgressWriter>,
 }
 
 struct HistoricalRejudgeReportEnvelope {
@@ -13372,6 +13887,7 @@ struct HistoricalRejudgeReportEnvelope {
     elapsed_ms: u128,
     judge_model: Option<String>,
     config_version: String,
+    progress_file: Option<PathBuf>,
     backup_path: Option<PathBuf>,
     backup_format: Option<String>,
 }
@@ -14083,6 +14599,31 @@ fn record_historical_rejudge_summary(
     summary.mutated_count += mutated_count;
 }
 
+fn historical_rejudge_progress_counts_from_decisions(
+    decisions: &[(
+        &mempal::core::db::HistoricalRejudgeCandidate,
+        HistoricalRejudgeDecision,
+    )],
+    mutated_count: usize,
+) -> HistoricalRejudgeProgressCounts {
+    let mut counts = HistoricalRejudgeProgressCounts {
+        scanned_count: decisions.len(),
+        mutated_count,
+        ..HistoricalRejudgeProgressCounts::default()
+    };
+    for (row, decision) in decisions {
+        if decision.protected {
+            counts.protected_count += 1;
+        } else if decision.delete_candidate {
+            counts.candidate_count += 1;
+            counts.estimated_bytes_reclaimed += row.drawer.content.len();
+        } else {
+            counts.kept_count += 1;
+        }
+    }
+    counts
+}
+
 fn sync_historical_rejudge_backup_storage(path: &Path) -> Result<()> {
     fs::File::open(path)
         .with_context(|| format!("failed to open backup {} for sync", path.display()))?
@@ -14118,6 +14659,7 @@ fn historical_rejudge_report_from_checkpoint(
     completed: bool,
     remaining_count: usize,
     elapsed_ms: u128,
+    progress_file: Option<PathBuf>,
 ) -> HistoricalRejudgeReport {
     HistoricalRejudgeReport {
         dry_run,
@@ -14137,6 +14679,7 @@ fn historical_rejudge_report_from_checkpoint(
         elapsed_ms,
         judge_model: checkpoint.judge_model.clone(),
         config_version: checkpoint.config_version.clone(),
+        progress_file,
         backup_path: checkpoint.backup_path.clone(),
         backup_format: checkpoint
             .backup_path
@@ -14174,6 +14717,7 @@ fn historical_rejudge_report_from_summary(
         elapsed_ms: envelope.elapsed_ms,
         judge_model: envelope.judge_model,
         config_version: envelope.config_version,
+        progress_file: envelope.progress_file,
         backup_path: envelope.backup_path,
         backup_format: envelope.backup_format,
         wings_rooms,
@@ -15952,6 +16496,7 @@ fn build_historical_rejudge_report(
         elapsed_ms: input.elapsed_ms,
         judge_model: input.judge_model,
         config_version: input.config_version,
+        progress_file: input.progress_file,
         backup_path: input.backup_path,
         backup_format: input.backup_format,
         wings_rooms,
@@ -15996,6 +16541,15 @@ fn print_historical_rejudge_report(report: &HistoricalRejudgeReport, format: &st
                 report.judge_model.as_deref().unwrap_or("none")
             );
             println!("config_version={}", report.config_version);
+            println!(
+                "progress_file={}",
+                report
+                    .progress_file
+                    .as_deref()
+                    .map(Path::display)
+                    .map(|display| display.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
             println!(
                 "backup_format={}",
                 report.backup_format.as_deref().unwrap_or("none")
@@ -17454,6 +18008,7 @@ enabled = true
             all: true,
             resume: false,
             page_size,
+            progress_file: None,
             wing: None,
             room: None,
             project: None,
@@ -17499,6 +18054,24 @@ enabled = true
                 |row| row.get(0),
             )
             .expect("load historical rejudge work item decision")
+    }
+
+    fn rejudge_progress_events(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .expect("read progress file")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse progress event"))
+            .collect()
+    }
+
+    fn sqlite_table_exists(db: &Database, table: &str) -> bool {
+        db.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("check sqlite table")
     }
 
     #[test]
@@ -17594,6 +18167,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -17630,6 +18204,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -17665,6 +18240,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -17748,6 +18324,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -17810,6 +18387,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18079,6 +18657,7 @@ enabled = true
                     all: false,
                     resume: false,
                     page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                    progress_file: None,
                     wing: None,
                     room: None,
                     project: None,
@@ -18117,6 +18696,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18148,6 +18728,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18180,6 +18761,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18210,6 +18792,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18245,6 +18828,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18287,6 +18871,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18349,6 +18934,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18417,6 +19003,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18492,6 +19079,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18584,6 +19172,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18673,6 +19262,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18762,6 +19352,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18813,6 +19404,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18975,6 +19567,157 @@ enabled = true
         assert!(
             backup_files(&backups).is_empty(),
             "dry-run full sweep must not create backup files"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_all_dry_run_writes_content_free_progress() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        for index in 0..3 {
+            insert_drawer(
+                &db,
+                &format!("low-progress-{index}"),
+                &format!("progress-secret-payload-{index}"),
+                "notes",
+                None,
+            );
+        }
+        let backups = backup_dir(&tmp);
+        let progress_file = tmp.path().join("rejudge-progress.jsonl");
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                progress_file: Some(&progress_file),
+                ..full_rejudge_options(false, Some(&backups), 2)
+            },
+        )
+        .await
+        .expect("dry-run full rejudge with progress");
+
+        assert_eq!(active_drawer_count(&db), 3);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_eq!(audit_count(&db), 0);
+        assert!(
+            backup_files(&backups).is_empty(),
+            "dry-run full sweep must not create backup files"
+        );
+        assert!(
+            !sqlite_table_exists(&db, HISTORICAL_REJUDGE_WORK_TABLE),
+            "dry-run progress must not create checkpoint work storage"
+        );
+        let events = rejudge_progress_events(&progress_file);
+        assert_eq!(
+            events.first().and_then(|e| e["status"].as_str()),
+            Some("started")
+        );
+        assert_eq!(
+            events.last().and_then(|e| e["status"].as_str()),
+            Some("completed")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["status"].as_str() == Some("page_completed")),
+            "progress must include page events: {events:?}"
+        );
+        let completed = events.last().expect("completed event");
+        assert_eq!(completed["dry_run"].as_bool(), Some(true));
+        assert_eq!(completed["all"].as_bool(), Some(true));
+        assert_eq!(completed["page_size"].as_u64(), Some(2));
+        assert_eq!(completed["snapshot_count"].as_u64(), Some(3));
+        assert_eq!(completed["scanned_count"].as_u64(), Some(3));
+        assert_eq!(completed["processed_count"].as_u64(), Some(3));
+        assert_eq!(completed["candidate_count"].as_u64(), Some(3));
+        assert_eq!(completed["delete_candidate_count"].as_u64(), Some(3));
+        assert_eq!(completed["mutated_count"].as_u64(), Some(0));
+        assert_eq!(completed["remaining_count"].as_u64(), Some(0));
+        assert!(completed["last_cursor_rowid"].as_i64().is_some());
+        assert!(completed["eta_secs"].as_f64().is_some());
+
+        let raw_progress = std::fs::read_to_string(&progress_file).expect("read progress");
+        assert!(
+            !raw_progress.contains("progress-secret-payload"),
+            "{raw_progress}"
+        );
+        assert!(!raw_progress.contains("low-progress"), "{raw_progress}");
+        assert!(!raw_progress.contains("reason"), "{raw_progress}");
+        assert!(!raw_progress.contains("preview"), "{raw_progress}");
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_all_execute_failure_writes_failed_progress_event() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(
+            &db,
+            "low-progress-failure",
+            "progress-failure-secret-payload",
+            "notes",
+            None,
+        );
+        db.conn()
+            .execute_batch(
+                r#"
+                CREATE TEMP TRIGGER rejudge_test_fail_gating_audit
+                BEFORE INSERT ON gating_audit
+                BEGIN
+                    SELECT RAISE(FAIL, 'injected gating audit failure');
+                END;
+                "#,
+            )
+            .expect("create audit failure trigger");
+        let backups = backup_dir(&tmp);
+        let progress_file = tmp.path().join("rejudge-failed-progress.jsonl");
+
+        let error = maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                progress_file: Some(&progress_file),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect_err("injected audit failure must fail command");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("injected gating audit failure")),
+            "{error:?}"
+        );
+        assert!(
+            db.get_drawer("low-progress-failure")
+                .expect("load active drawer")
+                .is_some(),
+            "failed execute page must not delete the drawer"
+        );
+        let events = rejudge_progress_events(&progress_file);
+        assert_eq!(
+            events.first().and_then(|e| e["status"].as_str()),
+            Some("started")
+        );
+        let failed = events.last().expect("failed event");
+        assert_eq!(failed["status"].as_str(), Some("failed"));
+        assert_eq!(failed["error"].as_str(), Some("historical_rejudge_failed"));
+        assert_eq!(failed["scanned_count"].as_u64(), Some(0));
+        assert_eq!(failed["mutated_count"].as_u64(), Some(0));
+
+        let raw_progress = std::fs::read_to_string(&progress_file).expect("read progress");
+        assert!(
+            !raw_progress.contains("progress-failure-secret-payload"),
+            "{raw_progress}"
+        );
+        assert!(
+            !raw_progress.contains("low-progress-failure"),
+            "{raw_progress}"
+        );
+        assert!(
+            !raw_progress.contains("injected gating audit failure"),
+            "{raw_progress}"
         );
     }
 
@@ -19539,6 +20282,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19586,6 +20330,7 @@ enabled = true
                 all: false,
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
                 wing: Some("hooks-raw"),
                 room: None,
                 project: None,
