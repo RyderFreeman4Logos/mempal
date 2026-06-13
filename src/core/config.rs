@@ -27,6 +27,7 @@ const DEFAULT_LLM_BACKEND: &str = "openai_compat";
 const DEFAULT_LLM_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_LLM_RETRY_INTERVAL_SECS: u64 = 2;
 const DEFAULT_LLM_MAX_CONCURRENT: usize = 16;
+const DEFAULT_LLM_ENDPOINT_PRIORITY: i32 = 0;
 const DEFAULT_MEMORY_INTELLIGENCE_TIMEOUT_SECS: u64 = 1800;
 const DEFAULT_SEARCH_DEADLINE_SECS: u64 = 5;
 const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
@@ -302,6 +303,7 @@ impl Config {
             ));
         }
         self.llm.validate_endpoint_pool()?;
+        self.validate_llm_judge_guardrails()?;
         if self.llm.enabled && self.llm.effective_endpoints()?.is_empty() {
             return Err(ConfigError::Validation(
                 "llm.base_url must be set when llm.enabled is true".to_string(),
@@ -696,7 +698,47 @@ impl Config {
             });
         }
         warnings.extend(self.llm_base_url_locality_warnings());
+        if let Some(judge) = self.ingest_gating.llm_judge.as_ref()
+            && !judge.enabled
+            && judge.allow_fallback_worse_memory
+        {
+            warnings.push(RuntimeWarning {
+                level: "warn",
+                source: "llm",
+                message: "LLM memory judging is disabled by explicit allow_fallback_worse_memory=true; memory quality may degrade.".to_string(),
+            });
+        }
         warnings
+    }
+
+    fn validate_llm_judge_guardrails(&self) -> Result<(), ConfigError> {
+        let Some(judge) = self.ingest_gating.llm_judge.as_ref() else {
+            return Ok(());
+        };
+        if !judge.enabled {
+            if judge.allow_fallback_worse_memory {
+                return Ok(());
+            }
+            return Err(ConfigError::Validation(
+                "ingest_gating.llm_judge.enabled=false requires allow_fallback_worse_memory=true to acknowledge lower memory quality".to_string(),
+            ));
+        }
+        if !self.llm.enabled {
+            return Err(ConfigError::Validation(
+                "ingest_gating.llm_judge.enabled=true requires [llm].enabled=true".to_string(),
+            ));
+        }
+        if !self.llm.enabled_for.iter().any(|item| item == "gating") {
+            return Err(ConfigError::Validation(
+                "ingest_gating.llm_judge.enabled=true requires llm.enabled_for to include \"gating\"".to_string(),
+            ));
+        }
+        if self.llm.effective_endpoints()?.is_empty() {
+            return Err(ConfigError::Validation(
+                "ingest_gating.llm_judge.enabled=true requires at least one configured LLM endpoint".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn llm_base_url_locality_warnings(&self) -> Vec<RuntimeWarning> {
@@ -1206,8 +1248,12 @@ pub struct LlmEndpointConfig {
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub extra_body: Option<serde_json::Value>,
+    /// Lower numbers are tried first. Equal priority endpoints share active load
+    /// according to each endpoint's `max_concurrent` capacity.
+    pub priority: Option<i32>,
     #[serde(alias = "timeout_secs")]
     pub request_timeout_secs: Option<u64>,
+    pub retry_interval_secs: Option<u64>,
     pub max_concurrent: Option<usize>,
 }
 
@@ -1219,7 +1265,9 @@ pub struct EffectiveLlmEndpoint {
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub extra_body: Option<serde_json::Value>,
+    pub priority: i32,
     pub request_timeout_secs: u64,
+    pub retry_interval_secs: u64,
     pub max_concurrent: usize,
 }
 
@@ -1268,9 +1316,14 @@ impl LlmConfig {
                     api_key: endpoint.api_key.clone(),
                     api_key_env: endpoint.api_key_env.clone(),
                     extra_body: endpoint.extra_body.clone(),
+                    priority: endpoint.priority.unwrap_or(DEFAULT_LLM_ENDPOINT_PRIORITY),
                     request_timeout_secs: endpoint
                         .request_timeout_secs
                         .unwrap_or(self.request_timeout_secs),
+                    retry_interval_secs: endpoint
+                        .retry_interval_secs
+                        .unwrap_or(self.retry_interval_secs)
+                        .max(1),
                     max_concurrent: endpoint
                         .max_concurrent
                         .unwrap_or(self.max_concurrent)
@@ -1291,6 +1344,19 @@ impl LlmConfig {
             ));
         }
         Ok(())
+    }
+
+    pub fn pool_capacity(&self) -> usize {
+        self.effective_endpoints()
+            .ok()
+            .filter(|endpoints| !endpoints.is_empty())
+            .map(|endpoints| {
+                endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint.max_concurrent.max(1))
+                    .sum::<usize>()
+            })
+            .unwrap_or_else(|| self.max_concurrent.max(1))
     }
 
     pub fn effective_model_summary(&self) -> Option<String> {
@@ -1320,7 +1386,9 @@ impl LlmConfig {
                     "model": endpoint.model,
                     "api_key_env": endpoint.api_key_env,
                     "extra_body": endpoint.extra_body,
+                    "priority": endpoint.priority,
                     "request_timeout_secs": endpoint.request_timeout_secs,
+                    "retry_interval_secs": endpoint.retry_interval_secs,
                     "max_concurrent": endpoint.max_concurrent,
                 })
             })
@@ -1348,7 +1416,9 @@ impl LlmConfig {
             api_key: self.api_key.clone(),
             api_key_env: self.api_key_env.clone(),
             extra_body: self.extra_body.clone(),
+            priority: DEFAULT_LLM_ENDPOINT_PRIORITY,
             request_timeout_secs: self.request_timeout_secs,
+            retry_interval_secs: self.retry_interval_secs.max(1),
             max_concurrent: self.max_concurrent.max(1),
         }))
     }
@@ -1967,6 +2037,7 @@ fn default_tier1_skip_events() -> Vec<String> {
 #[serde(default)]
 pub struct LlmJudgeConfig {
     pub enabled: bool,
+    pub allow_fallback_worse_memory: bool,
     pub system_prompt: Option<String>,
     pub threshold: f64,
 }
@@ -1975,6 +2046,7 @@ impl Default for LlmJudgeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_fallback_worse_memory: false,
             system_prompt: None,
             threshold: 0.3,
         }

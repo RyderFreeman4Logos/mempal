@@ -9929,7 +9929,7 @@ fn config_intelligence_command(config: &Config) -> Result<()> {
 fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     let cfg_meta = ConfigHandle::snapshot_meta();
     let scrub_stats = ConfigHandle::scrub_stats();
-    let runtime_warnings = ConfigHandle::collect_runtime_warnings();
+    let mut runtime_warnings = ConfigHandle::collect_runtime_warnings();
     let endpoint_health = if full {
         Some(
             mempal::endpoint_health::probe_endpoints_blocking(config)
@@ -10157,6 +10157,12 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
             println!("Endpoints:");
             println!("  embedding: {}", health.embedding.display());
             println!("  llm: {}", health.llm.display());
+            push_model_backend_runtime_warnings(
+                &mut runtime_warnings,
+                config,
+                health,
+                &queue_stats,
+            );
         }
         None => println!("Endpoints: (use --full to probe)"),
     }
@@ -10293,7 +10299,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         if let Some(base_url) = config.llm.effective_base_url_summary().as_deref() {
             println!("  base_url: {base_url}");
         }
-        println!("  max_concurrent: {}", config.llm.max_concurrent);
+        println!("  pool_capacity: {}", config.llm.pool_capacity());
         let llm_pending = queue_stats.pending;
         println!("  queue_pending: {llm_pending}");
     }
@@ -10346,6 +10352,41 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         println!("scopes: (use --full for breakdown)");
     }
     Ok(())
+}
+
+fn push_model_backend_runtime_warnings(
+    warnings: &mut Vec<mempal::core::config::RuntimeWarning>,
+    config: &Config,
+    endpoint_health: &mempal::endpoint_health::EndpointHealthSnapshot,
+    queue_stats: &mempal::core::queue::QueueStats,
+) {
+    if config
+        .ingest_gating
+        .llm_judge
+        .as_ref()
+        .is_some_and(|judge| judge.enabled)
+        && !endpoint_health.llm.reachable
+    {
+        warnings.push(mempal::core::config::RuntimeWarning {
+            level: "error",
+            source: "llm",
+            message: "LLM memory judge is configured but no judge endpoint is reachable; memory quality gating is unavailable until an endpoint recovers.".to_string(),
+        });
+    }
+    if queue_stats.pending > 0 && !endpoint_health.embedding.reachable {
+        warnings.push(mempal::core::config::RuntimeWarning {
+            level: "warn",
+            source: "embed",
+            message: "embedding queue has pending work and the embedding endpoint is unreachable; accepted queued writes will retry when an endpoint recovers.".to_string(),
+        });
+    }
+    if queue_stats.failed > 0 {
+        warnings.push(mempal::core::config::RuntimeWarning {
+            level: "warn",
+            source: "queue",
+            message: "queue has failed work; use `mempal reindex --failed` for failed embed-queue items, and resubmit any writes that were rejected before entering the queue.".to_string(),
+        });
+    }
 }
 
 fn display_list_or_none(values: &[String]) -> String {

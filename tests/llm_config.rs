@@ -103,12 +103,15 @@ enabled = true
 [[llm.endpoints]]
 base_url = "http://primary.local:8317/v1/"
 model = "primary-model"
+priority = 10
 
 [[llm.endpoints]]
 id = "lan.backup-1"
 base_url = "http://backup.local:8317/v1"
 model = "backup-model"
+priority = 20
 request_timeout_secs = 12
+retry_interval_secs = 4
 max_concurrent = 3
 "#,
     )
@@ -123,11 +126,16 @@ max_concurrent = 3
     assert_eq!(endpoints[0].id, "endpoint-1");
     assert_eq!(endpoints[0].base_url, "http://primary.local:8317/v1");
     assert_eq!(endpoints[0].model, "primary-model");
+    assert_eq!(endpoints[0].priority, 10);
     assert_eq!(endpoints[0].request_timeout_secs, 30);
+    assert_eq!(endpoints[0].retry_interval_secs, 2);
     assert_eq!(endpoints[0].max_concurrent, 16);
     assert_eq!(endpoints[1].id, "lan.backup-1");
+    assert_eq!(endpoints[1].priority, 20);
     assert_eq!(endpoints[1].request_timeout_secs, 12);
+    assert_eq!(endpoints[1].retry_interval_secs, 4);
     assert_eq!(endpoints[1].max_concurrent, 3);
+    assert_eq!(config.llm.pool_capacity(), 19);
 }
 
 #[test]
@@ -440,6 +448,65 @@ enabled = true
     match err {
         ConfigError::Validation(message) => {
             assert!(message.contains("llm.base_url"), "{message}");
+        }
+        other => panic!("expected ConfigError::Validation, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_llm_judge_disabled_requires_explicit_quality_degradation_opt_in() {
+    let err = Config::parse(
+        r#"
+[gating.llm_judge]
+enabled = false
+"#,
+    )
+    .expect_err("disabled LLM judge must require explicit unsafe opt-in");
+
+    match err {
+        ConfigError::Validation(message) => {
+            assert!(
+                message.contains("allow_fallback_worse_memory=true"),
+                "{message}"
+            );
+        }
+        other => panic!("expected ConfigError::Validation, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_llm_judge_disabled_with_explicit_opt_in_warns() {
+    let config = Config::parse(
+        r#"
+[gating.llm_judge]
+enabled = false
+allow_fallback_worse_memory = true
+"#,
+    )
+    .expect("explicit unsafe opt-in should parse");
+
+    let warnings = config.collect_runtime_warnings();
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.source == "llm" && warning.message.contains("allow_fallback_worse_memory=true")
+        }),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn test_llm_judge_enabled_requires_llm_gating_endpoint() {
+    let err = Config::parse(
+        r#"
+[gating.llm_judge]
+enabled = true
+"#,
+    )
+    .expect_err("enabled LLM judge without LLM endpoint must fail");
+
+    match err {
+        ConfigError::Validation(message) => {
+            assert!(message.contains("[llm].enabled=true"), "{message}");
         }
         other => panic!("expected ConfigError::Validation, got {other:?}"),
     }

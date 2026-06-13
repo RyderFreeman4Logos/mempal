@@ -11,6 +11,9 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::core::config::{EffectiveLlmEndpoint, LlmConfig, validate_llm_base_url};
 
+pub(crate) const MAX_REMOTE_RETRY_HINT: Duration = Duration::from_secs(60);
+const MAX_REMOTE_RETRY_HINT_SECS: u64 = 60;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: String,
@@ -45,11 +48,11 @@ pub enum LlmError {
         #[source]
         source: reqwest::Error,
     },
-    #[error("LLM endpoint returned error status {status}: {body}")]
+    #[error("LLM endpoint returned error status {status}")]
     HttpStatus { status: StatusCode, body: String },
     #[error("failed to decode LLM response: {0}")]
     DecodeResponse(String),
-    #[error("LLM endpoint returned client error status {status}: {body}")]
+    #[error("LLM endpoint returned client error status {status}")]
     ClientError {
         status: StatusCode,
         body: String,
@@ -73,6 +76,14 @@ impl LlmError {
             Self::HttpStatus { status, .. } => status.is_server_error(),
             Self::ClientError { status, .. } => *status == StatusCode::TOO_MANY_REQUESTS,
             Self::DecodeResponse(_) | Self::MissingConfiguration(_) => false,
+        }
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::ClientError { retry_after, .. } => *retry_after,
+            Self::TemporarilyUnavailable { retry_after, .. } => Some(*retry_after),
+            _ => None,
         }
     }
 }
@@ -169,6 +180,28 @@ impl LlmClient {
 
     pub async fn chat_completion(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
+        self.send_chat_completion(request).await
+    }
+
+    pub async fn try_chat_completion(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<LlmResponse>, LlmError> {
+        let permit = match self.semaphore.try_acquire() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(None),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(LlmError::MissingConfiguration(
+                    "llm endpoint semaphore closed".to_string(),
+                ));
+            }
+        };
+        let response = self.send_chat_completion(request).await;
+        drop(permit);
+        response.map(Some)
+    }
+
+    async fn send_chat_completion(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let endpoint = format!("{}/chat/completions", self.base_url);
         let model = request.model.as_deref().unwrap_or(&self.model);
         let mut body = serde_json::Map::new();
@@ -203,6 +236,7 @@ impl LlmClient {
         if !status.is_success() {
             let retry_after = parse_retry_after(response.headers());
             let body = response.text().await.map_err(map_reqwest_error)?;
+            let retry_after = retry_after.or_else(|| parse_reset_seconds(&body));
             if status.is_client_error() {
                 return Err(LlmError::ClientError {
                     status,
@@ -293,7 +327,35 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
+        .map(clamp_remote_retry_hint_secs)
+}
+
+fn parse_reset_seconds(body: &str) -> Option<Duration> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    find_reset_seconds(&value).map(clamp_remote_retry_hint_secs)
+}
+
+fn clamp_remote_retry_hint_secs(secs: u64) -> Duration {
+    Duration::from_secs(secs.min(MAX_REMOTE_RETRY_HINT_SECS))
+}
+
+fn find_reset_seconds(value: &Value) -> Option<u64> {
+    match value {
+        Value::Object(map) => {
+            if let Some(reset) = map.get("reset_seconds").and_then(value_as_u64) {
+                return Some(reset);
+            }
+            map.values().find_map(find_reset_seconds)
+        }
+        Value::Array(values) => values.iter().find_map(find_reset_seconds),
+        _ => None,
+    }
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
 }
 
 fn map_reqwest_error(source: reqwest::Error) -> LlmError {

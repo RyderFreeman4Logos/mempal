@@ -216,6 +216,81 @@ async fn test_llm_client_429_retryable() {
 }
 
 #[tokio::test]
+async fn test_llm_client_429_clamps_absurd_retry_after_header() {
+    let mut server = Server::new_async().await;
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(429)
+        .with_header("retry-after", "18446744073709551615")
+        .with_body("rate limited")
+        .create();
+    let config = config_for(&server, "");
+    let client = LlmClient::from_config(&config).expect("build client");
+
+    let error = client.chat_completion(&request()).await.expect_err("429");
+
+    mock.assert();
+    assert!(matches!(
+        error,
+        LlmError::ClientError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(duration),
+            ..
+        } if duration == Duration::from_secs(60)
+    ));
+}
+
+#[tokio::test]
+async fn test_llm_client_429_uses_router_reset_seconds_body() {
+    let mut server = Server::new_async().await;
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(429)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"model_cooldown","reset_seconds":7}}"#)
+        .create();
+    let config = config_for(&server, "");
+    let client = LlmClient::from_config(&config).expect("build client");
+
+    let error = client.chat_completion(&request()).await.expect_err("429");
+
+    mock.assert();
+    assert!(matches!(
+        error,
+        LlmError::ClientError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(duration),
+            ..
+        } if duration == Duration::from_secs(7)
+    ));
+}
+
+#[tokio::test]
+async fn test_llm_client_429_clamps_absurd_nested_reset_seconds_body() {
+    let mut server = Server::new_async().await;
+    let mock = server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(429)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"model_cooldown","reset_seconds":"18446744073709551615"}}"#)
+        .create();
+    let config = config_for(&server, "");
+    let client = LlmClient::from_config(&config).expect("build client");
+
+    let error = client.chat_completion(&request()).await.expect_err("429");
+
+    mock.assert();
+    assert!(matches!(
+        error,
+        LlmError::ClientError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(duration),
+            ..
+        } if duration == Duration::from_secs(60)
+    ));
+}
+
+#[tokio::test]
 async fn test_llm_client_no_api_key_no_auth_header() {
     let _guard = env_guard().await;
     // SAFETY: tests serialize environment mutation with a process-wide mutex.

@@ -8,7 +8,9 @@ use serde_json::Value;
 use crate::core::AsyncDb;
 use crate::core::config::{Config, ConfigHandle, LlmConfig};
 use crate::core::db::Database;
-use crate::core::queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore};
+use crate::core::queue::{
+    AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore, QueueFailureDisposition,
+};
 use crate::daemon_bootstrap::DaemonWriteObserver;
 
 use super::client::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse};
@@ -34,6 +36,7 @@ struct LlmClientConfigSignature {
     extra_body: Option<Value>,
     endpoints: Vec<crate::core::config::LlmEndpointConfig>,
     request_timeout_secs: u64,
+    retry_interval_secs: u64,
     max_concurrent: usize,
 }
 
@@ -48,6 +51,7 @@ impl From<&LlmConfig> for LlmClientConfigSignature {
             extra_body: config.extra_body.clone(),
             endpoints: config.endpoints.clone(),
             request_timeout_secs: config.request_timeout_secs,
+            retry_interval_secs: config.retry_interval_secs,
             max_concurrent: config.max_concurrent,
         }
     }
@@ -270,8 +274,9 @@ pub async fn run_llm_worker(
             Some(Err(error)) => {
                 tracing::error!("LLM task {message_id} failed after {latency_ms}ms: {error}");
                 write_observer.record_error(error.to_string());
+                let disposition = llm_task_failure_disposition(&error);
                 store
-                    .mark_failed(message.clone(), error.to_string())
+                    .mark_failed_with_disposition(message.clone(), error.to_string(), disposition)
                     .await
                     .with_context(|| format!("failed to mark_failed LLM task {message_id}"))?;
             }
@@ -364,7 +369,7 @@ async fn process_gating_task(
     config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
 ) -> Result<()> {
-    let (verdict, score) = request_gating_verdict(router, status, task, config, heartbeat).await?;
+    let (verdict, score) = request_gating_verdict(router, status, task, heartbeat).await?;
     apply_gating_verdict_async(db, task.clone(), config.clone(), verdict, score).await
 }
 
@@ -405,18 +410,13 @@ async fn request_gating_verdict(
     router: &LlmRouter,
     status: &LlmStatus,
     task: &LlmTaskPayload,
-    config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
 ) -> Result<(String, f64)> {
     let request = gating_request(task);
-    let retry_interval = config.llm.retry_interval_secs;
-    let response = retry::retry_llm_operation(retry_interval, heartbeat, || async {
-        router
-            .chat_completion(&request, heartbeat)
-            .await
-            .map(|routed| routed.response)
-    })
-    .await;
+    let response = router
+        .chat_completion(&request, heartbeat)
+        .await
+        .map(|routed| routed.response);
 
     record_gating_response(status, response)
 }
@@ -475,6 +475,37 @@ fn record_gating_response(
             Err(error).context("LLM gating request failed")
         }
     }
+}
+
+fn llm_task_failure_disposition(error: &anyhow::Error) -> QueueFailureDisposition {
+    if error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("failed to decode LLM task payload")
+    }) || error
+        .chain()
+        .any(|cause| cause.to_string().contains("unknown LLM task type"))
+    {
+        return QueueFailureDisposition::Terminal;
+    }
+    let Some(llm_error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<LlmError>())
+    else {
+        return QueueFailureDisposition::Retryable;
+    };
+    if !llm_error.is_retryable() {
+        return QueueFailureDisposition::Terminal;
+    }
+    llm_error
+        .retry_after()
+        .map(duration_to_retry_delay)
+        .unwrap_or(QueueFailureDisposition::Retryable)
+}
+
+fn duration_to_retry_delay(duration: Duration) -> QueueFailureDisposition {
+    let millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+    QueueFailureDisposition::RetryableAfter { delay_ms: millis }
 }
 
 fn apply_gating_verdict(
@@ -819,6 +850,37 @@ threshold = 0.5
             )
             .expect("read optional LLM audit verdict");
         verdict.zip(score)
+    }
+
+    #[test]
+    fn test_llm_task_failure_disposition_uses_retry_after_as_queue_delay() {
+        let error = Err::<(), _>(LlmError::TemporarilyUnavailable {
+            retry_after: Duration::from_secs(7),
+            reason: "model_cooldown".to_string(),
+        })
+        .context("LLM gating request failed")
+        .expect_err("synthetic error");
+
+        assert_eq!(
+            llm_task_failure_disposition(&error),
+            QueueFailureDisposition::RetryableAfter { delay_ms: 7_000 }
+        );
+    }
+
+    #[test]
+    fn test_llm_task_failure_disposition_terminals_non_retryable_errors() {
+        let error = Err::<(), _>(LlmError::ClientError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "invalid model".to_string(),
+            retry_after: None,
+        })
+        .context("LLM gating request failed")
+        .expect_err("synthetic error");
+
+        assert_eq!(
+            llm_task_failure_disposition(&error),
+            QueueFailureDisposition::Terminal
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

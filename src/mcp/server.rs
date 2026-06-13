@@ -2240,6 +2240,12 @@ impl MempalMcpServer {
                 source: "project_isolation".to_string(),
             });
         }
+        push_model_backend_warnings(
+            &mut system_warnings,
+            config.as_ref(),
+            &endpoint_health,
+            &queue_stats,
+        );
         push_db_holder_warnings(&mut system_warnings, &db_holders);
 
         let embed_failure_headline =
@@ -2386,10 +2392,12 @@ impl MempalMcpServer {
                         id: endpoint.id,
                         base_url: endpoint.base_url,
                         model: endpoint.model,
+                        priority: endpoint.priority,
+                        retry_interval_secs: endpoint.retry_interval_secs,
                         max_concurrent: endpoint.max_concurrent,
                     })
                     .collect(),
-                max_concurrent: config.llm.max_concurrent,
+                max_concurrent: config.llm.pool_capacity(),
             },
             intelligence_status: IntelligenceStatusDto {
                 mode: config.memory_intelligence.mode.to_string(),
@@ -7661,6 +7669,41 @@ pub(super) fn current_system_warnings() -> Vec<SystemWarning> {
             }),
     );
     warnings
+}
+
+fn push_model_backend_warnings(
+    system_warnings: &mut Vec<SystemWarning>,
+    config: &Config,
+    endpoint_health: &crate::endpoint_health::EndpointHealthSnapshot,
+    queue_stats: &crate::core::queue::QueueStats,
+) {
+    if config
+        .ingest_gating
+        .llm_judge
+        .as_ref()
+        .is_some_and(|judge| judge.enabled)
+        && !endpoint_health.llm.reachable
+    {
+        system_warnings.push(SystemWarning {
+            level: "error".to_string(),
+            message: "LLM memory judge is configured but no judge endpoint is reachable; memory quality gating is unavailable until an endpoint recovers.".to_string(),
+            source: "llm".to_string(),
+        });
+    }
+    if queue_stats.pending > 0 && !endpoint_health.embedding.reachable {
+        system_warnings.push(SystemWarning {
+            level: "warn".to_string(),
+            message: "embedding queue has pending work and the embedding endpoint is unreachable; accepted queued writes will retry when an endpoint recovers.".to_string(),
+            source: "embed".to_string(),
+        });
+    }
+    if queue_stats.failed > 0 {
+        system_warnings.push(SystemWarning {
+            level: "warn".to_string(),
+            message: "queue has failed work; use `mempal reindex --failed` for failed embed-queue items, and resubmit any writes that were rejected before entering the queue.".to_string(),
+            source: "queue".to_string(),
+        });
+    }
 }
 
 fn format_deadline(deadline: Duration) -> String {
