@@ -1,4 +1,4 @@
-use mempal::core::db::Database;
+use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use mempal::embed::{Embedder, EmbedderFactory};
 use mempal::ingest::{IngestOptions, ingest_file_with_options};
@@ -293,7 +293,10 @@ async fn test_neighbors_limited_to_same_wing() {
 fn test_current_schema_has_chunk_index() {
     let (_tmp, db) = new_db();
 
-    assert_eq!(db.schema_version().expect("schema version"), 17);
+    assert_eq!(
+        db.schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
     let exists: bool = db
         .conn()
         .query_row(

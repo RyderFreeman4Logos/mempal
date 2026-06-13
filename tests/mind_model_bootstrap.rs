@@ -19,7 +19,11 @@ use mempal::core::types::{
     KnowledgeTier, MemoryDomain, MemoryKind, Provenance, SourceType, TriggerHints,
 };
 use mempal::core::utils::{build_bootstrap_drawer_id_from_parts, build_drawer_id};
-use mempal::core::{anchor, db::Database, protocol::MEMORY_PROTOCOL};
+use mempal::core::{
+    anchor,
+    db::{CURRENT_SCHEMA_VERSION, Database},
+    protocol::MEMORY_PROTOCOL,
+};
 use mempal::embed::{Embedder, EmbedderFactory};
 use mempal::ingest::{IngestOptions, ingest_file_with_options};
 use mempal::mcp::MempalMcpServer;
@@ -564,7 +568,10 @@ fn test_migration_backfills_legacy_drawers_with_bootstrap_defaults() {
     }
 
     let db = Database::open(&db_path).expect("migrate db to latest");
-    assert_eq!(db.schema_version().expect("schema version"), 17);
+    assert_eq!(
+        db.schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
 
     let drawer = db
         .get_drawer("drawer_legacy_001")

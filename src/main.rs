@@ -112,6 +112,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+mod insights;
 mod longmemeval;
 mod patterns;
 #[path = "cli/prime.rs"]
@@ -604,6 +605,11 @@ enum Commands {
     Phase3 {
         #[command(subcommand)]
         command: Phase3Commands,
+    },
+    /// Capture and drain reusable design insights from dev workflows.
+    Insight {
+        #[command(subcommand)]
+        command: insights::InsightCommands,
     },
     /// Manage explicit tunnels between memory scopes.
     Tunnels {
@@ -3537,6 +3543,7 @@ fn run() -> Result<()> {
         Commands::Phase3 { command } => {
             block_on_result(phase3_command(&db, config.as_ref(), command))
         }
+        Commands::Insight { command } => insights::run_command(&db, command),
         Commands::Tunnels { command } => tunnels_command(&db, command),
         Commands::Taxonomy { command } => taxonomy_command(&db, command),
         Commands::FieldTaxonomy { format } => field_taxonomy_command(&format),
@@ -10006,6 +10013,19 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     let last_crystallization_at = db
         .last_crystallization_at()
         .context("failed to read last crystallization timestamp")?;
+    let design_insight_summary =
+        mempal::core::design_insights::unresolved_design_insight_summary(db.conn())
+            .context("failed to summarize design insights")?;
+    if design_insight_summary.high_value_open > 0 {
+        runtime_warnings.push(mempal::core::config::RuntimeWarning {
+            level: "warn",
+            source: "design_insights",
+            message: format!(
+                "{} unresolved high-value design insight(s) need draining; run `mempal insight list --status open --min-priority 4`.",
+                design_insight_summary.high_value_open
+            ),
+        });
+    }
     let daemon_pid = read_daemon_pid(db.path())?;
     let daemon_running = daemon_pid
         .map(process_is_running)
@@ -10098,6 +10118,23 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     match last_crystallization_at.as_deref() {
         Some(last) => println!("  last_crystallization_at: {last}"),
         None => println!("  last_crystallization_at: none"),
+    }
+    println!("Design Insights:");
+    println!("  open_total: {}", design_insight_summary.open_total);
+    println!(
+        "  high_value_open: {}",
+        design_insight_summary.high_value_open
+    );
+    if design_insight_summary.open_by_target.is_empty() {
+        println!("  open_by_target: none");
+    } else {
+        let targets = design_insight_summary
+            .open_by_target
+            .iter()
+            .map(|(target, count)| format!("{target}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  open_by_target: {targets}");
     }
     let triple_count = db.triple_count().context("failed to count triples")?;
     println!("taxonomy_entries: {taxonomy_count}");
@@ -13080,9 +13117,11 @@ Mempal Maintenance Runbook
 2. Ingest research plan: mempal phase3 research-ingest-plan <report.json>
 3. Knowledge distill: mempal knowledge distill
 4. Check adoption events: mempal phase3 adoption review
-5. Capture handoff: mempal cowork-capture --cwd <path> --summary-source handoff
-6. Run runtime adoption analytics: mempal phase3 adoption analytics
-7. Doctor check: mempal doctor";
+5. Design-opportunity pass: mempal insight runbook
+6. Drain high-value design insights: mempal insight list --status open --min-priority 4
+7. Capture handoff: mempal cowork-capture --cwd <path> --summary-source handoff
+8. Run runtime adoption analytics: mempal phase3 adoption analytics
+9. Doctor check: mempal doctor";
     match format.as_str() {
         "plain" => {
             println!("{RUNBOOK_CONTENT}");
@@ -13177,6 +13216,11 @@ fn maintenance_guided_run_command(format: String) -> Result<()> {
         MaintenanceStep {
             command: "mempal cowork-doctor --cwd .".to_string(),
             description: "Health check the multi-agent cowork bus registry".to_string(),
+        },
+        MaintenanceStep {
+            command: "mempal insight list --status open --min-priority 4".to_string(),
+            description: "Drain unresolved high-value design insights before or after issue work"
+                .to_string(),
         },
         MaintenanceStep {
             command: "mempal cowork-capture --cwd . --summary-source handoff".to_string(),
@@ -16788,6 +16832,15 @@ fn doctor_command(format: String) -> Result<()> {
                 report.embedding.queue.claimed,
                 report.embedding.queue.failed
             );
+            println!(
+                "design_insights=schema_available:{} open:{} high_value_open:{}",
+                report.design_insights.schema_available,
+                report.design_insights.open_total,
+                report.design_insights.high_value_open
+            );
+            if let Some(error) = report.design_insights.error.as_deref() {
+                println!("design_insights_error={error}");
+            }
             if report.embedding.endpoints.is_empty() {
                 println!("embedding_endpoints=none");
             } else {

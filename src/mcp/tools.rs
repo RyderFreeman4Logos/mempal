@@ -1903,6 +1903,7 @@ pub struct StatusResponse {
     pub sleep_conflicts_resolved: u64,
     pub pending_card_count: i64,
     pub last_crystallization_at: Option<String>,
+    pub design_insights: DesignInsightStatusDto,
     pub taxonomy_count: i64,
     pub db_size_bytes: u64,
     pub config_version: String,
@@ -1939,6 +1940,13 @@ pub struct StatusResponse {
     pub database_diagnostic: Option<DatabaseDiagnosticDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct DesignInsightStatusDto {
+    pub open_total: u64,
+    pub high_value_open: u64,
+    pub open_by_target: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

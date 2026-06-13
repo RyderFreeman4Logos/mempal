@@ -8,6 +8,9 @@ use serde::Serialize;
 
 use crate::core::config::{Config, ConfigHandle};
 use crate::core::db::CURRENT_SCHEMA_VERSION;
+use crate::core::design_insights::{
+    design_insights_table_exists, unresolved_design_insight_summary,
+};
 use crate::core::queue::{QueueStats, queue_stats_readonly};
 use crate::process_diagnostics::{DbHolderReport, inspect_db_holders};
 
@@ -78,6 +81,7 @@ pub struct DoctorReport {
     pub db_holders: DbHolderReport,
     pub install: DoctorInstallReport,
     pub embedding: DoctorEmbeddingReport,
+    pub design_insights: DoctorDesignInsightReport,
     pub restart_required_config_changes: Vec<String>,
     pub warnings: Vec<String>,
     pub recommendations: Vec<String>,
@@ -115,6 +119,14 @@ pub struct DoctorEmbeddingQueueReport {
     pub pending: u64,
     pub claimed: u64,
     pub failed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DoctorDesignInsightReport {
+    pub schema_available: bool,
+    pub open_total: u64,
+    pub high_value_open: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,6 +186,7 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
     let install = inspect_install();
     let config = Config::load().ok();
     let embedding = build_embedding_report(config.as_ref(), db_path);
+    let design_insights = inspect_design_insights(db_path);
     let restart_required_config_changes = ConfigHandle::restart_required_pending();
     let mut warnings = Vec::new();
     let mut recommendations = vec![
@@ -192,6 +205,17 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
     }
     if let Some(error) = db.error.as_deref() {
         warnings.push(format!("database schema could not be inspected: {error}"));
+    }
+    if design_insights.high_value_open > 0 {
+        warnings.push(format!(
+            "{} unresolved high-value design insight(s) need draining",
+            design_insights.high_value_open
+        ));
+        recommendations
+            .push("Run `mempal insight list --status open --min-priority 4`.".to_string());
+    }
+    if let Some(error) = design_insights.error.as_deref() {
+        warnings.push(format!("design insights could not be inspected: {error}"));
     }
     for change in &restart_required_config_changes {
         warnings.push(format!("config change pending restart: {change}"));
@@ -214,9 +238,41 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
         db_holders,
         install,
         embedding,
+        design_insights,
         restart_required_config_changes,
         warnings,
         recommendations,
+    }
+}
+
+fn inspect_design_insights(db_path: &Path) -> DoctorDesignInsightReport {
+    if !db_path.exists() {
+        return DoctorDesignInsightReport::default();
+    }
+    let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => conn,
+        Err(error) => {
+            return DoctorDesignInsightReport {
+                error: Some(error.to_string()),
+                ..DoctorDesignInsightReport::default()
+            };
+        }
+    };
+    if !design_insights_table_exists(&conn) {
+        return DoctorDesignInsightReport::default();
+    }
+    match unresolved_design_insight_summary(&conn) {
+        Ok(summary) => DoctorDesignInsightReport {
+            schema_available: true,
+            open_total: summary.open_total,
+            high_value_open: summary.high_value_open,
+            error: None,
+        },
+        Err(error) => DoctorDesignInsightReport {
+            schema_available: true,
+            error: Some(error.to_string()),
+            ..DoctorDesignInsightReport::default()
+        },
     }
 }
 
