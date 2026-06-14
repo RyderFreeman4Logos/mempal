@@ -14860,12 +14860,22 @@ fn mark_historical_rejudge_work_item_processed(
           AND drawer_rowid = ?5
         "#
     );
-    db.conn()
-        .execute(
-            &sql,
-            rusqlite::params![iso_timestamp(), decision, mutation, run_id, drawer_rowid],
-        )
-        .context("failed to mark historical rejudge work item processed")?;
+    let processed_at = iso_timestamp();
+    execute_historical_rejudge_sqlite_write_with_retry(
+        "failed to mark historical rejudge work item processed",
+        || {
+            db.conn().execute(
+                &sql,
+                rusqlite::params![
+                    processed_at.as_str(),
+                    decision,
+                    mutation,
+                    run_id,
+                    drawer_rowid
+                ],
+            )
+        },
+    )?;
     Ok(())
 }
 
@@ -14885,12 +14895,15 @@ fn mark_historical_rejudge_work_item_llm_confirm_pending(
           AND processed_at IS NULL
         "#
     );
-    db.conn()
-        .execute(
-            &sql,
-            rusqlite::params![proposal_score, run_id, drawer_rowid],
-        )
-        .context("failed to persist historical rejudge LLM confirmation stage")?;
+    execute_historical_rejudge_sqlite_write_with_retry(
+        "failed to persist historical rejudge LLM confirmation stage",
+        || {
+            db.conn().execute(
+                &sql,
+                rusqlite::params![proposal_score, run_id, drawer_rowid],
+            )
+        },
+    )?;
     Ok(())
 }
 
@@ -14930,16 +14943,29 @@ fn save_historical_rejudge_checkpoint(
     checkpoint: &HistoricalRejudgeCheckpoint,
 ) -> Result<()> {
     let raw = serde_json::to_string(checkpoint)?;
+    execute_historical_rejudge_sqlite_write_with_retry(
+        "failed to persist historical rejudge checkpoint",
+        || {
+            db.conn().execute(
+                r#"
+                INSERT INTO fork_ext_meta (key, value)
+                VALUES (?1, ?2)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                "#,
+                rusqlite::params![HISTORICAL_REJUDGE_CHECKPOINT_KEY, raw.as_str()],
+            )
+        },
+    )?;
+    Ok(())
+}
+
+fn execute_historical_rejudge_sqlite_write_with_retry<T>(
+    context: &'static str,
+    mut operation: impl FnMut() -> rusqlite::Result<T>,
+) -> Result<T> {
     for attempt in 0..=HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_RETRIES {
-        match db.conn().execute(
-            r#"
-            INSERT INTO fork_ext_meta (key, value)
-            VALUES (?1, ?2)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            "#,
-            rusqlite::params![HISTORICAL_REJUDGE_CHECKPOINT_KEY, raw.as_str()],
-        ) {
-            Ok(_) => return Ok(()),
+        match operation() {
+            Ok(rows) => return Ok(rows),
             Err(error)
                 if is_transient_sqlite_lock(&error)
                     && attempt < HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_RETRIES =>
@@ -14947,11 +14973,11 @@ fn save_historical_rejudge_checkpoint(
                 std::thread::sleep(historical_rejudge_checkpoint_save_retry_delay(attempt));
             }
             Err(error) => {
-                return Err(error).context("failed to persist historical rejudge checkpoint");
+                return Err(error).context(context);
             }
         }
     }
-    unreachable!("checkpoint save retry loop returns on its terminal attempt")
+    unreachable!("historical rejudge SQLite write retry loop returns on its terminal attempt")
 }
 
 const HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_RETRIES: usize = 40;
@@ -15301,15 +15327,19 @@ fn with_historical_rejudge_transaction<T>(
     db: &Database,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    db.conn()
-        .execute_batch("BEGIN IMMEDIATE;")
-        .context("failed to begin historical rejudge transaction")?;
+    execute_historical_rejudge_sqlite_write_with_retry(
+        "failed to begin historical rejudge transaction",
+        || db.conn().execute_batch("BEGIN IMMEDIATE;"),
+    )?;
     let result = operation();
     match result {
         Ok(value) => {
-            if let Err(error) = db.conn().execute_batch("COMMIT;") {
+            if let Err(error) = execute_historical_rejudge_sqlite_write_with_retry(
+                "failed to commit historical rejudge transaction",
+                || db.conn().execute_batch("COMMIT;"),
+            ) {
                 let _ = db.conn().execute_batch("ROLLBACK;");
-                return Err(error).context("failed to commit historical rejudge transaction");
+                return Err(error);
             }
             Ok(value)
         }
@@ -21426,6 +21456,169 @@ enabled = true
         assert_eq!(persisted.run_id, checkpoint.run_id);
         assert_eq!(persisted.last_processed_rowid, Some(2));
         assert_eq!(persisted.mutated_count, 1);
+    }
+
+    #[test]
+    fn historical_rejudge_confirm_pending_retries_transient_sqlite_lock() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let run_id = "retry-confirm-stage-run";
+        db.conn()
+            .execute(
+                &format!(
+                    r#"
+                    INSERT INTO {HISTORICAL_REJUDGE_WORK_TABLE} (
+                        run_id,
+                        drawer_rowid,
+                        drawer_id,
+                        snapshot_content_hash,
+                        snapshot_added_at,
+                        snapshot_wing,
+                        snapshot_source_type,
+                        snapshot_normalize_version
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "#
+                ),
+                rusqlite::params![
+                    run_id,
+                    7_i64,
+                    "drawer-7",
+                    "hash-7",
+                    "2026-01-01T00:00:00Z",
+                    "notes",
+                    "agent_inference",
+                    0_i64,
+                ],
+            )
+            .expect("insert pending work item");
+        db.conn()
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make confirm-stage writer fail fast so retry behavior is observable");
+        let blocker = rusqlite::Connection::open(&db_path).expect("open blocking connection");
+        blocker
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make blocker fail fast");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(75));
+            blocker
+                .execute_batch("COMMIT;")
+                .expect("release write lock");
+        });
+
+        let result = mark_historical_rejudge_work_item_llm_confirm_pending(&db, run_id, 7, 0.125);
+        release.join().expect("release thread");
+        result.expect("confirm-pending stage write must retry a transient SQLite lock");
+
+        let (stage, score): (String, f64) = db
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT llm_stage, llm_proposal_score FROM {HISTORICAL_REJUDGE_WORK_TABLE} WHERE run_id = ?1 AND drawer_rowid = ?2"
+                ),
+                rusqlite::params![run_id, 7_i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load updated work item");
+        assert_eq!(stage, "confirm_pending");
+        assert_eq!(score, 0.125);
+    }
+
+    #[test]
+    fn historical_rejudge_processed_item_transaction_retries_transient_sqlite_begin_lock() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let run_id = "retry-processed-transaction-run";
+        db.conn()
+            .execute(
+                &format!(
+                    r#"
+                    INSERT INTO {HISTORICAL_REJUDGE_WORK_TABLE} (
+                        run_id,
+                        drawer_rowid,
+                        drawer_id,
+                        snapshot_content_hash,
+                        snapshot_added_at,
+                        snapshot_wing,
+                        snapshot_source_type,
+                        snapshot_normalize_version,
+                        llm_stage,
+                        llm_proposal_score
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    "#
+                ),
+                rusqlite::params![
+                    run_id,
+                    9_i64,
+                    "drawer-9",
+                    "hash-9",
+                    "2026-01-01T00:00:00Z",
+                    "notes",
+                    "agent_inference",
+                    0_i64,
+                    "confirm_pending",
+                    0.875_f64,
+                ],
+            )
+            .expect("insert pending work item");
+        db.conn()
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make processed writer fail fast so retry behavior is observable");
+        let blocker = rusqlite::Connection::open(&db_path).expect("open blocking connection");
+        blocker
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make blocker fail fast");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(75));
+            blocker
+                .execute_batch("COMMIT;")
+                .expect("release write lock");
+        });
+
+        let result = with_historical_rejudge_transaction(&db, || {
+            mark_historical_rejudge_work_item_processed(&db, run_id, 9, "keep", "none")
+        });
+        release.join().expect("release thread");
+        result.expect("processed item transaction must retry transient SQLite begin lock");
+
+        let (processed_at, decision, mutation, stage, score): (
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<f64>,
+        ) = db
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT processed_at, decision, mutation, llm_stage, llm_proposal_score FROM {HISTORICAL_REJUDGE_WORK_TABLE} WHERE run_id = ?1 AND drawer_rowid = ?2"
+                ),
+                rusqlite::params![run_id, 9_i64],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("load processed work item");
+        assert!(processed_at.is_some());
+        assert_eq!(decision, "keep");
+        assert_eq!(mutation, "none");
+        assert_eq!(stage, None);
+        assert_eq!(score, None);
     }
 
     #[tokio::test]
