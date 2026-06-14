@@ -10030,12 +10030,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
             ),
         });
     }
-    let daemon_pid = read_daemon_pid(db.path())?;
-    let daemon_running = daemon_pid
-        .map(process_is_running)
-        .transpose()
-        .context("failed to probe daemon pid liveness")?
-        .unwrap_or(false);
+    let (daemon_pid, daemon_running) = detect_daemon_status(db.path())?;
     let last_heartbeat = db
         .conn()
         .query_row(
@@ -10540,6 +10535,37 @@ fn read_daemon_pid(db_path: &Path) -> Result<Option<i32>> {
         .parse::<i32>()
         .with_context(|| format!("invalid daemon pid in {}", pid_path.display()))?;
     Ok(Some(pid))
+}
+
+#[cfg(unix)]
+fn detect_daemon_status(db_path: &Path) -> Result<(Option<i32>, bool)> {
+    let pidfile_pid = read_daemon_pid(db_path)?;
+    if let Some(pid) = pidfile_pid
+        && process_is_running(pid).context("failed to probe daemon pid liveness")?
+    {
+        return Ok((Some(pid), true));
+    }
+
+    let (candidates, live_pidfile_pid) = collect_daemon_candidates(db_path)?;
+    let plan = mempal::daemon_singleton::plan_daemon_reap(&candidates, live_pidfile_pid);
+    if let Some(pid) = plan.keeper
+        && process_is_running(pid).context("failed to probe daemon singleton liveness")?
+    {
+        return Ok((Some(pid), true));
+    }
+
+    Ok((pidfile_pid, false))
+}
+
+#[cfg(not(unix))]
+fn detect_daemon_status(db_path: &Path) -> Result<(Option<i32>, bool)> {
+    let daemon_pid = read_daemon_pid(db_path)?;
+    let daemon_running = daemon_pid
+        .map(process_is_running)
+        .transpose()
+        .context("failed to probe daemon pid liveness")?
+        .unwrap_or(false);
+    Ok((daemon_pid, daemon_running))
 }
 
 #[cfg(unix)]
@@ -11827,6 +11853,42 @@ fn daemon_home_from_db_path(db_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn daemon_pid_path(db_path: &Path) -> PathBuf {
+    daemon_home_from_db_path(db_path).join("daemon.pid")
+}
+
+#[cfg(unix)]
+fn write_daemon_pid_file(db_path: &Path, pid: i32) -> Result<()> {
+    if !process_is_running(pid)? {
+        bail!("cannot repair daemon pid file: pid {pid} is not running");
+    }
+    let mempal_home = daemon_home_from_db_path(db_path);
+    fs::create_dir_all(&mempal_home)
+        .with_context(|| format!("failed to create {}", mempal_home.display()))?;
+    let pid_path = daemon_pid_path(db_path);
+    let tmp_path = mempal_home.join(format!("daemon.pid.tmp.{}", std::process::id()));
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .with_context(|| format!("failed to open {}", tmp_path.display()))?;
+        writeln!(file, "{pid}")
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", tmp_path.display()))?;
+    }
+    fs::rename(&tmp_path, &pid_path).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp_path.display(),
+            pid_path.display()
+        )
+    })?;
+    Ok(())
+}
+
 #[cfg(unix)]
 const DAEMON_TERM_CLEANUP_BUFFER: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(unix)]
@@ -11993,6 +12055,11 @@ fn reap_daemon_orphans(
     let plan = mempal::daemon_singleton::plan_daemon_reap(&candidates, pidfile_pid);
 
     if plan.targets.is_empty() {
+        if let Some(pid) = plan.keeper
+            && pidfile_pid != Some(pid)
+        {
+            write_daemon_pid_file(db_path, pid)?;
+        }
         if verbose {
             match plan.keeper {
                 Some(pid) => println!("daemon reap: keeping pid {pid}; no duplicate daemons found"),
@@ -12003,6 +12070,11 @@ fn reap_daemon_orphans(
     }
 
     let outcome = terminate_daemon_targets(&plan.targets)?;
+    if let Some(pid) = plan.keeper
+        && pidfile_pid != Some(pid)
+    {
+        write_daemon_pid_file(db_path, pid)?;
+    }
     if verbose {
         match plan.keeper {
             Some(pid) => println!("daemon reap: keeping pid {pid}"),
