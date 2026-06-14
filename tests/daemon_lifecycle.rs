@@ -230,6 +230,41 @@ fn test_daemon_restart_reaps_orphan_without_pidfile() {
 
 #[cfg(unix)]
 #[test]
+fn test_daemon_start_repairs_orphan_pidfile_before_reporting_running() {
+    let (tmp, db_path, _config_path) = setup_daemon_home();
+    let _cleanup = DaemonHomeCleanup {
+        db_path: db_path.clone(),
+    };
+    let pid_path = tmp.path().join(".mempal/daemon.pid");
+
+    let mut orphan = spawn_db_backed_orphan_daemon(tmp.path(), &db_path);
+    let orphan_pid = orphan.id() as i32;
+    assert!(!pid_path.exists());
+
+    let output = Command::new(mempal_bin())
+        .args(["daemon", "start"])
+        .env("HOME", tmp.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daemon start");
+    assert!(
+        !output.status.success(),
+        "daemon start should report the singleton is already running"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("daemon already running"), "{stderr}");
+
+    let repaired_pid = wait_for_pid_file(&pid_path, Duration::from_secs(2))
+        .expect("daemon start should repair singleton orphan pidfile before returning");
+    assert_eq!(repaired_pid, orphan_pid);
+    assert!(process_is_running_for_test(repaired_pid));
+
+    orphan.kill().expect("kill orphan daemon");
+    orphan.wait().expect("wait orphan daemon");
+}
+
+#[cfg(unix)]
+#[test]
 fn test_daemon_stop_terminates_pidfile_only_process() -> Result<()> {
     let (tmp, db_path, _config_path) = setup_daemon_home();
     let _cleanup = DaemonHomeCleanup {
@@ -306,6 +341,78 @@ fn test_daemon_restart_terminates_pidfile_only_process_and_restarts() -> Result<
     child.kill()?;
     child.wait()?;
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_daemon_reap_repairs_single_orphan_pidfile() {
+    let (tmp, db_path, _config_path) = setup_daemon_home();
+    let _cleanup = DaemonHomeCleanup {
+        db_path: db_path.clone(),
+    };
+    let pid_path = tmp.path().join(".mempal/daemon.pid");
+
+    let mut orphan = spawn_db_backed_orphan_daemon(tmp.path(), &db_path);
+    let orphan_pid = orphan.id() as i32;
+    assert!(
+        !pid_path.exists(),
+        "test setup should leave a live singleton without a pidfile"
+    );
+
+    let output = Command::new(mempal_bin())
+        .args(["daemon", "reap"])
+        .env("HOME", tmp.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daemon reap");
+    assert!(
+        output.status.success(),
+        "daemon reap failed: status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let repaired_pid = wait_for_pid_file(&pid_path, Duration::from_secs(2))
+        .expect("daemon reap should repair singleton orphan pidfile");
+    assert_eq!(repaired_pid, orphan_pid);
+    assert!(process_is_running_for_test(repaired_pid));
+    orphan.kill().expect("kill orphan daemon");
+    orphan.wait().expect("wait orphan daemon");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_status_full_treats_single_orphan_as_running() {
+    let (tmp, db_path, _config_path) = setup_daemon_home();
+    let _cleanup = DaemonHomeCleanup {
+        db_path: db_path.clone(),
+    };
+    let pid_path = tmp.path().join(".mempal/daemon.pid");
+
+    let mut orphan = spawn_db_backed_orphan_daemon(tmp.path(), &db_path);
+    let orphan_pid = orphan.id() as i32;
+    assert!(!pid_path.exists());
+
+    let output = Command::new(mempal_bin())
+        .args(["status", "--full"])
+        .env("HOME", tmp.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run status --full");
+    assert!(
+        output.status.success(),
+        "status --full failed: status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  running: true"), "{stdout}");
+    assert!(stdout.contains(&format!("  pid: {orphan_pid}")), "{stdout}");
+
+    orphan.kill().expect("kill orphan daemon");
+    orphan.wait().expect("wait orphan daemon");
 }
 
 #[cfg(unix)]
