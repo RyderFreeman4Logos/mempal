@@ -1,12 +1,13 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reqwest::StatusCode;
-use tokio::sync::Mutex;
 
 use crate::core::config::{EffectiveLlmEndpoint, LlmConfig};
+use crate::endpoint_pool::{
+    EndpointPool, EndpointPoolEndpoint, EndpointPoolEntry, EndpointPoolItem, EndpointPoolStrategy,
+};
 
-use super::client::{LlmClient, LlmError, LlmRequest, LlmResponse, MAX_REMOTE_RETRY_HINT};
+use super::client::{LlmClient, LlmError, LlmRequest, LlmResponse};
 use super::retry::HeartbeatCallback;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,16 +17,9 @@ pub struct RoutedLlmResponse {
     pub response: LlmResponse,
 }
 
-#[derive(Debug)]
-struct RoutedEndpoint {
-    config: EffectiveLlmEndpoint,
-    client: LlmClient,
-    unavailable_until: Mutex<Option<Instant>>,
-}
-
 #[derive(Debug, Clone)]
 pub struct LlmRouter {
-    endpoints: Arc<Vec<Arc<RoutedEndpoint>>>,
+    pool: EndpointPool<LlmClient>,
 }
 
 impl LlmRouter {
@@ -42,21 +36,24 @@ impl LlmRouter {
                 "llm endpoints must not be empty".to_string(),
             ));
         }
-        let mut endpoints = endpoints.into_iter().enumerate().collect::<Vec<_>>();
-        endpoints.sort_by_key(|(index, endpoint)| (endpoint.priority, *index));
-        let routed = endpoints
+        let items = endpoints
             .into_iter()
-            .map(|(_, config)| {
+            .map(|config| {
                 let client = LlmClient::from_endpoint(&config)?;
-                Ok(Arc::new(RoutedEndpoint {
-                    config,
+                Ok(EndpointPoolItem::new(
+                    EndpointPoolEndpoint::new(
+                        config.id,
+                        config.model,
+                        config.priority,
+                        config.max_concurrent,
+                        Duration::from_secs(config.retry_interval_secs),
+                    ),
                     client,
-                    unavailable_until: Mutex::new(None),
-                }))
+                ))
             })
             .collect::<Result<Vec<_>, LlmError>>()?;
         Ok(Self {
-            endpoints: Arc::new(routed),
+            pool: EndpointPool::new(items),
         })
     }
 
@@ -65,120 +62,79 @@ impl LlmRouter {
         request: &LlmRequest,
         heartbeat: Option<&HeartbeatCallback>,
     ) -> Result<RoutedLlmResponse, LlmError> {
-        let mut last_retryable = None;
-        let mut earliest_retry_after: Option<Duration> = None;
-        let mut first_saturated_endpoint: Option<Arc<RoutedEndpoint>> = None;
-
-        for endpoint in self.endpoints.iter() {
-            if let Some(retry_after) = endpoint.temporary_unavailable_remaining().await {
-                earliest_retry_after = Some(match earliest_retry_after {
-                    Some(current) => current.min(retry_after),
-                    None => retry_after,
-                });
-                continue;
-            }
-            refresh_heartbeat(heartbeat)?;
-            match endpoint.client.try_chat_completion(request).await {
-                Ok(Some(response)) => {
-                    return Ok(RoutedLlmResponse {
-                        endpoint_id: endpoint.config.id.clone(),
-                        endpoint_model: endpoint.config.model.clone(),
-                        response,
-                    });
-                }
-                Ok(None) => {
-                    if first_saturated_endpoint.is_none() {
-                        first_saturated_endpoint = Some(Arc::clone(endpoint));
-                    }
-                }
-                Err(error) if should_try_next_endpoint(&error) => {
-                    if let Some(retry_after) = endpoint.retry_after_for_error(&error) {
-                        endpoint.mark_temporarily_unavailable(retry_after).await;
-                        earliest_retry_after = Some(match earliest_retry_after {
-                            Some(current) => current.min(retry_after),
-                            None => retry_after,
-                        });
-                    }
-                    last_retryable = Some(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        if let Some(endpoint) = first_saturated_endpoint {
-            refresh_heartbeat(heartbeat)?;
-            let response = endpoint.client.chat_completion(request).await?;
-            return Ok(RoutedLlmResponse {
-                endpoint_id: endpoint.config.id.clone(),
-                endpoint_model: endpoint.config.model.clone(),
-                response,
-            });
-        }
-
-        match (last_retryable, earliest_retry_after) {
-            (None, Some(retry_after)) => Err(LlmError::TemporarilyUnavailable {
-                retry_after,
-                reason: format!(
-                    "{} endpoint(s) are cooling down after retryable failures",
-                    self.endpoints.len()
-                ),
-            }),
-            (Some(_error), Some(retry_after)) => Err(LlmError::TemporarilyUnavailable {
-                retry_after,
-                reason: format!(
-                    "{} endpoint(s) are cooling down after retryable failures",
-                    self.endpoints.len()
-                ),
-            }),
-            (Some(error), _) => Err(error),
-            (None, None) => Err(LlmError::MissingConfiguration(
-                "no LLM endpoint is currently available".to_string(),
-            )),
-        }
+        self.pool
+            .route(&LlmRoutingStrategy { request, heartbeat })
+            .await
     }
 
     pub fn endpoint_count(&self) -> usize {
-        self.endpoints.len()
+        self.pool.endpoint_count()
     }
 
     pub fn pool_capacity(&self) -> usize {
-        self.endpoints
-            .iter()
-            .map(|endpoint| endpoint.config.max_concurrent.max(1))
-            .sum()
+        self.pool.pool_capacity()
     }
 }
 
-impl RoutedEndpoint {
-    async fn temporary_unavailable_remaining(&self) -> Option<Duration> {
-        let mut guard = self.unavailable_until.lock().await;
-        match *guard {
-            Some(until) if until > Instant::now() => {
-                Some(until.saturating_duration_since(Instant::now()))
-            }
-            Some(_) => {
-                *guard = None;
-                None
-            }
-            None => None,
+struct LlmRoutingStrategy<'a> {
+    request: &'a LlmRequest,
+    heartbeat: Option<&'a HeartbeatCallback>,
+}
+
+#[async_trait::async_trait]
+impl EndpointPoolStrategy<LlmClient> for LlmRoutingStrategy<'_> {
+    type Output = RoutedLlmResponse;
+    type Error = LlmError;
+
+    async fn try_endpoint(
+        &self,
+        endpoint: &EndpointPoolEntry<LlmClient>,
+    ) -> Result<Option<Self::Output>, Self::Error> {
+        refresh_heartbeat(self.heartbeat)?;
+        match endpoint.client().try_chat_completion(self.request).await? {
+            Some(response) => Ok(Some(RoutedLlmResponse {
+                endpoint_id: endpoint.endpoint().id().to_string(),
+                endpoint_model: endpoint.endpoint().model().to_string(),
+                response,
+            })),
+            None => Ok(None),
         }
     }
 
-    fn retry_after_for_error(&self, error: &LlmError) -> Option<Duration> {
+    async fn wait_for_endpoint(
+        &self,
+        endpoint: &EndpointPoolEntry<LlmClient>,
+    ) -> Result<Self::Output, Self::Error> {
+        refresh_heartbeat(self.heartbeat)?;
+        let response = endpoint.client().chat_completion(self.request).await?;
+        Ok(RoutedLlmResponse {
+            endpoint_id: endpoint.endpoint().id().to_string(),
+            endpoint_model: endpoint.endpoint().model().to_string(),
+            response,
+        })
+    }
+
+    fn should_try_next(&self, error: &Self::Error) -> bool {
+        should_try_next_endpoint(error)
+    }
+
+    fn retry_after_for_error(
+        &self,
+        endpoint: &EndpointPoolEntry<LlmClient>,
+        error: &Self::Error,
+    ) -> Option<Duration> {
         match error {
             LlmError::ClientError {
                 status: StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT,
                 retry_after,
                 ..
-            } => Some(
-                retry_after.unwrap_or_else(|| Duration::from_secs(self.config.retry_interval_secs)),
-            ),
+            } => Some(retry_after.unwrap_or_else(|| endpoint.endpoint().retry_interval())),
             LlmError::TemporarilyUnavailable { retry_after, .. } => Some(*retry_after),
             LlmError::HttpRequest { .. } | LlmError::Timeout => {
-                Some(Duration::from_secs(self.config.retry_interval_secs))
+                Some(endpoint.endpoint().retry_interval())
             }
             LlmError::HttpStatus { status, .. } if status.is_server_error() => {
-                Some(Duration::from_secs(self.config.retry_interval_secs))
+                Some(endpoint.endpoint().retry_interval())
             }
             LlmError::HttpStatus { .. }
             | LlmError::ClientError { .. }
@@ -187,13 +143,17 @@ impl RoutedEndpoint {
         }
     }
 
-    async fn mark_temporarily_unavailable(&self, retry_after: Duration) {
-        let mut guard = self.unavailable_until.lock().await;
-        let now = Instant::now();
-        *guard = Some(
-            now.checked_add(retry_after)
-                .unwrap_or_else(|| now + MAX_REMOTE_RETRY_HINT),
-        );
+    fn all_cooling_down_error(&self, endpoint_count: usize, retry_after: Duration) -> Self::Error {
+        LlmError::TemporarilyUnavailable {
+            retry_after,
+            reason: format!(
+                "{endpoint_count} endpoint(s) are cooling down after retryable failures"
+            ),
+        }
+    }
+
+    fn no_endpoint_available_error(&self) -> Self::Error {
+        LlmError::MissingConfiguration("no LLM endpoint is currently available".to_string())
     }
 }
 
