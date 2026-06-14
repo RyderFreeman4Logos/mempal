@@ -18,6 +18,7 @@ pub(crate) mod db_path_identity;
 pub mod doctor;
 pub mod embed;
 pub mod endpoint_health;
+pub(crate) mod endpoint_pool;
 pub mod factcheck;
 pub mod field_taxonomy;
 pub mod hook;

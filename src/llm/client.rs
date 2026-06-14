@@ -11,7 +11,6 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::core::config::{EffectiveLlmEndpoint, LlmConfig, validate_llm_base_url};
 
-pub(crate) const MAX_REMOTE_RETRY_HINT: Duration = Duration::from_secs(60);
 const MAX_REMOTE_RETRY_HINT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

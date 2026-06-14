@@ -12,7 +12,6 @@ use crate::core::config::{Config, EffectiveEmbedEndpoint};
 
 use super::{EmbedError, Embedder, Result};
 
-pub(crate) const MAX_REMOTE_RETRY_HINT: Duration = Duration::from_secs(60);
 const MAX_REMOTE_RETRY_HINT_SECS: u64 = 60;
 
 #[derive(Debug, Clone)]

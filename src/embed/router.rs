@@ -1,12 +1,13 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reqwest::StatusCode;
-use tokio::sync::Mutex;
 
 use crate::core::config::{EffectiveEmbedEndpoint, EmbedConfig};
+use crate::endpoint_pool::{
+    EndpointPool, EndpointPoolEndpoint, EndpointPoolEntry, EndpointPoolItem, EndpointPoolStrategy,
+};
 
-use super::openai_compat::{MAX_REMOTE_RETRY_HINT, OpenAiCompatibleEmbedder};
+use super::openai_compat::OpenAiCompatibleEmbedder;
 use super::retry::HeartbeatCallback;
 use super::{EmbedError, Embedder, Result};
 
@@ -17,16 +18,9 @@ pub struct RoutedEmbeddingResponse {
     pub vectors: Vec<Vec<f32>>,
 }
 
-#[derive(Debug)]
-struct RoutedEndpoint {
-    config: EffectiveEmbedEndpoint,
-    client: OpenAiCompatibleEmbedder,
-    unavailable_until: Mutex<Option<Instant>>,
-}
-
 #[derive(Debug, Clone)]
 pub struct EmbeddingRouter {
-    endpoints: Arc<Vec<Arc<RoutedEndpoint>>>,
+    pool: EndpointPool<OpenAiCompatibleEmbedder>,
     dimensions: usize,
     name: String,
     max_input_tokens: Option<usize>,
@@ -52,118 +46,46 @@ impl EmbeddingRouter {
             .iter()
             .filter_map(|endpoint| endpoint.max_input_tokens)
             .min();
-        let mut endpoints = endpoints.into_iter().enumerate().collect::<Vec<_>>();
-        endpoints.sort_by_key(|(index, endpoint)| (endpoint.priority, *index));
-        let routed = endpoints
+        let items = endpoints
             .into_iter()
-            .map(|(_, config)| {
+            .map(|config| {
                 let client = OpenAiCompatibleEmbedder::from_endpoint(&config)?;
-                Ok(Arc::new(RoutedEndpoint {
-                    config,
+                Ok(EndpointPoolItem::new(
+                    EndpointPoolEndpoint::new(
+                        config.id,
+                        config.model,
+                        config.priority,
+                        config.max_concurrent,
+                        Duration::from_secs(config.retry_interval_secs),
+                    ),
                     client,
-                    unavailable_until: Mutex::new(None),
-                }))
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            endpoints: Arc::new(routed),
+            pool: EndpointPool::new(items),
             dimensions,
             name,
             max_input_tokens,
         })
     }
 
-    pub async fn embed_routed(
+    pub async fn embed_routed<'a>(
         &self,
-        texts: &[&str],
-        heartbeat: Option<&HeartbeatCallback>,
+        texts: &'a [&'a str],
+        heartbeat: Option<&'a HeartbeatCallback>,
     ) -> Result<RoutedEmbeddingResponse> {
-        let mut last_retryable = None;
-        let mut earliest_retry_after: Option<Duration> = None;
-        let mut first_saturated_endpoint: Option<Arc<RoutedEndpoint>> = None;
-
-        for endpoint in self.endpoints.iter() {
-            if let Some(retry_after) = endpoint.temporary_unavailable_remaining().await {
-                earliest_retry_after = Some(match earliest_retry_after {
-                    Some(current) => current.min(retry_after),
-                    None => retry_after,
-                });
-                continue;
-            }
-            refresh_heartbeat(heartbeat)?;
-            match endpoint.client.try_embed(texts).await {
-                Ok(Some(vectors)) => {
-                    endpoint.mark_available().await;
-                    crate::embed::global_embed_status()
-                        .record_endpoint_success(&endpoint.config.id);
-                    return Ok(RoutedEmbeddingResponse {
-                        endpoint_id: endpoint.config.id.clone(),
-                        endpoint_model: endpoint.config.model.clone(),
-                        vectors,
-                    });
-                }
-                Ok(None) => {
-                    if first_saturated_endpoint.is_none() {
-                        first_saturated_endpoint = Some(Arc::clone(endpoint));
-                    }
-                }
-                Err(error) if should_try_next_endpoint(&error) => {
-                    if let Some(retry_after) = endpoint.retry_after_for_error(&error) {
-                        endpoint.mark_temporarily_unavailable(retry_after).await;
-                        crate::embed::global_embed_status().record_endpoint_cooldown(
-                            &endpoint.config.id,
-                            retry_after,
-                            &error,
-                        );
-                        earliest_retry_after = Some(match earliest_retry_after {
-                            Some(current) => current.min(retry_after),
-                            None => retry_after,
-                        });
-                    }
-                    last_retryable = Some(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        if let Some(endpoint) = first_saturated_endpoint {
-            refresh_heartbeat(heartbeat)?;
-            let vectors = endpoint.client.embed_with_permit(texts).await?;
-            endpoint.mark_available().await;
-            crate::embed::global_embed_status().record_endpoint_success(&endpoint.config.id);
-            return Ok(RoutedEmbeddingResponse {
-                endpoint_id: endpoint.config.id.clone(),
-                endpoint_model: endpoint.config.model.clone(),
-                vectors,
-            });
-        }
-
-        match (last_retryable, earliest_retry_after) {
-            (None, Some(retry_after)) | (Some(_), Some(retry_after)) => {
-                Err(EmbedError::TemporarilyUnavailable {
-                    retry_after,
-                    reason: format!(
-                        "{} embedding endpoint(s) are cooling down after retryable failures",
-                        self.endpoints.len()
-                    ),
-                })
-            }
-            (Some(error), _) => Err(error),
-            (None, None) => Err(EmbedError::MissingConfiguration(
-                "no embedding endpoint is currently available".to_string(),
-            )),
-        }
+        self.pool
+            .route(&EmbeddingRoutingStrategy { texts, heartbeat })
+            .await
     }
 
     pub fn endpoint_count(&self) -> usize {
-        self.endpoints.len()
+        self.pool.endpoint_count()
     }
 
     pub fn pool_capacity(&self) -> usize {
-        self.endpoints
-            .iter()
-            .map(|endpoint| endpoint.config.max_concurrent.max(1))
-            .sum()
+        self.pool.pool_capacity()
     }
 }
 
@@ -188,56 +110,107 @@ impl Embedder for EmbeddingRouter {
     }
 }
 
-impl RoutedEndpoint {
-    async fn temporary_unavailable_remaining(&self) -> Option<Duration> {
-        let mut guard = self.unavailable_until.lock().await;
-        match *guard {
-            Some(until) if until > Instant::now() => {
-                Some(until.saturating_duration_since(Instant::now()))
+struct EmbeddingRoutingStrategy<'a> {
+    texts: &'a [&'a str],
+    heartbeat: Option<&'a HeartbeatCallback>,
+}
+
+#[async_trait::async_trait]
+impl EndpointPoolStrategy<OpenAiCompatibleEmbedder> for EmbeddingRoutingStrategy<'_> {
+    type Output = RoutedEmbeddingResponse;
+    type Error = EmbedError;
+
+    async fn try_endpoint(
+        &self,
+        endpoint: &EndpointPoolEntry<OpenAiCompatibleEmbedder>,
+    ) -> std::result::Result<Option<Self::Output>, Self::Error> {
+        refresh_heartbeat(self.heartbeat)?;
+        match endpoint.client().try_embed(self.texts).await? {
+            Some(vectors) => {
+                crate::embed::global_embed_status()
+                    .record_endpoint_success(endpoint.endpoint().id());
+                Ok(Some(RoutedEmbeddingResponse {
+                    endpoint_id: endpoint.endpoint().id().to_string(),
+                    endpoint_model: endpoint.endpoint().model().to_string(),
+                    vectors,
+                }))
             }
-            Some(_) => {
-                *guard = None;
-                crate::embed::global_embed_status().clear_endpoint_cooldown(&self.config.id);
-                None
-            }
-            None => None,
+            None => Ok(None),
         }
     }
 
-    fn retry_after_for_error(&self, error: &EmbedError) -> Option<Duration> {
+    async fn wait_for_endpoint(
+        &self,
+        endpoint: &EndpointPoolEntry<OpenAiCompatibleEmbedder>,
+    ) -> std::result::Result<Self::Output, Self::Error> {
+        refresh_heartbeat(self.heartbeat)?;
+        let vectors = endpoint.client().embed_with_permit(self.texts).await?;
+        crate::embed::global_embed_status().record_endpoint_success(endpoint.endpoint().id());
+        Ok(RoutedEmbeddingResponse {
+            endpoint_id: endpoint.endpoint().id().to_string(),
+            endpoint_model: endpoint.endpoint().model().to_string(),
+            vectors,
+        })
+    }
+
+    fn should_try_next(&self, error: &Self::Error) -> bool {
+        should_try_next_endpoint(error)
+    }
+
+    fn retry_after_for_error(
+        &self,
+        endpoint: &EndpointPoolEntry<OpenAiCompatibleEmbedder>,
+        error: &Self::Error,
+    ) -> Option<Duration> {
         match error {
             EmbedError::HttpStatus {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 retry_after,
                 ..
-            } => Some(
-                retry_after.unwrap_or_else(|| Duration::from_secs(self.config.retry_interval_secs)),
-            ),
+            } => Some(retry_after.unwrap_or_else(|| endpoint.endpoint().retry_interval())),
             EmbedError::TemporarilyUnavailable { retry_after, .. } => Some(*retry_after),
             EmbedError::HttpRequest { .. }
             | EmbedError::Runtime(_)
-            | EmbedError::WorkerPanic(_) => {
-                Some(Duration::from_secs(self.config.retry_interval_secs))
-            }
+            | EmbedError::WorkerPanic(_) => Some(endpoint.endpoint().retry_interval()),
             EmbedError::HttpStatus { status, .. } if status.is_server_error() => {
-                Some(Duration::from_secs(self.config.retry_interval_secs))
+                Some(endpoint.endpoint().retry_interval())
             }
             _ => None,
         }
     }
 
-    async fn mark_temporarily_unavailable(&self, retry_after: Duration) {
-        let mut guard = self.unavailable_until.lock().await;
-        let now = Instant::now();
-        *guard = Some(
-            now.checked_add(retry_after)
-                .unwrap_or_else(|| now + MAX_REMOTE_RETRY_HINT),
+    fn all_cooling_down_error(&self, endpoint_count: usize, retry_after: Duration) -> Self::Error {
+        EmbedError::TemporarilyUnavailable {
+            retry_after,
+            reason: format!(
+                "{endpoint_count} embedding endpoint(s) are cooling down after retryable failures"
+            ),
+        }
+    }
+
+    fn no_endpoint_available_error(&self) -> Self::Error {
+        EmbedError::MissingConfiguration("no embedding endpoint is currently available".to_string())
+    }
+
+    fn clear_cooldown_on_success(&self) -> bool {
+        true
+    }
+
+    fn on_cooldown_marked(
+        &self,
+        endpoint: &EndpointPoolEntry<OpenAiCompatibleEmbedder>,
+        retry_after: Duration,
+        error: &Self::Error,
+    ) {
+        crate::embed::global_embed_status().record_endpoint_cooldown(
+            endpoint.endpoint().id(),
+            retry_after,
+            error,
         );
     }
 
-    async fn mark_available(&self) {
-        let mut guard = self.unavailable_until.lock().await;
-        *guard = None;
+    fn on_cooldown_cleared(&self, endpoint: &EndpointPoolEntry<OpenAiCompatibleEmbedder>) {
+        crate::embed::global_embed_status().clear_endpoint_cooldown(endpoint.endpoint().id());
     }
 }
 
