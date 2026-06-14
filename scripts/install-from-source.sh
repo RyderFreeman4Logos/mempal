@@ -4,8 +4,9 @@
 # Why this script exists: `cargo install --git <fork> --branch main --force mempal`
 # is unreliable. `--force` only forces *installation*, not source re-fetch, so cargo's
 # git source cache can return a stale ref and silently skip the rebuild ("0 deps compiled").
-# After a CURRENT_SCHEMA_VERSION bump, the resulting binary will fail with
-# `database schema version N is newer than supported version N-1`.
+# After a CURRENT_SCHEMA_VERSION bump, the resulting binary will fail with a
+# schema mismatch error that tells you to update the mempal binary and, for MCP
+# servers, verify the MCP client command/path configuration.
 # See https://github.com/RyderFreeman4Logos/mempal/issues/76.
 #
 # This script always pulls fresh source and uses --path, which forces a real rebuild.

@@ -25,7 +25,8 @@ Before using the CLI, keep four nouns straight:
 > `cargo install --git <fork-url> --branch main --force mempal` may report success while actually
 > skipping the rebuild (cargo's source cache returns a stale ref despite `--force`, which only
 > forces *installation* not *re-fetch*). After a `CURRENT_SCHEMA_VERSION` bump in `src/core/db.rs`,
-> the resulting binary will fail with `database schema version N is newer than supported version N-1`.
+> the resulting binary will fail with a schema mismatch error that tells you to update the mempal
+> binary and, for MCP servers, verify the MCP client command/path configuration.
 > See [#76](https://github.com/RyderFreeman4Logos/mempal/issues/76).
 >
 > For fork builds, prefer the `--path` route below (clones a fresh checkout, builds locally).
