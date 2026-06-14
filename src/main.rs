@@ -97,7 +97,7 @@ use mempal::knowledge_gate::{
 use mempal::knowledge_lifecycle::{
     DemoteRequest, PromoteRequest, demote_knowledge, promote_knowledge,
 };
-use mempal::llm::{DEFAULT_GATING_JUDGE_PROMPT, LlmMessage, LlmRequest, LlmRouter};
+use mempal::llm::{DEFAULT_GATING_JUDGE_PROMPT, LlmError, LlmMessage, LlmRequest, LlmRouter};
 use mempal::mcp::{
     IngestControls, IngestOperationState, IngestRequest, IngestResponse, MempalMcpServer,
     OperationStatusRequest,
@@ -16375,11 +16375,40 @@ async fn evaluate_historical_drawer(
                     judge: "llm".to_string(),
                 });
             }
-            Err(error) => return Err(error).context("historical rejudge LLM gate failed"),
+            Err(error) => {
+                if let Some(decision) = historical_llm_fail_safe_keep_decision(&error) {
+                    return Ok(decision);
+                }
+                return Err(error).context("historical rejudge LLM gate failed");
+            }
         }
     }
 
     Ok(deterministic_historical_decision(drawer))
+}
+
+fn historical_llm_fail_safe_keep_decision(
+    error: &anyhow::Error,
+) -> Option<HistoricalRejudgeDecision> {
+    if !is_retryable_historical_llm_error(error) {
+        return None;
+    }
+    Some(HistoricalRejudgeDecision {
+        delete_candidate: false,
+        protected: false,
+        reason: "llm_unavailable_fail_safe_keep".to_string(),
+        label: Some("llm_unavailable".to_string()),
+        score: None,
+        tier: 3,
+        judge: "llm".to_string(),
+    })
+}
+
+fn is_retryable_historical_llm_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<LlmError>())
+        .any(LlmError::is_retryable)
 }
 
 const HIGH_HISTORICAL_IMPORTANCE_THRESHOLD: i32 = 3;
@@ -17959,6 +17988,28 @@ mod historical_rejudge_tests {
 
     fn test_config() -> Config {
         Config::parse("[gating]\nenabled = true\n").expect("parse config")
+    }
+
+    fn llm_rejudge_config(base_url: &str) -> Config {
+        Config::parse(&format!(
+            r#"
+[llm]
+enabled = true
+base_url = "{base_url}/v1"
+model = "test-judge"
+request_timeout_secs = 1
+retry_interval_secs = 1
+enabled_for = ["gating"]
+
+[gating]
+enabled = true
+
+[gating.llm_judge]
+enabled = true
+threshold = 0.3
+"#
+        ))
+        .expect("parse llm rejudge config")
     }
 
     #[test]
@@ -19932,6 +19983,71 @@ enabled = true
             !raw_progress.contains("injected gating audit failure"),
             "{raw_progress}"
         );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_all_execute_llm_timeout_fails_safe_keep_and_continues() {
+        let mut server = mockito::Server::new_async().await;
+        let llm_mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(408)
+            .with_body("request timeout")
+            .expect(1)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(
+            &db,
+            "llm-timeout-keep",
+            "Routine project note requiring an LLM judge verdict before historical cleanup.",
+            "notes",
+            None,
+        );
+        let rowid = drawer_rowid(&db, "llm-timeout-keep");
+        let backups = backup_dir(&tmp);
+        let config = llm_rejudge_config(&server.url());
+
+        maintenance_rejudge_command(&db, &config, full_rejudge_options(true, Some(&backups), 1))
+            .await
+            .expect("transient LLM timeout must not abort historical rejudge");
+
+        llm_mock.assert_async().await;
+        assert!(
+            db.get_drawer("llm-timeout-keep")
+                .expect("load active drawer")
+                .is_some(),
+            "LLM failures must fail-safe keep/no-delete"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        let backup_file = only_backup_file(&backups);
+        assert_eq!(
+            sqlite_backup_item_count(&backup_file),
+            0,
+            "kept rows must not write backup items"
+        );
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.status, "done");
+        assert_eq!(checkpoint.scanned_count, 1);
+        assert_eq!(checkpoint.kept_count, 1);
+        assert_eq!(checkpoint.mutated_count, 0);
+        assert_eq!(
+            historical_rejudge_work_item_decision(&db, &checkpoint.run_id, rowid).as_deref(),
+            Some("keep")
+        );
+        let (decision, reason, label): (String, String, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT decision, reason, label FROM gating_audit WHERE drawer_id = 'llm-timeout-keep'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load fail-safe audit row");
+        assert_eq!(decision, "keep");
+        assert_eq!(reason, "llm_unavailable_fail_safe_keep");
+        assert_eq!(label.as_deref(), Some("llm_unavailable"));
     }
 
     #[tokio::test]

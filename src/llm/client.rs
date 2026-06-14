@@ -74,7 +74,12 @@ impl LlmError {
         match self {
             Self::HttpRequest { .. } | Self::Timeout | Self::TemporarilyUnavailable { .. } => true,
             Self::HttpStatus { status, .. } => status.is_server_error(),
-            Self::ClientError { status, .. } => *status == StatusCode::TOO_MANY_REQUESTS,
+            Self::ClientError { status, .. } => {
+                matches!(
+                    *status,
+                    StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+                )
+            }
             Self::DecodeResponse(_) | Self::MissingConfiguration(_) => false,
         }
     }
