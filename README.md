@@ -63,6 +63,50 @@ enabled = false                                # default: no reranker call
 # top_k = 20
 ```
 
+LLM gating can be configured with multiple OpenAI-compatible endpoints. Lower
+`priority` values are tried first; equal values share capacity. Set Spark's one
+`priority` line to `0` for equal priority with Qwen, or keep it higher to use
+Spark only when Qwen is unavailable/saturated:
+
+```toml
+[llm]
+enabled = true
+backend = "openai_compat"
+enabled_for = ["gating"]
+request_timeout_secs = 3000
+
+[[llm.endpoints]]
+id = "qwen"
+base_url = "http://gb10:18009/v1"
+model = "qwen3.6-27b-decensor-by-aeon"
+priority = 0
+
+[[llm.endpoints]]
+id = "spark"
+base_url = "http://localhost:8317/v1"
+model = "spark"
+priority = 10 # change only this line to 0 for equal priority
+api_key_env = "SPARK_API_KEY"
+```
+
+When LLM gating is configured, endpoint outages are surfaced by `mempal status`;
+historical cleanup leaves LLM-gated work pending for retry instead of silently
+downgrading quality.
+
+For high-volume historical cleanup, Qwen can propose candidates and Spark can
+confirm each proposed candidate immediately before a reversible soft-delete:
+
+```bash
+mempal maintenance rejudge --all --execute \
+  --backup-dir /absolute/path/to/rejudge-backups \
+  --progress-file /absolute/path/to/rejudge-progress.jsonl \
+  --proposal-llm-endpoint qwen \
+  --confirm-llm-endpoint spark
+```
+
+If an endpoint is unavailable, rerun with `--resume`; `mempal status` shows the
+`waiting_llm` checkpoint and pending aggregate counts.
+
 Other backends:
 
 ```toml

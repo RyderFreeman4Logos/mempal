@@ -111,6 +111,102 @@ Notes:
   keeps the existing BM25/vector ranking and reports a warning instead of
   failing the request.
 
+LLM gating can use a pool of OpenAI-compatible chat-completion endpoints. When
+LLM gating is configured, endpoint outage is visible in `mempal status`; long
+historical cleanup work leaves the current item pending so a wrapper can retry
+with `--resume` instead of silently downgrading quality.
+
+```toml
+[llm]
+enabled = true
+backend = "openai_compat"
+enabled_for = ["gating"]
+request_timeout_secs = 3000
+retry_interval_secs = 60
+
+[[llm.endpoints]]
+id = "qwen"
+base_url = "http://gb10:18009/v1"
+model = "qwen3.6-27b-decensor-by-aeon"
+priority = 0
+max_concurrent = 1
+
+[[llm.endpoints]]
+id = "spark"
+base_url = "http://localhost:8317/v1"
+model = "spark"
+# Set this to 0 for equal priority with Qwen; keep it higher to save Spark quota
+# and use Spark only after Qwen is unavailable or saturated.
+priority = 10
+max_concurrent = 1
+# Prefer api_key_env for secrets in committed examples.
+api_key_env = "SPARK_API_KEY"
+```
+
+Do not mix `[[llm.endpoints]]` with legacy scalar `llm.base_url` / `llm.model`.
+
+### Two-stage historical cleanup with Qwen proposals and Spark confirmation
+
+For large reversible cleanup runs, use Qwen as the proposal gate and Spark as the
+immediate confirmation gate:
+
+```bash
+mempal maintenance rejudge \
+  --all --execute \
+  --backup-dir /absolute/path/to/rejudge-backups \
+  --progress-file /absolute/path/to/rejudge-progress.jsonl \
+  --proposal-llm-endpoint qwen \
+  --confirm-llm-endpoint spark
+```
+
+Behavior:
+
+- Qwen scores each active drawer first.
+- If Qwen keeps the drawer, Spark is not called.
+- If Qwen proposes forgetting the drawer, Spark is called immediately for that
+  drawer before any soft-delete is written.
+- Only Spark-confirmed candidates are soft-deleted; use restore commands/backups
+  to reverse them. Do not use `--hard-delete` for quality-gated cleanup.
+- The proposal stage is persisted before Spark confirmation. If Spark is
+  unavailable after Qwen proposes a candidate, rerun with `--resume`; Qwen is not
+  called again for that candidate.
+- If a configured LLM endpoint is unavailable, the current work item remains
+  pending, the checkpoint status becomes `waiting_llm`, and `mempal status`
+  shows a warning instead of silently keeping low-quality records.
+
+For unattended runs, wrap the command with `nohup` and retry with `--resume`.
+Keep logs/progress content-free: inspect counts, status, cursor, and model names,
+not raw drawer text or model responses.
+
+```bash
+RUN_DIR="$HOME/.mempal/runs/rejudge-$(date -u +%Y%m%dT%H%M%SZ)"
+export RUN_DIR
+mkdir -p "$RUN_DIR/backups"
+nohup bash -lc '
+set -euo pipefail
+while true; do
+  if mempal maintenance rejudge \
+    --all --execute --resume \
+    --backup-dir "$RUN_DIR/backups" \
+    --progress-file "$RUN_DIR/progress.jsonl" \
+    --proposal-llm-endpoint qwen \
+    --confirm-llm-endpoint spark; then
+    exit 0
+  fi
+  mempal status
+  sleep 300
+done
+' >"$RUN_DIR/runner.log" 2>&1 &
+```
+
+Watch progress with aggregate-only outputs:
+
+```bash
+mempal status
+tail -n 20 "$RUN_DIR/progress.jsonl"
+tail -n 100 "$RUN_DIR/runner.log"
+```
+
 ## Command Cheat Sheet
 
 Use this when you already know the concepts and just need the right command quickly.

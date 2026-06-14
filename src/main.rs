@@ -18,7 +18,9 @@ use mempal::context::{ContextPack, ContextRequest, assemble_context};
 use mempal::core::{
     anchor,
     compaction::merge_cluster,
-    config::{CompiledPrivacyConfig, Config, ConfigHandle, default_config_path},
+    config::{
+        CompiledPrivacyConfig, Config, ConfigHandle, EffectiveLlmEndpoint, default_config_path,
+    },
     db::{
         CURRENT_VECTOR_INDEX_VERSION, Database, HistoricalRejudgeAudit, ReindexVectorStash,
         VECTOR_DISTANCE_METRIC, find_similar_clusters, fts_tokenize_content, vector_metadata_key,
@@ -2096,53 +2098,62 @@ enum MaintenanceCommands {
         format: String,
     },
     /// Re-run current retention policy over historical drawers.
-    Rejudge {
-        #[command(subcommand)]
-        command: Option<MaintenanceRejudgeCommands>,
-        /// Print the historical rejudge / forget sweep runbook and exit.
-        #[arg(long = "help-verbose", default_value_t = false)]
-        help_verbose: bool,
-        /// Mutate storage. Omit for dry-run.
-        #[arg(long, default_value_t = false)]
-        execute: bool,
-        /// Irreversibly delete candidates instead of auditable soft-delete.
-        #[arg(long = "hard-delete", default_value_t = false)]
-        hard_delete: bool,
-        /// Absolute directory for atomic rejudge backup files. Required with --execute unless
-        /// --hard-delete --unsafe-no-backup is set; host-specific paths must be passed explicitly.
-        #[arg(long = "backup-dir")]
-        backup_dir: Option<PathBuf>,
-        /// Allow hard-delete execution without a backup.
-        #[arg(long = "unsafe-no-backup", default_value_t = false)]
-        unsafe_no_backup: bool,
-        /// Limit number of active drawers scanned.
-        #[arg(
-            long,
-            default_value_t = 1000,
-            help = "Limit number of active drawers scanned; ignored when --all is set"
-        )]
-        limit: usize,
-        /// Scan the full active database with a bounded historical snapshot.
-        #[arg(long, default_value_t = false)]
-        all: bool,
-        /// Resume the previous full historical rejudge sweep.
-        #[arg(long, default_value_t = false)]
-        resume: bool,
-        /// Number of snapshot rows to process per full-sweep page.
-        #[arg(long = "page-size", default_value_t = DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE)]
-        page_size: usize,
-        /// Write content-free JSONL progress telemetry to this file.
-        #[arg(long = "progress-file")]
-        progress_file: Option<PathBuf>,
-        #[arg(long)]
-        wing: Option<String>,
-        #[arg(long)]
-        room: Option<String>,
-        #[arg(long)]
-        project: Option<String>,
-        #[arg(long, default_value = "plain")]
-        format: String,
-    },
+    Rejudge(Box<MaintenanceRejudgeArgs>),
+}
+
+#[derive(Args)]
+struct MaintenanceRejudgeArgs {
+    #[command(subcommand)]
+    command: Option<MaintenanceRejudgeCommands>,
+    /// Print the historical rejudge / forget sweep runbook and exit.
+    #[arg(long = "help-verbose", default_value_t = false)]
+    help_verbose: bool,
+    /// Mutate storage. Omit for dry-run.
+    #[arg(long, default_value_t = false)]
+    execute: bool,
+    /// Irreversibly delete candidates instead of auditable soft-delete.
+    #[arg(long = "hard-delete", default_value_t = false)]
+    hard_delete: bool,
+    /// Absolute directory for atomic rejudge backup files. Required with --execute unless
+    /// --hard-delete --unsafe-no-backup is set; host-specific paths must be passed explicitly.
+    #[arg(long = "backup-dir")]
+    backup_dir: Option<PathBuf>,
+    /// Allow hard-delete execution without a backup.
+    #[arg(long = "unsafe-no-backup", default_value_t = false)]
+    unsafe_no_backup: bool,
+    /// Limit number of active drawers scanned.
+    #[arg(
+        long,
+        default_value_t = 1000,
+        help = "Limit number of active drawers scanned; ignored when --all is set"
+    )]
+    limit: usize,
+    /// Scan the full active database with a bounded historical snapshot.
+    #[arg(long, default_value_t = false)]
+    all: bool,
+    /// Resume the previous full historical rejudge sweep.
+    #[arg(long, default_value_t = false)]
+    resume: bool,
+    /// Number of snapshot rows to process per full-sweep page.
+    #[arg(long = "page-size", default_value_t = DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE)]
+    page_size: usize,
+    /// Write content-free JSONL progress telemetry to this file.
+    #[arg(long = "progress-file")]
+    progress_file: Option<PathBuf>,
+    /// First-stage LLM endpoint id/model for streaming candidate proposals.
+    #[arg(long = "proposal-llm-endpoint")]
+    proposal_llm_endpoint: Option<String>,
+    /// Second-stage LLM endpoint id/model used immediately when the proposal stage says forget.
+    #[arg(long = "confirm-llm-endpoint")]
+    confirm_llm_endpoint: Option<String>,
+    #[arg(long)]
+    wing: Option<String>,
+    #[arg(long)]
+    room: Option<String>,
+    #[arg(long)]
+    project: Option<String>,
+    #[arg(long, default_value = "plain")]
+    format: String,
 }
 
 #[derive(Subcommand)]
@@ -2298,6 +2309,8 @@ struct HistoricalRejudgeOptions<'a> {
     resume: bool,
     page_size: usize,
     progress_file: Option<&'a Path>,
+    proposal_llm_endpoint: Option<&'a str>,
+    confirm_llm_endpoint: Option<&'a str>,
     wing: Option<&'a str>,
     room: Option<&'a str>,
     project: Option<&'a str>,
@@ -2412,6 +2425,10 @@ struct HistoricalRejudgeCommandArgs {
     resume: bool,
     #[serde(default = "default_historical_rejudge_page_size")]
     page_size: usize,
+    #[serde(default)]
+    proposal_llm_endpoint: Option<String>,
+    #[serde(default)]
+    confirm_llm_endpoint: Option<String>,
     wing: Option<String>,
     room: Option<String>,
     project: Option<String>,
@@ -2554,9 +2571,12 @@ struct HistoricalRejudgeCheckpointStart<'a> {
 
 #[derive(Debug, Clone)]
 struct HistoricalRejudgeWorkItem {
+    run_id: String,
     drawer_rowid: i64,
     drawer_id: String,
     snapshot: HistoricalRejudgeWorkItemSnapshot,
+    llm_stage: Option<String>,
+    llm_proposal_score: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -3020,11 +3040,8 @@ fn run() -> Result<()> {
             return maintenance_runbook_command(format.clone());
         }
         Commands::Maintenance {
-            command:
-                MaintenanceCommands::Rejudge {
-                    help_verbose: true, ..
-                },
-        } => {
+            command: MaintenanceCommands::Rejudge(args),
+        } if args.help_verbose => {
             return maintenance_rejudge_help_verbose_command();
         }
         Commands::Maintenance {
@@ -3463,62 +3480,63 @@ fn run() -> Result<()> {
             },
         ),
         Commands::Maintenance {
-            command:
-                MaintenanceCommands::Rejudge {
-                    command: None,
-                    help_verbose: false,
-                    execute,
-                    hard_delete,
-                    backup_dir,
-                    unsafe_no_backup,
-                    limit,
-                    all,
-                    resume,
-                    page_size,
-                    progress_file,
-                    wing,
-                    room,
-                    project,
-                    format,
-                },
-        } => block_on_result(maintenance_rejudge_command(
-            &db,
-            config.as_ref(),
-            HistoricalRejudgeOptions {
+            command: MaintenanceCommands::Rejudge(args),
+        } => {
+            let MaintenanceRejudgeArgs {
+                command,
+                help_verbose: _,
                 execute,
                 hard_delete,
-                backup_dir: backup_dir.as_deref(),
+                backup_dir,
                 unsafe_no_backup,
                 limit,
                 all,
                 resume,
                 page_size,
-                progress_file: progress_file.as_deref(),
-                wing: wing.as_deref(),
-                room: room.as_deref(),
-                project: project.as_deref(),
-                format: format.as_str(),
-            },
-        )),
-        Commands::Maintenance {
-            command:
-                MaintenanceCommands::Rejudge {
-                    command:
-                        Some(MaintenanceRejudgeCommands::Restore {
-                            backup,
-                            execute,
-                            conflict_policy,
-                            format,
-                        }),
-                    ..
-                },
-        } => maintenance_rejudge_restore_command(
-            &db,
-            &backup,
-            execute,
-            conflict_policy,
-            format.as_str(),
-        ),
+                progress_file,
+                proposal_llm_endpoint,
+                confirm_llm_endpoint,
+                wing,
+                room,
+                project,
+                format,
+            } = *args;
+            match command {
+                None => block_on_result(maintenance_rejudge_command(
+                    &db,
+                    config.as_ref(),
+                    HistoricalRejudgeOptions {
+                        execute,
+                        hard_delete,
+                        backup_dir: backup_dir.as_deref(),
+                        unsafe_no_backup,
+                        limit,
+                        all,
+                        resume,
+                        page_size,
+                        progress_file: progress_file.as_deref(),
+                        proposal_llm_endpoint: proposal_llm_endpoint.as_deref(),
+                        confirm_llm_endpoint: confirm_llm_endpoint.as_deref(),
+                        wing: wing.as_deref(),
+                        room: room.as_deref(),
+                        project: project.as_deref(),
+                        format: format.as_str(),
+                    },
+                )),
+                Some(MaintenanceRejudgeCommands::Restore {
+                    backup,
+                    execute,
+                    conflict_policy,
+                    format,
+                }) => maintenance_rejudge_restore_command(
+                    &db,
+                    &backup,
+                    execute,
+                    conflict_policy,
+                    format.as_str(),
+                ),
+            }
+        }
         Commands::Kg { command } => kg_command(&db, command),
         Commands::Knowledge { command } => {
             block_on_result(knowledge_command(&db, config.as_ref(), command))
@@ -10002,6 +10020,12 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         ConfigHandle::restart_required_pending(),
     )
     .context("failed to build ingest gating status")?;
+    let historical_rejudge_checkpoint = load_historical_rejudge_checkpoint(db)
+        .context("failed to load historical rejudge checkpoint for status")?;
+    push_historical_rejudge_runtime_warning(
+        &mut runtime_warnings,
+        historical_rejudge_checkpoint.as_ref(),
+    );
     let db_size_bytes = db
         .database_size_bytes()
         .context("failed to compute database size")?;
@@ -10284,6 +10308,30 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         Some(eta) => println!("  eta_secs: {eta}"),
         None => println!("  eta_secs: n/a"),
     }
+    println!("Historical Rejudge:");
+    if let Some(checkpoint) = historical_rejudge_checkpoint.as_ref() {
+        let remaining = historical_rejudge_remaining_work_count(db, &checkpoint.run_id)
+            .unwrap_or_else(|_| {
+                checkpoint
+                    .snapshot_count
+                    .saturating_sub(checkpoint.scanned_count)
+            });
+        println!("  status: {}", checkpoint.status);
+        println!("  run_id: {}", checkpoint.run_id);
+        println!("  snapshot_count: {}", checkpoint.snapshot_count);
+        println!("  scanned_count: {}", checkpoint.scanned_count);
+        match checkpoint.last_processed_rowid {
+            Some(rowid) => println!("  cursor_rowid: {rowid}"),
+            None => println!("  cursor_rowid: none"),
+        }
+        println!("  remaining_count: {remaining}");
+        match checkpoint.judge_model.as_deref() {
+            Some(model) => println!("  judge_model: {model}"),
+            None => println!("  judge_model: none"),
+        }
+    } else {
+        println!("  status: none");
+    }
     println!("Scrub:");
     println!(
         "  total_patterns_matched: {}",
@@ -10470,6 +10518,27 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         println!("scopes: (use --full for breakdown)");
     }
     Ok(())
+}
+
+fn push_historical_rejudge_runtime_warning(
+    warnings: &mut Vec<mempal::core::config::RuntimeWarning>,
+    checkpoint: Option<&HistoricalRejudgeCheckpoint>,
+) {
+    let Some(checkpoint) = checkpoint else {
+        return;
+    };
+    if checkpoint.status != "waiting_llm" {
+        return;
+    }
+    warnings.push(mempal::core::config::RuntimeWarning {
+        level: "warn",
+        source: "historical_rejudge",
+        message: format!(
+            "historical rejudge is waiting for a configured LLM endpoint; {} of {} work item(s) remain pending and will retry on resume.",
+            checkpoint.snapshot_count.saturating_sub(checkpoint.scanned_count),
+            checkpoint.snapshot_count
+        ),
+    });
 }
 
 fn push_model_backend_runtime_warnings(
@@ -13410,6 +13479,9 @@ fn validate_historical_rejudge_options(options: HistoricalRejudgeOptions<'_>) ->
     if options.resume && (!options.all || !options.execute) {
         bail!("--resume requires --all --execute");
     }
+    if options.confirm_llm_endpoint.is_some() && options.proposal_llm_endpoint.is_none() {
+        bail!("--confirm-llm-endpoint requires --proposal-llm-endpoint");
+    }
     if let Some(backup_dir) = options.backup_dir {
         validate_absolute_path(backup_dir, "--backup-dir")?;
     }
@@ -13433,11 +13505,11 @@ async fn maintenance_rejudge_limited_command(
         )
         .context("failed to load historical rejudge candidates")?;
     let config_version = historical_rejudge_config_version(config);
-    let llm_router = historical_rejudge_llm_router(config);
-    let judge_model = llm_router
+    let llm_context = historical_rejudge_llm_context(config, options)?;
+    let judge_model = llm_context
         .as_ref()
-        .and_then(|_| config.llm.effective_model_summary())
-        .or_else(|| Some("deterministic".to_string()).filter(|_| llm_router.is_none()));
+        .map(HistoricalRejudgeLlmContext::model_summary)
+        .or_else(|| Some("deterministic".to_string()).filter(|_| llm_context.is_none()));
 
     if let Some(writer) = progress.as_mut() {
         writer.write_event(build_historical_rejudge_progress_event(
@@ -13463,7 +13535,7 @@ async fn maintenance_rejudge_limited_command(
 
     let mut decisions = Vec::with_capacity(rows.len());
     for row in &rows {
-        let decision = match evaluate_historical_drawer(row, config, llm_router.as_ref()).await {
+        let decision = match evaluate_historical_drawer(row, config, llm_context.as_ref()).await {
             Ok(decision) => decision,
             Err(error) => {
                 if let Some(writer) = progress.as_mut() {
@@ -13709,11 +13781,11 @@ async fn maintenance_rejudge_all_command(
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let config_version = historical_rejudge_config_version(config);
-    let llm_router = historical_rejudge_llm_router(config);
-    let judge_model = llm_router
+    let llm_context = historical_rejudge_llm_context(config, options)?;
+    let judge_model = llm_context
         .as_ref()
-        .and_then(|_| config.llm.effective_model_summary())
-        .or_else(|| Some("deterministic".to_string()).filter(|_| llm_router.is_none()));
+        .map(HistoricalRejudgeLlmContext::model_summary)
+        .or_else(|| Some("deterministic".to_string()).filter(|_| llm_context.is_none()));
     let backup_dir = historical_rejudge_effective_backup_dir(
         options,
         options.execute && !(options.hard_delete && options.unsafe_no_backup),
@@ -13726,7 +13798,7 @@ async fn maintenance_rejudge_all_command(
             options,
             HistoricalRejudgeDryRunContext {
                 project_id: project_id.as_deref(),
-                llm_router: llm_router.as_ref(),
+                llm_context: llm_context.as_ref(),
                 judge_model,
                 config_version,
                 started,
@@ -13824,7 +13896,7 @@ async fn maintenance_rejudge_all_command(
             options,
             &mut checkpoint,
             &page,
-            llm_router.as_ref(),
+            llm_context.as_ref(),
         )
         .await
         {
@@ -13836,13 +13908,22 @@ async fn maintenance_rejudge_all_command(
                 .last()
                 .map(|work_item| work_item.drawer_rowid)
                 .unwrap_or(page_start);
-            checkpoint.status = "failed".to_string();
+            let waiting_for_llm = is_retryable_historical_llm_error(&error);
+            checkpoint.status = if waiting_for_llm {
+                "waiting_llm".to_string()
+            } else {
+                "failed".to_string()
+            };
             checkpoint.updated_at = iso_timestamp();
             save_historical_rejudge_checkpoint(db, &checkpoint)?;
             if let Some(writer) = progress.as_mut() {
                 writer.write_event(build_historical_rejudge_progress_event(
                     HistoricalRejudgeProgressEventInput {
-                        status: "failed",
+                        status: if waiting_for_llm {
+                            "waiting_llm"
+                        } else {
+                            "failed"
+                        },
                         dry_run: false,
                         all: true,
                         limit: None,
@@ -13860,9 +13941,20 @@ async fn maintenance_rejudge_all_command(
                         config_version: &checkpoint.config_version,
                         started,
                         last_successful_page_at: None,
-                        error: Some("historical_rejudge_failed"),
+                        error: Some(if waiting_for_llm {
+                            "historical_rejudge_llm_unavailable_pending"
+                        } else {
+                            "historical_rejudge_failed"
+                        }),
                     },
                 ))?;
+            }
+            if waiting_for_llm {
+                return Err(error).with_context(|| {
+                    format!(
+                        "historical rejudge is waiting for a configured LLM endpoint while processing rowids {page_start}..={page_end}; pending work was left unprocessed and should be retried by rerunning `mempal maintenance rejudge --all --resume --execute`"
+                    )
+                });
             }
             return Err(error).with_context(|| {
                 format!(
@@ -14012,7 +14104,8 @@ async fn dry_run_historical_rejudge_all(
             break;
         }
         for row in &rows {
-            let decision = match evaluate_historical_drawer(row, config, context.llm_router).await {
+            let decision = match evaluate_historical_drawer(row, config, context.llm_context).await
+            {
                 Ok(decision) => decision,
                 Err(error) => {
                     if let Some(writer) = context.progress.as_mut() {
@@ -14128,7 +14221,7 @@ async fn dry_run_historical_rejudge_all(
 
 struct HistoricalRejudgeDryRunContext<'a> {
     project_id: Option<&'a str>,
-    llm_router: Option<&'a LlmRouter>,
+    llm_context: Option<&'a HistoricalRejudgeLlmContext>,
     judge_model: Option<String>,
     config_version: String,
     started: std::time::Instant,
@@ -14319,12 +14412,12 @@ async fn process_historical_rejudge_work_page(
     options: HistoricalRejudgeOptions<'_>,
     checkpoint: &mut HistoricalRejudgeCheckpoint,
     page: &[HistoricalRejudgeWorkItem],
-    llm_router: Option<&LlmRouter>,
+    llm_context: Option<&HistoricalRejudgeLlmContext>,
 ) -> Result<()> {
     let mut prepared = Vec::with_capacity(page.len());
     for work_item in page {
         prepared
-            .push(prepare_historical_rejudge_work_item(db, config, work_item, llm_router).await?);
+            .push(prepare_historical_rejudge_work_item(db, config, work_item, llm_context).await?);
     }
     process_prepared_historical_rejudge_work_items(db, options, checkpoint, &prepared)
 }
@@ -14333,7 +14426,7 @@ async fn prepare_historical_rejudge_work_item(
     db: &Database,
     config: &Config,
     work_item: &HistoricalRejudgeWorkItem,
-    llm_router: Option<&LlmRouter>,
+    llm_context: Option<&HistoricalRejudgeLlmContext>,
 ) -> Result<PreparedHistoricalRejudgeWorkItem> {
     let row = db
         .historical_rejudge_candidate_by_rowid(work_item.drawer_rowid, &work_item.drawer_id)
@@ -14362,7 +14455,7 @@ async fn prepare_historical_rejudge_work_item(
         });
     }
 
-    let decision = evaluate_historical_drawer(&row, config, llm_router).await?;
+    let decision = evaluate_historical_work_item(db, work_item, &row, config, llm_context).await?;
     Ok(PreparedHistoricalRejudgeWorkItem {
         work_item: work_item.clone(),
         row: Some(row),
@@ -14370,6 +14463,27 @@ async fn prepare_historical_rejudge_work_item(
         backup_item: None,
         terminal_decision: None,
     })
+}
+
+async fn evaluate_historical_work_item(
+    db: &Database,
+    work_item: &HistoricalRejudgeWorkItem,
+    row: &mempal::core::db::HistoricalRejudgeCandidate,
+    config: &Config,
+    llm_context: Option<&HistoricalRejudgeLlmContext>,
+) -> Result<HistoricalRejudgeDecision> {
+    if let Some(decision) = evaluate_historical_pre_llm(row, config) {
+        return Ok(decision);
+    }
+
+    if let Some(context) = llm_context {
+        return context
+            .evaluate_work_item(db, work_item, &row.drawer, config)
+            .await
+            .context("historical rejudge LLM gate failed");
+    }
+
+    Ok(deterministic_historical_decision(&row.drawer))
 }
 
 fn historical_rejudge_work_item_matches_snapshot(
@@ -14525,6 +14639,8 @@ fn ensure_historical_rejudge_checkpoint_storage(db: &Database) -> Result<()> {
             snapshot_project_id TEXT,
             snapshot_chunk_index INTEGER,
             snapshot_normalize_version INTEGER NOT NULL,
+            llm_stage TEXT,
+            llm_proposal_score REAL,
             processed_at TEXT,
             decision TEXT,
             mutation TEXT,
@@ -14550,6 +14666,8 @@ fn ensure_historical_rejudge_checkpoint_storage(db: &Database) -> Result<()> {
         "snapshot_normalize_version",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_historical_rejudge_work_column(db, "llm_stage", "TEXT")?;
+    ensure_historical_rejudge_work_column(db, "llm_proposal_score", "REAL")?;
     db.conn()
         .execute_batch(
             r#"
@@ -14673,6 +14791,7 @@ fn next_historical_rejudge_work_items(
     let sql = format!(
         r#"
         SELECT
+            run_id,
             drawer_rowid,
             drawer_id,
             snapshot_content_hash,
@@ -14683,7 +14802,9 @@ fn next_historical_rejudge_work_items(
             snapshot_source_type,
             snapshot_project_id,
             snapshot_chunk_index,
-            snapshot_normalize_version
+            snapshot_normalize_version,
+            llm_stage,
+            llm_proposal_score
         FROM {HISTORICAL_REJUDGE_WORK_TABLE}
         WHERE run_id = ?1
           AND processed_at IS NULL
@@ -14698,19 +14819,22 @@ fn next_historical_rejudge_work_items(
     let rows = statement
         .query_map(rusqlite::params![run_id, limit], |row| {
             Ok(HistoricalRejudgeWorkItem {
-                drawer_rowid: row.get(0)?,
-                drawer_id: row.get(1)?,
+                run_id: row.get(0)?,
+                drawer_rowid: row.get(1)?,
+                drawer_id: row.get(2)?,
                 snapshot: HistoricalRejudgeWorkItemSnapshot {
-                    content_hash: row.get(2)?,
-                    added_at: row.get(3)?,
-                    wing: row.get(4)?,
-                    room: row.get(5)?,
-                    source_file: row.get(6)?,
-                    source_type: row.get(7)?,
-                    project_id: row.get(8)?,
-                    chunk_index: row.get(9)?,
-                    normalize_version: row.get(10)?,
+                    content_hash: row.get(3)?,
+                    added_at: row.get(4)?,
+                    wing: row.get(5)?,
+                    room: row.get(6)?,
+                    source_file: row.get(7)?,
+                    source_type: row.get(8)?,
+                    project_id: row.get(9)?,
+                    chunk_index: row.get(10)?,
+                    normalize_version: row.get(11)?,
                 },
+                llm_stage: row.get(12)?,
+                llm_proposal_score: row.get(13)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -14729,7 +14853,9 @@ fn mark_historical_rejudge_work_item_processed(
         UPDATE {HISTORICAL_REJUDGE_WORK_TABLE}
         SET processed_at = ?1,
             decision = ?2,
-            mutation = ?3
+            mutation = ?3,
+            llm_stage = NULL,
+            llm_proposal_score = NULL
         WHERE run_id = ?4
           AND drawer_rowid = ?5
         "#
@@ -14740,6 +14866,31 @@ fn mark_historical_rejudge_work_item_processed(
             rusqlite::params![iso_timestamp(), decision, mutation, run_id, drawer_rowid],
         )
         .context("failed to mark historical rejudge work item processed")?;
+    Ok(())
+}
+
+fn mark_historical_rejudge_work_item_llm_confirm_pending(
+    db: &Database,
+    run_id: &str,
+    drawer_rowid: i64,
+    proposal_score: f64,
+) -> Result<()> {
+    let sql = format!(
+        r#"
+        UPDATE {HISTORICAL_REJUDGE_WORK_TABLE}
+        SET llm_stage = 'confirm_pending',
+            llm_proposal_score = ?1
+        WHERE run_id = ?2
+          AND drawer_rowid = ?3
+          AND processed_at IS NULL
+        "#
+    );
+    db.conn()
+        .execute(
+            &sql,
+            rusqlite::params![proposal_score, run_id, drawer_rowid],
+        )
+        .context("failed to persist historical rejudge LLM confirmation stage")?;
     Ok(())
 }
 
@@ -14836,6 +14987,8 @@ fn historical_rejudge_options_hash(
         "wing": options.wing,
         "room": options.room,
         "project_id": project_id,
+        "proposal_llm_endpoint": options.proposal_llm_endpoint,
+        "confirm_llm_endpoint": options.confirm_llm_endpoint,
         "config_version": config_version,
     });
     Ok(sha256_hex(&serde_json::to_vec(&value)?))
@@ -15132,6 +15285,8 @@ fn historical_rejudge_backup_metadata(
             all: options.all,
             resume: options.resume,
             page_size: options.page_size,
+            proposal_llm_endpoint: options.proposal_llm_endpoint.map(ToOwned::to_owned),
+            confirm_llm_endpoint: options.confirm_llm_endpoint.map(ToOwned::to_owned),
             wing: options.wing.map(ToOwned::to_owned),
             room: options.room.map(ToOwned::to_owned),
             project: options.project.map(ToOwned::to_owned),
@@ -16454,18 +16609,36 @@ fn print_historical_rejudge_restore_report(
 async fn evaluate_historical_drawer(
     row: &mempal::core::db::HistoricalRejudgeCandidate,
     config: &Config,
-    llm_router: Option<&LlmRouter>,
+    llm_context: Option<&HistoricalRejudgeLlmContext>,
 ) -> Result<HistoricalRejudgeDecision> {
+    if let Some(decision) = evaluate_historical_pre_llm(row, config) {
+        return Ok(decision);
+    }
+
+    if let Some(context) = llm_context {
+        return context
+            .evaluate(&row.drawer, config)
+            .await
+            .context("historical rejudge LLM gate failed");
+    }
+
+    Ok(deterministic_historical_decision(&row.drawer))
+}
+
+fn evaluate_historical_pre_llm(
+    row: &mempal::core::db::HistoricalRejudgeCandidate,
+    config: &Config,
+) -> Option<HistoricalRejudgeDecision> {
     let drawer = &row.drawer;
     if let Some(reason) = historical_protection_reason(drawer) {
-        return Ok(protected_historical_decision(reason));
+        return Some(protected_historical_decision(reason));
     }
 
     let candidate = historical_ingest_candidate(drawer);
     if let Some(decision) = evaluate_tier1(&candidate, &config.ingest_gating)
         && decision.is_rejected()
     {
-        return Ok(HistoricalRejudgeDecision {
+        return Some(HistoricalRejudgeDecision {
             delete_candidate: true,
             protected: false,
             reason: decision
@@ -16479,56 +16652,7 @@ async fn evaluate_historical_drawer(
         });
     }
 
-    if let Some(router) = llm_router {
-        match request_historical_llm_score(router, drawer, config).await {
-            Ok((score, reason)) => {
-                let threshold = config
-                    .ingest_gating
-                    .llm_judge
-                    .as_ref()
-                    .map(|judge| judge.threshold)
-                    .unwrap_or(0.3);
-                return Ok(HistoricalRejudgeDecision {
-                    delete_candidate: score < threshold,
-                    protected: false,
-                    reason: if score < threshold {
-                        format!("llm_below_threshold:{reason}")
-                    } else {
-                        format!("llm_keep:{reason}")
-                    },
-                    label: Some("llm_judge".to_string()),
-                    score: Some(score),
-                    tier: 3,
-                    judge: "llm".to_string(),
-                });
-            }
-            Err(error) => {
-                if let Some(decision) = historical_llm_fail_safe_keep_decision(&error) {
-                    return Ok(decision);
-                }
-                return Err(error).context("historical rejudge LLM gate failed");
-            }
-        }
-    }
-
-    Ok(deterministic_historical_decision(drawer))
-}
-
-fn historical_llm_fail_safe_keep_decision(
-    error: &anyhow::Error,
-) -> Option<HistoricalRejudgeDecision> {
-    if !is_retryable_historical_llm_error(error) {
-        return None;
-    }
-    Some(HistoricalRejudgeDecision {
-        delete_candidate: false,
-        protected: false,
-        reason: "llm_unavailable_fail_safe_keep".to_string(),
-        label: Some("llm_unavailable".to_string()),
-        score: None,
-        tier: 3,
-        judge: "llm".to_string(),
-    })
+    None
 }
 
 fn is_retryable_historical_llm_error(error: &anyhow::Error) -> bool {
@@ -16652,15 +16776,276 @@ fn protected_historical_decision(reason: String) -> HistoricalRejudgeDecision {
     }
 }
 
-fn historical_rejudge_llm_router(config: &Config) -> Option<LlmRouter> {
+enum HistoricalRejudgeLlmContext {
+    Single {
+        router: LlmRouter,
+        model_summary: String,
+    },
+    TwoStage {
+        proposal_router: LlmRouter,
+        proposal_summary: String,
+        confirm_router: LlmRouter,
+        confirm_summary: String,
+    },
+}
+
+impl HistoricalRejudgeLlmContext {
+    fn model_summary(&self) -> String {
+        match self {
+            Self::Single { model_summary, .. } => model_summary.clone(),
+            Self::TwoStage {
+                proposal_summary,
+                confirm_summary,
+                ..
+            } => format!("proposal:{proposal_summary}, confirm:{confirm_summary}"),
+        }
+    }
+
+    async fn evaluate(
+        &self,
+        drawer: &Drawer,
+        config: &Config,
+    ) -> Result<HistoricalRejudgeDecision> {
+        match self {
+            Self::Single { router, .. } => {
+                let (score, reason) = request_historical_llm_score(router, drawer, config).await?;
+                Ok(historical_llm_decision(
+                    score,
+                    reason,
+                    historical_llm_threshold(config),
+                    "llm",
+                ))
+            }
+            Self::TwoStage {
+                proposal_router,
+                confirm_router,
+                ..
+            } => {
+                let threshold = historical_llm_threshold(config);
+                let (proposal_score, proposal_reason) =
+                    request_historical_llm_score(proposal_router, drawer, config).await?;
+                if proposal_score >= threshold {
+                    return Ok(HistoricalRejudgeDecision {
+                        delete_candidate: false,
+                        protected: false,
+                        reason: format!("llm_proposal_keep:{proposal_reason}"),
+                        label: Some("llm_judge".to_string()),
+                        score: Some(proposal_score),
+                        tier: 3,
+                        judge: "llm".to_string(),
+                    });
+                }
+
+                let (confirm_score, confirm_reason) =
+                    request_historical_llm_score(confirm_router, drawer, config).await?;
+                Ok(HistoricalRejudgeDecision {
+                    delete_candidate: confirm_score < threshold,
+                    protected: false,
+                    reason: if confirm_score < threshold {
+                        format!(
+                            "llm_two_stage_confirm_delete:proposal={proposal_reason};confirm={confirm_reason}"
+                        )
+                    } else {
+                        format!(
+                            "llm_two_stage_confirm_keep:proposal={proposal_reason};confirm={confirm_reason}"
+                        )
+                    },
+                    label: Some("llm_judge".to_string()),
+                    score: Some(confirm_score),
+                    tier: 3,
+                    judge: "llm".to_string(),
+                })
+            }
+        }
+    }
+
+    async fn evaluate_work_item(
+        &self,
+        db: &Database,
+        work_item: &HistoricalRejudgeWorkItem,
+        drawer: &Drawer,
+        config: &Config,
+    ) -> Result<HistoricalRejudgeDecision> {
+        match self {
+            Self::Single { .. } => self.evaluate(drawer, config).await,
+            Self::TwoStage {
+                proposal_router,
+                confirm_router,
+                ..
+            } => {
+                let threshold = historical_llm_threshold(config);
+                let proposal_reason = if work_item.llm_stage.as_deref() == Some("confirm_pending") {
+                    match work_item.llm_proposal_score {
+                        Some(score) => format!("persisted_delete_candidate_score={score:.3}"),
+                        None => "persisted_delete_candidate".to_string(),
+                    }
+                } else {
+                    let (proposal_score, proposal_reason) =
+                        request_historical_llm_score(proposal_router, drawer, config).await?;
+                    if proposal_score >= threshold {
+                        return Ok(HistoricalRejudgeDecision {
+                            delete_candidate: false,
+                            protected: false,
+                            reason: format!("llm_proposal_keep:{proposal_reason}"),
+                            label: Some("llm_judge".to_string()),
+                            score: Some(proposal_score),
+                            tier: 3,
+                            judge: "llm".to_string(),
+                        });
+                    }
+                    mark_historical_rejudge_work_item_llm_confirm_pending(
+                        db,
+                        &work_item.run_id,
+                        work_item.drawer_rowid,
+                        proposal_score,
+                    )?;
+                    proposal_reason
+                };
+
+                let (confirm_score, confirm_reason) =
+                    request_historical_llm_score(confirm_router, drawer, config).await?;
+                Ok(HistoricalRejudgeDecision {
+                    delete_candidate: confirm_score < threshold,
+                    protected: false,
+                    reason: if confirm_score < threshold {
+                        format!(
+                            "llm_two_stage_confirm_delete:proposal={proposal_reason};confirm={confirm_reason}"
+                        )
+                    } else {
+                        format!(
+                            "llm_two_stage_confirm_keep:proposal={proposal_reason};confirm={confirm_reason}"
+                        )
+                    },
+                    label: Some("llm_judge".to_string()),
+                    score: Some(confirm_score),
+                    tier: 3,
+                    judge: "llm".to_string(),
+                })
+            }
+        }
+    }
+}
+
+fn historical_rejudge_llm_context(
+    config: &Config,
+    options: HistoricalRejudgeOptions<'_>,
+) -> Result<Option<HistoricalRejudgeLlmContext>> {
     if !config.llm.enabled || !config.llm.enabled_for.iter().any(|item| item == "gating") {
-        return None;
+        return Ok(None);
     }
-    let judge = config.ingest_gating.llm_judge.as_ref()?;
+    let Some(judge) = config.ingest_gating.llm_judge.as_ref() else {
+        return Ok(None);
+    };
     if !judge.enabled {
-        return None;
+        return Ok(None);
     }
-    LlmRouter::from_config(&config.llm).ok()
+
+    let endpoints = config
+        .llm
+        .effective_endpoints()
+        .context("failed to resolve historical rejudge LLM endpoints")?;
+    let Some(proposal_selector) = options.proposal_llm_endpoint else {
+        return Ok(Some(HistoricalRejudgeLlmContext::Single {
+            router: LlmRouter::from_endpoints(endpoints)?,
+            model_summary: config
+                .llm
+                .effective_model_summary()
+                .unwrap_or_else(|| "llm".to_string()),
+        }));
+    };
+
+    let proposal_endpoint =
+        historical_rejudge_select_llm_endpoint(&endpoints, proposal_selector, "proposal")?;
+    let proposal_summary = historical_rejudge_endpoint_summary(&proposal_endpoint);
+    let proposal_router = LlmRouter::from_endpoints(vec![proposal_endpoint])?;
+
+    let Some(confirm_selector) = options.confirm_llm_endpoint else {
+        return Ok(Some(HistoricalRejudgeLlmContext::Single {
+            router: proposal_router,
+            model_summary: proposal_summary,
+        }));
+    };
+
+    let confirm_endpoint =
+        historical_rejudge_select_llm_endpoint(&endpoints, confirm_selector, "confirm")?;
+    let confirm_summary = historical_rejudge_endpoint_summary(&confirm_endpoint);
+    let confirm_router = LlmRouter::from_endpoints(vec![confirm_endpoint])?;
+
+    Ok(Some(HistoricalRejudgeLlmContext::TwoStage {
+        proposal_router,
+        proposal_summary,
+        confirm_router,
+        confirm_summary,
+    }))
+}
+
+fn historical_rejudge_select_llm_endpoint(
+    endpoints: &[EffectiveLlmEndpoint],
+    selector: &str,
+    role: &str,
+) -> Result<EffectiveLlmEndpoint> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("historical rejudge {role} LLM endpoint selector must not be empty");
+    }
+    let mut matches = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.id == selector || endpoint.model == selector)
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => bail!(
+            "historical rejudge {role} LLM endpoint `{selector}` was not found; available endpoints: {}",
+            historical_rejudge_available_endpoint_summary(endpoints)
+        ),
+        _ => bail!(
+            "historical rejudge {role} LLM endpoint selector `{selector}` is ambiguous; use endpoint id"
+        ),
+    }
+}
+
+fn historical_rejudge_available_endpoint_summary(endpoints: &[EffectiveLlmEndpoint]) -> String {
+    endpoints
+        .iter()
+        .map(historical_rejudge_endpoint_summary)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn historical_rejudge_endpoint_summary(endpoint: &EffectiveLlmEndpoint) -> String {
+    format!("{}={}", endpoint.id, endpoint.model)
+}
+
+fn historical_llm_threshold(config: &Config) -> f64 {
+    config
+        .ingest_gating
+        .llm_judge
+        .as_ref()
+        .map(|judge| judge.threshold)
+        .unwrap_or(0.3)
+}
+
+fn historical_llm_decision(
+    score: f64,
+    reason: String,
+    threshold: f64,
+    judge: &str,
+) -> HistoricalRejudgeDecision {
+    let delete_candidate = score < threshold;
+    HistoricalRejudgeDecision {
+        delete_candidate,
+        protected: false,
+        reason: if delete_candidate {
+            format!("llm_below_threshold:{reason}")
+        } else {
+            format!("llm_keep:{reason}")
+        },
+        label: Some("llm_judge".to_string()),
+        score: Some(score),
+        tier: 3,
+        judge: judge.to_string(),
+    }
 }
 
 async fn request_historical_llm_score(
@@ -18149,6 +18534,51 @@ threshold = 0.3
         .expect("parse llm rejudge config")
     }
 
+    fn two_stage_llm_rejudge_config(proposal_base_url: &str, confirm_base_url: &str) -> Config {
+        Config::parse(&format!(
+            r#"
+[llm]
+enabled = true
+request_timeout_secs = 1
+retry_interval_secs = 1
+enabled_for = ["gating"]
+
+[[llm.endpoints]]
+id = "qwen"
+base_url = "{proposal_base_url}/v1"
+model = "qwen3.6-27b-decensor-by-aeon"
+
+[[llm.endpoints]]
+id = "spark"
+base_url = "{confirm_base_url}/v1"
+model = "spark"
+
+[gating]
+enabled = true
+
+[gating.llm_judge]
+enabled = true
+threshold = 0.3
+"#
+        ))
+        .expect("parse two-stage llm rejudge config")
+    }
+
+    fn llm_chat_response(model: &str, score: f64, reason: &str) -> String {
+        serde_json::json!({
+            "model": model,
+            "choices": [{
+                "message": {
+                    "content": serde_json::json!({
+                        "score": score,
+                        "reason": reason,
+                    }).to_string()
+                }
+            }]
+        })
+        .to_string()
+    }
+
     #[test]
     fn historical_rejudge_config_version_includes_endpoint_pool_identity() {
         let primary = Config::parse(
@@ -18200,6 +18630,54 @@ enabled = true
             primary.llm.effective_model_summary().as_deref(),
             Some("judge-a=judge-model-a, judge-b=judge-model-b")
         );
+    }
+
+    #[test]
+    fn historical_rejudge_waiting_llm_status_emits_runtime_warning() {
+        let now = iso_timestamp();
+        let checkpoint = HistoricalRejudgeCheckpoint {
+            run_id: "status-warning-run".to_string(),
+            status: "waiting_llm".to_string(),
+            options_hash: "options".to_string(),
+            started_at: now.clone(),
+            updated_at: now,
+            snapshot_max_rowid: 10,
+            snapshot_count: 10,
+            last_processed_rowid: Some(4),
+            scanned_count: 4,
+            candidate_count: 0,
+            kept_count: 4,
+            protected_count: 0,
+            mutated_count: 0,
+            estimated_bytes_reclaimed: 0,
+            mutation: "soft_delete".to_string(),
+            page_size: 1,
+            judge_model: Some("proposal:qwen, confirm:spark".to_string()),
+            config_version: "config".to_string(),
+            backup_path: None,
+        };
+        let mut warnings = Vec::new();
+
+        push_historical_rejudge_runtime_warning(&mut warnings, Some(&checkpoint));
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].level, "warn");
+        assert_eq!(warnings[0].source, "historical_rejudge");
+        assert!(
+            warnings[0].message.contains("configured LLM endpoint"),
+            "{}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[0].message.contains("6 of 10"),
+            "{}",
+            warnings[0].message
+        );
+
+        let mut completed = checkpoint;
+        completed.status = "done".to_string();
+        push_historical_rejudge_runtime_warning(&mut warnings, Some(&completed));
+        assert_eq!(warnings.len(), 1, "done checkpoint must not add warning");
     }
 
     fn insert_drawer(db: &Database, id: &str, content: &str, wing: &str, room: Option<&str>) {
@@ -18410,6 +18888,8 @@ enabled = true
             resume: false,
             page_size,
             progress_file: None,
+            proposal_llm_endpoint: None,
+            confirm_llm_endpoint: None,
             wing: None,
             room: None,
             project: None,
@@ -18455,6 +18935,22 @@ enabled = true
                 |row| row.get(0),
             )
             .expect("load historical rejudge work item decision")
+    }
+
+    fn historical_rejudge_work_item_llm_stage(
+        db: &Database,
+        run_id: &str,
+        drawer_rowid: i64,
+    ) -> Option<String> {
+        db.conn()
+            .query_row(
+                &format!(
+                    "SELECT llm_stage FROM {HISTORICAL_REJUDGE_WORK_TABLE} WHERE run_id = ?1 AND drawer_rowid = ?2"
+                ),
+                rusqlite::params![run_id, drawer_rowid],
+                |row| row.get(0),
+            )
+            .expect("load historical rejudge work item LLM stage")
     }
 
     fn rejudge_progress_events(path: &Path) -> Vec<serde_json::Value> {
@@ -18569,6 +19065,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18606,6 +19104,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18642,6 +19142,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18726,6 +19228,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -18789,6 +19293,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19059,6 +19565,8 @@ enabled = true
                     resume: false,
                     page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                     progress_file: None,
+                    proposal_llm_endpoint: None,
+                    confirm_llm_endpoint: None,
                     wing: None,
                     room: None,
                     project: None,
@@ -19098,6 +19606,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19130,6 +19640,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19163,6 +19675,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19194,6 +19708,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19230,6 +19746,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19273,6 +19791,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19336,6 +19856,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19405,6 +19927,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19481,6 +20005,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19574,6 +20100,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19664,6 +20192,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19754,6 +20284,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -19806,6 +20338,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -20123,7 +20657,7 @@ enabled = true
     }
 
     #[tokio::test]
-    async fn historical_rejudge_all_execute_llm_timeout_fails_safe_keep_and_continues() {
+    async fn historical_rejudge_all_execute_llm_timeout_keeps_work_pending_for_retry() {
         let mut server = mockito::Server::new_async().await;
         let llm_mock = server
             .mock("POST", "/v1/chat/completions")
@@ -20145,16 +20679,24 @@ enabled = true
         let backups = backup_dir(&tmp);
         let config = llm_rejudge_config(&server.url());
 
-        maintenance_rejudge_command(&db, &config, full_rejudge_options(true, Some(&backups), 1))
-            .await
-            .expect("transient LLM timeout must not abort historical rejudge");
+        let error = maintenance_rejudge_command(
+            &db,
+            &config,
+            full_rejudge_options(true, Some(&backups), 1),
+        )
+        .await
+        .expect_err("transient LLM timeout keeps the work item pending for retry");
+        assert!(
+            error.to_string().contains("LLM") || error.to_string().contains("endpoint"),
+            "unexpected error: {error:#}"
+        );
 
         llm_mock.assert_async().await;
         assert!(
             db.get_drawer("llm-timeout-keep")
                 .expect("load active drawer")
                 .is_some(),
-            "LLM failures must fail-safe keep/no-delete"
+            "LLM failures must not delete while the required gate is pending"
         );
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
         let backup_file = only_backup_file(&backups);
@@ -20166,25 +20708,307 @@ enabled = true
         let checkpoint = load_historical_rejudge_checkpoint(&db)
             .expect("load checkpoint")
             .expect("checkpoint");
-        assert_eq!(checkpoint.status, "done");
-        assert_eq!(checkpoint.scanned_count, 1);
-        assert_eq!(checkpoint.kept_count, 1);
+        assert_eq!(checkpoint.status, "waiting_llm");
+        assert_eq!(checkpoint.scanned_count, 0);
+        assert_eq!(checkpoint.kept_count, 0);
         assert_eq!(checkpoint.mutated_count, 0);
         assert_eq!(
             historical_rejudge_work_item_decision(&db, &checkpoint.run_id, rowid).as_deref(),
-            Some("keep")
+            None
         );
-        let (decision, reason, label): (String, String, Option<String>) = db
+        let audit_count: i64 = db
             .conn()
             .query_row(
-                "SELECT decision, reason, label FROM gating_audit WHERE drawer_id = 'llm-timeout-keep'",
+                "SELECT COUNT(*) FROM gating_audit WHERE drawer_id = 'llm-timeout-keep'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )
-            .expect("load fail-safe audit row");
-        assert_eq!(decision, "keep");
-        assert_eq!(reason, "llm_unavailable_fail_safe_keep");
-        assert_eq!(label.as_deref(), Some("llm_unavailable"));
+            .expect("count historical rejudge audit rows");
+        assert_eq!(
+            audit_count, 0,
+            "pending LLM work must not audit a keep verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_two_stage_keeps_when_proposal_keeps_without_confirming() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.91,
+                "proposal_keep",
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.01, "confirm_would_delete"))
+            .expect(0)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(
+            &db,
+            "proposal-keep",
+            "Routine project note that should be kept by Qwen proposal before Spark is called.",
+            "notes",
+            None,
+        );
+        let backups = backup_dir(&tmp);
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("proposal keep should complete without confirmation call");
+
+        proposal_mock.assert_async().await;
+        confirm_mock.assert_async().await;
+        assert!(
+            db.get_drawer("proposal-keep")
+                .expect("load active drawer")
+                .is_some(),
+            "proposal keep must not delete the drawer"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_two_stage_confirms_proposal_candidate_immediately() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_delete",
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.02, "confirm_delete"))
+            .expect(1)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(
+            &db,
+            "proposal-confirm-delete",
+            "Routine low-signal transient output that Qwen proposes and Spark confirms for cleanup.",
+            "notes",
+            None,
+        );
+        let backups = backup_dir(&tmp);
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("proposal delete should be immediately confirmed and deleted");
+
+        proposal_mock.assert_async().await;
+        confirm_mock.assert_async().await;
+        assert!(
+            db.get_drawer("proposal-confirm-delete")
+                .expect("load active drawer")
+                .is_none(),
+            "Spark-confirmed proposal should be soft-deleted"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+        assert_eq!(sqlite_backup_item_count(&only_backup_file(&backups)), 1);
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.status, "done");
+        assert_eq!(checkpoint.candidate_count, 1);
+        assert_eq!(checkpoint.mutated_count, 1);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_two_stage_keeps_when_confirm_rejects_proposal() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_delete",
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.92, "confirm_keep"))
+            .expect(1)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(
+            &db,
+            "proposal-confirm-keep",
+            "Borderline project note that Qwen proposes for cleanup but Spark keeps.",
+            "notes",
+            None,
+        );
+        let backups = backup_dir(&tmp);
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("Spark keep confirmation should complete without deleting");
+
+        proposal_mock.assert_async().await;
+        confirm_mock.assert_async().await;
+        assert!(
+            db.get_drawer("proposal-confirm-keep")
+                .expect("load active drawer")
+                .is_some(),
+            "Spark keep confirmation must preserve the active drawer"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.status, "done");
+        assert_eq!(checkpoint.kept_count, 1);
+        assert_eq!(checkpoint.candidate_count, 0);
+        assert_eq!(checkpoint.mutated_count, 0);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_two_stage_resume_skips_proposal_after_confirm_interruption() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_delete",
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let failing_confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(408)
+            .with_body("request timeout")
+            .expect(1)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(
+            &db,
+            "proposal-confirm-resume",
+            "Low-signal transient output that should not require Qwen to rerun after Spark recovers.",
+            "notes",
+            None,
+        );
+        let rowid = drawer_rowid(&db, "proposal-confirm-resume");
+        let backups = backup_dir(&tmp);
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+        let options = HistoricalRejudgeOptions {
+            proposal_llm_endpoint: Some("qwen"),
+            confirm_llm_endpoint: Some("spark"),
+            ..full_rejudge_options(true, Some(&backups), 1)
+        };
+
+        maintenance_rejudge_command(&db, &config, options)
+            .await
+            .expect_err("confirm outage should leave proposal-confirm work pending");
+
+        proposal_mock.assert_async().await;
+        failing_confirm_mock.assert_async().await;
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load waiting checkpoint")
+            .expect("waiting checkpoint");
+        assert_eq!(checkpoint.status, "waiting_llm");
+        assert_eq!(
+            historical_rejudge_work_item_llm_stage(&db, &checkpoint.run_id, rowid).as_deref(),
+            Some("confirm_pending")
+        );
+        assert_eq!(
+            historical_rejudge_work_item_decision(&db, &checkpoint.run_id, rowid).as_deref(),
+            None
+        );
+        assert!(
+            db.get_drawer("proposal-confirm-resume")
+                .expect("load active drawer")
+                .is_some(),
+            "confirm outage must not delete while Spark is pending"
+        );
+
+        let successful_confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.01, "confirm_delete"))
+            .expect(1)
+            .create_async()
+            .await;
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                resume: true,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("resume should use persisted proposal state and finish confirmation");
+
+        successful_confirm_mock.assert_async().await;
+        proposal_mock.assert_async().await;
+        assert!(
+            db.get_drawer("proposal-confirm-resume")
+                .expect("load active drawer")
+                .is_none(),
+            "successful Spark resume should soft-delete the confirmed candidate"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
     }
 
     #[tokio::test]
@@ -20805,6 +21629,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: None,
                 room: None,
                 project: None,
@@ -20853,6 +21679,8 @@ enabled = true
                 resume: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
                 wing: Some("hooks-raw"),
                 room: None,
                 project: None,
