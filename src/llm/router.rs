@@ -167,7 +167,7 @@ impl RoutedEndpoint {
     fn retry_after_for_error(&self, error: &LlmError) -> Option<Duration> {
         match error {
             LlmError::ClientError {
-                status: StatusCode::TOO_MANY_REQUESTS,
+                status: StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT,
                 retry_after,
                 ..
             } => Some(
@@ -203,7 +203,12 @@ fn should_try_next_endpoint(error: &LlmError) -> bool {
         | LlmError::Timeout
         | LlmError::TemporarilyUnavailable { .. } => true,
         LlmError::HttpStatus { status, .. } => status.is_server_error(),
-        LlmError::ClientError { status, .. } => *status == StatusCode::TOO_MANY_REQUESTS,
+        LlmError::ClientError { status, .. } => {
+            matches!(
+                *status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+            )
+        }
         LlmError::DecodeResponse(_) | LlmError::MissingConfiguration(_) => false,
     }
 }
