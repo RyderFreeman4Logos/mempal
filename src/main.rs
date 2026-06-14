@@ -14686,17 +14686,51 @@ fn save_historical_rejudge_checkpoint(
     checkpoint: &HistoricalRejudgeCheckpoint,
 ) -> Result<()> {
     let raw = serde_json::to_string(checkpoint)?;
-    db.conn()
-        .execute(
+    for attempt in 0..=HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_RETRIES {
+        match db.conn().execute(
             r#"
             INSERT INTO fork_ext_meta (key, value)
             VALUES (?1, ?2)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             "#,
-            rusqlite::params![HISTORICAL_REJUDGE_CHECKPOINT_KEY, raw],
-        )
-        .context("failed to persist historical rejudge checkpoint")?;
-    Ok(())
+            rusqlite::params![HISTORICAL_REJUDGE_CHECKPOINT_KEY, raw.as_str()],
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if is_transient_sqlite_lock(&error)
+                    && attempt < HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_RETRIES =>
+            {
+                std::thread::sleep(historical_rejudge_checkpoint_save_retry_delay(attempt));
+            }
+            Err(error) => {
+                return Err(error).context("failed to persist historical rejudge checkpoint");
+            }
+        }
+    }
+    unreachable!("checkpoint save retry loop returns on its terminal attempt")
+}
+
+const HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_RETRIES: usize = 40;
+const HISTORICAL_REJUDGE_CHECKPOINT_SAVE_INITIAL_DELAY_MS: u64 = 25;
+const HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_DELAY_MS: u64 = 500;
+
+fn historical_rejudge_checkpoint_save_retry_delay(attempt: usize) -> std::time::Duration {
+    let multiplier = 1_u64 << attempt.min(4);
+    let delay_ms = HISTORICAL_REJUDGE_CHECKPOINT_SAVE_INITIAL_DELAY_MS
+        .saturating_mul(multiplier)
+        .min(HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_DELAY_MS);
+    std::time::Duration::from_millis(delay_ms)
+}
+
+fn is_transient_sqlite_lock(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite_error, _)
+            if matches!(
+                sqlite_error.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 fn historical_rejudge_options_hash(
@@ -20409,6 +20443,62 @@ enabled = true
         assert_eq!(checkpoint.snapshot_count, 2);
         assert_eq!(checkpoint.scanned_count, 2);
         assert_eq!(checkpoint.mutated_count, 2);
+    }
+
+    #[test]
+    fn historical_rejudge_checkpoint_save_retries_transient_sqlite_lock() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        db.conn()
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make checkpoint writer fail fast so retry behavior is observable");
+        let blocker = rusqlite::Connection::open(&db_path).expect("open blocking connection");
+        blocker
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make blocker fail fast");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(75));
+            blocker
+                .execute_batch("COMMIT;")
+                .expect("release write lock");
+        });
+        let checkpoint = HistoricalRejudgeCheckpoint {
+            run_id: "retry-lock-run".to_string(),
+            status: "running".to_string(),
+            options_hash: "hash".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:01Z".to_string(),
+            snapshot_max_rowid: 42,
+            snapshot_count: 3,
+            last_processed_rowid: Some(2),
+            scanned_count: 2,
+            candidate_count: 1,
+            kept_count: 1,
+            protected_count: 0,
+            mutated_count: 1,
+            estimated_bytes_reclaimed: 64,
+            mutation: "soft_delete".to_string(),
+            page_size: 500,
+            judge_model: Some("deterministic".to_string()),
+            config_version: "cfg".to_string(),
+            backup_path: Some(tmp.path().join("backup.sqlite")),
+        };
+
+        let result = save_historical_rejudge_checkpoint(&db, &checkpoint);
+        release.join().expect("release thread");
+        result.expect("checkpoint save must retry a transient SQLite lock");
+
+        let persisted = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(persisted.run_id, checkpoint.run_id);
+        assert_eq!(persisted.last_processed_rowid, Some(2));
+        assert_eq!(persisted.mutated_count, 1);
     }
 
     #[tokio::test]
