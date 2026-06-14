@@ -28,6 +28,8 @@ pub enum QueueError {
     RetryCountOverflow { id: String },
     #[error("blocking queue task failed: {0}")]
     BlockingTaskFailed(String),
+    #[error("unsupported model task kind for auto-requeue: {0}")]
+    UnsupportedModelTaskKind(String),
 }
 
 pub type Result<T> = std::result::Result<T, QueueError>;
@@ -63,6 +65,11 @@ pub struct QueueStats {
     pub pending: u64,
     pub claimed: u64,
     pub failed: u64,
+    pub failed_retryable: u64,
+    pub failed_terminal: u64,
+    pub failed_retryable_embed: u64,
+    pub failed_retryable_llm: u64,
+    pub last_auto_requeue_at_unix_ms: Option<u64>,
     pub oldest_pending_age_secs: Option<u64>,
     pub rate_per_min: f64,
     pub avg_processing_ms: Option<u64>,
@@ -269,6 +276,11 @@ impl AsyncPendingMessageStore {
         disposition: QueueFailureDisposition,
     ) -> Result<()> {
         self.run(move |store| store.mark_failed_with_disposition(&claim, &error, disposition))
+            .await
+    }
+
+    pub async fn auto_requeue_failed_model_tasks(&self, model_kind: String) -> Result<u64> {
+        self.run(move |store| store.auto_requeue_failed_model_tasks(&model_kind))
             .await
     }
 
@@ -718,6 +730,7 @@ impl PendingMessageStore {
                 next_attempt_at = ?4,
                 status = ?5,
                 op_state = CASE WHEN ?5 = 'failed' THEN 'failed' ELSE 'queued' END,
+                failure_class = CASE WHEN ?5 = 'failed' THEN 'terminal' ELSE NULL END,
                 claim_token = NULL,
                 claimed_at = NULL,
                 heartbeat_at = NULL,
@@ -740,6 +753,57 @@ impl PendingMessageStore {
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Mark a model-backed task as failed but retryable once the corresponding endpoint recovers.
+    pub fn mark_model_task_failed_retryable(&self, id: &str, error: &str) -> Result<()> {
+        let now = now_secs();
+        let redacted_error = sanitize_last_error(error);
+        let conn = self.open_connection()?;
+        let updated = conn.execute(
+            r#"
+            UPDATE pending_messages
+            SET status = 'failed',
+                retry_count = 0,
+                retry_backoff_ms = 0,
+                next_attempt_at = ?2,
+                claim_token = NULL,
+                claimed_at = NULL,
+                heartbeat_at = NULL,
+                last_error = ?3,
+                op_state = 'failed',
+                failure_class = 'retryable_model'
+            WHERE id = ?1
+            "#,
+            params![id, now, redacted_error],
+        )?;
+        if updated == 0 {
+            return Err(QueueError::MessageNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Requeue retryable failed model tasks for the recovered model family.
+    pub fn auto_requeue_failed_model_tasks(&self, model_kind: &str) -> Result<u64> {
+        let now = now_secs();
+        let conn = self.open_connection()?;
+        let updated = match model_kind {
+            "embedding" => requeue_failed_model_tasks(&conn, now, "embedding")?,
+            "llm" => requeue_failed_model_tasks(&conn, now, "llm")?,
+            other => return Err(QueueError::UnsupportedModelTaskKind(other.to_string())),
+        };
+        if updated > 0 {
+            let now_ms = now_millis().to_string();
+            conn.execute(
+                r#"
+                INSERT INTO fork_ext_meta (key, value)
+                VALUES ('queue.auto_requeue.last_at_unix_ms', ?1)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                "#,
+                [now_ms],
+            )?;
+        }
+        Ok(updated)
     }
 
     /// Return dead-lettered embed-queue messages to pending for a targeted retry.
@@ -884,6 +948,50 @@ impl PendingMessageStore {
             .saturating_mul(multiplier)
             .min(self.config.max_delay_ms)
     }
+}
+
+fn requeue_failed_model_tasks(conn: &Connection, now: i64, model_kind: &str) -> Result<u64> {
+    let kind_predicate = match model_kind {
+        "embedding" => "kind != 'llm_task'",
+        "llm" => "kind = 'llm_task'",
+        other => return Err(QueueError::UnsupportedModelTaskKind(other.to_string())),
+    };
+    let sql = format!(
+        r#"
+        UPDATE pending_messages
+        SET status = 'pending',
+            retry_count = 0,
+            retry_backoff_ms = 0,
+            next_attempt_at = MIN(created_at, ?1),
+            claim_token = NULL,
+            claimed_at = NULL,
+            heartbeat_at = NULL,
+            last_error = NULL,
+            op_state = 'queued',
+            failure_class = NULL,
+            result_drawer_id = CASE
+                WHEN kind = 'ingest_async' THEN NULL
+                ELSE result_drawer_id
+            END,
+            rejected_reason = CASE
+                WHEN kind = 'ingest_async' THEN NULL
+                ELSE rejected_reason
+            END,
+            failure_detail = CASE
+                WHEN kind = 'ingest_async' THEN NULL
+                ELSE failure_detail
+            END,
+            result_json = CASE
+                WHEN kind = 'ingest_async' THEN NULL
+                ELSE result_json
+            END
+        WHERE status = 'failed'
+          AND failure_class = 'retryable_model'
+          AND {kind_predicate}
+        "#
+    );
+    let updated = conn.execute(&sql, [now])?;
+    Ok(updated as u64)
 }
 
 fn confirm_in_tx(
@@ -1107,6 +1215,67 @@ fn compute_queue_stats(conn: &Connection) -> Result<QueueStats> {
         }
     }
 
+    let has_failure_class = column_exists(conn, "pending_messages", "failure_class")?;
+    let (failed_retryable, failed_terminal, failed_retryable_embed, failed_retryable_llm) =
+        if has_failure_class {
+            let failed_retryable = conn.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM pending_messages
+                WHERE status = 'failed'
+                  AND failure_class = 'retryable_model'
+                "#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let failed_retryable_embed = conn.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM pending_messages
+                WHERE status = 'failed'
+                  AND failure_class = 'retryable_model'
+                  AND kind != 'llm_task'
+                "#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let failed_retryable_llm = conn.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM pending_messages
+                WHERE status = 'failed'
+                  AND failure_class = 'retryable_model'
+                  AND kind = 'llm_task'
+                "#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            (
+                failed_retryable,
+                failed.saturating_sub(failed_retryable),
+                failed_retryable_embed,
+                failed_retryable_llm,
+            )
+        } else {
+            (0, failed, 0, 0)
+        };
+    let last_auto_requeue_at_unix_ms = if table_exists(conn, "fork_ext_meta")? {
+        conn.query_row(
+            r#"
+            SELECT value
+            FROM fork_ext_meta
+            WHERE key = 'queue.auto_requeue.last_at_unix_ms'
+            "#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    } else {
+        None
+    };
+
     let oldest_pending_created_at = conn
         .query_row(
             "SELECT MIN(created_at) FROM pending_messages WHERE status = 'pending'",
@@ -1148,6 +1317,11 @@ fn compute_queue_stats(conn: &Connection) -> Result<QueueStats> {
         pending: pending_u64,
         claimed: i64_to_u64(claimed),
         failed: i64_to_u64(failed),
+        failed_retryable: i64_to_u64(failed_retryable),
+        failed_terminal: i64_to_u64(failed_terminal),
+        failed_retryable_embed: i64_to_u64(failed_retryable_embed),
+        failed_retryable_llm: i64_to_u64(failed_retryable_llm),
+        last_auto_requeue_at_unix_ms,
         oldest_pending_age_secs,
         rate_per_min,
         avg_processing_ms,
@@ -1300,6 +1474,18 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
         |row| row.get::<_, i64>(0),
     )?;
     Ok(count > 0)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let escaped_table = table.replace('"', "\"\"");
+    let mut statement = conn.prepare(&format!("PRAGMA table_info(\"{escaped_table}\")"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn sanitize_last_error(error: &str) -> String {

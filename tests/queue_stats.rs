@@ -205,6 +205,156 @@ fn test_fork_ext_migration_v0_to_v1_creates_pending_messages_table() {
 }
 
 #[test]
+fn test_queue_stats_readonly_handles_pre_v22_failure_class_schema() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let conn = Connection::open(&db_path).expect("open db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE fork_ext_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO fork_ext_meta (key, value) VALUES ('fork_ext_version', '21');
+
+        CREATE TABLE pending_messages (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_error TEXT,
+            op_state TEXT NOT NULL
+        );
+        "#,
+    )
+    .expect("create v21 queue schema");
+    conn.execute(
+        r#"
+        INSERT INTO pending_messages (
+            id,
+            kind,
+            source_hash,
+            status,
+            payload,
+            created_at,
+            last_error,
+            op_state
+        )
+        VALUES ('legacy-v21-failed', 'hook_event', 'legacy-v21-failed', 'failed', '{}', 1700000000, 'legacy failure', 'failed')
+        "#,
+        [],
+    )
+    .expect("insert v21 failed row");
+    drop(conn);
+
+    let stats = mempal::core::queue::queue_stats_readonly(&db_path).expect("readonly stats");
+    assert_eq!(stats.failed, 1);
+    assert_eq!(stats.failed_retryable, 0);
+    assert_eq!(stats.failed_terminal, 1);
+    assert_eq!(stats.failed_retryable_embed, 0);
+    assert_eq!(stats.failed_retryable_llm, 0);
+    assert_eq!(stats.last_auto_requeue_at_unix_ms, None);
+}
+
+#[test]
+fn test_fork_ext_v22_classifies_legacy_failed_rows_conservatively() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("palace.db");
+    let db = Database::open(&db_path).expect("open db");
+    let conn = db.conn();
+    conn.execute(
+        "UPDATE fork_ext_meta SET value = '21' WHERE key = 'fork_ext_version'",
+        [],
+    )
+    .expect("rewind fork ext version for v22 fixture");
+
+    for (id, kind, last_error) in [
+        ("transient-timeout", "llm_task", "429 Too Many Requests"),
+        (
+            "transient-hook-post-tool",
+            "hook_post_tool",
+            "timeout contacting embedding endpoint",
+        ),
+        (
+            "transient-hook-user-prompt",
+            "hook_user_prompt",
+            "connection reset by peer",
+        ),
+        (
+            "transient-hook-session-start",
+            "hook_session_start",
+            "503 Service Unavailable",
+        ),
+        (
+            "transient-hook-session-end",
+            "hook_session_end",
+            "rate limit exceeded",
+        ),
+        ("terminal-invalid", "llm_task", "invalid json payload"),
+        ("terminal-unknown", "hook_event", "worker rejected row"),
+        (
+            "terminal-unknown-kind-timeout",
+            "future_model_task",
+            "timeout acquiring database lock",
+        ),
+    ] {
+        conn.execute(
+            r#"
+            INSERT INTO pending_messages (
+                id,
+                kind,
+                source_hash,
+                status,
+                payload,
+                created_at,
+                last_error,
+                op_state
+            )
+            VALUES (?1, ?2, ?3, 'failed', '{}', 1700000000, ?4, 'failed')
+            "#,
+            params![id, kind, id, last_error],
+        )
+        .expect("insert legacy failed row");
+    }
+
+    apply_fork_ext_migrations_to(conn, 22).expect("apply ext v22 migration");
+    let failure_class_for = |id: &str| -> String {
+        conn.query_row(
+            "SELECT failure_class FROM pending_messages WHERE id = ?1",
+            [id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read failure_class")
+    };
+
+    assert_eq!(failure_class_for("transient-timeout"), "retryable_model");
+    assert_eq!(
+        failure_class_for("transient-hook-post-tool"),
+        "retryable_model"
+    );
+    assert_eq!(
+        failure_class_for("transient-hook-user-prompt"),
+        "retryable_model"
+    );
+    assert_eq!(
+        failure_class_for("transient-hook-session-start"),
+        "retryable_model"
+    );
+    assert_eq!(
+        failure_class_for("transient-hook-session-end"),
+        "retryable_model"
+    );
+    assert_eq!(failure_class_for("terminal-invalid"), "terminal");
+    assert_eq!(failure_class_for("terminal-unknown"), "terminal");
+    assert_eq!(
+        failure_class_for("terminal-unknown-kind-timeout"),
+        "terminal"
+    );
+}
+
+#[test]
 fn test_queue_stats_reflects_current_state() {
     let (_tmp, db_path, store) = new_store(QueueConfig {
         base_delay_ms: 0,
@@ -491,6 +641,128 @@ fn test_reindex_failed_requeues_only_failed_embed_queue_items() {
     assert_eq!(status_for(&failed_embed), ("pending".to_string(), 0));
     assert_eq!(status_for(&failed_llm), ("failed".to_string(), 4));
     assert_eq!(status_for(&pending_embed), ("pending".to_string(), 0));
+}
+
+#[test]
+fn test_queue_stats_split_failed_retryable_and_terminal_model_work() {
+    let (_tmp, _db_path, store) = new_store(QueueConfig::default());
+    let retryable_embed = store
+        .enqueue("hook_event", r#"{"n":1}"#)
+        .expect("enqueue retryable embed");
+    let retryable_llm = store
+        .enqueue("llm_task", r#"{"n":2}"#)
+        .expect("enqueue retryable llm");
+    let terminal_embed = store
+        .enqueue("hook_event", r#"{"n":3}"#)
+        .expect("enqueue terminal embed");
+
+    store
+        .mark_model_task_failed_retryable(&retryable_embed, "temporary embed outage")
+        .expect("mark retryable embed failed");
+    store
+        .mark_model_task_failed_retryable(&retryable_llm, "temporary llm outage")
+        .expect("mark retryable llm failed");
+    let terminal_claim = store
+        .claim_next("worker-terminal", 60)
+        .expect("claim")
+        .expect("terminal claim");
+    assert_eq!(terminal_claim.id, terminal_embed);
+    store
+        .mark_failed_with_disposition(
+            &terminal_claim,
+            "invalid configuration",
+            QueueFailureDisposition::Terminal,
+        )
+        .expect("mark terminal failed");
+
+    let stats = store.stats().expect("stats");
+    assert_eq!(stats.failed, 3);
+    assert_eq!(stats.failed_retryable, 2);
+    assert_eq!(stats.failed_terminal, 1);
+    assert_eq!(stats.failed_retryable_embed, 1);
+    assert_eq!(stats.failed_retryable_llm, 1);
+}
+
+#[test]
+fn test_auto_requeue_model_tasks_only_requeues_retryable_failed_kind() {
+    let (_tmp, db_path, store) = new_store(QueueConfig::default());
+    let retryable_embed = store
+        .enqueue("hook_event", r#"{"n":1}"#)
+        .expect("enqueue retryable embed");
+    let retryable_llm = store
+        .enqueue("llm_task", r#"{"n":2}"#)
+        .expect("enqueue retryable llm");
+    let terminal_embed = store
+        .enqueue("hook_event", r#"{"n":3}"#)
+        .expect("enqueue terminal embed");
+
+    store
+        .mark_model_task_failed_retryable(&retryable_embed, "temporary embed outage")
+        .expect("mark retryable embed failed");
+    store
+        .mark_model_task_failed_retryable(&retryable_llm, "temporary llm outage")
+        .expect("mark retryable llm failed");
+    let terminal_claim = store
+        .claim_next("worker-terminal", 60)
+        .expect("claim")
+        .expect("terminal claim");
+    assert_eq!(terminal_claim.id, terminal_embed);
+    store
+        .mark_failed_with_disposition(
+            &terminal_claim,
+            "invalid configuration",
+            QueueFailureDisposition::Terminal,
+        )
+        .expect("mark terminal failed");
+
+    let requeued = store
+        .auto_requeue_failed_model_tasks("embedding")
+        .expect("auto requeue embedding");
+
+    assert_eq!(requeued, 1);
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let status_for = |id: &str| -> (String, i64, Option<String>) {
+        conn.query_row(
+            "SELECT status, retry_count, last_error FROM pending_messages WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read queue row")
+    };
+    assert_eq!(
+        status_for(&retryable_embed),
+        ("pending".to_string(), 0, None)
+    );
+    assert_eq!(
+        status_for(&retryable_llm),
+        (
+            "failed".to_string(),
+            0,
+            Some("temporary llm outage".to_string())
+        )
+    );
+    assert_eq!(
+        status_for(&terminal_embed),
+        (
+            "failed".to_string(),
+            1,
+            Some("invalid configuration".to_string())
+        )
+    );
+
+    let last_auto_requeue_at = conn
+        .query_row(
+            "SELECT value FROM fork_ext_meta WHERE key = 'queue.auto_requeue.last_at_unix_ms'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("last auto requeue timestamp");
+    assert!(
+        last_auto_requeue_at
+            .parse::<u64>()
+            .is_ok_and(|value| value > 0),
+        "{last_auto_requeue_at}"
+    );
 }
 
 #[test]

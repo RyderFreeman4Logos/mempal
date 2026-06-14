@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 21;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 22;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
@@ -111,6 +111,15 @@ CREATE INDEX IF NOT EXISTS idx_ct_hermes_profile
 CREATE INDEX IF NOT EXISTS idx_ct_session_source
     ON conversation_turns(session_source, timestamp_epoch DESC)
     WHERE session_source IS NOT NULL;
+"#;
+
+pub const FORK_EXT_V22_SCHEMA_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_pending_failed_failure_class
+    ON pending_messages(status, failure_class, kind);
+
+INSERT INTO fork_ext_meta (key, value)
+VALUES ('queue.auto_requeue.last_at_unix_ms', '0')
+ON CONFLICT(key) DO NOTHING;
 "#;
 
 pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
@@ -439,6 +448,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 21,
             up: apply_v21,
         },
+        Migration {
+            version: 22,
+            up: apply_v22,
+        },
     ]
 }
 
@@ -633,6 +646,58 @@ fn apply_v21(conn: &Connection) -> rusqlite::Result<()> {
     ensure_nullable_column(conn, "conversation_turns", "previous_message_id", "TEXT")?;
     ensure_nullable_column(conn, "conversation_turns", "next_message_id", "TEXT")?;
     conn.execute_batch(FORK_EXT_V21_SCHEMA_SQL)
+}
+
+fn apply_v22(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_nullable_column(conn, "pending_messages", "failure_class", "TEXT")?;
+    conn.execute_batch(
+        r#"
+        UPDATE pending_messages
+        SET failure_class = CASE
+            WHEN status != 'failed' THEN NULL
+            WHEN lower(COALESCE(last_error, '')) LIKE '%decode%' THEN 'terminal'
+            WHEN lower(COALESCE(last_error, '')) LIKE '%unknown llm task%' THEN 'terminal'
+            WHEN lower(COALESCE(last_error, '')) LIKE '%invalid%' THEN 'terminal'
+            WHEN lower(COALESCE(last_error, '')) LIKE '%unsupported%' THEN 'terminal'
+            WHEN lower(COALESCE(last_error, '')) LIKE '%missing%' THEN 'terminal'
+            WHEN lower(COALESCE(last_error, '')) LIKE '%configuration%' THEN 'terminal'
+            WHEN lower(COALESCE(last_error, '')) LIKE '%config%' THEN 'terminal'
+            WHEN lower(COALESCE(last_error, '')) LIKE '%dimension%' THEN 'terminal'
+            WHEN lower(COALESCE(last_error, '')) LIKE '%no vectors%' THEN 'terminal'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%408%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%429%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%500%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%502%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%503%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%504%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%timeout%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%timed out%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%too many requests%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%rate limit%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%cooldown%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%connection refused%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%connection reset%' THEN 'retryable_model'
+            WHEN kind IN ('llm_task', 'ingest_async', 'hook_event', 'hook_post_tool', 'hook_user_prompt', 'hook_session_start', 'hook_session_end', 'hook:post-tool-use', 'hook:user-prompt-submit', 'hook:session-start', 'hook:session-end')
+                AND lower(COALESCE(last_error, '')) LIKE '%remote disconnected%' THEN 'retryable_model'
+            ELSE 'terminal'
+        END
+        WHERE failure_class IS NULL;
+        "#,
+    )?;
+    conn.execute_batch(FORK_EXT_V22_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {

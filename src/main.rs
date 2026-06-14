@@ -10261,6 +10261,16 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     println!("  pending: {}", queue_stats.pending);
     println!("  claimed: {}", queue_stats.claimed);
     println!("  failed: {}", queue_stats.failed);
+    println!("  failed_retryable: {}", queue_stats.failed_retryable);
+    println!("  failed_terminal: {}", queue_stats.failed_terminal);
+    println!(
+        "  failed_retryable_model: embedding={} llm={}",
+        queue_stats.failed_retryable_embed, queue_stats.failed_retryable_llm
+    );
+    match queue_stats.last_auto_requeue_at_unix_ms {
+        Some(ts) => println!("  last_auto_requeue_at_unix_ms: {ts}"),
+        None => println!("  last_auto_requeue_at_unix_ms: none"),
+    }
     println!("  rate_per_min: {:.1}", queue_stats.rate_per_min);
     match queue_stats.oldest_pending_age_secs {
         Some(age) => println!("  oldest_pending_age_secs: {age}"),
@@ -10492,7 +10502,10 @@ fn push_model_backend_runtime_warnings(
         warnings.push(mempal::core::config::RuntimeWarning {
             level: "warn",
             source: "queue",
-            message: "queue has failed work; use `mempal reindex --failed` for failed embed-queue items, and resubmit any writes that were rejected before entering the queue.".to_string(),
+            message: format!(
+                "queue has failed work (retryable_model={}, terminal={}); retryable model tasks are auto-requeued when their endpoint recovers, terminal failures require manual action.",
+                queue_stats.failed_retryable, queue_stats.failed_terminal
+            ),
         });
     }
 }
@@ -16999,10 +17012,20 @@ fn doctor_command(format: String) -> Result<()> {
             );
             println!("embedding_pool_capacity={}", report.embedding.pool_capacity);
             println!(
-                "embedding_queue=pending:{} claimed:{} failed:{}",
+                "embedding_queue=pending:{} claimed:{} failed:{} retryable_model:{} terminal:{} retryable_embedding:{} retryable_llm:{} last_auto_requeue_at_unix_ms:{}",
                 report.embedding.queue.pending,
                 report.embedding.queue.claimed,
-                report.embedding.queue.failed
+                report.embedding.queue.failed,
+                report.embedding.queue.failed_retryable,
+                report.embedding.queue.failed_terminal,
+                report.embedding.queue.failed_retryable_embed,
+                report.embedding.queue.failed_retryable_llm,
+                report
+                    .embedding
+                    .queue
+                    .last_auto_requeue_at_unix_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
             );
             println!(
                 "design_insights=schema_available:{} open:{} high_value_open:{}",

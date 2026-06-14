@@ -5,7 +5,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::Value;
 use tokio::time::timeout;
 
-use crate::core::config::{Config, EffectiveEmbedEndpoint, EffectiveLlmEndpoint};
+use crate::core::config::{Config, EffectiveEmbedEndpoint, EffectiveLlmEndpoint, LlmConfig};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -75,6 +75,17 @@ pub fn probe_endpoints_blocking(config: &Config) -> Result<EndpointHealthSnapsho
     Ok(runtime.block_on(probe_endpoints(config)))
 }
 
+/// Probe the LLM endpoint used by the daemon LLM worker.
+///
+/// `probe_endpoints` may report memory-intelligence LLM health when that
+/// subsystem has a distinct endpoint. Queue recovery for `llm_task` rows must
+/// instead follow `config.llm`, because that is the endpoint used to process
+/// daemon LLM work.
+pub async fn probe_daemon_llm_generation(config: &Config) -> ProbeStatus {
+    let (_, generation) = probe_llm_config(&config.llm).await;
+    generation
+}
+
 async fn probe_embedding(config: &Config) -> ProbeStatus {
     match config.embed.backend.as_str() {
         "openai_compat" | "api" => {
@@ -115,6 +126,10 @@ async fn probe_llm(config: &Config) -> (ProbeStatus, ProbeStatus) {
     } else {
         config.llm.clone()
     };
+    probe_llm_config(&effective_llm).await
+}
+
+async fn probe_llm_config(effective_llm: &LlmConfig) -> (ProbeStatus, ProbeStatus) {
     if !effective_llm.enabled {
         let disabled = ProbeStatus::unreachable("disabled".to_string());
         return (disabled.clone(), disabled);
@@ -305,5 +320,27 @@ fn resolve_api_key(
         Err(std::env::VarError::NotUnicode(_)) => {
             anyhow::bail!("api key env `{env_name}` is not valid unicode")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::config::Config;
+    use crate::core::types::IntelligenceMode;
+
+    #[tokio::test]
+    async fn daemon_llm_generation_probe_ignores_memory_intelligence_endpoint_when_worker_disabled()
+    {
+        let mut config = Config::default();
+        config.llm.enabled = false;
+        config.memory_intelligence.mode = IntelligenceMode::LocalLlm;
+        config.memory_intelligence.llm.base_url = Some("http://127.0.0.1:9/v1".to_string());
+        config.memory_intelligence.llm.model = Some("memory-intelligence-model".to_string());
+
+        let status = probe_daemon_llm_generation(&config).await;
+
+        assert!(!status.reachable);
+        assert_eq!(status.detail, "disabled");
     }
 }
