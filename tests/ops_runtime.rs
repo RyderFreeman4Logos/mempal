@@ -4,6 +4,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
+use mempal::core::queue::{PendingMessageStore, QueueFailureDisposition};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -119,6 +120,59 @@ fn test_cli_doctor_json_reports_schema_and_path() {
             .expect("warnings")
             .iter()
             .any(|warning| warning.as_str().unwrap_or_default().contains("PATH"))
+    );
+}
+
+#[test]
+
+fn test_cli_doctor_reports_queue_failure_classes() {
+    let home = TempDir::new().expect("home");
+    fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
+    let db_path = palace_db_path(&home);
+    Database::open(&db_path).expect("open db");
+    let store = PendingMessageStore::new_without_reclaim(&db_path);
+
+    let retryable = store
+        .enqueue("hook_event", r#"{"n":1}"#)
+        .expect("enqueue retryable row");
+    let terminal = store
+        .enqueue("hook_event", r#"{"n":2}"#)
+        .expect("enqueue terminal row");
+    store
+        .mark_model_task_failed_retryable(&retryable, "429 Too Many Requests")
+        .expect("mark retryable failed");
+    let terminal_claim = store
+        .claim_next("terminal-worker", 60)
+        .expect("claim terminal row")
+        .expect("terminal row claimed");
+    assert_eq!(terminal_claim.id, terminal);
+    store
+        .mark_failed_with_disposition(
+            &terminal_claim,
+            "invalid payload",
+            QueueFailureDisposition::Terminal,
+        )
+        .expect("mark terminal failed");
+
+    let json = run_mempal(&home, &["doctor", "--format", "json"]);
+    assert_success(&json);
+    let value: Value = serde_json::from_str(&stdout(&json)).expect("doctor json");
+    assert_eq!(value["embedding"]["queue"]["failed"], 2);
+    assert_eq!(value["embedding"]["queue"]["failed_retryable"], 1);
+    assert_eq!(value["embedding"]["queue"]["failed_terminal"], 1);
+    assert_eq!(value["embedding"]["queue"]["failed_retryable_embed"], 1);
+    assert_eq!(value["embedding"]["queue"]["failed_retryable_llm"], 0);
+    assert_eq!(
+        value["embedding"]["queue"]["last_auto_requeue_at_unix_ms"],
+        Value::Null
+    );
+
+    let plain = run_mempal(&home, &["doctor", "--format", "plain"]);
+    assert_success(&plain);
+    let out = stdout(&plain);
+    assert!(
+        out.contains("embedding_queue=pending:0 claimed:0 failed:2 retryable_model:1 terminal:1 retryable_embedding:1 retryable_llm:0 last_auto_requeue_at_unix_ms:none"),
+        "{out}"
     );
 }
 

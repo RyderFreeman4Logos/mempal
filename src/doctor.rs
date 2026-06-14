@@ -119,6 +119,11 @@ pub struct DoctorEmbeddingQueueReport {
     pub pending: u64,
     pub claimed: u64,
     pub failed: u64,
+    pub failed_retryable: u64,
+    pub failed_terminal: u64,
+    pub failed_retryable_embed: u64,
+    pub failed_retryable_llm: u64,
+    pub last_auto_requeue_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -327,6 +332,11 @@ fn queue_report_from_stats(stats: QueueStats) -> DoctorEmbeddingQueueReport {
         pending: stats.pending,
         claimed: stats.claimed,
         failed: stats.failed,
+        failed_retryable: stats.failed_retryable,
+        failed_terminal: stats.failed_terminal,
+        failed_retryable_embed: stats.failed_retryable_embed,
+        failed_retryable_llm: stats.failed_retryable_llm,
+        last_auto_requeue_at_unix_ms: stats.last_auto_requeue_at_unix_ms,
     }
 }
 

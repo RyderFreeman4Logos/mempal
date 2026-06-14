@@ -1418,6 +1418,11 @@ fn default_queue_stats() -> crate::core::queue::QueueStats {
         pending: 0,
         claimed: 0,
         failed: 0,
+        failed_retryable: 0,
+        failed_terminal: 0,
+        failed_retryable_embed: 0,
+        failed_retryable_llm: 0,
+        last_auto_requeue_at_unix_ms: None,
         oldest_pending_age_secs: None,
         rate_per_min: 0.0,
         avg_processing_ms: None,
@@ -2431,6 +2436,11 @@ impl MempalMcpServer {
                 pending: queue_stats.pending,
                 claimed: queue_stats.claimed,
                 failed: queue_stats.failed,
+                failed_retryable: queue_stats.failed_retryable,
+                failed_terminal: queue_stats.failed_terminal,
+                failed_retryable_embed: queue_stats.failed_retryable_embed,
+                failed_retryable_llm: queue_stats.failed_retryable_llm,
+                last_auto_requeue_at_unix_ms: queue_stats.last_auto_requeue_at_unix_ms,
                 rate_per_min: queue_stats.rate_per_min,
                 oldest_pending_age_secs: queue_stats.oldest_pending_age_secs,
                 avg_processing_ms: queue_stats.avg_processing_ms,
@@ -7756,7 +7766,10 @@ fn push_model_backend_warnings(
     if queue_stats.failed > 0 {
         system_warnings.push(SystemWarning {
             level: "warn".to_string(),
-            message: "queue has failed work; use `mempal reindex --failed` for failed embed-queue items, and resubmit any writes that were rejected before entering the queue.".to_string(),
+            message: format!(
+                "queue has failed work (retryable_model={}, terminal={}); retryable model tasks are auto-requeued when their endpoint recovers, terminal failures require manual action.",
+                queue_stats.failed_retryable, queue_stats.failed_terminal
+            ),
             source: "queue".to_string(),
         });
     }

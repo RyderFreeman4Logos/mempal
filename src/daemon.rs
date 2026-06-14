@@ -46,6 +46,7 @@ const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 /// Coupled to the orphan reaper grace period in `src/main.rs`.
 pub const DAEMON_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 const DAEMON_HOOK_WORKER_LIMIT: usize = 4;
+const ENDPOINT_RECOVERY_REQUEUE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
     run_command_with_bootstrap_events(config_path, foreground, None)
@@ -203,6 +204,11 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         context.store.clone(),
         Duration::from_secs(60),
     );
+    let endpoint_requeue_handle = spawn_endpoint_recovery_requeue_worker(
+        context.store.clone(),
+        Arc::new(crate::core::config::ConfigHandle::current),
+        ENDPOINT_RECOVERY_REQUEUE_INTERVAL,
+    );
 
     let llm_worker_handles: Vec<tokio::task::JoinHandle<_>> = if context.config.llm.enabled {
         let llm_client_runtime = crate::llm::worker::LlmClientRuntime::new(&context.config.llm);
@@ -304,6 +310,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     tracing::info!("LLM workers stopped");
     stall_watchdog_handle.abort();
     let _ = stall_watchdog_handle.await;
+    endpoint_requeue_handle.abort();
+    let _ = endpoint_requeue_handle.await;
 
     // Release any tasks still claimed by workers that were aborted or did not finish.
     let released = context
@@ -553,6 +561,155 @@ fn spawn_stall_watchdog(
             observer.maybe_log_stall(&store).await;
         }
     })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EndpointRecoveryRequeuePlan {
+    embedding: bool,
+    llm: bool,
+}
+
+impl EndpointRecoveryRequeuePlan {
+    fn is_empty(self) -> bool {
+        !self.embedding && !self.llm
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EndpointRecoveryRequeueState {
+    embedding_reachable: bool,
+    llm_generation_reachable: bool,
+}
+
+impl EndpointRecoveryRequeueState {
+    fn plan(
+        &self,
+        health: &crate::endpoint_health::EndpointHealthSnapshot,
+    ) -> EndpointRecoveryRequeuePlan {
+        EndpointRecoveryRequeuePlan {
+            embedding: health.embedding.reachable && !self.embedding_reachable,
+            llm: health.llm_generation.reachable && !self.llm_generation_reachable,
+        }
+    }
+
+    fn commit_successes(
+        &mut self,
+        health: &crate::endpoint_health::EndpointHealthSnapshot,
+        completed: EndpointRecoveryRequeuePlan,
+    ) {
+        if health.embedding.reachable {
+            self.embedding_reachable = self.embedding_reachable || completed.embedding;
+        } else {
+            self.embedding_reachable = false;
+        }
+        if health.llm_generation.reachable {
+            self.llm_generation_reachable = self.llm_generation_reachable || completed.llm;
+        } else {
+            self.llm_generation_reachable = false;
+        }
+    }
+}
+
+type EndpointRecoveryConfigProvider =
+    Arc<dyn Fn() -> Arc<crate::core::config::Config> + Send + Sync>;
+
+fn endpoint_recovery_probe_config(
+    config_provider: &EndpointRecoveryConfigProvider,
+) -> Arc<crate::core::config::Config> {
+    config_provider()
+}
+
+fn spawn_endpoint_recovery_requeue_worker(
+    store: AsyncPendingMessageStore,
+    config_provider: EndpointRecoveryConfigProvider,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut state = EndpointRecoveryRequeueState::default();
+        loop {
+            ticker.tick().await;
+            if shutdown_requested() {
+                break;
+            }
+            let config = endpoint_recovery_probe_config(&config_provider);
+            let (health, daemon_llm_generation) = tokio::join!(
+                crate::endpoint_health::probe_endpoints(config.as_ref()),
+                crate::endpoint_health::probe_daemon_llm_generation(config.as_ref())
+            );
+            let health = crate::endpoint_health::EndpointHealthSnapshot {
+                llm: daemon_llm_generation.clone(),
+                llm_generation: daemon_llm_generation,
+                ..health
+            };
+            if let Err(error) =
+                requeue_failed_model_tasks_after_recovery(&store, &mut state, &health).await
+            {
+                tracing::warn!(
+                    ?error,
+                    "failed to auto-requeue model tasks after endpoint recovery"
+                );
+            }
+        }
+    })
+}
+
+async fn requeue_failed_model_tasks_after_recovery(
+    store: &AsyncPendingMessageStore,
+    state: &mut EndpointRecoveryRequeueState,
+    health: &crate::endpoint_health::EndpointHealthSnapshot,
+) -> crate::core::queue::Result<EndpointRecoveryRequeuePlan> {
+    let plan = state.plan(health);
+    if plan.is_empty() {
+        state.commit_successes(health, EndpointRecoveryRequeuePlan::default());
+        return Ok(plan);
+    }
+    let mut completed = EndpointRecoveryRequeuePlan::default();
+    let mut error = None;
+    if plan.embedding {
+        match store
+            .auto_requeue_failed_model_tasks("embedding".to_string())
+            .await
+        {
+            Ok(requeued) => {
+                completed.embedding = true;
+                if requeued > 0 {
+                    tracing::info!(
+                        requeued,
+                        "auto-requeued failed embedding tasks after endpoint recovery"
+                    );
+                }
+            }
+            Err(requeue_error) => {
+                error.get_or_insert(requeue_error);
+            }
+        }
+    }
+    if plan.llm {
+        match store
+            .auto_requeue_failed_model_tasks("llm".to_string())
+            .await
+        {
+            Ok(requeued) => {
+                completed.llm = true;
+                if requeued > 0 {
+                    tracing::info!(
+                        requeued,
+                        "auto-requeued failed LLM tasks after endpoint recovery"
+                    );
+                }
+            }
+            Err(requeue_error) => {
+                error.get_or_insert(requeue_error);
+            }
+        }
+    }
+    state.commit_successes(health, completed);
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(plan)
 }
 
 #[cfg(unix)]
@@ -1981,18 +2138,24 @@ mod tests {
         AsyncDb,
         config::{Config, LlmJudgeConfig, TurnStorageMode},
         db::Database,
-        queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore, QueueError},
+        queue::{
+            AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore, QueueError,
+            QueueFailureDisposition,
+        },
         types::{Drawer, SourceType},
     };
     use crate::embed::{EmbedError, Embedder};
+    use crate::endpoint_health::{EndpointHealthSnapshot, ProbeStatus};
     use crate::hook::{CapturedHookEnvelope, HookEvent};
     use arc_swap::ArcSwap;
     use std::pin::Pin;
 
     use super::{
-        ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext, HookWorkerState,
-        build_drawer_records, compile_classifier_from_embedder, llm_worker_claim_enabled,
-        poll_claim_next, process_claimed_message_with_embedder, run_hook_worker, wing_from_cwd,
+        ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext,
+        EndpointRecoveryConfigProvider, EndpointRecoveryRequeuePlan, EndpointRecoveryRequeueState,
+        HookWorkerState, build_drawer_records, compile_classifier_from_embedder,
+        llm_worker_claim_enabled, poll_claim_next, process_claimed_message_with_embedder,
+        run_hook_worker, wing_from_cwd,
     };
 
     struct StubClaimSource {
@@ -2005,6 +2168,222 @@ mod tests {
                 responses: Mutex::new(VecDeque::from(responses)),
             }
         }
+    }
+
+    fn endpoint_health_snapshot(
+        embedding_reachable: bool,
+        llm_generation_reachable: bool,
+    ) -> EndpointHealthSnapshot {
+        let embedding = ProbeStatus {
+            reachable: embedding_reachable,
+            latency_ms: None,
+            detail: "test embedding".to_string(),
+        };
+        let llm_generation = ProbeStatus {
+            reachable: llm_generation_reachable,
+            latency_ms: None,
+            detail: "test generation".to_string(),
+        };
+        EndpointHealthSnapshot {
+            embedding,
+            llm: llm_generation.clone(),
+            llm_control_plane: ProbeStatus {
+                reachable: llm_generation_reachable,
+                latency_ms: None,
+                detail: "test control plane".to_string(),
+            },
+            llm_generation,
+        }
+    }
+
+    #[test]
+    fn test_endpoint_recovery_probe_config_uses_current_provider_value() {
+        let mut old_config = crate::core::config::Config::default();
+        old_config.llm.model = Some("old-model".to_string());
+        let mut new_config = crate::core::config::Config::default();
+        new_config.llm.model = Some("new-model".to_string());
+
+        let current = Arc::new(ArcSwap::from_pointee(old_config));
+        let provider_current = Arc::clone(&current);
+        let provider: EndpointRecoveryConfigProvider =
+            Arc::new(move || provider_current.load_full());
+
+        assert_eq!(
+            super::endpoint_recovery_probe_config(&provider)
+                .llm
+                .model
+                .as_deref(),
+            Some("old-model")
+        );
+        current.store(Arc::new(new_config));
+        assert_eq!(
+            super::endpoint_recovery_probe_config(&provider)
+                .llm
+                .model
+                .as_deref(),
+            Some("new-model")
+        );
+    }
+
+    #[test]
+    fn test_endpoint_recovery_requeue_state_triggers_only_on_reachable_edges() {
+        let mut state = EndpointRecoveryRequeueState::default();
+
+        let down = endpoint_health_snapshot(false, false);
+        assert_eq!(
+            state.plan(&down),
+            EndpointRecoveryRequeuePlan {
+                embedding: false,
+                llm: false,
+            }
+        );
+        state.commit_successes(&down, EndpointRecoveryRequeuePlan::default());
+
+        let embedding_up = endpoint_health_snapshot(true, false);
+        let embedding_plan = EndpointRecoveryRequeuePlan {
+            embedding: true,
+            llm: false,
+        };
+        assert_eq!(state.plan(&embedding_up), embedding_plan);
+        state.commit_successes(&embedding_up, embedding_plan);
+        assert_eq!(
+            state.plan(&embedding_up),
+            EndpointRecoveryRequeuePlan {
+                embedding: false,
+                llm: false,
+            }
+        );
+
+        state.commit_successes(&down, EndpointRecoveryRequeuePlan::default());
+        let llm_up = endpoint_health_snapshot(false, true);
+        assert_eq!(
+            state.plan(&llm_up),
+            EndpointRecoveryRequeuePlan {
+                embedding: false,
+                llm: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_endpoint_recovery_requeue_state_commits_edges_only_after_success() {
+        let health = endpoint_health_snapshot(true, true);
+        let mut state = EndpointRecoveryRequeueState::default();
+
+        let first_plan = state.plan(&health);
+        assert_eq!(
+            first_plan,
+            EndpointRecoveryRequeuePlan {
+                embedding: true,
+                llm: true,
+            }
+        );
+        assert_eq!(state.plan(&health), first_plan);
+
+        state.commit_successes(
+            &health,
+            EndpointRecoveryRequeuePlan {
+                embedding: true,
+                llm: false,
+            },
+        );
+        assert_eq!(
+            state.plan(&health),
+            EndpointRecoveryRequeuePlan {
+                embedding: false,
+                llm: true,
+            }
+        );
+
+        state.commit_successes(
+            &health,
+            EndpointRecoveryRequeuePlan {
+                embedding: false,
+                llm: true,
+            },
+        );
+        assert!(state.plan(&health).is_empty());
+
+        let down = endpoint_health_snapshot(false, false);
+        state.commit_successes(&down, EndpointRecoveryRequeuePlan::default());
+        assert_eq!(state.plan(&health), first_plan);
+    }
+
+    #[tokio::test]
+    async fn test_endpoint_recovery_requeues_only_retryable_failed_model_tasks() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let sync_store = PendingMessageStore::new_without_reclaim(&db_path);
+        let async_store = AsyncPendingMessageStore::new_without_reclaim(&db_path);
+
+        let retryable_embedding_id = sync_store
+            .enqueue("hook_event", r#"{"n":1}"#)
+            .expect("enqueue retryable embedding");
+        let terminal_embedding_id = sync_store
+            .enqueue("hook_event", r#"{"n":2}"#)
+            .expect("enqueue terminal embedding");
+        let retryable_llm_id = sync_store
+            .enqueue("llm_task", r#"{"task_type":"gating","drawer_id":"d1"}"#)
+            .expect("enqueue retryable llm");
+
+        sync_store
+            .mark_model_task_failed_retryable(&retryable_embedding_id, "timeout")
+            .expect("mark retryable embedding failed");
+        let terminal_claim = sync_store
+            .claim_next("terminal-worker", 60)
+            .expect("claim terminal embedding")
+            .expect("terminal embedding row");
+        assert_eq!(terminal_claim.id, terminal_embedding_id);
+        sync_store
+            .mark_failed_with_disposition(
+                &terminal_claim,
+                "invalid payload",
+                QueueFailureDisposition::Terminal,
+            )
+            .expect("mark terminal embedding failed");
+        sync_store
+            .mark_model_task_failed_retryable(&retryable_llm_id, "429 Too Many Requests")
+            .expect("mark retryable llm failed");
+
+        let mut state = EndpointRecoveryRequeueState::default();
+        let plan = super::requeue_failed_model_tasks_after_recovery(
+            &async_store,
+            &mut state,
+            &endpoint_health_snapshot(true, true),
+        )
+        .await
+        .expect("requeue after recovery");
+        assert_eq!(
+            plan,
+            EndpointRecoveryRequeuePlan {
+                embedding: true,
+                llm: true,
+            }
+        );
+
+        let stats = sync_store.stats().expect("queue stats");
+        assert_eq!(stats.pending, 2);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.failed_retryable, 0);
+        assert_eq!(stats.failed_terminal, 1);
+        assert_eq!(stats.failed_retryable_embed, 0);
+        assert_eq!(stats.failed_retryable_llm, 0);
+        assert!(stats.last_auto_requeue_at_unix_ms.is_some());
+
+        let repeated_plan = super::requeue_failed_model_tasks_after_recovery(
+            &async_store,
+            &mut state,
+            &endpoint_health_snapshot(true, true),
+        )
+        .await
+        .expect("second recovery check");
+        assert!(repeated_plan.is_empty());
+        let terminal_status = sync_store
+            .operation_status(&terminal_embedding_id)
+            .expect("terminal status")
+            .expect("terminal record");
+        assert_eq!(terminal_status.op_state, "failed");
     }
 
     #[test]

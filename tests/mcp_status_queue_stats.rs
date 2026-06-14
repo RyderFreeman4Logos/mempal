@@ -289,6 +289,11 @@ async fn test_mcp_status_surfaces_queue_stats() {
     assert_eq!(response.queue_stats.pending, 1);
     assert_eq!(response.queue_stats.claimed, 0);
     assert_eq!(response.queue_stats.failed, 0);
+    assert_eq!(response.queue_stats.failed_retryable, 0);
+    assert_eq!(response.queue_stats.failed_terminal, 0);
+    assert_eq!(response.queue_stats.failed_retryable_embed, 0);
+    assert_eq!(response.queue_stats.failed_retryable_llm, 0);
+    assert_eq!(response.queue_stats.last_auto_requeue_at_unix_ms, None);
     assert!((response.queue_stats.rate_per_min - 0.1).abs() < f64::EPSILON);
     assert!(response.queue_stats.avg_processing_ms.is_some());
     assert_eq!(response.queue_stats.eta_secs, Some(600));
@@ -308,7 +313,13 @@ async fn test_mcp_status_headline_reflects_failed_queue() {
     )
     .expect("create store");
 
-    store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
+    let retryable = store
+        .enqueue("hook_event", r#"{"n":1}"#)
+        .expect("enqueue retryable");
+    store.enqueue("hook_event", r#"{"n":2}"#).expect("enqueue");
+    store
+        .mark_model_task_failed_retryable(&retryable, "temporary embed outage")
+        .expect("mark retryable model failed");
     let failed = store
         .claim_next("worker-failed", 60)
         .expect("claim")
@@ -320,13 +331,19 @@ async fn test_mcp_status_headline_reflects_failed_queue() {
     let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
     let response = server.mempal_status().await.expect("status").0;
 
-    assert_eq!(response.queue_stats.failed, 1);
-    assert_eq!(response.embed_status.failed_count, 1);
-    assert_eq!(response.embed_status.fail_count, 1);
-    assert_eq!(response.embed_status.failure_count, 1);
+    assert_eq!(response.queue_stats.failed, 2);
+    assert_eq!(response.queue_stats.failed_retryable, 1);
+    assert_eq!(response.queue_stats.failed_terminal, 1);
+    assert_eq!(response.queue_stats.failed_retryable_embed, 1);
+    assert_eq!(response.queue_stats.failed_retryable_llm, 0);
+    assert_eq!(response.embed_status.failed_count, 2);
+    assert_eq!(response.embed_status.fail_count, 2);
+    assert_eq!(response.embed_status.failure_count, 2);
     assert!(
         response.system_warnings.iter().any(|warning| {
-            warning.source == "queue" && warning.message.contains("mempal reindex --failed")
+            warning.source == "queue"
+                && warning.message.contains("retryable_model=1")
+                && warning.message.contains("terminal=1")
         }),
         "{:?}",
         response.system_warnings

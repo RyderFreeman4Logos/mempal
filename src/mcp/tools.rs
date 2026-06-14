@@ -2150,6 +2150,12 @@ pub struct QueueStatsDto {
     pub pending: u64,
     pub claimed: u64,
     pub failed: u64,
+    pub failed_retryable: u64,
+    pub failed_terminal: u64,
+    pub failed_retryable_embed: u64,
+    pub failed_retryable_llm: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_auto_requeue_at_unix_ms: Option<u64>,
     pub rate_per_min: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_pending_age_secs: Option<u64>,
