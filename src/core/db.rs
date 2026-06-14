@@ -204,7 +204,9 @@ pub enum DbError {
     InvalidTunnel(String),
     #[error("failed to register sqlite-vec auto extension: {0}")]
     RegisterVec(String),
-    #[error("database schema version {current} is newer than supported version {supported}")]
+    #[error(
+        "database schema version {current} is newer than supported version {supported}; update the mempal binary that opens this database (for example, run `cargo install mempal` or reinstall from this source checkout). If this error comes from an MCP server, check the MCP client configuration and ensure its command/path points at the updated mempal binary."
+    )]
     UnsupportedSchemaVersion { current: u32, supported: u32 },
     #[error("supersedes and replace_text are mutually exclusive")]
     ReplacementTargetConflict,
@@ -6940,6 +6942,30 @@ mod tests {
     fn insert_test_drawer(db: &Database, id: &str, content: &str, project_id: Option<&str>) {
         db.insert_drawer_with_project(&test_drawer(id, content), project_id)
             .expect("insert drawer");
+    }
+
+    #[test]
+    fn unsupported_schema_version_error_guides_binary_update_and_mcp_config() {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {};",
+            CURRENT_SCHEMA_VERSION + 1
+        ))
+        .expect("set future schema version");
+
+        let err = apply_migrations(&conn).expect_err("future schema should be unsupported");
+        let message = err.to_string();
+
+        assert!(message.contains(&format!(
+            "database schema version {} is newer than supported version {}",
+            CURRENT_SCHEMA_VERSION + 1,
+            CURRENT_SCHEMA_VERSION
+        )));
+        assert!(message.contains("update the mempal binary"));
+        assert!(message.contains("cargo install mempal"));
+        assert!(message.contains("MCP server"));
+        assert!(message.contains("MCP client configuration"));
+        assert!(message.contains("command/path"));
     }
 
     #[test]
