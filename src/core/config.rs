@@ -27,6 +27,7 @@ const DEFAULT_EMBED_MAX_CONCURRENT: usize = 16;
 const DEFAULT_EMBED_ENDPOINT_PRIORITY: i32 = 0;
 const DEFAULT_LLM_BACKEND: &str = "openai_compat";
 const DEFAULT_LLM_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_LLM_HEALTH_PROBE_TIMEOUT_SECS: u64 = 3;
 const DEFAULT_LLM_RETRY_INTERVAL_SECS: u64 = 2;
 const DEFAULT_LLM_MAX_CONCURRENT: usize = 16;
 const DEFAULT_LLM_ENDPOINT_PRIORITY: i32 = 0;
@@ -1557,6 +1558,7 @@ pub struct LlmConfig {
     pub endpoints: Vec<LlmEndpointConfig>,
     #[serde(alias = "timeout_secs")]
     pub request_timeout_secs: u64,
+    pub health_probe_timeout_secs: u64,
     pub retry_interval_secs: u64,
     pub max_concurrent: usize,
     pub enabled_for: Vec<String>,
@@ -1574,6 +1576,7 @@ impl Default for LlmConfig {
             extra_body: None,
             endpoints: Vec::new(),
             request_timeout_secs: DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
+            health_probe_timeout_secs: DEFAULT_LLM_HEALTH_PROBE_TIMEOUT_SECS,
             retry_interval_secs: DEFAULT_LLM_RETRY_INTERVAL_SECS,
             max_concurrent: DEFAULT_LLM_MAX_CONCURRENT,
             enabled_for: vec!["gating".to_string()],
@@ -1595,6 +1598,7 @@ pub struct LlmEndpointConfig {
     pub priority: Option<i32>,
     #[serde(alias = "timeout_secs")]
     pub request_timeout_secs: Option<u64>,
+    pub health_probe_timeout_secs: Option<u64>,
     pub retry_interval_secs: Option<u64>,
     pub max_concurrent: Option<usize>,
 }
@@ -1609,6 +1613,7 @@ pub struct EffectiveLlmEndpoint {
     pub extra_body: Option<serde_json::Value>,
     pub priority: i32,
     pub request_timeout_secs: u64,
+    pub health_probe_timeout_secs: u64,
     pub retry_interval_secs: u64,
     pub max_concurrent: usize,
 }
@@ -1662,6 +1667,10 @@ impl LlmConfig {
                     request_timeout_secs: endpoint
                         .request_timeout_secs
                         .unwrap_or(self.request_timeout_secs),
+                    health_probe_timeout_secs: endpoint
+                        .health_probe_timeout_secs
+                        .unwrap_or(self.health_probe_timeout_secs)
+                        .max(1),
                     retry_interval_secs: endpoint
                         .retry_interval_secs
                         .unwrap_or(self.retry_interval_secs)
@@ -1760,6 +1769,7 @@ impl LlmConfig {
             extra_body: self.extra_body.clone(),
             priority: DEFAULT_LLM_ENDPOINT_PRIORITY,
             request_timeout_secs: self.request_timeout_secs,
+            health_probe_timeout_secs: self.health_probe_timeout_secs.max(1),
             retry_interval_secs: self.retry_interval_secs.max(1),
             max_concurrent: self.max_concurrent.max(1),
         }))

@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use serde_json::Value;
 use tokio::time::timeout;
 
 use crate::core::config::{Config, EffectiveEmbedEndpoint, EffectiveLlmEndpoint};
@@ -11,7 +12,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointHealthSnapshot {
     pub embedding: ProbeStatus,
+    /// Backward-compatible alias for LLM generation health.
     pub llm: ProbeStatus,
+    /// Shallow control-plane probe (`/models`) for LLM endpoints.
+    pub llm_control_plane: ProbeStatus,
+    /// Deep generation probe (`/chat/completions`) for LLM endpoints.
+    pub llm_generation: ProbeStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,8 +57,14 @@ impl ProbeStatus {
 }
 
 pub async fn probe_endpoints(config: &Config) -> EndpointHealthSnapshot {
-    let (embedding, llm) = tokio::join!(probe_embedding(config), probe_llm(config));
-    EndpointHealthSnapshot { embedding, llm }
+    let (embedding, (llm_control_plane, llm_generation)) =
+        tokio::join!(probe_embedding(config), probe_llm(config));
+    EndpointHealthSnapshot {
+        embedding,
+        llm: llm_generation.clone(),
+        llm_control_plane,
+        llm_generation,
+    }
 }
 
 pub fn probe_endpoints_blocking(config: &Config) -> Result<EndpointHealthSnapshot> {
@@ -93,7 +105,7 @@ async fn probe_embedding_endpoints(endpoints: &[EffectiveEmbedEndpoint]) -> Prob
     ProbeStatus::unreachable(failures.join("; "))
 }
 
-async fn probe_llm(config: &Config) -> ProbeStatus {
+async fn probe_llm(config: &Config) -> (ProbeStatus, ProbeStatus) {
     let effective_llm = if config.memory_intelligence.mode.uses_llm()
         && config
             .memory_intelligence
@@ -104,17 +116,32 @@ async fn probe_llm(config: &Config) -> ProbeStatus {
         config.llm.clone()
     };
     if !effective_llm.enabled {
-        return ProbeStatus::unreachable("disabled".to_string());
+        let disabled = ProbeStatus::unreachable("disabled".to_string());
+        return (disabled.clone(), disabled);
     }
     let endpoints = match effective_llm.effective_endpoints() {
         Ok(endpoints) if !endpoints.is_empty() => endpoints,
-        Ok(_) => return ProbeStatus::unreachable("missing base_url".to_string()),
-        Err(error) => return ProbeStatus::unreachable(error.to_string()),
+        Ok(_) => {
+            let missing = ProbeStatus::unreachable("missing base_url".to_string());
+            return (missing.clone(), missing);
+        }
+        Err(error) => {
+            let failure = ProbeStatus::unreachable(error.to_string());
+            return (failure.clone(), failure);
+        }
     };
     probe_llm_endpoints(&endpoints).await
 }
 
-async fn probe_llm_endpoints(endpoints: &[EffectiveLlmEndpoint]) -> ProbeStatus {
+async fn probe_llm_endpoints(endpoints: &[EffectiveLlmEndpoint]) -> (ProbeStatus, ProbeStatus) {
+    let (control_plane, generation) = tokio::join!(
+        probe_llm_control_plane_endpoints(endpoints),
+        probe_llm_generation_endpoints(endpoints)
+    );
+    (control_plane, generation)
+}
+
+async fn probe_llm_control_plane_endpoints(endpoints: &[EffectiveLlmEndpoint]) -> ProbeStatus {
     let mut failures = Vec::new();
     for endpoint in endpoints {
         let status = probe_models_endpoint(
@@ -134,6 +161,21 @@ async fn probe_llm_endpoints(endpoints: &[EffectiveLlmEndpoint]) -> ProbeStatus 
     ProbeStatus::unreachable(failures.join("; "))
 }
 
+async fn probe_llm_generation_endpoints(endpoints: &[EffectiveLlmEndpoint]) -> ProbeStatus {
+    let mut failures = Vec::new();
+    for endpoint in endpoints {
+        let status = probe_chat_completion_endpoint(endpoint).await;
+        if status.reachable {
+            return ProbeStatus::reachable(
+                status.latency_ms,
+                format!("generation probe via {}", endpoint.id),
+            );
+        }
+        failures.push(format!("{}: {}", endpoint.id, status.detail));
+    }
+    ProbeStatus::unreachable(failures.join("; "))
+}
+
 async fn probe_models_endpoint(
     base_url: &str,
     api_key_env: Option<&str>,
@@ -141,7 +183,7 @@ async fn probe_models_endpoint(
 ) -> ProbeStatus {
     let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
     match timeout(PROBE_TIMEOUT, async {
-        let client = build_http_client(api_key_env, direct_api_key)?;
+        let client = build_http_client(api_key_env, direct_api_key, PROBE_TIMEOUT)?;
         let started = Instant::now();
         let response = client
             .get(&endpoint)
@@ -163,9 +205,76 @@ async fn probe_models_endpoint(
     }
 }
 
+async fn probe_chat_completion_endpoint(endpoint: &EffectiveLlmEndpoint) -> ProbeStatus {
+    let probe_timeout = Duration::from_secs(endpoint.health_probe_timeout_secs.max(1));
+    let request = match build_chat_probe_body(endpoint) {
+        Ok(request) => request,
+        Err(error) => return ProbeStatus::unreachable(format!("{error:#}")),
+    };
+    let url = format!(
+        "{}/chat/completions",
+        endpoint.base_url.trim_end_matches('/')
+    );
+    match timeout(probe_timeout, async {
+        let client = build_http_client(
+            endpoint.api_key_env.as_deref(),
+            endpoint.api_key.as_deref(),
+            probe_timeout,
+        )?;
+        let started = Instant::now();
+        let response = client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .with_context(|| format!("request failed for {url}"))?;
+        response
+            .error_for_status_ref()
+            .with_context(|| format!("generation probe returned {}", response.status()))?;
+        Ok::<u64, anyhow::Error>(started.elapsed().as_millis() as u64)
+    })
+    .await
+    {
+        Ok(Ok(latency_ms)) => {
+            ProbeStatus::reachable(Some(latency_ms), "generation probe".to_string())
+        }
+        Ok(Err(error)) => ProbeStatus::unreachable(format!("{error:#}")),
+        Err(_) => {
+            ProbeStatus::unreachable(format!("timeout after {}ms", probe_timeout.as_millis()))
+        }
+    }
+}
+
+fn build_chat_probe_body(endpoint: &EffectiveLlmEndpoint) -> Result<Value> {
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), Value::String(endpoint.model.clone()));
+    body.insert(
+        "messages".to_string(),
+        serde_json::json!([{ "role": "user", "content": "ping" }]),
+    );
+    body.insert("temperature".to_string(), serde_json::json!(0.0));
+    body.insert("max_tokens".to_string(), serde_json::json!(1));
+    if let Some(extra_body) = endpoint.extra_body.as_ref() {
+        let Value::Object(extra) = extra_body else {
+            anyhow::bail!("llm.extra_body must be a JSON object");
+        };
+        for (key, value) in extra {
+            if matches!(
+                key.as_str(),
+                "model" | "messages" | "temperature" | "max_tokens"
+            ) {
+                continue;
+            }
+            body.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(Value::Object(body))
+}
+
 fn build_http_client(
     api_key_env: Option<&str>,
     direct_api_key: Option<&str>,
+    request_timeout: Duration,
 ) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
     if let Some(api_key) = resolve_api_key(api_key_env, direct_api_key)? {
@@ -175,7 +284,7 @@ fn build_http_client(
     }
     reqwest::Client::builder()
         .default_headers(headers)
-        .timeout(PROBE_TIMEOUT)
+        .timeout(request_timeout)
         .build()
         .context("failed to build health probe client")
 }

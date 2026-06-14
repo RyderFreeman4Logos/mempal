@@ -2362,6 +2362,12 @@ impl MempalMcpServer {
                 embedding_latency_ms: endpoint_health.embedding.latency_ms,
                 llm_reachable: endpoint_health.llm.reachable,
                 llm_latency_ms: endpoint_health.llm.latency_ms,
+                llm_control_plane_reachable: endpoint_health.llm_control_plane.reachable,
+                llm_control_plane_latency_ms: endpoint_health.llm_control_plane.latency_ms,
+                llm_control_plane_detail: endpoint_health.llm_control_plane.detail.clone(),
+                llm_generation_reachable: endpoint_health.llm_generation.reachable,
+                llm_generation_latency_ms: endpoint_health.llm_generation.latency_ms,
+                llm_generation_detail: endpoint_health.llm_generation.detail.clone(),
             },
             embed_status: EmbedStatusDto {
                 backend: config.embed.backend.clone(),
@@ -7736,8 +7742,8 @@ fn push_model_backend_warnings(
     {
         system_warnings.push(SystemWarning {
             level: "error".to_string(),
-            message: "LLM memory judge is configured but no judge endpoint is reachable; memory quality gating is unavailable until an endpoint recovers.".to_string(),
-            source: "llm".to_string(),
+            message: "LLM memory judge is configured but no chat-completion endpoint is reachable; memory quality gating is unavailable until generation recovers.".to_string(),
+            source: "llm_generation".to_string(),
         });
     }
     if queue_stats.pending > 0 && !endpoint_health.embedding.reachable {

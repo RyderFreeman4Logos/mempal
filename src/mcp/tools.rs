@@ -1975,9 +1975,18 @@ pub struct EndpointHealthDto {
     pub embedding_reachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_latency_ms: Option<u64>,
+    /// Backward-compatible alias for LLM generation health.
     pub llm_reachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_latency_ms: Option<u64>,
+    pub llm_control_plane_reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_control_plane_latency_ms: Option<u64>,
+    pub llm_control_plane_detail: String,
+    pub llm_generation_reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_generation_latency_ms: Option<u64>,
+    pub llm_generation_detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]

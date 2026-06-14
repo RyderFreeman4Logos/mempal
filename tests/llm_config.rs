@@ -7,6 +7,7 @@ fn test_llm_config_default_disabled() {
     assert!(!config.enabled);
     assert_eq!(config.backend, "openai_compat");
     assert_eq!(config.request_timeout_secs, 30);
+    assert_eq!(config.health_probe_timeout_secs, 3);
     assert_eq!(config.retry_interval_secs, 2);
     assert_eq!(config.max_concurrent, 16);
     assert_eq!(config.enabled_for, vec!["gating".to_string()]);
@@ -30,6 +31,7 @@ base_url = "http://localhost:8317/v1"
 model = "qwen35-35b-a3b"
 api_key_env = "LOCAL_ROUTER_API_KEY"
 request_timeout_secs = 45
+health_probe_timeout_secs = 5
 retry_interval_secs = 3
 max_concurrent = 8
 enabled_for = ["gating", "distill", "compress"]
@@ -49,6 +51,7 @@ enabled_for = ["gating", "distill", "compress"]
         Some("LOCAL_ROUTER_API_KEY")
     );
     assert_eq!(config.llm.request_timeout_secs, 45);
+    assert_eq!(config.llm.health_probe_timeout_secs, 5);
     assert_eq!(config.llm.retry_interval_secs, 3);
     assert_eq!(config.llm.max_concurrent, 8);
     assert_eq!(
@@ -71,6 +74,7 @@ base_url = "http://localhost:8317/v1"
 model = "qwen35-35b-a3b"
 api_key_env = "LOCAL_ROUTER_API_KEY"
 request_timeout_secs = 45
+health_probe_timeout_secs = 6
 max_concurrent = 8
 "#,
     )
@@ -90,6 +94,7 @@ max_concurrent = 8
         Some("LOCAL_ROUTER_API_KEY")
     );
     assert_eq!(endpoints[0].request_timeout_secs, 45);
+    assert_eq!(endpoints[0].health_probe_timeout_secs, 6);
     assert_eq!(endpoints[0].max_concurrent, 8);
 }
 
@@ -111,6 +116,7 @@ base_url = "http://backup.local:8317/v1"
 model = "backup-model"
 priority = 20
 request_timeout_secs = 12
+health_probe_timeout_secs = 4
 retry_interval_secs = 4
 max_concurrent = 3
 "#,
@@ -128,11 +134,13 @@ max_concurrent = 3
     assert_eq!(endpoints[0].model, "primary-model");
     assert_eq!(endpoints[0].priority, 10);
     assert_eq!(endpoints[0].request_timeout_secs, 30);
+    assert_eq!(endpoints[0].health_probe_timeout_secs, 3);
     assert_eq!(endpoints[0].retry_interval_secs, 2);
     assert_eq!(endpoints[0].max_concurrent, 16);
     assert_eq!(endpoints[1].id, "lan.backup-1");
     assert_eq!(endpoints[1].priority, 20);
     assert_eq!(endpoints[1].request_timeout_secs, 12);
+    assert_eq!(endpoints[1].health_probe_timeout_secs, 4);
     assert_eq!(endpoints[1].retry_interval_secs, 4);
     assert_eq!(endpoints[1].max_concurrent, 3);
     assert_eq!(config.llm.pool_capacity(), 19);

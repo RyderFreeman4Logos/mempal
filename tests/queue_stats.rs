@@ -125,7 +125,7 @@ fn test_status_command_shows_endpoint_health() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let handle = thread::spawn(move || {
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (mut stream, _) = listener.accept().expect("accept");
             let mut buf = [0_u8; 1024];
             let _ = stream.read(&mut buf);
@@ -140,6 +140,7 @@ fn test_status_command_shows_endpoint_health() {
     let (home, _db_path) = setup_home_with_status_endpoints(&format!("http://{addr}/v1"));
     let output = Command::new(mempal_bin())
         .arg("status")
+        .arg("--full")
         .env("HOME", home.path())
         .output()
         .expect("run mempal status");
@@ -148,7 +149,11 @@ fn test_status_command_shows_endpoint_health() {
     let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
     assert!(stdout.contains("Endpoints:"), "{stdout}");
     assert!(stdout.contains("embedding: reachable ("), "{stdout}");
-    assert!(stdout.contains("llm: reachable ("), "{stdout}");
+    assert!(
+        stdout.contains("llm_control_plane: reachable ("),
+        "{stdout}"
+    );
+    assert!(stdout.contains("llm_generation: reachable ("), "{stdout}");
 
     handle.join().expect("server join");
 }
