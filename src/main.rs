@@ -9923,6 +9923,10 @@ fn config_intelligence_command(config: &Config) -> Result<()> {
     }
     println!("  timeout_secs: {}", effective_llm.request_timeout_secs);
     println!(
+        "  health_probe_timeout_secs: {}",
+        effective_llm.health_probe_timeout_secs
+    );
+    println!(
         "  extra_body: {}",
         if effective_llm.extra_body.is_some() {
             "configured"
@@ -10232,7 +10236,11 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         Some(health) => {
             println!("Endpoints:");
             println!("  embedding: {}", health.embedding.display());
-            println!("  llm: {}", health.llm.display());
+            println!(
+                "  llm_control_plane: {}",
+                health.llm_control_plane.display()
+            );
+            println!("  llm_generation: {}", health.llm_generation.display());
             push_model_backend_runtime_warnings(
                 &mut runtime_warnings,
                 config,
@@ -10474,8 +10482,8 @@ fn push_model_backend_runtime_warnings(
     {
         warnings.push(mempal::core::config::RuntimeWarning {
             level: "error",
-            source: "llm",
-            message: "LLM memory judge is configured but no judge endpoint is reachable; memory quality gating is unavailable until an endpoint recovers.".to_string(),
+            source: "llm_generation",
+            message: "LLM memory judge is configured but no chat-completion endpoint is reachable; memory quality gating is unavailable until generation recovers.".to_string(),
         });
     }
     if queue_stats.pending > 0 && !endpoint_health.embedding.reachable {

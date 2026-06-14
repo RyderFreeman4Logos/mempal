@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
 #[cfg(feature = "integration")]
-use axum::{Json, Router, routing::get};
+use axum::{
+    Json, Router,
+    routing::{get, post},
+};
 #[cfg(feature = "integration")]
 use common::harness::McpStdio;
 use mempal::core::compaction::merge_cluster;
@@ -134,7 +137,10 @@ enabled = true
     assert_eq!(response.llm_status.max_concurrent, 5);
     assert!(
         response.system_warnings.iter().any(|warning| {
-            warning.source == "llm" && warning.message.contains("no judge endpoint is reachable")
+            warning.source == "llm_generation"
+                && warning
+                    .message
+                    .contains("no chat-completion endpoint is reachable")
         }),
         "{:?}",
         response.system_warnings
@@ -203,10 +209,21 @@ retry_interval_secs = 5
 
 #[cfg(feature = "integration")]
 async fn spawn_models_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let app = Router::new().route(
-        "/v1/models",
-        get(|| async { Json(json!({ "object": "list", "data": [] })) }),
-    );
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({ "object": "list", "data": [] })) }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(json!({
+                    "id": "health-probe",
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                }))
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -467,6 +484,30 @@ async fn test_mcp_status_surfaces_endpoint_health() {
         response["endpoint_health"]["llm_latency_ms"]
             .as_u64()
             .is_some(),
+        "{response:#?}"
+    );
+    assert!(
+        response["endpoint_health"]["llm_control_plane_reachable"]
+            .as_bool()
+            .expect("llm_control_plane_reachable bool"),
+        "{response:#?}"
+    );
+    assert!(
+        response["endpoint_health"]["llm_generation_reachable"]
+            .as_bool()
+            .expect("llm_generation_reachable bool"),
+        "{response:#?}"
+    );
+    assert!(
+        response["endpoint_health"]["llm_control_plane_detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()),
+        "{response:#?}"
+    );
+    assert!(
+        response["endpoint_health"]["llm_generation_detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()),
         "{response:#?}"
     );
 
