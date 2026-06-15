@@ -689,7 +689,9 @@ fn unhealthy_rest_route_detail(route: &RestRouteReport) -> Option<String> {
 
 fn route_probe_url(endpoint: &str, path: &str) -> String {
     match path {
-        "/api/search" => format!("{endpoint}{path}?q=mempal-doctor-rest&top_k=1"),
+        "/api/search" => format!(
+            "{endpoint}{path}?q=mempal-doctor-rest&wing=hermes-user%2Fhermes-user%2Fdefault&include_raw_turns=false&top_k=0"
+        ),
         "/api/timeline" | "/api/pinned_facts" => format!("{endpoint}{path}?limit=1"),
         _ => format!("{endpoint}{path}"),
     }
