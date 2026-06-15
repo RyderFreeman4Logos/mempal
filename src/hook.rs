@@ -1,6 +1,5 @@
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::core::{
@@ -301,7 +300,7 @@ struct CapturedPayload {
     truncated: bool,
 }
 
-fn capture_stdin_payload(bytes: Vec<u8>, mempal_home: &Path) -> Result<CapturedPayload> {
+fn capture_stdin_payload(bytes: Vec<u8>, _mempal_home: &Path) -> Result<CapturedPayload> {
     let original_size_bytes = bytes.len();
     if original_size_bytes <= MAX_INLINE_PAYLOAD_BYTES {
         return Ok(CapturedPayload {
@@ -313,25 +312,9 @@ fn capture_stdin_payload(bytes: Vec<u8>, mempal_home: &Path) -> Result<CapturedP
         });
     }
 
-    let oversize_dir = mempal_home.join("hook-oversize");
-    fs::create_dir_all(&oversize_dir)
-        .with_context(|| format!("failed to create {}", oversize_dir.display()))?;
-
-    let digest = blake3::hash(&bytes).to_hex().to_string();
-    let final_path = oversize_dir.join(format!("{digest}.json"));
-    let tmp_path = oversize_dir.join(format!("{digest}.tmp"));
-    let mut file = File::create(&tmp_path)
-        .with_context(|| format!("failed to create {}", tmp_path.display()))?;
-    file.write_all(&bytes)
-        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    file.flush()
-        .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
-    fs::rename(&tmp_path, &final_path)
-        .with_context(|| format!("failed to finalize {}", final_path.display()))?;
-
     Ok(CapturedPayload {
         inline_payload: None,
-        payload_path: Some(final_path),
+        payload_path: None,
         preview: Some(safe_preview(&bytes)),
         original_size_bytes,
         truncated: true,
@@ -444,5 +427,28 @@ impl HookEvent {
             HookEvent::SessionStart => "SessionStart",
             HookEvent::SessionEnd => "SessionEnd",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_oversize_capture_keeps_preview_without_raw_payload_file() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let bytes = vec![b'x'; MAX_INLINE_PAYLOAD_BYTES + 1];
+
+        let captured = capture_stdin_payload(bytes, tmp.path()).expect("capture oversize payload");
+
+        assert!(captured.inline_payload.is_none());
+        assert!(captured.payload_path.is_none());
+        assert!(captured.preview.is_some());
+        assert_eq!(captured.original_size_bytes, MAX_INLINE_PAYLOAD_BYTES + 1);
+        assert!(captured.truncated);
+        assert!(
+            !tmp.path().join("hook-oversize").exists(),
+            "automatic hook capture must not persist oversized raw payload before LLM gate"
+        );
     }
 }

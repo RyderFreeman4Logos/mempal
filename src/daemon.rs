@@ -210,12 +210,16 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         ENDPOINT_RECOVERY_REQUEUE_INTERVAL,
     );
 
-    let llm_worker_handles: Vec<tokio::task::JoinHandle<_>> = if context.config.llm.enabled {
-        let llm_client_runtime = crate::llm::worker::LlmClientRuntime::new(&context.config.llm);
+    let llm_gate = context
+        .config
+        .llm
+        .enabled
+        .then(|| HookLlmGateRuntime::new(&context.config.llm));
+    let llm_worker_handles: Vec<tokio::task::JoinHandle<_>> = if let Some(llm_gate) = &llm_gate {
         let num_workers = context.config.llm.pool_capacity();
-        let llm_status = Arc::new(crate::llm::LlmStatus::new(10));
         let llm_store = Arc::new(context.store.clone());
-        let llm_client_runtime = Arc::new(Mutex::new(llm_client_runtime));
+        let llm_client_runtime = llm_gate.client_runtime.clone();
+        let llm_status = llm_gate.status.clone();
         let async_db = context.async_db.clone();
         let write_observer = context.write_observer.clone();
         tracing::info!("spawning {num_workers} LLM worker tasks");
@@ -252,6 +256,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         worker_id: worker_id.clone(),
         embedder: Arc::clone(&embedder),
         prototype_classifier: Arc::clone(&prototype_classifier),
+        llm_gate,
         config: Arc::clone(&context.config),
         mempal_home: context.mempal_home.clone(),
         write_observer: context.write_observer.clone(),
@@ -336,9 +341,57 @@ struct HookWorkerState {
     worker_id: String,
     embedder: Arc<DaemonEmbedder>,
     prototype_classifier: Arc<ArcSwap<Option<PrototypeClassifier>>>,
+    llm_gate: Option<HookLlmGateRuntime>,
     config: Arc<crate::core::config::Config>,
     mempal_home: PathBuf,
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+}
+
+#[derive(Clone)]
+pub struct HookLlmGateRuntime {
+    client_runtime: crate::llm::worker::SharedLlmClientRuntime,
+    status: Arc<crate::llm::LlmStatus>,
+}
+
+impl HookLlmGateRuntime {
+    pub fn new(config: &crate::core::config::LlmConfig) -> Self {
+        Self {
+            client_runtime: Arc::new(Mutex::new(crate::llm::worker::LlmClientRuntime::new(
+                config,
+            ))),
+            status: Arc::new(crate::llm::LlmStatus::new(10)),
+        }
+    }
+
+    async fn judge(
+        &self,
+        config: &crate::core::config::Config,
+        task: &crate::llm::LlmTaskPayload,
+        heartbeat: Option<&crate::llm::retry::HeartbeatCallback>,
+    ) -> Result<crate::llm::worker::GatingJudgeOutcome> {
+        if !crate::ingest::gating::llm_judge_active(config) {
+            anyhow::bail!(
+                "LLM gating is required for automatic hook writes but the LLM judge is not active"
+            );
+        }
+        let router = {
+            let mut runtime = self
+                .client_runtime
+                .lock()
+                .expect("LLM client runtime mutex poisoned");
+            runtime
+                .router_for_config(&config.llm)
+                .context("LLM gating router unavailable")?
+        };
+        crate::llm::worker::request_strict_effective_gating_verdict(
+            &router,
+            &self.status,
+            task,
+            config,
+            heartbeat,
+        )
+        .await
+    }
 }
 
 fn spawn_hook_workers_until_limit(
@@ -417,6 +470,7 @@ async fn process_hook_worker_message(
         state.embedder.as_ref(),
         DaemonIngestContext {
             prototype_classifier: classifier_ref,
+            llm_gate: state.llm_gate.as_ref(),
             config: state.config.as_ref(),
             mempal_home: &state.mempal_home,
         },
@@ -871,6 +925,7 @@ type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 pub struct DaemonIngestContext<'a> {
     pub prototype_classifier: Option<&'a PrototypeClassifier>,
+    pub llm_gate: Option<&'a HookLlmGateRuntime>,
     pub config: &'a crate::core::config::Config,
     pub mempal_home: &'a Path,
 }
@@ -1029,6 +1084,7 @@ struct DrawerRecord {
     importance: i32,
     bypass_novelty: bool,
     project_id: Option<String>,
+    deferred_raw_payload: Option<String>,
 }
 
 fn build_drawer_records(
@@ -1088,6 +1144,7 @@ fn build_drawer_records(
                         importance: review.importance,
                         bypass_novelty: true,
                         project_id,
+                        deferred_raw_payload: None,
                     }))
                 }
                 SessionReviewOutcome::Skipped(reason) => {
@@ -1186,6 +1243,7 @@ fn build_user_prompt_project_record(
         importance: 0,
         bypass_novelty: false,
         project_id,
+        deferred_raw_payload: audit_record.deferred_raw_payload.clone(),
     }))
 }
 
@@ -1212,10 +1270,13 @@ fn load_session_review_payload(envelope: &CapturedHookEnvelope) -> Result<Option
         return Ok(envelope.payload.clone());
     }
 
-    let payload_path = envelope
-        .payload_path
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("truncated session_end missing payload_path"))?;
+    let Some(payload_path) = envelope.payload_path.as_deref() else {
+        tracing::info!(
+            original_size_bytes = envelope.original_size_bytes,
+            "truncated session_end omitted raw payload before LLM gate; skipping self-review extraction"
+        );
+        return Ok(None);
+    };
     fs::read_to_string(payload_path).map(Some).with_context(|| {
         format!(
             "failed to read truncated session_end payload {}",
@@ -1235,7 +1296,6 @@ fn build_audit_drawer_record(
         tracing::warn!(
             event = %envelope.event,
             original_size_bytes = envelope.original_size_bytes,
-            payload_preview = %preview,
             "processing truncated hook envelope"
         );
         let content = serde_json::to_string(&json!({
@@ -1262,16 +1322,22 @@ fn build_audit_drawer_record(
             importance: 0,
             bypass_novelty: false,
             project_id,
+            deferred_raw_payload: None,
         });
     }
 
     let raw_payload = envelope.payload.as_deref().unwrap_or_default();
     let (wing, room) = audit_target_for_event(&envelope.event, raw_payload, config);
     let preview = config.scrub_content(&preview_for_event(&envelope.event, raw_payload));
-    let payload_path = if raw_turn_storage_disabled(&wing, &room, config) {
-        synthetic_source_file("hook-payload-skipped")
+    let (payload_path, deferred_raw_payload) = if raw_turn_storage_disabled(&wing, &room, config) {
+        (synthetic_source_file("hook-payload-skipped"), None)
     } else {
-        persist_raw_payload(raw_payload, mempal_home)?
+        (
+            raw_payload_storage_path(raw_payload, mempal_home)
+                .to_string_lossy()
+                .to_string(),
+            Some(raw_payload.to_string()),
+        )
     };
     let content = serde_json::to_string(&json!({
         "event": envelope.event,
@@ -1300,6 +1366,7 @@ fn build_audit_drawer_record(
         importance: 0,
         bypass_novelty: false,
         project_id,
+        deferred_raw_payload,
     })
 }
 
@@ -1392,14 +1459,14 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     }
     if let Some(decision) = gating_decision.as_ref()
         && decision.is_rejected()
-        && !should_enqueue_llm_gating(context.daemon.config, &gating_decision)
+        && should_drop_reject_before_automatic_hook_llm_gate(context.daemon.config, decision)
     {
         record_gating_audit_async(
             context.db,
             &drawer_id,
             decision,
             record.project_id.clone(),
-            &candidate.content,
+            None,
         )
         .await?;
         return Ok(drawer_id);
@@ -1418,6 +1485,24 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                     ?error,
                     message_id,
                     "failed to refresh daemon ingest heartbeat"
+                );
+            }
+        });
+        Ok(())
+    };
+    let llm_heartbeat_store = context.store.clone();
+    let llm_heartbeat_message_id = context.message.id.clone();
+    let llm_heartbeat_worker_id = context.worker_id.to_string();
+    let llm_heartbeat = move || -> std::result::Result<(), crate::llm::LlmError> {
+        let store = llm_heartbeat_store.clone();
+        let message_id = llm_heartbeat_message_id.clone();
+        let worker_id = llm_heartbeat_worker_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
+                tracing::warn!(
+                    ?error,
+                    message_id,
+                    "failed to refresh daemon LLM gating heartbeat"
                 );
             }
         });
@@ -1444,34 +1529,49 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 .embedding_classifier
                 .threshold,
         );
-        if should_enqueue_llm_gating(context.daemon.config, &Some(decision.clone())) {
-            let llm_decision = GatingDecision::accepted(0, Some("llm_pending".to_string()), None);
-            record_gating_audit_async(
-                context.db,
-                &drawer_id,
-                &llm_decision,
-                record.project_id.clone(),
-                &candidate.content,
-            )
-            .await?;
-            gating_audit_recorded = true;
-            gating_decision = Some(llm_decision);
-        } else {
+        if decision.is_rejected()
+            && should_drop_reject_before_automatic_hook_llm_gate(context.daemon.config, &decision)
+        {
             record_gating_audit_async(
                 context.db,
                 &drawer_id,
                 &decision,
                 record.project_id.clone(),
-                &candidate.content,
+                None,
             )
             .await?;
-            gating_audit_recorded = true;
-            if decision.is_rejected() {
-                return Ok(drawer_id);
-            }
-            gating_decision = Some(decision);
+            return Ok(drawer_id);
         }
+        gating_decision = Some(decision);
         vector = Some(candidate_vector);
+    }
+    if !gating_audit_recorded && automatic_hook_llm_gate_required(context.daemon.config) {
+        let classifier_decision = gating_decision.clone();
+        let llm_decision = judge_automatic_hook_llm_gate(
+            context,
+            &drawer_id,
+            &candidate.content,
+            Some(&llm_heartbeat),
+        )
+        .await?;
+        let audit_decision = classifier_decision
+            .as_ref()
+            .map(|decision| audit_decision_with_llm_outcome(decision, &llm_decision))
+            .unwrap_or_else(|| llm_decision.clone());
+        record_gating_audit_async(
+            context.db,
+            &drawer_id,
+            &audit_decision,
+            record.project_id.clone(),
+            (!audit_decision.is_rejected()).then_some(candidate.content.as_str()),
+        )
+        .await?;
+        record_llm_verdict_async(context.db, &drawer_id, &llm_decision).await?;
+        gating_audit_recorded = true;
+        if llm_decision.is_rejected() {
+            return Ok(drawer_id);
+        }
+        gating_decision = Some(llm_decision);
     }
     if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
         record_gating_audit_async(
@@ -1479,7 +1579,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             &drawer_id,
             decision,
             record.project_id.clone(),
-            &candidate.content,
+            (!decision.is_rejected()).then_some(candidate.content.as_str()),
         )
         .await?;
     }
@@ -1498,6 +1598,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     if record.bypass_novelty {
         insert_drawer_with_vector_async(context.db, &drawer_id, record.clone(), vector.clone())
             .await?;
+        persist_deferred_raw_payload(&record)?;
         enqueue_llm_gating_after_durable_insert(
             context.db,
             context.store,
@@ -1539,6 +1640,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             }
             insert_drawer_with_vector_async(context.db, &drawer_id, record.clone(), vector.clone())
                 .await?;
+            persist_deferred_raw_payload(&record)?;
             enqueue_llm_gating_after_durable_insert(
                 context.db,
                 context.store,
@@ -1632,6 +1734,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                     vector.clone(),
                 )
                 .await?;
+                persist_deferred_raw_payload(&record)?;
                 enqueue_llm_gating_after_durable_insert(
                     context.db,
                     context.store,
@@ -1675,6 +1778,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                             vector.clone(),
                         )
                         .await?;
+                        persist_deferred_raw_payload(&record)?;
                         enqueue_llm_gating_after_durable_insert(
                             context.db,
                             context.store,
@@ -1719,10 +1823,116 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         Ok(())
                     })
                     .await?;
+                persist_deferred_raw_payload(&record)?;
                 Ok(target_id)
             }
         }
     }
+}
+
+fn automatic_hook_llm_gate_required(config: &crate::core::config::Config) -> bool {
+    config.ingest_gating.enabled
+        && config
+            .ingest_gating
+            .llm_judge
+            .as_ref()
+            .is_some_and(|judge| judge.enabled)
+}
+
+fn should_drop_reject_before_automatic_hook_llm_gate(
+    config: &crate::core::config::Config,
+    decision: &GatingDecision,
+) -> bool {
+    if !decision.is_rejected() {
+        return false;
+    }
+    if automatic_hook_llm_gate_required(config)
+        && decision.gating_reason.as_deref() == Some("prototype_below_threshold")
+    {
+        return false;
+    }
+    !should_enqueue_llm_gating(config, &Some(decision.clone()))
+}
+
+async fn judge_automatic_hook_llm_gate(
+    context: &DrawerIngestContext<'_, impl Embedder + ?Sized>,
+    drawer_id: &str,
+    content: &str,
+    heartbeat: Option<&crate::llm::retry::HeartbeatCallback>,
+) -> Result<GatingDecision> {
+    let gate = context.daemon.llm_gate.ok_or_else(|| {
+        anyhow::anyhow!(
+            "LLM gating is required for automatic hook writes but no LLM gate runtime is available"
+        )
+    })?;
+    let task = crate::llm::LlmTaskPayload {
+        task_type: "gating".to_string(),
+        drawer_id: drawer_id.to_string(),
+        drawer_ids: vec![drawer_id.to_string()],
+        content: content.to_string(),
+        system_prompt: context
+            .daemon
+            .config
+            .ingest_gating
+            .llm_judge
+            .as_ref()
+            .and_then(|judge| judge.system_prompt.clone()),
+    };
+    let outcome = match gate.judge(context.daemon.config, &task, heartbeat).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let error_chain = format!("{error:#}");
+            return Err(error.context(format!(
+                "automatic hook LLM gate failed before durable insert: {error_chain}"
+            )));
+        }
+    };
+    Ok(gating_decision_from_llm_outcome(outcome))
+}
+
+fn gating_decision_from_llm_outcome(
+    outcome: crate::llm::worker::GatingJudgeOutcome,
+) -> GatingDecision {
+    let score = Some(outcome.score as f32);
+    if outcome.verdict.is_keep() {
+        GatingDecision::accepted(0, Some("llm_keep".to_string()), score)
+    } else {
+        GatingDecision::rejected(0, Some("llm_reject".to_string()), None, score)
+    }
+}
+
+fn audit_decision_with_llm_outcome(
+    classifier_decision: &GatingDecision,
+    llm_decision: &GatingDecision,
+) -> GatingDecision {
+    let mut audit_decision = classifier_decision.clone();
+    audit_decision.decision = if llm_decision.is_rejected() {
+        "rejected".to_string()
+    } else {
+        "accepted".to_string()
+    };
+    audit_decision
+}
+
+async fn record_llm_verdict_async(
+    db: &AsyncDb,
+    drawer_id: &str,
+    decision: &GatingDecision,
+) -> Result<()> {
+    let drawer_id = drawer_id.to_string();
+    let verdict = if decision.is_rejected() {
+        "reject"
+    } else {
+        "keep"
+    }
+    .to_string();
+    let score = decision.score.map(f64::from);
+    db.run_write_anyhow(move |db| {
+        db.upsert_llm_verdict_by_candidate_hash(&drawer_id, &verdict, score)
+            .with_context(|| format!("failed to record LLM verdict {}", drawer_id))?;
+        Ok(())
+    })
+    .await
 }
 
 async fn enqueue_llm_gating_after_durable_insert(
@@ -1768,14 +1978,19 @@ async fn record_gating_audit_async(
     drawer_id: &str,
     decision: &GatingDecision,
     project_id: Option<String>,
-    content: &str,
+    content: Option<&str>,
 ) -> Result<()> {
     let drawer_id = drawer_id.to_string();
     let decision = decision.clone();
-    let content = content.to_string();
+    let content = content.map(str::to_string);
     db.run_write_anyhow(move |db| {
-        db.record_gating_audit(&drawer_id, &decision, project_id.as_deref(), Some(&content))
-            .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
+        db.record_gating_audit(
+            &drawer_id,
+            &decision,
+            project_id.as_deref(),
+            content.as_deref(),
+        )
+        .with_context(|| format!("failed to record gating audit {}", drawer_id))?;
         Ok(())
     })
     .await
@@ -1915,25 +2130,39 @@ fn hook_payload_session_id(raw_payload: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn persist_raw_payload(raw_payload: &str, mempal_home: &Path) -> Result<String> {
-    let payload_dir = mempal_home.join("hook-payloads");
-    fs::create_dir_all(&payload_dir)
-        .with_context(|| format!("failed to create {}", payload_dir.display()))?;
+fn raw_payload_storage_path(raw_payload: &str, mempal_home: &Path) -> PathBuf {
     let digest = blake3::hash(raw_payload.as_bytes()).to_hex().to_string();
-    let path = payload_dir.join(format!("{digest}.json"));
+    mempal_home
+        .join("hook-payloads")
+        .join(format!("{digest}.json"))
+}
+
+fn persist_deferred_raw_payload(record: &DrawerRecord) -> Result<()> {
+    let Some(raw_payload) = record.deferred_raw_payload.as_deref() else {
+        return Ok(());
+    };
+    persist_raw_payload_at(raw_payload, Path::new(&record.source_file))
+}
+
+fn persist_raw_payload_at(raw_payload: &str, path: &Path) -> Result<()> {
+    let payload_dir = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("raw hook payload path has no parent: {}", path.display())
+    })?;
+    fs::create_dir_all(payload_dir)
+        .with_context(|| format!("failed to create {}", payload_dir.display()))?;
     if !path.exists() {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&path)
+            .open(path)
             .with_context(|| format!("failed to create {}", path.display()))?;
         file.write_all(raw_payload.as_bytes())
             .with_context(|| format!("failed to write {}", path.display()))?;
         file.flush()
             .with_context(|| format!("failed to flush {}", path.display()))?;
     }
-    Ok(path.to_string_lossy().to_string())
+    Ok(())
 }
 
 fn should_enqueue_llm_gating(
@@ -2771,6 +3000,7 @@ mod tests {
                     StaticEmbedder,
                 ))),
                 prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
+                llm_gate: None,
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
@@ -2973,6 +3203,7 @@ mod tests {
                     },
                 ))),
                 prototype_classifier: std::sync::Arc::new(ArcSwap::from_pointee(None)),
+                llm_gate: None,
                 config: std::sync::Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
@@ -3063,6 +3294,7 @@ mod tests {
                     },
                 ))),
                 prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
+                llm_gate: None,
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
@@ -3199,6 +3431,7 @@ mod tests {
                     },
                 ))),
                 prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
+                llm_gate: None,
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
@@ -3304,6 +3537,7 @@ mod tests {
             &StaticEmbedder,
             DaemonIngestContext {
                 prototype_classifier: None,
+                llm_gate: None,
                 config: &config,
                 mempal_home: tmp.path(),
             },
@@ -3325,7 +3559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_daemon_enqueues_llm_gating_after_drawer_vector_is_durable() {
+    async fn test_automatic_hook_without_llm_gate_does_not_write_drawer() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -3334,8 +3568,8 @@ mod tests {
         let async_store = AsyncPendingMessageStore::from_store(store.clone());
         let hook_payload = serde_json::json!({
             "tool_name": "DesignCapture",
-            "input": "record durable llm enqueue order",
-            "output": "The daemon must durably insert the drawer and vector before exposing the local LLM gating task to the worker queue.",
+            "input": "record automatic hook llm requirement",
+            "output": "Automatic hook captures must not become durable memories until the local LLM gate explicitly keeps them.",
             "exit_code": 0
         })
         .to_string();
@@ -3356,77 +3590,70 @@ mod tests {
             .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
             .expect("enqueue hook envelope");
         let message = store
-            .claim_next("llm-race-worker", 60)
+            .claim_next("llm-required-worker", 60)
             .expect("claim next")
             .expect("claimed message");
         assert_eq!(message.id, queued_id);
 
         let mut config = Config::default();
-        config.llm.enabled = true;
-        config.llm.enabled_for = vec!["gating".to_string()];
         config.ingest_gating.enabled = true;
-        config.ingest_gating.embedding_classifier.enabled = true;
-        config.ingest_gating.embedding_classifier.threshold = 1.1;
-        config.ingest_gating.embedding_classifier.prototypes = vec!["keep".to_string()];
         config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
             enabled: true,
             ..LlmJudgeConfig::default()
         });
-        let classifier_embedder = StaticEmbedder;
-        let classifier =
-            compile_classifier_from_embedder(&classifier_embedder, &config.ingest_gating)
-                .await
-                .expect("compile classifier")
-                .expect("classifier enabled");
-        let embedder = LlmClaimRaceProbeEmbedder {
-            store: store.clone(),
-            embed_calls: AtomicUsize::new(0),
-        };
-        let drawer_id = process_claimed_message_with_embedder(
+        let error = process_claimed_message_with_embedder(
             &async_db,
             &async_store,
-            "llm-race-worker",
+            "llm-required-worker",
             &message,
-            &embedder,
+            &StaticEmbedder,
             DaemonIngestContext {
-                prototype_classifier: Some(&classifier),
+                prototype_classifier: None,
+                llm_gate: None,
                 config: &config,
                 mempal_home: tmp.path(),
             },
         )
         .await
-        .expect("process hook envelope");
+        .expect_err("automatic hook write must fail safe when LLM gate is unavailable");
 
-        assert_eq!(embedder.embed_calls.load(Ordering::SeqCst), 1);
         assert!(
-            db.drawer_exists(&drawer_id).expect("drawer exists query"),
-            "drawer must exist before LLM task is claimable"
+            error.to_string().contains("LLM") || error.to_string().contains("llm"),
+            "error should mention missing LLM gate: {error:#}"
         );
-        let vector_count: i64 = db
+        let drawer_count: i64 = db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM drawer_vectors WHERE id = ?1",
-                [drawer_id.as_str()],
+                "SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL",
+                [],
                 |row| row.get(0),
             )
-            .expect("query vector");
+            .expect("count drawers");
         assert_eq!(
-            vector_count, 1,
-            "vector must exist before LLM task is claimable"
+            drawer_count, 0,
+            "automatic hook must not durably insert without an LLM keep verdict"
         );
-
-        let llm_task = store
-            .claim_next_by_kind("llm-race-final", 60, "llm_task")
-            .expect("claim llm task")
-            .expect("llm task should be queued after durable insert");
-        let task: crate::llm::LlmTaskPayload =
-            serde_json::from_str(&llm_task.payload).expect("decode llm task");
-        assert_eq!(task.drawer_id, drawer_id);
+        assert!(
+            store
+                .claim_next_by_kind("llm-required-final", 60, "llm_task")
+                .expect("claim llm task")
+                .is_none(),
+            "automatic hook must not queue a post-insert LLM task when no drawer was written"
+        );
     }
 
     #[tokio::test]
-    async fn test_daemon_routes_tier2_unclassified_to_llm_before_skipping() {
+    async fn test_automatic_hook_default_score_keep_precedes_durable_insert() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut llm_server = mockito::Server::new_async().await;
+        let llm_mock = llm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{"model":"test-llm","choices":[{"message":{"role":"assistant","content":"{\"score\":0.95,\"reason\":\"important design note\"}"}}]}"#,
+            )
+            .create_async()
+            .await;
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
         let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
@@ -3463,6 +3690,9 @@ mod tests {
 
         let mut config = Config::default();
         config.llm.enabled = true;
+        config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
+        config.llm.model = Some("test-llm".to_string());
+        config.llm.enabled_for = vec!["gating".to_string()];
         config.ingest_gating.enabled = true;
         config.ingest_gating.embedding_classifier.enabled = true;
         config.ingest_gating.embedding_classifier.threshold = 1.1;
@@ -3471,11 +3701,17 @@ mod tests {
             enabled: true,
             ..LlmJudgeConfig::default()
         });
-        let embedder = StaticEmbedder;
-        let classifier = compile_classifier_from_embedder(&embedder, &config.ingest_gating)
-            .await
-            .expect("compile classifier")
-            .expect("classifier enabled");
+        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let classifier_embedder = StaticEmbedder;
+        let classifier =
+            compile_classifier_from_embedder(&classifier_embedder, &config.ingest_gating)
+                .await
+                .expect("compile classifier")
+                .expect("classifier enabled");
+        let embedder = LlmClaimRaceProbeEmbedder {
+            store: store.clone(),
+            embed_calls: AtomicUsize::new(0),
+        };
 
         let drawer_id = process_claimed_message_with_embedder(
             &async_db,
@@ -3485,6 +3721,7 @@ mod tests {
             &embedder,
             DaemonIngestContext {
                 prototype_classifier: Some(&classifier),
+                llm_gate: Some(&llm_gate),
                 config: &config,
                 mempal_home: tmp.path(),
             },
@@ -3492,37 +3729,53 @@ mod tests {
         .await
         .expect("process hook envelope");
 
+        llm_mock.assert_async().await;
+        assert_eq!(embedder.embed_calls.load(Ordering::SeqCst), 1);
         assert!(
             db.drawer_exists(&drawer_id).expect("drawer exists query"),
-            "unclassified Tier 2 candidates should be stored fail-open for local LLM judge"
+            "automatic hook candidate may become durable only after LLM keep"
         );
-        let llm_task = store
-            .claim_next_by_kind("llm-unclassified-final", 60, "llm_task")
-            .expect("claim llm task")
-            .expect("unclassified Tier 2 candidate should be queued for LLM judge");
-        let task: crate::llm::LlmTaskPayload =
-            serde_json::from_str(&llm_task.payload).expect("decode llm task");
-        assert_eq!(task.drawer_id, drawer_id);
+        assert!(
+            store
+                .claim_next_by_kind("llm-unclassified-final", 60, "llm_task")
+                .expect("claim llm task")
+                .is_none(),
+            "automatic hook must not enqueue a post-insert LLM task after synchronous keep"
+        );
+        let vector_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawer_vectors WHERE id = ?1",
+                [drawer_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("query vector");
+        assert_eq!(vector_count, 1);
 
-        let (audit_decision, label, audit_drawer_id, content_preview): (
+        let (audit_decision, label, audit_drawer_id, llm_verdict, llm_score): (
             String,
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<f64>,
         ) = db
             .conn()
             .query_row(
-                "SELECT decision, label, drawer_id, content_preview FROM gating_audit WHERE candidate_hash = ?1",
+                "SELECT decision, label, drawer_id, llm_verdict, llm_score FROM gating_audit WHERE candidate_hash = ?1",
                 [drawer_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .expect("query daemon gating audit");
         assert_eq!(audit_decision, "keep");
-        assert_eq!(label.as_deref(), Some("llm_pending"));
-        assert_eq!(audit_drawer_id.as_deref(), Some(drawer_id.as_str()));
         assert!(
-            content_preview.is_none(),
-            "fail-open LLM-pending audit rows must not retain raw content previews"
+            label.is_none(),
+            "LLM keep must not overwrite classifier audit label"
+        );
+        assert_eq!(audit_drawer_id.as_deref(), Some(drawer_id.as_str()));
+        assert_eq!(llm_verdict.as_deref(), Some("keep"));
+        assert!(
+            llm_score.is_some_and(|score| (score - 0.95).abs() < 1e-6),
+            "llm_score={llm_score:?}"
         );
         let dropped_total: i64 = db
             .conn()
@@ -3534,19 +3787,659 @@ mod tests {
             .expect("query dropped counter");
         assert_eq!(
             dropped_total, 0,
-            "fail-open LLM-pending candidates must not increment drop counters"
+            "LLM-kept automatic hook candidates must not increment drop counters"
         );
-        db.upsert_llm_verdict(&drawer_id, "keep", Some(0.9))
-            .expect("upsert llm verdict");
-        let llm_verdict: Option<String> = db
+    }
+
+    #[tokio::test]
+    async fn test_automatic_hook_prototype_hard_reject_bypasses_llm_gate() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let hook_payload = serde_json::json!({
+            "tool_name": "DesignCapture",
+            "input": "record prototype hard reject",
+            "output": "This candidate should match the noise prototype and be rejected before any LLM call.",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("prototype-hard-reject-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.llm.base_url = Some("http://127.0.0.1:1/v1".to_string());
+        config.llm.model = Some("unreachable-test-llm".to_string());
+        config.llm.enabled_for = vec!["gating".to_string()];
+        config.ingest_gating.enabled = true;
+        config.ingest_gating.embedding_classifier.enabled = true;
+        config.ingest_gating.embedding_classifier.threshold = 0.0;
+        config.ingest_gating.embedding_classifier.prototypes = vec!["noise".to_string()];
+        config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let classifier_embedder = StaticEmbedder;
+        let classifier =
+            compile_classifier_from_embedder(&classifier_embedder, &config.ingest_gating)
+                .await
+                .expect("compile classifier")
+                .expect("classifier enabled");
+
+        let drawer_id = process_claimed_message_with_embedder(
+            &async_db,
+            &async_store,
+            "prototype-hard-reject-worker",
+            &message,
+            &StaticEmbedder,
+            DaemonIngestContext {
+                prototype_classifier: Some(&classifier),
+                llm_gate: Some(&llm_gate),
+                config: &config,
+                mempal_home: tmp.path(),
+            },
+        )
+        .await
+        .expect("prototype hard reject should not call unreachable LLM");
+
+        assert!(
+            !db.drawer_exists(&drawer_id).expect("drawer exists query"),
+            "prototype hard-rejected hook candidates must not become durable"
+        );
+        let (audit_decision, tier, reason, llm_verdict, content_preview): (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = db
             .conn()
             .query_row(
-                "SELECT llm_verdict FROM gating_audit WHERE candidate_hash = ?1",
+                "SELECT decision, tier, reason, llm_verdict, content_preview FROM gating_audit WHERE candidate_hash = ?1",
                 [drawer_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("query daemon gating audit");
+        assert_eq!(audit_decision, "skip");
+        assert_eq!(tier, 2);
+        assert_eq!(reason.as_deref(), Some("prototype.noise"));
+        assert!(llm_verdict.is_none());
+        assert!(
+            content_preview.is_none(),
+            "automatic hook fast-reject audit must not persist candidate content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_automatic_hook_soft_prototype_reject_retries_when_llm_inactive() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let hook_payload = serde_json::json!({
+            "tool_name": "DesignCapture",
+            "input": "record soft prototype reject",
+            "output": "This candidate falls below prototype threshold and requires an LLM decision before any drop.",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("soft-prototype-reject-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+
+        let mut config = Config::default();
+        config.llm.enabled = false;
+        config.llm.enabled_for = Vec::new();
+        config.ingest_gating.enabled = true;
+        config.ingest_gating.embedding_classifier.enabled = true;
+        config.ingest_gating.embedding_classifier.threshold = 2.0;
+        config.ingest_gating.embedding_classifier.prototypes = vec!["keep".to_string()];
+        config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let classifier = compile_classifier_from_embedder(&StaticEmbedder, &config.ingest_gating)
+            .await
+            .expect("compile classifier")
+            .expect("classifier enabled");
+
+        super::process_hook_worker_message(
+            HookWorkerState {
+                async_db,
+                store: async_store,
+                worker_id: "soft-prototype-reject-worker".to_string(),
+                embedder: std::sync::Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
+                    StaticEmbedder,
+                ))),
+                prototype_classifier: std::sync::Arc::new(ArcSwap::from_pointee(Some(classifier))),
+                llm_gate: Some(llm_gate),
+                config: std::sync::Arc::new(config),
+                mempal_home: tmp.path().to_path_buf(),
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+            },
+            message.clone(),
+            60,
+        )
+        .await;
+
+        let queue_row: (String, i64, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT status, retry_count, last_error FROM pending_messages WHERE id = ?1",
+                [message.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query queue row");
+        assert!(
+            queue_row
+                .2
+                .as_deref()
+                .is_some_and(|error| error.contains("LLM judge is not active")),
+            "unexpected queue error: {:?}",
+            queue_row.2
+        );
+        assert_eq!(queue_row.0, "pending");
+        assert_eq!(queue_row.1, 1);
+        assert!(
+            !tmp.path().join("hook-payloads").exists(),
+            "soft prototype reject must not persist raw payload before LLM keep"
+        );
+        let drawer_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
+            .expect("query drawer count");
+        assert_eq!(drawer_count, 0);
+        let audit_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM gating_audit", [], |row| row.get(0))
+            .expect("query audit count");
+        assert_eq!(audit_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_automatic_hook_llm_gate_preserves_classifier_audit() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut llm_server = mockito::Server::new_async().await;
+        let llm_mock = llm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{"model":"test-llm","choices":[{"message":{"role":"assistant","content":"{\"score\":0.95,\"reason\":\"important design note\"}"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let hook_payload = serde_json::json!({
+            "tool_name": "DesignCapture",
+            "input": "record classifier audit preservation",
+            "output": "Retain this candidate only after LLM keep while preserving the prototype classifier audit fields.",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("classifier-audit-preserve-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
+        config.llm.model = Some("test-llm".to_string());
+        config.llm.enabled_for = vec!["gating".to_string()];
+        config.ingest_gating.enabled = true;
+        config.ingest_gating.embedding_classifier.enabled = true;
+        config.ingest_gating.embedding_classifier.threshold = 1.1;
+        config.ingest_gating.embedding_classifier.prototypes = vec!["keep".to_string()];
+        config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+        let classifier_embedder = StaticEmbedder;
+        let classifier =
+            compile_classifier_from_embedder(&classifier_embedder, &config.ingest_gating)
+                .await
+                .expect("compile classifier")
+                .expect("classifier enabled");
+
+        let drawer_id = process_claimed_message_with_embedder(
+            &async_db,
+            &async_store,
+            "classifier-audit-preserve-worker",
+            &message,
+            &StaticEmbedder,
+            DaemonIngestContext {
+                prototype_classifier: Some(&classifier),
+                llm_gate: Some(&llm_gate),
+                config: &config,
+                mempal_home: tmp.path(),
+            },
+        )
+        .await
+        .expect("process hook envelope");
+
+        llm_mock.assert_async().await;
+        struct GatingAuditRow {
+            decision: String,
+            tier: i64,
+            reason: Option<String>,
+            score: Option<f64>,
+            label: Option<String>,
+            llm_verdict: Option<String>,
+            llm_score: Option<f64>,
+        }
+
+        let audit = db
+            .conn()
+            .query_row(
+                "SELECT decision, tier, reason, score, label, llm_verdict, llm_score FROM gating_audit WHERE candidate_hash = ?1",
+                [drawer_id.as_str()],
+                |row| {
+                    Ok(GatingAuditRow {
+                        decision: row.get(0)?,
+                        tier: row.get(1)?,
+                        reason: row.get(2)?,
+                        score: row.get(3)?,
+                        label: row.get(4)?,
+                        llm_verdict: row.get(5)?,
+                        llm_score: row.get(6)?,
+                    })
+                },
+            )
+            .expect("query daemon gating audit");
+        assert_eq!(audit.decision, "keep");
+        assert_eq!(audit.tier, 2, "classifier tier must be preserved");
+        assert_eq!(audit.reason.as_deref(), Some("prototype_below_threshold"));
+        assert!(
+            audit.score.is_some_and(|value| (value - 1.0).abs() < 1e-6),
+            "classifier score={:?}",
+            audit.score
+        );
+        assert!(audit.label.is_none());
+        assert_eq!(audit.llm_verdict.as_deref(), Some("keep"));
+        assert!(
+            audit
+                .llm_score
+                .is_some_and(|value| (value - 0.95).abs() < 1e-6),
+            "llm_score={:?}",
+            audit.llm_score
+        );
+    }
+
+    #[tokio::test]
+    async fn test_automatic_hook_malformed_llm_gate_does_not_write_drawer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut llm_server = mockito::Server::new_async().await;
+        let llm_mock = llm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{"model":"test-llm","choices":[{"message":{"role":"assistant","content":"not a verdict"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let hook_payload = serde_json::json!({
+            "tool_name": "DesignCapture",
+            "input": "record malformed llm fail safe",
+            "output": "Automatic hook captures must fail safe when the LLM gate returns malformed output.",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("llm-malformed-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
+        config.llm.model = Some("test-llm".to_string());
+        config.llm.enabled_for = vec!["gating".to_string()];
+        config.ingest_gating.enabled = true;
+        config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+
+        super::process_hook_worker_message(
+            HookWorkerState {
+                async_db,
+                store: async_store,
+                worker_id: "llm-malformed-worker".to_string(),
+                embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
+                    StaticEmbedder,
+                ))),
+                prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
+                llm_gate: Some(llm_gate),
+                config: Arc::new(config),
+                mempal_home: tmp.path().to_path_buf(),
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+            },
+            message,
+            60,
+        )
+        .await;
+
+        llm_mock.assert_async().await;
+        let (status, retry_count, last_error): (String, i64, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT status, retry_count, last_error FROM pending_messages WHERE kind = ?1",
+                [HookEvent::PostToolUse.queue_kind()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query queue row");
+        assert_eq!(status, "pending");
+        assert_eq!(retry_count, 1);
+        assert!(
+            last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("verdict")),
+            "last_error={last_error:?}"
+        );
+        let drawer_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawers WHERE deleted_at IS NULL",
+                [],
                 |row| row.get(0),
             )
-            .expect("query llm verdict");
-        assert_eq!(llm_verdict.as_deref(), Some("keep"));
+            .expect("count drawers");
+        assert_eq!(drawer_count, 0);
+        assert!(
+            !tmp.path().join("hook-payloads").exists(),
+            "malformed automatic hook gate must not persist raw payload before retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_automatic_hook_llm_reject_records_verdict_without_drawer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut llm_server = mockito::Server::new_async().await;
+        let llm_mock = llm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{"model":"test-llm","choices":[{"message":{"role":"assistant","content":"{\"verdict\":\"reject\",\"score\":0.12}"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let hook_payload = serde_json::json!({
+            "tool_name": "DesignCapture",
+            "input": "record reject audit",
+            "output": "Reject this low-signal hook capture and keep only aggregate audit metadata.",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("llm-reject-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
+        config.llm.model = Some("test-llm".to_string());
+        config.llm.enabled_for = vec!["gating".to_string()];
+        config.ingest_gating.enabled = true;
+        config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+
+        let drawer_id = process_claimed_message_with_embedder(
+            &async_db,
+            &async_store,
+            "llm-reject-worker",
+            &message,
+            &StaticEmbedder,
+            DaemonIngestContext {
+                prototype_classifier: None,
+                llm_gate: Some(&llm_gate),
+                config: &config,
+                mempal_home: tmp.path(),
+            },
+        )
+        .await
+        .expect("process hook envelope");
+
+        llm_mock.assert_async().await;
+        assert!(
+            !db.drawer_exists(&drawer_id).expect("drawer exists query"),
+            "LLM-rejected automatic hook candidate must not become durable"
+        );
+        assert!(
+            !tmp.path().join("hook-payloads").exists(),
+            "LLM-rejected automatic hook candidate must not persist raw payload"
+        );
+        let (audit_decision, audit_drawer_id, llm_verdict, llm_score, content_preview): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+            Option<String>,
+        ) = db
+            .conn()
+            .query_row(
+                "SELECT decision, drawer_id, llm_verdict, llm_score, content_preview FROM gating_audit WHERE candidate_hash = ?1",
+                [drawer_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("query daemon gating audit");
+        assert_eq!(audit_decision, "skip");
+        assert!(audit_drawer_id.is_none());
+        assert_eq!(llm_verdict.as_deref(), Some("reject"));
+        assert!(
+            llm_score.is_some_and(|score| (score - 0.12).abs() < 1e-6),
+            "llm_score={llm_score:?}"
+        );
+        assert!(
+            content_preview.is_none(),
+            "LLM-rejected automatic hook audit must not persist candidate content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_automatic_hook_truncated_reject_does_not_persist_oversize_payload() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut llm_server = mockito::Server::new_async().await;
+        let llm_mock = llm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(
+                r#"{"model":"test-llm","choices":[{"message":{"role":"assistant","content":"{\"verdict\":\"reject\",\"score\":0.10}"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(db.path()).expect("open queue");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: None,
+            payload_path: None,
+            payload_preview: Some("oversize synthetic preview".to_string()),
+            original_size_bytes: 10 * 1024 * 1024 + 1,
+            truncated: true,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = store
+            .claim_next("truncated-reject-worker", 60)
+            .expect("claim next")
+            .expect("claimed message");
+
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.llm.base_url = Some(format!("{}/v1", llm_server.url()));
+        config.llm.model = Some("test-llm".to_string());
+        config.llm.enabled_for = vec!["gating".to_string()];
+        config.ingest_gating.enabled = true;
+        config.ingest_gating.llm_judge = Some(LlmJudgeConfig {
+            enabled: true,
+            ..LlmJudgeConfig::default()
+        });
+        let llm_gate = super::HookLlmGateRuntime::new(&config.llm);
+
+        let drawer_id = process_claimed_message_with_embedder(
+            &async_db,
+            &async_store,
+            "truncated-reject-worker",
+            &message,
+            &StaticEmbedder,
+            DaemonIngestContext {
+                prototype_classifier: None,
+                llm_gate: Some(&llm_gate),
+                config: &config,
+                mempal_home: tmp.path(),
+            },
+        )
+        .await
+        .expect("process truncated hook envelope");
+
+        llm_mock.assert_async().await;
+        assert!(
+            !db.drawer_exists(&drawer_id).expect("drawer exists query"),
+            "LLM-rejected truncated hook candidate must not become durable"
+        );
+        assert!(
+            !tmp.path().join("hook-oversize").exists(),
+            "truncated automatic hook reject must not persist oversized raw payload"
+        );
+        assert!(
+            !tmp.path().join("hook-payloads").exists(),
+            "truncated automatic hook reject must not persist raw payload"
+        );
     }
 
     #[test]

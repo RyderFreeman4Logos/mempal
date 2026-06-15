@@ -139,6 +139,31 @@ pub struct LlmTaskPayload {
     pub system_prompt: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatingRetentionVerdict {
+    Keep,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GatingJudgeOutcome {
+    pub verdict: GatingRetentionVerdict,
+    pub score: f64,
+}
+
+impl GatingRetentionVerdict {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => LLM_VERDICT_KEEP,
+            Self::Reject => LLM_VERDICT_REJECT,
+        }
+    }
+
+    pub(crate) fn is_keep(self) -> bool {
+        self == Self::Keep
+    }
+}
+
 pub async fn run_llm_worker(
     store: Arc<AsyncPendingMessageStore>,
     client_runtime: SharedLlmClientRuntime,
@@ -369,8 +394,15 @@ async fn process_gating_task(
     config: &crate::core::config::Config,
     heartbeat: Option<&HeartbeatCallback>,
 ) -> Result<()> {
-    let (verdict, score) = request_gating_verdict(router, status, task, heartbeat).await?;
-    apply_gating_verdict_async(db, task.clone(), config.clone(), verdict, score).await
+    let outcome = request_effective_gating_verdict(router, status, task, config, heartbeat).await?;
+    apply_gating_verdict_async(
+        db,
+        task.clone(),
+        config.clone(),
+        outcome.verdict.as_str().to_string(),
+        outcome.score,
+    )
+    .await
 }
 
 async fn apply_gating_verdict_async(
@@ -421,6 +453,33 @@ async fn request_gating_verdict(
     record_gating_response(status, response)
 }
 
+pub(crate) async fn request_effective_gating_verdict(
+    router: &LlmRouter,
+    status: &LlmStatus,
+    task: &LlmTaskPayload,
+    config: &crate::core::config::Config,
+    heartbeat: Option<&HeartbeatCallback>,
+) -> Result<GatingJudgeOutcome> {
+    let (verdict, score) = request_gating_verdict(router, status, task, heartbeat).await?;
+    Ok(effective_gating_outcome(config, &verdict, score))
+}
+
+pub(crate) async fn request_strict_effective_gating_verdict(
+    router: &LlmRouter,
+    status: &LlmStatus,
+    task: &LlmTaskPayload,
+    config: &crate::core::config::Config,
+    heartbeat: Option<&HeartbeatCallback>,
+) -> Result<GatingJudgeOutcome> {
+    let request = gating_request(task);
+    let response = router
+        .chat_completion(&request, heartbeat)
+        .await
+        .map(|routed| routed.response);
+    let (verdict, score) = record_strict_gating_response(status, response)?;
+    Ok(effective_gating_outcome(config, &verdict, score))
+}
+
 async fn request_gating_verdict_with_client(
     client: &LlmClient,
     status: &LlmStatus,
@@ -469,6 +528,23 @@ fn record_gating_response(
         Ok(response) => {
             status.record_success();
             Ok(parse_gating_verdict(&response.content))
+        }
+        Err(error) => {
+            status.record_failure(&error);
+            Err(error).context("LLM gating request failed")
+        }
+    }
+}
+
+fn record_strict_gating_response(
+    status: &LlmStatus,
+    response: Result<LlmResponse, LlmError>,
+) -> Result<(String, f64)> {
+    match response {
+        Ok(response) => {
+            let verdict = parse_strict_gating_verdict(&response.content)?;
+            status.record_success();
+            Ok(verdict)
         }
         Err(error) => {
             status.record_failure(&error);
@@ -574,6 +650,24 @@ fn effective_retention_verdict(verdict: &str, score: f64, threshold: f64) -> &'s
     }
 }
 
+fn effective_gating_outcome(
+    config: &crate::core::config::Config,
+    verdict: &str,
+    score: f64,
+) -> GatingJudgeOutcome {
+    let threshold = config
+        .ingest_gating
+        .llm_judge
+        .as_ref()
+        .map(|judge| judge.threshold)
+        .unwrap_or(0.3);
+    let verdict = match effective_retention_verdict(verdict, score, threshold) {
+        LLM_VERDICT_REJECT => GatingRetentionVerdict::Reject,
+        _ => GatingRetentionVerdict::Keep,
+    };
+    GatingJudgeOutcome { verdict, score }
+}
+
 fn is_reject_verdict(verdict: &str) -> bool {
     matches!(
         verdict.trim().to_ascii_lowercase().as_str(),
@@ -588,6 +682,47 @@ fn is_reject_verdict(verdict: &str) -> bool {
             | "quarantine"
             | "quarantined"
     )
+}
+
+fn is_keep_verdict(verdict: &str) -> bool {
+    matches!(
+        verdict.trim().to_ascii_lowercase().as_str(),
+        "keep" | "kept" | "accept" | "accepted" | "retain" | "retained"
+    )
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("LLM gating verdict is malformed: {0}")]
+struct StrictGatingVerdictError(String);
+
+fn parse_strict_gating_verdict(content: &str) -> Result<(String, f64)> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).map_err(|error| {
+        StrictGatingVerdictError(format!("verdict must be valid JSON: {error}"))
+    })?;
+    let score = parsed
+        .get("score")
+        .and_then(|value| value.as_f64())
+        .context("LLM gating verdict JSON must include numeric field 'score'")?;
+    if !(0.0..=1.0).contains(&score) {
+        anyhow::bail!("LLM gating verdict score must be between 0.0 and 1.0");
+    }
+    if let Some(verdict) = parsed.get("verdict").and_then(|value| value.as_str()) {
+        if !is_keep_verdict(verdict) && !is_reject_verdict(verdict) {
+            return Err(StrictGatingVerdictError(
+                "verdict field must be keep or reject".to_string(),
+            )
+            .into());
+        }
+        return Ok((verdict.to_string(), score));
+    }
+    let reason = parsed
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .context("LLM gating verdict JSON without 'verdict' must include non-empty string field 'reason'")?;
+    let _ = reason;
+    Ok((LLM_VERDICT_KEEP.to_string(), score))
 }
 
 fn parse_gating_verdict(content: &str) -> (String, f64) {
@@ -850,6 +985,59 @@ threshold = 0.5
             )
             .expect("read optional LLM audit verdict");
         verdict.zip(score)
+    }
+
+    #[test]
+    fn test_strict_gating_parser_accepts_default_score_reason_keep_shape() {
+        let (verdict, score) =
+            parse_strict_gating_verdict(r#"{"score":0.95,"reason":"important design note"}"#)
+                .expect("default score/reason response should parse");
+        let outcome = effective_gating_outcome(&llm_judge_config(0.7), &verdict, score);
+
+        assert_eq!(verdict, LLM_VERDICT_KEEP);
+        assert!((score - 0.95).abs() < f64::EPSILON);
+        assert_eq!(outcome.verdict, GatingRetentionVerdict::Keep);
+    }
+
+    #[test]
+    fn test_strict_gating_parser_accepts_default_score_reason_reject_shape() {
+        let (verdict, score) =
+            parse_strict_gating_verdict(r#"{"score":0.12,"reason":"routine tool output"}"#)
+                .expect("default score/reason response should parse");
+        let outcome = effective_gating_outcome(&llm_judge_config(0.7), &verdict, score);
+
+        assert_eq!(verdict, LLM_VERDICT_KEEP);
+        assert!((score - 0.12).abs() < f64::EPSILON);
+        assert_eq!(outcome.verdict, GatingRetentionVerdict::Reject);
+    }
+
+    #[test]
+    fn test_strict_gating_parser_rejects_ambiguous_score_without_reason_or_verdict() {
+        let error = parse_strict_gating_verdict(r#"{"score":0.95}"#)
+            .expect_err("score-only response is ambiguous under the default prompt contract");
+
+        assert!(
+            error.to_string().contains("reason") || error.to_string().contains("verdict"),
+            "unexpected parser error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_strict_gating_parser_does_not_echo_unsupported_verdict_value() {
+        let raw_verdict = "private echoed model fragment";
+        let error =
+            parse_strict_gating_verdict(&format!(r#"{{"score":0.95,"verdict":"{raw_verdict}"}}"#))
+                .expect_err("unsupported verdict should fail strict parsing");
+        let error_text = error.to_string();
+
+        assert!(
+            error_text.contains("verdict"),
+            "unexpected parser error: {error:#}"
+        );
+        assert!(
+            !error_text.contains(raw_verdict),
+            "strict parser error must not echo model-provided verdict text: {error:#}"
+        );
     }
 
     #[test]

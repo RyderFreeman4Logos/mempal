@@ -334,6 +334,7 @@ async fn ingest_mcp(server: &MempalMcpServer, content: &str) -> mempal::mcp::Ing
                 content: content.to_string(),
                 wing: "code-memory".to_string(),
                 room: Some("gating".to_string()),
+                source_type: Some("system_generated".to_string()),
                 dry_run: Some(false),
                 ..IngestRequest::default()
             })

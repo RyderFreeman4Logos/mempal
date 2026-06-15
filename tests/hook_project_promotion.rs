@@ -150,6 +150,7 @@ enabled = false
             &StaticEmbedder,
             DaemonIngestContext {
                 prototype_classifier: None,
+                llm_gate: None,
                 config: &self.config,
                 mempal_home: &self.mempal_home,
             },
@@ -371,6 +372,7 @@ enabled = false
             &StaticEmbedder,
             DaemonIngestContext {
                 prototype_classifier: None,
+                llm_gate: None,
                 config: &self.config,
                 mempal_home: &self.mempal_home,
             },

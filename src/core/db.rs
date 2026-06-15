@@ -734,6 +734,23 @@ impl Database {
         Ok(())
     }
 
+    pub fn upsert_llm_verdict_by_candidate_hash(
+        &self,
+        candidate_hash: &str,
+        verdict: &str,
+        score: Option<f64>,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            r#"
+            UPDATE gating_audit
+            SET llm_verdict = ?1, llm_score = ?2
+            WHERE candidate_hash = ?3
+            "#,
+            params![verdict, score, candidate_hash],
+        )?;
+        Ok(())
+    }
+
     pub fn record_historical_rejudge_audit(
         &self,
         audit: HistoricalRejudgeAudit<'_>,

@@ -1566,12 +1566,19 @@ fn parse_source_type_param(value: Option<&str>) -> std::result::Result<SourceTyp
     match value {
         Some(raw) => raw.parse::<SourceType>().map_err(|_| {
             ErrorData::invalid_params(
-                "source_type must be one of user_explicit, agent_observation, agent_inference, system_generated",
+                "source_type must be one of: user_explicit, agent_observation, agent_inference, system_generated",
                 None,
             )
         }),
         None => Ok(SourceType::AgentInference),
     }
+}
+
+fn should_apply_async_llm_gating(source_type: SourceType) -> bool {
+    matches!(
+        source_type,
+        SourceType::SystemGenerated | SourceType::AgentObservation
+    )
 }
 
 fn resolve_confidence_param(
@@ -4124,6 +4131,7 @@ impl MempalMcpServer {
                     // mechanical Tier 1 skips while allowing quality policies such as
                     // llm_first to judge Tier 2 keeps.
                     if superseded_drawer_id.is_none()
+                        && should_apply_async_llm_gating(source_type)
                         && should_route_to_llm_judge(&config, &Some(tier2.decision.clone()))
                     {
                         let llm_decision =
@@ -8323,6 +8331,90 @@ mod tests {
         .expect("create MCP server")
         .with_async_db_for_test(async_db);
         (tempdir, db_path, server)
+    }
+
+    #[test]
+    fn test_mcp_invalid_source_type_error_does_not_echo_raw_value() {
+        let raw = "private-invalid-source-type";
+        let error = parse_source_type_param(Some(raw)).expect_err("source_type should reject raw");
+        let message = format!("{error:?}");
+
+        assert!(message.contains("source_type must be one of"));
+        assert!(
+            !message.contains(raw),
+            "invalid source_type errors must not echo caller-supplied raw values"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_explicit_ingest_bypasses_llm_gating() {
+        let _config_guard = ConfigOverrideGuard::install(
+            r#"
+[llm]
+enabled = true
+base_url = "http://127.0.0.1:9/v1"
+model = "unreachable-test-llm"
+enabled_for = ["gating"]
+
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.5
+prototypes = ["keep"]
+
+[gating.llm_judge]
+enabled = true
+quality_policy = "llm_required_for_keep"
+"#,
+        )
+        .await;
+        let (_tempdir, db_path, server) = setup_server();
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "Explicit MCP agent write must bypass LLM filtering even when automatic hook filtering is required.".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("explicit".to_string()),
+                source_type: Some("agent_inference".to_string()),
+                wait: Some(true),
+                wait_timeout_secs: Some(5),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("explicit MCP ingest should not depend on LLM availability")
+            .0;
+
+        assert!(!response.dropped);
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(!response.drawer_id.is_empty());
+        assert!(
+            response.gating_decision.as_ref().is_none_or(|decision| {
+                decision.label.as_deref() != Some("llm_pending")
+                    && decision.label.as_deref() != Some("llm_keep")
+            }),
+            "explicit MCP ingest must not enter the LLM filtering path: {:?}",
+            response.gating_decision
+        );
+        let queue = PendingMessageStore::new_without_reclaim(&db_path);
+        assert!(
+            queue
+                .claim_next_by_kind("mcp-explicit-bypass", 60, "llm_task")
+                .expect("claim llm task")
+                .is_none(),
+            "explicit MCP ingest must not enqueue post-insert LLM filtering tasks"
+        );
+        let audit_label: Option<String> = Database::open(&db_path)
+            .expect("open db")
+            .conn()
+            .query_row(
+                "SELECT label FROM gating_audit WHERE candidate_hash = ?1",
+                [response.drawer_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("query gating audit label");
+        assert_ne!(audit_label.as_deref(), Some("llm_pending"));
     }
 
     #[cfg(unix)]

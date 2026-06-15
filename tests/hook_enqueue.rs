@@ -586,12 +586,14 @@ fn test_hook_envelopes_oversized_payload() {
         .as_str()
         .expect("preview string");
     assert!(preview.len() <= 4096);
-    let payload_path = PathBuf::from(
-        envelope_json["payload_path"]
-            .as_str()
-            .expect("payload path string"),
+    assert!(
+        envelope_json["payload_path"].is_null(),
+        "oversized automatic hook capture must not persist raw payload before LLM gate"
     );
-    assert!(payload_path.exists(), "oversized payload file must exist");
+    assert!(
+        !home.path().join(".mempal").join("hook-oversize").exists(),
+        "oversized automatic hook capture must not create hook-oversize files"
+    );
 }
 
 #[test]
