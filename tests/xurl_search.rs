@@ -1,3 +1,4 @@
+use mempal::core::config::SearchRerankerConfig;
 use mempal::core::db::Database;
 use mempal::embed::Embedder;
 use mempal::xurl::model::{Provenance, RawTurn, Role, Tool, TurnMetadata};
@@ -328,6 +329,64 @@ async fn search_paginates_ranked_results_with_filter_offset() {
 }
 
 #[tokio::test]
+async fn search_optionally_reranks_configured_top_k_hits() {
+    let db = open_temp_db();
+    let embedder = AxisEmbedder;
+    let ids = [
+        seed_scored_turn(&db, 0, 0.99),
+        seed_scored_turn(&db, 1, 0.90),
+        seed_scored_turn(&db, 2, 0.80),
+    ];
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("POST", "/v1/rerank")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "model": "test-reranker",
+            "query": "needle",
+            "top_n": 2
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"results":[{"index":1,"relevance_score":0.98},{"index":0,"relevance_score":0.12}]}"#,
+        )
+        .create_async()
+        .await;
+
+    let result = search::search(
+        &db.inner,
+        &embedder,
+        "needle",
+        SearchOptions {
+            limit: 3,
+            min_score: Some(0.0),
+            reranker: Some(SearchRerankerConfig {
+                enabled: true,
+                endpoint: Some(server.url()),
+                model: Some("test-reranker".to_string()),
+                timeout_secs: 2,
+                top_k: 2,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    mock.assert_async().await;
+    let hit_ids = result
+        .hits
+        .iter()
+        .map(|hit| hit.turn_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        hit_ids,
+        vec![ids[1].as_str(), ids[0].as_str(), ids[2].as_str()]
+    );
+    assert!(result.warnings.is_empty());
+}
+
+#[tokio::test]
 async fn search_with_tool_filter() {
     let db = open_temp_db();
     let embedder = SemanticEmbedder::new(16);
@@ -608,6 +667,7 @@ fn markdown_reports_sub_floor_candidates_when_floor_hides_all_hits() {
         best_score_below_floor: Some(0.645),
         total_candidates: 3,
         min_score_floor: Some(0.70),
+        warnings: Vec::new(),
     });
 
     assert!(
@@ -632,6 +692,7 @@ fn markdown_derives_sub_floor_hint_from_low_best_score() {
         best_score_below_floor: Some(0.350),
         total_candidates: 3,
         min_score_floor: Some(0.70),
+        warnings: Vec::new(),
     });
 
     assert!(
@@ -673,6 +734,7 @@ fn markdown_keeps_confident_match_output_free_of_sub_floor_hint() {
         best_score_below_floor: Some(0.645),
         total_candidates: 2,
         min_score_floor: Some(0.70),
+        warnings: Vec::new(),
     });
 
     assert!(
@@ -697,6 +759,7 @@ fn markdown_reports_no_more_results_for_empty_page_with_passing_matches() {
         best_score_below_floor: Some(0.55),
         total_candidates: 2,
         min_score_floor: Some(0.70),
+        warnings: Vec::new(),
     });
 
     assert!(

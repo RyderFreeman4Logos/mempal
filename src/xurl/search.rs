@@ -21,12 +21,13 @@ struct TurnBestEntry {
     next_message_id: Option<String>,
 }
 
+use crate::core::config::SearchRerankerConfig;
 use crate::core::db::Database;
 use crate::embed::Embedder;
 use crate::xurl::store::{TurnFilter, push_filter_conditions};
 use crate::xurl::{XurlError, XurlResult};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
     pub turn_id: String,
     pub session_id: String,
@@ -58,6 +59,8 @@ pub struct SearchResult {
     pub total_candidates: usize,
     /// The min-score threshold that was applied, if any.
     pub min_score_floor: Option<f32>,
+    /// Non-sensitive diagnostics for optional retrieval stages such as reranking.
+    pub warnings: Vec<String>,
 }
 
 /// Deserialize a raw f32 little-endian BLOB into a vector.
@@ -95,6 +98,8 @@ pub struct SearchOptions {
     pub include_agent_prompts: bool,
     /// Exclude hits scoring below this threshold.
     pub min_score: Option<f32>,
+    /// Optional top-K reranker. `None` keeps xurl search fully local and preserves vector order.
+    pub reranker: Option<SearchRerankerConfig>,
 }
 
 /// Semantic search over `conversation_turn_vectors` using brute-force cosine similarity.
@@ -118,6 +123,7 @@ pub async fn search<E: Embedder + ?Sized>(
         include_csa,
         include_agent_prompts,
         min_score,
+        reranker,
     } = opts;
     if limit == 0 {
         return Ok(SearchResult {
@@ -126,6 +132,7 @@ pub async fn search<E: Embedder + ?Sized>(
             best_score_below_floor: None,
             total_candidates: 0,
             min_score_floor: min_score,
+            warnings: Vec::new(),
         });
     }
 
@@ -307,6 +314,26 @@ pub async fn search<E: Embedder + ?Sized>(
     let best_score_below_floor = below_floor.into_iter().next().map(|h| h.score);
 
     let passing_total = passing.len();
+    let mut passing = passing;
+    let mut warnings = Vec::new();
+    if let Some(reranker_config) = reranker {
+        let documents = passing
+            .iter()
+            .map(|hit| hit.content.as_str())
+            .collect::<Vec<_>>();
+        let outcome = crate::search::rerank::maybe_rerank_indices_with_config(
+            &reranker_config,
+            query,
+            documents,
+        )
+        .await;
+        warnings.extend(outcome.warnings);
+        passing = outcome
+            .order
+            .into_iter()
+            .filter_map(|index| passing.get(index).cloned())
+            .collect();
+    }
     let hits = passing.into_iter().skip(offset).take(limit).collect();
 
     Ok(SearchResult {
@@ -315,6 +342,7 @@ pub async fn search<E: Embedder + ?Sized>(
         best_score_below_floor,
         total_candidates,
         min_score_floor: min_score,
+        warnings,
     })
 }
 
