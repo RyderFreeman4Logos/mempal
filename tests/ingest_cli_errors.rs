@@ -79,6 +79,53 @@ fn write_embed_config(home: &Path, base_url: &str) {
     write_embed_config_with_privacy(home, base_url, false);
 }
 
+fn write_embed_config_with_hook_llm_judge(home: &Path, embed_base_url: &str, llm_base_url: &str) {
+    let db_path = home.join(".mempal").join("palace.db");
+    let config = format!(
+        r#"
+db_path = "{}"
+
+[embed]
+backend = "openai_compat"
+base_url = "{}"
+api_model = "test-embed"
+dim = 4
+
+[embed.openai_compat]
+base_url = "{}"
+model = "test-embed"
+dim = 4
+request_timeout_secs = 2
+
+[llm]
+enabled = true
+base_url = "{}"
+model = "test-llm"
+request_timeout_secs = 1
+retry_interval_secs = 1
+enabled_for = ["gating"]
+
+[hooks]
+enabled = true
+
+[gating]
+enabled = true
+
+[gating.llm_judge]
+enabled = true
+threshold = 0.5
+
+[privacy]
+enabled = false
+"#,
+        db_path.display(),
+        embed_base_url,
+        embed_base_url,
+        llm_base_url
+    );
+    fs::write(home.join(".mempal").join("config.toml"), config).expect("write config");
+}
+
 fn write_embed_config_with_privacy(home: &Path, base_url: &str, privacy_enabled: bool) {
     let db_path = home.join(".mempal").join("palace.db");
     let config = format!(
@@ -272,6 +319,52 @@ async fn test_ingest_stdin_json_creates_single_drawer() {
         mempal::core::types::SourceType::UserExplicit
     );
     assert!((drawer.confidence - 0.82).abs() < f64::EPSILON);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_stdin_user_explicit_bypasses_hook_llm_gate() {
+    let tmp = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_embed_config_with_hook_llm_judge(
+        tmp.path(),
+        &format!("http://{addr}/v1"),
+        "http://127.0.0.1:9/v1",
+    );
+
+    let payload = r#"{
+        "content": "explicit CLI memory should not wait for automatic hook LLM filtering",
+        "wing": "explicit-wing",
+        "room": "explicit-room",
+        "source_file": "cli://stdin/explicit"
+    }"#;
+    let output = run_ingest_stdin_json(
+        tmp.path(),
+        payload,
+        &["--source-type", "user_explicit", "--json"],
+    );
+    handle.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "explicit stdin ingest must not call the unavailable LLM, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse stdin ingest JSON");
+    let drawer_id = json["drawer_ids"][0].as_str().expect("drawer id string");
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    let drawer = db
+        .get_drawer(drawer_id)
+        .expect("get drawer")
+        .expect("drawer exists");
+    assert_eq!(drawer.wing, "explicit-wing");
+    assert_eq!(drawer.room.as_deref(), Some("explicit-room"));
+    assert_eq!(
+        drawer.source_type,
+        mempal::core::types::SourceType::UserExplicit
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
