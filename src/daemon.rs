@@ -87,14 +87,6 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     install_shutdown_handlers()?;
     tracing::info!("daemon log path: {}", context.log_path.display());
 
-    if context.config.hooks.session_end.auto_ingest_conversation {
-        tracing::warn!(
-            "config.hooks.session_end.auto_ingest_conversation is set to true but was \
-             removed in P16. Use `mempal xurl ingest` instead. \
-             Set auto_ingest_conversation = false to suppress this warning."
-        );
-    }
-
     // Start REST API before the hooks check so the API remains available
     // even when hooks are disabled.
     #[cfg(feature = "rest")]
@@ -1010,6 +1002,20 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         last_drawer_id = Some(drawer_id);
     }
 
+    if let Some(stats) =
+        auto_ingest_hermes_session_end(db, store, worker_id, message, embedder, &context, &envelope)
+            .await?
+    {
+        tracing::info!(
+            turns_parsed = stats.turns_parsed,
+            turns_inserted = stats.turns_inserted,
+            turns_skipped = stats.turns_skipped,
+            turns_updated = stats.turns_updated,
+            vectors_created = stats.vectors_created,
+            "auto-ingested gated Hermes session turns"
+        );
+    }
+
     Ok(last_drawer_id.unwrap_or_else(|| message.id.clone()))
 }
 
@@ -1056,6 +1062,425 @@ async fn embed_text_with_heartbeat<E: Embedder + ?Sized>(
         .into_iter()
         .next()
         .ok_or_else(|| EmbedError::Runtime("embedder returned no vectors".to_string()))
+}
+
+async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
+    db: &AsyncDb,
+    store: &AsyncPendingMessageStore,
+    worker_id: &str,
+    message: &ClaimedMessage,
+    embedder: &E,
+    context: &DaemonIngestContext<'_>,
+    envelope: &CapturedHookEnvelope,
+) -> Result<Option<crate::xurl::ingest::IngestStats>> {
+    if envelope.event != crate::hook::HookEvent::SessionEnd.display_name()
+        || !context.config.hooks.session_end.auto_ingest_conversation
+    {
+        return Ok(None);
+    }
+    if !context.config.ingest_gating.enabled {
+        tracing::warn!(
+            "SessionEnd Hermes auto-ingest skipped because ingest_gating.enabled is false; \
+             automatic conversation import requires a pre-insert gate"
+        );
+        return Ok(Some(crate::xurl::ingest::IngestStats::default()));
+    }
+
+    let Some(session_id) = hermes_session_id_from_envelope(envelope) else {
+        tracing::warn!(
+            event = %envelope.event,
+            agent = %envelope.agent,
+            "SessionEnd Hermes auto-ingest skipped because payload has no session_id"
+        );
+        return Ok(Some(crate::xurl::ingest::IngestStats::default()));
+    };
+    let profile = context.config.hooks.session_end.hermes_profile.trim();
+    let profile = if profile.is_empty() {
+        "default"
+    } else {
+        profile
+    };
+    let hermes_db = crate::xurl::ingest::default_hermes_db_path(
+        profile,
+        context.config.hooks.session_end.hermes_home.as_deref(),
+    );
+    if !hermes_db.exists() {
+        tracing::warn!(
+            hermes_db = %hermes_db.display(),
+            hermes_profile = profile,
+            "SessionEnd Hermes auto-ingest skipped because state.db was not found"
+        );
+        return Ok(Some(crate::xurl::ingest::IngestStats::default()));
+    }
+
+    let mut parse_options =
+        crate::xurl::parser::hermes::HermesParseOptions::new(&session_id, profile, false);
+    parse_options.session_id_filter = Some(session_id.clone());
+    parse_options.cwd = Some(envelope.claude_cwd.clone());
+    let parse_db = hermes_db.clone();
+    let parsed_turns = tokio::task::spawn_blocking(move || {
+        crate::xurl::parser::hermes::parse_hermes_db_with_options(&parse_db, &parse_options)
+    })
+    .await
+    .context("Hermes auto-ingest parser task failed")?
+    .with_context(|| format!("failed to parse Hermes state.db {}", hermes_db.display()))?;
+    let turns_parsed = parsed_turns.len();
+
+    let heartbeat_store = store.clone();
+    let heartbeat_message_id = message.id.clone();
+    let heartbeat_worker_id = worker_id.to_string();
+    let embed_heartbeat = move || -> crate::embed::Result<()> {
+        let store = heartbeat_store.clone();
+        let message_id = heartbeat_message_id.clone();
+        let worker_id = heartbeat_worker_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
+                tracing::warn!(
+                    ?error,
+                    message_id,
+                    "failed to refresh Hermes auto-ingest embed heartbeat"
+                );
+            }
+        });
+        Ok(())
+    };
+    let llm_heartbeat_store = store.clone();
+    let llm_heartbeat_message_id = message.id.clone();
+    let llm_heartbeat_worker_id = worker_id.to_string();
+    let llm_heartbeat = move || -> std::result::Result<(), crate::llm::LlmError> {
+        let store = llm_heartbeat_store.clone();
+        let message_id = llm_heartbeat_message_id.clone();
+        let worker_id = llm_heartbeat_worker_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = store.refresh_heartbeat(message_id.clone(), worker_id).await {
+                tracing::warn!(
+                    ?error,
+                    message_id,
+                    "failed to refresh Hermes auto-ingest LLM heartbeat"
+                );
+            }
+        });
+        Ok(())
+    };
+
+    let project_id = resolve_hook_project_id(envelope, context.config)?;
+    let mut kept_turns = Vec::new();
+    for mut turn in parsed_turns {
+        turn.content = context.config.scrub_content(&turn.content);
+        if turn.content.trim().is_empty() {
+            continue;
+        }
+        let candidate_hash = crate::xurl::store::turn_id_for(&turn);
+        if gate_automatic_hermes_turn(
+            db,
+            embedder,
+            context,
+            AutomaticHermesTurnGateInput {
+                turn: &turn,
+                candidate_hash: &candidate_hash,
+                project_id: project_id.as_deref(),
+                embed_heartbeat: Some(&embed_heartbeat),
+                llm_heartbeat: Some(&llm_heartbeat),
+            },
+        )
+        .await?
+        {
+            kept_turns.push(turn);
+        }
+    }
+
+    if kept_turns.is_empty() {
+        return Ok(Some(crate::xurl::ingest::IngestStats {
+            turns_parsed,
+            turns_inserted: 0,
+            turns_skipped: 0,
+            turns_updated: 0,
+            vectors_created: 0,
+        }));
+    }
+
+    let insert_stats = db
+        .run_write_anyhow(move |db| {
+            crate::xurl::store::insert_turns(db.conn(), &kept_turns)
+                .context("failed to insert gated Hermes turns")
+        })
+        .await?;
+    let turn_ids = insert_stats.turn_ids.clone();
+    let vector_fingerprint = context
+        .config
+        .embed
+        .current_vector_embedder_fingerprint(embedder.dimensions());
+    let vectors_created = embed_and_write_hermes_turn_vectors(
+        db,
+        embedder,
+        &turn_ids,
+        &vector_fingerprint,
+        context.config,
+        Some(&embed_heartbeat),
+    )
+    .await
+    .context("failed to embed gated Hermes turns")?;
+
+    Ok(Some(crate::xurl::ingest::IngestStats {
+        turns_parsed,
+        turns_inserted: insert_stats.inserted,
+        turns_skipped: insert_stats.skipped,
+        turns_updated: insert_stats.updated,
+        vectors_created,
+    }))
+}
+
+async fn embed_and_write_hermes_turn_vectors<E: Embedder + ?Sized>(
+    db: &AsyncDb,
+    embedder: &E,
+    turn_ids: &[String],
+    fingerprint: &str,
+    config: &crate::core::config::Config,
+    heartbeat: Option<&HeartbeatCallback>,
+) -> Result<usize> {
+    let mut embedded = 0usize;
+    for batch in turn_ids.chunks(500) {
+        let batch_ids = batch.to_vec();
+        let candidates = db
+            .run_read_anyhow(move |db| {
+                if batch_ids.is_empty() {
+                    return Ok(Vec::<(String, String)>::new());
+                }
+                let placeholders = (0..batch_ids.len())
+                    .map(|index| format!("?{}", index + 1))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT ct.id, ct.content \
+                     FROM conversation_turns ct \
+                     LEFT JOIN conversation_turn_vectors ctv \
+                       ON ctv.turn_id = ct.id AND ctv.chunk_index = 0 \
+                     WHERE ct.id IN ({placeholders}) AND ctv.turn_id IS NULL"
+                );
+                let mut stmt = db.conn().prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(batch_ids.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })
+            .await?;
+        if candidates.is_empty() {
+            continue;
+        }
+
+        let mut vector_rows = Vec::<(String, i64, Vec<u8>)>::new();
+        for (turn_id, content) in candidates {
+            let chunks = crate::ingest::chunk::chunk_text_token_aware(
+                &content,
+                &config.chunker,
+                embedder,
+                Some(&format!("xurl:auto-hermes:{turn_id}")),
+            );
+            for (chunk_index, chunk) in chunks.iter().enumerate() {
+                let vector = embed_text_with_heartbeat(embedder, chunk, heartbeat).await?;
+                vector_rows.push((
+                    turn_id.clone(),
+                    chunk_index as i64,
+                    serialize_f32_vector(&vector),
+                ));
+            }
+        }
+        if vector_rows.is_empty() {
+            continue;
+        }
+
+        let fingerprint = fingerprint.to_string();
+        let dim = i64::try_from(embedder.dimensions()).unwrap_or(i64::MAX);
+        let rows_written = db
+            .run_write_anyhow(move |db| {
+                let conn = db.conn();
+                conn.execute_batch("BEGIN IMMEDIATE")?;
+                let write = (|| -> rusqlite::Result<usize> {
+                    let mut rows_written = 0usize;
+                    for (turn_id, chunk_index, blob) in &vector_rows {
+                        rows_written += conn.execute(
+                            "INSERT INTO conversation_turn_vectors \
+                             (turn_id, chunk_index, vector, embedder_fingerprint, dim, index_version) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                             ON CONFLICT(turn_id, chunk_index) DO NOTHING",
+                            rusqlite::params![
+                                turn_id,
+                                chunk_index,
+                                blob,
+                                &fingerprint,
+                                dim,
+                                crate::core::db::CURRENT_VECTOR_INDEX_VERSION,
+                            ],
+                        )?;
+                    }
+                    Ok(rows_written)
+                })();
+                match write {
+                    Ok(rows_written) => {
+                        conn.execute_batch("COMMIT")?;
+                        Ok(rows_written)
+                    }
+                    Err(error) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Err(error.into())
+                    }
+                }
+            })
+            .await?;
+        embedded += rows_written;
+    }
+    Ok(embedded)
+}
+
+fn serialize_f32_vector(vector: &[f32]) -> Vec<u8> {
+    vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+struct AutomaticHermesTurnGateInput<'a> {
+    turn: &'a crate::xurl::model::RawTurn,
+    candidate_hash: &'a str,
+    project_id: Option<&'a str>,
+    embed_heartbeat: Option<&'a HeartbeatCallback>,
+    llm_heartbeat: Option<&'a crate::llm::retry::HeartbeatCallback>,
+}
+
+async fn gate_automatic_hermes_turn<E: Embedder + ?Sized>(
+    db: &AsyncDb,
+    embedder: &E,
+    context: &DaemonIngestContext<'_>,
+    input: AutomaticHermesTurnGateInput<'_>,
+) -> Result<bool> {
+    let candidate = IngestCandidate {
+        content: input.turn.content.clone(),
+        event: Some("HermesSessionTurn".to_string()),
+        tool_name: input.turn.metadata.tool_name.clone(),
+        exit_code: None,
+    };
+    let mut gating_decision = evaluate_tier1(&candidate, &context.config.ingest_gating);
+    if gating_decision.is_none()
+        && context.config.ingest_gating.enabled
+        && !tier2_enabled(&context.config.ingest_gating)
+    {
+        gating_decision = Some(GatingDecision::accepted(
+            0,
+            Some("tier2_disabled".to_string()),
+            None,
+        ));
+    }
+    if let Some(decision) = gating_decision.as_ref()
+        && decision.is_rejected()
+        && should_drop_reject_before_automatic_hook_llm_gate(context.config, decision)
+    {
+        record_gating_audit_async(
+            db,
+            input.candidate_hash,
+            decision,
+            input.project_id.map(ToOwned::to_owned),
+            None,
+        )
+        .await?;
+        return Ok(false);
+    }
+
+    if gating_decision.is_none() && tier2_enabled(&context.config.ingest_gating) {
+        let classifier = context.prototype_classifier.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Hermes auto-ingest requires prototype classifier but it is not available"
+            )
+        })?;
+        let candidate_vector = embed_text_with_heartbeat(
+            embedder,
+            analysis_content(&candidate.content),
+            input.embed_heartbeat,
+        )
+        .await?;
+        let decision = classifier.decide(
+            &candidate_vector,
+            context.config.ingest_gating.embedding_classifier.threshold,
+        );
+        if decision.is_rejected()
+            && should_drop_reject_before_automatic_hook_llm_gate(context.config, &decision)
+        {
+            record_gating_audit_async(
+                db,
+                input.candidate_hash,
+                &decision,
+                input.project_id.map(ToOwned::to_owned),
+                None,
+            )
+            .await?;
+            return Ok(false);
+        }
+        gating_decision = Some(decision);
+    }
+
+    if automatic_hook_llm_gate_required(context.config) {
+        let classifier_decision = gating_decision.clone();
+        let llm_decision = judge_automatic_content_llm_gate(
+            context.llm_gate,
+            context.config,
+            input.candidate_hash,
+            &candidate.content,
+            input.llm_heartbeat,
+        )
+        .await?;
+        let audit_decision = classifier_decision
+            .as_ref()
+            .map(|decision| audit_decision_with_llm_outcome(decision, &llm_decision))
+            .unwrap_or_else(|| llm_decision.clone());
+        record_gating_audit_async(
+            db,
+            input.candidate_hash,
+            &audit_decision,
+            input.project_id.map(ToOwned::to_owned),
+            (!audit_decision.is_rejected()).then_some(candidate.content.as_str()),
+        )
+        .await?;
+        record_llm_verdict_async(db, input.candidate_hash, &llm_decision).await?;
+        return Ok(!llm_decision.is_rejected());
+    }
+
+    let decision = gating_decision.unwrap_or_else(|| {
+        GatingDecision::accepted(0, Some("gating_default_keep".to_string()), None)
+    });
+    let keep = !decision.is_rejected();
+    record_gating_audit_async(
+        db,
+        input.candidate_hash,
+        &decision,
+        input.project_id.map(ToOwned::to_owned),
+        keep.then_some(candidate.content.as_str()),
+    )
+    .await?;
+    Ok(keep)
+}
+
+fn hermes_session_id_from_envelope(envelope: &CapturedHookEnvelope) -> Option<String> {
+    let payload = envelope.payload.as_deref()?;
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+    json_string_at(&value, &["session_id"])
+        .or_else(|| json_string_at(&value, &["sessionId"]))
+        .or_else(|| json_string_at(&value, &["session", "id"]))
+        .or_else(|| json_string_at(&value, &["session", "session_id"]))
+}
+
+fn json_string_at(value: &Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn queue_failure_disposition(error: &anyhow::Error) -> QueueFailureDisposition {
@@ -1860,25 +2285,40 @@ async fn judge_automatic_hook_llm_gate(
     content: &str,
     heartbeat: Option<&crate::llm::retry::HeartbeatCallback>,
 ) -> Result<GatingDecision> {
-    let gate = context.daemon.llm_gate.ok_or_else(|| {
+    judge_automatic_content_llm_gate(
+        context.daemon.llm_gate,
+        context.daemon.config,
+        drawer_id,
+        content,
+        heartbeat,
+    )
+    .await
+}
+
+async fn judge_automatic_content_llm_gate(
+    gate: Option<&HookLlmGateRuntime>,
+    config: &crate::core::config::Config,
+    candidate_hash: &str,
+    content: &str,
+    heartbeat: Option<&crate::llm::retry::HeartbeatCallback>,
+) -> Result<GatingDecision> {
+    let gate = gate.ok_or_else(|| {
         anyhow::anyhow!(
             "LLM gating is required for automatic hook writes but no LLM gate runtime is available"
         )
     })?;
     let task = crate::llm::LlmTaskPayload {
         task_type: "gating".to_string(),
-        drawer_id: drawer_id.to_string(),
-        drawer_ids: vec![drawer_id.to_string()],
+        drawer_id: candidate_hash.to_string(),
+        drawer_ids: vec![candidate_hash.to_string()],
         content: content.to_string(),
-        system_prompt: context
-            .daemon
-            .config
+        system_prompt: config
             .ingest_gating
             .llm_judge
             .as_ref()
             .and_then(|judge| judge.system_prompt.clone()),
     };
-    let outcome = match gate.judge(context.daemon.config, &task, heartbeat).await {
+    let outcome = match gate.judge(config, &task, heartbeat).await {
         Ok(outcome) => outcome,
         Err(error) => {
             let error_chain = format!("{error:#}");

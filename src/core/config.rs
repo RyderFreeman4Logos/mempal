@@ -1115,9 +1115,14 @@ pub struct HooksSessionEndConfig {
     pub trailing_messages: usize,
     pub min_length: usize,
     pub wing: String,
-    /// Deprecated (P16): SessionEnd auto-ingest was removed. Field kept for config
-    /// compat; set to false in your config to suppress the deprecation warning.
+    /// Automatically ingest the matching Hermes session into xurl when a SessionEnd
+    /// hook is processed. Automatic ingest is gated before any conversation turn is
+    /// written, so rejected/noisy turns never enter `conversation_turns` or vectors.
     pub auto_ingest_conversation: bool,
+    /// Hermes profile to ingest when `auto_ingest_conversation` is enabled.
+    pub hermes_profile: String,
+    /// Optional Hermes home override. Defaults to `HERMES_HOME` or `~/.hermes`.
+    pub hermes_home: Option<PathBuf>,
 }
 
 impl Default for HooksSessionEndConfig {
@@ -1128,6 +1133,8 @@ impl Default for HooksSessionEndConfig {
             min_length: DEFAULT_SESSION_REVIEW_MIN_LENGTH,
             wing: DEFAULT_SESSION_REVIEW_WING.to_string(),
             auto_ingest_conversation: false,
+            hermes_profile: "default".to_string(),
+            hermes_home: None,
         }
     }
 }
