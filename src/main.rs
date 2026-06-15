@@ -10865,6 +10865,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                     include_csa,
                     include_agent_prompts,
                     min_score: Some(min_score),
+                    reranker: Some(config.search.reranker.clone()),
                 },
             )
             .await
@@ -11309,6 +11310,7 @@ async fn hermes_query_command(db: &Database, config: &Config, args: HermesQueryA
             include_csa: args.include_csa,
             include_agent_prompts: args.include_agent_prompts,
             min_score: Some(args.min_score),
+            reranker: Some(config.search.reranker.clone()),
         },
     )
     .await

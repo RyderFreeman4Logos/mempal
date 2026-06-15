@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import sys
 import tempfile
@@ -11,7 +12,12 @@ PLUGIN_DIR = os.path.dirname(__file__)
 if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
-from mempal import MempalMemoryProvider, _LLMClient, _IntelligenceEnhancer  # noqa: E402
+from mempal import (  # noqa: E402
+    MempalMemoryProvider,
+    _LLMClient,
+    _IntelligenceEnhancer,
+    _encode_query_params,
+)
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -22,6 +28,25 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertIn("register_memory_provider", scan_window)
         self.assertIn("MemoryProvider", scan_window)
+
+    def test_rest_query_encoding_uses_serde_compatible_booleans(self) -> None:
+        encoded = _encode_query_params({"include_raw_turns": False, "active": True})
+
+        self.assertIn("include_raw_turns=false", encoded)
+        self.assertIn("active=true", encoded)
+
+    def test_hooks_rest_query_encoding_uses_serde_compatible_booleans(self) -> None:
+        hooks_path = os.path.join(PLUGIN_DIR, "mempal-hooks", "__init__.py")
+        spec = importlib.util.spec_from_file_location("mempal_hooks_for_test", hooks_path)
+        if spec is None or spec.loader is None:
+            self.fail("failed to load mempal-hooks plugin module")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        encoded = module._encode_query_params({"include_raw_turns": False, "active": True})
+
+        self.assertIn("include_raw_turns=false", encoded)
+        self.assertIn("active=true", encoded)
 
 
 class RecordingProvider(MempalMemoryProvider):

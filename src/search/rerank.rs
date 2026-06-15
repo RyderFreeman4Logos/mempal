@@ -24,6 +24,28 @@ pub struct RerankOutcome {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRerankOutcome {
+    pub order: Vec<usize>,
+    pub warnings: Vec<String>,
+}
+
+impl IndexRerankOutcome {
+    fn unchanged(len: usize) -> Self {
+        Self {
+            order: (0..len).collect(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn fallback(len: usize, error: RerankError) -> Self {
+        Self {
+            order: (0..len).collect(),
+            warnings: vec![reranker_fallback_warning(&error)],
+        }
+    }
+}
+
 impl RerankOutcome {
     fn unchanged(results: Vec<SearchResult>) -> Self {
         Self {
@@ -125,26 +147,21 @@ impl HttpReranker {
             model,
         })
     }
-}
 
-#[async_trait::async_trait]
-impl Reranker for HttpReranker {
-    async fn try_rerank(
+    pub async fn try_rerank_indices(
         &self,
         query: &str,
-        results: Vec<SearchResult>,
-    ) -> Result<Vec<SearchResult>, RerankError> {
-        if results.len() <= 1 {
-            return Ok(results);
+        documents: Vec<&str>,
+    ) -> Result<Vec<usize>, RerankError> {
+        if documents.len() <= 1 {
+            return Ok((0..documents.len()).collect());
         }
+        let document_count = documents.len();
         let request = RerankRequest {
             model: &self.model,
             query,
-            documents: results
-                .iter()
-                .map(|result| result.content.as_str())
-                .collect(),
-            top_n: results.len(),
+            documents,
+            top_n: document_count,
         };
         let response = self
             .client
@@ -161,7 +178,26 @@ impl Reranker for HttpReranker {
         let body = read_limited_response_body(response).await?;
         let response = serde_json::from_slice::<RerankResponse>(&body)
             .map_err(|source| RerankError::DecodeResponse(source.to_string()))?;
-        reorder_results(results, response.items())
+        reorder_indices(document_count, response.items())
+    }
+}
+
+#[async_trait::async_trait]
+impl Reranker for HttpReranker {
+    async fn try_rerank(
+        &self,
+        query: &str,
+        results: Vec<SearchResult>,
+    ) -> Result<Vec<SearchResult>, RerankError> {
+        let documents = results
+            .iter()
+            .map(|result| result.content.as_str())
+            .collect();
+        let order = self.try_rerank_indices(query, documents).await?;
+        Ok(order
+            .into_iter()
+            .map(|index| results[index].clone())
+            .collect())
     }
 }
 
@@ -244,6 +280,33 @@ pub async fn maybe_rerank_with_config(
     }
 }
 
+pub async fn maybe_rerank_indices_with_config(
+    config: &SearchRerankerConfig,
+    query: &str,
+    documents: Vec<&str>,
+) -> IndexRerankOutcome {
+    if !config.enabled || documents.len() <= 1 {
+        return IndexRerankOutcome::unchanged(documents.len());
+    }
+
+    let candidate_count = config.top_k.min(documents.len());
+    let candidates = documents[..candidate_count].to_vec();
+    let reranker = match HttpReranker::from_config(config) {
+        Ok(reranker) => reranker,
+        Err(error) => return IndexRerankOutcome::fallback(documents.len(), error),
+    };
+    match reranker.try_rerank_indices(query, candidates).await {
+        Ok(mut order) => {
+            order.extend(candidate_count..documents.len());
+            IndexRerankOutcome {
+                order,
+                warnings: Vec::new(),
+            }
+        }
+        Err(error) => IndexRerankOutcome::fallback(documents.len(), error),
+    }
+}
+
 fn reranker_fallback_warning(error: &RerankError) -> String {
     format!(
         "reranker unavailable; using original search ranking: {}",
@@ -284,21 +347,28 @@ struct RerankItem {
     score: Option<f32>,
 }
 
+#[cfg(test)]
 fn reorder_results(
     results: Vec<SearchResult>,
     items: Vec<RerankItem>,
 ) -> Result<Vec<SearchResult>, RerankError> {
+    let order = reorder_indices(results.len(), items)?;
+    Ok(order
+        .into_iter()
+        .map(|index| results[index].clone())
+        .collect())
+}
+
+fn reorder_indices(len: usize, items: Vec<RerankItem>) -> Result<Vec<usize>, RerankError> {
     if items.is_empty() {
         return Err(RerankError::InvalidResponse(
             "missing results or data array".to_string(),
         ));
     }
-
-    let original = results;
     let mut ranked = items
         .into_iter()
         .filter_map(|item| {
-            if item.index >= original.len() {
+            if item.index >= len {
                 return None;
             }
             let score = item.score?;
@@ -321,15 +391,15 @@ fn reorder_results(
     });
 
     let mut seen = HashSet::new();
-    let mut ordered = Vec::with_capacity(original.len());
+    let mut ordered = Vec::with_capacity(len);
     for (index, _) in ranked {
         if seen.insert(index) {
-            ordered.push(original[index].clone());
+            ordered.push(index);
         }
     }
-    for (index, result) in original.into_iter().enumerate() {
+    for index in 0..len {
         if seen.insert(index) {
-            ordered.push(result);
+            ordered.push(index);
         }
     }
     Ok(ordered)
