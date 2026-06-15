@@ -128,6 +128,20 @@ def _strip_none(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
+def _rest_query_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value
+
+
+def _encode_query_params(params: Dict[str, Any]) -> str:
+    import urllib.parse
+
+    return urllib.parse.urlencode(
+        {k: _rest_query_value(v) for k, v in params.items() if v is not None}
+    )
+
+
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
@@ -668,10 +682,10 @@ class MempalMemoryProvider:
             logger.warning("mempal circuit breaker tripped after %d failures. Pausing %ds.", self._consecutive_failures, _BREAKER_COOLDOWN_SECS)
 
     def _get(self, path, params=None):
-        import urllib.parse, urllib.request
+        import urllib.request
         url = self._base_url + path
         if params:
-            url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+            url += "?" + _encode_query_params(params)
         with urllib.request.urlopen(url, timeout=10) as resp:
             return json.loads(resp.read().decode())
 

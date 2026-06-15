@@ -67,6 +67,20 @@ def _load_config(hermes_home: str = "") -> dict:
     return config
 
 
+def _rest_query_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value
+
+
+def _encode_query_params(params: Dict[str, Any]) -> str:
+    import urllib.parse
+
+    return urllib.parse.urlencode(
+        {k: _rest_query_value(v) for k, v in params.items() if v is not None}
+    )
+
+
 class _MempalHooks:
     def __init__(self) -> None:
         self._base_url = "http://127.0.0.1:3080"
@@ -114,14 +128,11 @@ class _MempalHooks:
             )
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        import urllib.parse
         import urllib.request
 
         url = self._base_url + path
         if params:
-            url += "?" + urllib.parse.urlencode(
-                {k: v for k, v in params.items() if v is not None}
-            )
+            url += "?" + _encode_query_params(params)
         with urllib.request.urlopen(url, timeout=10) as resp:
             return json.loads(resp.read().decode())
 
