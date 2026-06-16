@@ -13952,11 +13952,16 @@ async fn maintenance_rejudge_all_command(
                 ))?;
             }
             if waiting_for_llm {
-                return Err(error).with_context(|| {
-                    format!(
-                        "historical rejudge is waiting for a configured LLM endpoint while processing rowids {page_start}..={page_end}; pending work was left unprocessed and should be retried by rerunning `mempal maintenance rejudge --all --resume --execute`"
-                    )
-                });
+                let retry_delay = historical_rejudge_llm_retry_delay(&error);
+                eprintln!(
+                    "historical rejudge is waiting for a configured LLM endpoint while processing rowids {page_start}..={page_end}; retrying in {}s",
+                    retry_delay.as_secs_f64()
+                );
+                tokio::time::sleep(retry_delay).await;
+                checkpoint.status = "running".to_string();
+                checkpoint.updated_at = iso_timestamp();
+                save_historical_rejudge_checkpoint(db, &checkpoint)?;
+                continue;
             }
             return Err(error).with_context(|| {
                 format!(
@@ -16694,6 +16699,16 @@ fn is_retryable_historical_llm_error(error: &anyhow::Error) -> bool {
         .any(LlmError::is_retryable)
 }
 
+fn historical_rejudge_llm_retry_delay(error: &anyhow::Error) -> std::time::Duration {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<LlmError>())
+        .find_map(LlmError::retry_after)
+        .filter(|duration| !duration.is_zero())
+        .unwrap_or_else(|| std::time::Duration::from_secs(1))
+        .max(std::time::Duration::from_millis(1))
+}
+
 const HIGH_HISTORICAL_IMPORTANCE_THRESHOLD: i32 = 3;
 
 fn historical_protection_reason(drawer: &Drawer) -> Option<String> {
@@ -18969,22 +18984,6 @@ enabled = true
             .expect("load historical rejudge work item decision")
     }
 
-    fn historical_rejudge_work_item_llm_stage(
-        db: &Database,
-        run_id: &str,
-        drawer_rowid: i64,
-    ) -> Option<String> {
-        db.conn()
-            .query_row(
-                &format!(
-                    "SELECT llm_stage FROM {HISTORICAL_REJUDGE_WORK_TABLE} WHERE run_id = ?1 AND drawer_rowid = ?2"
-                ),
-                rusqlite::params![run_id, drawer_rowid],
-                |row| row.get(0),
-            )
-            .expect("load historical rejudge work item LLM stage")
-    }
-
     fn rejudge_progress_events(path: &Path) -> Vec<serde_json::Value> {
         std::fs::read_to_string(path)
             .expect("read progress file")
@@ -20689,12 +20688,20 @@ enabled = true
     }
 
     #[tokio::test]
-    async fn historical_rejudge_all_execute_llm_timeout_keeps_work_pending_for_retry() {
+    async fn historical_rejudge_all_execute_llm_timeout_retries_until_recovered() {
         let mut server = mockito::Server::new_async().await;
-        let llm_mock = server
+        let timeout_mock = server
             .mock("POST", "/v1/chat/completions")
             .with_status(408)
+            .with_header("Retry-After", "0")
             .with_body("request timeout")
+            .expect(1)
+            .create_async()
+            .await;
+        let recovered_mock = server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("test-judge", 0.91, "retry_keep"))
             .expect(1)
             .create_async()
             .await;
@@ -20711,24 +20718,17 @@ enabled = true
         let backups = backup_dir(&tmp);
         let config = llm_rejudge_config(&server.url());
 
-        let error = maintenance_rejudge_command(
-            &db,
-            &config,
-            full_rejudge_options(true, Some(&backups), 1),
-        )
-        .await
-        .expect_err("transient LLM timeout keeps the work item pending for retry");
-        assert!(
-            error.to_string().contains("LLM") || error.to_string().contains("endpoint"),
-            "unexpected error: {error:#}"
-        );
+        maintenance_rejudge_command(&db, &config, full_rejudge_options(true, Some(&backups), 1))
+            .await
+            .expect("transient LLM timeout should wait and retry until the endpoint recovers");
 
-        llm_mock.assert_async().await;
+        timeout_mock.assert_async().await;
+        recovered_mock.assert_async().await;
         assert!(
             db.get_drawer("llm-timeout-keep")
                 .expect("load active drawer")
                 .is_some(),
-            "LLM failures must not delete while the required gate is pending"
+            "LLM recovery with a keep verdict must preserve the drawer"
         );
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
         let backup_file = only_backup_file(&backups);
@@ -20740,13 +20740,13 @@ enabled = true
         let checkpoint = load_historical_rejudge_checkpoint(&db)
             .expect("load checkpoint")
             .expect("checkpoint");
-        assert_eq!(checkpoint.status, "waiting_llm");
-        assert_eq!(checkpoint.scanned_count, 0);
-        assert_eq!(checkpoint.kept_count, 0);
+        assert_eq!(checkpoint.status, "done");
+        assert_eq!(checkpoint.scanned_count, 1);
+        assert_eq!(checkpoint.kept_count, 1);
         assert_eq!(checkpoint.mutated_count, 0);
         assert_eq!(
             historical_rejudge_work_item_decision(&db, &checkpoint.run_id, rowid).as_deref(),
-            None
+            Some("keep")
         );
         let audit_count: i64 = db
             .conn()
@@ -20757,8 +20757,8 @@ enabled = true
             )
             .expect("count historical rejudge audit rows");
         assert_eq!(
-            audit_count, 0,
-            "pending LLM work must not audit a keep verdict"
+            audit_count, 1,
+            "recovered LLM work should audit the final verdict"
         );
     }
 
@@ -20948,7 +20948,7 @@ enabled = true
     }
 
     #[tokio::test]
-    async fn historical_rejudge_two_stage_resume_skips_proposal_after_confirm_interruption() {
+    async fn historical_rejudge_two_stage_retries_confirm_without_rerunning_proposal() {
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -20965,53 +20965,11 @@ enabled = true
         let failing_confirm_mock = confirm_server
             .mock("POST", "/v1/chat/completions")
             .with_status(408)
+            .with_header("Retry-After", "0")
             .with_body("request timeout")
             .expect(1)
             .create_async()
             .await;
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
-        insert_drawer(
-            &db,
-            "proposal-confirm-resume",
-            "Low-signal transient output that should not require Qwen to rerun after Spark recovers.",
-            "notes",
-            None,
-        );
-        let rowid = drawer_rowid(&db, "proposal-confirm-resume");
-        let backups = backup_dir(&tmp);
-        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
-        let options = HistoricalRejudgeOptions {
-            proposal_llm_endpoint: Some("qwen"),
-            confirm_llm_endpoint: Some("spark"),
-            ..full_rejudge_options(true, Some(&backups), 1)
-        };
-
-        maintenance_rejudge_command(&db, &config, options)
-            .await
-            .expect_err("confirm outage should leave proposal-confirm work pending");
-
-        proposal_mock.assert_async().await;
-        failing_confirm_mock.assert_async().await;
-        let checkpoint = load_historical_rejudge_checkpoint(&db)
-            .expect("load waiting checkpoint")
-            .expect("waiting checkpoint");
-        assert_eq!(checkpoint.status, "waiting_llm");
-        assert_eq!(
-            historical_rejudge_work_item_llm_stage(&db, &checkpoint.run_id, rowid).as_deref(),
-            Some("confirm_pending")
-        );
-        assert_eq!(
-            historical_rejudge_work_item_decision(&db, &checkpoint.run_id, rowid).as_deref(),
-            None
-        );
-        assert!(
-            db.get_drawer("proposal-confirm-resume")
-                .expect("load active drawer")
-                .is_some(),
-            "confirm outage must not delete while Spark is pending"
-        );
-
         let successful_confirm_mock = confirm_server
             .mock("POST", "/v1/chat/completions")
             .with_status(200)
@@ -21019,26 +20977,43 @@ enabled = true
             .expect(1)
             .create_async()
             .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(
+            &db,
+            "proposal-confirm-retry",
+            "Low-signal transient output that should not require Qwen to rerun after Spark recovers.",
+            "notes",
+            None,
+        );
+        let backups = backup_dir(&tmp);
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
         maintenance_rejudge_command(
             &db,
             &config,
             HistoricalRejudgeOptions {
-                resume: true,
                 proposal_llm_endpoint: Some("qwen"),
                 confirm_llm_endpoint: Some("spark"),
                 ..full_rejudge_options(true, Some(&backups), 1)
             },
         )
         .await
-        .expect("resume should use persisted proposal state and finish confirmation");
+        .expect("confirm outage should wait and retry until Spark recovers");
 
-        successful_confirm_mock.assert_async().await;
         proposal_mock.assert_async().await;
+        failing_confirm_mock.assert_async().await;
+        successful_confirm_mock.assert_async().await;
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.status, "done");
+        assert_eq!(checkpoint.mutated_count, 1);
         assert!(
-            db.get_drawer("proposal-confirm-resume")
+            db.get_drawer("proposal-confirm-retry")
                 .expect("load active drawer")
                 .is_none(),
-            "successful Spark resume should soft-delete the confirmed candidate"
+            "successful Spark retry should soft-delete the confirmed candidate"
         );
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
     }
