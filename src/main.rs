@@ -15225,6 +15225,56 @@ fn mark_historical_rejudge_work_item_llm_confirm_pending(
     Ok(())
 }
 
+#[derive(Debug)]
+enum HistoricalRejudgeConfirmPendingPersistence {
+    Persisted,
+    Keep(HistoricalRejudgeDecision),
+}
+
+fn mark_historical_rejudge_work_item_llm_confirm_pending_or_keep(
+    db: &Database,
+    run_id: &str,
+    drawer_rowid: i64,
+    proposal_score: f64,
+) -> Result<HistoricalRejudgeConfirmPendingPersistence> {
+    let result = mark_historical_rejudge_work_item_llm_confirm_pending(
+        db,
+        run_id,
+        drawer_rowid,
+        proposal_score,
+    );
+    historical_rejudge_confirm_pending_persistence_outcome(result, proposal_score)
+}
+
+fn historical_rejudge_confirm_pending_persistence_outcome(
+    result: Result<()>,
+    proposal_score: f64,
+) -> Result<HistoricalRejudgeConfirmPendingPersistence> {
+    match result {
+        Ok(()) => Ok(HistoricalRejudgeConfirmPendingPersistence::Persisted),
+        Err(error) if is_transient_sqlite_lock_error(&error) => {
+            Ok(HistoricalRejudgeConfirmPendingPersistence::Keep(
+                historical_rejudge_confirm_pending_lock_keep_decision(proposal_score),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn historical_rejudge_confirm_pending_lock_keep_decision(
+    proposal_score: f64,
+) -> HistoricalRejudgeDecision {
+    HistoricalRejudgeDecision {
+        delete_candidate: false,
+        protected: false,
+        reason: "llm_confirm_pending_persistence_locked_keep".to_string(),
+        label: Some("llm_judge".to_string()),
+        score: Some(proposal_score),
+        tier: 3,
+        judge: "llm".to_string(),
+    }
+}
+
 fn historical_rejudge_remaining_work_count(db: &Database, run_id: &str) -> Result<usize> {
     let sql = format!(
         "SELECT COUNT(*) FROM {HISTORICAL_REJUDGE_WORK_TABLE} WHERE run_id = ?1 AND processed_at IS NULL"
@@ -15319,6 +15369,13 @@ fn is_transient_sqlite_lock(error: &rusqlite::Error) -> bool {
                 rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             )
     )
+}
+
+fn is_transient_sqlite_lock_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+        .any(is_transient_sqlite_lock)
 }
 
 fn historical_rejudge_options_hash(
@@ -17262,12 +17319,17 @@ impl HistoricalRejudgeLlmContext {
                             judge: "llm".to_string(),
                         });
                     }
-                    mark_historical_rejudge_work_item_llm_confirm_pending(
+                    match mark_historical_rejudge_work_item_llm_confirm_pending_or_keep(
                         db,
                         &work_item.run_id,
                         work_item.drawer_rowid,
                         proposal_score,
-                    )?;
+                    )? {
+                        HistoricalRejudgeConfirmPendingPersistence::Persisted => {}
+                        HistoricalRejudgeConfirmPendingPersistence::Keep(decision) => {
+                            return Ok(decision);
+                        }
+                    }
                     proposal_reason
                 };
 
@@ -22638,6 +22700,51 @@ threshold = 0.7
             .expect("load updated work item");
         assert_eq!(stage, "confirm_pending");
         assert_eq!(score, 0.125);
+    }
+
+    #[test]
+    fn historical_rejudge_confirm_pending_exhausted_sqlite_lock_keeps_fail_closed() {
+        let lock_error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseLocked,
+                extended_code: rusqlite::ffi::SQLITE_LOCKED,
+            },
+            Some("database is locked".to_string()),
+        );
+
+        let outcome = historical_rejudge_confirm_pending_persistence_outcome(
+            Err(anyhow::Error::new(lock_error)),
+            0.125,
+        )
+        .expect("transient lock should convert to a fail-closed keep decision");
+
+        let HistoricalRejudgeConfirmPendingPersistence::Keep(decision) = outcome else {
+            panic!("exhausted transient lock must not report a persisted confirmation stage");
+        };
+        assert!(!decision.delete_candidate);
+        assert!(!decision.protected);
+        assert_eq!(
+            decision.reason,
+            "llm_confirm_pending_persistence_locked_keep"
+        );
+        assert_eq!(decision.label.as_deref(), Some("llm_judge"));
+        assert_eq!(decision.score, Some(0.125));
+        assert_eq!(decision.tier, 3);
+        assert_eq!(decision.judge, "llm");
+    }
+
+    #[test]
+    fn historical_rejudge_confirm_pending_non_lock_error_still_fails() {
+        let error = historical_rejudge_confirm_pending_persistence_outcome(
+            Err(anyhow::Error::new(rusqlite::Error::InvalidQuery)),
+            0.125,
+        )
+        .expect_err("non-lock SQLite errors must remain fatal");
+
+        assert!(
+            !is_transient_sqlite_lock_error(&error),
+            "non-lock errors must not be reclassified as transient lock failures"
+        );
     }
 
     #[test]
