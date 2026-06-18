@@ -49,6 +49,7 @@ bimap = "0.6"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 daemonize = "0.5"
+futures = "0.3"
 jieba-rs = "0.8"
 libc = "0.2"
 model2vec-rs = { version = "0.1", optional = true }
