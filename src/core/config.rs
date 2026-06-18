@@ -173,6 +173,7 @@ impl Config {
             Ok(contents) => Self::parse(&contents),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut config = Self::default();
+                config.embed.backend = "model2vec".to_string();
                 config.apply_env_overrides();
                 config.validate()?;
                 Ok(config)
@@ -3315,6 +3316,22 @@ mod tests {
             config.embed.openai_compat.dim,
             Some(super::DEFAULT_OPENAI_DIM)
         );
+    }
+
+    #[test]
+    fn load_from_missing_config_uses_model2vec_default() {
+        let _guard = env_lock();
+        let saved_env = save_embed_env();
+        clear_embed_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("missing-config.toml");
+
+        let config = Config::load_from(&config_path).expect("missing config should load defaults");
+
+        restore_embed_env(saved_env);
+        assert_eq!(config.embed.backend, "model2vec");
+        assert!(config.embed.openai_compat.base_url.is_none());
+        assert!(config.embed.openai_compat.model.is_none());
     }
 
     #[test]

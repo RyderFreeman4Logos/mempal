@@ -1,6 +1,6 @@
 # mempal
 
-Project memory for coding agents. Single binary, `cargo install mempal`, find past decisions with citations in seconds.
+Project memory for coding agents. Single binary, `cargo install mempal`, find past decisions with citations in seconds. Local-first by default: SQLite + model2vec, with no cloud LLM, embedding, or rerank calls unless you opt in.
 
 ## What It Does
 
@@ -15,6 +15,7 @@ Next session (any agent) → mempal search → finds the decision with source ci
 - **Self-describing protocol**: MEMORY_PROTOCOL embedded in MCP ServerInfo teaches any agent how to use mempal — no system prompt configuration required
 - **Multilingual**: model2vec-rs (BGE-M3 distilled) as default embedder, zero native dependencies
 - **Single file**: everything lives in `~/.mempal/palace.db` (SQLite + sqlite-vec)
+- **No cloud by default**: remote embeddings, LLM gating, and rerankers are disabled until configured explicitly
 
 ## Quick Start
 
@@ -26,11 +27,19 @@ Next session (any agent) → mempal search → finds the decision with source ci
 > binary and, for MCP servers, verify the MCP client command/path configuration.
 > See [#76](https://github.com/RyderFreeman4Logos/mempal/issues/76).
 >
-> For fork builds, prefer the `--path` route below (clones a fresh checkout, builds locally).
+> For fork builds, prefer the root `--path` route below (clones a fresh checkout, builds locally).
 > A one-liner is provided at [`scripts/install-from-source.sh`](scripts/install-from-source.sh).
 
+Released crate:
+
 ```bash
-cargo install --path crates/mempal-cli --locked
+cargo install mempal
+```
+
+Current repository checkout:
+
+```bash
+cargo install --path . --locked
 
 mempal init ~/code/myapp
 mempal ingest ~/code/myapp --wing myapp
@@ -41,12 +50,14 @@ mempal wake-up
 With REST support:
 
 ```bash
-cargo install --path crates/mempal-cli --locked --features rest
+cargo install --path . --locked --features rest
 ```
 
 ## Configuration
 
 Config at `~/.mempal/config.toml` (optional, defaults work without it):
+
+With no config file, mempal uses the local SQLite database at `~/.mempal/palace.db`, the local model2vec embedder, and no reranker or LLM calls. OpenAI-compatible embedding, LLM gating, and reranking examples below are opt-in.
 
 ```toml
 db_path = "~/.mempal/palace.db"
@@ -73,7 +84,7 @@ enabled = false                                # default: no reranker call
 # top_k = 20
 ```
 
-LLM gating can be configured with multiple OpenAI-compatible endpoints. Lower
+Optional LLM gating can be configured with multiple OpenAI-compatible endpoints. Lower
 `priority` values are tried first; equal values share capacity. Set Spark's one
 `priority` line to `0` for equal priority with Qwen, or keep it higher to use
 Spark only when Qwen is unavailable/saturated:
@@ -124,7 +135,7 @@ Other backends:
 [embed]
 backend = "onnx"
 
-# External API
+# Opt-in external API
 [embed]
 backend = "api"
 api_endpoint = "http://localhost:11434/api/embeddings"
@@ -339,18 +350,20 @@ mempal compress "Kai recommended Clerk over Auth0 based on pricing and DX"
 
 Chinese text uses jieba-rs POS tagging for proper word segmentation.
 
-## Architecture
+## Current Package Layout
 
-| Crate | Responsibility |
-|-------|---------------|
-| `mempal-core` | Types, SQLite schema v4, taxonomy, triples |
-| `mempal-embed` | Embedder trait (model2vec default, ort optional) |
-| `mempal-ingest` | Format detection, normalization, chunking (5 formats) |
-| `mempal-search` | Hybrid search (BM25 + vector + RRF), routing, tunnels |
-| `mempal-aaak` | AAAK encode/decode with BNF grammar + roundtrip tests |
-| `mempal-mcp` | MCP server (9 tools) |
-| `mempal-api` | Feature-gated REST API |
-| `mempal-cli` | CLI entrypoint |
+mempal currently builds as one Cargo package named `mempal`, with the binary at `src/main.rs`. Older specs and plans may mention a future or historical multi-crate workspace; those references are not the current install path.
+
+| Path | Responsibility |
+|------|---------------|
+| `src/core/` | Types, SQLite schema, taxonomy, triples, config, queue |
+| `src/embed/` | Embedder implementations (model2vec default, ONNX and OpenAI-compatible optional paths) |
+| `src/ingest/` | Format detection, normalization, chunking, gating, novelty |
+| `src/search/` | Hybrid search (BM25 + vector + RRF), routing, tunnels |
+| `src/aaak/` | AAAK encode/decode with BNF grammar + roundtrip tests |
+| `src/mcp/` | MCP server tools and protocol surface |
+| `src/api/` | Feature-gated REST API |
+| `src/main.rs`, `src/cli/` | CLI entrypoint and command helpers |
 
 Key design choices:
 - **model2vec-rs** default embedder — zero native deps, multilingual (BGE-M3 distilled)
@@ -363,9 +376,9 @@ Key design choices:
 ## Development
 
 ```bash
-cargo test --workspace
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test
+cargo test --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 ```
 
