@@ -2134,6 +2134,9 @@ struct MaintenanceRejudgeArgs {
     /// Resume the previous full historical rejudge sweep.
     #[arg(long, default_value_t = false)]
     resume: bool,
+    /// UNSAFE: allow a legacy checkpoint without a policy fingerprint to resume across config-version drift.
+    #[arg(long = "unsafe-allow-config-version-drift", default_value_t = false)]
+    unsafe_allow_config_version_drift: bool,
     /// Number of snapshot rows to process per full-sweep page.
     #[arg(long = "page-size", default_value_t = DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE)]
     page_size: usize,
@@ -2307,6 +2310,7 @@ struct HistoricalRejudgeOptions<'a> {
     limit: usize,
     all: bool,
     resume: bool,
+    unsafe_allow_config_version_drift: bool,
     page_size: usize,
     progress_file: Option<&'a Path>,
     proposal_llm_endpoint: Option<&'a str>,
@@ -3492,6 +3496,7 @@ fn run() -> Result<()> {
                 limit,
                 all,
                 resume,
+                unsafe_allow_config_version_drift,
                 page_size,
                 progress_file,
                 proposal_llm_endpoint,
@@ -3513,6 +3518,7 @@ fn run() -> Result<()> {
                         limit,
                         all,
                         resume,
+                        unsafe_allow_config_version_drift,
                         page_size,
                         progress_file: progress_file.as_deref(),
                         proposal_llm_endpoint: proposal_llm_endpoint.as_deref(),
@@ -13510,8 +13516,11 @@ async fn maintenance_rejudge_limited_command(
     let llm_context = historical_rejudge_llm_context(config, options)?;
     let judge_model = llm_context
         .as_ref()
-        .map(HistoricalRejudgeLlmContext::model_summary)
-        .or_else(|| Some("deterministic".to_string()).filter(|_| llm_context.is_none()));
+        .map(|context| Ok(context.model_summary()))
+        .or_else(|| {
+            (llm_context.is_none()).then(|| historical_rejudge_deterministic_model_summary(config))
+        })
+        .transpose()?;
 
     if let Some(writer) = progress.as_mut() {
         writer.write_event(build_historical_rejudge_progress_event(
@@ -13786,8 +13795,11 @@ async fn maintenance_rejudge_all_command(
     let llm_context = historical_rejudge_llm_context(config, options)?;
     let judge_model = llm_context
         .as_ref()
-        .map(HistoricalRejudgeLlmContext::model_summary)
-        .or_else(|| Some("deterministic".to_string()).filter(|_| llm_context.is_none()));
+        .map(|context| Ok(context.model_summary()))
+        .or_else(|| {
+            (llm_context.is_none()).then(|| historical_rejudge_deterministic_model_summary(config))
+        })
+        .transpose()?;
     let backup_dir = historical_rejudge_effective_backup_dir(
         options,
         options.execute && !(options.hard_delete && options.unsafe_no_backup),
@@ -14280,7 +14292,13 @@ fn prepare_historical_rejudge_checkpoint(
                 "historical rejudge checkpoint is already done; omit --resume to start a new sweep"
             );
         }
-        if checkpoint.options_hash != options_hash {
+        if !historical_rejudge_checkpoint_matches_resume(
+            &checkpoint,
+            options,
+            project_id,
+            &options_hash,
+            judge_model.as_ref(),
+        )? {
             bail!("historical rejudge checkpoint does not match current filters/config");
         }
         return Ok(checkpoint);
@@ -14295,6 +14313,119 @@ fn prepare_historical_rejudge_checkpoint(
         backup_dir,
         options_hash,
     )
+}
+
+fn historical_rejudge_checkpoint_matches_resume(
+    checkpoint: &HistoricalRejudgeCheckpoint,
+    options: HistoricalRejudgeOptions<'_>,
+    project_id: Option<&str>,
+    current_options_hash: &str,
+    current_judge_model: Option<&String>,
+) -> Result<bool> {
+    if checkpoint.options_hash == current_options_hash {
+        return Ok(historical_rejudge_judge_model_matches_without_config_drift(
+            checkpoint.judge_model.as_ref(),
+            current_judge_model,
+        ));
+    }
+
+    // In-flight sweeps store the config version in the options hash. A live
+    // config reload can change that version even when the destructive scope,
+    // endpoint identity, judge policy, and selected model are unchanged. Recompute
+    // the hash with the checkpoint's original config version to distinguish
+    // harmless config-version drift from changed filters or judge identity.
+    let legacy_options_hash =
+        historical_rejudge_options_hash(options, project_id, &checkpoint.config_version)?;
+    if checkpoint.options_hash != legacy_options_hash {
+        return Ok(false);
+    }
+    if historical_rejudge_safety_fingerprinted_summary(checkpoint.judge_model.as_ref())
+        && checkpoint.judge_model.as_ref() == current_judge_model
+    {
+        return Ok(true);
+    }
+    Ok(options.unsafe_allow_config_version_drift
+        && historical_rejudge_judge_model_matches_without_config_drift(
+            checkpoint.judge_model.as_ref(),
+            current_judge_model,
+        ))
+}
+
+fn historical_rejudge_judge_model_matches_without_config_drift(
+    checkpoint_judge_model: Option<&String>,
+    current_judge_model: Option<&String>,
+) -> bool {
+    if checkpoint_judge_model == current_judge_model {
+        return true;
+    }
+
+    let (Some(checkpoint), Some(current)) = (checkpoint_judge_model, current_judge_model) else {
+        return false;
+    };
+    if checkpoint.contains("@endpoint:") || checkpoint.contains("@policy:") {
+        return false;
+    }
+
+    let current_without_safety = historical_rejudge_without_safety_fingerprints(current);
+    checkpoint == &current_without_safety
+        || historical_rejudge_legacy_model_summary(&current_without_safety)
+            .is_some_and(|model_summary| checkpoint == &model_summary)
+}
+
+fn historical_rejudge_safety_fingerprinted_summary(summary: Option<&String>) -> bool {
+    summary
+        .map(|summary| summary.contains("@policy:"))
+        .unwrap_or(false)
+}
+
+fn historical_rejudge_without_safety_fingerprints(summary: &str) -> String {
+    summary
+        .split(", ")
+        .map(|part| {
+            let without_endpoint = part
+                .split_once("@endpoint:")
+                .map(|(label, _)| label)
+                .unwrap_or(part);
+            without_endpoint
+                .split_once("@policy:")
+                .map(|(label, _)| label)
+                .unwrap_or(without_endpoint)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn historical_rejudge_legacy_model_summary(summary: &str) -> Option<String> {
+    let parts = summary.split(", ").collect::<Vec<_>>();
+    match parts.as_slice() {
+        [single] => historical_rejudge_model_after_endpoint_label(single).map(ToOwned::to_owned),
+        [proposal, confirm] => historical_rejudge_legacy_two_stage_model_summary(proposal, confirm),
+        [_, _, ..] | [] => None,
+    }
+}
+
+fn historical_rejudge_legacy_two_stage_model_summary(
+    proposal: &str,
+    confirm: &str,
+) -> Option<String> {
+    let proposal_model = historical_rejudge_stage_model_after_endpoint_label(proposal, "proposal")?;
+    let confirm_model = historical_rejudge_stage_model_after_endpoint_label(confirm, "confirm")?;
+    Some(format!(
+        "proposal:{proposal_model}, confirm:{confirm_model}"
+    ))
+}
+
+fn historical_rejudge_stage_model_after_endpoint_label<'a>(
+    part: &'a str,
+    stage: &str,
+) -> Option<&'a str> {
+    let endpoint_label = part.strip_prefix(stage)?.strip_prefix(':')?;
+    historical_rejudge_model_after_endpoint_label(endpoint_label)
+}
+
+fn historical_rejudge_model_after_endpoint_label(label: &str) -> Option<&str> {
+    let (_, model) = label.split_once('=')?;
+    (!model.is_empty()).then_some(model)
 }
 
 fn start_historical_rejudge_checkpoint(
@@ -16827,24 +16958,35 @@ enum HistoricalRejudgeLlmContext {
     Single {
         router: LlmRouter,
         model_summary: String,
+        policy_fingerprint: String,
     },
     TwoStage {
         proposal_router: LlmRouter,
         proposal_summary: String,
         confirm_router: LlmRouter,
         confirm_summary: String,
+        policy_fingerprint: String,
     },
 }
 
 impl HistoricalRejudgeLlmContext {
     fn model_summary(&self) -> String {
         match self {
-            Self::Single { model_summary, .. } => model_summary.clone(),
+            Self::Single {
+                model_summary,
+                policy_fingerprint,
+                ..
+            } => format!("{model_summary}@policy:{policy_fingerprint}"),
             Self::TwoStage {
                 proposal_summary,
                 confirm_summary,
+                policy_fingerprint,
                 ..
-            } => format!("proposal:{proposal_summary}, confirm:{confirm_summary}"),
+            } => {
+                format!(
+                    "proposal:{proposal_summary}, confirm:{confirm_summary}@policy:{policy_fingerprint}"
+                )
+            }
         }
     }
 
@@ -16986,18 +17128,22 @@ fn historical_rejudge_llm_context(
     if !judge.enabled {
         return Ok(None);
     }
+    let policy_fingerprint = historical_rejudge_judge_policy_fingerprint(config)?;
 
     let endpoints = config
         .llm
         .effective_endpoints()
         .context("failed to resolve historical rejudge LLM endpoints")?;
     let Some(proposal_selector) = options.proposal_llm_endpoint else {
+        let model_summary = if endpoints.is_empty() {
+            "llm".to_string()
+        } else {
+            historical_rejudge_available_endpoint_summary(&endpoints)
+        };
         return Ok(Some(HistoricalRejudgeLlmContext::Single {
             router: LlmRouter::from_endpoints(endpoints)?,
-            model_summary: config
-                .llm
-                .effective_model_summary()
-                .unwrap_or_else(|| "llm".to_string()),
+            model_summary,
+            policy_fingerprint,
         }));
     };
 
@@ -17010,6 +17156,7 @@ fn historical_rejudge_llm_context(
         return Ok(Some(HistoricalRejudgeLlmContext::Single {
             router: proposal_router,
             model_summary: proposal_summary,
+            policy_fingerprint,
         }));
     };
 
@@ -17023,6 +17170,7 @@ fn historical_rejudge_llm_context(
         proposal_summary,
         confirm_router,
         confirm_summary,
+        policy_fingerprint,
     }))
 }
 
@@ -17061,7 +17209,50 @@ fn historical_rejudge_available_endpoint_summary(endpoints: &[EffectiveLlmEndpoi
 }
 
 fn historical_rejudge_endpoint_summary(endpoint: &EffectiveLlmEndpoint) -> String {
-    format!("{}={}", endpoint.id, endpoint.model)
+    format!(
+        "{}={}@endpoint:{}",
+        endpoint.id,
+        endpoint.model,
+        historical_rejudge_endpoint_identity_fingerprint(endpoint)
+    )
+}
+
+fn historical_rejudge_endpoint_identity_fingerprint(endpoint: &EffectiveLlmEndpoint) -> String {
+    let identity = serde_json::json!({
+        "id": endpoint.id,
+        "base_url": endpoint.base_url,
+        "model": endpoint.model,
+        "api_key_env": endpoint.api_key_env,
+        "extra_body": endpoint.extra_body,
+        "priority": endpoint.priority,
+        "request_timeout_secs": endpoint.request_timeout_secs,
+        "retry_interval_secs": endpoint.retry_interval_secs,
+        "max_concurrent": endpoint.max_concurrent,
+    });
+    let digest = sha256_hex(&serde_json::to_vec(&identity).unwrap_or_default());
+    digest[..12].to_string()
+}
+
+fn historical_rejudge_judge_policy_fingerprint(config: &Config) -> Result<String> {
+    let effective_prompt = config
+        .ingest_gating
+        .llm_judge
+        .as_ref()
+        .and_then(|judge| judge.system_prompt.as_deref())
+        .unwrap_or(DEFAULT_GATING_JUDGE_PROMPT);
+    let identity = serde_json::json!({
+        "ingest_gating": &config.ingest_gating,
+        "effective_llm_judge_prompt": effective_prompt,
+    });
+    let digest = sha256_hex(&serde_json::to_vec(&identity)?);
+    Ok(digest[..12].to_string())
+}
+
+fn historical_rejudge_deterministic_model_summary(config: &Config) -> Result<String> {
+    Ok(format!(
+        "deterministic@policy:{}",
+        historical_rejudge_judge_policy_fingerprint(config)?
+    ))
 }
 
 fn historical_llm_threshold(config: &Config) -> f64 {
@@ -18680,6 +18871,140 @@ enabled = true
     }
 
     #[test]
+    fn historical_rejudge_endpoint_summary_fingerprints_endpoint_identity() {
+        let endpoint =
+            test_effective_llm_endpoint("judge-a", "http://judge-a.local:8317/v1", "judge-model");
+        let changed_base_url =
+            test_effective_llm_endpoint("judge-a", "http://judge-b.local:8317/v1", "judge-model");
+
+        let summary = historical_rejudge_endpoint_summary(&endpoint);
+        assert!(
+            summary.starts_with("judge-a=judge-model@endpoint:"),
+            "{summary}"
+        );
+        assert_ne!(
+            summary,
+            historical_rejudge_endpoint_summary(&changed_base_url)
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_model_summary_fingerprints_judge_policy() {
+        let original =
+            two_stage_llm_rejudge_config("http://qwen.local:8317", "http://spark.local:8317");
+        let changed_policy = Config::parse(
+            r#"
+[llm]
+enabled = true
+request_timeout_secs = 1
+retry_interval_secs = 1
+enabled_for = ["gating"]
+
+[[llm.endpoints]]
+id = "qwen"
+base_url = "http://qwen.local:8317/v1"
+model = "qwen3.6-27b-decensor-by-aeon"
+
+[[llm.endpoints]]
+id = "spark"
+base_url = "http://spark.local:8317/v1"
+model = "spark"
+
+[gating]
+enabled = true
+
+[gating.llm_judge]
+enabled = true
+threshold = 0.7
+"#,
+        )
+        .expect("parse changed judge policy");
+        let options = HistoricalRejudgeOptions {
+            proposal_llm_endpoint: Some("qwen"),
+            confirm_llm_endpoint: Some("spark"),
+            ..full_rejudge_options(true, None, 1)
+        };
+
+        let original_summary = historical_rejudge_llm_context(&original, options)
+            .expect("original llm context")
+            .expect("original llm enabled")
+            .model_summary();
+        let changed_policy_summary = historical_rejudge_llm_context(&changed_policy, options)
+            .expect("changed policy llm context")
+            .expect("changed policy llm enabled")
+            .model_summary();
+
+        assert!(original_summary.contains("@policy:"), "{original_summary}");
+        assert_ne!(original_summary, changed_policy_summary);
+    }
+
+    #[test]
+    fn historical_rejudge_legacy_model_summary_matches_two_stage_and_colon_tags() {
+        let two_stage_checkpoint = Some("proposal:qwen-model, confirm:spark-model".to_string());
+        let two_stage_current = Some(
+            "proposal:qwen=qwen-model@endpoint:proposal-v1, confirm:spark=spark-model@endpoint:confirm-v1@policy:policy-v1"
+                .to_string(),
+        );
+        assert!(historical_rejudge_judge_model_matches_without_config_drift(
+            two_stage_checkpoint.as_ref(),
+            two_stage_current.as_ref()
+        ));
+
+        let two_stage_colon_checkpoint = Some("proposal:llama3:8b, confirm:qwen2.5:7b".to_string());
+        let two_stage_colon_current = Some(
+            "proposal:ollama=llama3:8b@endpoint:proposal-v1, confirm:ollama=qwen2.5:7b@endpoint:confirm-v1@policy:policy-v1"
+                .to_string(),
+        );
+        assert!(historical_rejudge_judge_model_matches_without_config_drift(
+            two_stage_colon_checkpoint.as_ref(),
+            two_stage_colon_current.as_ref()
+        ));
+
+        let colon_checkpoint = Some("llama3:8b".to_string());
+        let colon_current = Some("legacy=llama3:8b@endpoint:local-v1@policy:policy-v1".to_string());
+        assert!(historical_rejudge_judge_model_matches_without_config_drift(
+            colon_checkpoint.as_ref(),
+            colon_current.as_ref()
+        ));
+    }
+
+    #[test]
+    fn historical_rejudge_legacy_model_summary_rejects_changed_models() {
+        let two_stage_checkpoint = Some("proposal:qwen-model, confirm:spark-model".to_string());
+        let changed_two_stage_current = Some(
+            "proposal:qwen=qwen-model-v2@endpoint:proposal-v1, confirm:spark=spark-model@endpoint:confirm-v1@policy:policy-v1"
+                .to_string(),
+        );
+        assert!(
+            !historical_rejudge_judge_model_matches_without_config_drift(
+                two_stage_checkpoint.as_ref(),
+                changed_two_stage_current.as_ref()
+            )
+        );
+
+        let malformed_two_stage_current = Some(
+            "proposal:qwen=qwen-model@endpoint:proposal-v1, confirm:spark=spark-model@endpoint:confirm-v1, extra:side=side-model@endpoint:side-v1@policy:policy-v1"
+                .to_string(),
+        );
+        assert!(
+            !historical_rejudge_judge_model_matches_without_config_drift(
+                two_stage_checkpoint.as_ref(),
+                malformed_two_stage_current.as_ref()
+            )
+        );
+
+        let colon_checkpoint = Some("llama3:8b".to_string());
+        let changed_colon_current =
+            Some("legacy=qwen2.5:7b@endpoint:local-v1@policy:policy-v1".to_string());
+        assert!(
+            !historical_rejudge_judge_model_matches_without_config_drift(
+                colon_checkpoint.as_ref(),
+                changed_colon_current.as_ref()
+            )
+        );
+    }
+
+    #[test]
     fn historical_rejudge_waiting_llm_status_emits_runtime_warning() {
         let now = iso_timestamp();
         let checkpoint = HistoricalRejudgeCheckpoint {
@@ -18725,6 +19050,22 @@ enabled = true
         completed.status = "done".to_string();
         push_historical_rejudge_runtime_warning(&mut warnings, Some(&completed));
         assert_eq!(warnings.len(), 1, "done checkpoint must not add warning");
+    }
+
+    fn test_effective_llm_endpoint(id: &str, base_url: &str, model: &str) -> EffectiveLlmEndpoint {
+        EffectiveLlmEndpoint {
+            id: id.to_string(),
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            api_key: None,
+            api_key_env: Some("TEST_LLM_API_KEY".to_string()),
+            extra_body: Some(serde_json::json!({"chat_template_kwargs":{"enable_thinking":false}})),
+            priority: 0,
+            request_timeout_secs: 30,
+            health_probe_timeout_secs: 3,
+            retry_interval_secs: 2,
+            max_concurrent: 1,
+        }
     }
 
     fn insert_drawer(db: &Database, id: &str, content: &str, wing: &str, room: Option<&str>) {
@@ -18933,6 +19274,7 @@ enabled = true
             limit: 100,
             all: true,
             resume: false,
+            unsafe_allow_config_version_drift: false,
             page_size,
             progress_file: None,
             proposal_llm_endpoint: None,
@@ -19016,6 +19358,407 @@ enabled = true
     }
 
     #[test]
+    fn historical_rejudge_resume_accepts_same_scope_when_only_config_version_drifts() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        insert_drawer(&db, "resume-drift", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+        let start_options = HistoricalRejudgeOptions {
+            proposal_llm_endpoint: Some("qwen"),
+            confirm_llm_endpoint: Some("spark"),
+            ..full_rejudge_options(true, Some(&backups), 1)
+        };
+        let old_config_version = "old-config-version";
+        let new_config_version = "new-config-version";
+        let proposal_endpoint =
+            test_effective_llm_endpoint("qwen", "http://qwen.local:8317/v1", "qwen-model");
+        let confirm_endpoint =
+            test_effective_llm_endpoint("spark", "http://spark.local:8317/v1", "spark-model");
+        let policy_fingerprint = "policy-v1";
+        let judge_model = Some(format!(
+            "proposal:{}, confirm:{}@policy:{policy_fingerprint}",
+            historical_rejudge_endpoint_summary(&proposal_endpoint),
+            historical_rejudge_endpoint_summary(&confirm_endpoint)
+        ));
+        let options_hash = historical_rejudge_options_hash(start_options, None, old_config_version)
+            .expect("old options hash");
+        let checkpoint = start_historical_rejudge_checkpoint(
+            &db,
+            start_options,
+            None,
+            old_config_version,
+            judge_model.clone(),
+            Some(&backups),
+            options_hash,
+        )
+        .expect("start checkpoint");
+
+        let resumed = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..start_options
+            },
+            None,
+            new_config_version,
+            judge_model,
+            Some(&backups),
+        )
+        .expect("resume should tolerate unrelated config-version drift");
+
+        assert_eq!(resumed.run_id, checkpoint.run_id);
+        assert_eq!(resumed.config_version, old_config_version);
+        assert_eq!(historical_rejudge_work_item_count(&db, &resumed.run_id), 1);
+
+        let mismatched_judge_model_without_config_drift = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..start_options
+            },
+            None,
+            old_config_version,
+            Some("proposal:qwen=other-model, confirm:spark=spark-model".to_string()),
+            Some(&backups),
+        )
+        .expect_err("resume must reject changed judge model even without config-version drift");
+        assert!(
+            mismatched_judge_model_without_config_drift
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{mismatched_judge_model_without_config_drift:#}"
+        );
+
+        let changed_endpoint_same_model = test_effective_llm_endpoint(
+            "qwen",
+            "http://qwen-replacement.local:8317/v1",
+            "qwen-model",
+        );
+        let mismatched_endpoint_identity = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..start_options
+            },
+            None,
+            new_config_version,
+            Some(format!(
+                "proposal:{}, confirm:{}",
+                historical_rejudge_endpoint_summary(&changed_endpoint_same_model),
+                historical_rejudge_endpoint_summary(&confirm_endpoint)
+            )),
+            Some(&backups),
+        )
+        .expect_err("resume must reject changed endpoint identity despite same id/model");
+        assert!(
+            mismatched_endpoint_identity
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{mismatched_endpoint_identity:#}"
+        );
+
+        let mismatched_policy = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..start_options
+            },
+            None,
+            new_config_version,
+            Some(format!(
+                "proposal:{}, confirm:{}@policy:policy-v2",
+                historical_rejudge_endpoint_summary(&proposal_endpoint),
+                historical_rejudge_endpoint_summary(&confirm_endpoint)
+            )),
+            Some(&backups),
+        )
+        .expect_err("resume must reject changed judge policy despite config-version drift");
+        assert!(
+            mismatched_policy
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{mismatched_policy:#}"
+        );
+
+        let mismatched_judge_model = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..start_options
+            },
+            None,
+            new_config_version,
+            Some("proposal:qwen=other-model, confirm:spark=spark-model".to_string()),
+            Some(&backups),
+        )
+        .expect_err("resume must reject changed judge model despite config-version drift");
+        assert!(
+            mismatched_judge_model
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{mismatched_judge_model:#}"
+        );
+
+        let legacy_tmp = tempfile::TempDir::new().expect("legacy tempdir");
+        let legacy_db =
+            Database::open(&legacy_tmp.path().join("palace.db")).expect("open legacy db");
+        ensure_historical_rejudge_checkpoint_storage(&legacy_db)
+            .expect("ensure legacy checkpoint storage");
+        insert_drawer(&legacy_db, "legacy-resume-drift", "ok", "notes", None);
+        let legacy_backups = backup_dir(&legacy_tmp);
+        let legacy_options = HistoricalRejudgeOptions {
+            proposal_llm_endpoint: Some("qwen"),
+            confirm_llm_endpoint: Some("spark"),
+            ..full_rejudge_options(true, Some(&legacy_backups), 1)
+        };
+        let legacy_judge_model = Some("proposal:qwen-model, confirm:spark-model".to_string());
+        let fingerprinted_judge_model = Some(format!(
+            "proposal:{}, confirm:{}@policy:{policy_fingerprint}",
+            historical_rejudge_endpoint_summary(&proposal_endpoint),
+            historical_rejudge_endpoint_summary(&confirm_endpoint)
+        ));
+        let legacy_options_hash =
+            historical_rejudge_options_hash(legacy_options, None, old_config_version)
+                .expect("legacy old options hash");
+        start_historical_rejudge_checkpoint(
+            &legacy_db,
+            legacy_options,
+            None,
+            old_config_version,
+            legacy_judge_model,
+            Some(&legacy_backups),
+            legacy_options_hash,
+        )
+        .expect("start legacy checkpoint");
+
+        let unsafe_required = prepare_historical_rejudge_checkpoint(
+            &legacy_db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..legacy_options
+            },
+            None,
+            new_config_version,
+            fingerprinted_judge_model.clone(),
+            Some(&legacy_backups),
+        )
+        .expect_err("legacy checkpoint without policy fingerprint must fail closed across config-version drift");
+        assert!(
+            unsafe_required
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{unsafe_required:#}"
+        );
+
+        let unsafe_resumed = prepare_historical_rejudge_checkpoint(
+            &legacy_db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                unsafe_allow_config_version_drift: true,
+                ..legacy_options
+            },
+            None,
+            new_config_version,
+            fingerprinted_judge_model,
+            Some(&legacy_backups),
+        )
+        .expect("explicit unsafe override should allow compatible legacy checkpoint");
+        assert_eq!(unsafe_resumed.config_version, old_config_version);
+    }
+
+    #[test]
+    fn historical_rejudge_deterministic_policy_drift_requires_fingerprint_or_unsafe_override() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        insert_drawer(&db, "deterministic-resume-drift", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+        let options = full_rejudge_options(true, Some(&backups), 1);
+        let old_config_version = "old-config-version";
+        let new_config_version = "new-config-version";
+        let old_policy = "deterministic@policy:old-policy".to_string();
+        let new_policy = Some("deterministic@policy:new-policy".to_string());
+        let options_hash = historical_rejudge_options_hash(options, None, old_config_version)
+            .expect("old options hash");
+        start_historical_rejudge_checkpoint(
+            &db,
+            options,
+            None,
+            old_config_version,
+            Some(old_policy),
+            Some(&backups),
+            options_hash,
+        )
+        .expect("start deterministic checkpoint");
+
+        let changed_policy = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..options
+            },
+            None,
+            new_config_version,
+            new_policy,
+            Some(&backups),
+        )
+        .expect_err("resume must reject deterministic judge policy drift");
+        assert!(
+            changed_policy
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{changed_policy:#}"
+        );
+
+        let legacy_tmp = tempfile::TempDir::new().expect("legacy tempdir");
+        let legacy_db =
+            Database::open(&legacy_tmp.path().join("palace.db")).expect("open legacy db");
+        ensure_historical_rejudge_checkpoint_storage(&legacy_db)
+            .expect("ensure legacy checkpoint storage");
+        insert_drawer(
+            &legacy_db,
+            "legacy-deterministic-drift",
+            "ok",
+            "notes",
+            None,
+        );
+        let legacy_backups = backup_dir(&legacy_tmp);
+        let legacy_options = full_rejudge_options(true, Some(&legacy_backups), 1);
+        let legacy_options_hash =
+            historical_rejudge_options_hash(legacy_options, None, old_config_version)
+                .expect("legacy old options hash");
+        start_historical_rejudge_checkpoint(
+            &legacy_db,
+            legacy_options,
+            None,
+            old_config_version,
+            Some("deterministic".to_string()),
+            Some(&legacy_backups),
+            legacy_options_hash,
+        )
+        .expect("start legacy deterministic checkpoint");
+
+        let legacy_bare_deterministic = prepare_historical_rejudge_checkpoint(
+            &legacy_db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..legacy_options
+            },
+            None,
+            new_config_version,
+            Some("deterministic".to_string()),
+            Some(&legacy_backups),
+        )
+        .expect_err("bare deterministic summary must fail closed across config-version drift");
+        assert!(
+            legacy_bare_deterministic
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{legacy_bare_deterministic:#}"
+        );
+
+        let legacy_requires_unsafe = prepare_historical_rejudge_checkpoint(
+            &legacy_db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..legacy_options
+            },
+            None,
+            new_config_version,
+            Some("deterministic@policy:new-policy".to_string()),
+            Some(&legacy_backups),
+        )
+        .expect_err("legacy deterministic checkpoint without policy fingerprint must fail closed");
+        assert!(
+            legacy_requires_unsafe
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{legacy_requires_unsafe:#}"
+        );
+
+        let legacy_unsafe_resumed = prepare_historical_rejudge_checkpoint(
+            &legacy_db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                unsafe_allow_config_version_drift: true,
+                ..legacy_options
+            },
+            None,
+            new_config_version,
+            Some("deterministic@policy:new-policy".to_string()),
+            Some(&legacy_backups),
+        )
+        .expect("explicit unsafe override should allow legacy deterministic checkpoint");
+        assert_eq!(legacy_unsafe_resumed.config_version, old_config_version);
+    }
+
+    #[test]
+    fn historical_rejudge_unsafe_override_accepts_legacy_single_endpoint_model_label() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        insert_drawer(&db, "legacy-single-endpoint", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+        let old_config_version = "old-config-version";
+        let new_config_version = "new-config-version";
+        let options = full_rejudge_options(true, Some(&backups), 1);
+        let options_hash = historical_rejudge_options_hash(options, None, old_config_version)
+            .expect("old options hash");
+        start_historical_rejudge_checkpoint(
+            &db,
+            options,
+            None,
+            old_config_version,
+            Some("legacy-model".to_string()),
+            Some(&backups),
+            options_hash,
+        )
+        .expect("start legacy single-endpoint checkpoint");
+
+        let endpoint =
+            test_effective_llm_endpoint("legacy", "http://legacy.local:8317/v1", "legacy-model");
+        let current_judge_model = Some(format!(
+            "{}@policy:policy-v2",
+            historical_rejudge_endpoint_summary(&endpoint)
+        ));
+
+        let unsafe_required = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..options
+            },
+            None,
+            new_config_version,
+            current_judge_model.clone(),
+            Some(&backups),
+        )
+        .expect_err("legacy single-endpoint label must fail closed without unsafe override");
+        assert!(
+            unsafe_required
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{unsafe_required:#}"
+        );
+
+        let resumed = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                unsafe_allow_config_version_drift: true,
+                ..options
+            },
+            None,
+            new_config_version,
+            current_judge_model,
+            Some(&backups),
+        )
+        .expect("unsafe override should accept legacy single-endpoint model label");
+        assert_eq!(resumed.config_version, old_config_version);
+    }
+
+    #[test]
     fn historical_rejudge_same_second_resnapshot_keeps_active_protected_work_distinct() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
@@ -19094,6 +19837,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19133,6 +19877,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19171,6 +19916,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19257,6 +20003,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19322,6 +20069,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19594,6 +20342,7 @@ enabled = true
                     limit: 100,
                     all: false,
                     resume: false,
+                    unsafe_allow_config_version_drift: false,
                     page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                     progress_file: None,
                     proposal_llm_endpoint: None,
@@ -19635,6 +20384,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19669,6 +20419,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19704,6 +20455,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19737,6 +20489,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19775,6 +20528,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19820,6 +20574,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19885,6 +20640,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -19956,6 +20712,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -20034,6 +20791,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -20129,6 +20887,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -20221,6 +20980,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -20313,6 +21073,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -20367,6 +21128,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -21797,6 +22559,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
@@ -21847,6 +22610,7 @@ enabled = true
                 limit: 100,
                 all: false,
                 resume: false,
+                unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
                 proposal_llm_endpoint: None,
