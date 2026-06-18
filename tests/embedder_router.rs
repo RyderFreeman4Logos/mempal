@@ -1,13 +1,19 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use mempal::core::config::Config;
 use mempal::embed::{
     ConfiguredEmbedderFactory, EmbedError, EmbedderFactory, router::EmbeddingRouter,
+    shared_embedder_runtime_snapshot,
 };
 use mockito::{Matcher, Server};
 use tokio::sync::{Barrier, Notify};
+
+fn shared_embedder_cache_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 fn embedding_body(vector: &[f32]) -> String {
     serde_json::json!({
@@ -324,6 +330,7 @@ async fn test_embedding_router_waits_for_saturated_healthy_endpoint_before_coold
 
 #[tokio::test]
 async fn test_configured_embedder_factory_builds_share_endpoint_capacity() {
+    let _cache_guard = shared_embedder_cache_test_lock().lock().await;
     let (gb10_url, gb10_count, gb10_server) =
         spawn_counting_embedding_server(Duration::from_millis(200)).await;
     let (spark_url, spark_count, spark_server) =
@@ -357,4 +364,45 @@ async fn test_configured_embedder_factory_builds_share_endpoint_capacity() {
 
     assert_eq!(gb10_count.load(Ordering::SeqCst), 1);
     assert_eq!(spark_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_daemon_embedder_factory_remote_mode_avoids_local_model2vec() {
+    let _cache_guard = shared_embedder_cache_test_lock().lock().await;
+    let (base_url, request_count, server) =
+        spawn_counting_embedding_server(Duration::from_millis(1)).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("daemon-embedder-router.db");
+    let config = Config::parse(&format!(
+        r#"
+db_path = "{}"
+
+[embed]
+backend = "model2vec"
+
+[embed.openai_compat]
+base_url = "{base_url}"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 3
+
+[daemon]
+embedder_mode = "remote"
+"#,
+        db_path.display()
+    ))
+    .expect("parse config");
+    let factory = ConfiguredEmbedderFactory::new_for_daemon(config);
+    let embedder = factory.build().await.expect("daemon embedder");
+
+    let vectors = embedder.embed(&["hello"]).await.expect("embed remotely");
+    server.abort();
+    let _ = server.await;
+
+    assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3]]);
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    let snapshot = shared_embedder_runtime_snapshot();
+    assert!(snapshot.loaded);
+    assert_eq!(snapshot.backend.as_deref(), Some("openai_compat"));
+    assert_eq!(snapshot.model.as_deref(), Some("Qwen/Qwen3-Embedding-8B"));
+    assert_eq!(snapshot.dimensions, Some(3));
 }

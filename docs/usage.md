@@ -68,6 +68,12 @@ db_path = "~/.mempal/palace.db"
 backend = "model2vec"
 # model = "minishlab/potion-multilingual-128M" # default multilingual model
 
+[daemon]
+# configured: use [embed] as-is
+# remote: daemon uses [embed.openai_compat] / [[embed.endpoints]] and does not load local model2vec fallback
+# small_local: daemon uses minishlab/potion-base-8M
+embedder_mode = "configured"
+
 [search.reranker]
 enabled = false
 # endpoint = "http://gb10:18003/v1/rerank"
@@ -96,6 +102,28 @@ api_endpoint = "http://localhost:11434/api/embeddings"
 api_model = "nomic-embed-text"
 ```
 
+For a long-lived daemon on a memory-constrained machine, prefer a local/LAN
+OpenAI-compatible embedding service:
+
+```toml
+[daemon]
+embedder_mode = "remote"
+
+[embed]
+backend = "openai_compat"
+
+[embed.openai_compat]
+base_url = "http://127.0.0.1:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 4096
+```
+
+`remote` mode is daemon-only: normal one-shot CLI commands still use `[embed]`
+as configured, while daemon workers and daemon REST embedding avoid loading the
+in-process model2vec cache. If you need an all-local low-memory daemon, set
+`embedder_mode = "small_local"` to use `minishlab/potion-base-8M`. After
+changing backend/model/dimensions, run `mempal reindex` and restart the daemon.
+
 Notes:
 
 - `model2vec` is the default backend.
@@ -103,6 +131,9 @@ Notes:
 - First use of `model2vec` or `onnx` may download model assets.
 - If `config.toml` is missing, `mempal` still works with defaults.
 - The benchmark and search commands use whatever embedder backend is configured here.
+- `mempal daemon status` and `mempal doctor` report daemon RSS/PSS,
+  `exe_deleted`, and sanitized embedder cache status so upgrades that leave a
+  resident `/usr/local/bin/mempal (deleted)` daemon are visible.
 - Reranking is disabled by default. To use a local/LAN reranker, set
   `[search.reranker] enabled = true`, `endpoint`, `model`, `timeout_secs`, and
   `top_k`. A bare endpoint like `gb10:18003` is normalized to
