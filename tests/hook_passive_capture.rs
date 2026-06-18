@@ -123,6 +123,22 @@ where
     panic!("condition not satisfied within {timeout:?}");
 }
 
+async fn wait_for_daemon_stderr_line(daemon: &DaemonSupervisor, timeout: Duration, needle: &str) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if daemon
+            .stderr_lines()
+            .await
+            .iter()
+            .any(|line| line.contains(needle))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("daemon stderr did not contain {needle:?} within {timeout:?}");
+}
+
 fn drawer_count(db_path: &Path) -> i64 {
     Database::open(db_path)
         .expect("open db")
@@ -649,6 +665,47 @@ async fn test_daemon_slow_hook_does_not_block_later_hook() {
 
     daemon.sigterm();
     let status = daemon.wait().await.expect("wait daemon");
+    assert!(status.success(), "daemon exited with {status:?}");
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_daemon_sigterm_wakes_long_poll_hook_workers() {
+    let _guard = test_guard().await;
+    let (tmp, _mempal_home, db_path, config_path) = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_config(
+        &config_path,
+        &db_path,
+        true,
+        10_000,
+        60,
+        Some(&format!("http://{addr}/v1")),
+    );
+
+    let mut daemon = DaemonSupervisor::spawn(
+        HashMap::from([("HOME".to_string(), tmp.path().display().to_string())]),
+        vec!["--foreground".to_string()],
+    )
+    .await
+    .expect("spawn daemon");
+    daemon
+        .wait_ready(Duration::from_secs(5))
+        .await
+        .expect("wait ready");
+    wait_for_daemon_stderr_line(
+        &daemon,
+        Duration::from_secs(5),
+        "daemon hook workers started",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    daemon.sigterm();
+    let status = tokio::time::timeout(Duration::from_secs(1), daemon.wait())
+        .await
+        .expect("daemon did not wake long-poll hook workers after SIGTERM")
+        .expect("wait daemon");
     assert!(status.success(), "daemon exited with {status:?}");
     handle.shutdown().await;
 }

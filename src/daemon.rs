@@ -1,8 +1,12 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{future::Future, pin::Pin};
@@ -29,6 +33,8 @@ use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evalua
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use serde_json::{Value, json};
+#[cfg(any(test, unix))]
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -260,6 +266,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         config: Arc::clone(&context.config),
         mempal_home: context.mempal_home.clone(),
         write_observer: context.write_observer.clone(),
+        #[cfg(test)]
+        idle_observer: None,
     };
     let mut hook_workers = JoinSet::new();
     let mut next_hook_worker_index = 0;
@@ -269,6 +277,10 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         &mut next_hook_worker_index,
         claim_ttl_secs,
         poll_interval,
+    );
+    tracing::info!(
+        limit = DAEMON_HOOK_WORKER_LIMIT,
+        "daemon hook workers started"
     );
     loop {
         context.write_observer.maybe_log_stall(&context.store).await;
@@ -345,6 +357,8 @@ struct HookWorkerState {
     config: Arc<crate::core::config::Config>,
     mempal_home: PathBuf,
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+    #[cfg(test)]
+    idle_observer: Option<Arc<Notify>>,
 }
 
 #[derive(Clone)]
@@ -434,16 +448,59 @@ async fn run_hook_worker(state: HookWorkerState, claim_ttl_secs: i64, poll_inter
         }
 
         match poll_claim_next(&state.store, &state.worker_id, claim_ttl_secs, |duration| {
-            Box::pin(tokio::time::sleep(duration))
+            Box::pin(wait_for_shutdown_or_sleep(duration))
         })
         .await
         {
             ClaimPollResult::Claimed(message) => {
                 process_hook_worker_message(state.clone(), message, claim_ttl_secs).await;
             }
-            ClaimPollResult::Idle => tokio::time::sleep(poll_interval).await,
+            ClaimPollResult::Idle => {
+                #[cfg(test)]
+                let idle_observer = state.idle_observer.clone();
+                wait_for_shutdown_or_sleep_after(poll_interval, move || {
+                    #[cfg(test)]
+                    notify_hook_worker_idle(idle_observer);
+                })
+                .await;
+            }
             ClaimPollResult::RetryAfterError => continue,
         }
+    }
+}
+
+async fn wait_for_shutdown_or_sleep(duration: Duration) {
+    wait_for_shutdown_or_sleep_after(duration, || {}).await;
+}
+
+async fn wait_for_shutdown_or_sleep_after(duration: Duration, before_wait: impl FnOnce()) {
+    #[cfg(unix)]
+    {
+        let shutdown = shutdown_notify().notified();
+        tokio::pin!(shutdown);
+        shutdown.as_mut().enable();
+        if shutdown_requested() {
+            return;
+        }
+        before_wait();
+
+        tokio::select! {
+            () = tokio::time::sleep(duration) => {}
+            () = &mut shutdown => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        before_wait();
+        tokio::time::sleep(duration).await;
+    }
+}
+
+#[cfg(test)]
+fn notify_hook_worker_idle(observer: Option<Arc<Notify>>) {
+    if let Some(observer) = observer {
+        observer.notify_one();
     }
 }
 
@@ -551,11 +608,36 @@ fn hook_message_heartbeat_interval(claim_ttl_secs: i64) -> Duration {
 }
 
 async fn wait_for_hook_worker_or_tick(hook_workers: &mut JoinSet<()>, tick: Duration) {
-    if hook_workers.is_empty() {
-        tokio::time::sleep(tick).await;
+    if shutdown_requested() {
         return;
     }
 
+    if hook_workers.is_empty() {
+        wait_for_shutdown_or_sleep(tick).await;
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        let shutdown = shutdown_notify().notified();
+        tokio::pin!(shutdown);
+        shutdown.as_mut().enable();
+        if shutdown_requested() {
+            return;
+        }
+
+        tokio::select! {
+            result = hook_workers.join_next() => {
+                if let Some(result) = result {
+                    handle_hook_worker_join(result);
+                }
+            }
+            () = tokio::time::sleep(tick) => {}
+            () = &mut shutdown => {}
+        }
+    }
+
+    #[cfg(not(unix))]
     tokio::select! {
         result = hook_workers.join_next() => {
             if let Some(result) = result {
@@ -2644,17 +2726,61 @@ struct DaemonEmbedderRuntimeSnapshot {
 
 #[cfg(unix)]
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static SHUTDOWN_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+#[cfg(unix)]
+static SHUTDOWN_NOTIFY: OnceLock<Notify> = OnceLock::new();
+
+#[cfg(unix)]
+fn shutdown_notify() -> &'static Notify {
+    SHUTDOWN_NOTIFY.get_or_init(Notify::new)
+}
+
+#[cfg(unix)]
+fn request_shutdown_and_notify() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    shutdown_notify().notify_waiters();
+}
+
+#[cfg(all(unix, test))]
+fn request_shutdown() {
+    request_shutdown_and_notify();
+}
+
+#[cfg(unix)]
+fn reset_shutdown_request() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+}
+
+#[cfg(all(not(unix), test))]
+fn request_shutdown() {}
+
+#[cfg(not(unix))]
+fn reset_shutdown_request() {}
 
 #[cfg(unix)]
 extern "C" fn daemon_signal_handler(_signal: i32) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    write_shutdown_signal_byte();
 }
 
 #[cfg(unix)]
 fn install_shutdown_handlers() -> Result<()> {
-    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
-    // SAFETY: installs a process signal handler that only writes an AtomicBool,
-    // which is signal-safe.
+    reset_shutdown_request();
+    let (read_fd, write_fd) = create_shutdown_signal_pipe()?;
+    let previous_write_fd = SHUTDOWN_SIGNAL_WRITE_FD.swap(write_fd, Ordering::SeqCst);
+    if previous_write_fd >= 0 {
+        // SAFETY: the previous descriptor was installed by this process as the
+        // shutdown self-pipe write end. Closing it during handler installation is
+        // outside signal-handler context.
+        unsafe {
+            libc::close(previous_write_fd);
+        }
+    }
+    spawn_shutdown_signal_bridge(read_fd);
+
+    // SAFETY: installs a process signal handler that only writes an AtomicBool
+    // and a byte to a nonblocking self-pipe, both async-signal-safe operations.
     unsafe {
         let handler = daemon_signal_handler as *const () as usize;
         if libc::signal(libc::SIGTERM, handler) == libc::SIG_ERR {
@@ -2667,6 +2793,135 @@ fn install_shutdown_handlers() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_shutdown_signal_pipe() -> Result<(RawFd, RawFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: `fds` points to two valid c_int slots for libc to initialize.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("failed to create shutdown pipe");
+    }
+
+    if let Err(error) =
+        configure_shutdown_signal_fd(fds[0]).and_then(|()| configure_shutdown_signal_fd(fds[1]))
+    {
+        // SAFETY: both descriptors were returned by `pipe` above and are still
+        // owned by this function on this error path.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(error);
+    }
+
+    Ok((fds[0], fds[1]))
+}
+
+#[cfg(unix)]
+fn configure_shutdown_signal_fd(fd: RawFd) -> Result<()> {
+    set_fd_flag(fd, libc::F_GETFL, libc::F_SETFL, libc::O_NONBLOCK)
+        .context("failed to set shutdown pipe nonblocking")?;
+    set_fd_flag(fd, libc::F_GETFD, libc::F_SETFD, libc::FD_CLOEXEC)
+        .context("failed to set shutdown pipe close-on-exec")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_fd_flag(
+    fd: RawFd,
+    get_cmd: libc::c_int,
+    set_cmd: libc::c_int,
+    flag: libc::c_int,
+) -> Result<()> {
+    // SAFETY: `fd` is an open file descriptor and `fcntl` is called with the
+    // standard get/set flag commands for that descriptor.
+    let current = unsafe { libc::fcntl(fd, get_cmd) };
+    if current == -1 {
+        return Err(std::io::Error::last_os_error()).context("failed to read fd flags");
+    }
+    // SAFETY: `fd` is valid and `current | flag` is the updated flag set for
+    // the matching `set_cmd`.
+    if unsafe { libc::fcntl(fd, set_cmd, current | flag) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("failed to update fd flags");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_shutdown_signal_byte() {
+    let write_fd = SHUTDOWN_SIGNAL_WRITE_FD.load(Ordering::SeqCst);
+    if write_fd < 0 {
+        return;
+    }
+
+    let byte = [1_u8];
+    // SAFETY: `write_fd` is the nonblocking write end of the process-global
+    // shutdown self-pipe. `write(2)` is async-signal-safe; errors are ignored
+    // because the atomic flag already records shutdown intent.
+    unsafe {
+        let _ = libc::write(write_fd, byte.as_ptr().cast(), byte.len());
+    }
+}
+
+#[cfg(unix)]
+fn spawn_shutdown_signal_bridge(read_fd: RawFd) {
+    // SAFETY: `read_fd` was just returned by `pipe` and ownership moves into
+    // the async bridge task.
+    let read_fd = unsafe { OwnedFd::from_raw_fd(read_fd) };
+    tokio::spawn(async move {
+        let async_fd = match tokio::io::unix::AsyncFd::new(read_fd) {
+            Ok(async_fd) => async_fd,
+            Err(error) => {
+                tracing::warn!(?error, "failed to create shutdown signal bridge");
+                return;
+            }
+        };
+        let mut buffer = [0_u8; 64];
+
+        loop {
+            let mut ready = match async_fd.readable().await {
+                Ok(ready) => ready,
+                Err(error) => {
+                    tracing::warn!(?error, "shutdown signal bridge readiness failed");
+                    return;
+                }
+            };
+
+            loop {
+                // SAFETY: the buffer is valid for writes and the descriptor is
+                // owned by `async_fd` for the lifetime of this task.
+                let bytes_read = unsafe {
+                    libc::read(
+                        async_fd.get_ref().as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+
+                if bytes_read > 0 {
+                    request_shutdown_and_notify();
+                    return;
+                }
+                if bytes_read == 0 {
+                    return;
+                }
+
+                let error = std::io::Error::last_os_error();
+                match error.kind() {
+                    std::io::ErrorKind::Interrupted => continue,
+                    std::io::ErrorKind::WouldBlock => {
+                        ready.clear_ready();
+                        break;
+                    }
+                    _ => {
+                        tracing::warn!(?error, "shutdown signal bridge read failed");
+                        return;
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[cfg(not(unix))]
@@ -2894,14 +3149,31 @@ mod tests {
     use crate::hook::{CapturedHookEnvelope, HookEvent};
     use arc_swap::ArcSwap;
     use std::pin::Pin;
+    use tokio::sync::Notify;
 
     use super::{
         ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext,
         EndpointRecoveryConfigProvider, EndpointRecoveryRequeuePlan, EndpointRecoveryRequeueState,
         HookWorkerState, build_drawer_records, compile_classifier_from_embedder,
         llm_worker_claim_enabled, poll_claim_next, process_claimed_message_with_embedder,
-        run_hook_worker, wing_from_cwd,
+        request_shutdown, reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick,
+        wing_from_cwd,
     };
+
+    struct ShutdownResetGuard;
+
+    impl ShutdownResetGuard {
+        fn new() -> Self {
+            reset_shutdown_request();
+            Self
+        }
+    }
+
+    impl Drop for ShutdownResetGuard {
+        fn drop(&mut self) {
+            reset_shutdown_request();
+        }
+    }
 
     struct StubClaimSource {
         responses: Mutex<VecDeque<Result<Option<ClaimedMessage>, QueueError>>>,
@@ -3466,7 +3738,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_bounded_hook_worker_continues_claiming_after_completed_batch() {
-        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        let _shutdown_guard = ShutdownResetGuard::new();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let mempal_home = tmp.path().join(".mempal");
@@ -3507,6 +3779,7 @@ mod tests {
             !config.llm.enabled,
             "test runtime config must keep LLM disabled"
         );
+        let idle_observer = Arc::new(Notify::new());
         let worker = tokio::spawn(run_hook_worker(
             HookWorkerState {
                 async_db,
@@ -3520,6 +3793,7 @@ mod tests {
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                idle_observer: Some(Arc::clone(&idle_observer)),
             },
             60,
             Duration::from_millis(10),
@@ -3548,12 +3822,45 @@ mod tests {
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.claimed, 0);
 
-        super::SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), idle_observer.notified())
+            .await
+            .expect("worker should enter idle after completing queued hooks");
+
+        request_shutdown();
         tokio::time::timeout(Duration::from_secs(1), worker)
             .await
             .expect("worker should observe shutdown")
             .expect("worker task should not panic");
-        super::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_main_loop_wait_wakes_on_shutdown_with_active_worker() {
+        let _shutdown_guard = ShutdownResetGuard::new();
+        let mut hook_workers = tokio::task::JoinSet::new();
+        hook_workers.spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                wait_for_hook_worker_or_tick(&mut hook_workers, Duration::from_secs(60)),
+                async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    request_shutdown();
+                }
+            );
+        })
+        .await
+        .expect("shutdown should wake main-loop wait without waiting for poll tick");
+
+        assert_eq!(
+            hook_workers.len(),
+            1,
+            "active worker should remain for the drain-budget path"
+        );
+        hook_workers.abort_all();
+        while hook_workers.join_next().await.is_some() {}
     }
 
     struct StaticEmbedder;
@@ -3723,6 +4030,7 @@ mod tests {
                 config: std::sync::Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                idle_observer: None,
             },
             message,
             60,
@@ -3814,6 +4122,7 @@ mod tests {
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                idle_observer: None,
             },
             message,
             60,
@@ -3951,6 +4260,7 @@ mod tests {
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                idle_observer: None,
             },
             message,
             1,
@@ -4482,6 +4792,7 @@ mod tests {
                 config: std::sync::Arc::new(config),
                 mempal_home: tmp.path().to_path_buf(),
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                idle_observer: None,
             },
             message.clone(),
             60,
@@ -4722,6 +5033,7 @@ mod tests {
                 config: Arc::new(config),
                 mempal_home: tmp.path().to_path_buf(),
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                idle_observer: None,
             },
             message,
             60,
