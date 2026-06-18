@@ -1720,6 +1720,7 @@ dependencies = [
  "daemonize",
  "dotenvy",
  "filetime",
+ "futures",
  "hyper 0.14.32",
  "jieba-rs",
  "libc",

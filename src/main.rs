@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use futures::{StreamExt, TryStreamExt, stream};
 use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::adoption_analytics::build_runtime_adoption_analytics;
 #[cfg(feature = "rest")]
@@ -2141,6 +2142,12 @@ struct MaintenanceRejudgeArgs {
     /// Number of snapshot rows to process per full-sweep page.
     #[arg(long = "page-size", default_value_t = DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE)]
     page_size: usize,
+    /// Maximum concurrent LLM evaluations within one full-sweep page.
+    #[arg(
+        long = "llm-concurrency",
+        default_value_t = DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY
+    )]
+    llm_concurrency: usize,
     /// Write content-free JSONL progress telemetry to this file.
     #[arg(long = "progress-file")]
     progress_file: Option<PathBuf>,
@@ -2322,6 +2329,19 @@ struct HistoricalRejudgeOptions<'a> {
     format: &'a str,
 }
 
+#[derive(Clone, Copy)]
+struct HistoricalRejudgeRuntimeOptions {
+    llm_concurrency: usize,
+}
+
+impl Default for HistoricalRejudgeRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            llm_concurrency: DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HistoricalRejudgeReport {
     dry_run: bool,
@@ -2478,6 +2498,7 @@ struct HistoricalRejudgeBackupIntegrity {
 }
 
 const DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE: usize = 500;
+const DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY: usize = 1;
 const HISTORICAL_REJUDGE_CHECKPOINT_KEY: &str = "maintenance.rejudge.checkpoint";
 const HISTORICAL_REJUDGE_WORK_TABLE: &str = "historical_rejudge_work_items";
 static HISTORICAL_REJUDGE_RUN_ID_SEQUENCE: std::sync::atomic::AtomicU64 =
@@ -3503,6 +3524,7 @@ fn run() -> Result<()> {
                 resume,
                 unsafe_allow_config_version_drift,
                 page_size,
+                llm_concurrency,
                 progress_file,
                 proposal_llm_endpoint,
                 confirm_llm_endpoint,
@@ -3511,28 +3533,33 @@ fn run() -> Result<()> {
                 project,
                 format,
             } = *args;
+            let options = HistoricalRejudgeOptions {
+                execute,
+                hard_delete,
+                backup_dir: backup_dir.as_deref(),
+                unsafe_no_backup,
+                limit,
+                all,
+                resume,
+                unsafe_allow_config_version_drift,
+                page_size,
+                progress_file: progress_file.as_deref(),
+                proposal_llm_endpoint: proposal_llm_endpoint.as_deref(),
+                confirm_llm_endpoint: confirm_llm_endpoint.as_deref(),
+                wing: wing.as_deref(),
+                room: room.as_deref(),
+                project: project.as_deref(),
+                format: format.as_str(),
+            };
             match command {
-                None => block_on_result(maintenance_rejudge_command(
+                None if llm_concurrency == DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY => {
+                    block_on_result(maintenance_rejudge_command(&db, config.as_ref(), options))
+                }
+                None => block_on_result(maintenance_rejudge_command_with_runtime(
                     &db,
                     config.as_ref(),
-                    HistoricalRejudgeOptions {
-                        execute,
-                        hard_delete,
-                        backup_dir: backup_dir.as_deref(),
-                        unsafe_no_backup,
-                        limit,
-                        all,
-                        resume,
-                        unsafe_allow_config_version_drift,
-                        page_size,
-                        progress_file: progress_file.as_deref(),
-                        proposal_llm_endpoint: proposal_llm_endpoint.as_deref(),
-                        confirm_llm_endpoint: confirm_llm_endpoint.as_deref(),
-                        wing: wing.as_deref(),
-                        room: room.as_deref(),
-                        project: project.as_deref(),
-                        format: format.as_str(),
-                    },
+                    options,
+                    HistoricalRejudgeRuntimeOptions { llm_concurrency },
                 )),
                 Some(MaintenanceRejudgeCommands::Restore {
                     backup,
@@ -13594,7 +13621,23 @@ async fn maintenance_rejudge_command(
     config: &Config,
     options: HistoricalRejudgeOptions<'_>,
 ) -> Result<()> {
+    maintenance_rejudge_command_with_runtime(
+        db,
+        config,
+        options,
+        HistoricalRejudgeRuntimeOptions::default(),
+    )
+    .await
+}
+
+async fn maintenance_rejudge_command_with_runtime(
+    db: &Database,
+    config: &Config,
+    options: HistoricalRejudgeOptions<'_>,
+    runtime: HistoricalRejudgeRuntimeOptions,
+) -> Result<()> {
     validate_historical_rejudge_options(options)?;
+    validate_historical_rejudge_runtime_options(runtime)?;
     let current_dir = env::current_dir().ok();
     let project_id = if options.project.is_some() {
         resolve_project_id(options.project, config, current_dir.as_deref())
@@ -13605,8 +13648,15 @@ async fn maintenance_rejudge_command(
     let mut progress = HistoricalRejudgeProgressWriter::create(options.progress_file)?;
 
     if options.all {
-        return maintenance_rejudge_all_command(db, config, options, project_id, progress.as_mut())
-            .await;
+        return maintenance_rejudge_all_command(
+            db,
+            config,
+            options,
+            runtime,
+            project_id,
+            progress.as_mut(),
+        )
+        .await;
     }
 
     maintenance_rejudge_limited_command(db, config, options, project_id, progress.as_mut()).await
@@ -13633,6 +13683,15 @@ fn validate_historical_rejudge_options(options: HistoricalRejudgeOptions<'_>) ->
     }
     if let Some(backup_dir) = options.backup_dir {
         validate_absolute_path(backup_dir, "--backup-dir")?;
+    }
+    Ok(())
+}
+
+fn validate_historical_rejudge_runtime_options(
+    runtime: HistoricalRejudgeRuntimeOptions,
+) -> Result<()> {
+    if runtime.llm_concurrency == 0 {
+        bail!("--llm-concurrency must be greater than zero");
     }
     Ok(())
 }
@@ -13928,6 +13987,7 @@ async fn maintenance_rejudge_all_command(
     db: &Database,
     config: &Config,
     options: HistoricalRejudgeOptions<'_>,
+    runtime: HistoricalRejudgeRuntimeOptions,
     project_id: Option<String>,
     mut progress: Option<&mut HistoricalRejudgeProgressWriter>,
 ) -> Result<()> {
@@ -14045,16 +14105,30 @@ async fn maintenance_rejudge_all_command(
             break;
         }
 
-        if let Err(error) = process_historical_rejudge_work_page(
-            db,
-            config,
-            options,
-            &mut checkpoint,
-            &page,
-            llm_context.as_ref(),
-        )
-        .await
-        {
+        let page_result = if runtime.llm_concurrency == DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY {
+            process_historical_rejudge_work_page(
+                db,
+                config,
+                options,
+                &mut checkpoint,
+                &page,
+                llm_context.as_ref(),
+            )
+            .await
+        } else {
+            process_historical_rejudge_work_page_with_concurrency(
+                db,
+                config,
+                options,
+                &mut checkpoint,
+                &page,
+                llm_context.as_ref(),
+                runtime.llm_concurrency,
+            )
+            .await
+        };
+
+        if let Err(error) = page_result {
             let page_start = page
                 .first()
                 .map(|work_item| work_item.drawer_rowid)
@@ -14770,12 +14844,80 @@ async fn process_historical_rejudge_work_page(
     page: &[HistoricalRejudgeWorkItem],
     llm_context: Option<&HistoricalRejudgeLlmContext>,
 ) -> Result<()> {
-    let mut prepared = Vec::with_capacity(page.len());
-    for work_item in page {
-        prepared
-            .push(prepare_historical_rejudge_work_item(db, config, work_item, llm_context).await?);
-    }
+    process_historical_rejudge_work_page_with_concurrency(
+        db,
+        config,
+        options,
+        checkpoint,
+        page,
+        llm_context,
+        DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY,
+    )
+    .await
+}
+
+async fn process_historical_rejudge_work_page_with_concurrency(
+    db: &Database,
+    config: &Config,
+    options: HistoricalRejudgeOptions<'_>,
+    checkpoint: &mut HistoricalRejudgeCheckpoint,
+    page: &[HistoricalRejudgeWorkItem],
+    llm_context: Option<&HistoricalRejudgeLlmContext>,
+    llm_concurrency: usize,
+) -> Result<()> {
+    let prepared =
+        prepare_historical_rejudge_work_page(db, config, page, llm_context, llm_concurrency)
+            .await?;
     process_prepared_historical_rejudge_work_items(db, options, checkpoint, &prepared)
+}
+
+async fn prepare_historical_rejudge_work_page(
+    db: &Database,
+    config: &Config,
+    page: &[HistoricalRejudgeWorkItem],
+    llm_context: Option<&HistoricalRejudgeLlmContext>,
+    llm_concurrency: usize,
+) -> Result<Vec<PreparedHistoricalRejudgeWorkItem>> {
+    prepare_historical_rejudge_work_page_with(page, llm_concurrency, |work_item| {
+        prepare_historical_rejudge_work_item(db, config, work_item, llm_context)
+    })
+    .await
+}
+
+async fn prepare_historical_rejudge_work_page_with<'a, F, Fut>(
+    page: &'a [HistoricalRejudgeWorkItem],
+    llm_concurrency: usize,
+    prepare: F,
+) -> Result<Vec<PreparedHistoricalRejudgeWorkItem>>
+where
+    F: Fn(&'a HistoricalRejudgeWorkItem) -> Fut,
+    Fut: Future<Output = Result<PreparedHistoricalRejudgeWorkItem>> + 'a,
+{
+    if llm_concurrency == 0 {
+        bail!("--llm-concurrency must be greater than zero");
+    }
+    if page.is_empty() {
+        return Ok(Vec::new());
+    }
+    if llm_concurrency == 1 {
+        let mut prepared = Vec::with_capacity(page.len());
+        for work_item in page {
+            prepared.push(prepare(work_item).await?);
+        }
+        return Ok(prepared);
+    }
+
+    let prepare = &prepare;
+    let mut prepared = stream::iter(page.iter().enumerate())
+        .map(|(index, work_item)| {
+            let future = prepare(work_item);
+            async move { future.await.map(|prepared| (index, prepared)) }
+        })
+        .buffer_unordered(llm_concurrency.min(page.len()))
+        .try_collect::<Vec<_>>()
+        .await?;
+    prepared.sort_by_key(|(index, _)| *index);
+    Ok(prepared.into_iter().map(|(_, prepared)| prepared).collect())
 }
 
 async fn prepare_historical_rejudge_work_item(
@@ -19767,6 +19909,78 @@ threshold = 0.7
             .expect("load historical rejudge work item decision")
     }
 
+    fn test_historical_rejudge_work_item(run_id: &str, rowid: i64) -> HistoricalRejudgeWorkItem {
+        HistoricalRejudgeWorkItem {
+            run_id: run_id.to_string(),
+            drawer_rowid: rowid,
+            drawer_id: format!("drawer-{rowid}"),
+            snapshot: HistoricalRejudgeWorkItemSnapshot {
+                content_hash: format!("hash-{rowid}"),
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+                wing: "notes".to_string(),
+                room: None,
+                source_file: Some(format!("drawer-{rowid}.json")),
+                source_type: "agent_inference".to_string(),
+                project_id: None,
+                chunk_index: None,
+                normalize_version: 0,
+            },
+            llm_stage: None,
+            llm_proposal_score: None,
+        }
+    }
+
+    fn insert_test_historical_rejudge_work_item(db: &Database, item: &HistoricalRejudgeWorkItem) {
+        db.conn()
+            .execute(
+                &format!(
+                    r#"
+                    INSERT INTO {HISTORICAL_REJUDGE_WORK_TABLE} (
+                        run_id,
+                        drawer_rowid,
+                        drawer_id,
+                        snapshot_content_hash,
+                        snapshot_added_at,
+                        snapshot_wing,
+                        snapshot_room,
+                        snapshot_source_file,
+                        snapshot_source_type,
+                        snapshot_project_id,
+                        snapshot_chunk_index,
+                        snapshot_normalize_version
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    "#
+                ),
+                rusqlite::params![
+                    item.run_id.as_str(),
+                    item.drawer_rowid,
+                    item.drawer_id.as_str(),
+                    item.snapshot.content_hash.as_str(),
+                    item.snapshot.added_at.as_str(),
+                    item.snapshot.wing.as_str(),
+                    item.snapshot.room.as_deref(),
+                    item.snapshot.source_file.as_deref(),
+                    item.snapshot.source_type.as_str(),
+                    item.snapshot.project_id.as_deref(),
+                    item.snapshot.chunk_index,
+                    item.snapshot.normalize_version,
+                ],
+            )
+            .expect("insert test historical rejudge work item");
+    }
+
+    fn terminal_prepared_historical_rejudge_work_item(
+        work_item: &HistoricalRejudgeWorkItem,
+    ) -> PreparedHistoricalRejudgeWorkItem {
+        PreparedHistoricalRejudgeWorkItem {
+            work_item: work_item.clone(),
+            row: None,
+            decision: None,
+            backup_item: None,
+            terminal_decision: Some("missing"),
+        }
+    }
+
     fn rejudge_progress_events(path: &Path) -> Vec<serde_json::Value> {
         std::fs::read_to_string(path)
             .expect("read progress file")
@@ -19796,6 +20010,148 @@ threshold = 0.7
         assert_ne!(first, second);
         assert!(first.starts_with("historical-rejudge-20260612T010203Z-aaaaaaaaaaaa-"));
         assert!(second.starts_with("historical-rejudge-20260612T010203Z-aaaaaaaaaaaa-"));
+    }
+
+    #[test]
+    fn historical_rejudge_llm_concurrency_cli_defaults_to_one() {
+        let command =
+            <MaintenanceRejudgeArgs as clap::Args>::augment_args(clap::Command::new("rejudge"));
+        let matches = command
+            .try_get_matches_from(["rejudge"])
+            .expect("parse rejudge args");
+        let args = <MaintenanceRejudgeArgs as clap::FromArgMatches>::from_arg_matches(&matches)
+            .expect("build rejudge args");
+
+        assert_eq!(
+            args.llm_concurrency,
+            DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_llm_concurrency_zero_is_rejected() {
+        let command =
+            <MaintenanceRejudgeArgs as clap::Args>::augment_args(clap::Command::new("rejudge"));
+        let matches = command
+            .try_get_matches_from(["rejudge", "--llm-concurrency", "0"])
+            .expect("parse rejudge args");
+        let args = <MaintenanceRejudgeArgs as clap::FromArgMatches>::from_arg_matches(&matches)
+            .expect("build rejudge args");
+        let error = validate_historical_rejudge_runtime_options(HistoricalRejudgeRuntimeOptions {
+            llm_concurrency: args.llm_concurrency,
+        })
+        .expect_err("zero LLM concurrency must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--llm-concurrency must be greater than zero"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_parallel_prepare_honors_llm_concurrency_cap() {
+        let page = (1..=6)
+            .map(|rowid| test_historical_rejudge_work_item("parallel-cap-run", rowid))
+            .collect::<Vec<_>>();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let prepared = prepare_historical_rejudge_work_page_with(&page, 2, |work_item| {
+            let active = std::sync::Arc::clone(&active);
+            let max_active = std::sync::Arc::clone(&max_active);
+            async move {
+                let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(terminal_prepared_historical_rejudge_work_item(work_item))
+            }
+        })
+        .await
+        .expect("parallel prepare");
+
+        assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|item| item.work_item.drawer_rowid)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_parallel_prepare_finalizes_in_page_order() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let page = (1..=3)
+            .map(|rowid| test_historical_rejudge_work_item("parallel-order-run", rowid))
+            .collect::<Vec<_>>();
+        for item in &page {
+            insert_test_historical_rejudge_work_item(&db, item);
+        }
+
+        let prepared =
+            prepare_historical_rejudge_work_page_with(&page, 3, |work_item| async move {
+                let delay_ms = match work_item.drawer_rowid {
+                    1 => 30,
+                    2 => 10,
+                    _ => 0,
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                Ok(terminal_prepared_historical_rejudge_work_item(work_item))
+            })
+            .await
+            .expect("parallel prepare");
+        let mut checkpoint = HistoricalRejudgeCheckpoint {
+            run_id: "parallel-order-run".to_string(),
+            status: "running".to_string(),
+            options_hash: "hash".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            snapshot_max_rowid: 3,
+            snapshot_count: 3,
+            last_processed_rowid: None,
+            scanned_count: 0,
+            candidate_count: 0,
+            kept_count: 0,
+            protected_count: 0,
+            mutated_count: 0,
+            estimated_bytes_reclaimed: 0,
+            mutation: "soft_delete".to_string(),
+            page_size: 3,
+            judge_model: Some("test".to_string()),
+            config_version: "cfg".to_string(),
+            backup_path: None,
+        };
+
+        process_prepared_historical_rejudge_work_items(
+            &db,
+            full_rejudge_options(true, None, 3),
+            &mut checkpoint,
+            &prepared,
+        )
+        .expect("finalize prepared items");
+
+        assert_eq!(checkpoint.last_processed_rowid, Some(3));
+        assert_eq!(checkpoint.scanned_count, 3);
+        assert_eq!(
+            (1..=3)
+                .map(|rowid| historical_rejudge_work_item_decision(
+                    &db,
+                    "parallel-order-run",
+                    rowid
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                Some("missing".to_string()),
+                Some("missing".to_string()),
+                Some("missing".to_string()),
+            ]
+        );
     }
 
     #[test]
