@@ -22,8 +22,9 @@ use mempal::core::{
         CompiledPrivacyConfig, Config, ConfigHandle, EffectiveLlmEndpoint, default_config_path,
     },
     db::{
-        CURRENT_VECTOR_INDEX_VERSION, Database, HistoricalRejudgeAudit, ReindexVectorStash,
-        VECTOR_DISTANCE_METRIC, find_similar_clusters, fts_tokenize_content, vector_metadata_key,
+        CURRENT_VECTOR_INDEX_VERSION, Database, DbError, HistoricalRejudgeAudit,
+        ReindexVectorStash, VECTOR_DISTANCE_METRIC, find_similar_clusters, fts_tokenize_content,
+        vector_metadata_key,
     },
     phase3::{
         CardContextDefaultProposalReport, CardContextRollbackControlReport, EvaluatorAdviceInput,
@@ -3092,6 +3093,10 @@ fn run() -> Result<()> {
 
     let db = match if dashboard_mode {
         open_dashboard_database(&db_path).context("failed to open dashboard database")
+    } else if command_retries_historical_rejudge_startup_open(&cli.command) {
+        open_historical_rejudge_startup_database_with_retry(|| {
+            Database::open(&db_path).context("failed to open database")
+        })
     } else {
         Database::open(&db_path).context("failed to open database")
     } {
@@ -3743,6 +3748,33 @@ fn run() -> Result<()> {
         | Commands::ReleaseReadiness { .. }
         | Commands::Doctor { .. } => unreachable!(),
     }
+}
+
+fn command_retries_historical_rejudge_startup_open(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Maintenance {
+            command: MaintenanceCommands::Rejudge(args),
+        } if args.command.is_none() && args.resume
+    )
+}
+
+fn open_historical_rejudge_startup_database_with_retry(
+    mut open_database: impl FnMut() -> Result<Database>,
+) -> Result<Database> {
+    for attempt in 0..=HISTORICAL_REJUDGE_SQLITE_LOCK_MAX_RETRIES {
+        match open_database() {
+            Ok(db) => return Ok(db),
+            Err(error)
+                if is_transient_sqlite_lock_error(&error)
+                    && attempt < HISTORICAL_REJUDGE_SQLITE_LOCK_MAX_RETRIES =>
+            {
+                std::thread::sleep(historical_rejudge_sqlite_lock_retry_delay(attempt));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("historical rejudge startup database retry loop returns on terminal attempt")
 }
 
 fn is_dashboard_command(command: &Commands) -> bool {
@@ -15331,14 +15363,14 @@ fn execute_historical_rejudge_sqlite_write_with_retry<T>(
     context: &'static str,
     mut operation: impl FnMut() -> rusqlite::Result<T>,
 ) -> Result<T> {
-    for attempt in 0..=HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_RETRIES {
+    for attempt in 0..=HISTORICAL_REJUDGE_SQLITE_LOCK_MAX_RETRIES {
         match operation() {
             Ok(rows) => return Ok(rows),
             Err(error)
                 if is_transient_sqlite_lock(&error)
-                    && attempt < HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_RETRIES =>
+                    && attempt < HISTORICAL_REJUDGE_SQLITE_LOCK_MAX_RETRIES =>
             {
-                std::thread::sleep(historical_rejudge_checkpoint_save_retry_delay(attempt));
+                std::thread::sleep(historical_rejudge_sqlite_lock_retry_delay(attempt));
             }
             Err(error) => {
                 return Err(error).context(context);
@@ -15348,15 +15380,15 @@ fn execute_historical_rejudge_sqlite_write_with_retry<T>(
     unreachable!("historical rejudge SQLite write retry loop returns on its terminal attempt")
 }
 
-const HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_RETRIES: usize = 40;
-const HISTORICAL_REJUDGE_CHECKPOINT_SAVE_INITIAL_DELAY_MS: u64 = 25;
-const HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_DELAY_MS: u64 = 500;
+const HISTORICAL_REJUDGE_SQLITE_LOCK_MAX_RETRIES: usize = 40;
+const HISTORICAL_REJUDGE_SQLITE_LOCK_INITIAL_DELAY_MS: u64 = 25;
+const HISTORICAL_REJUDGE_SQLITE_LOCK_MAX_DELAY_MS: u64 = 500;
 
-fn historical_rejudge_checkpoint_save_retry_delay(attempt: usize) -> std::time::Duration {
+fn historical_rejudge_sqlite_lock_retry_delay(attempt: usize) -> std::time::Duration {
     let multiplier = 1_u64 << attempt.min(4);
-    let delay_ms = HISTORICAL_REJUDGE_CHECKPOINT_SAVE_INITIAL_DELAY_MS
+    let delay_ms = HISTORICAL_REJUDGE_SQLITE_LOCK_INITIAL_DELAY_MS
         .saturating_mul(multiplier)
-        .min(HISTORICAL_REJUDGE_CHECKPOINT_SAVE_MAX_DELAY_MS);
+        .min(HISTORICAL_REJUDGE_SQLITE_LOCK_MAX_DELAY_MS);
     std::time::Duration::from_millis(delay_ms)
 }
 
@@ -15364,18 +15396,34 @@ fn is_transient_sqlite_lock(error: &rusqlite::Error) -> bool {
     matches!(
         error,
         rusqlite::Error::SqliteFailure(sqlite_error, _)
-            if matches!(
-                sqlite_error.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            )
+            if is_transient_sqlite_lock_code(sqlite_error)
     )
 }
 
+fn is_transient_sqlite_lock_code(sqlite_error: &rusqlite::ffi::Error) -> bool {
+    let primary_code = sqlite_error.extended_code & 0xff;
+    matches!(
+        sqlite_error.code,
+        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+    ) || matches!(
+        primary_code,
+        rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED
+    )
+}
+
+fn is_transient_db_error_sqlite_lock(error: &DbError) -> bool {
+    matches!(error, DbError::Sqlite(sqlite_error) if is_transient_sqlite_lock(sqlite_error))
+}
+
 fn is_transient_sqlite_lock_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .filter_map(|cause| cause.downcast_ref::<rusqlite::Error>())
-        .any(is_transient_sqlite_lock)
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(is_transient_sqlite_lock)
+            || cause
+                .downcast_ref::<DbError>()
+                .is_some_and(is_transient_db_error_sqlite_lock)
+    })
 }
 
 fn historical_rejudge_options_hash(
@@ -19046,6 +19094,60 @@ mod historical_rejudge_tests {
 
     fn test_config() -> Config {
         Config::parse("[gating]\nenabled = true\n").expect("parse config")
+    }
+
+    fn database_locked_open_error() -> anyhow::Error {
+        let sqlite_error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseLocked,
+                extended_code: rusqlite::ffi::SQLITE_LOCKED,
+            },
+            Some("database is locked".to_string()),
+        );
+        anyhow::Error::new(mempal::core::db::DbError::from(sqlite_error))
+            .context("failed to open database")
+    }
+
+    #[test]
+    fn historical_rejudge_startup_database_open_retries_transient_sqlite_lock() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let attempts = std::cell::Cell::new(0);
+
+        let db = open_historical_rejudge_startup_database_with_retry(|| {
+            let current_attempt = attempts.get();
+            attempts.set(current_attempt + 1);
+            if current_attempt == 0 {
+                Err(database_locked_open_error())
+            } else {
+                Database::open(&db_path).context("failed to open database")
+            }
+        })
+        .expect("historical rejudge startup open must retry transient SQLite locks");
+
+        assert_eq!(attempts.get(), 2);
+        let drawer_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
+            .expect("query opened database");
+        assert_eq!(drawer_count, 0);
+    }
+
+    #[test]
+    fn historical_rejudge_startup_database_open_does_not_retry_non_lock_sqlite_error() {
+        let attempts = std::cell::Cell::new(0);
+
+        let error = match open_historical_rejudge_startup_database_with_retry(|| {
+            attempts.set(attempts.get() + 1);
+            Err(anyhow::Error::new(rusqlite::Error::InvalidQuery)
+                .context("failed to open database"))
+        }) {
+            Ok(_) => panic!("non-lock SQLite errors must remain fatal"),
+            Err(error) => error,
+        };
+
+        assert_eq!(attempts.get(), 1);
+        assert!(!is_transient_sqlite_lock_error(&error));
     }
 
     fn llm_rejudge_config(base_url: &str) -> Config {
