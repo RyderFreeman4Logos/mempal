@@ -293,7 +293,7 @@ fn ensure_status_allowed(status: &RemoteCallServiceReport) -> Result<(), RemoteC
 
 fn embedding_status(config: &Config) -> RemoteCallServiceReport {
     let policy = &config.privacy.remote_calls;
-    if !embedding_backend_is_http(&config.embed.backend) {
+    let Some(http_backend) = active_embedding_http_backend(config) else {
         let status = if config.embed.backend == "model2vec" && config.embed.model.is_none() {
             RemoteCallStatus::DefaultLocal
         } else {
@@ -306,9 +306,16 @@ fn embedding_status(config: &Config) -> RemoteCallServiceReport {
             None,
             config.embed.backend.clone(),
         );
-    }
+    };
 
-    let endpoints = match config.embed.effective_endpoints() {
+    let effective_endpoints = if http_backend.eq_ignore_ascii_case(config.embed.backend.as_str()) {
+        config.embed.effective_endpoints()
+    } else {
+        let mut embed = config.embed.clone();
+        embed.backend = http_backend.to_string();
+        embed.effective_endpoints()
+    };
+    let endpoints = match effective_endpoints {
         Ok(endpoints) if !endpoints.is_empty() => endpoints,
         Ok(_) => {
             return service_report(
@@ -334,8 +341,24 @@ fn embedding_status(config: &Config) -> RemoteCallServiceReport {
         policy,
         RemoteCallService::Embedding,
         endpoints.iter().map(|endpoint| endpoint.base_url.as_str()),
-        "openai_compat",
+        if http_backend.eq_ignore_ascii_case(config.embed.backend.as_str()) {
+            "openai_compat"
+        } else {
+            "openai_compat fallback"
+        },
     )
+}
+
+fn active_embedding_http_backend(config: &Config) -> Option<&str> {
+    if embedding_backend_is_http(&config.embed.backend) {
+        return Some(config.embed.backend.as_str());
+    }
+    config
+        .embed
+        .fallback
+        .as_deref()
+        .filter(|fallback| !fallback.eq_ignore_ascii_case(config.embed.backend.as_str()))
+        .filter(|fallback| embedding_backend_is_http(fallback))
 }
 
 fn llm_status(config: &Config) -> RemoteCallServiceReport {
@@ -701,6 +724,34 @@ mod tests {
         assert!(ensure_embedding_allowed(&local).is_ok());
         assert!(ensure_llm_allowed(&local, &local.llm).is_ok());
         assert!(ensure_rerank_allowed(&local.privacy.remote_calls, &local.search.reranker).is_ok());
+    }
+
+    #[test]
+    fn fail_closed_policy_blocks_remote_embedding_fallback_for_local_primary() {
+        let mut config = default_local_config();
+        config.embed.fallback = Some("openai_compat".to_string());
+        config
+            .embed
+            .endpoints
+            .push(crate::core::config::EmbedEndpointConfig {
+                id: Some("remote-fallback".to_string()),
+                backend: Some("openai_compat".to_string()),
+                base_url: Some("https://api.openai.com/v1/private-fallback-path".to_string()),
+                model: Some("text-embedding-3-large".to_string()),
+                ..Default::default()
+            });
+        config.privacy.remote_calls.fail_closed = true;
+
+        let report = build_remote_call_report(&config);
+        let embedding = &report.services[0];
+
+        assert_eq!(embedding.status, RemoteCallStatus::RemoteEndpoint);
+        assert_eq!(embedding.policy, RemoteCallPolicyEffect::BlockedByPolicy);
+        assert_eq!(
+            embedding.endpoint.as_deref(),
+            Some(BLOCKED_REMOTE_ENDPOINT_LABEL)
+        );
+        assert!(ensure_embedding_allowed(&config).is_err());
     }
 
     #[test]

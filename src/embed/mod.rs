@@ -316,3 +316,41 @@ impl Embedder for ManagedEmbedder {
         self.primary.estimate_tokens(text)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::config::{Config, EmbedEndpointConfig};
+
+    #[tokio::test]
+    async fn remote_fallback_backend_is_blocked_before_router_construction() {
+        let mut config = Config::default();
+        config.embed.backend = "model2vec".to_string();
+        config.embed.fallback = Some("openai_compat".to_string());
+        config.embed.endpoints.push(EmbedEndpointConfig {
+            id: Some("remote-fallback".to_string()),
+            backend: Some("openai_compat".to_string()),
+            base_url: Some("https://api.openai.com/v1/private-fallback-path".to_string()),
+            model: Some("text-embedding-3-large".to_string()),
+            ..Default::default()
+        });
+        config.privacy.remote_calls.fail_closed = true;
+
+        let error = match build_backend_from_name(&config, "openai_compat").await {
+            Ok(_) => panic!("remote fallback backend should be blocked by fail-closed policy"),
+            Err(error) => error,
+        };
+
+        match error {
+            EmbedError::RemoteCallPolicy(policy) => {
+                assert_eq!(policy.service, "embedding");
+                assert_eq!(policy.allow_field, "allow_embedding");
+                assert_eq!(
+                    policy.endpoint,
+                    crate::core::remote_calls::BLOCKED_REMOTE_ENDPOINT_LABEL
+                );
+            }
+            other => panic!("expected remote call policy error, got {other}"),
+        }
+    }
+}
