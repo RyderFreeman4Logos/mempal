@@ -6,7 +6,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use axum::{Json, Router, routing::post};
-use mempal::core::config::{Config, ConfigHandle, IngestGatingConfig, LlmConfig, LlmJudgeConfig};
+use mempal::core::config::{
+    Config, ConfigHandle, IngestGatingConfig, LlmConfig, LlmJudgeConfig, RemoteCallPolicyConfig,
+};
 use mempal::core::db::Database;
 use mempal::core::queue::{ClaimedMessage, PendingMessageStore};
 use mempal::llm::client::LlmClient;
@@ -505,15 +507,16 @@ fn test_llm_client_runtime_rebuilds_on_endpoint_change() {
         model: Some("model-stable".to_string()),
         ..Default::default()
     };
+    let policy = RemoteCallPolicyConfig::default();
     let mut runtime = LlmClientRuntime::new(&config);
     let first = runtime
-        .router_for_config(&config)
+        .router_for_config(&config, &policy)
         .expect("load initial router");
 
     let mut changed = config.clone();
     changed.base_url = Some("http://127.0.0.1:20000/v1".to_string());
     let second = runtime
-        .router_for_config(&changed)
+        .router_for_config(&changed, &policy)
         .expect("rebuild changed router");
 
     assert!(
@@ -531,15 +534,16 @@ fn test_llm_client_runtime_rebuilds_on_legacy_retry_interval_change() {
         retry_interval_secs: 1,
         ..Default::default()
     };
+    let policy = RemoteCallPolicyConfig::default();
     let mut runtime = LlmClientRuntime::new(&config);
     let first = runtime
-        .router_for_config(&config)
+        .router_for_config(&config, &policy)
         .expect("load initial router");
 
     let mut changed = config.clone();
     changed.retry_interval_secs = 9;
     let second = runtime
-        .router_for_config(&changed)
+        .router_for_config(&changed, &policy)
         .expect("rebuild changed retry interval router");
 
     assert!(
@@ -563,9 +567,10 @@ model = "model-a"
     )
     .expect("parse initial endpoint list")
     .llm;
+    let policy = RemoteCallPolicyConfig::default();
     let mut runtime = LlmClientRuntime::new(&config);
     let first = runtime
-        .router_for_config(&config)
+        .router_for_config(&config, &policy)
         .expect("load initial router");
 
     let changed = Config::parse(
@@ -587,7 +592,7 @@ model = "model-b"
     .expect("parse changed endpoint list")
     .llm;
     let second = runtime
-        .router_for_config(&changed)
+        .router_for_config(&changed, &policy)
         .expect("rebuild changed endpoint list router");
 
     assert!(
@@ -604,16 +609,17 @@ fn test_llm_client_runtime_recovers_after_invalid_initial_config() {
         model: Some("model-stable".to_string()),
         ..Default::default()
     };
+    let policy = RemoteCallPolicyConfig::default();
     let mut runtime = LlmClientRuntime::new(&invalid);
     assert!(
-        runtime.router_for_config(&invalid).is_err(),
+        runtime.router_for_config(&invalid, &policy).is_err(),
         "invalid initial config should be retried from the worker loop"
     );
 
     let mut fixed = invalid.clone();
     fixed.base_url = Some("http://127.0.0.1:19999/v1".to_string());
     let router = runtime
-        .router_for_config(&fixed)
+        .router_for_config(&fixed, &policy)
         .expect("fixed config should build a router");
 
     assert_eq!(router.endpoint_count(), 1);

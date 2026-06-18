@@ -16,6 +16,7 @@ pub mod project;
 pub mod protocol;
 pub mod queue;
 pub mod reindex;
+pub mod remote_calls;
 pub mod skills;
 pub mod strata;
 pub mod timeline;

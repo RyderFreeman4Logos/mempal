@@ -7,6 +7,10 @@ use mempal::endpoint_health::probe_endpoints;
 use mockito::Server;
 use serde_json::json;
 use std::net::SocketAddr;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 async fn spawn_llm_health_server(
@@ -39,6 +43,49 @@ async fn spawn_llm_health_server(
             .expect("serve LLM health server");
     });
     (addr, handle)
+}
+
+async fn spawn_counting_health_server()
+-> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let models_count = Arc::clone(&request_count);
+    let generation_count = Arc::clone(&request_count);
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(move || {
+                let models_count = Arc::clone(&models_count);
+                async move {
+                    models_count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({ "object": "list", "data": [] }))
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move || {
+                let generation_count = Arc::clone(&generation_count);
+                async move {
+                    generation_count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "model": "probe-model",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "ok"}
+                        }]
+                    }))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("[::1]:0")
+        .await
+        .expect("bind counting health server");
+    let addr = listener.local_addr().expect("counting health server addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve counting health server");
+    });
+    (addr, request_count, handle)
 }
 
 #[tokio::test]
@@ -102,6 +149,103 @@ model = "secondary-model"
         "generation probe via secondary"
     );
     assert_eq!(health.llm.detail, health.llm_generation.detail);
+}
+
+#[tokio::test]
+async fn test_endpoint_health_skips_remote_probes_when_fail_closed() {
+    let (addr, request_count, handle) = spawn_counting_health_server().await;
+    let base_url = format!("http://localhost.:{}/v1", addr.port());
+    let config = Config::parse(&format!(
+        r#"
+[privacy.remote_calls]
+fail_closed = true
+
+[embed]
+backend = "openai_compat"
+base_url = "{base_url}/private-embed-path"
+api_model = "Qwen/Qwen3-Embedding-8B"
+
+[llm]
+enabled = true
+base_url = "{base_url}/private-chat-path"
+model = "probe-model"
+api_key = "sk-secret-should-not-print"
+"#
+    ))
+    .expect("parse blocked remote health config");
+
+    let health = probe_endpoints(&config).await;
+    handle.abort();
+    let _ = handle.await;
+
+    assert_eq!(
+        request_count.load(Ordering::SeqCst),
+        0,
+        "fail_closed probes must not contact blocked remote-looking endpoints"
+    );
+    assert!(!health.embedding.reachable, "{health:#?}");
+    assert!(!health.llm_control_plane.reachable, "{health:#?}");
+    assert!(!health.llm_generation.reachable, "{health:#?}");
+    let details = format!(
+        "{}\n{}\n{}",
+        health.embedding.detail, health.llm_control_plane.detail, health.llm_generation.detail
+    );
+    assert!(details.contains("skipped"), "{details}");
+    assert!(
+        details.contains("privacy.remote_calls.fail_closed"),
+        "{details}"
+    );
+    assert!(details.contains("allow_embedding"), "{details}");
+    assert!(details.contains("allow_llm"), "{details}");
+    assert!(details.contains("<remote-endpoint>"), "{details}");
+    assert!(!details.contains("localhost."), "{details}");
+    assert!(!details.contains(&addr.port().to_string()), "{details}");
+    assert!(!details.contains("private-embed-path"), "{details}");
+    assert!(!details.contains("private-chat-path"), "{details}");
+    assert!(!details.contains("sk-secret-should-not-print"), "{details}");
+}
+
+#[tokio::test]
+async fn test_endpoint_health_probes_explicitly_allowed_remote_policy() {
+    let (addr, request_count, handle) = spawn_counting_health_server().await;
+    let base_url = format!("http://localhost.:{}/v1", addr.port());
+    let config = Config::parse(&format!(
+        r#"
+[privacy.remote_calls]
+fail_closed = true
+allow_embedding = true
+allow_llm = true
+
+[embed]
+backend = "openai_compat"
+base_url = "{base_url}"
+api_model = "Qwen/Qwen3-Embedding-8B"
+
+[llm]
+enabled = true
+base_url = "{base_url}"
+model = "probe-model"
+"#
+    ))
+    .expect("parse allowed remote health config");
+
+    let health = probe_endpoints(&config).await;
+    handle.abort();
+    let _ = handle.await;
+
+    assert!(health.embedding.reachable, "{health:#?}");
+    assert!(health.llm_control_plane.reachable, "{health:#?}");
+    assert!(health.llm_generation.reachable, "{health:#?}");
+    assert_eq!(
+        request_count.load(Ordering::SeqCst),
+        3,
+        "embedding, llm control-plane, and llm generation probes should run"
+    );
+    let details = format!(
+        "{}\n{}\n{}",
+        health.embedding.detail, health.llm_control_plane.detail, health.llm_generation.detail
+    );
+    assert!(!details.contains("skipped"), "{details}");
 }
 
 #[tokio::test]

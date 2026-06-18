@@ -21,7 +21,7 @@ struct TurnBestEntry {
     next_message_id: Option<String>,
 }
 
-use crate::core::config::SearchRerankerConfig;
+use crate::core::config::{RemoteCallPolicyConfig, SearchRerankerConfig};
 use crate::core::db::Database;
 use crate::embed::Embedder;
 use crate::xurl::store::{TurnFilter, push_filter_conditions};
@@ -100,6 +100,8 @@ pub struct SearchOptions {
     pub min_score: Option<f32>,
     /// Optional top-K reranker. `None` keeps xurl search fully local and preserves vector order.
     pub reranker: Option<SearchRerankerConfig>,
+    /// Fail-closed remote-call policy applied when a reranker endpoint is configured.
+    pub remote_call_policy: RemoteCallPolicyConfig,
 }
 
 /// Semantic search over `conversation_turn_vectors` using brute-force cosine similarity.
@@ -124,6 +126,7 @@ pub async fn search<E: Embedder + ?Sized>(
         include_agent_prompts,
         min_score,
         reranker,
+        remote_call_policy,
     } = opts;
     if limit == 0 {
         return Ok(SearchResult {
@@ -321,8 +324,9 @@ pub async fn search<E: Embedder + ?Sized>(
             .iter()
             .map(|hit| hit.content.as_str())
             .collect::<Vec<_>>();
-        let outcome = crate::search::rerank::maybe_rerank_indices_with_config(
+        let outcome = crate::search::rerank::maybe_rerank_indices_with_config_and_policy(
             &reranker_config,
+            &remote_call_policy,
             query,
             documents,
         )

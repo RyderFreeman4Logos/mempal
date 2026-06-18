@@ -66,6 +66,8 @@ pub enum LlmError {
     },
     #[error("missing LLM configuration: {0}")]
     MissingConfiguration(String),
+    #[error("{0}")]
+    RemoteCallPolicy(#[from] crate::core::remote_calls::RemoteCallPolicyError),
 }
 
 impl LlmError {
@@ -79,7 +81,9 @@ impl LlmError {
                     StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
                 )
             }
-            Self::DecodeResponse(_) | Self::MissingConfiguration(_) => false,
+            Self::DecodeResponse(_) | Self::MissingConfiguration(_) | Self::RemoteCallPolicy(_) => {
+                false
+            }
         }
     }
 

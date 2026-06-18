@@ -785,6 +785,7 @@ impl Config {
                 .ok()
                 .as_deref()
                 .unwrap_or(&[]),
+            self.privacy.remote_calls.fail_closed && !self.privacy.remote_calls.allow_llm,
         ));
         if self.memory_intelligence.llm.defines_endpoint() {
             let effective = self.memory_intelligence.effective_llm_config(&self.llm);
@@ -795,6 +796,7 @@ impl Config {
                     .ok()
                     .as_deref()
                     .unwrap_or(&[]),
+                self.privacy.remote_calls.fail_closed && !self.privacy.remote_calls.allow_llm,
             ));
         }
         if self.search.reranker.enabled
@@ -803,9 +805,15 @@ impl Config {
             )
             && !llm_base_url_is_local_or_lan(&endpoint)
         {
-            let host = llm_base_url_host(&endpoint)
-                .map(|host| format!(" host `{host}`"))
-                .unwrap_or_default();
+            let host = if self.privacy.remote_calls.fail_closed
+                && !self.privacy.remote_calls.allow_rerank
+            {
+                " host `<remote-endpoint>`".to_string()
+            } else {
+                llm_base_url_host(&endpoint)
+                    .map(|host| format!(" host `{host}`"))
+                    .unwrap_or_default()
+            };
             warnings.push(RuntimeWarning {
                 level: "warn",
                 source: "reranker",
@@ -821,6 +829,7 @@ impl Config {
 fn llm_endpoint_locality_warnings(
     setting: &str,
     endpoints: &[EffectiveLlmEndpoint],
+    redact_remote_identity: bool,
 ) -> Vec<RuntimeWarning> {
     endpoints
         .iter()
@@ -829,9 +838,13 @@ fn llm_endpoint_locality_warnings(
             if base_url.is_empty() || llm_base_url_is_local_or_lan(base_url) {
                 return None;
             }
-            let host = llm_base_url_host(base_url)
-                .map(|host| format!(" host `{host}`"))
-                .unwrap_or_default();
+            let host = if redact_remote_identity {
+                " host `<remote-endpoint>`".to_string()
+            } else {
+                llm_base_url_host(base_url)
+                    .map(|host| format!(" host `{host}`"))
+                    .unwrap_or_default()
+            };
             let field = if endpoint.id == "legacy" {
                 format!("{setting}.base_url")
             } else {
@@ -1696,6 +1709,10 @@ impl EffectiveLlmEndpoint {
     pub fn base_url_label(&self) -> String {
         format!("{}={}", self.id, self.base_url)
     }
+
+    pub fn base_url_display_label(&self) -> String {
+        format!("{}={}", self.id, endpoint_url_display_label(&self.base_url))
+    }
 }
 
 impl LlmConfig {
@@ -1793,6 +1810,14 @@ impl LlmConfig {
             self,
             |endpoint| endpoint.base_url.clone(),
             EffectiveLlmEndpoint::base_url_label,
+        )
+    }
+
+    pub fn effective_base_url_display_summary(&self) -> Option<String> {
+        summarize_effective_endpoints(
+            self,
+            |endpoint| endpoint_url_display_label(&endpoint.base_url),
+            EffectiveLlmEndpoint::base_url_display_label,
         )
     }
 
@@ -2116,6 +2141,7 @@ impl Default for DegradationConfig {
 pub struct PrivacyConfig {
     pub enabled: bool,
     pub scrub_patterns: Vec<ScrubPattern>,
+    pub remote_calls: RemoteCallPolicyConfig,
 }
 
 impl PrivacyConfig {
@@ -2154,8 +2180,18 @@ impl Default for PrivacyConfig {
         Self {
             enabled: false,
             scrub_patterns: Self::default_scrub_patterns(),
+            remote_calls: RemoteCallPolicyConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct RemoteCallPolicyConfig {
+    pub fail_closed: bool,
+    pub allow_embedding: bool,
+    pub allow_llm: bool,
+    pub allow_rerank: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

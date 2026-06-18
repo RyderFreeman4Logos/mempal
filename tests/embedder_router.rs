@@ -1,8 +1,9 @@
+use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use mempal::core::config::Config;
+use mempal::core::config::{Config, ConfigHandle};
 use mempal::embed::{
     ConfiguredEmbedderFactory, EmbedError, EmbedderFactory, router::EmbeddingRouter,
     shared_embedder_runtime_snapshot,
@@ -13,6 +14,17 @@ use tokio::sync::{Barrier, Notify};
 fn shared_embedder_cache_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+struct ConfigHandleResetGuard;
+
+impl Drop for ConfigHandleResetGuard {
+    fn drop(&mut self) {
+        let tempdir = tempfile::tempdir().expect("config reset tempdir");
+        let path = tempdir.path().join("config.toml");
+        fs::write(&path, "").expect("write reset config");
+        ConfigHandle::harness_reload_from_path(&path);
+    }
 }
 
 fn embedding_body(vector: &[f32]) -> String {
@@ -364,6 +376,64 @@ async fn test_configured_embedder_factory_builds_share_endpoint_capacity() {
 
     assert_eq!(gb10_count.load(Ordering::SeqCst), 1);
     assert_eq!(spark_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_configured_embedder_factory_privacy_reload_blocks_cached_remote() {
+    let _cache_guard = shared_embedder_cache_test_lock().lock().await;
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let db_path = tempdir.path().join("palace.db");
+    let config_path = tempdir.path().join("config.toml");
+    let initial_config = format!(
+        r#"
+db_path = "{}"
+
+[embed]
+backend = "openai_compat"
+base_url = "https://api.openai.com/v1/private-embed-path"
+api_model = "text-embedding-3-large"
+
+[embed.openai_compat]
+dim = 3
+"#,
+        db_path.display()
+    );
+    fs::write(&config_path, &initial_config).expect("write initial config");
+    ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
+    let _reset_guard = ConfigHandleResetGuard;
+    let factory = ConfiguredEmbedderFactory::new(ConfigHandle::current().as_ref().clone());
+
+    let _first = factory.build().await.expect("initial remote embedder");
+    let blocked_config = format!(
+        r#"
+db_path = "{}"
+
+[privacy.remote_calls]
+fail_closed = true
+
+[embed]
+backend = "openai_compat"
+base_url = "https://api.openai.com/v1/private-embed-path"
+api_model = "text-embedding-3-large"
+
+[embed.openai_compat]
+dim = 3
+"#,
+        db_path.display()
+    );
+    fs::write(&config_path, blocked_config).expect("write blocked config");
+    ConfigHandle::harness_reload_from_path(&config_path);
+
+    let error = match factory.build().await {
+        Ok(_) => panic!("privacy-only hot reload must invalidate cached remote embedder"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("privacy.remote_calls.fail_closed"),
+        "{message}"
+    );
+    assert!(message.contains("allow_embedding"), "{message}");
 }
 
 #[tokio::test]

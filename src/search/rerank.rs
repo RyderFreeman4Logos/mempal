@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::core::config::{
-    SearchRerankerConfig, normalize_reranker_endpoint_url, scrub_sensitive_text,
+    RemoteCallPolicyConfig, SearchRerankerConfig, normalize_reranker_endpoint_url,
+    scrub_sensitive_text,
 };
 use crate::core::types::SearchResult;
 
@@ -89,6 +90,8 @@ pub enum RerankError {
     DecodeResponse(String),
     #[error("invalid reranker response: {0}")]
     InvalidResponse(String),
+    #[error("{0}")]
+    RemoteCallPolicy(#[from] crate::core::remote_calls::RemoteCallPolicyError),
 }
 
 /// Reranks a list of search results given the original query.
@@ -124,6 +127,18 @@ pub struct HttpReranker {
 
 impl HttpReranker {
     pub fn from_config(config: &SearchRerankerConfig) -> Result<Self, RerankError> {
+        Self::from_config_inner(config)
+    }
+
+    pub fn from_config_with_policy(
+        config: &SearchRerankerConfig,
+        policy: &RemoteCallPolicyConfig,
+    ) -> Result<Self, RerankError> {
+        crate::core::remote_calls::ensure_rerank_allowed(policy, config)?;
+        Self::from_config_inner(config)
+    }
+
+    fn from_config_inner(config: &SearchRerankerConfig) -> Result<Self, RerankError> {
         let endpoint = config
             .endpoint
             .as_deref()
@@ -250,6 +265,16 @@ fn map_reqwest_error(source: reqwest::Error) -> RerankError {
 pub async fn maybe_rerank_with_config(
     config: &SearchRerankerConfig,
     query: &str,
+    results: Vec<SearchResult>,
+) -> RerankOutcome {
+    maybe_rerank_with_config_and_policy(config, &RemoteCallPolicyConfig::default(), query, results)
+        .await
+}
+
+pub async fn maybe_rerank_with_config_and_policy(
+    config: &SearchRerankerConfig,
+    policy: &RemoteCallPolicyConfig,
+    query: &str,
     mut results: Vec<SearchResult>,
 ) -> RerankOutcome {
     if !config.enabled || results.len() <= 1 {
@@ -259,7 +284,7 @@ pub async fn maybe_rerank_with_config(
     let candidate_count = config.top_k.min(results.len());
     let tail = results.split_off(candidate_count);
     let candidates = results;
-    let reranker = match HttpReranker::from_config(config) {
+    let reranker = match HttpReranker::from_config_with_policy(config, policy) {
         Ok(reranker) => reranker,
         Err(error) => {
             let mut original = candidates;
@@ -285,13 +310,28 @@ pub async fn maybe_rerank_indices_with_config(
     query: &str,
     documents: Vec<&str>,
 ) -> IndexRerankOutcome {
+    maybe_rerank_indices_with_config_and_policy(
+        config,
+        &RemoteCallPolicyConfig::default(),
+        query,
+        documents,
+    )
+    .await
+}
+
+pub async fn maybe_rerank_indices_with_config_and_policy(
+    config: &SearchRerankerConfig,
+    policy: &RemoteCallPolicyConfig,
+    query: &str,
+    documents: Vec<&str>,
+) -> IndexRerankOutcome {
     if !config.enabled || documents.len() <= 1 {
         return IndexRerankOutcome::unchanged(documents.len());
     }
 
     let candidate_count = config.top_k.min(documents.len());
     let candidates = documents[..candidate_count].to_vec();
-    let reranker = match HttpReranker::from_config(config) {
+    let reranker = match HttpReranker::from_config_with_policy(config, policy) {
         Ok(reranker) => reranker,
         Err(error) => return IndexRerankOutcome::fallback(documents.len(), error),
     };

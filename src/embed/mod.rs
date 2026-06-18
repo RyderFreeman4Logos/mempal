@@ -81,6 +81,8 @@ pub enum EmbedError {
     Tokenizer(String),
     #[error("embedding runtime error: {0}")]
     Runtime(String),
+    #[error("{0}")]
+    RemoteCallPolicy(#[from] crate::core::remote_calls::RemoteCallPolicyError),
     #[error("embedding worker panicked")]
     WorkerPanic(#[source] tokio::task::JoinError),
     #[error("failed to call embedding endpoint {endpoint}")]
@@ -153,6 +155,7 @@ impl EmbedError {
             | Self::UnsupportedBackend(_)
             | Self::MissingConfiguration(_)
             | Self::InvalidConfiguration(_)
+            | Self::RemoteCallPolicy(_)
             | Self::ReadApiKeyEnv { .. } => false,
         }
     }
@@ -236,9 +239,12 @@ pub async fn build_backend_from_name(config: &Config, backend: &str) -> Result<B
         }
         #[cfg(feature = "onnx")]
         "onnx" => Ok(Box::new(onnx::OnnxEmbedder::new_or_download().await?)),
-        "openai_compat" | "api" => Ok(Box::new(router::EmbeddingRouter::from_config(
-            &config.embed,
-        )?)),
+        "openai_compat" | "api" => {
+            crate::core::remote_calls::ensure_embedding_allowed(config)?;
+            Ok(Box::new(router::EmbeddingRouter::from_config(
+                &config.embed,
+            )?))
+        }
         "stub" => {
             let dim = config
                 .embed

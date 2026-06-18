@@ -82,7 +82,15 @@ enabled = false                                # default: no reranker call
 # model = "qwen3-reranker"
 # timeout_secs = 2
 # top_k = 20
+
+[privacy.remote_calls]
+fail_closed = false                            # set true to block external endpoints unless allowed below
+allow_embedding = false
+allow_llm = false
+allow_rerank = false
 ```
+
+Run `mempal cost status` to see whether embedding, LLM, or rerank paths are disabled, local/private, or configured for a redacted external endpoint.
 
 Optional LLM gating can be configured with multiple OpenAI-compatible endpoints. Lower
 `priority` values are tried first; equal values share capacity. Set Spark's one

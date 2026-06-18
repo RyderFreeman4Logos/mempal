@@ -140,7 +140,7 @@ async fn run_crystallization_inner(
             .has_effective_llm_endpoint(&config.llm)
             .then(|| {
                 let llm_config = config.memory_intelligence.effective_llm_config(&config.llm);
-                LlmRouter::from_config(&llm_config)
+                LlmRouter::from_config_with_policy(&llm_config, &config.privacy.remote_calls)
             })
             .transpose()?
     } else {

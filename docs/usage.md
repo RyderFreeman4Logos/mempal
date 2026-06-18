@@ -89,9 +89,17 @@ enabled = false
 # model = "qwen3-reranker"
 # timeout_secs = 2
 # top_k = 20
+
+[privacy.remote_calls]
+fail_closed = false
+allow_embedding = false
+allow_llm = false
+allow_rerank = false
 ```
 
 With no config file, `mempal` uses the local SQLite database at `~/.mempal/palace.db`, the local model2vec embedder, and no reranker or LLM calls. OpenAI-compatible embeddings, LLM gating, and reranking are opt-in.
+
+Use `mempal cost status` to print redacted remote-call status for embedding, LLM, and rerank paths. Set `[privacy.remote_calls] fail_closed = true` to block external endpoints unless the matching `allow_*` toggle is also true.
 
 Use local ONNX instead of the default model2vec backend:
 

@@ -380,7 +380,7 @@ impl HookLlmGateRuntime {
                 .lock()
                 .expect("LLM client runtime mutex poisoned");
             runtime
-                .router_for_config(&config.llm)
+                .router_for_config(&config.llm, &config.privacy.remote_calls)
                 .context("LLM gating router unavailable")?
         };
         crate::llm::worker::request_strict_effective_gating_verdict(

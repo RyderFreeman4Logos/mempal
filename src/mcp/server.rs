@@ -28,6 +28,10 @@ use crate::core::{
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
     queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore},
     reindex::ReindexProgressStore,
+    remote_calls::{
+        RemoteCallService, endpoint_policy_diagnostic_label, endpoint_policy_global_runtime_error,
+        endpoint_policy_runtime_error,
+    },
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
         AnchorKind, BootstrapIdentityParts, Drawer, DrawerSummary, ExplicitTunnel,
@@ -2328,6 +2332,18 @@ impl MempalMcpServer {
                 GatingRuntimeStatusDto::default()
             }
         };
+        let remote_call_policy = &config.privacy.remote_calls;
+        let embed_endpoints = config.embed.effective_endpoints().unwrap_or_default();
+        let embedding_endpoint_label = |base_url: &str| {
+            endpoint_policy_diagnostic_label(
+                remote_call_policy,
+                RemoteCallService::Embedding,
+                base_url,
+            )
+        };
+        let llm_endpoint_label = |base_url: &str| {
+            endpoint_policy_diagnostic_label(remote_call_policy, RemoteCallService::Llm, base_url)
+        };
 
         Ok(Json(StatusResponse {
             schema_version: db_snapshot.schema_version,
@@ -2372,6 +2388,7 @@ impl MempalMcpServer {
             endpoint_health: EndpointHealthDto {
                 embedding_reachable: endpoint_health.embedding.reachable,
                 embedding_latency_ms: endpoint_health.embedding.latency_ms,
+                embedding_detail: endpoint_health.embedding.detail.clone(),
                 llm_reachable: endpoint_health.llm.reachable,
                 llm_latency_ms: endpoint_health.llm.latency_ms,
                 llm_control_plane_reachable: endpoint_health.llm_control_plane.reachable,
@@ -2386,20 +2403,23 @@ impl MempalMcpServer {
                 base_url: config
                     .embed
                     .resolved_openai_base_url()
-                    .map(ToOwned::to_owned),
+                    .map(embedding_endpoint_label),
                 model: config.embed.effective_model_summary(),
-                endpoints: config
-                    .embed
-                    .effective_endpoints()
-                    .unwrap_or_default()
-                    .into_iter()
+                endpoints: embed_endpoints
+                    .iter()
                     .map(|endpoint| {
                         let runtime = embed_endpoint_runtime.get(&endpoint.id);
+                        let last_error = endpoint_policy_runtime_error(
+                            remote_call_policy,
+                            RemoteCallService::Embedding,
+                            &endpoint.base_url,
+                            runtime.and_then(|state| state.last_error.clone()),
+                        );
                         EmbedEndpointStatusDto {
-                            id: endpoint.id,
-                            backend: endpoint.backend,
-                            base_url: endpoint.base_url,
-                            model: endpoint.model,
+                            id: endpoint.id.clone(),
+                            backend: endpoint.backend.clone(),
+                            base_url: embedding_endpoint_label(&endpoint.base_url),
+                            model: endpoint.model.clone(),
                             priority: endpoint.priority,
                             retry_interval_secs: endpoint.retry_interval_secs,
                             request_timeout_secs: endpoint.request_timeout_secs,
@@ -2413,7 +2433,7 @@ impl MempalMcpServer {
                                 .and_then(|state| state.last_failure_at_unix_ms),
                             last_success_at_unix_ms: runtime
                                 .and_then(|state| state.last_success_at_unix_ms),
-                            last_error: runtime.and_then(|state| state.last_error.clone()),
+                            last_error,
                         }
                     })
                     .collect(),
@@ -2424,7 +2444,14 @@ impl MempalMcpServer {
                 degraded: embed_snapshot.degraded,
                 fail_count: embed_failure_headline,
                 failure_count: embed_failure_headline,
-                last_error: embed_snapshot.last_error,
+                last_error: endpoint_policy_global_runtime_error(
+                    remote_call_policy,
+                    RemoteCallService::Embedding,
+                    embed_endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.base_url.as_str()),
+                    embed_snapshot.last_error,
+                ),
                 last_success_at_unix_ms: embed_snapshot.last_success_at_unix_ms,
             },
             embedder_circuit: EmbedderCircuitDto {
@@ -2469,7 +2496,7 @@ impl MempalMcpServer {
                     .into_iter()
                     .map(|endpoint| LlmEndpointStatusDto {
                         id: endpoint.id,
-                        base_url: endpoint.base_url,
+                        base_url: llm_endpoint_label(&endpoint.base_url),
                         model: endpoint.model,
                         priority: endpoint.priority,
                         retry_interval_secs: endpoint.retry_interval_secs,
@@ -8251,6 +8278,14 @@ mod tests {
         gate: Arc<Notify>,
     }
 
+    struct EmbedStatusResetGuard;
+
+    impl Drop for EmbedStatusResetGuard {
+        fn drop(&mut self) {
+            global_embed_status().reset_for_tests();
+        }
+    }
+
     #[derive(Default)]
     struct KnowledgeRefs {
         supporting: Vec<String>,
@@ -8331,6 +8366,108 @@ mod tests {
         .expect("create MCP server")
         .with_async_db_for_test(async_db);
         (tempdir, db_path, server)
+    }
+
+    #[tokio::test]
+    async fn test_mcp_status_redacts_blocked_remote_endpoint_identity() {
+        global_embed_status().reset_for_tests();
+        let _embed_status_guard = EmbedStatusResetGuard;
+        let config = Config::parse(
+            r#"
+[privacy.remote_calls]
+fail_closed = true
+
+[embed]
+backend = "openai_compat"
+base_url = "https://api.openai.com:9443/v1/private-embed-path"
+api_model = "text-embedding-3-large"
+
+[embed.openai_compat]
+api_key_env = "MEMPAL_SECRET_TOKEN_ENV"
+
+[llm]
+enabled = true
+base_url = "https://llm.example.com/v1/private-chat-path"
+model = "judge"
+api_key = "sk-secret-should-not-print"
+"#,
+        )
+        .expect("parse config");
+        let stale_error = crate::embed::EmbedError::Runtime(
+            "failed https://api.openai.com:9443/v1/private-embed-path?api_key=sk-secret-should-not-print MEMPAL_SECRET_TOKEN_ENV"
+                .to_string(),
+        );
+        global_embed_status().record_endpoint_cooldown(
+            "legacy",
+            Duration::from_secs(30),
+            &stale_error,
+        );
+        global_embed_status().record_failure(&stale_error);
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db fixture");
+        let server = MempalMcpServer::new_with_factory_and_config(
+            db_path,
+            config,
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_async_db_for_test(async_db);
+
+        let status = server.mempal_status().await.expect("status").0;
+        let rendered = serde_json::to_string(&status).expect("serialize status");
+
+        assert_eq!(
+            status.embed_status.base_url.as_deref(),
+            Some(crate::core::remote_calls::BLOCKED_REMOTE_ENDPOINT_LABEL)
+        );
+        assert!(
+            status
+                .embed_status
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.base_url
+                    == crate::core::remote_calls::BLOCKED_REMOTE_ENDPOINT_LABEL),
+            "{rendered}"
+        );
+        assert!(
+            status
+                .llm_status
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.base_url
+                    == crate::core::remote_calls::BLOCKED_REMOTE_ENDPOINT_LABEL),
+            "{rendered}"
+        );
+        assert!(rendered.contains("skipped"), "{rendered}");
+        assert!(status.embed_status.last_error.is_none(), "{rendered}");
+        assert!(
+            status
+                .embed_status
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.last_error.is_none()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("privacy.remote_calls.fail_closed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("allow_embedding"), "{rendered}");
+        assert!(rendered.contains("allow_llm"), "{rendered}");
+        assert!(!rendered.contains("api.openai.com"), "{rendered}");
+        assert!(!rendered.contains("9443"), "{rendered}");
+        assert!(!rendered.contains("llm.example.com"), "{rendered}");
+        assert!(!rendered.contains("private-embed-path"), "{rendered}");
+        assert!(!rendered.contains("private-chat-path"), "{rendered}");
+        assert!(
+            !rendered.contains("sk-secret-should-not-print"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("MEMPAL_SECRET_TOKEN_ENV"), "{rendered}");
+        assert!(!rendered.contains("api_key"), "{rendered}");
     }
 
     #[test]
