@@ -14368,8 +14368,8 @@ fn historical_rejudge_judge_model_matches_without_config_drift(
 
     let current_without_safety = historical_rejudge_without_safety_fingerprints(current);
     checkpoint == &current_without_safety
-        || historical_rejudge_legacy_single_endpoint_model_label(&current_without_safety)
-            .is_some_and(|model| checkpoint == model)
+        || historical_rejudge_legacy_model_summary(&current_without_safety)
+            .is_some_and(|model_summary| checkpoint == &model_summary)
 }
 
 fn historical_rejudge_safety_fingerprinted_summary(summary: Option<&String>) -> bool {
@@ -14395,13 +14395,36 @@ fn historical_rejudge_without_safety_fingerprints(summary: &str) -> String {
         .join(", ")
 }
 
-fn historical_rejudge_legacy_single_endpoint_model_label(summary: &str) -> Option<&str> {
-    let mut parts = summary.split(", ");
-    let single = parts.next()?;
-    if parts.next().is_some() || single.contains(':') {
-        return None;
+fn historical_rejudge_legacy_model_summary(summary: &str) -> Option<String> {
+    let parts = summary.split(", ").collect::<Vec<_>>();
+    match parts.as_slice() {
+        [single] => historical_rejudge_model_after_endpoint_label(single).map(ToOwned::to_owned),
+        [proposal, confirm] => historical_rejudge_legacy_two_stage_model_summary(proposal, confirm),
+        [_, _, ..] | [] => None,
     }
-    let (_, model) = single.split_once('=')?;
+}
+
+fn historical_rejudge_legacy_two_stage_model_summary(
+    proposal: &str,
+    confirm: &str,
+) -> Option<String> {
+    let proposal_model = historical_rejudge_stage_model_after_endpoint_label(proposal, "proposal")?;
+    let confirm_model = historical_rejudge_stage_model_after_endpoint_label(confirm, "confirm")?;
+    Some(format!(
+        "proposal:{proposal_model}, confirm:{confirm_model}"
+    ))
+}
+
+fn historical_rejudge_stage_model_after_endpoint_label<'a>(
+    part: &'a str,
+    stage: &str,
+) -> Option<&'a str> {
+    let endpoint_label = part.strip_prefix(stage)?.strip_prefix(':')?;
+    historical_rejudge_model_after_endpoint_label(endpoint_label)
+}
+
+fn historical_rejudge_model_after_endpoint_label(label: &str) -> Option<&str> {
+    let (_, model) = label.split_once('=')?;
     (!model.is_empty()).then_some(model)
 }
 
@@ -18916,6 +18939,72 @@ threshold = 0.7
     }
 
     #[test]
+    fn historical_rejudge_legacy_model_summary_matches_two_stage_and_colon_tags() {
+        let two_stage_checkpoint = Some("proposal:qwen-model, confirm:spark-model".to_string());
+        let two_stage_current = Some(
+            "proposal:qwen=qwen-model@endpoint:proposal-v1, confirm:spark=spark-model@endpoint:confirm-v1@policy:policy-v1"
+                .to_string(),
+        );
+        assert!(historical_rejudge_judge_model_matches_without_config_drift(
+            two_stage_checkpoint.as_ref(),
+            two_stage_current.as_ref()
+        ));
+
+        let two_stage_colon_checkpoint = Some("proposal:llama3:8b, confirm:qwen2.5:7b".to_string());
+        let two_stage_colon_current = Some(
+            "proposal:ollama=llama3:8b@endpoint:proposal-v1, confirm:ollama=qwen2.5:7b@endpoint:confirm-v1@policy:policy-v1"
+                .to_string(),
+        );
+        assert!(historical_rejudge_judge_model_matches_without_config_drift(
+            two_stage_colon_checkpoint.as_ref(),
+            two_stage_colon_current.as_ref()
+        ));
+
+        let colon_checkpoint = Some("llama3:8b".to_string());
+        let colon_current = Some("legacy=llama3:8b@endpoint:local-v1@policy:policy-v1".to_string());
+        assert!(historical_rejudge_judge_model_matches_without_config_drift(
+            colon_checkpoint.as_ref(),
+            colon_current.as_ref()
+        ));
+    }
+
+    #[test]
+    fn historical_rejudge_legacy_model_summary_rejects_changed_models() {
+        let two_stage_checkpoint = Some("proposal:qwen-model, confirm:spark-model".to_string());
+        let changed_two_stage_current = Some(
+            "proposal:qwen=qwen-model-v2@endpoint:proposal-v1, confirm:spark=spark-model@endpoint:confirm-v1@policy:policy-v1"
+                .to_string(),
+        );
+        assert!(
+            !historical_rejudge_judge_model_matches_without_config_drift(
+                two_stage_checkpoint.as_ref(),
+                changed_two_stage_current.as_ref()
+            )
+        );
+
+        let malformed_two_stage_current = Some(
+            "proposal:qwen=qwen-model@endpoint:proposal-v1, confirm:spark=spark-model@endpoint:confirm-v1, extra:side=side-model@endpoint:side-v1@policy:policy-v1"
+                .to_string(),
+        );
+        assert!(
+            !historical_rejudge_judge_model_matches_without_config_drift(
+                two_stage_checkpoint.as_ref(),
+                malformed_two_stage_current.as_ref()
+            )
+        );
+
+        let colon_checkpoint = Some("llama3:8b".to_string());
+        let changed_colon_current =
+            Some("legacy=qwen2.5:7b@endpoint:local-v1@policy:policy-v1".to_string());
+        assert!(
+            !historical_rejudge_judge_model_matches_without_config_drift(
+                colon_checkpoint.as_ref(),
+                changed_colon_current.as_ref()
+            )
+        );
+    }
+
+    #[test]
     fn historical_rejudge_waiting_llm_status_emits_runtime_warning() {
         let now = iso_timestamp();
         let checkpoint = HistoricalRejudgeCheckpoint {
@@ -19423,8 +19512,7 @@ threshold = 0.7
             confirm_llm_endpoint: Some("spark"),
             ..full_rejudge_options(true, Some(&legacy_backups), 1)
         };
-        let legacy_judge_model =
-            Some("proposal:qwen=qwen-model, confirm:spark=spark-model".to_string());
+        let legacy_judge_model = Some("proposal:qwen-model, confirm:spark-model".to_string());
         let fingerprinted_judge_model = Some(format!(
             "proposal:{}, confirm:{}@policy:{policy_fingerprint}",
             historical_rejudge_endpoint_summary(&proposal_endpoint),
