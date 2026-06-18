@@ -125,7 +125,7 @@ impl IntelligenceRouter {
             .has_effective_llm_endpoint(&config.llm)
         {
             let llm_config = config.memory_intelligence.effective_llm_config(&config.llm);
-            LlmRouter::from_config(&llm_config)
+            LlmRouter::from_config_with_policy(&llm_config, &config.privacy.remote_calls)
                 .ok()
                 .map(LlmIntelligenceEnhancer::new)
         } else {

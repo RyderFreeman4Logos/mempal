@@ -13,6 +13,9 @@ use crate::core::{
     config::ConfigHandle,
     db::Database,
     project::{ProjectSearchScope, resolve_project_id},
+    remote_calls::{
+        RemoteCallService, blocked_remote_endpoint_error, endpoint_policy_display_label,
+    },
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
         BootstrapEvidenceArgs, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
@@ -1408,10 +1411,20 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
             .into_iter()
             .map(|endpoint| {
                 let runtime = endpoint_runtime.get(&endpoint.id);
+                let blocked_remote_endpoint = blocked_remote_endpoint_error(
+                    &daemon_embed_config.privacy.remote_calls,
+                    RemoteCallService::Embedding,
+                    &endpoint.base_url,
+                )
+                .is_some();
                 ApiEmbeddingEndpointStatus {
                     id: endpoint.id,
                     backend: endpoint.backend,
-                    base_url: crate::core::config::endpoint_url_display_label(&endpoint.base_url),
+                    base_url: endpoint_policy_display_label(
+                        &daemon_embed_config.privacy.remote_calls,
+                        RemoteCallService::Embedding,
+                        &endpoint.base_url,
+                    ),
                     model: endpoint.model,
                     priority: endpoint.priority,
                     retry_interval_secs: endpoint.retry_interval_secs,
@@ -1425,7 +1438,11 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
                         .and_then(|state| state.last_failure_at_unix_ms),
                     last_success_at_unix_ms: runtime
                         .and_then(|state| state.last_success_at_unix_ms),
-                    last_error: runtime.and_then(|state| state.last_error.clone()),
+                    last_error: if blocked_remote_endpoint {
+                        None
+                    } else {
+                        runtime.and_then(|state| state.last_error.clone())
+                    },
                 }
             })
             .collect(),

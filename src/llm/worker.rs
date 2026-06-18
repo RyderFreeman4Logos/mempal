@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::AsyncDb;
-use crate::core::config::{Config, ConfigHandle, LlmConfig};
+use crate::core::config::{Config, ConfigHandle, LlmConfig, RemoteCallPolicyConfig};
 use crate::core::db::Database;
 use crate::core::queue::{
     AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore, QueueFailureDisposition,
@@ -38,10 +38,11 @@ struct LlmClientConfigSignature {
     request_timeout_secs: u64,
     retry_interval_secs: u64,
     max_concurrent: usize,
+    remote_call_policy: RemoteCallPolicyConfig,
 }
 
-impl From<&LlmConfig> for LlmClientConfigSignature {
-    fn from(config: &LlmConfig) -> Self {
+impl LlmClientConfigSignature {
+    fn new(config: &LlmConfig, remote_call_policy: &RemoteCallPolicyConfig) -> Self {
         Self {
             backend: config.backend.clone(),
             base_url: config.base_url.clone(),
@@ -53,6 +54,7 @@ impl From<&LlmConfig> for LlmClientConfigSignature {
             request_timeout_secs: config.request_timeout_secs,
             retry_interval_secs: config.retry_interval_secs,
             max_concurrent: config.max_concurrent,
+            remote_call_policy: remote_call_policy.clone(),
         }
     }
 }
@@ -74,15 +76,22 @@ impl LlmClientRuntime {
         };
         Self {
             router,
-            signature: LlmClientConfigSignature::from(config),
+            signature: LlmClientConfigSignature::new(config, &RemoteCallPolicyConfig::default()),
         }
     }
 
     #[doc(hidden)]
-    pub fn router_for_config(&mut self, config: &LlmConfig) -> Result<Arc<LlmRouter>, LlmError> {
-        let signature = LlmClientConfigSignature::from(config);
+    pub fn router_for_config(
+        &mut self,
+        config: &LlmConfig,
+        remote_call_policy: &RemoteCallPolicyConfig,
+    ) -> Result<Arc<LlmRouter>, LlmError> {
+        let signature = LlmClientConfigSignature::new(config, remote_call_policy);
         if self.router.is_none() || self.signature != signature {
-            self.router = Some(Arc::new(LlmRouter::from_config(config)?));
+            self.router = Some(Arc::new(LlmRouter::from_config_with_policy(
+                config,
+                remote_call_policy,
+            )?));
             self.signature = signature;
             tracing::info!("LLM router rebuilt after config hot-reload");
         }
@@ -110,7 +119,7 @@ async fn client_for_claimed_generation(
             let mut runtime = client_runtime
                 .lock()
                 .expect("LLM client runtime mutex poisoned");
-            runtime.router_for_config(&snapshot.config.llm)
+            runtime.router_for_config(&snapshot.config.llm, &snapshot.config.privacy.remote_calls)
         }?;
 
         let observed_generation = *llm_gen_rx.borrow_and_update();

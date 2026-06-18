@@ -20,7 +20,8 @@ use mempal::core::{
     anchor,
     compaction::merge_cluster,
     config::{
-        CompiledPrivacyConfig, Config, ConfigHandle, EffectiveLlmEndpoint, default_config_path,
+        CompiledPrivacyConfig, Config, ConfigHandle, EffectiveEmbedEndpoint, EffectiveLlmEndpoint,
+        default_config_path,
     },
     db::{
         CURRENT_VECTOR_INDEX_VERSION, Database, DbError, HistoricalRejudgeAudit,
@@ -428,6 +429,11 @@ enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
+    },
+    /// Inspect remote-call cost and privacy status.
+    Cost {
+        #[command(subcommand)]
+        command: CostCommands,
     },
     /// Manage project-scoped drawer metadata.
     Project {
@@ -1383,6 +1389,12 @@ impl From<XurlTool> for mempal::xurl::model::Tool {
 enum ConfigCommands {
     /// Show current memory intelligence mode and effective LLM settings.
     Intelligence,
+}
+
+#[derive(Subcommand)]
+enum CostCommands {
+    /// Show whether embedding, LLM, or rerank paths can call external endpoints.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -2859,6 +2871,11 @@ fn run() -> Result<()> {
                 .with_context(|| format!("failed to load config {}", config_path.display()))?;
             return config_command(&config, command);
         }
+        Commands::Cost { command } => {
+            let config = Config::load_from(&config_path)
+                .with_context(|| format!("failed to load config {}", config_path.display()))?;
+            return cost_command(&config, command);
+        }
         Commands::Daemon {
             command,
             foreground,
@@ -3773,6 +3790,7 @@ fn run() -> Result<()> {
         | Commands::MaintenanceRunbook { .. }
         | Commands::Maintenance { .. }
         | Commands::ReleaseReadiness { .. }
+        | Commands::Cost { .. }
         | Commands::Doctor { .. } => unreachable!(),
     }
 }
@@ -9980,6 +9998,34 @@ fn config_command(config: &Config, command: &ConfigCommands) -> Result<()> {
     }
 }
 
+fn cost_command(config: &Config, command: &CostCommands) -> Result<()> {
+    match command {
+        CostCommands::Status => cost_status_command(config),
+    }
+}
+
+fn cost_status_command(config: &Config) -> Result<()> {
+    let report = mempal::core::remote_calls::build_remote_call_report(config);
+    println!("remote_calls:");
+    println!("  privacy_policy:");
+    println!("    fail_closed: {}", report.policy.fail_closed);
+    println!("    allow_embedding: {}", report.policy.allow_embedding);
+    println!("    allow_llm: {}", report.policy.allow_llm);
+    println!("    allow_rerank: {}", report.policy.allow_rerank);
+    println!("  services:");
+    for service in report.services {
+        println!("    {}:", service.service_name());
+        println!("      status: {}", service.status_name());
+        println!("      policy: {}", service.policy_name());
+        match service.endpoint.as_deref() {
+            Some(endpoint) => println!("      endpoint: {endpoint}"),
+            None => println!("      endpoint: none"),
+        }
+        println!("      detail: {}", service.detail);
+    }
+    Ok(())
+}
+
 fn config_intelligence_command(config: &Config) -> Result<()> {
     let effective_llm = config.memory_intelligence.effective_llm_config(&config.llm);
     let llm_state = if !config.memory_intelligence.mode.uses_llm() {
@@ -10000,7 +10046,15 @@ fn config_intelligence_command(config: &Config) -> Result<()> {
         Some(model) => println!("  llm_model: {model}"),
         None => println!("  llm_model: none"),
     }
-    match effective_llm.effective_base_url_summary().as_deref() {
+    let effective_llm_endpoints = effective_llm.effective_endpoints().unwrap_or_default();
+    let effective_llm_base_url = mempal::core::remote_calls::endpoint_policy_diagnostic_summary(
+        &config.privacy.remote_calls,
+        mempal::core::remote_calls::RemoteCallService::Llm,
+        effective_llm_endpoints
+            .iter()
+            .map(|endpoint| endpoint.base_url.as_str()),
+    );
+    match (!effective_llm_base_url.is_empty()).then_some(effective_llm_base_url) {
         Some(base_url) => println!("  llm_base_url: {base_url}"),
         None => println!("  llm_base_url: none"),
     }
@@ -10271,7 +10325,10 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         mempal::core::queue::failure_headline_count(embed_status.fail_count, &queue_stats);
     println!("embed_fail_count: {embed_failure_headline}");
     println!("embed_degraded: {}", embed_status.degraded);
-    if let Some(last_error) = embed_status.last_error {
+    let endpoints = config.embed.effective_endpoints().unwrap_or_default();
+    if let Some(last_error) =
+        embed_last_error_for_status(config, &endpoints, embed_status.last_error)
+    {
         println!("embed_last_error: {last_error}");
     }
     if let Some(last_success_at) = embed_status.last_success_at_unix_ms {
@@ -10287,11 +10344,15 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     if let Some(model) = config.embed.effective_model_summary().as_deref() {
         println!("  model: {model}");
     }
-    if let Some(base_url) = config.embed.effective_base_url_display_summary().as_deref() {
-        println!("  base_url: {base_url}");
-    }
     println!("  pool_capacity: {}", config.embed.pool_capacity());
-    let endpoints = config.embed.effective_endpoints().unwrap_or_default();
+    let embed_base_url = mempal::core::remote_calls::endpoint_policy_diagnostic_summary(
+        &config.privacy.remote_calls,
+        mempal::core::remote_calls::RemoteCallService::Embedding,
+        endpoints.iter().map(|endpoint| endpoint.base_url.as_str()),
+    );
+    if !embed_base_url.is_empty() {
+        println!("  base_url: {embed_base_url}");
+    }
     if endpoints.is_empty() {
         println!("  endpoints: none");
     } else {
@@ -10307,7 +10368,11 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
                 endpoint.id,
                 endpoint.backend,
                 endpoint.model,
-                mempal::core::config::endpoint_url_display_label(&endpoint.base_url),
+                mempal::core::remote_calls::endpoint_policy_diagnostic_label(
+                    &config.privacy.remote_calls,
+                    mempal::core::remote_calls::RemoteCallService::Embedding,
+                    &endpoint.base_url
+                ),
                 endpoint.priority,
                 endpoint.max_concurrent,
                 endpoint.retry_interval_secs,
@@ -10531,8 +10596,16 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         if let Some(model) = config.llm.effective_model_summary().as_deref() {
             println!("  model: {model}");
         }
-        if let Some(base_url) = config.llm.effective_base_url_summary().as_deref() {
-            println!("  base_url: {base_url}");
+        let llm_endpoints = config.llm.effective_endpoints().unwrap_or_default();
+        let llm_base_url = mempal::core::remote_calls::endpoint_policy_diagnostic_summary(
+            &config.privacy.remote_calls,
+            mempal::core::remote_calls::RemoteCallService::Llm,
+            llm_endpoints
+                .iter()
+                .map(|endpoint| endpoint.base_url.as_str()),
+        );
+        if !llm_base_url.is_empty() {
+            println!("  base_url: {llm_base_url}");
         }
         println!("  pool_capacity: {}", config.llm.pool_capacity());
         let llm_pending = queue_stats.pending;
@@ -10587,6 +10660,19 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         println!("scopes: (use --full for breakdown)");
     }
     Ok(())
+}
+
+fn embed_last_error_for_status(
+    config: &Config,
+    endpoints: &[EffectiveEmbedEndpoint],
+    last_error: Option<String>,
+) -> Option<String> {
+    mempal::core::remote_calls::endpoint_policy_global_runtime_error(
+        &config.privacy.remote_calls,
+        mempal::core::remote_calls::RemoteCallService::Embedding,
+        endpoints.iter().map(|endpoint| endpoint.base_url.as_str()),
+        last_error,
+    )
 }
 
 fn push_historical_rejudge_runtime_warning(
@@ -10935,6 +11021,7 @@ async fn xurl_ingest_command(db: &Database, config: &Config, command: XurlComman
                     include_agent_prompts,
                     min_score: Some(min_score),
                     reranker: Some(config.search.reranker.clone()),
+                    remote_call_policy: config.privacy.remote_calls.clone(),
                 },
             )
             .await
@@ -11380,6 +11467,7 @@ async fn hermes_query_command(db: &Database, config: &Config, args: HermesQueryA
             include_agent_prompts: args.include_agent_prompts,
             min_score: Some(args.min_score),
             reranker: Some(config.search.reranker.clone()),
+            remote_call_policy: config.privacy.remote_calls.clone(),
         },
     )
     .await
@@ -17607,6 +17695,7 @@ fn historical_rejudge_llm_context(
         .llm
         .effective_endpoints()
         .context("failed to resolve historical rejudge LLM endpoints")?;
+    mempal::core::remote_calls::ensure_llm_allowed(config, &config.llm)?;
     let Some(proposal_selector) = options.proposal_llm_endpoint else {
         let model_summary = if endpoints.is_empty() {
             "llm".to_string()
@@ -18543,6 +18632,60 @@ mod tests {
     };
 
     const TEST_TARGET_FINGERPRINT: &str = "test-embedder:8:target";
+
+    #[test]
+    fn test_status_embed_last_error_suppresses_blocked_remote_endpoint_identity() {
+        let config = Config::parse(
+            r#"
+[privacy.remote_calls]
+fail_closed = true
+
+[embed]
+backend = "openai_compat"
+base_url = "https://api.openai.com:9443/v1/private-embed-path"
+api_model = "text-embedding-3-large"
+"#,
+        )
+        .expect("parse config");
+        let endpoints = config
+            .embed
+            .effective_endpoints()
+            .expect("effective endpoints");
+        let stale_error = Some(
+            "failed https://api.openai.com:9443/v1/private-embed-path?api_key=sk-secret-should-not-print MEMPAL_SECRET_TOKEN_ENV"
+                .to_string(),
+        );
+
+        let rendered = embed_last_error_for_status(&config, &endpoints, stale_error);
+
+        assert!(rendered.is_none());
+    }
+
+    #[test]
+    fn test_status_embed_last_error_preserves_allowed_remote_diagnostics() {
+        let config = Config::parse(
+            r#"
+[privacy.remote_calls]
+fail_closed = true
+allow_embedding = true
+
+[embed]
+backend = "openai_compat"
+base_url = "https://api.openai.com:9443/v1"
+api_model = "text-embedding-3-large"
+"#,
+        )
+        .expect("parse config");
+        let endpoints = config
+            .embed
+            .effective_endpoints()
+            .expect("effective endpoints");
+        let last_error = Some("connection refused".to_string());
+
+        let rendered = embed_last_error_for_status(&config, &endpoints, last_error);
+
+        assert_eq!(rendered.as_deref(), Some("connection refused"));
+    }
 
     #[test]
     #[cfg(unix)]

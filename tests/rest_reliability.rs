@@ -36,16 +36,18 @@ impl TestEnv {
     }
 
     fn new_with_api_search_deadline_secs(api_search_deadline_secs: u64) -> Self {
+        Self::new_with_config_suffix(api_search_deadline_secs, "")
+    }
+
+    fn new_with_config_suffix(api_search_deadline_secs: u64, config_suffix: &str) -> Self {
         let tmp = TempDir::new().expect("tempdir");
         let mempal_home = tmp.path().join(".mempal");
         fs::create_dir_all(&mempal_home).expect("create mempal home");
         let db_path = mempal_home.join("palace.db");
         Database::open(&db_path).expect("open db");
         let config_path = mempal_home.join("config.toml");
-        fs::write(
-            &config_path,
-            format!(
-                r#"
+        let mut config = format!(
+            r#"
 db_path = "{}"
 
 [config_hot_reload]
@@ -66,10 +68,13 @@ write_queue_capacity = 10
 write_drain_timeout_secs = 2
 search_db_deadline_secs = {api_search_deadline_secs}
 "#,
-                db_path.display()
-            ),
-        )
-        .expect("write config");
+            db_path.display()
+        );
+        if !config_suffix.trim().is_empty() {
+            config.push('\n');
+            config.push_str(config_suffix);
+        }
+        fs::write(&config_path, config).expect("write config");
         ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
         global_embed_status().reset_for_tests();
         Self {
@@ -425,6 +430,78 @@ async fn test_status_shows_degraded_mode() {
         circuit.get("vector_search_mode").and_then(Value::as_str),
         Some("bm25_only")
     );
+}
+
+#[tokio::test]
+async fn test_status_redacts_blocked_remote_embedding_endpoint_identity() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new_with_config_suffix(
+        30,
+        r#"
+[privacy.remote_calls]
+fail_closed = true
+
+[embed]
+backend = "openai_compat"
+base_url = "https://api.openai.com:9443/v1/private-embed-path"
+api_model = "text-embedding-3-large"
+
+[embed.openai_compat]
+api_key_env = "MEMPAL_SECRET_TOKEN_ENV"
+
+[llm]
+enabled = true
+base_url = "https://llm.example.com:9444/v1/private-chat-path"
+model = "judge"
+api_key = "sk-secret-should-not-print"
+enabled_for = ["gating"]
+
+[search.reranker]
+enabled = true
+endpoint = "https://rerank.example.com:9445/private-rerank-path"
+model = "rerank"
+"#,
+    );
+    global_embed_status().record_endpoint_cooldown(
+        "legacy",
+        Duration::from_secs(30),
+        &EmbedError::Runtime(
+            "failed https://api.openai.com:9443/v1/private-embed-path?api_key=sk-secret-should-not-print MEMPAL_SECRET_TOKEN_ENV"
+                .to_string(),
+        ),
+    );
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (status, _headers, body) = get_json(state, "/api/status").await;
+    let rendered = serde_json::to_string(&body).expect("serialize status body");
+
+    assert_eq!(status, StatusCode::OK);
+    let endpoints = body["embedding_endpoints"]
+        .as_array()
+        .expect("embedding endpoints");
+    assert_eq!(endpoints.len(), 1, "{rendered}");
+    assert_eq!(
+        endpoints[0]["base_url"].as_str(),
+        Some(mempal::core::remote_calls::BLOCKED_REMOTE_ENDPOINT_LABEL),
+        "{rendered}"
+    );
+    assert!(endpoints[0]["last_error"].is_null(), "{rendered}");
+    assert!(rendered.contains(mempal::core::remote_calls::BLOCKED_REMOTE_ENDPOINT_LABEL));
+    assert!(!rendered.contains("api.openai.com"), "{rendered}");
+    assert!(!rendered.contains("9443"), "{rendered}");
+    assert!(!rendered.contains("private-embed-path"), "{rendered}");
+    assert!(!rendered.contains("api_key"), "{rendered}");
+    assert!(
+        !rendered.contains("sk-secret-should-not-print"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("MEMPAL_SECRET_TOKEN_ENV"), "{rendered}");
+    assert!(!rendered.contains("llm.example.com"), "{rendered}");
+    assert!(!rendered.contains("9444"), "{rendered}");
+    assert!(!rendered.contains("private-chat-path"), "{rendered}");
+    assert!(!rendered.contains("rerank.example.com"), "{rendered}");
+    assert!(!rendered.contains("9445"), "{rendered}");
+    assert!(!rendered.contains("private-rerank-path"), "{rendered}");
 }
 
 #[tokio::test(flavor = "current_thread")]

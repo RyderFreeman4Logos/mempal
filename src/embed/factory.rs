@@ -178,6 +178,12 @@ fn embedder_runtime_signature(config: &Config) -> String {
         "endpoints": config.embed.effective_endpoint_fingerprints(),
         "max_concurrent": config.embed.max_concurrent,
         "retry_interval_secs": config.embed.retry.interval_secs,
+        "privacy_remote_calls": {
+            "fail_closed": config.privacy.remote_calls.fail_closed,
+            "allow_embedding": config.privacy.remote_calls.allow_embedding,
+            "allow_llm": config.privacy.remote_calls.allow_llm,
+            "allow_rerank": config.privacy.remote_calls.allow_rerank,
+        },
     })
     .to_string()
 }

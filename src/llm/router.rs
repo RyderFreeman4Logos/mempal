@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 
-use crate::core::config::{EffectiveLlmEndpoint, LlmConfig};
+use crate::core::config::{EffectiveLlmEndpoint, LlmConfig, RemoteCallPolicyConfig};
 use crate::endpoint_pool::{
     EndpointPool, EndpointPoolEndpoint, EndpointPoolEntry, EndpointPoolItem, EndpointPoolStrategy,
 };
@@ -28,6 +28,14 @@ impl LlmRouter {
             .effective_endpoints()
             .map_err(|error| LlmError::MissingConfiguration(error.to_string()))?;
         Self::from_endpoints(endpoints)
+    }
+
+    pub fn from_config_with_policy(
+        config: &LlmConfig,
+        policy: &RemoteCallPolicyConfig,
+    ) -> Result<Self, LlmError> {
+        crate::core::remote_calls::ensure_llm_allowed_for_policy(policy, config)?;
+        Self::from_config(config)
     }
 
     pub fn from_endpoints(endpoints: Vec<EffectiveLlmEndpoint>) -> Result<Self, LlmError> {
@@ -139,7 +147,8 @@ impl EndpointPoolStrategy<LlmClient> for LlmRoutingStrategy<'_> {
             LlmError::HttpStatus { .. }
             | LlmError::ClientError { .. }
             | LlmError::DecodeResponse(_)
-            | LlmError::MissingConfiguration(_) => None,
+            | LlmError::MissingConfiguration(_)
+            | LlmError::RemoteCallPolicy(_) => None,
         }
     }
 
@@ -169,7 +178,9 @@ fn should_try_next_endpoint(error: &LlmError) -> bool {
                 StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
             )
         }
-        LlmError::DecodeResponse(_) | LlmError::MissingConfiguration(_) => false,
+        LlmError::DecodeResponse(_)
+        | LlmError::MissingConfiguration(_)
+        | LlmError::RemoteCallPolicy(_) => false,
     }
 }
 

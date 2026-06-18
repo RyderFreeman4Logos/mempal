@@ -170,7 +170,13 @@ pub async fn maybe_rerank_search_results(
     results: Vec<SearchResult>,
 ) -> rerank::RerankOutcome {
     let config = crate::core::config::ConfigHandle::current();
-    rerank::maybe_rerank_with_config(&config.search.reranker, query, results).await
+    rerank::maybe_rerank_with_config_and_policy(
+        &config.search.reranker,
+        &config.privacy.remote_calls,
+        query,
+        results,
+    )
+    .await
 }
 
 async fn apply_optional_reranker_to_outcome(
@@ -178,8 +184,13 @@ async fn apply_optional_reranker_to_outcome(
     mut outcome: SearchOutcome,
 ) -> SearchOutcome {
     let config = crate::core::config::ConfigHandle::current();
-    let rerank_outcome =
-        rerank::maybe_rerank_with_config(&config.search.reranker, query, outcome.results).await;
+    let rerank_outcome = rerank::maybe_rerank_with_config_and_policy(
+        &config.search.reranker,
+        &config.privacy.remote_calls,
+        query,
+        outcome.results,
+    )
+    .await;
     outcome.results = rerank_outcome.results;
     outcome.warnings.extend(rerank_outcome.warnings);
     outcome

@@ -81,6 +81,8 @@ pub enum EmbedError {
     Tokenizer(String),
     #[error("embedding runtime error: {0}")]
     Runtime(String),
+    #[error("{0}")]
+    RemoteCallPolicy(#[from] crate::core::remote_calls::RemoteCallPolicyError),
     #[error("embedding worker panicked")]
     WorkerPanic(#[source] tokio::task::JoinError),
     #[error("failed to call embedding endpoint {endpoint}")]
@@ -153,6 +155,7 @@ impl EmbedError {
             | Self::UnsupportedBackend(_)
             | Self::MissingConfiguration(_)
             | Self::InvalidConfiguration(_)
+            | Self::RemoteCallPolicy(_)
             | Self::ReadApiKeyEnv { .. } => false,
         }
     }
@@ -236,9 +239,12 @@ pub async fn build_backend_from_name(config: &Config, backend: &str) -> Result<B
         }
         #[cfg(feature = "onnx")]
         "onnx" => Ok(Box::new(onnx::OnnxEmbedder::new_or_download().await?)),
-        "openai_compat" | "api" => Ok(Box::new(router::EmbeddingRouter::from_config(
-            &config.embed,
-        )?)),
+        "openai_compat" | "api" => {
+            crate::core::remote_calls::ensure_embedding_allowed(config)?;
+            Ok(Box::new(router::EmbeddingRouter::from_config(
+                &config.embed,
+            )?))
+        }
         "stub" => {
             let dim = config
                 .embed
@@ -308,5 +314,43 @@ impl Embedder for ManagedEmbedder {
 
     fn estimate_tokens(&self, text: &str) -> usize {
         self.primary.estimate_tokens(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::config::{Config, EmbedEndpointConfig};
+
+    #[tokio::test]
+    async fn remote_fallback_backend_is_blocked_before_router_construction() {
+        let mut config = Config::default();
+        config.embed.backend = "model2vec".to_string();
+        config.embed.fallback = Some("openai_compat".to_string());
+        config.embed.endpoints.push(EmbedEndpointConfig {
+            id: Some("remote-fallback".to_string()),
+            backend: Some("openai_compat".to_string()),
+            base_url: Some("https://api.openai.com/v1/private-fallback-path".to_string()),
+            model: Some("text-embedding-3-large".to_string()),
+            ..Default::default()
+        });
+        config.privacy.remote_calls.fail_closed = true;
+
+        let error = match build_backend_from_name(&config, "openai_compat").await {
+            Ok(_) => panic!("remote fallback backend should be blocked by fail-closed policy"),
+            Err(error) => error,
+        };
+
+        match error {
+            EmbedError::RemoteCallPolicy(policy) => {
+                assert_eq!(policy.service, "embedding");
+                assert_eq!(policy.allow_field, "allow_embedding");
+                assert_eq!(
+                    policy.endpoint,
+                    crate::core::remote_calls::BLOCKED_REMOTE_ENDPOINT_LABEL
+                );
+            }
+            other => panic!("expected remote call policy error, got {other}"),
+        }
     }
 }

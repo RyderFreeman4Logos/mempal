@@ -6,12 +6,15 @@ use std::{env, fs, io};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
-use crate::core::config::{Config, ConfigHandle, endpoint_url_display_label};
+use crate::core::config::{Config, ConfigHandle};
 use crate::core::db::CURRENT_SCHEMA_VERSION;
 use crate::core::design_insights::{
     design_insights_table_exists, unresolved_design_insight_summary,
 };
 use crate::core::queue::{QueueStats, queue_stats_readonly};
+use crate::core::remote_calls::{
+    RemoteCallService, endpoint_policy_display_label, endpoint_policy_runtime_error,
+};
 use crate::daemon_status::{DaemonEmbedderRuntimeStatus, read_embedder_status};
 use crate::process_diagnostics::{
     DbHolderReport, ProcessMemoryReport, inspect_db_holders, inspect_process_memory,
@@ -312,10 +315,22 @@ fn build_embedding_report(config: Option<&Config>, db_path: &Path) -> DoctorEmbe
         .into_iter()
         .map(|endpoint| {
             let runtime = endpoint_runtime.get(&endpoint.id);
+            let last_error = runtime.and_then(|state| {
+                endpoint_policy_runtime_error(
+                    &config.privacy.remote_calls,
+                    RemoteCallService::Embedding,
+                    &endpoint.base_url,
+                    state.last_error.clone(),
+                )
+            });
             DoctorEmbeddingEndpointReport {
                 id: endpoint.id,
                 backend: endpoint.backend,
-                base_url: endpoint_url_display_label(&endpoint.base_url),
+                base_url: endpoint_policy_display_label(
+                    &config.privacy.remote_calls,
+                    RemoteCallService::Embedding,
+                    &endpoint.base_url,
+                ),
                 model: endpoint.model,
                 priority: endpoint.priority,
                 retry_interval_secs: endpoint.retry_interval_secs,
@@ -326,7 +341,7 @@ fn build_embedding_report(config: Option<&Config>, db_path: &Path) -> DoctorEmbe
                 cooldown_until_unix_ms: runtime.and_then(|state| state.cooldown_until_unix_ms),
                 last_failure_at_unix_ms: runtime.and_then(|state| state.last_failure_at_unix_ms),
                 last_success_at_unix_ms: runtime.and_then(|state| state.last_success_at_unix_ms),
-                last_error: runtime.and_then(|state| state.last_error.clone()),
+                last_error,
             }
         })
         .collect();
@@ -1010,6 +1025,82 @@ model = "Qwen/Qwen3-Embedding-8B"
         assert_eq!(report.endpoints.len(), 1);
         assert_eq!(report.endpoints[0].base_url, "http://127.0.0.1:18002");
         assert!(!report.endpoints[0].base_url.contains("private-token-path"));
+    }
+
+    #[test]
+    fn test_embedding_report_redacts_blocked_remote_endpoint_identity() {
+        let config = Config::parse(
+            r#"
+[privacy.remote_calls]
+fail_closed = true
+
+[embed]
+backend = "openai_compat"
+base_url = "https://api.openai.com/v1/private-token-path"
+api_model = "Qwen/Qwen3-Embedding-8B"
+
+[embed.openai_compat]
+api_key_env = "MEMPAL_SECRET_TOKEN_ENV"
+"#,
+        )
+        .expect("parse config");
+
+        let report = build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"));
+        let rendered = serde_json::to_string(&report).expect("serialize report");
+
+        assert_eq!(report.endpoints.len(), 1);
+        assert_eq!(
+            report.endpoints[0].base_url,
+            crate::core::remote_calls::BLOCKED_REMOTE_ENDPOINT_LABEL
+        );
+        assert!(!rendered.contains("api.openai.com"), "{rendered}");
+        assert!(!rendered.contains("private-token-path"), "{rendered}");
+        assert!(!rendered.contains("MEMPAL_SECRET_TOKEN_ENV"), "{rendered}");
+    }
+
+    #[test]
+    fn test_embedding_report_redacts_blocked_remote_endpoint_runtime_error() {
+        let config = Config::parse(
+            r#"
+[privacy.remote_calls]
+fail_closed = true
+
+[embed]
+backend = "openai_compat"
+
+[[embed.endpoints]]
+id = "doctor-blocked-remote"
+backend = "openai_compat"
+base_url = "https://api.openai.com:9443/v1/private-embed-path"
+model = "text-embedding-3-large"
+"#,
+        )
+        .expect("parse config");
+        crate::embed::global_embed_status().record_endpoint_cooldown(
+            "doctor-blocked-remote",
+            Duration::from_secs(60),
+            &crate::embed::EmbedError::Runtime(
+                "failed https://api.openai.com:9443/v1/private-embed-path?api_key=sk-secret-should-not-print MEMPAL_SECRET_TOKEN_ENV"
+                    .to_string(),
+            ),
+        );
+
+        let report = build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"));
+        let rendered = serde_json::to_string(&report).expect("serialize report");
+
+        assert_eq!(report.endpoints.len(), 1);
+        assert_eq!(
+            report.endpoints[0].base_url,
+            crate::core::remote_calls::BLOCKED_REMOTE_ENDPOINT_LABEL
+        );
+        assert!(report.endpoints[0].last_error.is_none());
+        assert!(!rendered.contains("api.openai.com"), "{rendered}");
+        assert!(!rendered.contains("private-embed-path"), "{rendered}");
+        assert!(!rendered.contains("MEMPAL_SECRET_TOKEN_ENV"), "{rendered}");
+        assert!(
+            !rendered.contains("sk-secret-should-not-print"),
+            "{rendered}"
+        );
     }
 
     #[cfg(target_os = "linux")]

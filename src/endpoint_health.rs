@@ -5,7 +5,10 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::Value;
 use tokio::time::timeout;
 
-use crate::core::config::{Config, EffectiveEmbedEndpoint, EffectiveLlmEndpoint, LlmConfig};
+use crate::core::config::{
+    Config, EffectiveEmbedEndpoint, EffectiveLlmEndpoint, LlmConfig, RemoteCallPolicyConfig,
+};
+use crate::core::remote_calls::{RemoteCallService, blocked_remote_endpoint_error};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -82,7 +85,7 @@ pub fn probe_endpoints_blocking(config: &Config) -> Result<EndpointHealthSnapsho
 /// instead follow `config.llm`, because that is the endpoint used to process
 /// daemon LLM work.
 pub async fn probe_daemon_llm_generation(config: &Config) -> ProbeStatus {
-    let (_, generation) = probe_llm_config(&config.llm).await;
+    let (_, generation) = probe_llm_config(&config.llm, &config.privacy.remote_calls).await;
     generation
 }
 
@@ -94,15 +97,24 @@ async fn probe_embedding(config: &Config) -> ProbeStatus {
                 Ok(_) => return ProbeStatus::unreachable("missing base_url".to_string()),
                 Err(error) => return ProbeStatus::unreachable(error.to_string()),
             };
-            probe_embedding_endpoints(&endpoints).await
+            probe_embedding_endpoints(&endpoints, &config.privacy.remote_calls).await
         }
         backend => ProbeStatus::reachable(None, format!("local backend: {backend}")),
     }
 }
 
-async fn probe_embedding_endpoints(endpoints: &[EffectiveEmbedEndpoint]) -> ProbeStatus {
+async fn probe_embedding_endpoints(
+    endpoints: &[EffectiveEmbedEndpoint],
+    policy: &RemoteCallPolicyConfig,
+) -> ProbeStatus {
     let mut failures = Vec::new();
     for endpoint in endpoints {
+        if let Some(status) =
+            blocked_probe_status(policy, RemoteCallService::Embedding, &endpoint.base_url)
+        {
+            failures.push(status.detail);
+            continue;
+        }
         let status =
             probe_models_endpoint(&endpoint.base_url, endpoint.api_key_env.as_deref(), None).await;
         if status.reachable {
@@ -126,10 +138,13 @@ async fn probe_llm(config: &Config) -> (ProbeStatus, ProbeStatus) {
     } else {
         config.llm.clone()
     };
-    probe_llm_config(&effective_llm).await
+    probe_llm_config(&effective_llm, &config.privacy.remote_calls).await
 }
 
-async fn probe_llm_config(effective_llm: &LlmConfig) -> (ProbeStatus, ProbeStatus) {
+async fn probe_llm_config(
+    effective_llm: &LlmConfig,
+    policy: &RemoteCallPolicyConfig,
+) -> (ProbeStatus, ProbeStatus) {
     if !effective_llm.enabled {
         let disabled = ProbeStatus::unreachable("disabled".to_string());
         return (disabled.clone(), disabled);
@@ -145,20 +160,32 @@ async fn probe_llm_config(effective_llm: &LlmConfig) -> (ProbeStatus, ProbeStatu
             return (failure.clone(), failure);
         }
     };
-    probe_llm_endpoints(&endpoints).await
+    probe_llm_endpoints(&endpoints, policy).await
 }
 
-async fn probe_llm_endpoints(endpoints: &[EffectiveLlmEndpoint]) -> (ProbeStatus, ProbeStatus) {
+async fn probe_llm_endpoints(
+    endpoints: &[EffectiveLlmEndpoint],
+    policy: &RemoteCallPolicyConfig,
+) -> (ProbeStatus, ProbeStatus) {
     let (control_plane, generation) = tokio::join!(
-        probe_llm_control_plane_endpoints(endpoints),
-        probe_llm_generation_endpoints(endpoints)
+        probe_llm_control_plane_endpoints(endpoints, policy),
+        probe_llm_generation_endpoints(endpoints, policy)
     );
     (control_plane, generation)
 }
 
-async fn probe_llm_control_plane_endpoints(endpoints: &[EffectiveLlmEndpoint]) -> ProbeStatus {
+async fn probe_llm_control_plane_endpoints(
+    endpoints: &[EffectiveLlmEndpoint],
+    policy: &RemoteCallPolicyConfig,
+) -> ProbeStatus {
     let mut failures = Vec::new();
     for endpoint in endpoints {
+        if let Some(status) =
+            blocked_probe_status(policy, RemoteCallService::Llm, &endpoint.base_url)
+        {
+            failures.push(status.detail);
+            continue;
+        }
         let status = probe_models_endpoint(
             &endpoint.base_url,
             endpoint.api_key_env.as_deref(),
@@ -176,9 +203,18 @@ async fn probe_llm_control_plane_endpoints(endpoints: &[EffectiveLlmEndpoint]) -
     ProbeStatus::unreachable(failures.join("; "))
 }
 
-async fn probe_llm_generation_endpoints(endpoints: &[EffectiveLlmEndpoint]) -> ProbeStatus {
+async fn probe_llm_generation_endpoints(
+    endpoints: &[EffectiveLlmEndpoint],
+    policy: &RemoteCallPolicyConfig,
+) -> ProbeStatus {
     let mut failures = Vec::new();
     for endpoint in endpoints {
+        if let Some(status) =
+            blocked_probe_status(policy, RemoteCallService::Llm, &endpoint.base_url)
+        {
+            failures.push(status.detail);
+            continue;
+        }
         let status = probe_chat_completion_endpoint(endpoint).await;
         if status.reachable {
             return ProbeStatus::reachable(
@@ -189,6 +225,15 @@ async fn probe_llm_generation_endpoints(endpoints: &[EffectiveLlmEndpoint]) -> P
         failures.push(format!("{}: {}", endpoint.id, status.detail));
     }
     ProbeStatus::unreachable(failures.join("; "))
+}
+
+fn blocked_probe_status(
+    policy: &RemoteCallPolicyConfig,
+    service: RemoteCallService,
+    endpoint: &str,
+) -> Option<ProbeStatus> {
+    blocked_remote_endpoint_error(policy, service, endpoint)
+        .map(|error| ProbeStatus::unreachable(format!("skipped: {error}")))
 }
 
 async fn probe_models_endpoint(
