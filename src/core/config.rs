@@ -51,6 +51,7 @@ const DEFAULT_HOOK_WING: &str = "agent-diary";
 const DEFAULT_HOOK_POLL_INTERVAL_MS: u64 = 500;
 const DEFAULT_HOOK_CLAIM_TTL_SECS: u64 = 120;
 const DEFAULT_DAEMON_LOG_PATH: &str = "~/.mempal/daemon.log";
+pub const DAEMON_SMALL_LOCAL_EMBED_MODEL: &str = "minishlab/potion-base-8M";
 const DEFAULT_MCP_LOG_PATH: &str = "~/.mempal/mcp.log";
 const DEFAULT_SESSION_REVIEW_WING: &str = "session-reviews";
 const DEFAULT_SESSION_REVIEW_MIN_LENGTH: usize = 100;
@@ -515,6 +516,23 @@ impl Config {
         }
         let _ = self.compile_privacy()?;
         Ok(())
+    }
+
+    pub fn daemon_embedder_config(&self) -> Self {
+        let mut config = self.clone();
+        match self.daemon.embedder_mode {
+            DaemonEmbedderMode::Configured => {}
+            DaemonEmbedderMode::Remote => {
+                config.embed.backend = "openai_compat".to_string();
+                config.embed.fallback = None;
+            }
+            DaemonEmbedderMode::SmallLocal => {
+                config.embed.backend = "model2vec".to_string();
+                config.embed.model = Some(DAEMON_SMALL_LOCAL_EMBED_MODEL.to_string());
+                config.embed.fallback = None;
+            }
+        }
+        config
     }
 
     pub fn compile_privacy(&self) -> Result<CompiledPrivacyConfig, ConfigError> {
@@ -1006,6 +1024,17 @@ fn validate_base_url(base_url: &str, field: &str, credential_hint: &str) -> Resu
     Ok(())
 }
 
+pub fn endpoint_url_display_label(base_url: &str) -> String {
+    let Ok(parsed) = Url::parse(base_url) else {
+        return "<invalid-url>".to_string();
+    };
+    let host = parsed.host_str().unwrap_or("<unknown-host>");
+    match parsed.port() {
+        Some(port) => format!("{}://{}:{port}", parsed.scheme(), host),
+        None => format!("{}://{}", parsed.scheme(), host),
+    }
+}
+
 fn validate_embed_endpoint_vector_identity(
     endpoints: &[EffectiveEmbedEndpoint],
 ) -> Result<(), ConfigError> {
@@ -1172,12 +1201,33 @@ impl Default for ApiConfig {
 #[serde(default)]
 pub struct DaemonConfig {
     pub log_path: String,
+    pub embedder_mode: DaemonEmbedderMode,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             log_path: DEFAULT_DAEMON_LOG_PATH.to_string(),
+            embedder_mode: DaemonEmbedderMode::Configured,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonEmbedderMode {
+    #[default]
+    Configured,
+    Remote,
+    SmallLocal,
+}
+
+impl DaemonEmbedderMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Remote => "remote",
+            Self::SmallLocal => "small_local",
         }
     }
 }
@@ -1354,6 +1404,14 @@ impl EmbedConfig {
         )
     }
 
+    pub fn effective_base_url_display_summary(&self) -> Option<String> {
+        summarize_effective_embed_endpoints(
+            self,
+            |endpoint| endpoint_url_display_label(&endpoint.base_url),
+            EffectiveEmbedEndpoint::base_url_display_label,
+        )
+    }
+
     pub fn effective_endpoint_fingerprints(&self) -> Vec<serde_json::Value> {
         self.effective_endpoints()
             .unwrap_or_default()
@@ -1526,6 +1584,10 @@ impl EffectiveEmbedEndpoint {
 
     pub fn base_url_label(&self) -> String {
         format!("{}={}", self.id, self.base_url)
+    }
+
+    pub fn base_url_display_label(&self) -> String {
+        format!("{}={}", self.id, endpoint_url_display_label(&self.base_url))
     }
 }
 
@@ -2979,12 +3041,57 @@ impl Default for SleepConfig {
 mod tests {
     use std::sync::{Mutex, OnceLock};
 
-    use super::{Config, DecayMode};
+    use super::{
+        Config, DAEMON_SMALL_LOCAL_EMBED_MODEL, DaemonEmbedderMode, DecayMode,
+        endpoint_url_display_label,
+    };
 
     // Serialize env-mutating tests to prevent flaky parallel interference.
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.get_or_init(Mutex::default).lock().unwrap()
+    }
+
+    fn save_embed_env() -> [(&'static str, Option<String>); 4] {
+        [
+            (
+                "MEMPAL_EMBED_BACKEND",
+                std::env::var("MEMPAL_EMBED_BACKEND").ok(),
+            ),
+            (
+                "MEMPAL_EMBED_BASE_URL",
+                std::env::var("MEMPAL_EMBED_BASE_URL").ok(),
+            ),
+            (
+                "MEMPAL_EMBED_MODEL",
+                std::env::var("MEMPAL_EMBED_MODEL").ok(),
+            ),
+            ("MEMPAL_EMBED_DIM", std::env::var("MEMPAL_EMBED_DIM").ok()),
+        ]
+    }
+
+    fn clear_embed_env() {
+        // SAFETY: tests using this helper hold ENV_LOCK, so no concurrent env
+        // access happens within this module while the mutation is active.
+        unsafe {
+            std::env::remove_var("MEMPAL_EMBED_BACKEND");
+            std::env::remove_var("MEMPAL_EMBED_BASE_URL");
+            std::env::remove_var("MEMPAL_EMBED_MODEL");
+            std::env::remove_var("MEMPAL_EMBED_DIM");
+        }
+    }
+
+    fn restore_embed_env(saved: [(&'static str, Option<String>); 4]) {
+        // SAFETY: tests using this helper hold ENV_LOCK, so no concurrent env
+        // access happens within this module while the mutation is active.
+        unsafe {
+            for (key, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 
     #[test]
@@ -3208,5 +3315,82 @@ mod tests {
             config.embed.openai_compat.dim,
             Some(super::DEFAULT_OPENAI_DIM)
         );
+    }
+
+    #[test]
+    fn daemon_embedder_remote_mode_uses_http_backend_without_model2vec_fallback() {
+        let _guard = env_lock();
+        let saved_env = save_embed_env();
+        clear_embed_env();
+        let config = Config::parse(
+            r#"
+[embed]
+backend = "model2vec"
+fallback = "model2vec"
+
+[embed.openai_compat]
+base_url = "http://gb10:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+
+[daemon]
+embedder_mode = "remote"
+"#,
+        )
+        .expect("parse config");
+        restore_embed_env(saved_env);
+
+        let daemon_config = config.daemon_embedder_config();
+
+        assert_eq!(
+            daemon_config.daemon.embedder_mode,
+            DaemonEmbedderMode::Remote
+        );
+        assert_eq!(daemon_config.embed.backend, "openai_compat");
+        assert_eq!(daemon_config.embed.fallback, None);
+        assert_eq!(
+            daemon_config.embed.effective_model_summary().as_deref(),
+            Some("Qwen/Qwen3-Embedding-8B")
+        );
+    }
+
+    #[test]
+    fn daemon_embedder_small_local_mode_uses_small_model_without_fallback() {
+        let _guard = env_lock();
+        let saved_env = save_embed_env();
+        clear_embed_env();
+        let config = Config::parse(
+            r#"
+[embed]
+backend = "openai_compat"
+fallback = "model2vec"
+model = "minishlab/potion-multilingual-128M"
+
+[daemon]
+embedder_mode = "small_local"
+"#,
+        )
+        .expect("parse config");
+        restore_embed_env(saved_env);
+
+        let daemon_config = config.daemon_embedder_config();
+
+        assert_eq!(daemon_config.embed.backend, "model2vec");
+        assert_eq!(
+            daemon_config.embed.model.as_deref(),
+            Some(DAEMON_SMALL_LOCAL_EMBED_MODEL)
+        );
+        assert_eq!(daemon_config.embed.fallback, None);
+    }
+
+    #[test]
+    fn endpoint_url_display_label_drops_userinfo_path_query_and_fragment() {
+        let display = endpoint_url_display_label(
+            "https://user:secret@example.com:8443/v1/token-path?api_key=hidden#frag",
+        );
+
+        assert_eq!(display, "https://example.com:8443");
+        assert!(!display.contains("secret"));
+        assert!(!display.contains("token-path"));
+        assert!(!display.contains("api_key"));
     }
 }

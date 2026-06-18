@@ -19,7 +19,10 @@ pub mod router;
 pub mod status;
 pub mod stub;
 
-pub use factory::{ConfiguredEmbedderFactory, EmbedderFactory};
+pub use factory::{
+    ConfiguredEmbedderFactory, EmbedderFactory, SharedEmbedderRuntimeSnapshot,
+    shared_embedder_runtime_snapshot,
+};
 pub use router::EmbeddingRouter;
 pub use status::{EmbedHealthSnapshot, EmbedStatus, global_embed_status};
 

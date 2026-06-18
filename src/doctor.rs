@@ -1,18 +1,21 @@
-use std::env;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{env, fs, io};
 
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
-use crate::core::config::{Config, ConfigHandle};
+use crate::core::config::{Config, ConfigHandle, endpoint_url_display_label};
 use crate::core::db::CURRENT_SCHEMA_VERSION;
 use crate::core::design_insights::{
     design_insights_table_exists, unresolved_design_insight_summary,
 };
 use crate::core::queue::{QueueStats, queue_stats_readonly};
-use crate::process_diagnostics::{DbHolderReport, inspect_db_holders};
+use crate::daemon_status::{DaemonEmbedderRuntimeStatus, read_embedder_status};
+use crate::process_diagnostics::{
+    DbHolderReport, ProcessMemoryReport, inspect_db_holders, inspect_process_memory,
+};
 
 pub const REQUIRED_MCP_TOOLS: &[&str] = &[
     "mempal_context",
@@ -79,6 +82,7 @@ pub struct DoctorReport {
     pub supported_schema_version: u32,
     pub db: DoctorDbReport,
     pub db_holders: DbHolderReport,
+    pub daemon: DoctorDaemonReport,
     pub install: DoctorInstallReport,
     pub embedding: DoctorEmbeddingReport,
     pub design_insights: DoctorDesignInsightReport,
@@ -124,6 +128,14 @@ pub struct DoctorEmbeddingQueueReport {
     pub failed_retryable_embed: u64,
     pub failed_retryable_llm: u64,
     pub last_auto_requeue_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DoctorDaemonReport {
+    pub pid: Option<i32>,
+    pub running: bool,
+    pub embedder: Option<DaemonEmbedderRuntimeStatus>,
+    pub process: Option<ProcessMemoryReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -188,6 +200,7 @@ pub struct RestPortOwner {
 pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
     let db = inspect_db(db_path);
     let db_holders = inspect_db_holders(db_path);
+    let daemon = inspect_daemon(db_path);
     let install = inspect_install();
     let config = Config::load().ok();
     let embedding = build_embedding_report(config.as_ref(), db_path);
@@ -226,6 +239,7 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
         warnings.push(format!("config change pending restart: {change}"));
     }
     push_db_holder_warnings(&mut warnings, &mut recommendations, &db_holders);
+    push_daemon_warnings(&mut warnings, &mut recommendations, &daemon);
     if install.path_matches_current_exe == Some(false) {
         warnings
             .push("PATH resolves mempal to a different executable than this process".to_string());
@@ -241,6 +255,7 @@ pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
         supported_schema_version: CURRENT_SCHEMA_VERSION,
         db,
         db_holders,
+        daemon,
         install,
         embedding,
         design_insights,
@@ -300,7 +315,7 @@ fn build_embedding_report(config: Option<&Config>, db_path: &Path) -> DoctorEmbe
             DoctorEmbeddingEndpointReport {
                 id: endpoint.id,
                 backend: endpoint.backend,
-                base_url: endpoint.base_url,
+                base_url: endpoint_url_display_label(&endpoint.base_url),
                 model: endpoint.model,
                 priority: endpoint.priority,
                 retry_interval_secs: endpoint.retry_interval_secs,
@@ -495,6 +510,73 @@ fn push_db_holder_warnings(
             db_holders.extra_holder_count
         ));
     }
+}
+
+fn push_daemon_warnings(
+    warnings: &mut Vec<String>,
+    recommendations: &mut Vec<String>,
+    daemon: &DoctorDaemonReport,
+) {
+    if daemon
+        .process
+        .as_ref()
+        .is_some_and(|process| process.exe_deleted)
+    {
+        warnings.push("running daemon executable has been deleted or replaced on disk".to_string());
+        recommendations.push(
+            "Run `mempal daemon restart` after upgrading so the resident daemon uses the current binary."
+                .to_string(),
+        );
+    }
+    if daemon
+        .embedder
+        .as_ref()
+        .is_some_and(|embedder| embedder.cache_loaded && embedder.backend == "model2vec")
+    {
+        recommendations.push(
+            "For a lower-memory long-lived daemon, set `[daemon].embedder_mode = \"remote\"` with a local/LAN OpenAI-compatible embedding endpoint, or `small_local` for the smaller in-process model, then run `mempal reindex` if vector dimensions changed."
+                .to_string(),
+        );
+    }
+}
+
+fn inspect_daemon(db_path: &Path) -> DoctorDaemonReport {
+    let mempal_home = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let embedder = read_embedder_status(mempal_home).ok().flatten();
+    let pid = read_daemon_pid_file(mempal_home)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            embedder
+                .as_ref()
+                .and_then(|status| i32::try_from(status.pid).ok())
+        });
+    let process = pid.map(inspect_process_memory);
+    let running = process
+        .as_ref()
+        .is_some_and(|process| process.error.is_none());
+    DoctorDaemonReport {
+        pid,
+        running,
+        embedder,
+        process,
+    }
+}
+
+fn read_daemon_pid_file(mempal_home: &Path) -> io::Result<Option<i32>> {
+    let pid_path = mempal_home.join("daemon.pid");
+    let content = match fs::read_to_string(&pid_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let pid = content.trim().parse::<i32>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid daemon pid in {}: {error}", pid_path.display()),
+        )
+    })?;
+    Ok(Some(pid))
 }
 
 fn inspect_db(db_path: &Path) -> DoctorDbReport {
@@ -862,6 +944,72 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("extra process"))
         );
+    }
+
+    #[test]
+    fn test_daemon_warnings_report_deleted_exe_and_low_memory_recommendation() {
+        let report = DoctorDaemonReport {
+            pid: Some(42),
+            running: true,
+            embedder: Some(DaemonEmbedderRuntimeStatus {
+                pid: 42,
+                updated_at_unix_secs: 123,
+                cache_loaded: true,
+                mode: "configured".to_string(),
+                backend: "model2vec".to_string(),
+                model: Some("minishlab/potion-multilingual-128M".to_string()),
+                dimensions: Some(1024),
+                fallback: None,
+                source: "test".to_string(),
+            }),
+            process: Some(ProcessMemoryReport {
+                pid: 42,
+                exe_deleted: true,
+                exe_path: Some("/usr/local/bin/mempal (deleted)".to_string()),
+                ..ProcessMemoryReport::default()
+            }),
+        };
+        let mut warnings = Vec::new();
+        let mut recommendations = Vec::new();
+
+        push_daemon_warnings(&mut warnings, &mut recommendations, &report);
+
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("deleted or replaced"))
+        );
+        assert!(
+            recommendations
+                .iter()
+                .any(|recommendation| recommendation.contains("mempal daemon restart"))
+        );
+        assert!(
+            recommendations
+                .iter()
+                .any(|recommendation| recommendation.contains("embedder_mode = \"remote\""))
+        );
+    }
+
+    #[test]
+    fn test_embedding_report_redacts_endpoint_url_paths() {
+        let config = Config::parse(
+            r#"
+[embed]
+backend = "openai_compat"
+
+[embed.openai_compat]
+base_url = "http://127.0.0.1:18002/v1/private-token-path"
+model = "Qwen/Qwen3-Embedding-8B"
+"#,
+        )
+        .expect("parse config");
+
+        let report = build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"));
+
+        assert_eq!(report.endpoints.len(), 1);
+        assert_eq!(report.endpoints[0].base_url, "http://127.0.0.1:18002");
+        assert!(!report.endpoints[0].base_url.contains("private-token-path"));
     }
 
     #[cfg(target_os = "linux")]

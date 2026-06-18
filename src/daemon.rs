@@ -86,6 +86,13 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
 
     install_shutdown_handlers()?;
     tracing::info!("daemon log path: {}", context.log_path.display());
+    write_daemon_embedder_status(
+        &context.mempal_home,
+        &crate::daemon_status::DaemonEmbedderRuntimeStatus::unloaded_from_config(
+            context.config.as_ref(),
+            "daemon-startup",
+        ),
+    );
 
     // Start REST API before the hooks check so the API remains available
     // even when hooks are disabled.
@@ -107,7 +114,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
                     .context("failed to resolve REST server address")?;
                 tracing::info!("daemon REST listening on http://{local_addr}");
                 eprintln!("daemon REST listening on http://{local_addr}");
-                let factory = crate::embed::ConfiguredEmbedderFactory::new(config_for_rest);
+                let factory =
+                    crate::embed::ConfiguredEmbedderFactory::new_for_daemon(config_for_rest);
                 let state = ApiState::new(db_path_rest, Arc::new(factory));
                 Some(tokio::spawn(async move {
                     if let Err(error) = serve_rest_api(listener, state, async {
@@ -151,7 +159,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     .context("failed to start daemon hook IPC service")?;
 
     let embedder = Arc::new(
-        DaemonEmbedder::from_config(context.config.as_ref())
+        DaemonEmbedder::from_config(context.config.as_ref(), &context.mempal_home)
             .await
             .context("failed to build daemon embedder")?,
     );
@@ -2619,6 +2627,7 @@ pub(crate) fn llm_worker_claim_enabled(config: &crate::core::config::Config) -> 
 struct DaemonEmbedder {
     name: String,
     runtime: Mutex<DaemonEmbedderRuntime>,
+    status_path: Option<PathBuf>,
 }
 
 struct DaemonEmbedderRuntime {
@@ -2676,14 +2685,21 @@ pub fn shutdown_requested() -> bool {
 }
 
 impl DaemonEmbedder {
-    async fn from_config(config: &crate::core::config::Config) -> crate::embed::Result<Self> {
+    async fn from_config(
+        config: &crate::core::config::Config,
+        mempal_home: &Path,
+    ) -> crate::embed::Result<Self> {
         let generation = crate::core::config::ConfigHandle::current_embed_generation();
         let runtime = DaemonEmbedderRuntime::from_config(config, generation).await?;
         let name = runtime.primary.name().to_string();
-        Ok(Self {
+        let status_path = Some(crate::daemon_status::embedder_status_path(mempal_home));
+        let embedder = Self {
             name,
             runtime: Mutex::new(runtime),
-        })
+            status_path,
+        };
+        embedder.write_loaded_status(config, "daemon-hook-worker");
+        Ok(embedder)
     }
 
     async fn runtime_snapshot(&self) -> crate::embed::Result<DaemonEmbedderRuntimeSnapshot> {
@@ -2698,10 +2714,28 @@ impl DaemonEmbedder {
             .runtime
             .lock()
             .expect("daemon embedder runtime mutex poisoned");
-        if guard.generation != generation {
+        let status = if guard.generation != generation {
             *guard = replacement;
+            Some(
+                crate::daemon_status::DaemonEmbedderRuntimeStatus::loaded_from_config(
+                    config.as_ref(),
+                    guard.primary.dimensions(),
+                    guard
+                        .fallback
+                        .as_ref()
+                        .map(|fallback| fallback.name().to_string()),
+                    "daemon-hook-worker-reload",
+                ),
+            )
+        } else {
+            None
+        };
+        let snapshot = guard.snapshot();
+        drop(guard);
+        if let (Some(status_path), Some(status)) = (&self.status_path, status) {
+            write_daemon_embedder_status_path(status_path, &status);
         }
-        Ok(guard.snapshot())
+        Ok(snapshot)
     }
 
     fn snapshot_if_generation(&self, generation: u64) -> Option<DaemonEmbedderRuntimeSnapshot> {
@@ -2723,7 +2757,28 @@ impl DaemonEmbedder {
         Self {
             name,
             runtime: Mutex::new(runtime),
+            status_path: None,
         }
+    }
+
+    fn write_loaded_status(&self, config: &crate::core::config::Config, source: &str) {
+        let Some(status_path) = &self.status_path else {
+            return;
+        };
+        let guard = self
+            .runtime
+            .lock()
+            .expect("daemon embedder runtime mutex poisoned");
+        let status = crate::daemon_status::DaemonEmbedderRuntimeStatus::loaded_from_config(
+            config,
+            guard.primary.dimensions(),
+            guard
+                .fallback
+                .as_ref()
+                .map(|fallback| fallback.name().to_string()),
+            source,
+        );
+        write_daemon_embedder_status_path(status_path, &status);
     }
 }
 
@@ -2773,11 +2828,12 @@ impl DaemonEmbedderRuntime {
         config: &crate::core::config::Config,
         generation: u64,
     ) -> crate::embed::Result<Self> {
+        let config = config.daemon_embedder_config();
         let primary: Arc<dyn Embedder> =
-            Arc::from(build_backend_from_name(config, config.embed.backend.as_str()).await?);
+            Arc::from(build_backend_from_name(&config, config.embed.backend.as_str()).await?);
         let fallback = match config.embed.fallback.as_deref() {
             Some(name) if name.eq_ignore_ascii_case(config.embed.backend.as_str()) => None,
-            Some(name) => Some(Arc::from(build_backend_from_name(config, name).await?)),
+            Some(name) => Some(Arc::from(build_backend_from_name(&config, name).await?)),
             None => None,
         };
         Ok(Self {
@@ -2793,6 +2849,26 @@ impl DaemonEmbedderRuntime {
             fallback: self.fallback.as_ref().map(Arc::clone),
         }
     }
+}
+
+fn write_daemon_embedder_status(
+    mempal_home: &Path,
+    status: &crate::daemon_status::DaemonEmbedderRuntimeStatus,
+) {
+    if let Err(error) = crate::daemon_status::write_embedder_status_atomic(mempal_home, status) {
+        tracing::warn!(%error, "failed to write daemon embedder status");
+    }
+}
+
+fn write_daemon_embedder_status_path(
+    status_path: &Path,
+    status: &crate::daemon_status::DaemonEmbedderRuntimeStatus,
+) {
+    let Some(mempal_home) = status_path.parent() else {
+        tracing::warn!("failed to write daemon embedder status: status path has no parent");
+        return;
+    };
+    write_daemon_embedder_status(mempal_home, status);
 }
 
 #[cfg(test)]

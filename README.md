@@ -55,6 +55,16 @@ db_path = "~/.mempal/palace.db"
 backend = "model2vec"                          # default, zero native deps
 # model = "minishlab/potion-multilingual-128M" # default multilingual model (1024d)
 
+# Optional: keep long-lived daemon RSS lower than the in-process default model.
+# Requires [embed.openai_compat] or [[embed.endpoints]] below.
+[daemon]
+embedder_mode = "remote"                       # configured | remote | small_local
+
+[embed.openai_compat]
+# base_url = "http://127.0.0.1:18002/v1"       # local/LAN embedding endpoint
+# model = "Qwen/Qwen3-Embedding-8B"
+# dim = 4096
+
 [search.reranker]
 enabled = false                                # default: no reranker call
 # endpoint = "http://gb10:18003/v1/rerank"     # local/LAN reranker endpoint
@@ -120,6 +130,14 @@ backend = "api"
 api_endpoint = "http://localhost:11434/api/embeddings"
 api_model = "nomic-embed-text"
 ```
+
+Daemon low-memory mode:
+
+- `[daemon].embedder_mode = "configured"` uses the normal `[embed]` backend.
+- `"remote"` forces daemon workers and daemon REST embedding to use the configured OpenAI-compatible/API endpoint and disables daemon fallback to local model2vec.
+- `"small_local"` forces the daemon to use `minishlab/potion-base-8M` instead of the larger default in-process model.
+- After changing backend/model/dimensions, run `mempal reindex`, then `mempal daemon restart`.
+- `mempal daemon status` and `mempal doctor` report daemon RSS/PSS, whether the daemon executable is deleted/replaced, and whether the daemon embedder cache is loaded.
 
 ## Commands
 

@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 
 use crate::core::config::{Config, ConfigHandle};
 use async_trait::async_trait;
+use serde::Serialize;
 
 use super::{Embedder, Result};
 
@@ -14,19 +15,37 @@ pub trait EmbedderFactory: Send + Sync {
 #[derive(Clone)]
 pub struct ConfiguredEmbedderFactory {
     config: Config,
+    daemon_mode: bool,
 }
 
 impl ConfiguredEmbedderFactory {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            daemon_mode: false,
+        }
+    }
+
+    pub fn new_for_daemon(config: Config) -> Self {
+        Self {
+            config,
+            daemon_mode: true,
+        }
     }
 
     fn active_config(&self) -> Config {
         let current = ConfigHandle::current();
-        if current.db_path == self.config.db_path && !config_is_default_snapshot(current.as_ref()) {
+        let config = if current.db_path == self.config.db_path
+            && !config_is_default_snapshot(current.as_ref())
+        {
             current.as_ref().clone()
         } else {
             self.config.clone()
+        };
+        if self.daemon_mode {
+            config.daemon_embedder_config()
+        } else {
+            config
         }
     }
 }
@@ -48,6 +67,10 @@ impl EmbedderFactory for ConfiguredEmbedderFactory {
         let embedder: Arc<dyn Embedder> = Arc::from(super::from_config(&config).await?);
         *guard = Some(SharedEmbedderRuntime {
             signature,
+            backend: config.embed.backend.clone(),
+            model: config.embed.effective_model_summary(),
+            dimensions: embedder.dimensions(),
+            max_input_tokens: embedder.max_input_tokens(),
             embedder: Arc::clone(&embedder),
         });
         Ok(Box::new(SharedEmbedder { inner: embedder }))
@@ -56,7 +79,25 @@ impl EmbedderFactory for ConfiguredEmbedderFactory {
 
 struct SharedEmbedderRuntime {
     signature: String,
+    backend: String,
+    model: Option<String>,
+    dimensions: usize,
+    max_input_tokens: Option<usize>,
     embedder: Arc<dyn Embedder>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SharedEmbedderRuntimeSnapshot {
+    pub loaded: bool,
+    pub busy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<usize>,
 }
 
 struct SharedEmbedder {
@@ -89,6 +130,27 @@ impl Embedder for SharedEmbedder {
 fn shared_embedder_cache() -> &'static tokio::sync::Mutex<Option<SharedEmbedderRuntime>> {
     static CACHE: OnceLock<tokio::sync::Mutex<Option<SharedEmbedderRuntime>>> = OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+pub fn shared_embedder_runtime_snapshot() -> SharedEmbedderRuntimeSnapshot {
+    let cache = shared_embedder_cache();
+    let Ok(guard) = cache.try_lock() else {
+        return SharedEmbedderRuntimeSnapshot {
+            busy: true,
+            ..SharedEmbedderRuntimeSnapshot::default()
+        };
+    };
+    match guard.as_ref() {
+        Some(runtime) => SharedEmbedderRuntimeSnapshot {
+            loaded: true,
+            busy: false,
+            backend: Some(runtime.backend.clone()),
+            model: runtime.model.clone(),
+            dimensions: Some(runtime.dimensions),
+            max_input_tokens: runtime.max_input_tokens,
+        },
+        None => SharedEmbedderRuntimeSnapshot::default(),
+    }
 }
 
 fn config_is_default_snapshot(config: &Config) -> bool {

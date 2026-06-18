@@ -10228,7 +10228,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     if let Some(model) = config.embed.effective_model_summary().as_deref() {
         println!("  model: {model}");
     }
-    if let Some(base_url) = config.embed.effective_base_url_summary().as_deref() {
+    if let Some(base_url) = config.embed.effective_base_url_display_summary().as_deref() {
         println!("  base_url: {base_url}");
     }
     println!("  pool_capacity: {}", config.embed.pool_capacity());
@@ -10248,7 +10248,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
                 endpoint.id,
                 endpoint.backend,
                 endpoint.model,
-                endpoint.base_url,
+                mempal::core::config::endpoint_url_display_label(&endpoint.base_url),
                 endpoint.priority,
                 endpoint.max_concurrent,
                 endpoint.retry_interval_secs,
@@ -10278,13 +10278,17 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     println!("Daemon:");
     println!("  running: {daemon_running}");
     match daemon_pid {
-        Some(pid) => println!("  pid: {pid}"),
+        Some(pid) => {
+            println!("  pid: {pid}");
+            print_daemon_process_report(pid, "  ");
+        }
         None => println!("  pid: none"),
     }
     match last_heartbeat {
         Some(hb) => println!("  last_heartbeat_unix_secs: {hb}"),
         None => println!("  last_heartbeat_unix_secs: none"),
     }
+    print_daemon_embedder_status(&daemon_home_from_db_path(db.path()), "  ");
     let db_holders = mempal::process_diagnostics::inspect_db_holders(db.path());
     print_db_holder_report("DB Holders", &db_holders, "  ");
     println!("Queue:");
@@ -12430,6 +12434,7 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
             if process_is_running(pid)? {
                 println!("status: running");
                 println!("pid: {pid}");
+                print_daemon_process_report(pid, "");
                 let pid_path = mempal_home.join("daemon.pid");
                 if let Ok(meta) = std::fs::metadata(&pid_path) {
                     if let Ok(modified) = meta.modified() {
@@ -12470,21 +12475,24 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
             siblings.len()
         );
     }
+    print_daemon_embedder_status(&mempal_home, "");
     let db_holders = mempal::process_diagnostics::inspect_db_holders(db_path);
     print_db_holder_report("db_holders", &db_holders, "");
     #[cfg(feature = "rest")]
     if let Ok(config) = Config::load()
         && config.api.enabled
-        && let Ok(Some(telemetry)) =
-            block_on_result(fetch_daemon_search_telemetry(&config.api.addr))
+        && let Ok(Some(status)) = block_on_result(fetch_daemon_status(&config.api.addr))
     {
-        print_daemon_search_telemetry(&telemetry);
+        print_daemon_rest_embedder_cache(&status);
+        if let Some(telemetry) = status.get("search_telemetry") {
+            print_daemon_search_telemetry(telemetry);
+        }
     }
     Ok(())
 }
 
 #[cfg(feature = "rest")]
-async fn fetch_daemon_search_telemetry(addr: &str) -> Result<Option<Value>> {
+async fn fetch_daemon_status(addr: &str) -> Result<Option<Value>> {
     let endpoint = normalize_rest_endpoint(addr);
     let url = format!("{endpoint}/api/status");
     let client = reqwest::Client::builder()
@@ -12502,7 +12510,7 @@ async fn fetch_daemon_search_telemetry(addr: &str) -> Result<Option<Value>> {
         .json::<Value>()
         .await
         .context("failed to parse REST status JSON")?;
-    Ok(body.get("search_telemetry").cloned())
+    Ok(Some(body))
 }
 
 #[cfg(feature = "rest")]
@@ -12513,6 +12521,107 @@ fn normalize_rest_endpoint(endpoint: &str) -> String {
     } else {
         format!("http://{trimmed}")
     }
+}
+
+fn print_daemon_process_report(pid: i32, prefix: &str) {
+    let report = mempal::process_diagnostics::inspect_process_memory(pid);
+    if let Some(error) = report.error.as_deref() {
+        println!("{prefix}process_diagnostics_error: {error}");
+    }
+    if let Some(exe_path) = report.exe_path.as_deref() {
+        println!("{prefix}exe_path: {exe_path}");
+    }
+    println!("{prefix}exe_deleted: {}", report.exe_deleted);
+    println!(
+        "{prefix}memory.rss_bytes: {}",
+        display_opt_u64(report.rss_bytes)
+    );
+    println!(
+        "{prefix}memory.pss_bytes: {}",
+        display_opt_u64(report.pss_bytes)
+    );
+    println!(
+        "{prefix}memory.private_dirty_bytes: {}",
+        display_opt_u64(report.private_dirty_bytes)
+    );
+    if report.exe_deleted {
+        println!(
+            "{prefix}warning: daemon binary has been deleted or replaced; run `mempal daemon restart` after upgrade"
+        );
+    }
+}
+
+fn print_daemon_embedder_status(mempal_home: &Path, prefix: &str) {
+    match mempal::daemon_status::read_embedder_status(mempal_home) {
+        Ok(Some(status)) => {
+            println!("{prefix}embedder.cache_loaded: {}", status.cache_loaded);
+            println!("{prefix}embedder.mode: {}", status.mode);
+            println!("{prefix}embedder.backend: {}", status.backend);
+            println!(
+                "{prefix}embedder.model: {}",
+                status.model.as_deref().unwrap_or("none")
+            );
+            println!(
+                "{prefix}embedder.dimensions: {}",
+                display_opt_usize(status.dimensions)
+            );
+            println!(
+                "{prefix}embedder.fallback: {}",
+                status.fallback.as_deref().unwrap_or("none")
+            );
+            println!("{prefix}embedder.status_pid: {}", status.pid);
+            println!(
+                "{prefix}embedder.updated_at_unix_secs: {}",
+                status.updated_at_unix_secs
+            );
+            println!("{prefix}embedder.status_source: {}", status.source);
+        }
+        Ok(None) => println!("{prefix}embedder.cache_loaded: unknown"),
+        Err(error) => println!("{prefix}embedder.status_error: {error}"),
+    }
+}
+
+#[cfg(feature = "rest")]
+fn print_daemon_rest_embedder_cache(status: &Value) {
+    let Some(cache) = status.get("embedder_cache") else {
+        return;
+    };
+    println!(
+        "rest.embedder_cache.loaded: {}",
+        cache
+            .get("loaded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    println!(
+        "rest.embedder_cache.busy: {}",
+        cache.get("busy").and_then(Value::as_bool).unwrap_or(false)
+    );
+    println!(
+        "rest.embedder_cache.backend: {}",
+        json_str(cache, "backend")
+    );
+    println!("rest.embedder_cache.model: {}", json_str(cache, "model"));
+    println!(
+        "rest.embedder_cache.dimensions: {}",
+        cache
+            .get("dimensions")
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+}
+
+fn display_opt_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn display_opt_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 #[cfg(feature = "rest")]
@@ -17699,6 +17808,62 @@ fn doctor_command(format: String) -> Result<()> {
                 "path_matches_current_exe={:?}",
                 report.install.path_matches_current_exe
             );
+            println!("daemon_running={}", report.daemon.running);
+            println!(
+                "daemon_pid={}",
+                report
+                    .daemon
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+            if let Some(process) = report.daemon.process.as_ref() {
+                println!("daemon_exe_deleted={}", process.exe_deleted);
+                if let Some(exe_path) = process.exe_path.as_deref() {
+                    println!("daemon_exe_path={exe_path}");
+                }
+                println!(
+                    "daemon_rss_bytes={}",
+                    process
+                        .rss_bytes
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                println!(
+                    "daemon_pss_bytes={}",
+                    process
+                        .pss_bytes
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                println!(
+                    "daemon_private_dirty_bytes={}",
+                    process
+                        .private_dirty_bytes
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+            }
+            match report.daemon.embedder.as_ref() {
+                Some(embedder) => {
+                    println!("daemon_embedder_cache_loaded={}", embedder.cache_loaded);
+                    println!("daemon_embedder_mode={}", embedder.mode);
+                    println!("daemon_embedder_backend={}", embedder.backend);
+                    println!(
+                        "daemon_embedder_model={}",
+                        embedder.model.as_deref().unwrap_or("none")
+                    );
+                    println!(
+                        "daemon_embedder_dimensions={}",
+                        embedder
+                            .dimensions
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    );
+                    println!("daemon_embedder_status_source={}", embedder.source);
+                }
+                None => println!("daemon_embedder_cache_loaded=unknown"),
+            }
             println!("embedding_backend={}", report.embedding.backend);
             println!(
                 "embedding_model={}",

@@ -409,6 +409,7 @@ struct StatusResponse {
     db_size_bytes: u64,
     embedding_status: String,
     embedding_endpoints: Vec<ApiEmbeddingEndpointStatus>,
+    embedder_cache: crate::embed::SharedEmbedderRuntimeSnapshot,
     search_mode: String,
     embedder_circuit: EmbedderCircuitStatus,
     write_queue: WriteQueueStats,
@@ -1332,6 +1333,7 @@ async fn taxonomy_handler(
 
 async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResponse>, ApiError> {
     let config = ConfigHandle::current();
+    let daemon_embed_config = config.daemon_embedder_config();
     let embed_snapshot = crate::embed::global_embed_status().snapshot();
     let endpoint_runtime = crate::embed::global_embed_status()
         .endpoint_runtime_snapshots()
@@ -1399,7 +1401,7 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         taxonomy_count: db_snapshot.taxonomy_count,
         db_size_bytes: db_snapshot.db_size_bytes,
         embedding_status: current_embedding_status(&embed_snapshot).to_string(),
-        embedding_endpoints: config
+        embedding_endpoints: daemon_embed_config
             .embed
             .effective_endpoints()
             .unwrap_or_default()
@@ -1409,7 +1411,7 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
                 ApiEmbeddingEndpointStatus {
                     id: endpoint.id,
                     backend: endpoint.backend,
-                    base_url: endpoint.base_url,
+                    base_url: crate::core::config::endpoint_url_display_label(&endpoint.base_url),
                     model: endpoint.model,
                     priority: endpoint.priority,
                     retry_interval_secs: endpoint.retry_interval_secs,
@@ -1427,6 +1429,7 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
                 }
             })
             .collect(),
+        embedder_cache: crate::embed::shared_embedder_runtime_snapshot(),
         search_mode: vector_search_circuit
             .vector_search_mode
             .as_str()

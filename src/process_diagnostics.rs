@@ -228,6 +228,22 @@ pub struct DbHolderProcess {
     pub current_mcp_server: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProcessMemoryReport {
+    pub pid: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pss_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_dirty_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe_path: Option<String>,
+    pub exe_deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Inspect live DB holders. On non-Linux platforms this returns an empty report
 /// because `/proc/<pid>/fd` enumeration is Linux-specific.
 pub fn inspect_db_holders(db_path: &Path) -> DbHolderReport {
@@ -249,6 +265,22 @@ pub fn inspect_db_holders(db_path: &Path) -> DbHolderReport {
     #[cfg(not(target_os = "linux"))]
     {
         empty_report(db_path, None)
+    }
+}
+
+pub fn inspect_process_memory(pid: i32) -> ProcessMemoryReport {
+    #[cfg(target_os = "linux")]
+    {
+        inspect_process_memory_in_proc(pid, Path::new("/proc"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        ProcessMemoryReport {
+            pid,
+            error: Some("process memory diagnostics are only available on Linux".to_string()),
+            ..ProcessMemoryReport::default()
+        }
     }
 }
 
@@ -466,6 +498,53 @@ fn read_cmdline(path: &Path) -> Vec<String> {
         return Vec::new();
     };
     parse_cmdline(&bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_process_memory_in_proc(pid: i32, proc_root: &Path) -> ProcessMemoryReport {
+    let pid_dir = proc_root.join(pid.to_string());
+    if !pid_dir.exists() {
+        return ProcessMemoryReport {
+            pid,
+            error: Some(format!(
+                "process {pid} is not visible in {}",
+                proc_root.display()
+            )),
+            ..ProcessMemoryReport::default()
+        };
+    }
+
+    let mut report = ProcessMemoryReport {
+        pid,
+        ..ProcessMemoryReport::default()
+    };
+    match fs::read_link(pid_dir.join("exe")) {
+        Ok(exe_path) => {
+            let display = exe_path.to_string_lossy().into_owned();
+            report.exe_deleted = display.ends_with(" (deleted)");
+            report.exe_path = Some(display);
+        }
+        Err(error) => {
+            report.error = Some(format!("failed to read process exe link: {error}"));
+        }
+    }
+    if let Ok(status) = fs::read_to_string(pid_dir.join("status")) {
+        report.rss_bytes = parse_proc_kb_metric(&status, "VmRSS:");
+    }
+    if let Ok(smaps) = fs::read_to_string(pid_dir.join("smaps_rollup")) {
+        report.pss_bytes = parse_proc_kb_metric(&smaps, "Pss:");
+        report.private_dirty_bytes = parse_proc_kb_metric(&smaps, "Private_Dirty:");
+    }
+    report
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_kb_metric(contents: &str, label: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let value = line.strip_prefix(label)?.trim();
+        let kb = value.split_ascii_whitespace().next()?.parse::<u64>().ok()?;
+        kb.checked_mul(1024)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1148,6 +1227,33 @@ mod tests {
             let opened = opened_db_files(&proc_root.join("55").join("fd"), &targets);
 
             assert_eq!(opened, vec!["db"]);
+        }
+
+        #[test]
+        fn test_inspect_process_memory_reports_rss_pss_private_dirty_and_deleted_exe() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let proc_root = tmp.path();
+            let pid_dir = proc_root.join("321");
+            fs::create_dir_all(&pid_dir).expect("create pid dir");
+            fs::write(pid_dir.join("status"), "Name:\tmempal\nVmRSS:\t  2048 kB\n")
+                .expect("write status");
+            fs::write(
+                pid_dir.join("smaps_rollup"),
+                "Rss: 2048 kB\nPss: 1536 kB\nPrivate_Dirty: 1024 kB\n",
+            )
+            .expect("write smaps");
+            symlink("/usr/local/bin/mempal (deleted)", pid_dir.join("exe")).expect("symlink exe");
+
+            let report = inspect_process_memory_in_proc(321, proc_root);
+
+            assert_eq!(report.rss_bytes, Some(2_097_152));
+            assert_eq!(report.pss_bytes, Some(1_572_864));
+            assert_eq!(report.private_dirty_bytes, Some(1_048_576));
+            assert!(report.exe_deleted);
+            assert_eq!(
+                report.exe_path.as_deref(),
+                Some("/usr/local/bin/mempal (deleted)")
+            );
         }
     }
 
