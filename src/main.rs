@@ -14322,6 +14322,12 @@ fn historical_rejudge_checkpoint_matches_resume(
     current_options_hash: &str,
     current_judge_model: Option<&String>,
 ) -> Result<bool> {
+    if checkpoint.mutation != historical_rejudge_mutation(options)
+        || checkpoint.page_size != options.page_size
+    {
+        return Ok(false);
+    }
+
     if checkpoint.options_hash == current_options_hash {
         return Ok(historical_rejudge_judge_model_matches_without_config_drift(
             checkpoint.judge_model.as_ref(),
@@ -14339,9 +14345,10 @@ fn historical_rejudge_checkpoint_matches_resume(
     if checkpoint.options_hash != legacy_options_hash {
         return Ok(false);
     }
-    if historical_rejudge_safety_fingerprinted_summary(checkpoint.judge_model.as_ref())
-        && checkpoint.judge_model.as_ref() == current_judge_model
-    {
+    if historical_rejudge_judge_model_matches_config_drift(
+        checkpoint.judge_model.as_ref(),
+        current_judge_model,
+    ) {
         return Ok(true);
     }
     Ok(options.unsafe_allow_config_version_drift
@@ -14349,6 +14356,30 @@ fn historical_rejudge_checkpoint_matches_resume(
             checkpoint.judge_model.as_ref(),
             current_judge_model,
         ))
+}
+
+fn historical_rejudge_mutation(options: HistoricalRejudgeOptions<'_>) -> &'static str {
+    if options.hard_delete {
+        "hard_delete"
+    } else {
+        "soft_delete"
+    }
+}
+
+fn historical_rejudge_judge_model_matches_config_drift(
+    checkpoint_judge_model: Option<&String>,
+    current_judge_model: Option<&String>,
+) -> bool {
+    if historical_rejudge_safety_fingerprinted_summary(checkpoint_judge_model)
+        && checkpoint_judge_model == current_judge_model
+    {
+        return true;
+    }
+
+    let (Some(checkpoint), Some(current)) = (checkpoint_judge_model, current_judge_model) else {
+        return false;
+    };
+    historical_rejudge_live_two_stage_endpoint_model_summary_matches(checkpoint, current)
 }
 
 fn historical_rejudge_judge_model_matches_without_config_drift(
@@ -14426,6 +14457,46 @@ fn historical_rejudge_stage_model_after_endpoint_label<'a>(
 fn historical_rejudge_model_after_endpoint_label(label: &str) -> Option<&str> {
     let (_, model) = label.split_once('=')?;
     (!model.is_empty()).then_some(model)
+}
+
+type HistoricalRejudgeTwoStageEndpointModelSummary<'a> = ((&'a str, &'a str), (&'a str, &'a str));
+
+fn historical_rejudge_live_two_stage_endpoint_model_summary_matches(
+    checkpoint: &str,
+    current: &str,
+) -> bool {
+    let Some(checkpoint_summary) = historical_rejudge_two_stage_endpoint_model_summary(checkpoint)
+    else {
+        return false;
+    };
+    let current_without_safety = historical_rejudge_without_safety_fingerprints(current);
+    historical_rejudge_two_stage_endpoint_model_summary(&current_without_safety)
+        .is_some_and(|current_summary| checkpoint_summary == current_summary)
+}
+
+fn historical_rejudge_two_stage_endpoint_model_summary(
+    summary: &str,
+) -> Option<HistoricalRejudgeTwoStageEndpointModelSummary<'_>> {
+    if summary.contains("@endpoint:") || summary.contains("@policy:") {
+        return None;
+    }
+    let parts = summary.split(", ").collect::<Vec<_>>();
+    let [proposal, confirm] = parts.as_slice() else {
+        return None;
+    };
+    Some((
+        historical_rejudge_stage_endpoint_model_parts(proposal, "proposal")?,
+        historical_rejudge_stage_endpoint_model_parts(confirm, "confirm")?,
+    ))
+}
+
+fn historical_rejudge_stage_endpoint_model_parts<'a>(
+    part: &'a str,
+    stage: &str,
+) -> Option<(&'a str, &'a str)> {
+    let label = part.strip_prefix(stage)?.strip_prefix(':')?;
+    let (endpoint_id, model) = label.split_once('=')?;
+    (!endpoint_id.is_empty() && !model.is_empty()).then_some((endpoint_id, model))
 }
 
 fn start_historical_rejudge_checkpoint(
@@ -19565,6 +19636,143 @@ threshold = 0.7
         )
         .expect("explicit unsafe override should allow compatible legacy checkpoint");
         assert_eq!(unsafe_resumed.config_version, old_config_version);
+    }
+
+    #[test]
+    fn historical_rejudge_resume_accepts_live_two_stage_endpoint_model_summary_config_drift() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        insert_drawer(&db, "live-resume-drift", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+        let options = HistoricalRejudgeOptions {
+            proposal_llm_endpoint: Some("qwen"),
+            confirm_llm_endpoint: Some("spark"),
+            ..full_rejudge_options(true, Some(&backups), DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE)
+        };
+        let old_config_version = "e8c4df7aceb1";
+        let new_config_version = "e3c72cd529ff";
+        let checkpoint_judge_model =
+            Some("proposal:qwen=qwen3.6-27b-decensor-by-aeon, confirm:spark=spark".to_string());
+        let current_judge_model = Some(
+            "proposal:qwen=qwen3.6-27b-decensor-by-aeon@endpoint:proposal-v1, confirm:spark=spark@endpoint:confirm-v1@policy:policy-v1"
+                .to_string(),
+        );
+        let options_hash = historical_rejudge_options_hash(options, None, old_config_version)
+            .expect("old options hash");
+        let mut checkpoint = start_historical_rejudge_checkpoint(
+            &db,
+            options,
+            None,
+            old_config_version,
+            checkpoint_judge_model,
+            Some(&backups),
+            options_hash,
+        )
+        .expect("start checkpoint");
+        checkpoint.status = "waiting_llm".to_string();
+        checkpoint.last_processed_rowid = Some(drawer_rowid(&db, "live-resume-drift"));
+        save_historical_rejudge_checkpoint(&db, &checkpoint).expect("save live checkpoint");
+
+        let resumed = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..options
+            },
+            None,
+            new_config_version,
+            current_judge_model.clone(),
+            Some(&backups),
+        )
+        .expect("resume should accept live two-stage endpoint=model summary drift");
+        assert_eq!(resumed.run_id, checkpoint.run_id);
+        assert_eq!(resumed.status, "waiting_llm");
+        assert_eq!(resumed.config_version, old_config_version);
+        assert_eq!(resumed.page_size, DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE);
+
+        let changed_model = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                ..options
+            },
+            None,
+            new_config_version,
+            Some(
+                "proposal:qwen=qwen3.6-27b-decensor-by-aeon-v2@endpoint:proposal-v1, confirm:spark=spark@endpoint:confirm-v1@policy:policy-v1"
+                    .to_string(),
+            ),
+            Some(&backups),
+        )
+        .expect_err("resume must reject changed two-stage judge model");
+        assert!(
+            changed_model
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{changed_model:#}"
+        );
+
+        let changed_filter = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                wing: Some("notes"),
+                ..options
+            },
+            None,
+            new_config_version,
+            current_judge_model.clone(),
+            Some(&backups),
+        )
+        .expect_err("resume must reject changed filters");
+        assert!(
+            changed_filter
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{changed_filter:#}"
+        );
+
+        let changed_mutation = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                hard_delete: true,
+                unsafe_no_backup: true,
+                ..options
+            },
+            None,
+            new_config_version,
+            current_judge_model.clone(),
+            Some(&backups),
+        )
+        .expect_err("resume must reject changed destructive scope");
+        assert!(
+            changed_mutation
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{changed_mutation:#}"
+        );
+
+        let changed_page_size = prepare_historical_rejudge_checkpoint(
+            &db,
+            HistoricalRejudgeOptions {
+                resume: true,
+                page_size: 250,
+                ..options
+            },
+            None,
+            new_config_version,
+            current_judge_model,
+            Some(&backups),
+        )
+        .expect_err("resume must reject changed stored page size");
+        assert!(
+            changed_page_size
+                .to_string()
+                .contains("checkpoint does not match"),
+            "{changed_page_size:#}"
+        );
     }
 
     #[test]
