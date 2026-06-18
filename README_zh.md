@@ -1,6 +1,6 @@
 # mempal
 
-Coding agent 的项目记忆工具。单二进制，`cargo install mempal`，10 秒内带出处找回历史决策。
+Coding agent 的项目记忆工具。单二进制，`cargo install mempal`，10 秒内带出处找回历史决策。默认本地优先：SQLite + model2vec，不主动调用云端 LLM、嵌入或 rerank 服务。
 
 ## 做什么
 
@@ -15,11 +15,20 @@ Agent 写代码 → 提交 → mempal 保存决策上下文
 - **自描述协议**：MEMORY_PROTOCOL 嵌入 MCP ServerInfo，任何 agent 连接后自动学会使用方式——无需系统提示配置
 - **多语言**：model2vec-rs（BGE-M3 蒸馏）作为默认嵌入器，零原生依赖
 - **单文件**：所有数据在 `~/.mempal/palace.db`（SQLite + sqlite-vec）
+- **默认无云端调用**：远程嵌入、LLM gating、reranker 都需要显式配置后才会启用
 
 ## 快速开始
 
+发布版：
+
 ```bash
-cargo install --path crates/mempal-cli --locked
+cargo install mempal
+```
+
+当前仓库 checkout：
+
+```bash
+cargo install --path . --locked
 
 mempal init ~/code/myapp
 mempal ingest ~/code/myapp --wing myapp
@@ -30,12 +39,14 @@ mempal wake-up
 启用 REST 支持：
 
 ```bash
-cargo install --path crates/mempal-cli --locked --features rest
+cargo install --path . --locked --features rest
 ```
 
 ## 配置
 
 配置文件 `~/.mempal/config.toml`（可选，不存在时使用默认值）：
+
+没有配置文件时，mempal 使用 `~/.mempal/palace.db` 本地 SQLite 数据库、本地 model2vec 嵌入器，并且不调用 reranker 或 LLM。下面的 OpenAI-compatible 嵌入、LLM gating、rerank 配置都是 opt-in。
 
 ```toml
 db_path = "~/.mempal/palace.db"
@@ -52,7 +63,7 @@ backend = "model2vec"                          # 默认，零原生依赖
 [embed]
 backend = "onnx"
 
-# 外部 API
+# 可选外部 API
 [embed]
 backend = "api"
 api_endpoint = "http://localhost:11434/api/embeddings"
@@ -200,18 +211,20 @@ mempal compress "Kai recommended Clerk over Auth0 based on pricing and DX"
 
 中文文本使用 jieba-rs 词性标注进行分词。
 
-## 架构
+## 当前包布局
 
-| Crate | 职责 |
-|-------|------|
-| `mempal-core` | 类型、SQLite schema v4、taxonomy、triples |
-| `mempal-embed` | Embedder trait（model2vec 默认，ort 可选） |
-| `mempal-ingest` | 格式检测、归一化、分块（5 种格式） |
-| `mempal-search` | 混合检索（BM25 + 向量 + RRF）、路由、tunnel |
-| `mempal-aaak` | AAAK 编解码（BNF 语法 + 往返验证） |
-| `mempal-mcp` | MCP 服务器（7 工具） |
-| `mempal-api` | REST API（feature-gated） |
-| `mempal-cli` | CLI 入口 |
+mempal 当前是一个名为 `mempal` 的 Cargo package，二进制入口在 `src/main.rs`。旧 specs / plans 中可能仍提到多 crate workspace；这些是历史或未来规划引用，不是当前安装路径。
+
+| 路径 | 职责 |
+|------|------|
+| `src/core/` | 类型、SQLite schema、taxonomy、triples、配置、队列 |
+| `src/embed/` | 嵌入实现（model2vec 默认，ONNX 和 OpenAI-compatible 为可选路径） |
+| `src/ingest/` | 格式检测、归一化、分块、gating、novelty |
+| `src/search/` | 混合检索（BM25 + 向量 + RRF）、路由、tunnel |
+| `src/aaak/` | AAAK 编解码（BNF 语法 + 往返验证） |
+| `src/mcp/` | MCP server tools 和协议表面 |
+| `src/api/` | REST API（feature-gated） |
+| `src/main.rs`, `src/cli/` | CLI 入口和命令辅助逻辑 |
 
 关键设计：
 - **model2vec-rs** 默认嵌入——零原生依赖，多语言（BGE-M3 蒸馏）
@@ -224,9 +237,9 @@ mempal compress "Kai recommended Clerk over Auth0 based on pricing and DX"
 ## 开发
 
 ```bash
-cargo test --workspace
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test
+cargo test --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 ```
 

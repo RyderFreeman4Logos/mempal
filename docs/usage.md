@@ -18,6 +18,7 @@ Before using the CLI, keep four nouns straight:
 - original text lives in the `drawers` table
 - vectors live in `drawer_vectors`
 - AAAK is output-only and does not replace stored raw text
+- default operation is local-first: SQLite + model2vec, with no cloud LLM, embedding, or rerank calls unless configured explicitly
 
 ## Install
 
@@ -29,27 +30,35 @@ Before using the CLI, keep four nouns straight:
 > binary and, for MCP servers, verify the MCP client command/path configuration.
 > See [#76](https://github.com/RyderFreeman4Logos/mempal/issues/76).
 >
-> For fork builds, prefer the `--path` route below (clones a fresh checkout, builds locally).
+> For fork builds, prefer the root `--path` route below (clones a fresh checkout, builds locally).
 > A one-liner is provided at [`scripts/install-from-source.sh`](../scripts/install-from-source.sh).
 
-Install the CLI locally:
+Install the released crate:
 
 ```bash
-cargo install --path crates/mempal-cli --locked
+cargo install mempal
+```
+
+Install from the current repository checkout:
+
+```bash
+cargo install --path . --locked
 ```
 
 Install with REST support:
 
 ```bash
-cargo install --path crates/mempal-cli --locked --features rest
+cargo install --path . --locked --features rest
 ```
 
 For development without installation:
 
 ```bash
-cargo run -p mempal-cli -- --help
-cargo run -p mempal-cli --features rest -- serve --help
+cargo run -- --help
+cargo run --features rest -- serve --help
 ```
+
+The repository currently has one Cargo package named `mempal`, with the binary at `src/main.rs`. Historical specs and plans may mention a multi-crate workspace; treat those as implementation history or roadmap notes, not current install instructions.
 
 ## Configuration
 
@@ -82,6 +91,8 @@ enabled = false
 # top_k = 20
 ```
 
+With no config file, `mempal` uses the local SQLite database at `~/.mempal/palace.db`, the local model2vec embedder, and no reranker or LLM calls. OpenAI-compatible embeddings, LLM gating, and reranking are opt-in.
+
 Use local ONNX instead of the default model2vec backend:
 
 ```toml
@@ -91,7 +102,7 @@ db_path = "~/.mempal/palace.db"
 backend = "onnx"
 ```
 
-Use an external embedding API instead of local embeddings:
+Optionally use an external embedding API instead of local embeddings:
 
 ```toml
 db_path = "~/.mempal/palace.db"
@@ -142,7 +153,7 @@ Notes:
   keeps the existing BM25/vector ranking and reports a warning instead of
   failing the request.
 
-LLM gating can use a pool of OpenAI-compatible chat-completion endpoints. When
+Optional LLM gating can use a pool of OpenAI-compatible chat-completion endpoints. When
 LLM gating is configured, endpoint outage is visible in `mempal status`; long
 historical cleanup work leaves the current item pending so a wrapper can retry
 with `--resume` instead of silently downgrading quality.
@@ -1107,8 +1118,8 @@ Use it carefully anyway. `delete` is safer than hard removal, but once `mempal p
 If you modify code or behavior in this repository, the current validation baseline is:
 
 ```bash
-cargo test --workspace
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test
+cargo test --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 ```
