@@ -103,6 +103,7 @@ use mempal::knowledge_lifecycle::{
     DemoteRequest, PromoteRequest, demote_knowledge, promote_knowledge,
 };
 use mempal::llm::{DEFAULT_GATING_JUDGE_PROMPT, LlmError, LlmMessage, LlmRequest, LlmRouter};
+use mempal::markdown_export::{MarkdownExportOptions, default_max_body_bytes, export_markdown};
 use mempal::mcp::{
     IngestControls, IngestOperationState, IngestRequest, IngestResponse, MempalMcpServer,
     OperationStatusRequest,
@@ -362,6 +363,11 @@ enum Commands {
     Operation {
         #[command(subcommand)]
         command: OperationCommands,
+    },
+    /// Export generated review surfaces from canonical SQLite memory.
+    Export {
+        #[command(subcommand)]
+        command: ExportCommands,
     },
     /// Index a Claude Code session JSONL transcript as searchable conversation memory.
     /// Wing is always "conversation"; room defaults to the sessionId field or filename stem.
@@ -1135,6 +1141,39 @@ enum DoctorCommands {
         addr: Option<String>,
         #[arg(long, default_value = "plain")]
         format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExportCommands {
+    /// Export active drawers as generated Markdown mirror files.
+    #[command(
+        long_about = "Export active drawers from canonical SQLite into deterministic Markdown mirror files.\n\nSQLite remains the source of truth. Markdown files are generated review/export artifacts, not the canonical store. Non-empty unmanaged directories are refused; existing mempal mirrors are refreshed through their manifest, and colliding unmanaged files stop the export. Import/watch sync is intentionally not active in this command; any future import/watch path must be explicit opt-in and conflict-safe."
+    )]
+    Md {
+        /// Directory that will receive generated Markdown files.
+        output_dir: PathBuf,
+        /// Export only this project ID. Defaults to the configured/current project when available.
+        #[arg(long)]
+        project: Option<String>,
+        /// Include legacy global drawers together with --project/current project.
+        #[arg(long, default_value_t = false)]
+        include_global: bool,
+        /// Export all active drawers across project scopes.
+        #[arg(long, default_value_t = false)]
+        all_projects: bool,
+        /// Restrict export to one wing.
+        #[arg(long)]
+        wing: Option<String>,
+        /// Restrict export to one room.
+        #[arg(long)]
+        room: Option<String>,
+        /// Maximum bytes of redacted body content written per drawer.
+        #[arg(long = "max-body-bytes", default_value_t = default_max_body_bytes())]
+        max_body_bytes: usize,
+        /// Disable export-boundary redaction. By default, secret-like values are redacted.
+        #[arg(long, default_value_t = false)]
+        no_redact: bool,
     },
 }
 
@@ -3288,6 +3327,7 @@ fn run() -> Result<()> {
         Commands::Operation { command } => {
             block_on_result(operation_command(&db, config.as_ref(), command))
         }
+        Commands::Export { command } => export_command(&db, config.as_ref(), command),
         Commands::IngestConversation { .. } => {
             eprintln!(
                 "error: `mempal ingest-conversation` was removed in P16.\n\
@@ -3921,7 +3961,8 @@ fn is_dashboard_command(command: &Commands) -> bool {
         | Commands::Timeline { .. }
         | Commands::Stats { .. }
         | Commands::View { .. }
-        | Commands::Reflect { .. } => true,
+        | Commands::Reflect { .. }
+        | Commands::Export { .. } => true,
         Commands::Audit { command, .. } => {
             !matches!(command, Some(AuditCommands::Cleanup { dry_run: false, .. }))
         }
@@ -5747,6 +5788,56 @@ async fn search_command(
         println!();
     }
     Ok(())
+}
+
+fn export_command(db: &Database, config: &Config, command: ExportCommands) -> Result<()> {
+    match command {
+        ExportCommands::Md {
+            output_dir,
+            project,
+            include_global,
+            all_projects,
+            wing,
+            room,
+            max_body_bytes,
+            no_redact,
+        } => {
+            let current_dir = env::current_dir().ok();
+            let resolved_project =
+                resolve_project_id(project.as_deref(), config, current_dir.as_deref())
+                    .context("failed to resolve markdown export project id")?;
+            let scope = ProjectSearchScope::from_request(
+                resolved_project,
+                include_global,
+                all_projects,
+                config.search.strict_project_isolation,
+            );
+            let mut options = MarkdownExportOptions::new(output_dir, scope);
+            options.wing = wing;
+            options.room = room;
+            options.max_body_bytes = max_body_bytes;
+            options.redact = !no_redact;
+
+            let report = export_markdown(db, &options)?;
+            println!(
+                "exported {} drawer(s) to {}",
+                report.exported,
+                report.output_dir.display()
+            );
+            println!("canonical_source: {}", report.canonical_source);
+            println!("mirror_semantics: {}", report.mirror_semantics);
+            println!(
+                "redaction: {}",
+                if report.redacted {
+                    "default"
+                } else {
+                    "disabled"
+                }
+            );
+            println!("SQLite remains canonical; Markdown import/watch sync is not active.");
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
