@@ -2,14 +2,12 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
-use regex::Regex;
 use rusqlite::{params_from_iter, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 
-use crate::core::config::scrub_sensitive_text;
+use crate::core::config::scrub_export_sensitive_text;
 use crate::core::db::Database;
 use crate::core::project::{ProjectFilterMode, ProjectSearchScope};
 
@@ -1065,26 +1063,7 @@ fn redact_if_needed(value: &str, redact: bool) -> String {
     if !redact {
         return value.to_string();
     }
-    let mut redacted = scrub_sensitive_text(value);
-    for regex in export_redaction_patterns() {
-        redacted = regex
-            .replace_all(&redacted, "[REDACTED:secret_like]")
-            .into_owned();
-    }
-    redacted
-}
-
-fn export_redaction_patterns() -> &'static [Regex] {
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        [
-            r#"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)\s*[:=]\s*["']?[^\s"']{8,}"#,
-            r#"(?i)\bAuthorization:\s*Basic\s+[A-Za-z0-9+/=]{12,}"#,
-        ]
-        .into_iter()
-        .filter_map(|pattern| Regex::new(pattern).ok())
-        .collect()
-    })
+    scrub_export_sensitive_text(value)
 }
 
 fn push_yaml_str(output: &mut String, key: &str, value: &str) {

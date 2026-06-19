@@ -118,6 +118,9 @@ use mempal::sleep::{
     NremSummary, RemSummary, SalienceSummary, SleepCycleSummary, SleepPhaseSelection,
     SleepRunOptions, run_sleep_cycle,
 };
+use mempal::wiki::{
+    WikiBuildOptions, WikiVerifyOptions, build_wiki, current_wiki_unix_secs, verify_wiki,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -368,6 +371,11 @@ enum Commands {
     Export {
         #[command(subcommand)]
         command: ExportCommands,
+    },
+    /// Build or verify derived source-backed knowledge wiki pages.
+    Wiki {
+        #[command(subcommand)]
+        command: WikiCommands,
     },
     /// Index a Claude Code session JSONL transcript as searchable conversation memory.
     /// Wing is always "conversation"; room defaults to the sessionId field or filename stem.
@@ -1174,6 +1182,44 @@ enum ExportCommands {
         /// Disable export-boundary redaction. By default, secret-like values are redacted.
         #[arg(long, default_value_t = false)]
         no_redact: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WikiCommands {
+    /// Build source-backed Markdown wiki pages from canonical SQLite memory.
+    #[command(
+        long_about = "Build deterministic Markdown wiki pages for entities and decisions from canonical SQLite memory.\n\nThe wiki is a derived read-only view, not a second source of truth. Generated pages include drawer/triple citations, separate active and superseded claims, redact secret-like values by default, and write a .mempal-wiki.toml manifest for later verification."
+    )]
+    Build {
+        /// Directory that will receive generated wiki pages.
+        output_dir: PathBuf,
+        /// Build only this project ID. Defaults to the configured/current project when available.
+        #[arg(long)]
+        project: Option<String>,
+        /// Include legacy global drawers together with --project/current project.
+        #[arg(long, default_value_t = false)]
+        include_global: bool,
+        /// Build pages across all project scopes.
+        #[arg(long, default_value_t = false)]
+        all_projects: bool,
+        /// Unix seconds or RFC3339 timestamp used to classify expired claims.
+        #[arg(long)]
+        now: Option<String>,
+        /// Disable wiki Markdown redaction. By default, secret-like values are redacted.
+        #[arg(long, default_value_t = false)]
+        no_redact: bool,
+    },
+    /// Verify generated wiki pages against current SQLite refs without editing pages.
+    #[command(
+        long_about = "Verify a generated mempal knowledge wiki against canonical SQLite memory.\n\nThis mode checks the manifest's drawer/triple fingerprints and flags pages whose supporting refs changed, disappeared, were deleted, or expired. It never treats Markdown as authoritative input."
+    )]
+    Verify {
+        /// Directory containing a .mempal-wiki.toml manifest.
+        output_dir: PathBuf,
+        /// Unix seconds or RFC3339 timestamp used to classify expired refs.
+        #[arg(long)]
+        now: Option<String>,
     },
 }
 
@@ -3328,6 +3374,7 @@ fn run() -> Result<()> {
             block_on_result(operation_command(&db, config.as_ref(), command))
         }
         Commands::Export { command } => export_command(&db, config.as_ref(), command),
+        Commands::Wiki { command } => wiki_command(&db, config.as_ref(), command),
         Commands::IngestConversation { .. } => {
             eprintln!(
                 "error: `mempal ingest-conversation` was removed in P16.\n\
@@ -3962,7 +4009,8 @@ fn is_dashboard_command(command: &Commands) -> bool {
         | Commands::Stats { .. }
         | Commands::View { .. }
         | Commands::Reflect { .. }
-        | Commands::Export { .. } => true,
+        | Commands::Export { .. }
+        | Commands::Wiki { .. } => true,
         Commands::Audit { command, .. } => {
             !matches!(command, Some(AuditCommands::Cleanup { dry_run: false, .. }))
         }
@@ -5837,6 +5885,92 @@ fn export_command(db: &Database, config: &Config, command: ExportCommands) -> Re
             println!("SQLite remains canonical; Markdown import/watch sync is not active.");
             Ok(())
         }
+    }
+}
+
+fn wiki_command(db: &Database, config: &Config, command: WikiCommands) -> Result<()> {
+    match command {
+        WikiCommands::Build {
+            output_dir,
+            project,
+            include_global,
+            all_projects,
+            now,
+            no_redact,
+        } => {
+            let current_dir = env::current_dir().ok();
+            let resolved_project =
+                resolve_project_id(project.as_deref(), config, current_dir.as_deref())
+                    .context("failed to resolve knowledge wiki project id")?;
+            let scope = ProjectSearchScope::from_request(
+                resolved_project,
+                include_global,
+                all_projects,
+                config.search.strict_project_isolation,
+            );
+            let now_secs = parse_wiki_now(now.as_deref())?;
+            let report = build_wiki(
+                db,
+                &WikiBuildOptions {
+                    output_dir,
+                    scope,
+                    now_secs,
+                    redact: !no_redact,
+                },
+            )?;
+            println!(
+                "built {} wiki page(s) with {} citation ref(s) in {}",
+                report.page_count,
+                report.citation_count,
+                report.output_dir.display()
+            );
+            println!("canonical_source: {}", report.canonical_source);
+            println!("wiki_semantics: {}", report.wiki_semantics);
+            println!(
+                "redaction: {}",
+                if no_redact { "disabled" } else { "enabled" }
+            );
+            println!("SQLite remains canonical; wiki pages are generated read-only views.");
+            Ok(())
+        }
+        WikiCommands::Verify { output_dir, now } => {
+            let now_secs = parse_wiki_now(now.as_deref())?;
+            let report = verify_wiki(
+                db,
+                &WikiVerifyOptions {
+                    output_dir,
+                    now_secs,
+                },
+            )?;
+            println!(
+                "checked {} wiki ref(s) in {}",
+                report.checked_refs,
+                report.output_dir.display()
+            );
+            if report.is_clean() {
+                println!("wiki verification clean");
+                return Ok(());
+            }
+            println!("stale_refs:");
+            for stale in &report.stale_refs {
+                println!(
+                    "  - page={} {}={} reason={}",
+                    stale.page, stale.ref_kind, stale.ref_id, stale.reason
+                );
+            }
+            bail!(
+                "knowledge wiki verification failed: {} stale ref(s)",
+                report.stale_refs.len()
+            )
+        }
+    }
+}
+
+fn parse_wiki_now(raw: Option<&str>) -> Result<i64> {
+    match raw {
+        Some(value) => mempal::core::decay::parse_temporal_timestamp_secs(value)
+            .with_context(|| format!("invalid --now timestamp: {value}")),
+        None => Ok(current_wiki_unix_secs()),
     }
 }
 

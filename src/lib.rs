@@ -49,4 +49,5 @@ pub mod repair;
 pub mod search;
 pub mod session_review;
 pub mod sleep;
+pub mod wiki;
 pub mod xurl;
