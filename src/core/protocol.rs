@@ -134,8 +134,9 @@ You have persistent project memory via mempal. Follow these rules in every sessi
 
 6. USE TYPED INGEST FOR STRUCTURED MEMORY
    When saving memory with mempal_ingest, set typed metadata when the meaning is
-   known: memory_kind (evidence, knowledge, profile_fact), domain (project,
-   user, agent, skill, global), and field (for example preferences, tooling, or
+   known: memory_kind (evidence, knowledge, atomic_fact, decision, case, skill,
+   foresight, profile_fact, profile_trait), domain (project, user, agent,
+   skill, global), and field (for example preferences, tooling, or
    software-engineering). Typed metadata lets search, context assembly,
    crystallization, and future recall filter precisely without rewriting raw
    drawer content. Leave fields unset only when the default project/evidence

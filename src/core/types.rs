@@ -106,13 +106,135 @@ pub fn default_confidence(source_type: SourceType) -> f64 {
     }
 }
 
+/// First-class memory taxonomy stored on every drawer.
+///
+/// Lifecycle is shared across kinds through the existing drawer columns:
+/// `status` marks active/canonical/superseded/etc., `supersedes` records a
+/// replacement link, and `valid_from`/`valid_until` bound temporal validity in
+/// SQLite. `Evidence` is the backwards-compatible raw evidence drawer kind.
+/// `Knowledge` is the only kind governed by tier/supporting-ref promotion gates;
+/// the other structured kinds are typed records that keep provenance on the
+/// original drawer row.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {
+    /// Raw source evidence; persisted verbatim and used as the migration target
+    /// for legacy generic drawers.
     #[default]
     Evidence,
+    /// Governed knowledge with tier/status/supporting-ref lifecycle gates.
     Knowledge,
+    /// Minimal claim that should be independently superseded or expired.
+    AtomicFact,
+    /// Durable choice with rationale and replacement history.
+    Decision,
+    /// Worked example, incident, or task trajectory.
+    Case,
+    /// Reusable procedure or operating capability.
+    Skill,
+    /// Forward-looking hypothesis, prediction, or watch item.
+    Foresight,
+    /// Legacy user/profile fact slug retained for existing rows and clients.
     ProfileFact,
+    /// Durable user preference or behavioral trait.
+    ProfileTrait,
+}
+
+impl MemoryKind {
+    pub const SUPPORTED: &'static [Self] = &[
+        Self::Evidence,
+        Self::Knowledge,
+        Self::AtomicFact,
+        Self::Decision,
+        Self::Case,
+        Self::Skill,
+        Self::Foresight,
+        Self::ProfileFact,
+        Self::ProfileTrait,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Evidence => "evidence",
+            Self::Knowledge => "knowledge",
+            Self::AtomicFact => "atomic_fact",
+            Self::Decision => "decision",
+            Self::Case => "case",
+            Self::Skill => "skill",
+            Self::Foresight => "foresight",
+            Self::ProfileFact => "profile_fact",
+            Self::ProfileTrait => "profile_trait",
+        }
+    }
+
+    pub fn supported_slugs() -> &'static str {
+        "evidence, knowledge, atomic_fact, decision, case, skill, foresight, profile_fact, profile_trait"
+    }
+
+    pub fn is_knowledge(self) -> bool {
+        matches!(self, Self::Knowledge)
+    }
+
+    pub fn is_raw_evidence(self) -> bool {
+        matches!(self, Self::Evidence)
+    }
+
+    pub fn is_typed_record(self) -> bool {
+        matches!(
+            self,
+            Self::AtomicFact
+                | Self::Decision
+                | Self::Case
+                | Self::Skill
+                | Self::Foresight
+                | Self::ProfileFact
+                | Self::ProfileTrait
+        )
+    }
+
+    pub fn prefers_statement_text(self) -> bool {
+        self.is_knowledge() || self.is_typed_record()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseMemoryKindError {
+    value: String,
+}
+
+impl fmt::Display for ParseMemoryKindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid memory_kind: {}", self.value)
+    }
+}
+
+impl std::error::Error for ParseMemoryKindError {}
+
+impl FromStr for MemoryKind {
+    type Err = ParseMemoryKindError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "evidence" => Ok(Self::Evidence),
+            "knowledge" => Ok(Self::Knowledge),
+            "atomic_fact" => Ok(Self::AtomicFact),
+            "decision" => Ok(Self::Decision),
+            "case" => Ok(Self::Case),
+            "skill" => Ok(Self::Skill),
+            "foresight" => Ok(Self::Foresight),
+            "profile_fact" => Ok(Self::ProfileFact),
+            "profile_trait" => Ok(Self::ProfileTrait),
+            other => Err(ParseMemoryKindError {
+                value: other.to_string(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for MemoryKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -755,5 +877,36 @@ mod tests {
         assert_eq!(default_confidence(SourceType::AgentObservation), 0.7);
         assert_eq!(default_confidence(SourceType::AgentInference), 0.5);
         assert_eq!(default_confidence(SourceType::SystemGenerated), 0.3);
+    }
+
+    #[test]
+    fn memory_kind_taxonomy_round_trips_as_stable_slugs() {
+        let expected = [
+            (MemoryKind::Evidence, "evidence"),
+            (MemoryKind::Knowledge, "knowledge"),
+            (MemoryKind::AtomicFact, "atomic_fact"),
+            (MemoryKind::Decision, "decision"),
+            (MemoryKind::Case, "case"),
+            (MemoryKind::Skill, "skill"),
+            (MemoryKind::Foresight, "foresight"),
+            (MemoryKind::ProfileFact, "profile_fact"),
+            (MemoryKind::ProfileTrait, "profile_trait"),
+        ];
+
+        assert_eq!(MemoryKind::SUPPORTED.len(), expected.len());
+        for (kind, slug) in expected {
+            assert_eq!(kind.as_str(), slug);
+            assert_eq!(kind.to_string(), slug);
+            assert_eq!(slug.parse::<MemoryKind>().expect("parse slug"), kind);
+            let encoded = serde_json::to_string(&kind).expect("serialize kind");
+            assert_eq!(encoded, format!("\"{slug}\""));
+            let decoded: MemoryKind = serde_json::from_str(&encoded).expect("deserialize kind");
+            assert_eq!(decoded, kind);
+        }
+
+        assert!(MemoryKind::Knowledge.is_knowledge());
+        assert!(MemoryKind::Decision.is_typed_record());
+        assert!(MemoryKind::ProfileTrait.prefers_statement_text());
+        assert!(MemoryKind::Evidence.is_raw_evidence());
     }
 }

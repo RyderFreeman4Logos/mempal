@@ -1824,20 +1824,13 @@ fn invalid_enum_value(kind: &'static str, value: String) -> rusqlite::Error {
 
 #[allow(dead_code)]
 fn memory_kind_from_str(value: &str) -> rusqlite::Result<MemoryKind> {
-    match value {
-        "evidence" => Ok(MemoryKind::Evidence),
-        "knowledge" => Ok(MemoryKind::Knowledge),
-        "profile_fact" => Ok(MemoryKind::ProfileFact),
-        _ => Err(invalid_enum_value("memory_kind", value.to_string())),
-    }
+    value
+        .parse()
+        .map_err(|_| invalid_enum_value("memory_kind", value.to_string()))
 }
 
 fn memory_kind_slug(value: &MemoryKind) -> &'static str {
-    match value {
-        MemoryKind::Evidence => "evidence",
-        MemoryKind::Knowledge => "knowledge",
-        MemoryKind::ProfileFact => "profile_fact",
-    }
+    value.as_str()
 }
 
 #[allow(dead_code)]

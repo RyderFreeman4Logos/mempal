@@ -88,7 +88,9 @@ pub struct RetrievalScopeRequest {
     pub include_global: Option<bool>,
     /// Opt-in override to search across all projects for this request.
     pub all_projects: Option<bool>,
-    /// Optional memory kind filter (`evidence`, `knowledge`, or `profile_fact`).
+    /// Optional memory kind filter (`evidence`, `knowledge`, `atomic_fact`,
+    /// `decision`, `case`, `skill`, `foresight`, `profile_fact`, or
+    /// `profile_trait`).
     pub memory_kind: Option<String>,
     /// Optional domain filter (`project`, `user`, `agent`, `skill`, `global`).
     pub domain: Option<String>,
@@ -1395,6 +1397,7 @@ pub struct ContextSectionDto {
 pub struct ContextItemDto {
     pub drawer_id: String,
     pub source_file: String,
+    pub memory_kind: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub card_id: Option<String>,
@@ -1654,7 +1657,8 @@ pub struct IngestRequest {
     /// Default 0. Use 3-5 for key decisions, architecture choices, and lessons learned.
     pub importance: Option<i32>,
 
-    /// Optional typed memory kind: evidence, knowledge, or profile_fact.
+    /// Optional typed memory kind: evidence, knowledge, atomic_fact, decision,
+    /// case, skill, foresight, profile_fact, or profile_trait.
     pub memory_kind: Option<String>,
     /// Optional typed domain: project, user, agent, skill, or global.
     pub domain: Option<String>,
@@ -3272,6 +3276,7 @@ impl From<ContextItem> for ContextItemDto {
         Self {
             drawer_id: value.drawer_id,
             source_file: value.source_file,
+            memory_kind: memory_kind_slug(&value.memory_kind).to_string(),
             text: value.text,
             card_id: value.card_id,
             tier: value
@@ -3453,11 +3458,7 @@ impl From<NeighborChunk> for NeighborChunkDto {
 }
 
 fn memory_kind_slug(value: &MemoryKind) -> &'static str {
-    match value {
-        MemoryKind::Evidence => "evidence",
-        MemoryKind::Knowledge => "knowledge",
-        MemoryKind::ProfileFact => "profile_fact",
-    }
+    value.as_str()
 }
 
 fn domain_slug(value: &MemoryDomain) -> &'static str {

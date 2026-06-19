@@ -248,11 +248,7 @@ fn citation_from_link(
 }
 
 fn memory_kind_slug(value: &MemoryKind) -> &'static str {
-    match value {
-        MemoryKind::Evidence => "evidence",
-        MemoryKind::Knowledge => "knowledge",
-        MemoryKind::ProfileFact => "profile_fact",
-    }
+    value.as_str()
 }
 
 fn domain_slug(value: &MemoryDomain) -> &'static str {

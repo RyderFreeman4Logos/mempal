@@ -5558,11 +5558,15 @@ fn rewrite_drawers_typed_ingest_checks(conn: &Connection) -> Result<bool, DbErro
     let replacements = [
         (
             "memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge')) DEFAULT 'evidence'",
-            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'profile_fact'))",
+            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait'))",
         ),
         (
             "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge'))",
+            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait'))",
+        ),
+        (
             "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'profile_fact'))",
+            "memory_kind TEXT NOT NULL DEFAULT 'evidence' CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait'))",
         ),
         (
             "domain TEXT NOT NULL CHECK(domain IN ('project', 'agent', 'skill', 'global')) DEFAULT 'project'",
@@ -5575,11 +5579,19 @@ fn rewrite_drawers_typed_ingest_checks(conn: &Connection) -> Result<bool, DbErro
         ("field TEXT NOT NULL DEFAULT 'general'", "field TEXT"),
         (
             "status TEXT CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
-            "status TEXT DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+            "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
         ),
         (
             "status TEXT DEFAULT 'active' CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+            "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        ),
+        (
             "status TEXT DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+            "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+        ),
+        (
+            "status TEXT DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
+            "status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'))",
         ),
     ];
 
@@ -5843,7 +5855,7 @@ struct DrawerColumnMigration {
 const V5_DRAWER_COLUMN_MIGRATIONS: &[DrawerColumnMigration] = &[
     DrawerColumnMigration {
         name: "memory_kind",
-        sql: "ALTER TABLE drawers ADD COLUMN memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge')) DEFAULT 'evidence';",
+        sql: "ALTER TABLE drawers ADD COLUMN memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait')) DEFAULT 'evidence';",
     },
     DrawerColumnMigration {
         name: "domain",
@@ -5879,7 +5891,7 @@ const V5_DRAWER_COLUMN_MIGRATIONS: &[DrawerColumnMigration] = &[
     },
     DrawerColumnMigration {
         name: "status",
-        sql: "ALTER TABLE drawers ADD COLUMN status TEXT CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'));",
+        sql: "ALTER TABLE drawers ADD COLUMN status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'));",
     },
     DrawerColumnMigration {
         name: "supporting_refs",
@@ -5943,7 +5955,7 @@ CREATE INDEX IF NOT EXISTS idx_drawers_content_hash ON drawers(wing, content_has
 "#;
 
 const V5_MIGRATION_SQL: &str = r#"
-ALTER TABLE drawers ADD COLUMN memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge')) DEFAULT 'evidence';
+ALTER TABLE drawers ADD COLUMN memory_kind TEXT NOT NULL CHECK(memory_kind IN ('evidence', 'knowledge', 'atomic_fact', 'decision', 'case', 'skill', 'foresight', 'profile_fact', 'profile_trait')) DEFAULT 'evidence';
 ALTER TABLE drawers ADD COLUMN domain TEXT NOT NULL CHECK(domain IN ('project', 'agent', 'skill', 'global')) DEFAULT 'project';
 ALTER TABLE drawers ADD COLUMN field TEXT NOT NULL DEFAULT 'general';
 ALTER TABLE drawers ADD COLUMN anchor_kind TEXT NOT NULL CHECK(anchor_kind IN ('global', 'repo', 'worktree')) DEFAULT 'repo';
@@ -5952,7 +5964,7 @@ ALTER TABLE drawers ADD COLUMN parent_anchor_id TEXT;
 ALTER TABLE drawers ADD COLUMN provenance TEXT CHECK(provenance IN ('runtime', 'research', 'human'));
 ALTER TABLE drawers ADD COLUMN statement TEXT;
 ALTER TABLE drawers ADD COLUMN tier TEXT CHECK(tier IN ('qi', 'shu', 'dao_ren', 'dao_tian'));
-ALTER TABLE drawers ADD COLUMN status TEXT CHECK(status IN ('candidate', 'promoted', 'canonical', 'demoted', 'retired'));
+ALTER TABLE drawers ADD COLUMN status TEXT CHECK(status IN ('active', 'superseded', 'pending_review', 'candidate', 'promoted', 'canonical', 'demoted', 'retired'));
 ALTER TABLE drawers ADD COLUMN supporting_refs TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE drawers ADD COLUMN counterexample_refs TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE drawers ADD COLUMN teaching_refs TEXT NOT NULL DEFAULT '[]';
@@ -6462,23 +6474,14 @@ fn source_type_from_str(source_type: &str) -> Result<SourceType, DbError> {
 }
 
 fn memory_kind_as_str(memory_kind: &MemoryKind) -> &'static str {
-    match memory_kind {
-        MemoryKind::Evidence => "evidence",
-        MemoryKind::Knowledge => "knowledge",
-        MemoryKind::ProfileFact => "profile_fact",
-    }
+    memory_kind.as_str()
 }
 
 fn memory_kind_from_str(memory_kind: &str) -> Result<MemoryKind, DbError> {
-    match memory_kind {
-        "evidence" => Ok(MemoryKind::Evidence),
-        "knowledge" => Ok(MemoryKind::Knowledge),
-        "profile_fact" => Ok(MemoryKind::ProfileFact),
-        other => Err(DbError::InvalidEnumValue {
-            kind: "memory_kind",
-            value: other.to_string(),
-        }),
-    }
+    memory_kind.parse().map_err(|_| DbError::InvalidEnumValue {
+        kind: "memory_kind",
+        value: memory_kind.to_string(),
+    })
 }
 
 fn memory_domain_as_str(domain: &MemoryDomain) -> &'static str {

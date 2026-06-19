@@ -174,6 +174,8 @@ struct IngestRequest {
     counterexample_refs: Option<Vec<String>>,
     teaching_refs: Option<Vec<String>>,
     verification_refs: Option<Vec<String>>,
+    opposes_refs: Option<Vec<String>>,
+    supersedes_refs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,15 +235,16 @@ fn resolve_confidence_param(source_type: SourceType, value: Option<f64>) -> Resu
 }
 
 fn parse_memory_kind(value: &str) -> Result<MemoryKind, ApiError> {
-    match value.trim() {
-        "evidence" => Ok(MemoryKind::Evidence),
-        "knowledge" => Ok(MemoryKind::Knowledge),
-        "profile_fact" => Ok(MemoryKind::ProfileFact),
-        other => Err(ApiError::new(
+    value.trim().parse().map_err(|_| {
+        ApiError::new(
             StatusCode::BAD_REQUEST,
-            format!("invalid memory_kind: {other}; expected evidence, knowledge, or profile_fact"),
-        )),
-    }
+            format!(
+                "invalid memory_kind: {}; expected {}",
+                value.trim(),
+                MemoryKind::supported_slugs()
+            ),
+        )
+    })
 }
 
 fn parse_domain(value: &str) -> Result<MemoryDomain, ApiError> {
@@ -289,11 +292,7 @@ fn parse_tier_opt(value: &str) -> Result<KnowledgeTier, ApiError> {
 }
 
 fn memory_kind_slug(kind: MemoryKind) -> &'static str {
-    match kind {
-        MemoryKind::Evidence => "evidence",
-        MemoryKind::Knowledge => "knowledge",
-        MemoryKind::ProfileFact => "profile_fact",
-    }
+    kind.as_str()
 }
 
 fn domain_slug(domain: MemoryDomain) -> &'static str {
@@ -343,6 +342,55 @@ fn normalize_refs(values: Option<&[String]>) -> Vec<String> {
         .collect()
 }
 
+fn refs_are_empty(groups: &[&[String]]) -> bool {
+    groups.iter().all(|refs| refs.is_empty())
+}
+
+fn validate_active_or_canonical_status(
+    label: &str,
+    status: Option<&KnowledgeStatus>,
+) -> Result<(), ApiError> {
+    if status
+        .is_some_and(|value| !matches!(value, KnowledgeStatus::Active | KnowledgeStatus::Canonical))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{label} status must be active or canonical"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_non_knowledge_metadata(
+    label: &str,
+    status: Option<&KnowledgeStatus>,
+    tier: &Option<KnowledgeTier>,
+    ref_groups: &[&[String]],
+) -> Result<(), ApiError> {
+    if tier.is_some() || !refs_are_empty(ref_groups) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{label} drawer does not allow knowledge-only tier/ref fields"),
+        ));
+    }
+    validate_active_or_canonical_status(label, status)
+}
+
+fn validate_typed_metadata_contract(
+    memory_kind: MemoryKind,
+    status: Option<&KnowledgeStatus>,
+    tier: &Option<KnowledgeTier>,
+    ref_groups: &[&[String]],
+) -> Result<(), ApiError> {
+    if memory_kind.is_knowledge() {
+        return Ok(());
+    }
+    if memory_kind.is_raw_evidence() {
+        return validate_non_knowledge_metadata("evidence", status, tier, ref_groups);
+    }
+    validate_non_knowledge_metadata("typed record", status, tier, ref_groups)
+}
+
 struct ValidatedIngestRequest {
     source_type: SourceType,
     confidence: f64,
@@ -387,6 +435,25 @@ fn validate_ingest_request(request: &IngestRequest) -> Result<ValidatedIngestReq
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let typed_supporting_refs = normalize_refs(request.supporting_refs.as_deref());
+    let typed_counterexample_refs = normalize_refs(request.counterexample_refs.as_deref());
+    let typed_teaching_refs = normalize_refs(request.teaching_refs.as_deref());
+    let typed_verification_refs = normalize_refs(request.verification_refs.as_deref());
+    let typed_opposes_refs = normalize_refs(request.opposes_refs.as_deref());
+    let typed_supersedes_refs = normalize_refs(request.supersedes_refs.as_deref());
+    validate_typed_metadata_contract(
+        typed_memory_kind.unwrap_or(MemoryKind::Evidence),
+        typed_status.as_ref(),
+        &typed_tier,
+        &[
+            &typed_supporting_refs,
+            &typed_counterexample_refs,
+            &typed_teaching_refs,
+            &typed_verification_refs,
+            &typed_opposes_refs,
+            &typed_supersedes_refs,
+        ],
+    )?;
 
     Ok(ValidatedIngestRequest {
         source_type,
@@ -398,10 +465,10 @@ fn validate_ingest_request(request: &IngestRequest) -> Result<ValidatedIngestReq
         typed_tier,
         typed_is_pinned: request.is_pinned.unwrap_or(false),
         typed_statement,
-        typed_supporting_refs: normalize_refs(request.supporting_refs.as_deref()),
-        typed_counterexample_refs: normalize_refs(request.counterexample_refs.as_deref()),
-        typed_teaching_refs: normalize_refs(request.teaching_refs.as_deref()),
-        typed_verification_refs: normalize_refs(request.verification_refs.as_deref()),
+        typed_supporting_refs,
+        typed_counterexample_refs,
+        typed_teaching_refs,
+        typed_verification_refs,
     })
 }
 
