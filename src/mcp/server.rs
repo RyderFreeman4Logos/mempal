@@ -118,13 +118,13 @@ use super::tools::{
     OperationStatusRequest, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto,
     Phase3Request, Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest,
     PinnedFactsResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest,
-    ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievedKnowledgeCardDto,
-    RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto,
-    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, SkillDto,
-    SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, StatusDetail, StatusRequest,
-    StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto, TaxonomyRequest,
-    TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto, TunnelsRequest,
-    TunnelsResponse, TurnStorageStatusDto,
+    ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievalScopeRequest,
+    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto,
+    RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
+    SearchResultDto, SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount,
+    StatusDetail, StatusRequest, StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto,
+    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
+    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
@@ -1865,6 +1865,214 @@ where
         .ok_or_else(|| ErrorData::invalid_params(format!("invalid {field}: {value}"), None))
 }
 
+#[derive(Debug, Clone)]
+struct EffectiveMcpSearchScope {
+    wing: Option<String>,
+    room: Option<String>,
+    project_id: Option<String>,
+    include_global: bool,
+    all_projects: bool,
+    filters: SearchFilters,
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveMcpContextScope {
+    project_id: Option<String>,
+    all_projects: bool,
+    domain: Option<String>,
+    field: Option<String>,
+}
+
+fn merge_scope_string(
+    scope_value: Option<&String>,
+    legacy_value: Option<&String>,
+    field: &str,
+) -> std::result::Result<Option<String>, ErrorData> {
+    match (scope_value, legacy_value) {
+        (Some(scope), Some(legacy)) if scope != legacy => Err(ErrorData::invalid_params(
+            format!("scope.{field} conflicts with legacy top-level {field}"),
+            None,
+        )),
+        (Some(scope), _) => Ok(Some(scope.clone())),
+        (None, Some(legacy)) => Ok(Some(legacy.clone())),
+        (None, None) => Ok(None),
+    }
+}
+
+fn merge_scope_bool(
+    scope_value: Option<bool>,
+    legacy_value: Option<bool>,
+    field: &str,
+) -> std::result::Result<Option<bool>, ErrorData> {
+    match (scope_value, legacy_value) {
+        (Some(scope), Some(legacy)) if scope != legacy => Err(ErrorData::invalid_params(
+            format!("scope.{field} conflicts with legacy top-level {field}"),
+            None,
+        )),
+        (Some(scope), _) => Ok(Some(scope)),
+        (None, Some(legacy)) => Ok(Some(legacy)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn merge_room_and_session(
+    room: Option<String>,
+    session: Option<&String>,
+) -> std::result::Result<Option<String>, ErrorData> {
+    match (room, session) {
+        (Some(room), Some(session)) if room != *session => Err(ErrorData::invalid_params(
+            "scope.session conflicts with room; session maps to the drawer room column",
+            None,
+        )),
+        (Some(room), _) => Ok(Some(room)),
+        (None, Some(session)) => Ok(Some(session.clone())),
+        (None, None) => Ok(None),
+    }
+}
+
+fn effective_search_scope(
+    request: &SearchRequest,
+) -> std::result::Result<EffectiveMcpSearchScope, ErrorData> {
+    let scope = request.scope.as_ref();
+    let wing = merge_scope_string(
+        scope.and_then(|value| value.wing.as_ref()),
+        request.wing.as_ref(),
+        "wing",
+    )?;
+    let room = merge_scope_string(
+        scope.and_then(|value| value.room.as_ref()),
+        request.room.as_ref(),
+        "room",
+    )?;
+    let room = merge_room_and_session(room, scope.and_then(|value| value.session.as_ref()))?;
+    let project_id = merge_scope_string(
+        scope.and_then(|value| value.project_id.as_ref()),
+        request.project_id.as_ref(),
+        "project_id",
+    )?;
+    let include_global = merge_scope_bool(
+        scope.and_then(|value| value.include_global),
+        request.include_global,
+        "include_global",
+    )?
+    .unwrap_or(false);
+    let all_projects = merge_scope_bool(
+        scope.and_then(|value| value.all_projects),
+        request.all_projects,
+        "all_projects",
+    )?
+    .unwrap_or(false);
+    let filters = SearchFilters {
+        memory_kind: merge_scope_string(
+            scope.and_then(|value| value.memory_kind.as_ref()),
+            request.memory_kind.as_ref(),
+            "memory_kind",
+        )?,
+        domain: merge_scope_string(
+            scope.and_then(|value| value.domain.as_ref()),
+            request.domain.as_ref(),
+            "domain",
+        )?,
+        field: merge_scope_string(
+            scope.and_then(|value| value.field.as_ref()),
+            request.field.as_ref(),
+            "field",
+        )?,
+        tier: merge_scope_string(
+            scope.and_then(|value| value.tier.as_ref()),
+            request.tier.as_ref(),
+            "tier",
+        )?,
+        status: merge_scope_string(
+            scope.and_then(|value| value.status.as_ref()),
+            request.status.as_ref(),
+            "status",
+        )?,
+        anchor_kind: merge_scope_string(
+            scope.and_then(|value| value.anchor_kind.as_ref()),
+            request.anchor_kind.as_ref(),
+            "anchor_kind",
+        )?,
+    };
+    Ok(EffectiveMcpSearchScope {
+        wing,
+        room,
+        project_id,
+        include_global,
+        all_projects,
+        filters,
+    })
+}
+
+fn reject_context_search_only_scope(
+    scope: &RetrievalScopeRequest,
+) -> std::result::Result<(), ErrorData> {
+    for (field, present) in [
+        ("wing", scope.wing.is_some()),
+        ("room", scope.room.is_some()),
+        ("session", scope.session.is_some()),
+        ("include_global", scope.include_global.unwrap_or(false)),
+        ("memory_kind", scope.memory_kind.is_some()),
+        ("tier", scope.tier.is_some()),
+        ("status", scope.status.is_some()),
+        ("anchor_kind", scope.anchor_kind.is_some()),
+    ] {
+        if present {
+            return Err(ErrorData::invalid_params(
+                format!("scope.{field} is supported by mempal_search, not mempal_context"),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn effective_context_scope(
+    request: &ContextRequest,
+) -> std::result::Result<EffectiveMcpContextScope, ErrorData> {
+    let scope = request.scope.as_ref();
+    if let Some(scope) = scope {
+        reject_context_search_only_scope(scope)?;
+    }
+    Ok(EffectiveMcpContextScope {
+        project_id: merge_scope_string(
+            scope.and_then(|value| value.project_id.as_ref()),
+            request.project_id.as_ref(),
+            "project_id",
+        )?,
+        all_projects: merge_scope_bool(
+            scope.and_then(|value| value.all_projects),
+            request.all_projects,
+            "all_projects",
+        )?
+        .unwrap_or(false),
+        domain: merge_scope_string(
+            scope.and_then(|value| value.domain.as_ref()),
+            request.domain.as_ref(),
+            "domain",
+        )?,
+        field: merge_scope_string(
+            scope.and_then(|value| value.field.as_ref()),
+            request.field.as_ref(),
+            "field",
+        )?,
+    })
+}
+
+fn reject_unresolved_strict_context_scope(
+    project_id: Option<&str>,
+    all_projects: bool,
+    config: &Config,
+) -> std::result::Result<(), ErrorData> {
+    if project_id.is_none() && !all_projects && config.search.strict_project_isolation {
+        return Err(ErrorData::invalid_params(
+            "no project scope resolved, isolation strict; set scope.all_projects=true to opt into all-project context",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn normalize_refs(values: Option<&[String]>) -> Vec<String> {
     values
@@ -2560,33 +2768,27 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_search",
-        description = "Search persistent project memory via hybrid vector+BM25 retrieval with optional wing/room/project and typed metadata filters. PREFER THIS over grepping files or guessing from general knowledge when answering ANY project-specific question. Response search_mode reports hybrid or bm25_only fallback. Every result includes drawer_id and source_file for citation, typed fields (`memory_kind`, `domain`, `field`, status/tier/anchor data), and structured AAAK-derived signals (`entities`, `topics`, `flags`, `emotions`, `importance_stars`) for filtering and ranking."
+        description = "Search persistent project memory via hybrid vector+BM25 retrieval. Prefer the unified `scope` object for wing/room/session/project and typed metadata filters; legacy top-level scope fields remain compatibility aliases. PREFER THIS over grepping files or guessing from general knowledge when answering ANY project-specific question. Response search_mode reports hybrid or bm25_only fallback. Every result includes drawer_id and source_file for citation, typed fields (`memory_kind`, `domain`, `field`, status/tier/anchor data), and structured AAAK-derived signals (`entities`, `topics`, `flags`, `emotions`, `importance_stars`) for filtering and ranking."
     )]
     pub async fn mempal_search(
         &self,
         Parameters(request): Parameters<SearchRequest>,
     ) -> std::result::Result<Json<SearchResponse>, ErrorData> {
         let config = ConfigHandle::current();
+        let request_scope = effective_search_scope(&request)?;
         let project_id = self
-            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .resolve_mcp_project_id(request_scope.project_id.as_deref(), config.as_ref())
             .await?;
-        let unresolved_scope = project_id.is_none() && !request.all_projects.unwrap_or(false);
+        let unresolved_scope = project_id.is_none() && !request_scope.all_projects;
         let scope = ProjectSearchScope::from_request(
             project_id,
-            request.include_global.unwrap_or(false),
-            request.all_projects.unwrap_or(false),
+            request_scope.include_global,
+            request_scope.all_projects,
             config.search.strict_project_isolation,
         );
         let top_k = request.top_k.unwrap_or(10);
         let search_options = SearchOptions {
-            filters: SearchFilters {
-                memory_kind: request.memory_kind.clone(),
-                domain: request.domain,
-                field: request.field.clone(),
-                tier: request.tier.clone(),
-                status: request.status.clone(),
-                anchor_kind: request.anchor_kind.clone(),
-            },
+            filters: request_scope.filters.clone(),
             with_neighbors: request.with_neighbors.unwrap_or(false),
             include_raw_turns: request.include_raw_turns.unwrap_or(false),
             include_expired: request.include_expired.unwrap_or(false),
@@ -2596,8 +2798,8 @@ impl MempalMcpServer {
         let mut response_warnings = Vec::new();
         let route = {
             let query = request.query.clone();
-            let wing = request.wing.clone();
-            let room = request.room.clone();
+            let wing = request_scope.wing.clone();
+            let room = request_scope.room.clone();
             let fallback_route = crate::core::types::RouteDecision {
                 wing: wing.clone(),
                 room: room.clone(),
@@ -3144,12 +3346,13 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_context",
-        description = "Assemble a mind-model runtime context pack from typed memory. Use this when you need ordered guidance rather than raw search results: dao_tian -> dao_ren -> shu -> qi, with evidence and Phase-2 knowledge cards opt-in. Returns source-backed items with citations and trigger_hints metadata, but never executes skills."
+        description = "Assemble a mind-model runtime context pack from typed memory. Use the unified `scope` object for project/domain/field context scope; search-only scope fields are rejected instead of ignored. Use this when you need ordered guidance rather than raw search results: dao_tian -> dao_ren -> shu -> qi, with evidence and Phase-2 knowledge cards opt-in. Returns source-backed items with citations and trigger_hints metadata, but never executes skills."
     )]
     async fn mempal_context(
         &self,
         Parameters(request): Parameters<ContextRequest>,
     ) -> std::result::Result<Json<ContextResponse>, ErrorData> {
+        let request_scope = effective_context_scope(&request)?;
         let max_items = request.max_items.unwrap_or(12);
         if max_items == 0 {
             return Err(ErrorData::invalid_params(
@@ -3159,7 +3362,8 @@ impl MempalMcpServer {
         }
         let dao_tian_limit = request.dao_tian_limit.unwrap_or(1);
 
-        let domain = parse_domain(request.domain.as_deref())?.unwrap_or(MemoryDomain::Project);
+        let domain =
+            parse_domain(request_scope.domain.as_deref())?.unwrap_or(MemoryDomain::Project);
         let cwd = match request.cwd.as_deref() {
             Some(value) if !value.trim().is_empty() => PathBuf::from(value),
             Some(_) => {
@@ -3176,6 +3380,23 @@ impl MempalMcpServer {
             })?,
         };
 
+        let trigger = request.trigger.as_deref().map(parse_context_trigger);
+        let config = crate::core::config::ConfigHandle::current();
+        let include_cards = request
+            .include_cards
+            .unwrap_or(config.context.include_cards_default);
+        let project_id = if request_scope.all_projects {
+            None
+        } else {
+            self.resolve_mcp_project_id(request_scope.project_id.as_deref(), config.as_ref())
+                .await?
+        };
+        reject_unresolved_strict_context_scope(
+            project_id.as_deref(),
+            request_scope.all_projects,
+            config.as_ref(),
+        )?;
+
         let embedder = self.embedder_factory.build().await.map_err(|error| {
             ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
         })?;
@@ -3187,18 +3408,13 @@ impl MempalMcpServer {
             .next()
             .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
 
-        let trigger = request.trigger.as_deref().map(parse_context_trigger);
-        let config = crate::core::config::ConfigHandle::current();
-        let include_cards = request
-            .include_cards
-            .unwrap_or(config.context.include_cards_default);
         let db = self.open_db()?;
         let pack = assemble_context_with_vector(
             &db,
             crate::context::ContextRequest {
                 query: request.query,
                 domain,
-                field: request
+                field: request_scope
                     .field
                     .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
                 cwd,
@@ -3206,7 +3422,7 @@ impl MempalMcpServer {
                 include_cards,
                 max_items,
                 dao_tian_limit,
-                project_id: config.project.id.clone(),
+                project_id,
                 trigger,
                 context_cfg_override: None,
                 include_distill_suggestions: request.include_distill_suggestions.unwrap_or(true),
@@ -9906,6 +10122,7 @@ quality_policy = "llm_required_for_keep"
                 project_id: None,
                 include_global: None,
                 all_projects: None,
+                scope: None,
                 disable_progressive: None,
                 include_raw_turns: None,
                 include_expired: None,
@@ -10322,10 +10539,33 @@ quality_policy = "llm_required_for_keep"
     fn test_mcp_tool_registry_includes_mempal_context() {
         let (_tempdir, _db_path, server) = setup_server();
         let tools = server.tool_router.list_all();
+        let search_tool = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_search")
+            .expect("mempal_search tool exists");
+        let search_props = search_tool
+            .input_schema
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .expect("mempal_search must have a properties object");
+        assert!(
+            search_props.get("scope").is_some(),
+            "mempal_search must expose unified scope in tools/list"
+        );
+
         let context_tool = tools
             .iter()
             .find(|tool| tool.name == "mempal_context")
             .expect("mempal_context tool exists");
+        let context_props = context_tool
+            .input_schema
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .expect("mempal_context must have a properties object");
+        assert!(
+            context_props.get("scope").is_some(),
+            "mempal_context must expose unified scope in tools/list"
+        );
         assert!(
             context_tool
                 .description

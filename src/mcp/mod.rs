@@ -12,6 +12,6 @@ pub use tools::{
     MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest,
     PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
     ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse,
-    RollbackRequest, RollbackResponse, RouteDecisionDto, SearchRequest, SearchResponse,
-    SearchResultDto, StatusDetail, StatusRequest, StatusResponse, StatusScope,
+    RetrievalScopeRequest, RollbackRequest, RollbackResponse, RouteDecisionDto, SearchRequest,
+    SearchResponse, SearchResultDto, StatusDetail, StatusRequest, StatusResponse, StatusScope,
 };

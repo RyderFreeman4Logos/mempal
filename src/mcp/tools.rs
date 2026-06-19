@@ -73,6 +73,37 @@ pub enum StatusScope {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct RetrievalScopeRequest {
+    /// Optional wing filter. This is a strict equality match.
+    pub wing: Option<String>,
+    /// Optional room filter. This is a strict equality match.
+    pub room: Option<String>,
+    /// Optional session filter for drawer-backed session captures. This maps
+    /// to the existing `room` column and conflicts with `room` when both differ.
+    pub session: Option<String>,
+    /// Optional explicit project scope.
+    pub project_id: Option<String>,
+    /// Include legacy/global drawers (`project_id IS NULL`) alongside the
+    /// current project. Ignored when `all_projects=true`.
+    pub include_global: Option<bool>,
+    /// Opt-in override to search across all projects for this request.
+    pub all_projects: Option<bool>,
+    /// Optional memory kind filter (`evidence`, `knowledge`, or `profile_fact`).
+    pub memory_kind: Option<String>,
+    /// Optional domain filter (`project`, `user`, `agent`, `skill`, `global`).
+    pub domain: Option<String>,
+    /// Optional bootstrap field filter.
+    pub field: Option<String>,
+    /// Optional knowledge tier filter.
+    pub tier: Option<String>,
+    /// Optional lifecycle status filter such as `active`, `candidate`,
+    /// `promoted`, `canonical`, `demoted`, or `retired`.
+    pub status: Option<String>,
+    /// Optional anchor kind filter (`global`, `repo`, `worktree`).
+    pub anchor_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     /// Natural-language query. Use the user's actual question verbatim
     /// when possible — the embedding model handles paraphrase and translation.
@@ -94,40 +125,40 @@ pub struct SearchRequest {
     /// Maximum number of results to return. Defaults to 10 when omitted.
     pub top_k: Option<usize>,
 
-    /// Optional explicit project scope. When omitted, mempal resolves the
-    /// current project from `[project]` config or MCP roots and scopes the
-    /// query there by default. If neither resolves, search runs unscoped
-    /// unless strict isolation is enabled. Set `all_projects=true` to bypass
-    /// project scoping.
+    /// Unified retrieval scope. Prefer this object for new callers. Legacy
+    /// top-level scope fields remain accepted for compatibility and must not
+    /// conflict with fields inside this object.
+    pub scope: Option<RetrievalScopeRequest>,
+
+    /// Legacy alias for `scope.project_id`.
     pub project_id: Option<String>,
 
-    /// Include legacy/global drawers (`project_id IS NULL`) alongside the
-    /// current project. Ignored when `all_projects=true`.
+    /// Legacy alias for `scope.include_global`.
     pub include_global: Option<bool>,
 
-    /// Opt-in override to search across all projects for this request.
+    /// Legacy alias for `scope.all_projects`.
     pub all_projects: Option<bool>,
 
     /// Return full verbatim content for this call even when progressive
     /// disclosure is enabled globally.
     pub disable_progressive: Option<bool>,
 
-    /// Optional memory kind filter (`evidence` or `knowledge`).
+    /// Legacy alias for `scope.memory_kind`.
     pub memory_kind: Option<String>,
 
-    /// Optional domain filter (`project`, `agent`, `skill`, `global`).
+    /// Legacy alias for `scope.domain`.
     pub domain: Option<String>,
 
-    /// Optional bootstrap field filter.
+    /// Legacy alias for `scope.field`.
     pub field: Option<String>,
 
-    /// Optional knowledge tier filter.
+    /// Legacy alias for `scope.tier`.
     pub tier: Option<String>,
 
-    /// Optional knowledge status filter.
+    /// Legacy alias for `scope.status`.
     pub status: Option<String>,
 
-    /// Optional anchor kind filter (`global`, `repo`, `worktree`).
+    /// Legacy alias for `scope.anchor_kind`.
     pub anchor_kind: Option<String>,
 
     /// If true and top_k <= 10, include previous/next chunks from the same source.
@@ -155,8 +186,14 @@ pub struct SearchResponse {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ContextRequest {
     pub query: String,
+    /// Unified retrieval scope. `mempal_context` supports `project_id`,
+    /// `all_projects`, `domain`, and `field`; search-only fields such as
+    /// `session`, `memory_kind`, and `status` are rejected instead of ignored.
+    pub scope: Option<RetrievalScopeRequest>,
     pub field: Option<String>,
     pub domain: Option<String>,
+    pub project_id: Option<String>,
+    pub all_projects: Option<bool>,
     pub cwd: Option<String>,
     pub include_evidence: Option<bool>,
     pub include_cards: Option<bool>,

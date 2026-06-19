@@ -2,7 +2,7 @@
 
 use crate::core::decay::{search_decay_factor_at, validity_window_contains_at};
 use crate::core::{
-    db::Database,
+    db::{Database, FtsMetadataFilters, FtsSearchScope},
     project::{ProjectSearchScope, SearchResultSource},
     types::{
         AnchorKind, Drawer, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
@@ -13,7 +13,9 @@ use crate::core::{
 use crate::embed::{EmbedError, Embedder, global_embed_status};
 use thiserror::Error;
 
-use crate::search::filter::{build_filter_clause, build_vector_search_sql};
+use crate::search::filter::{
+    RetrievalFilterParamIndexes, build_retrieval_filter_clause, build_vector_search_sql,
+};
 use rusqlite::{OptionalExtension, params_from_iter};
 
 pub mod filter;
@@ -21,6 +23,8 @@ pub mod preview;
 pub mod rerank;
 pub mod route;
 pub mod tiered;
+
+const EXACT_VECTOR_CANDIDATE_LIMIT: i64 = 4_096;
 
 pub type Result<T> = std::result::Result<T, SearchError>;
 
@@ -513,15 +517,25 @@ pub fn search_with_vector_and_scope_options(
     };
 
     // Hybrid search: vector + BM25, merged via RRF
-    let vector_results = search_by_vector(db, query_vector, route.clone(), scope, candidate_top_k)?;
+    let vector_results = search_by_vector_with_filters(
+        db,
+        query_vector,
+        route.clone(),
+        scope,
+        &options.filters,
+        candidate_top_k,
+    )?;
 
     let fts_ids = db
-        .search_fts(
+        .search_fts_filtered(
             query,
-            route.wing.as_deref(),
-            route.room.as_deref(),
-            scope.mode_param(),
-            scope.project_id.as_deref(),
+            FtsSearchScope {
+                wing: route.wing.as_deref(),
+                room: route.room.as_deref(),
+                project_mode: scope.mode_param(),
+                project_id: scope.project_id.as_deref(),
+                filters: options.filters.as_fts_metadata_filters(),
+            },
             candidate_top_k,
         )
         .map_err(SearchError::KeywordSearch)?;
@@ -531,9 +545,7 @@ pub fn search_with_vector_and_scope_options(
     } else {
         rrf_merge(vector_results, &fts_ids, &route, scope, db, candidate_top_k)
     };
-    if !options.filters.is_empty() {
-        results.retain(|result| matches_filters(result, &options.filters));
-    }
+    retain_search_filters(&mut results, &options.filters);
     if exclude_raw_turns {
         results.retain(|result| {
             !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
@@ -542,6 +554,7 @@ pub fn search_with_vector_and_scope_options(
 
     // Inject tunnel hints: for each result, check if its room exists in other wings
     inject_tunnel_hints_and_results(db, &mut results, scope);
+    retain_search_filters(&mut results, &options.filters);
     if exclude_raw_turns {
         results.retain(|result| {
             !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
@@ -895,26 +908,28 @@ pub fn search_bm25_only_with_options(
         top_k
     };
     let fts_ids = db
-        .search_fts(
+        .search_fts_filtered(
             query,
-            route.wing.as_deref(),
-            route.room.as_deref(),
-            scope.mode_param(),
-            scope.project_id.as_deref(),
+            FtsSearchScope {
+                wing: route.wing.as_deref(),
+                room: route.room.as_deref(),
+                project_mode: scope.mode_param(),
+                project_id: scope.project_id.as_deref(),
+                filters: options.filters.as_fts_metadata_filters(),
+            },
             candidate_top_k,
         )
         .map_err(SearchError::KeywordSearch)?;
 
     let mut results = rrf_merge(Vec::new(), &fts_ids, &route, scope, db, candidate_top_k);
-    if !options.filters.is_empty() {
-        results.retain(|result| matches_filters(result, &options.filters));
-    }
+    retain_search_filters(&mut results, &options.filters);
     if exclude_raw_turns {
         results.retain(|result| {
             !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
         });
     }
     inject_tunnel_hints_and_results(db, &mut results, scope);
+    retain_search_filters(&mut results, &options.filters);
     if exclude_raw_turns {
         results.retain(|result| {
             !crate::core::strata::is_excluded_raw_turn_result(result, &config.turns)
@@ -951,6 +966,17 @@ impl SearchFilters {
             && self.status.is_none()
             && self.anchor_kind.is_none()
     }
+
+    fn as_fts_metadata_filters(&self) -> FtsMetadataFilters<'_> {
+        FtsMetadataFilters {
+            memory_kind: self.memory_kind.as_deref(),
+            domain: self.domain.as_deref(),
+            field: self.field.as_deref(),
+            tier: self.tier.as_deref(),
+            status: self.status.as_deref(),
+            anchor_kind: self.anchor_kind.as_deref(),
+        }
+    }
 }
 
 fn matches_filters(result: &SearchResult, filters: &SearchFilters) -> bool {
@@ -982,6 +1008,12 @@ fn matches_filters(result: &SearchResult, filters: &SearchFilters) -> bool {
             .anchor_kind
             .as_deref()
             .is_none_or(|value| value == anchor_kind_slug(&result.anchor_kind))
+}
+
+fn retain_search_filters(results: &mut Vec<SearchResult>, filters: &SearchFilters) {
+    if !filters.is_empty() {
+        results.retain(|result| matches_filters(result, filters));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,7 +1312,7 @@ fn current_vector_dim(
 pub fn compute_knn_k(top_k: usize) -> i64 {
     let raw = top_k.saturating_mul(50);
     let raw_i64 = i64::try_from(raw).unwrap_or(i64::MAX);
-    raw_i64.clamp(100, 4_096)
+    raw_i64.clamp(100, EXACT_VECTOR_CANDIDATE_LIMIT)
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,6 +1326,24 @@ pub fn search_by_vector(
     scope: &ProjectSearchScope,
     top_k: usize,
 ) -> Result<Vec<SearchResult>> {
+    search_by_vector_with_filters(
+        db,
+        query_vector,
+        route,
+        scope,
+        &SearchFilters::default(),
+        top_k,
+    )
+}
+
+fn search_by_vector_with_filters(
+    db: &Database,
+    query_vector: &[f32],
+    route: RouteDecision,
+    scope: &ProjectSearchScope,
+    filters: &SearchFilters,
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
     if top_k == 0 {
         return Ok(Vec::new());
     }
@@ -1303,7 +1353,21 @@ pub fn search_by_vector(
 
     let count_sql = format!(
         "SELECT COUNT(*) FROM drawers d {}",
-        build_filter_clause("d", 1, 2, 3, 4)
+        build_retrieval_filter_clause(
+            "d",
+            RetrievalFilterParamIndexes {
+                wing: 1,
+                room: 2,
+                project_mode: 3,
+                project_id: 4,
+                memory_kind: 5,
+                domain: 6,
+                field: 7,
+                tier: 8,
+                status: 9,
+                anchor_kind: 10,
+            },
+        )
     );
     let candidate_count: i64 = db
         .conn()
@@ -1314,6 +1378,12 @@ pub fn search_by_vector(
                 applied_room,
                 scope.mode_param(),
                 scope.project_id.as_deref(),
+                filters.memory_kind.as_deref(),
+                filters.domain.as_deref(),
+                filters.field.as_deref(),
+                filters.tier.as_deref(),
+                filters.status.as_deref(),
+                filters.anchor_kind.as_deref(),
             ),
             |row| row.get(0),
         )
@@ -1322,9 +1392,8 @@ pub fn search_by_vector(
         return Ok(Vec::new());
     }
 
-    // When the *filtered* candidate set (wing + room + project scope all
-    // applied by `build_filter_clause` above) fits within the sqlite-vec KNN
-    // limit, use the exact in-memory path regardless of scope mode. This is a
+    // When the *bounded* candidate set fits within the sqlite-vec KNN limit,
+    // use the exact in-memory path regardless of scope mode. This is a
     // deliberate recall-preserving choice, not a perf compromise:
     //
     //   - The exact path applies the FULL filter (wing/room/project) *before*
@@ -1338,19 +1407,24 @@ pub fn search_by_vector(
     // After the decorate-sort-undecorate fix in `search_by_vector_scoped_exact`
     // the exact path costs one cosine evaluation per candidate (O(n)), so
     // scoring up to 4096 candidates is milliseconds -- there is no longer a
-    // latency reason to prefer the approximate KNN path here. Flipping this
-    // gate to favor KNN for the common case is a recall-semantics change and
-    // must go through debate / orchestrator sign-off (see issue #250); do NOT
-    // change it as part of the perf fix.
-    if candidate_count <= 4_096 {
+    // latency reason to prefer the approximate KNN path for that bounded case.
+    //
+    // Typed metadata filters are counted above and then enforced again after
+    // RRF. They must not bypass this guard: the exact path materializes every
+    // matching embedding, so a broad filter such as `memory_kind=evidence`
+    // could otherwise load an unbounded number of vector blobs from an MCP call.
+    if candidate_count <= EXACT_VECTOR_CANDIDATE_LIMIT {
         return search_by_vector_scoped_exact(
             db,
-            query_vector,
-            route.clone(),
-            applied_wing,
-            applied_room,
-            top_k,
-            scope,
+            ExactVectorSearchRequest {
+                query_vector,
+                route: route.clone(),
+                applied_wing,
+                applied_room,
+                top_k,
+                scope,
+                filters,
+            },
         );
     }
 
@@ -1425,19 +1499,47 @@ pub fn search_by_vector(
         .collect())
 }
 
+struct ExactVectorSearchRequest<'a> {
+    query_vector: &'a [f32],
+    route: RouteDecision,
+    applied_wing: Option<&'a str>,
+    applied_room: Option<&'a str>,
+    top_k: usize,
+    scope: &'a ProjectSearchScope,
+    filters: &'a SearchFilters,
+}
+
 fn search_by_vector_scoped_exact(
     db: &Database,
-    query_vector: &[f32],
-    route: RouteDecision,
-    applied_wing: Option<&str>,
-    applied_room: Option<&str>,
-    top_k: usize,
-    scope: &ProjectSearchScope,
+    request: ExactVectorSearchRequest<'_>,
 ) -> Result<Vec<SearchResult>> {
+    let ExactVectorSearchRequest {
+        query_vector,
+        route,
+        applied_wing,
+        applied_room,
+        top_k,
+        scope,
+        filters,
+    } = request;
     let top_k = i64::try_from(top_k).map_err(|_| SearchError::InvalidTopK)?;
     // Use the full filter clause so all scope modes (all / project /
     // project_plus_global / null_only) work correctly through the exact path.
-    let filter = build_filter_clause("d", 1, 2, 3, 4);
+    let filter = build_retrieval_filter_clause(
+        "d",
+        RetrievalFilterParamIndexes {
+            wing: 1,
+            room: 2,
+            project_mode: 3,
+            project_id: 4,
+            memory_kind: 5,
+            domain: 6,
+            field: 7,
+            tier: 8,
+            status: 9,
+            anchor_kind: 10,
+        },
+    );
     let search_sql = format!(
         r#"
         SELECT d.id, d.content, d.wing, d.room, d.source_file, d.project_id, v.embedding
@@ -1457,6 +1559,12 @@ fn search_by_vector_scoped_exact(
                 applied_room,
                 scope.mode_param(),
                 scope.project_id.as_deref(),
+                filters.memory_kind.as_deref(),
+                filters.domain.as_deref(),
+                filters.field.as_deref(),
+                filters.tier.as_deref(),
+                filters.status.as_deref(),
+                filters.anchor_kind.as_deref(),
             ),
             |row| {
                 let drawer_id: String = row.get(0)?;
