@@ -7897,6 +7897,7 @@ fn context_error(error: crate::context::ContextError) -> ErrorData {
         | crate::context::ContextError::Search(_)
         | crate::context::ContextError::LoadDrawer(_)
         | crate::context::ContextError::LoadCard(_)
+        | crate::context::ContextError::Foresight(_)
         | crate::context::ContextError::Tiered(_) => {
             ErrorData::internal_error(format!("context assembly failed: {error}"), None)
         }

@@ -40,7 +40,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 18;
+pub const CURRENT_SCHEMA_VERSION: u32 = 19;
 pub const CURRENT_VECTOR_INDEX_VERSION: &str = "v2";
 pub const VECTOR_DISTANCE_METRIC: &str = "cosine";
 /// SQLite page cache budget for issue #311's large-DB stale reindex path.
@@ -6259,6 +6259,28 @@ CREATE INDEX IF NOT EXISTS idx_design_insights_project_status
     ON design_insights(project_id, status, priority DESC);
 "#;
 
+const V19_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS foresights (
+    drawer_id TEXT PRIMARY KEY REFERENCES drawers(id) ON DELETE CASCADE,
+    statement TEXT NOT NULL,
+    reason TEXT,
+    trigger_condition TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    valid_from TEXT,
+    valid_until TEXT,
+    resolved_at TEXT,
+    resolution_note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_foresights_due
+    ON foresights(due_at, resolved_at);
+
+CREATE INDEX IF NOT EXISTS idx_foresights_validity
+    ON foresights(valid_from, valid_until);
+"#;
+
 const V12_COMPACTION_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
     ON drawers(compacted_into)
@@ -6413,6 +6435,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 18,
             sql: V18_MIGRATION_SQL,
+        },
+        Migration {
+            version: 19,
+            sql: V19_MIGRATION_SQL,
         },
     ];
     MIGRATIONS

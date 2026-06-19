@@ -235,6 +235,7 @@ pub struct BudgetUsedDto {
     pub t1_tokens: usize,
     pub t2_tokens: usize,
     pub t3_tokens: usize,
+    pub foresight_tokens: usize,
     pub total_tokens: usize,
 }
 
@@ -3190,6 +3191,7 @@ fn tiered_assembly_to_dto(
         t1_tokens: tiered.budget_used.t1_tokens,
         t2_tokens: tiered.budget_used.t2_tokens,
         t3_tokens: tiered.budget_used.t3_tokens,
+        foresight_tokens: tiered.budget_used.foresight_tokens,
         total_tokens: tiered.budget_used.total_tokens(),
     };
     (t1, t2, t3, budget)

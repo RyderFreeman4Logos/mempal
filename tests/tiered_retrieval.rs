@@ -207,10 +207,12 @@ fn test_tiered_context_budget_does_not_exceed_total() {
 
     let tiered = pack.tiered.expect("tiered assembly should be present");
     let total = tiered.budget_used.total_tokens();
-    let sum =
-        tiered.budget_used.t1_tokens + tiered.budget_used.t2_tokens + tiered.budget_used.t3_tokens;
+    let sum = tiered.budget_used.t1_tokens
+        + tiered.budget_used.t2_tokens
+        + tiered.budget_used.t3_tokens
+        + tiered.budget_used.foresight_tokens;
     assert!(total <= 8000, "total_tokens={total} must not exceed 8000");
-    assert_eq!(total, sum, "total_tokens must equal t1+t2+t3 sum");
+    assert_eq!(total, sum, "total_tokens must equal all token buckets");
 }
 
 // --- Scenario: overflow_to_t2=true transfers T1/T3 unused budget to T2 ---
