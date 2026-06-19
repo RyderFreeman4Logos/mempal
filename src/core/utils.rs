@@ -389,11 +389,7 @@ fn enum_slug(value: &str) -> String {
 }
 
 fn memory_kind_as_str(kind: &MemoryKind) -> &'static str {
-    match kind {
-        MemoryKind::Evidence => "evidence",
-        MemoryKind::Knowledge => "knowledge",
-        MemoryKind::ProfileFact => "profile_fact",
-    }
+    kind.as_str()
 }
 
 fn memory_domain_as_str(domain: &MemoryDomain) -> &'static str {

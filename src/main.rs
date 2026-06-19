@@ -4441,11 +4441,13 @@ fn parse_source_type_bound(field: &str, value: Option<&str>) -> Result<Option<So
 
 fn parse_memory_kind_bound(field: &str, value: Option<&str>) -> Result<Option<MemoryKind>> {
     value
-        .map(|raw| match raw {
-            "evidence" => Ok(MemoryKind::Evidence),
-            "knowledge" => Ok(MemoryKind::Knowledge),
-            "profile_fact" => Ok(MemoryKind::ProfileFact),
-            other => bail!("{field} must be one of evidence, knowledge, profile_fact; got {other}"),
+        .map(|raw| {
+            raw.parse::<MemoryKind>().with_context(|| {
+                format!(
+                    "{field} must be one of {}; got {raw}",
+                    MemoryKind::supported_slugs()
+                )
+            })
         })
         .transpose()
 }
@@ -5742,11 +5744,7 @@ fn build_cli_search_result(result: mempal::core::types::SearchResult) -> CliSear
 }
 
 fn memory_kind_slug(v: &MemoryKind) -> &'static str {
-    match v {
-        MemoryKind::Evidence => "evidence",
-        MemoryKind::Knowledge => "knowledge",
-        MemoryKind::ProfileFact => "profile_fact",
-    }
+    v.as_str()
 }
 fn domain_slug(v: &MemoryDomain) -> &'static str {
     match v {
@@ -5914,14 +5912,15 @@ fn stable_cli_id(prefix: &str, parts: &[&str]) -> String {
 }
 
 fn effective_wake_up_text(drawer: &mempal::core::types::Drawer) -> &str {
-    match drawer.memory_kind {
-        MemoryKind::Knowledge => drawer
+    if drawer.memory_kind.prefers_statement_text() {
+        drawer
             .statement
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .unwrap_or(drawer.content.as_str()),
-        MemoryKind::Evidence | MemoryKind::ProfileFact => drawer.content.as_str(),
+            .unwrap_or(drawer.content.as_str())
+    } else {
+        drawer.content.as_str()
     }
 }
 
@@ -17455,10 +17454,7 @@ fn historical_protection_reason(drawer: &Drawer) -> Option<String> {
     ) {
         return Some("canonical_or_promoted".to_string());
     }
-    if matches!(
-        drawer.memory_kind,
-        MemoryKind::Knowledge | MemoryKind::ProfileFact
-    ) {
+    if drawer.memory_kind.is_knowledge() || drawer.memory_kind.is_typed_record() {
         return Some("typed_high_signal_memory".to_string());
     }
     let score = mempal::importance::score_importance(drawer);

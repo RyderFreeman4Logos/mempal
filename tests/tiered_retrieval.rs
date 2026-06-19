@@ -6,8 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mempal::context::{ContextRequest, assemble_context_with_vector};
 use mempal::core::config::{ContextBudgetConfig, ContextConfig};
 use mempal::core::db::Database;
-use mempal::core::types::{Drawer, MemoryDomain, SourceType};
-use mempal::search::tiered::{ContextTrigger, T3Params, compute_budgets, fetch_t3, now_unix_secs};
+use mempal::core::types::{Drawer, MemoryDomain, SourceType, Triple};
+use mempal::search::tiered::{
+    ContextTrigger, T3Params, compute_budgets, fetch_t3, fetch_t3_kg, now_unix_secs,
+};
 use tempfile::TempDir;
 
 fn now_secs() -> i64 {
@@ -71,6 +73,30 @@ fn insert(db: &Database, drawer: &Drawer) {
     db.insert_drawer(drawer).expect("insert drawer");
     db.insert_vector(&drawer.id, &dummy_vector())
         .expect("insert vector");
+}
+
+fn insert_with_validity(
+    db: &Database,
+    drawer: &Drawer,
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
+) {
+    db.insert_drawer_with_project_validity(drawer, None, None, valid_from, valid_until)
+        .expect("insert drawer with validity");
+}
+
+fn insert_kg_source(db: &Database, triple_id: &str, term: &str, drawer_id: &str) {
+    db.insert_triple(&Triple {
+        id: triple_id.to_string(),
+        subject: format!("{term} subject"),
+        predicate: "relates_to".to_string(),
+        object: format!("{term} object"),
+        valid_from: None,
+        valid_to: None,
+        confidence: 1.0,
+        source_drawer: Some(drawer_id.to_string()),
+    })
+    .expect("insert KG triple");
 }
 
 fn request_with_cfg(cwd: &Path, cfg: ContextConfig) -> ContextRequest {
@@ -245,6 +271,48 @@ fn test_tiered_t3_respects_recency_window() {
     assert!(
         !ids.contains(&"drawer-old"),
         "drawer-old should NOT be in T3: {ids:?}"
+    );
+}
+
+// --- Scenario: T3 KG applies drawer validity before per-term candidate cap ---
+
+#[test]
+fn test_tiered_t3_kg_validity_filter_precedes_candidate_limit() {
+    let (_, db) = new_db();
+    let now = now_unix_secs();
+    let expired_from = (now - 200).to_string();
+    let expired_until = (now - 100).to_string();
+    let future_from = (now + 100).to_string();
+    let term = "kgterm472";
+
+    for i in 0..24 {
+        let drawer_id = format!("kg-invalid-{i:02}");
+        let drawer = make_drawer(&drawer_id, "general", 1, 0);
+        if i % 2 == 0 {
+            insert_with_validity(&db, &drawer, Some(&expired_from), Some(&expired_until));
+        } else {
+            insert_with_validity(&db, &drawer, Some(&future_from), None);
+        }
+        insert_kg_source(&db, &format!("triple-invalid-{i:02}"), term, &drawer_id);
+    }
+
+    let active = make_drawer("kg-active-after-invalid-window", "general", 1, 0);
+    insert_with_validity(&db, &active, Some(&expired_from), None);
+    insert_kg_source(&db, "triple-active-after-invalid-window", term, &active.id);
+
+    let items = fetch_t3_kg(&db, &[term], 8000, None, &[], now).expect("fetch T3 KG");
+    let ids = items
+        .iter()
+        .map(|item| item.drawer_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        ids.contains(&"kg-active-after-invalid-window"),
+        "active KG drawer after more than 20 invalid candidates should be returned: {ids:?}"
+    );
+    assert!(
+        ids.iter().all(|id| !id.starts_with("kg-invalid-")),
+        "expired and future KG drawers should not be returned: {ids:?}"
     );
 }
 

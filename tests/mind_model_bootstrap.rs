@@ -422,9 +422,10 @@ fn bootstrap_drawer(
         content: content.to_string(),
         wing: "mempal".to_string(),
         room: Some("bootstrap".to_string()),
-        source_file: Some(match memory_kind {
-            MemoryKind::Evidence | MemoryKind::ProfileFact => format!("tests://{id}"),
-            MemoryKind::Knowledge => format!("knowledge://project/bootstrap/{id}"),
+        source_file: Some(if memory_kind.is_knowledge() {
+            format!("knowledge://project/bootstrap/{id}")
+        } else {
+            format!("tests://{id}")
         }),
         source_type: SourceType::AgentInference,
         confidence: 0.5,
@@ -438,9 +439,10 @@ fn bootstrap_drawer(
         anchor_kind: AnchorKind::Repo,
         anchor_id: format!("repo://{id}"),
         parent_anchor_id: None,
-        provenance: match memory_kind {
-            MemoryKind::Evidence | MemoryKind::ProfileFact => Some(Provenance::Human),
-            MemoryKind::Knowledge => None,
+        provenance: if memory_kind.is_knowledge() {
+            None
+        } else {
+            Some(Provenance::Human)
         },
         statement: statement.map(ToOwned::to_owned),
         tier,

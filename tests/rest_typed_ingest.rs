@@ -352,6 +352,133 @@ async fn test_typed_ingest_invalid_memory_kind_returns_400() {
 }
 
 #[tokio::test]
+async fn test_typed_ingest_decision_rejects_tier() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (status, body) = post_json(
+        state,
+        "/api/ingest",
+        json!({
+            "content": "Use typed decision records without knowledge tier metadata.",
+            "wing": "policy",
+            "room": "decisions",
+            "memory_kind": "decision",
+            "tier": "qi",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+}
+
+#[tokio::test]
+async fn test_typed_ingest_decision_rejects_supporting_refs() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (status, body) = post_json(
+        state,
+        "/api/ingest",
+        json!({
+            "content": "Use typed decision records without knowledge ref metadata.",
+            "wing": "policy",
+            "room": "decisions",
+            "memory_kind": "decision",
+            "supporting_refs": ["drawer_ev_001"],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+}
+
+#[tokio::test]
+async fn test_typed_ingest_decision_rejects_invalid_status() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (status, body) = post_json(
+        state,
+        "/api/ingest",
+        json!({
+            "content": "Typed decisions only allow active or canonical status.",
+            "wing": "policy",
+            "room": "decisions",
+            "memory_kind": "decision",
+            "status": "demoted",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+}
+
+#[tokio::test]
+async fn test_typed_ingest_decision_rejects_ref_aliases() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (status, body) = post_json(
+        state,
+        "/api/ingest",
+        json!({
+            "content": "Typed decisions reject knowledge ref aliases too.",
+            "wing": "policy",
+            "room": "decisions",
+            "memory_kind": "decision",
+            "opposes_refs": ["drawer_ev_001"],
+            "supersedes_refs": ["drawer_ev_002"],
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+}
+
+#[tokio::test]
+async fn test_typed_ingest_decision_without_knowledge_fields_is_accepted() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (status, body) = post_json(
+        state,
+        "/api/ingest",
+        json!({
+            "content": "Choose REST validation parity for typed decision rows.",
+            "wing": "policy",
+            "room": "decisions",
+            "memory_kind": "decision",
+            "domain": "project",
+            "field": "engineering",
+            "status": "active",
+            "statement": "REST typed decision rows use typed-record lifecycle metadata.",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    let drawer_id = body["drawer_id"].as_str().expect("drawer_id");
+    let db = env.db();
+    let drawer = db
+        .get_drawer(drawer_id)
+        .expect("load drawer")
+        .expect("drawer exists");
+    assert_eq!(drawer.memory_kind, MemoryKind::Decision);
+    assert_eq!(drawer.status, Some(KnowledgeStatus::Active));
+    assert_eq!(drawer.tier, None);
+    assert!(drawer.supporting_refs.is_empty());
+    assert!(drawer.counterexample_refs.is_empty());
+    assert!(drawer.teaching_refs.is_empty());
+    assert!(drawer.verification_refs.is_empty());
+}
+
+#[tokio::test]
 async fn test_typed_ingest_invalid_memory_kind_returns_400_when_writes_degraded() {
     let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();

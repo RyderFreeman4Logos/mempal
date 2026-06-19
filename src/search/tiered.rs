@@ -15,9 +15,29 @@ use serde::Serialize;
 
 use crate::core::db::Database;
 use crate::core::db::DbError;
+use crate::core::decay::validity_window_contains_at;
 use crate::embed::estimate_tokens;
 
-type DrawerRow = (String, String, Option<String>, Option<String>, String, f64);
+struct DrawerRow {
+    id: String,
+    content: String,
+    room: Option<String>,
+    source_file: Option<String>,
+    added_at: String,
+    effective_importance: f64,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+}
+
+impl DrawerRow {
+    fn is_valid_at(&self, now_unix: i64) -> bool {
+        validity_window_contains_at(
+            self.valid_from.as_deref(),
+            self.valid_until.as_deref(),
+            now_unix,
+        )
+    }
+}
 
 /// A single item retrieved by the tiered retrieval strategies.
 #[derive(Debug, Clone, Serialize)]
@@ -143,7 +163,8 @@ pub fn fetch_t1(db: &Database, params: T1Params<'_>) -> Result<Vec<TieredItem>, 
         -- carries the persisted stale penalty (default 1.0) so a legacy 0.0 row that
         -- fact-check down-ranked ranks at importance*penalty, not full importance.
         SELECT id, content, room, source_file, added_at,
-               COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL) * COALESCE(stale_penalty_applied, 1.0))
+               COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL) * COALESCE(stale_penalty_applied, 1.0)),
+               valid_from, valid_until
         FROM drawers
         WHERE deleted_at IS NULL
           AND room IN ('decision', 'feedback', 'rule')
@@ -160,28 +181,32 @@ pub fn fetch_t1(db: &Database, params: T1Params<'_>) -> Result<Vec<TieredItem>, 
 
     let rows: Vec<DrawerRow> = if let Some(pid) = params.project_id {
         stmt.query_map(params![params.min_importance as i32, pid], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, f64>(5)?,
-            ))
+            Ok(DrawerRow {
+                id: row.get::<_, String>(0)?,
+                content: row.get::<_, String>(1)?,
+                room: row.get::<_, Option<String>>(2)?,
+                source_file: row.get::<_, Option<String>>(3)?,
+                added_at: row.get::<_, String>(4)?,
+                effective_importance: row.get::<_, f64>(5)?,
+                valid_from: row.get::<_, Option<String>>(6)?,
+                valid_until: row.get::<_, Option<String>>(7)?,
+            })
         })
         .map_err(|e| TieredError::T1Query(DbError::Sqlite(e)))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TieredError::T1Query(DbError::Sqlite(e)))?
     } else {
         stmt.query_map(params![params.min_importance as i32], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, f64>(5)?,
-            ))
+            Ok(DrawerRow {
+                id: row.get::<_, String>(0)?,
+                content: row.get::<_, String>(1)?,
+                room: row.get::<_, Option<String>>(2)?,
+                source_file: row.get::<_, Option<String>>(3)?,
+                added_at: row.get::<_, String>(4)?,
+                effective_importance: row.get::<_, f64>(5)?,
+                valid_from: row.get::<_, Option<String>>(6)?,
+                valid_until: row.get::<_, Option<String>>(7)?,
+            })
         })
         .map_err(|e| TieredError::T1Query(DbError::Sqlite(e)))?
         .collect::<Result<Vec<_>, _>>()
@@ -191,17 +216,18 @@ pub fn fetch_t1(db: &Database, params: T1Params<'_>) -> Result<Vec<TieredItem>, 
     // Score and sort: score = effective_importance × exp(-λ × days_since_added_at).
     let mut scored: Vec<(f64, TieredItem)> = rows
         .into_iter()
-        .map(|(id, content, room, source_file, added_at, eff_imp)| {
-            let added_unix = parse_added_at_unix(&added_at);
+        .filter(|row| row.is_valid_at(params.now_unix))
+        .map(|row| {
+            let added_unix = parse_added_at_unix(&row.added_at);
             let days = (params.now_unix - added_unix).max(0) as f64 / 86_400.0;
-            let score = eff_imp * (-params.lambda * days).exp();
+            let score = row.effective_importance * (-params.lambda * days).exp();
             let item = TieredItem {
-                drawer_id: id,
-                content,
-                source_file: source_file.unwrap_or_default(),
-                room,
+                drawer_id: row.id,
+                content: row.content,
+                source_file: row.source_file.unwrap_or_default(),
+                room: row.room,
                 t3_source: None,
-                effective_importance: eff_imp,
+                effective_importance: row.effective_importance,
                 added_at_unix: added_unix,
                 matched_pattern_id: None,
             };
@@ -246,7 +272,8 @@ pub fn fetch_t3(db: &Database, params: T3Params<'_>) -> Result<Vec<TieredItem>, 
         -- NULLIF(...,0.0): persisted 0.0 sentinel falls back to importance*penalty
         -- (stale_penalty_applied default 1.0) so down-ranked legacy rows stay down (GitHub #309).
         SELECT id, content, room, source_file, added_at,
-               COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL) * COALESCE(stale_penalty_applied, 1.0))
+               COALESCE(NULLIF(effective_importance, 0.0), CAST(COALESCE(importance, 0) AS REAL) * COALESCE(stale_penalty_applied, 1.0)),
+               valid_from, valid_until
         FROM drawers
         WHERE deleted_at IS NULL
           AND CAST(added_at AS INTEGER) >= ?1
@@ -261,28 +288,32 @@ pub fn fetch_t3(db: &Database, params: T3Params<'_>) -> Result<Vec<TieredItem>, 
 
     let rows: Vec<DrawerRow> = if let Some(pid) = params.project_id {
         stmt.query_map(params![cutoff, pid], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, f64>(5)?,
-            ))
+            Ok(DrawerRow {
+                id: row.get::<_, String>(0)?,
+                content: row.get::<_, String>(1)?,
+                room: row.get::<_, Option<String>>(2)?,
+                source_file: row.get::<_, Option<String>>(3)?,
+                added_at: row.get::<_, String>(4)?,
+                effective_importance: row.get::<_, f64>(5)?,
+                valid_from: row.get::<_, Option<String>>(6)?,
+                valid_until: row.get::<_, Option<String>>(7)?,
+            })
         })
         .map_err(|e| TieredError::T3Query(DbError::Sqlite(e)))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TieredError::T3Query(DbError::Sqlite(e)))?
     } else {
         stmt.query_map(params![cutoff], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, f64>(5)?,
-            ))
+            Ok(DrawerRow {
+                id: row.get::<_, String>(0)?,
+                content: row.get::<_, String>(1)?,
+                room: row.get::<_, Option<String>>(2)?,
+                source_file: row.get::<_, Option<String>>(3)?,
+                added_at: row.get::<_, String>(4)?,
+                effective_importance: row.get::<_, f64>(5)?,
+                valid_from: row.get::<_, Option<String>>(6)?,
+                valid_until: row.get::<_, Option<String>>(7)?,
+            })
         })
         .map_err(|e| TieredError::T3Query(DbError::Sqlite(e)))?
         .collect::<Result<Vec<_>, _>>()
@@ -294,23 +325,23 @@ pub fn fetch_t3(db: &Database, params: T3Params<'_>) -> Result<Vec<TieredItem>, 
 
     let mut items = Vec::new();
     let mut used = 0usize;
-    for (id, content, room, source_file, added_at, eff_imp) in rows {
-        if exclude_set.contains(id.as_str()) {
+    for row in rows {
+        if !row.is_valid_at(params.now_unix) || exclude_set.contains(row.id.as_str()) {
             continue;
         }
-        let tokens = estimate_tokens(&content);
+        let tokens = estimate_tokens(&row.content);
         if used + tokens > params.budget_tokens && !items.is_empty() {
             break;
         }
         used += tokens;
         items.push(TieredItem {
-            added_at_unix: parse_added_at_unix(&added_at),
-            drawer_id: id,
-            content,
-            source_file: source_file.unwrap_or_default(),
-            room,
+            added_at_unix: parse_added_at_unix(&row.added_at),
+            drawer_id: row.id,
+            content: row.content,
+            source_file: row.source_file.unwrap_or_default(),
+            room: row.room,
             t3_source: Some("recency".to_string()),
-            effective_importance: eff_imp,
+            effective_importance: row.effective_importance,
             matched_pattern_id: None,
         });
     }
@@ -336,7 +367,7 @@ pub fn fetch_t3_kg(
         exclude_ids.iter().map(String::as_str).collect();
 
     let project_clause = if project_id.is_some() {
-        "(d.project_id = ?2 OR d.project_id IS NULL)"
+        "(d.project_id = ?3 OR d.project_id IS NULL)"
     } else {
         "1 = 1"
     };
@@ -347,26 +378,60 @@ pub fn fetch_t3_kg(
         let term_pattern = format!("%{term}%");
         let sql = format!(
             r#"
-            SELECT DISTINCT t.source_drawer
-            FROM triples t
-            JOIN drawers d ON d.id = t.source_drawer AND d.deleted_at IS NULL
-            WHERE t.source_drawer IS NOT NULL
-              AND (t.subject LIKE ?1 OR t.object LIKE ?1)
-              AND {project_clause}
+            WITH matched AS (
+                SELECT
+                    t.source_drawer,
+                    MIN(t.rowid) AS first_seen,
+                    TRIM(COALESCE(d.valid_from, '')) AS valid_from,
+                    TRIM(COALESCE(d.valid_until, '')) AS valid_until
+                FROM triples t
+                JOIN drawers d ON d.id = t.source_drawer AND d.deleted_at IS NULL
+                WHERE t.source_drawer IS NOT NULL
+                  AND (t.subject LIKE ?1 OR t.object LIKE ?1)
+                  AND {project_clause}
+                GROUP BY t.source_drawer, d.valid_from, d.valid_until
+            ),
+            parsed AS (
+                SELECT
+                    source_drawer,
+                    first_seen,
+                    CASE
+                        WHEN valid_from = '' THEN NULL
+                        WHEN (
+                            (valid_from GLOB '-[0-9]*' AND substr(valid_from, 2) NOT GLOB '*[^0-9]*')
+                            OR (valid_from GLOB '[0-9]*' AND valid_from NOT GLOB '*[^0-9]*')
+                        ) THEN CAST(valid_from AS INTEGER)
+                        ELSE CAST(strftime('%s', valid_from) AS INTEGER)
+                    END AS valid_from_secs,
+                    CASE
+                        WHEN valid_until = '' THEN NULL
+                        WHEN (
+                            (valid_until GLOB '-[0-9]*' AND substr(valid_until, 2) NOT GLOB '*[^0-9]*')
+                            OR (valid_until GLOB '[0-9]*' AND valid_until NOT GLOB '*[^0-9]*')
+                        ) THEN CAST(valid_until AS INTEGER)
+                        ELSE CAST(strftime('%s', valid_until) AS INTEGER)
+                    END AS valid_until_secs
+                FROM matched
+            )
+            SELECT source_drawer
+            FROM parsed
+            WHERE (valid_from_secs IS NULL OR valid_from_secs <= ?2)
+              AND (valid_until_secs IS NULL OR valid_until_secs >= ?2)
+            ORDER BY first_seen ASC
             LIMIT 20
             "#,
         );
         let ids: Vec<String> = if let Some(pid) = project_id {
             conn.prepare(&sql)
                 .map_err(|e| TieredError::KgQuery(DbError::Sqlite(e)))?
-                .query_map(params![term_pattern, pid], |row| row.get(0))
+                .query_map(params![term_pattern, now_unix, pid], |row| row.get(0))
                 .map_err(|e| TieredError::KgQuery(DbError::Sqlite(e)))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| TieredError::KgQuery(DbError::Sqlite(e)))?
         } else {
             conn.prepare(&sql)
                 .map_err(|e| TieredError::KgQuery(DbError::Sqlite(e)))?
-                .query_map(params![term_pattern], |row| row.get(0))
+                .query_map(params![term_pattern, now_unix], |row| row.get(0))
                 .map_err(|e| TieredError::KgQuery(DbError::Sqlite(e)))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| TieredError::KgQuery(DbError::Sqlite(e)))?
@@ -383,6 +448,24 @@ pub fn fetch_t3_kg(
     let mut used = 0usize;
     for drawer_id in candidate_ids {
         if exclude_set.contains(drawer_id.as_str()) {
+            continue;
+        }
+        let validity = conn.query_row(
+            "SELECT valid_from, valid_until FROM drawers WHERE id = ?1 AND deleted_at IS NULL",
+            params![drawer_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        );
+        let (valid_from, valid_until) = match validity {
+            Ok(value) => value,
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(error) => return Err(TieredError::KgQuery(DbError::Sqlite(error))),
+        };
+        if !validity_window_contains_at(valid_from.as_deref(), valid_until.as_deref(), now_unix) {
             continue;
         }
         if let Ok(Some(d)) = db.get_drawer(&drawer_id) {
@@ -407,7 +490,6 @@ pub fn fetch_t3_kg(
             break;
         }
     }
-    let _ = now_unix; // available for future TTL filtering
     Ok(items)
 }
 

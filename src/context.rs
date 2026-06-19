@@ -140,6 +140,7 @@ pub struct ContextSection {
 pub struct ContextItem {
     pub drawer_id: String,
     pub source_file: String,
+    pub memory_kind: MemoryKind,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub card_id: Option<String>,
@@ -504,10 +505,27 @@ fn tiered_to_context_item(
     item: &TieredItem,
     request: &ContextRequest,
 ) -> Result<ContextItem> {
-    let trigger_hints = db
+    let drawer = db
         .get_drawer(&item.drawer_id)
-        .map_err(ContextError::LoadDrawer)?
-        .and_then(|d| d.trigger_hints);
+        .map_err(ContextError::LoadDrawer)?;
+    let memory_kind = drawer
+        .as_ref()
+        .map(|drawer| drawer.memory_kind)
+        .unwrap_or(MemoryKind::Evidence);
+    let tier = drawer.as_ref().and_then(|drawer| drawer.tier.clone());
+    let status = drawer.as_ref().and_then(|drawer| drawer.status.clone());
+    let text = if memory_kind.prefers_statement_text() {
+        drawer
+            .as_ref()
+            .and_then(|drawer| drawer.statement.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(item.content.as_str())
+            .to_string()
+    } else {
+        item.content.clone()
+    };
+    let trigger_hints = drawer.and_then(|drawer| drawer.trigger_hints);
     // Derive anchor context using anchors built from request.
     let anchors = context_anchors(request)?;
     let first = anchors.into_iter().next();
@@ -517,10 +535,11 @@ fn tiered_to_context_item(
     Ok(ContextItem {
         drawer_id: item.drawer_id.clone(),
         source_file: item.source_file.clone(),
-        text: item.content.clone(),
+        memory_kind,
+        text,
         card_id: None,
-        tier: None,
-        status: None,
+        tier,
+        status,
         anchor_kind,
         anchor_id,
         parent_anchor_id: None,
@@ -901,19 +920,21 @@ fn context_item_from_result(db: &Database, result: SearchResult) -> Result<Conte
         .get_drawer(&result.drawer_id)
         .map_err(ContextError::LoadDrawer)?
         .and_then(|drawer| drawer.trigger_hints);
-    let text = match result.memory_kind {
-        MemoryKind::Knowledge => result
+    let text = if result.memory_kind.prefers_statement_text() {
+        result
             .statement
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(result.content.as_str())
-            .to_string(),
-        MemoryKind::Evidence | MemoryKind::ProfileFact => result.content,
+            .to_string()
+    } else {
+        result.content
     };
     Ok(ContextItem {
         drawer_id: result.drawer_id,
         source_file: result.source_file,
+        memory_kind: result.memory_kind,
         text,
         tier: result.tier,
         status: result.status,
@@ -979,6 +1000,7 @@ fn context_item_from_card(db: &Database, card: KnowledgeCard) -> Result<ContextI
     Ok(ContextItem {
         drawer_id: card.id.clone(),
         source_file: format!("knowledge-card://{}", card.id),
+        memory_kind: MemoryKind::Knowledge,
         text: card.statement.clone(),
         card_id: Some(card.id),
         tier: Some(card.tier),
@@ -1021,11 +1043,7 @@ fn active_statuses() -> &'static [KnowledgeStatus] {
 }
 
 fn memory_kind_slug(value: &MemoryKind) -> &'static str {
-    match value {
-        MemoryKind::Evidence => "evidence",
-        MemoryKind::Knowledge => "knowledge",
-        MemoryKind::ProfileFact => "profile_fact",
-    }
+    value.as_str()
 }
 
 fn domain_slug(value: &MemoryDomain) -> &'static str {

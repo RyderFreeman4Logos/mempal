@@ -1241,7 +1241,7 @@ fn validate_ingest_request(
     let derived_anchor = validate_anchor_metadata(request, &domain, source_type)?;
 
     match memory_kind {
-        MemoryKind::Evidence | MemoryKind::ProfileFact => {
+        MemoryKind::Evidence => {
             if statement.is_some()
                 || tier.is_some()
                 || !supporting_refs.is_empty()
@@ -1260,7 +1260,7 @@ fn validate_ingest_request(
                 !matches!(value, KnowledgeStatus::Active | KnowledgeStatus::Canonical)
             }) {
                 return Err(ErrorData::invalid_params(
-                    "evidence/profile_fact status must be active or canonical",
+                    "evidence status must be active or canonical",
                     None,
                 ));
             }
@@ -1285,6 +1285,55 @@ fn validate_ingest_request(
                 verification_refs: Vec::new(),
                 scope_constraints: None,
                 trigger_hints: None,
+            })
+        }
+        MemoryKind::AtomicFact
+        | MemoryKind::Decision
+        | MemoryKind::Case
+        | MemoryKind::Skill
+        | MemoryKind::Foresight
+        | MemoryKind::ProfileFact
+        | MemoryKind::ProfileTrait => {
+            if tier.is_some()
+                || !supporting_refs.is_empty()
+                || !counterexample_refs.is_empty()
+                || !teaching_refs.is_empty()
+                || !verification_refs.is_empty()
+            {
+                return Err(ErrorData::invalid_params(
+                    "typed record drawer does not allow knowledge-only tier/ref fields",
+                    None,
+                ));
+            }
+            if status.as_ref().is_some_and(|value| {
+                !matches!(value, KnowledgeStatus::Active | KnowledgeStatus::Canonical)
+            }) {
+                return Err(ErrorData::invalid_params(
+                    "typed record status must be active or canonical",
+                    None,
+                ));
+            }
+
+            Ok(ValidatedIngestMetadata {
+                memory_kind,
+                domain,
+                field,
+                is_pinned: request.is_pinned.unwrap_or(false),
+                anchor_kind: derived_anchor.anchor_kind,
+                anchor_id: derived_anchor.anchor_id,
+                parent_anchor_id: derived_anchor.parent_anchor_id,
+                provenance: Some(
+                    provenance.unwrap_or_else(|| anchor::bootstrap_provenance(source_type)),
+                ),
+                statement,
+                tier: None,
+                status,
+                supporting_refs: Vec::new(),
+                counterexample_refs: Vec::new(),
+                teaching_refs: Vec::new(),
+                verification_refs: Vec::new(),
+                scope_constraints,
+                trigger_hints,
             })
         }
         MemoryKind::Knowledge => {
@@ -1643,8 +1692,8 @@ fn drawer_from_ingest_metadata(
     source_confidence: SourceConfidence,
     importance: i32,
 ) -> Drawer {
-    let source_file = match metadata.memory_kind {
-        MemoryKind::Knowledge => Some(knowledge_source_file(
+    let source_file = if metadata.memory_kind.is_knowledge() {
+        Some(knowledge_source_file(
             &metadata.domain,
             &metadata.field,
             metadata.tier.as_ref().expect("validated knowledge tier"),
@@ -1652,11 +1701,12 @@ fn drawer_from_ingest_metadata(
                 .statement
                 .as_deref()
                 .expect("validated knowledge statement"),
-        )),
-        MemoryKind::Evidence | MemoryKind::ProfileFact => Some(source_file_or_synthetic(
+        ))
+    } else {
+        Some(source_file_or_synthetic(
             drawer_id,
             request.source_file.as_deref().or(request.source.as_deref()),
-        )),
+        ))
     };
 
     Drawer {
@@ -1783,12 +1833,7 @@ fn validate_tier_status(
 
 #[allow(dead_code)]
 fn parse_memory_kind(value: Option<&str>) -> std::result::Result<Option<MemoryKind>, ErrorData> {
-    parse_enum(value, "memory_kind", |normalized| match normalized {
-        "evidence" => Some(MemoryKind::Evidence),
-        "knowledge" => Some(MemoryKind::Knowledge),
-        "profile_fact" => Some(MemoryKind::ProfileFact),
-        _ => None,
-    })
+    parse_enum(value, "memory_kind", |normalized| normalized.parse().ok())
 }
 
 fn parse_domain(value: Option<&str>) -> std::result::Result<Option<MemoryDomain>, ErrorData> {
