@@ -34,15 +34,17 @@ jobs:
     needs: fmt
     runs-on: ubuntu-latest
     env:
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: ${{ matrix.cargo_build_jobs }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - label: default
             cargo_args: ""
+            cargo_build_jobs: 2
           - label: rest
             cargo_args: "--features rest"
+            cargo_build_jobs: 1
     steps:
       - uses: actions/checkout@v5
 
@@ -63,7 +65,12 @@ jobs:
         run: cargo clean
 
       - name: cargo test --workspace ${{ matrix.cargo_args }}
+        if: matrix.label == 'default'
         run: cargo test --workspace ${{ matrix.cargo_args }}
+
+      - name: cargo test --workspace --features rest in target batches
+        if: matrix.label == 'rest'
+        run: bash scripts/ci/rest-tests.sh
 
       - name: Clear test artifacts before release build
         run: cargo clean
