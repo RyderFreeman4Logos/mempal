@@ -40,6 +40,7 @@ pub mod knowledge_distill;
 pub mod knowledge_gate;
 pub mod knowledge_lifecycle;
 pub mod llm;
+pub mod markdown_export;
 pub mod mcp;
 pub mod observability;
 pub mod process_diagnostics;
