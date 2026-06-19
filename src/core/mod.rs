@@ -2,6 +2,7 @@
 
 pub mod anchor;
 pub mod async_db;
+pub mod case_skill;
 pub mod compaction;
 pub mod config;
 pub mod db;

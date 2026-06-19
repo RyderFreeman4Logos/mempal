@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const SKILLS_SCHEMA_MIN_FORK_EXT_VERSION: u32 = 13;
+const CASE_BACKED_PATTERN_MODEL_ID: &str = "case-backed-skill-v1";
+const CASE_BACKED_PATTERN_TAG: &str = "case-backed-skill";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +97,20 @@ pub struct PromoteArgs<'a> {
     pub trigger_description: &'a str,
     pub skill_min_sessions: usize,
     pub project_id: Option<&'a str>,
+}
+
+pub struct ProposeSkillFromExemplarsArgs<'a> {
+    pub pattern_id: &'a str,
+    pub name: &'a str,
+    pub trigger_description: &'a str,
+    pub exemplar_ids: &'a [String],
+    pub project_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProposedSkill {
+    pub skill: Skill,
+    pub created: bool,
 }
 
 fn now_ms() -> i64 {
@@ -216,6 +232,165 @@ pub fn promote_pattern_to_skill(
         updated_at: now,
         project_id: args.project_id.map(str::to_string),
     })
+}
+
+/// Create or return a probationary skill backed by explicit exemplar drawers.
+///
+/// This is used by deterministic procedural-memory proposals that already have
+/// verified exemplar case ids but did not originate from the vector pattern
+/// induction table. The resulting row still uses the normal skill lifecycle:
+/// list, show, adopt, reject, retire, and active promotion all operate on the
+/// same `skills` table.
+pub fn propose_skill_from_exemplars(
+    conn: &Connection,
+    args: &ProposeSkillFromExemplarsArgs<'_>,
+) -> rusqlite::Result<ProposedSkill> {
+    with_immediate_transaction(conn, || {
+        propose_skill_from_exemplars_transaction(conn, args)
+    })
+}
+
+fn propose_skill_from_exemplars_transaction(
+    conn: &Connection,
+    args: &ProposeSkillFromExemplarsArgs<'_>,
+) -> rusqlite::Result<ProposedSkill> {
+    let now = now_ms();
+    ensure_case_backed_pattern(conn, args, now)?;
+
+    let existing = conn
+        .query_row(
+            "SELECT skill_id FROM skills WHERE pattern_id = ?1 AND status IN ('probationary', 'active') ORDER BY updated_at DESC LIMIT 1",
+            [args.pattern_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(skill_id) = existing {
+        let skill = get_skill(conn, &skill_id)?.ok_or(rusqlite::Error::InvalidQuery)?;
+        return Ok(ProposedSkill {
+            skill,
+            created: false,
+        });
+    }
+
+    let skill_id = new_skill_id();
+    let exemplar_ids_json = serde_json::to_string(args.exemplar_ids)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+
+    conn.execute(
+        r#"
+        INSERT INTO skills (
+            skill_id, name, trigger_description, pattern_id, exemplar_ids,
+            adoption_count, rejection_count, status, promoted_at, updated_at, project_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 'probationary', ?6, ?6, ?7)
+        "#,
+        params![
+            skill_id,
+            args.name,
+            args.trigger_description,
+            args.pattern_id,
+            exemplar_ids_json,
+            now,
+            args.project_id,
+        ],
+    )?;
+
+    Ok(ProposedSkill {
+        skill: Skill {
+            skill_id,
+            name: args.name.to_string(),
+            trigger_description: args.trigger_description.to_string(),
+            pattern_id: args.pattern_id.to_string(),
+            exemplar_ids: args.exemplar_ids.to_vec(),
+            adoption_count: 0,
+            rejection_count: 0,
+            status: SkillStatus::Probationary,
+            promoted_at: now,
+            updated_at: now,
+            project_id: args.project_id.map(str::to_string),
+        },
+        created: true,
+    })
+}
+
+fn with_immediate_transaction<T>(
+    conn: &Connection,
+    f: impl FnOnce() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match f() {
+        Ok(value) => {
+            if let Err(error) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn ensure_case_backed_pattern(
+    conn: &Connection,
+    args: &ProposeSkillFromExemplarsArgs<'_>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let exemplar_ids_json = serde_json::to_string(args.exemplar_ids)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    let topic_tags_json = serde_json::to_string(&[CASE_BACKED_PATTERN_TAG])
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    let signature = vec_to_blob(&case_backed_pattern_signature(args.pattern_id));
+    let exemplar_count = args.exemplar_ids.len() as i64;
+
+    conn.execute(
+        r#"
+        INSERT INTO patterns (
+            pattern_id, signature, exemplar_ids, exemplar_count,
+            session_ids, session_count, topic_tags, model_id,
+            status, first_seen_at, updated_at, project_id
+        ) VALUES (?1, ?2, ?3, ?4, ?3, ?4, ?5, ?6, 'active', ?7, ?7, ?8)
+        ON CONFLICT(pattern_id) DO UPDATE SET
+            signature = excluded.signature,
+            exemplar_ids = excluded.exemplar_ids,
+            exemplar_count = excluded.exemplar_count,
+            session_ids = excluded.session_ids,
+            session_count = excluded.session_count,
+            topic_tags = excluded.topic_tags,
+            model_id = excluded.model_id,
+            status = 'active',
+            updated_at = excluded.updated_at,
+            project_id = excluded.project_id
+        "#,
+        params![
+            args.pattern_id,
+            signature,
+            exemplar_ids_json,
+            exemplar_count,
+            topic_tags_json,
+            CASE_BACKED_PATTERN_MODEL_ID,
+            now,
+            args.project_id,
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn case_backed_pattern_signature(pattern_id: &str) -> Vec<f32> {
+    let digest = blake3::hash(pattern_id.as_bytes());
+    let mut values = digest.as_bytes()[..8]
+        .iter()
+        .map(|byte| f32::from(*byte) + 1.0)
+        .collect::<Vec<_>>();
+    let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm != 0.0 {
+        for value in &mut values {
+            *value /= norm;
+        }
+    }
+    values
 }
 
 /// Record an adoption signal. Returns new status after the signal.
@@ -455,7 +630,9 @@ pub fn get_skill(conn: &Connection, skill_id: &str) -> rusqlite::Result<Option<S
 }
 
 /// Load active skills for context injection into T1.
-/// Filters by cosine similarity between query_vector and the pattern signature.
+/// Pattern-backed skills are filtered by cosine similarity to their signature.
+/// Case-backed skills keep a deterministic pattern row but use explicit
+/// adoption, not query-vector similarity, as the activation signal.
 /// Returns skills ordered by eta DESC.
 pub fn load_active_skills_for_context(
     conn: &Connection,
@@ -463,11 +640,11 @@ pub fn load_active_skills_for_context(
     query_vector: &[f32],
     similarity_threshold: f32,
 ) -> rusqlite::Result<Vec<SkillForContext>> {
-    // Fetch all active skills (with pattern signatures).
+    // Fetch all active skills with pattern signatures.
     let mut stmt = conn.prepare(
         r#"
         SELECT s.skill_id, s.name, s.trigger_description, s.exemplar_ids,
-               s.adoption_count, s.rejection_count, p.signature
+               s.adoption_count, s.rejection_count, p.signature, p.model_id
         FROM skills s
         JOIN patterns p ON p.pattern_id = s.pattern_id
         WHERE s.status = 'active'
@@ -485,6 +662,7 @@ pub fn load_active_skills_for_context(
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -500,7 +678,19 @@ pub fn load_active_skills_for_context(
                 adoption,
                 rejection,
                 sig_blob,
+                model_id,
             )| {
+                if model_id.as_deref() == Some(CASE_BACKED_PATTERN_MODEL_ID) {
+                    return Some(SkillForContext {
+                        skill_id,
+                        name,
+                        trigger_description,
+                        eta: compute_eta(adoption, rejection),
+                        exemplar_count: serde_json::from_str::<Vec<String>>(&exemplar_json)
+                            .map(|ids| ids.len())
+                            .unwrap_or_default(),
+                    });
+                }
                 let sig = blob_to_vec(&sig_blob);
                 let sim = if query_vector.is_empty() || sig.is_empty() {
                     0.0f32
@@ -530,6 +720,13 @@ pub fn load_active_skills_for_context(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(skills)
+}
+
+fn vec_to_blob(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }
 
 fn blob_to_vec(bytes: &[u8]) -> Vec<f32> {

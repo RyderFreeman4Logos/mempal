@@ -117,6 +117,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+mod case_skill;
 mod insights;
 mod longmemeval;
 mod patterns;
@@ -806,7 +807,13 @@ enum Commands {
         #[command(subcommand)]
         command: patterns::PatternsCommands,
     },
-    /// Skill management (list, show, promote, adopt, reject, retire).
+    /// Case procedural memory (open, close).
+    Case {
+        #[command(subcommand)]
+        command: case_skill::CaseCommands,
+    },
+    /// Skill management (list, show, promote, propose, adopt, reject, retire).
+    #[command(alias = "skill")]
     Skills {
         #[command(subcommand)]
         command: skills::SkillsCommands,
@@ -3778,6 +3785,7 @@ fn run() -> Result<()> {
             block_on_result(checkpoint_command(&db, config.as_ref(), command))
         }
         Commands::Patterns { command } => patterns::run_command(config.as_ref(), command),
+        Commands::Case { command } => case_skill::run_command(config.as_ref(), command),
         Commands::Skills { command } => skills::run_command(config.as_ref(), command),
         Commands::Repair { command } => repair_cli::run_command(config.as_ref(), command),
         Commands::Xurl { command } => {
