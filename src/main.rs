@@ -139,6 +139,7 @@ struct SearchCommandOptions<'a> {
     query: &'a str,
     wing: Option<&'a str>,
     room: Option<&'a str>,
+    session: Option<&'a str>,
     filters: SearchFilters,
     top_k: usize,
     project: Option<&'a str>,
@@ -211,6 +212,17 @@ struct RollbackCommandOptions<'a> {
     json: bool,
 }
 
+fn resolve_room_session_scope(room: Option<&str>, session: Option<&str>) -> Result<Option<String>> {
+    match (room, session) {
+        (Some(room), Some(session)) if room != session => {
+            bail!("--session conflicts with --room; session maps to the drawer room column")
+        }
+        (Some(room), _) => Ok(Some(room.to_string())),
+        (None, Some(session)) => Ok(Some(session.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
 struct ConsolidateCommandOptions<'a> {
     wing: Option<&'a str>,
     room: Option<&'a str>,
@@ -245,6 +257,8 @@ struct ContextCommandArgs {
     query: String,
     field: String,
     domain: String,
+    project: Option<String>,
+    all_projects: bool,
     cwd: Option<PathBuf>,
     format: String,
     include_evidence: bool,
@@ -360,6 +374,8 @@ enum Commands {
         #[arg(long)]
         room: Option<String>,
         #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
         memory_kind: Option<String>,
         #[arg(long)]
         domain: Option<String>,
@@ -405,6 +421,10 @@ enum Commands {
         field: String,
         #[arg(long, default_value = "project")]
         domain: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = false)]
+        all_projects: bool,
         #[arg(long)]
         cwd: Option<PathBuf>,
         #[arg(long, default_value = "plain")]
@@ -3233,6 +3253,7 @@ fn run() -> Result<()> {
             query,
             wing,
             room,
+            session,
             memory_kind,
             domain,
             field,
@@ -3254,6 +3275,7 @@ fn run() -> Result<()> {
                 query: &query,
                 wing: wing.as_deref(),
                 room: room.as_deref(),
+                session: session.as_deref(),
                 filters: SearchFilters {
                     memory_kind,
                     domain,
@@ -3282,6 +3304,8 @@ fn run() -> Result<()> {
             query,
             field,
             domain,
+            project,
+            all_projects,
             cwd,
             format,
             include_evidence,
@@ -3306,6 +3330,8 @@ fn run() -> Result<()> {
                     query,
                     field,
                     domain,
+                    project,
+                    all_projects,
                     cwd,
                     format,
                     include_evidence,
@@ -5441,6 +5467,17 @@ async fn context_command(db: &Database, config: &Config, args: ContextCommandArg
         Some(cwd) => cwd,
         None => env::current_dir().context("failed to read current directory")?,
     };
+    let project_id = if args.all_projects {
+        None
+    } else {
+        resolve_project_id(args.project.as_deref(), config, Some(cwd.as_path()))
+            .context("failed to resolve context project id")?
+    };
+    if project_id.is_none() && !args.all_projects && config.search.strict_project_isolation {
+        bail!(
+            "no project scope resolved, isolation strict; pass --all-projects to opt into all-project context"
+        );
+    }
     let trigger = args.trigger.as_deref().map(|s| match s {
         "on_demand" => mempal::search::tiered::ContextTrigger::OnDemand,
         "repair" => mempal::search::tiered::ContextTrigger::Repair,
@@ -5459,7 +5496,7 @@ async fn context_command(db: &Database, config: &Config, args: ContextCommandArg
             include_cards: args.include_cards,
             max_items: args.max_items,
             dao_tian_limit: args.dao_tian_limit,
-            project_id: config.project.id.clone(),
+            project_id,
             trigger,
             context_cfg_override: None,
             include_distill_suggestions: !args.no_distill_suggestions,
@@ -5564,13 +5601,14 @@ async fn search_command(
         options.all_projects,
         config.search.strict_project_isolation,
     );
+    let room = resolve_room_session_scope(options.room, options.session)?;
     let embedder = build_embedder(config).await?;
     let outcome = search_with_all_options_outcome(
         db,
         &*embedder,
         options.query,
         options.wing,
-        options.room,
+        room.as_deref(),
         &scope,
         SearchOptions {
             filters: options.filters,

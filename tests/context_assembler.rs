@@ -348,6 +348,14 @@ fn write_context_default_config(home: &Path, include_cards_default: bool) {
     .expect("write context config");
 }
 
+fn write_strict_search_config(home: &Path) {
+    fs::write(
+        home.join(".mempal").join("config.toml"),
+        "[search]\nstrict_project_isolation = true\n",
+    )
+    .expect("write strict search config");
+}
+
 fn run_context_json(home: &Path, query: &str, extra_args: &[&str]) -> Value {
     let (endpoint, handle) = start_openai_embedding_stub(query, vector());
     write_cli_api_config(home, &endpoint);
@@ -971,7 +979,7 @@ fn test_context_json_output_exposes_stable_pack_shape() {
         tool_needs: vec!["cargo-test".to_string()],
     });
     insert_fixture(&db, &drawer);
-    let value = run_context_json(tmp.path(), "debug", &[]);
+    let value = run_context_json(tmp.path(), "debug", &["--all-projects"]);
     assert_eq!(value["query"], "debug");
     assert_eq!(value["domain"], "project");
     assert_eq!(value["field"], "general");
@@ -989,6 +997,39 @@ fn test_context_json_output_exposes_stable_pack_shape() {
     assert_eq!(item["anchor_kind"], "repo");
     assert!(item["anchor_id"].is_string());
     assert_eq!(item["trigger_hints"]["intent_tags"][0], "debugging");
+}
+
+#[test]
+fn test_cli_context_without_project_errors_when_strict() {
+    let (tmp, _db) = setup_cli_home();
+    write_strict_search_config(tmp.path());
+
+    let output = Command::new(mempal_bin())
+        .args([
+            "context",
+            "strict context query",
+            "--cwd",
+            "/",
+            "--format",
+            "json",
+        ])
+        .env("HOME", tmp.path())
+        .env_remove("MEMPAL_PROJECT_ID")
+        .output()
+        .expect("run mempal context");
+    assert!(
+        !output.status.success(),
+        "strict context without a project should fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no project scope resolved, isolation strict"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--all-projects"),
+        "stderr should mention the explicit all-projects opt-in: {stderr}"
+    );
 }
 
 #[test]
@@ -1013,7 +1054,11 @@ fn test_cli_context_dao_tian_limit_zero_omits_section() {
         insert_fixture(&db, &item);
     }
 
-    let value = run_context_json(tmp.path(), "debug", &["--dao-tian-limit", "0"]);
+    let value = run_context_json(
+        tmp.path(),
+        "debug",
+        &["--all-projects", "--dao-tian-limit", "0"],
+    );
     let names: Vec<_> = value["sections"]
         .as_array()
         .expect("sections")
@@ -1046,7 +1091,11 @@ fn test_cli_context_dao_tian_limit_two_allows_two_items() {
         insert_fixture(&db, &item);
     }
 
-    let value = run_context_json(tmp.path(), "debug", &["--dao-tian-limit", "2"]);
+    let value = run_context_json(
+        tmp.path(),
+        "debug",
+        &["--all-projects", "--dao-tian-limit", "2"],
+    );
     let dao_tian = value["sections"]
         .as_array()
         .expect("sections")
@@ -1399,7 +1448,7 @@ fn test_cli_context_json_includes_distill_suggestions() {
             &evidence_in_field(&format!("drawer_auth_{index}"), "auth"),
         );
     }
-    let json = run_context_json(home.path(), "debug", &[]);
+    let json = run_context_json(home.path(), "debug", &["--all-projects"]);
     let suggestions = json
         .get("distill_suggestions")
         .and_then(|value| value.as_array())

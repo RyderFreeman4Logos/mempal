@@ -12,6 +12,7 @@ use crate::core::{
     db::Database,
     db::DbError,
     patterns::PatternSummary,
+    project::ProjectSearchScope,
     skills::SkillForContext,
     types::{
         AnchorKind, KnowledgeCard, KnowledgeCardFilter, KnowledgeEvidenceLink,
@@ -24,7 +25,9 @@ use crate::search::tiered::{
     BudgetUsed, ContextTrigger, T1Params, T3Params, TieredItem, compute_budgets, fetch_t1,
     fetch_t3, fetch_t3_kg, now_unix_secs,
 };
-use crate::search::{SearchError, SearchFilters, SearchOptions, search_with_vector_options};
+use crate::search::{
+    SearchError, SearchFilters, SearchOptions, search_with_vector_and_scope_options,
+};
 
 pub type Result<T> = std::result::Result<T, ContextError>;
 
@@ -405,11 +408,14 @@ fn search_t2_hybrid(
             status: None,
             anchor_kind: Some(anchor_kind_slug(&anchor.anchor_kind).to_string()),
         };
-        let results = search_with_vector_options(
+        let scope =
+            ProjectSearchScope::from_request(request.project_id.clone(), false, false, false);
+        let results = search_with_vector_and_scope_options(
             db,
             &request.query,
             query_vector,
             route.clone(),
+            &scope,
             SearchOptions {
                 filters,
                 with_neighbors: false,
@@ -872,11 +878,14 @@ fn search_context_candidates(
         anchor_kind: Some(anchor_kind_slug(&query.anchor.anchor_kind).to_string()),
     };
 
-    search_with_vector_options(
+    let scope =
+        ProjectSearchScope::from_request(query.request.project_id.clone(), false, false, false);
+    search_with_vector_and_scope_options(
         db,
         &query.request.query,
         query.query_vector,
         query.route.clone(),
+        &scope,
         SearchOptions {
             filters,
             with_neighbors: false,

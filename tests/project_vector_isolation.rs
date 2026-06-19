@@ -1770,6 +1770,7 @@ async fn test_search_excludes_other_project_fts() {
         .conn()
         .prepare(&build_fts_runtime_sql())
         .expect("prepare fts sql");
+    assert_eq!(stmt.parameter_count(), 12);
     let ids = stmt
         .query_map(
             params![
@@ -1778,7 +1779,13 @@ async fn test_search_excludes_other_project_fts() {
                 Option::<String>::None,
                 "project",
                 "proj-A",
-                10_i64
+                10_i64,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
             ],
             |row| row.get::<_, String>(0),
         )
@@ -2662,4 +2669,51 @@ async fn test_mcp_search_without_project_warns_and_returns_empty_when_strict() {
         warning_messages.contains(&"no project scope resolved, isolation strict"),
         "missing strict isolation warning: {structured}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mcp_context_without_project_errors_when_strict() {
+    let _guard = config_guard().await;
+    let env = SearchEnv::new(None, true);
+    insert_projected_drawer(
+        &env.db_path,
+        "drawer-proj-a",
+        "strict context query",
+        "code",
+        Some("room"),
+        Some("proj-A"),
+        &[0.1, 0.2, 0.3],
+    );
+    insert_projected_drawer(
+        &env.db_path,
+        "drawer-proj-b",
+        "strict context query",
+        "code",
+        Some("room"),
+        Some("proj-B"),
+        &[0.1, 0.2, 0.3],
+    );
+
+    let error = env
+        .server()
+        .context_json_for_test(json!({
+            "query": "strict context query",
+            "include_evidence": true
+        }))
+        .await
+        .expect_err("strict context without a project must fail closed");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("no project scope resolved, isolation strict"),
+        "unexpected context error: {message}"
+    );
+
+    env.server()
+        .context_json_for_test(json!({
+            "query": "strict context query",
+            "include_evidence": true,
+            "scope": { "all_projects": true }
+        }))
+        .await
+        .expect("scope.all_projects=true should explicitly opt into all-project context");
 }

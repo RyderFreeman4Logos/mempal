@@ -249,6 +249,25 @@ pub enum DbError {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FtsMetadataFilters<'a> {
+    pub memory_kind: Option<&'a str>,
+    pub domain: Option<&'a str>,
+    pub field: Option<&'a str>,
+    pub tier: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub anchor_kind: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FtsSearchScope<'a> {
+    pub wing: Option<&'a str>,
+    pub room: Option<&'a str>,
+    pub project_mode: &'a str,
+    pub project_id: Option<&'a str>,
+    pub filters: FtsMetadataFilters<'a>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct ReindexSourceScopeSummary {
     pub(crate) drawer_count: u64,
@@ -3816,6 +3835,25 @@ impl Database {
         project_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, f64)>, DbError> {
+        self.search_fts_filtered(
+            query,
+            FtsSearchScope {
+                wing,
+                room,
+                project_mode,
+                project_id,
+                filters: FtsMetadataFilters::default(),
+            },
+            limit,
+        )
+    }
+
+    pub fn search_fts_filtered(
+        &self,
+        query: &str,
+        scope: FtsSearchScope<'_>,
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, DbError> {
         let Some(match_query) = build_fts_match_query(query) else {
             return Ok(Vec::new());
         };
@@ -3828,11 +3866,17 @@ impl Database {
             .query_map(
                 (
                     match_query.as_str(),
-                    wing,
-                    room,
-                    project_mode,
-                    project_id,
+                    scope.wing,
+                    scope.room,
+                    scope.project_mode,
+                    scope.project_id,
                     limit,
+                    scope.filters.memory_kind,
+                    scope.filters.domain,
+                    scope.filters.field,
+                    scope.filters.tier,
+                    scope.filters.status,
+                    scope.filters.anchor_kind,
                 ),
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
             )?
