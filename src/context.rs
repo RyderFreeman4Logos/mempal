@@ -11,6 +11,7 @@ use crate::core::{
     config::ContextConfig,
     db::Database,
     db::DbError,
+    foresight::{self, ForesightError, ForesightListRequest},
     patterns::PatternSummary,
     project::ProjectSearchScope,
     skills::SkillForContext,
@@ -45,6 +46,8 @@ pub enum ContextError {
     LoadDrawer(#[source] DbError),
     #[error("failed to load context card metadata")]
     LoadCard(#[source] DbError),
+    #[error("failed to load foresight context")]
+    Foresight(#[source] ForesightError),
     #[error("tiered retrieval failed")]
     Tiered(#[source] crate::search::tiered::TieredError),
 }
@@ -191,6 +194,17 @@ struct CardAppendState<'a> {
     tier_remaining: &'a mut usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ForesightContextBudget {
+    max_items: usize,
+    remaining_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ForesightContextUsage {
+    tokens: usize,
+}
+
 pub async fn assemble_context<E: Embedder + ?Sized>(
     db: &Database,
     embedder: &E,
@@ -327,10 +341,28 @@ fn assemble_tiered(
         t1_tokens: t1_tokens_used,
         t2_tokens: t2_tokens_used,
         t3_tokens: t3_tokens_used,
+        foresight_tokens: 0,
     };
 
     // Build legacy sections for backward compat.
-    let sections = build_tiered_sections(db, &t1_items, &t2_results, &t3_all, &request)?;
+    let mut sections = build_tiered_sections(db, &t1_items, &t2_results, &t3_all, &request)?;
+    let foresight_usage = prepend_due_foresight_section(
+        db,
+        &request,
+        &mut sections,
+        ForesightContextBudget {
+            max_items: request.max_items,
+            remaining_tokens: Some(
+                cfg.budget
+                    .total_tokens
+                    .saturating_sub(budget_used.total_tokens()),
+            ),
+        },
+    )?;
+    let budget_used = BudgetUsed {
+        foresight_tokens: foresight_usage.tokens,
+        ..budget_used
+    };
 
     let active_skills = load_active_skills(
         db,
@@ -695,6 +727,16 @@ fn assemble_flat(
         }
     }
 
+    prepend_due_foresight_section(
+        db,
+        &request,
+        &mut sections,
+        ForesightContextBudget {
+            max_items: request.max_items,
+            remaining_tokens: None,
+        },
+    )?;
+
     let recurring_themes = load_recurring_themes(db, request.project_id.as_deref());
     let repair_warnings = load_repair_warnings(db, request.project_id.as_deref());
     let active_skills = load_active_skills(
@@ -1009,6 +1051,148 @@ fn context_item_from_card(db: &Database, card: KnowledgeCard) -> Result<ContextI
         anchor_id: card.anchor_id,
         parent_anchor_id: card.parent_anchor_id,
         trigger_hints: card.trigger_hints,
+        evidence_citations,
+    })
+}
+
+fn prepend_due_foresight_section(
+    db: &Database,
+    request: &ContextRequest,
+    sections: &mut Vec<ContextSection>,
+    budget: ForesightContextBudget,
+) -> Result<ForesightContextUsage> {
+    let max_foresight_items = request.max_items.min(5);
+    if max_foresight_items == 0 {
+        return Ok(ForesightContextUsage::default());
+    }
+
+    let anchors = context_anchors(request)?;
+    let scope = ProjectSearchScope::from_request(request.project_id.clone(), false, false, false);
+    let mut seen = sections
+        .iter()
+        .flat_map(|section| section.items.iter().map(|item| item.drawer_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut items = Vec::new();
+    let mut usage = ForesightContextUsage::default();
+    let mut remaining_tokens = budget.remaining_tokens;
+    for anchor in anchors {
+        let foresights = foresight::list_foresights(
+            db,
+            ForesightListRequest {
+                scope: scope.clone(),
+                domain: Some(anchor.domain),
+                field: Some(request.field.clone()),
+                anchor_kind: Some(anchor.anchor_kind),
+                anchor_id: Some(anchor.anchor_id),
+                include_pending: false,
+                include_resolved: false,
+                include_expired: false,
+                now_unix: now_unix_secs(),
+                limit: Some(max_foresight_items),
+            },
+        )
+        .map_err(ContextError::Foresight)?;
+        for foresight in foresights {
+            if !seen.insert(foresight.drawer_id.clone()) {
+                continue;
+            }
+            let item = context_item_from_foresight(db, foresight)?;
+            let item_tokens = crate::embed::estimate_tokens(&item.text);
+            if remaining_tokens.is_some_and(|tokens| item_tokens > tokens) {
+                continue;
+            }
+            if let Some(tokens) = remaining_tokens.as_mut() {
+                *tokens = tokens.saturating_sub(item_tokens);
+            }
+            usage.tokens += item_tokens;
+            items.push(item);
+            if items.len() >= max_foresight_items {
+                break;
+            }
+        }
+        if items.len() >= max_foresight_items {
+            break;
+        }
+    }
+
+    if items.is_empty() {
+        return Ok(usage);
+    }
+
+    let due_ids = items
+        .iter()
+        .map(|item| item.drawer_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for section in sections.iter_mut() {
+        section
+            .items
+            .retain(|item| !due_ids.contains(item.drawer_id.as_str()));
+    }
+    sections.retain(|section| !section.items.is_empty());
+    trim_context_sections_to_item_cap(sections, budget.max_items.saturating_sub(items.len()));
+    sections.insert(
+        0,
+        ContextSection {
+            name: "foresight".to_string(),
+            items,
+        },
+    );
+    Ok(usage)
+}
+
+fn trim_context_sections_to_item_cap(sections: &mut Vec<ContextSection>, max_items: usize) {
+    let mut remaining = max_items;
+    for section in sections.iter_mut() {
+        if remaining >= section.items.len() {
+            remaining -= section.items.len();
+        } else {
+            section.items.truncate(remaining);
+            remaining = 0;
+        }
+    }
+    sections.retain(|section| !section.items.is_empty());
+}
+
+fn context_item_from_foresight(
+    db: &Database,
+    foresight: foresight::Foresight,
+) -> Result<ContextItem> {
+    let mut text = format!(
+        "{} [due_at={} trigger={}]",
+        foresight.statement, foresight.due_at, foresight.trigger_condition
+    );
+    if let Some(reason) = foresight.reason.as_deref() {
+        text.push_str(" reason=");
+        text.push_str(reason);
+    }
+    let evidence_citations = foresight::evidence_role_refs(&foresight)
+        .into_iter()
+        .map(|(role, drawer_id)| {
+            let source_file = db
+                .get_drawer(&drawer_id)
+                .map_err(ContextError::LoadDrawer)?
+                .and_then(|drawer| drawer.source_file)
+                .unwrap_or_else(|| format!("drawer://{drawer_id}"));
+            Ok(ContextEvidenceCitation {
+                evidence_drawer_id: drawer_id,
+                role,
+                source_file,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ContextItem {
+        drawer_id: foresight.drawer_id,
+        source_file: foresight.source_file,
+        memory_kind: MemoryKind::Foresight,
+        text,
+        card_id: None,
+        tier: None,
+        status: Some(KnowledgeStatus::Active),
+        anchor_kind: foresight.anchor_kind,
+        anchor_id: foresight.anchor_id,
+        parent_anchor_id: foresight.parent_anchor_id,
+        trigger_hints: None,
         evidence_citations,
     })
 }

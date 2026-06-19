@@ -9,6 +9,7 @@ pub mod db;
 pub use async_db::AsyncDb;
 pub mod decay;
 pub mod design_insights;
+pub mod foresight;
 pub mod hot_reload;
 pub mod patterns;
 pub mod phase3;

@@ -60,11 +60,12 @@ pub struct BudgetUsed {
     pub t1_tokens: usize,
     pub t2_tokens: usize,
     pub t3_tokens: usize,
+    pub foresight_tokens: usize,
 }
 
 impl BudgetUsed {
     pub fn total_tokens(&self) -> usize {
-        self.t1_tokens + self.t2_tokens + self.t3_tokens
+        self.t1_tokens + self.t2_tokens + self.t3_tokens + self.foresight_tokens
     }
 }
 

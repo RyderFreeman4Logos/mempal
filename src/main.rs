@@ -118,6 +118,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 mod case_skill;
+mod foresight_cli;
 mod insights;
 mod longmemeval;
 mod patterns;
@@ -811,6 +812,11 @@ enum Commands {
     Case {
         #[command(subcommand)]
         command: case_skill::CaseCommands,
+    },
+    /// Future-bound memory signals (add, list, resolve).
+    Foresight {
+        #[command(subcommand)]
+        command: foresight_cli::ForesightCommands,
     },
     /// Skill management (list, show, promote, propose, adopt, reject, retire).
     #[command(alias = "skill")]
@@ -3786,6 +3792,9 @@ fn run() -> Result<()> {
         }
         Commands::Patterns { command } => patterns::run_command(config.as_ref(), command),
         Commands::Case { command } => case_skill::run_command(config.as_ref(), command),
+        Commands::Foresight { command } => {
+            foresight_cli::run_command(&db, config.as_ref(), command)
+        }
         Commands::Skills { command } => skills::run_command(config.as_ref(), command),
         Commands::Repair { command } => repair_cli::run_command(config.as_ref(), command),
         Commands::Xurl { command } => {
