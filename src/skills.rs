@@ -4,8 +4,10 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 
 use mempal::core::{
+    case_skill::{SkillProposalOptions, propose_skills_from_cases},
     config::Config,
     db::Database,
+    project::resolve_project_id,
     skills::{
         PromoteArgs, PromotionError, adopt_skill, get_skill, list_skills, promote_pattern_to_skill,
         reject_skill, retire_skill, skills_table_exists,
@@ -47,6 +49,30 @@ pub enum SkillsCommands {
         /// Optional project scope.
         #[arg(long)]
         project: Option<String>,
+    },
+    /// Propose probationary skills from repeated verified cases.
+    Propose {
+        /// Build proposals from memory_kind=case drawers.
+        #[arg(long = "from-cases")]
+        from_cases: bool,
+        /// Minimum successful verified cases required per procedure key.
+        #[arg(long = "min-support", required = true)]
+        min_support: usize,
+        /// Minimum verification evidence refs required per successful case.
+        #[arg(long = "min-verification-refs", default_value_t = 1)]
+        min_verification_refs: usize,
+        /// Optional case wing filter.
+        #[arg(long)]
+        wing: Option<String>,
+        /// Optional project scope.
+        #[arg(long)]
+        project: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Show proposals without writing skill drawers.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Record adoption of a skill (positive signal).
     Adopt {
@@ -93,6 +119,27 @@ pub fn run_command(config: &Config, command: SkillsCommands) -> Result<()> {
             &name,
             &trigger,
             project.as_deref(),
+        ),
+        SkillsCommands::Propose {
+            from_cases,
+            min_support,
+            min_verification_refs,
+            wing,
+            project,
+            json,
+            dry_run,
+        } => cmd_propose_from_cases(
+            &db,
+            config,
+            ProposeFromCasesCliArgs {
+                from_cases,
+                min_support,
+                min_verification_refs,
+                wing,
+                project,
+                json,
+                dry_run,
+            },
         ),
         SkillsCommands::Adopt { skill_id } => cmd_adopt(&db, config, &skill_id),
         SkillsCommands::Reject { skill_id } => cmd_reject(&db, config, &skill_id),
@@ -177,11 +224,14 @@ fn cmd_promote(
     trigger: &str,
     project: Option<&str>,
 ) -> Result<()> {
+    let current_dir = std::env::current_dir().ok();
+    let project_id = resolve_project_id(project, config, current_dir.as_deref())
+        .context("failed to resolve skill project id")?;
     let args = PromoteArgs {
         pattern_id,
         name,
         trigger_description: trigger,
-        project_id: project,
+        project_id: project_id.as_deref(),
         skill_min_sessions: config.skills.skill_min_sessions,
     };
     match promote_pattern_to_skill(db.conn(), &args) {
@@ -207,6 +257,72 @@ fn cmd_promote(
         Err(PromotionError::Db(e)) => {
             bail!("database error during promotion: {e}");
         }
+    }
+    Ok(())
+}
+
+struct ProposeFromCasesCliArgs {
+    from_cases: bool,
+    min_support: usize,
+    min_verification_refs: usize,
+    wing: Option<String>,
+    project: Option<String>,
+    json: bool,
+    dry_run: bool,
+}
+
+fn cmd_propose_from_cases(
+    db: &Database,
+    config: &Config,
+    args: ProposeFromCasesCliArgs,
+) -> Result<()> {
+    if !args.from_cases {
+        bail!("skills propose currently requires --from-cases");
+    }
+    let current_dir = std::env::current_dir().ok();
+    let project_id = resolve_project_id(args.project.as_deref(), config, current_dir.as_deref())
+        .context("failed to resolve skill proposal project id")?;
+    let outcome = propose_skills_from_cases(
+        db,
+        SkillProposalOptions {
+            from_cases: args.from_cases,
+            min_support: args.min_support,
+            min_verification_refs: args.min_verification_refs,
+            wing: args.wing,
+            project_id,
+            dry_run: args.dry_run,
+        },
+    )
+    .context("failed to propose skills from cases")?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&outcome)
+                .context("failed to serialize skill proposals")?
+        );
+        return Ok(());
+    }
+
+    if outcome.proposals.is_empty() {
+        println!("no case-backed skill proposals met the support threshold");
+        return Ok(());
+    }
+
+    println!(
+        "{:<38} {:>7} {:>7} {:>7}  PROCEDURE",
+        "SKILL_ID", "SUPPORT", "VERIFY", "COUNTER"
+    );
+    println!("{}", "-".repeat(100));
+    for proposal in &outcome.proposals {
+        println!(
+            "{:<38} {:>7} {:>7} {:>7}  {}",
+            proposal.skill_id.as_deref().unwrap_or("(dry-run)"),
+            proposal.support_count,
+            proposal.verification_ref_count,
+            proposal.counterexample_count,
+            proposal.procedure_key
+        );
     }
     Ok(())
 }
