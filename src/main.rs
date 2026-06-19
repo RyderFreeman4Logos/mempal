@@ -108,6 +108,10 @@ use mempal::mcp::{
     OperationStatusRequest,
 };
 use mempal::observability;
+use mempal::reflect::{
+    ReflectionEvidenceRef, ReflectionMode, ReflectionOptions, ReflectionReport, current_unix_secs,
+    run_reflection,
+};
 use mempal::search::{SearchFilters, SearchOptions, search_with_all_options_outcome};
 use mempal::sleep::{
     NremSummary, RemSummary, SalienceSummary, SleepCycleSummary, SleepPhaseSelection,
@@ -283,6 +287,19 @@ struct RollbackOutput {
 enum WakeUpFormat {
     Aaak,
     Protocol,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReflectModeArg {
+    Deterministic,
+}
+
+impl From<ReflectModeArg> for ReflectionMode {
+    fn from(value: ReflectModeArg) -> Self {
+        match value {
+            ReflectModeArg::Deterministic => Self::Deterministic,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -606,6 +623,23 @@ enum Commands {
         salience: bool,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Report deterministic offline reflection findings without mutating memory.
+    Reflect {
+        #[arg(long, value_enum, default_value = "deterministic")]
+        mode: ReflectModeArg,
+        /// Inspect only drawers and source-backed facts in this project.
+        #[arg(long)]
+        project: Option<String>,
+        /// Maximum sample rows per report category.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// RFC3339 timestamp for deterministic temporal checks.
+        #[arg(long)]
+        now: Option<String>,
+        /// Output the full aggregate report as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Manage knowledge graph triples.
     Kg {
@@ -3565,6 +3599,21 @@ fn run() -> Result<()> {
                 dry_run,
             },
         ),
+        Commands::Reflect {
+            mode,
+            project,
+            limit,
+            now,
+            json,
+        } => reflect_command(
+            &db,
+            config.as_ref(),
+            mode,
+            project.as_deref(),
+            limit,
+            now.as_deref(),
+            json,
+        ),
         Commands::Maintenance {
             command: MaintenanceCommands::Rejudge(args),
         } => {
@@ -3871,7 +3920,8 @@ fn is_dashboard_command(command: &Commands) -> bool {
         | Commands::Tail { .. }
         | Commands::Timeline { .. }
         | Commands::Stats { .. }
-        | Commands::View { .. } => true,
+        | Commands::View { .. }
+        | Commands::Reflect { .. } => true,
         Commands::Audit { command, .. } => {
             !matches!(command, Some(AuditCommands::Cleanup { dry_run: false, .. }))
         }
@@ -6186,6 +6236,50 @@ fn sleep_command(db: &Database, config: &Config, options: SleepCommandOptions) -
     Ok(())
 }
 
+fn reflect_command(
+    db: &Database,
+    config: &Config,
+    mode: ReflectModeArg,
+    project: Option<&str>,
+    limit: usize,
+    now: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let current_dir = env::current_dir().ok();
+    let project_id = project
+        .map(|project| resolve_project_id(Some(project), config, current_dir.as_deref()))
+        .transpose()
+        .context("failed to resolve reflection project filter")?
+        .flatten();
+    let now_unix_secs = match now {
+        Some(raw) => {
+            mempal::factcheck::resolve_now(Some(raw)).context("invalid --now timestamp")?
+        }
+        None => current_unix_secs(),
+    };
+    let report = run_reflection(
+        db,
+        &ReflectionOptions {
+            mode: mode.into(),
+            project_id,
+            limit_per_category: limit,
+            now_unix_secs,
+        },
+    )
+    .context("deterministic reflection failed")?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .context("failed to serialize reflection report")?
+        );
+    } else {
+        print_reflection_report(&report);
+    }
+    Ok(())
+}
+
 async fn crystallize_command(
     db: &Database,
     config: &Config,
@@ -6382,6 +6476,103 @@ fn print_sleep_summary(summary: &SleepCycleSummary) {
         summary.conflicts_resolved_count(),
         summary.salience_scored_count()
     );
+}
+
+fn print_reflection_report(report: &ReflectionReport) {
+    println!(
+        "reflect: mode={} dry_run={} project={} generated_at_unix_secs={} limit_per_category={}",
+        report.mode.as_str(),
+        report.dry_run,
+        report.project_id.as_deref().unwrap_or("all"),
+        report.generated_at_unix_secs,
+        report.limit_per_category
+    );
+    println!(
+        "summary: duplicate_groups={} duplicate_drawers={} expired_drawers={} stale_kg_facts={} tunnel_candidates={}",
+        report.summary.duplicate_group_count,
+        report.summary.duplicate_drawer_count,
+        report.summary.expired_drawer_count,
+        report.summary.stale_kg_fact_count,
+        report.summary.tunnel_candidate_count
+    );
+
+    if !report.duplicate_candidates.is_empty() {
+        println!("duplicates:");
+        for candidate in &report.duplicate_candidates {
+            println!(
+                "  - reason={} hash_prefix={} drawers={}",
+                candidate.reason_code, candidate.content_hash_prefix, candidate.drawer_count
+            );
+            print_evidence_samples(&candidate.samples);
+        }
+    }
+    if !report.expired_drawers.is_empty() {
+        println!("expired_drawers:");
+        for candidate in &report.expired_drawers {
+            println!(
+                "  - reason={} drawer={} valid_until={} unix_secs={} downranked={} stale_penalty_applied={:.3}",
+                candidate.reason_code,
+                evidence_label(&candidate.drawer),
+                candidate.valid_until,
+                candidate.valid_until_unix_secs,
+                candidate.already_downranked,
+                candidate.stale_penalty_applied
+            );
+        }
+    }
+    if !report.stale_kg_facts.is_empty() {
+        println!("stale_kg_facts:");
+        for candidate in &report.stale_kg_facts {
+            let source = candidate
+                .source
+                .as_ref()
+                .map(evidence_label)
+                .unwrap_or_else(|| "source_drawer=<none>".to_string());
+            println!(
+                "  - reason={} triple={} valid_to={} unix_secs={} {}",
+                candidate.reason_code,
+                candidate.triple_id,
+                candidate.valid_to,
+                candidate.valid_to_unix_secs,
+                source
+            );
+        }
+    }
+    if !report.tunnel_candidates.is_empty() {
+        println!("tunnel_candidates:");
+        for candidate in &report.tunnel_candidates {
+            println!(
+                "  - reason={} room={} wings={} drawers={}",
+                candidate.reason_code,
+                candidate.room,
+                candidate.wings.join(","),
+                candidate.drawer_count
+            );
+            print_evidence_samples(&candidate.samples);
+        }
+    }
+}
+
+fn print_evidence_samples(samples: &[ReflectionEvidenceRef]) {
+    for sample in samples {
+        println!("    sample {}", evidence_label(sample));
+    }
+}
+
+fn evidence_label(evidence: &ReflectionEvidenceRef) -> String {
+    let room = evidence
+        .room
+        .as_deref()
+        .map(|room| format!("/{room}"))
+        .unwrap_or_default();
+    format!(
+        "drawer={} scope={}{} project={} source={}",
+        evidence.drawer_id,
+        evidence.wing,
+        room,
+        evidence.project_id.as_deref().unwrap_or("global"),
+        evidence.source_file.as_deref().unwrap_or("<none>")
+    )
 }
 
 fn print_nrem_summary(summary: &NremSummary) {
