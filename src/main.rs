@@ -14407,8 +14407,17 @@ fn cowork_session_close_command(
         } else {
             None
         };
+        let writer_lease = if let Some(db) = db_opt.as_ref() {
+            Some(acquire_cli_content_writer_lease(
+                db,
+                "cowork-session-close-capture",
+            )?)
+        } else {
+            None
+        };
         let capture_report = capture_handoff_to_memory(
             db_opt.as_ref(),
+            writer_lease.as_ref().map(|lease| lease.lease()),
             &home,
             &cwd,
             CoworkCaptureRequest {
@@ -14488,8 +14497,14 @@ fn cowork_capture_command(
     } else {
         None
     };
+    let writer_lease = if let Some(db) = db_opt.as_ref() {
+        Some(acquire_cli_content_writer_lease(db, "cowork-capture")?)
+    } else {
+        None
+    };
     let report = capture_handoff_to_memory(
         db_opt.as_ref(),
+        writer_lease.as_ref().map(|lease| lease.lease()),
         &home,
         &cwd,
         CoworkCaptureRequest {

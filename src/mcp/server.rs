@@ -6994,9 +6994,18 @@ impl MempalMcpServer {
                 let capture = if request.capture.unwrap_or(false) {
                     let execute = request.execute.unwrap_or(false);
                     let db = if execute { Some(self.open_db()?) } else { None };
+                    let writer_lease = if let Some(db) = db.as_ref() {
+                        Some(self.acquire_content_writer_lease(
+                            db,
+                            "mempal_cowork_bus session_close capture",
+                        )?)
+                    } else {
+                        None
+                    };
                     Some(
                         bus::capture_handoff_to_memory(
                             db.as_ref(),
+                            writer_lease.as_ref().map(|lease| &lease.lease),
                             &mempal_home,
                             &cwd,
                             bus::CoworkCaptureRequest {
@@ -7062,8 +7071,14 @@ impl MempalMcpServer {
             "capture" => {
                 let execute = request.execute.unwrap_or(false);
                 let db = if execute { Some(self.open_db()?) } else { None };
+                let writer_lease = if let Some(db) = db.as_ref() {
+                    Some(self.acquire_content_writer_lease(db, "mempal_cowork_bus capture")?)
+                } else {
+                    None
+                };
                 let report = bus::capture_handoff_to_memory(
                     db.as_ref(),
+                    writer_lease.as_ref().map(|lease| &lease.lease),
                     &mempal_home,
                     &cwd,
                     bus::CoworkCaptureRequest {
@@ -7126,6 +7141,20 @@ impl MempalMcpServer {
 
         // Apply stale penalty to drawers associated with StaleFact triples (P13).
         let stale_penalty = ConfigHandle::current().importance.stale_penalty;
+        let has_stale_penalty_targets = report.issues.iter().any(|issue| {
+            matches!(
+                issue,
+                crate::factcheck::FactIssue::StaleFact {
+                    source_drawer: Some(_),
+                    ..
+                }
+            )
+        });
+        let _writer_lease = if has_stale_penalty_targets {
+            Some(self.acquire_content_writer_lease(&db, "mempal_fact_check stale penalty")?)
+        } else {
+            None
+        };
         for issue in &report.issues {
             if let crate::factcheck::FactIssue::StaleFact {
                 source_drawer: Some(drawer_id),
@@ -7240,6 +7269,8 @@ impl MempalMcpServer {
                 })?;
 
                 let skill_min_sessions = config.skills.skill_min_sessions;
+                let _writer_lease =
+                    self.acquire_content_writer_lease(&db, "mempal_skill promote")?;
                 let skill = tokio::task::block_in_place(|| {
                     crate::core::skills::promote_pattern_to_skill(
                         db.conn(),
@@ -7278,6 +7309,7 @@ impl MempalMcpServer {
                     ErrorData::invalid_params("skill_id is required for adopt", None)
                 })?;
                 let active_threshold = config.skills.active_threshold;
+                let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_skill adopt")?;
                 let new_status = tokio::task::block_in_place(|| {
                     crate::core::skills::adopt_skill(db.conn(), skill_id, active_threshold)
                 })
@@ -7303,6 +7335,8 @@ impl MempalMcpServer {
                     ErrorData::invalid_params("skill_id is required for reject", None)
                 })?;
                 let retire_threshold = config.skills.retire_threshold;
+                let _writer_lease =
+                    self.acquire_content_writer_lease(&db, "mempal_skill reject")?;
                 let new_status = tokio::task::block_in_place(|| {
                     crate::core::skills::reject_skill(db.conn(), skill_id, retire_threshold)
                 })
@@ -7327,6 +7361,8 @@ impl MempalMcpServer {
                 let skill_id = request.skill_id.as_deref().ok_or_else(|| {
                     ErrorData::invalid_params("skill_id is required for retire", None)
                 })?;
+                let _writer_lease =
+                    self.acquire_content_writer_lease(&db, "mempal_skill retire")?;
                 let found = tokio::task::block_in_place(|| {
                     crate::core::skills::retire_skill(db.conn(), skill_id)
                 })
@@ -8230,9 +8266,13 @@ fn bus_error_to_mcp(error: BusError) -> ErrorData {
         | BusError::SelfSend(_)
         | BusError::MessageTooLarge(_)
         | BusError::InboxFull { .. } => ErrorData::invalid_params(error.to_string(), None),
-        BusError::LegacyInbox(_) | BusError::Io(_) | BusError::Json(_) | BusError::Db(_) => {
-            ErrorData::internal_error(error.to_string(), None)
-        }
+        BusError::MissingCaptureWriterLease
+        | BusError::CaptureWriterLeaseVerify { .. }
+        | BusError::CaptureWriterLeaseLost { .. }
+        | BusError::LegacyInbox(_)
+        | BusError::Io(_)
+        | BusError::Json(_)
+        | BusError::Db(_) => ErrorData::internal_error(error.to_string(), None),
     }
 }
 
@@ -10976,6 +11016,100 @@ quality_policy = "llm_required_for_keep"
         .expect("insert triple");
     }
 
+    fn insert_stale_triple_with_source_drawer(
+        db_path: &Path,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        source_drawer: &str,
+    ) {
+        let db = Database::open(db_path).expect("open db");
+        db.insert_triple(&Triple {
+            id: crate::core::utils::build_triple_id(subject, predicate, object),
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            valid_from: Some("1700000000".to_string()),
+            valid_to: Some("1799999999".to_string()),
+            confidence: 1.0,
+            source_drawer: Some(source_drawer.to_string()),
+        })
+        .expect("insert stale triple");
+    }
+
+    fn read_stale_penalty(db_path: &Path, drawer_id: &str) -> f64 {
+        let db = Database::open(db_path).expect("open db");
+        db.conn()
+            .query_row(
+                "SELECT COALESCE(stale_penalty_applied, 1.0) FROM drawers WHERE id = ?1",
+                [drawer_id],
+                |row| row.get(0),
+            )
+            .expect("read stale penalty")
+    }
+
+    fn insert_active_skill_pattern(db_path: &Path, pattern_id: &str) {
+        let db = Database::open(db_path).expect("open db");
+        db.conn()
+            .execute(
+                r#"
+                INSERT INTO patterns (
+                    pattern_id, signature, exemplar_ids, exemplar_count,
+                    session_ids, session_count, topic_tags, model_id,
+                    status, first_seen_at, updated_at, project_id
+                ) VALUES (?1, ?2, ?3, 1, ?4, 6, ?5, 'test-model', 'active', 1713000000, 1713000000, NULL)
+                "#,
+                params![
+                    pattern_id,
+                    vec![0_u8; 32],
+                    r#"["drawer-a"]"#,
+                    r#"["session-a","session-b","session-c","session-d","session-e","session-f"]"#,
+                    r#"["lease-test"]"#,
+                ],
+            )
+            .expect("insert active skill pattern");
+    }
+
+    fn skill_row_count(db_path: &Path) -> i64 {
+        let db = Database::open(db_path).expect("open db");
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM skills", [], |row| row.get(0))
+            .expect("count skills")
+    }
+
+    fn cowork_bus_request(action: &str, cwd: &Path) -> CoworkBusRequest {
+        CoworkBusRequest {
+            action: action.to_string(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            agent_id: None,
+            tool: None,
+            transport: None,
+            tmux_target: None,
+            from: None,
+            to: Vec::new(),
+            agents: Vec::new(),
+            message: None,
+            thread_id: None,
+            channel: None,
+            message_id: None,
+            limit: None,
+            now: None,
+            seen_at: None,
+            lines: None,
+            probe_tmux: None,
+            session_id: None,
+            title: None,
+            goal: None,
+            status: None,
+            summary_source: None,
+            wing: None,
+            room: None,
+            note: None,
+            capture: None,
+            execute: None,
+        }
+    }
+
     async fn run_search(
         server: &MempalMcpServer,
         query: &str,
@@ -13101,6 +13235,232 @@ quality_policy = "llm_required_for_keep"
             db.list_explicit_tunnels(None).expect("list tunnels").len(),
             1
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mcp_fact_check_stale_penalty_rejects_existing_content_writer_lease() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "fact-check-stale-lease-target",
+            "Alice works at Acme.",
+            "mcp",
+            Some("lease"),
+            "/tmp/fact-check-stale.md",
+            3,
+        );
+        insert_stale_triple_with_source_drawer(
+            &db_path,
+            "Alice",
+            "works_at",
+            "Acme",
+            "fact-check-stale-lease-target",
+        );
+        let _daemon_lease = hold_daemon_writer_lease(&db_path);
+
+        let error = match server
+            .mempal_fact_check(Parameters(FactCheckRequest {
+                text: "Alice works at Acme.".to_string(),
+                wing: None,
+                room: None,
+                now: Some("2028-01-15T08:00:00Z".to_string()),
+            }))
+            .await
+        {
+            Ok(_) => panic!("stale penalty write must reject under daemon writer lease"),
+            Err(error) => error,
+        };
+
+        assert_writer_lease_conflict(&error);
+        assert_eq!(
+            read_stale_penalty(&db_path, "fact-check-stale-lease-target"),
+            1.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mcp_fact_check_stale_penalty_succeeds_without_content_writer_conflict() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "fact-check-stale-success-target",
+            "Alice works at Acme.",
+            "mcp",
+            Some("lease"),
+            "/tmp/fact-check-stale-success.md",
+            3,
+        );
+        insert_stale_triple_with_source_drawer(
+            &db_path,
+            "Alice",
+            "works_at",
+            "Acme",
+            "fact-check-stale-success-target",
+        );
+
+        let response = server
+            .mempal_fact_check(Parameters(FactCheckRequest {
+                text: "Alice works at Acme.".to_string(),
+                wing: None,
+                room: None,
+                now: Some("2028-01-15T08:00:00Z".to_string()),
+            }))
+            .await
+            .expect("fact check succeeds")
+            .0;
+
+        assert!(
+            response
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, crate::factcheck::FactIssue::StaleFact { .. })),
+            "expected stale fact issue: {:?}",
+            response.issues
+        );
+        assert!(
+            read_stale_penalty(&db_path, "fact-check-stale-success-target") < 1.0,
+            "stale penalty should be applied"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mcp_skill_promote_rejects_existing_content_writer_lease() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_active_skill_pattern(&db_path, "pat-lease-conflict");
+        let _daemon_lease = hold_daemon_writer_lease(&db_path);
+
+        let error = match server
+            .mempal_skill(Parameters(SkillRequest {
+                action: "promote".to_string(),
+                skill_id: None,
+                pattern_id: Some("pat-lease-conflict".to_string()),
+                name: Some("Lease guarded skill".to_string()),
+                trigger_description: Some("Use when validating writer leases".to_string()),
+                status: None,
+                project_id: None,
+            }))
+            .await
+        {
+            Ok(_) => panic!("skill promote must reject under daemon writer lease"),
+            Err(error) => error,
+        };
+
+        assert_writer_lease_conflict(&error);
+        assert_eq!(skill_row_count(&db_path), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mcp_skill_promote_succeeds_without_content_writer_conflict() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_active_skill_pattern(&db_path, "pat-lease-success");
+
+        let response = server
+            .mempal_skill(Parameters(SkillRequest {
+                action: "promote".to_string(),
+                skill_id: None,
+                pattern_id: Some("pat-lease-success".to_string()),
+                name: Some("Lease guarded skill".to_string()),
+                trigger_description: Some("Use when validating writer leases".to_string()),
+                status: None,
+                project_id: None,
+            }))
+            .await
+            .expect("skill promote succeeds")
+            .0;
+
+        assert_eq!(response.status.as_deref(), Some("probationary"));
+        assert_eq!(skill_row_count(&db_path), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_cowork_capture_rejects_existing_content_writer_lease() {
+        let (tempdir, db_path, server) = setup_server();
+        let (_mempal_home, repo, _guard) = setup_cowork_home(&tempdir).await;
+        let mut register = cowork_bus_request("register", &repo);
+        register.agent_id = Some("claude-main".to_string());
+        register.tool = Some("claude".to_string());
+        server
+            .mempal_cowork_bus(Parameters(register))
+            .await
+            .expect("register agent");
+        let _daemon_lease = hold_daemon_writer_lease(&db_path);
+
+        let mut capture = cowork_bus_request("capture", &repo);
+        capture.execute = Some(true);
+        capture.summary_source = Some("handoff".to_string());
+        let error = match server.mempal_cowork_bus(Parameters(capture)).await {
+            Ok(_) => panic!("cowork capture must reject under daemon writer lease"),
+            Err(error) => error,
+        };
+
+        assert_writer_lease_conflict(&error);
+        let db = Database::open(&db_path).expect("open db");
+        assert_eq!(db.drawer_count().expect("drawer count"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_cowork_session_close_capture_rejects_existing_content_writer_lease() {
+        let (tempdir, db_path, server) = setup_server();
+        let (_mempal_home, repo, _guard) = setup_cowork_home(&tempdir).await;
+        let mut register = cowork_bus_request("register", &repo);
+        register.agent_id = Some("claude-main".to_string());
+        register.tool = Some("claude".to_string());
+        server
+            .mempal_cowork_bus(Parameters(register))
+            .await
+            .expect("register agent");
+        let mut create = cowork_bus_request("session_create", &repo);
+        create.session_id = Some("lease-session".to_string());
+        create.title = Some("Lease session".to_string());
+        create.agents = vec!["claude-main".to_string()];
+        server
+            .mempal_cowork_bus(Parameters(create))
+            .await
+            .expect("create session");
+        let _daemon_lease = hold_daemon_writer_lease(&db_path);
+
+        let mut close = cowork_bus_request("session_close", &repo);
+        close.session_id = Some("lease-session".to_string());
+        close.capture = Some(true);
+        close.execute = Some(true);
+        close.summary_source = Some("handoff".to_string());
+        let error = match server.mempal_cowork_bus(Parameters(close)).await {
+            Ok(_) => panic!("cowork session_close capture must reject under daemon writer lease"),
+            Err(error) => error,
+        };
+
+        assert_writer_lease_conflict(&error);
+        let db = Database::open(&db_path).expect("open db");
+        assert_eq!(db.drawer_count().expect("drawer count"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_cowork_capture_succeeds_without_content_writer_conflict() {
+        let (tempdir, db_path, server) = setup_server();
+        let (_mempal_home, repo, _guard) = setup_cowork_home(&tempdir).await;
+        let mut register = cowork_bus_request("register", &repo);
+        register.agent_id = Some("claude-main".to_string());
+        register.tool = Some("claude".to_string());
+        server
+            .mempal_cowork_bus(Parameters(register))
+            .await
+            .expect("register agent");
+
+        let mut capture = cowork_bus_request("capture", &repo);
+        capture.execute = Some(true);
+        capture.summary_source = Some("handoff".to_string());
+        let response = server
+            .mempal_cowork_bus(Parameters(capture))
+            .await
+            .expect("cowork capture succeeds")
+            .0;
+
+        let drawer_id = response
+            .capture
+            .and_then(|capture| capture.drawer_id)
+            .expect("capture drawer id");
+        let db = Database::open(&db_path).expect("open db");
+        assert!(db.get_drawer(&drawer_id).expect("get drawer").is_some());
     }
 
     #[tokio::test]

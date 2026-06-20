@@ -234,6 +234,7 @@ fn cmd_promote(
         project_id: project_id.as_deref(),
         skill_min_sessions: config.skills.skill_min_sessions,
     };
+    let _writer_lease = super::acquire_cli_content_writer_lease(db, "skills-promote")?;
     match promote_pattern_to_skill(db.conn(), &args) {
         Ok(skill) => {
             println!(
@@ -282,6 +283,14 @@ fn cmd_propose_from_cases(
     let current_dir = std::env::current_dir().ok();
     let project_id = resolve_project_id(args.project.as_deref(), config, current_dir.as_deref())
         .context("failed to resolve skill proposal project id")?;
+    let _writer_lease = if args.dry_run {
+        None
+    } else {
+        Some(super::acquire_cli_content_writer_lease(
+            db,
+            "skills-propose",
+        )?)
+    };
     let outcome = propose_skills_from_cases(
         db,
         SkillProposalOptions {
@@ -328,6 +337,7 @@ fn cmd_propose_from_cases(
 }
 
 fn cmd_adopt(db: &Database, config: &Config, skill_id: &str) -> Result<()> {
+    let _writer_lease = super::acquire_cli_content_writer_lease(db, "skills-adopt")?;
     let new_status = adopt_skill(db.conn(), skill_id, config.skills.active_threshold)
         .with_context(|| format!("failed to adopt skill {skill_id}"))?;
     match new_status {
@@ -341,6 +351,7 @@ fn cmd_adopt(db: &Database, config: &Config, skill_id: &str) -> Result<()> {
 }
 
 fn cmd_reject(db: &Database, config: &Config, skill_id: &str) -> Result<()> {
+    let _writer_lease = super::acquire_cli_content_writer_lease(db, "skills-reject")?;
     let new_status = reject_skill(db.conn(), skill_id, config.skills.retire_threshold)
         .with_context(|| format!("failed to reject skill {skill_id}"))?;
     match new_status {
@@ -354,6 +365,7 @@ fn cmd_reject(db: &Database, config: &Config, skill_id: &str) -> Result<()> {
 }
 
 fn cmd_retire(db: &Database, skill_id: &str) -> Result<()> {
+    let _writer_lease = super::acquire_cli_content_writer_lease(db, "skills-retire")?;
     let found = retire_skill(db.conn(), skill_id)
         .with_context(|| format!("failed to retire skill {skill_id}"))?;
     if found {
