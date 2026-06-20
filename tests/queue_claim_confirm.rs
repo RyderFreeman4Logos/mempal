@@ -107,6 +107,50 @@ fn test_enqueue_then_claim_returns_same_payload() {
 }
 
 #[test]
+fn test_claim_by_id_and_kind_claims_only_target_message() {
+    let (_tmp, _db_path, store) = new_store();
+
+    let hook_id = store
+        .enqueue("hook_event", r#"{"tool":"Bash"}"#)
+        .expect("enqueue hook");
+    let first_ingest_id = store
+        .enqueue("ingest_async", r#"{"content":"first"}"#)
+        .expect("enqueue first ingest");
+    let second_ingest_id = store
+        .enqueue("ingest_async", r#"{"content":"second"}"#)
+        .expect("enqueue second ingest");
+
+    assert!(
+        store
+            .claim_by_id_and_kind("worker-wrong-kind", 60, &hook_id, "ingest_async")
+            .expect("wrong-kind target claim")
+            .is_none(),
+        "targeted claim must not claim a row with a different kind"
+    );
+
+    let targeted = store
+        .claim_by_id_and_kind("worker-target", 60, &second_ingest_id, "ingest_async")
+        .expect("targeted claim")
+        .expect("targeted message");
+    assert_eq!(targeted.id, second_ingest_id);
+    assert_eq!(targeted.kind, "ingest_async");
+    assert_eq!(targeted.payload, r#"{"content":"second"}"#);
+
+    let next_ingest = store
+        .claim_next_by_kind("worker-next", 60, "ingest_async")
+        .expect("claim next ingest")
+        .expect("remaining ingest");
+    assert_eq!(next_ingest.id, first_ingest_id);
+
+    let next_any = store
+        .claim_next("worker-any", 60)
+        .expect("claim next")
+        .expect("remaining hook");
+    assert_eq!(next_any.id, hook_id);
+    assert_eq!(next_any.kind, "hook_event");
+}
+
+#[test]
 fn test_confirm_deletes_row() {
     let (_tmp, db_path, store) = new_store();
     let id = store

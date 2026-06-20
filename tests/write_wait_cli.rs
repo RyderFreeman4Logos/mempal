@@ -122,6 +122,27 @@ fn spawn_cli(home: &Path, args: &[&str]) -> Child {
         .expect("spawn mempal")
 }
 
+fn wait_child_output_timeout(mut child: Child, timeout: Duration) -> Output {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll child").is_some() {
+            return child.wait_with_output().expect("collect child output");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("collect timed-out child output");
+            panic!(
+                "child did not exit within {timeout:?}; stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn prepared_ingest_payload(content: &str, wing: &str, room: Option<&str>) -> String {
     serde_json::to_string(&json!({
         "request": {
@@ -505,7 +526,7 @@ async fn test_ingest_wait_json_matches_non_wait_json_output() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_ingest_wait_json_timeout_drains_active_scoped_worker_before_exit() {
+async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
     let home = setup_home();
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     let _config = write_config(home.path(), &format!("http://{addr}/v1"));
@@ -566,26 +587,57 @@ async fn test_ingest_wait_json_timeout_drains_active_scoped_worker_before_exit()
         .expect("operation record exists");
     assert_eq!(running.op_state, "running");
 
-    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let output = wait_child_output_timeout(child, Duration::from_secs(4));
     assert!(
-        child.try_wait().expect("poll ingest wait").is_none(),
-        "ingest --stdin --wait must not exit while its scoped worker is mid-ingest"
-    );
-
-    handle.resume();
-    let output = child.wait_with_output().expect("wait ingest child");
-    handle.shutdown().await;
-
-    assert!(
-        output.status.success(),
+        !output.status.success(),
         "stdout={}, stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout: Value = serde_json::from_slice(&output.stdout).expect("completed ingest JSON");
-    assert_eq!(stdout["stats"]["files"], 1);
-    assert_eq!(stdout["stats"]["chunks"], 1);
-    assert_eq!(stdout["stats"]["skipped"], 0);
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("timed-out ingest JSON");
+    assert_eq!(stdout["operation_id"], operation_id);
+    assert_eq!(stdout["state"], "queued");
+    assert_eq!(stdout["timed_out"], true);
+    assert_eq!(stdout["drawer_id"], "");
+    assert!(
+        !stdout
+            .as_object()
+            .expect("ingest receipt object")
+            .contains_key("drawer_ids"),
+        "timed-out receipt must not report drawer ids: {stdout}"
+    );
+    let queued = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load queued status")
+        .expect("operation record exists");
+    assert_eq!(queued.op_state, "queued");
+
+    handle.resume();
+    let recovery = run_cli(
+        home.path(),
+        &["operation", "wait", &operation_id, "--timeout-secs", "10"],
+    );
+    handle.shutdown().await;
+
+    assert!(
+        recovery.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&recovery.stdout),
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    let (recovery_stdout, recovery_stderr) = print_lines(&recovery);
+    assert!(
+        recovery_stdout.contains("state=completed"),
+        "{recovery_stdout}"
+    );
+    assert!(
+        recovery_stdout.contains("timed_out=false"),
+        "{recovery_stdout}"
+    );
+    assert!(
+        recovery_stderr.contains("waiting for operation_id="),
+        "{recovery_stderr}"
+    );
     let completed = PendingMessageStore::new_without_reclaim(&db_path)
         .operation_status(&operation_id)
         .expect("load completed status")
@@ -1147,7 +1199,7 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_operation_wait_timeout_drains_active_scoped_worker_before_exit() {
+async fn test_operation_wait_timeout_returns_receipt_and_requeues_claim() {
     let home = setup_home();
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     let config_path = write_config(home.path(), &format!("http://{addr}/v1"));
@@ -1162,7 +1214,7 @@ async fn test_operation_wait_timeout_drains_active_scoped_worker_before_exit() {
     );
 
     handle.pause();
-    let mut child = spawn_cli(
+    let child = spawn_cli(
         home.path(),
         &["operation", "wait", &operation_id, "--timeout-secs", "1"],
     );
@@ -1184,26 +1236,51 @@ async fn test_operation_wait_timeout_drains_active_scoped_worker_before_exit() {
         .expect("operation record exists");
     assert_eq!(running.op_state, "running");
 
-    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let output = wait_child_output_timeout(child, Duration::from_secs(4));
     assert!(
-        child.try_wait().expect("poll operation wait").is_none(),
-        "operation wait must not exit while its scoped worker is mid-ingest"
-    );
-
-    handle.resume();
-    let output = child.wait_with_output().expect("wait operation child");
-    handle.shutdown().await;
-
-    assert!(
-        output.status.success(),
+        !output.status.success(),
         "stdout={}, stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let (stdout, stderr) = print_lines(&output);
-    assert!(stdout.contains("state=completed"), "{stdout}");
-    assert!(stdout.contains("timed_out=false"), "{stdout}");
+    assert!(stdout.contains("operation_id="), "{stdout}");
+    assert!(stdout.contains("state=queued"), "{stdout}");
+    assert!(stdout.contains("timed_out=true"), "{stdout}");
+    assert!(stdout.contains("drawer_id="), "{stdout}");
     assert!(stderr.contains("waiting for operation_id="), "{stderr}");
+    let queued = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load queued status")
+        .expect("operation record exists");
+    assert_eq!(queued.op_state, "queued");
+
+    handle.resume();
+    let recovery = run_cli(
+        home.path(),
+        &["operation", "wait", &operation_id, "--timeout-secs", "10"],
+    );
+    handle.shutdown().await;
+
+    assert!(
+        recovery.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&recovery.stdout),
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    let (recovery_stdout, recovery_stderr) = print_lines(&recovery);
+    assert!(
+        recovery_stdout.contains("state=completed"),
+        "{recovery_stdout}"
+    );
+    assert!(
+        recovery_stdout.contains("timed_out=false"),
+        "{recovery_stdout}"
+    );
+    assert!(
+        recovery_stderr.contains("waiting for operation_id="),
+        "{recovery_stderr}"
+    );
 
     let db = Database::open(&db_path).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
