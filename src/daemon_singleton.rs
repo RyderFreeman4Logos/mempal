@@ -24,17 +24,24 @@
 //! and is released automatically when the process dies — even on `SIGKILL`,
 //! which is precisely how an orphaned daemon's lock frees up for its successor.
 
+use std::env;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use crate::db_path_identity::DbPathIdentity;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Lock file name, written next to `daemon.pid` inside `mempal_home`.
+/// Legacy lock file name used by pre-#496 daemon builds.
 pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
+pub const MEMPAL_RUNTIME_DIR_ENV: &str = "MEMPAL_RUNTIME_DIR";
+pub const DAEMON_LOCK_SUFFIX: &str = ".daemon.lock";
+pub const DAEMON_METADATA_SUFFIX: &str = ".daemon.json";
+const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 const MEMPAL_DB_PATH_ENV: &[u8] = b"MEMPAL_DB_PATH=";
 
 /// Sentinel error meaning a healthy daemon already holds the singleton lock.
@@ -43,9 +50,48 @@ const MEMPAL_DB_PATH_ENV: &[u8] = b"MEMPAL_DB_PATH=";
 /// can be turned into a clean success exit at the single production call site
 /// without disturbing the `Result<DaemonContext>` signature the integration
 /// tests depend on. Downcast with [`anyhow::Error::is`].
-#[derive(Debug, Error)]
-#[error("daemon already running (singleton lock held)")]
-pub struct DaemonAlreadyRunning;
+#[derive(Debug)]
+pub struct DaemonAlreadyRunning {
+    pub owner: Option<DaemonLockMetadata>,
+    pub lock_path: Option<PathBuf>,
+}
+
+impl DaemonAlreadyRunning {
+    pub fn new(owner: Option<DaemonLockMetadata>, lock_path: Option<PathBuf>) -> Self {
+        Self { owner, lock_path }
+    }
+}
+
+impl std::fmt::Display for DaemonAlreadyRunning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "daemon already running (singleton lock held")?;
+        if let Some(lock_path) = &self.lock_path {
+            write!(formatter, ", lock={}", lock_path.display())?;
+        }
+        if let Some(owner) = &self.owner {
+            write!(
+                formatter,
+                ", owner_pid={}, boot_id={}, version={}, db_fingerprint={}, started_at_unix_ms={}",
+                owner.pid,
+                owner.boot_id.as_deref().unwrap_or("unknown"),
+                owner.binary_version,
+                owner.db_fingerprint,
+                owner.started_at_unix_ms
+            )?;
+            if let Some(path) = &owner.executable_path {
+                write!(formatter, ", executable={path}")?;
+            }
+            if owner.executable_deleted {
+                write!(formatter, ", executable_deleted=true")?;
+            }
+        } else {
+            write!(formatter, ", owner_metadata=unavailable")?;
+        }
+        write!(formatter, ")")
+    }
+}
+
+impl std::error::Error for DaemonAlreadyRunning {}
 
 #[derive(Debug, Error)]
 pub enum DaemonLockError {
@@ -63,7 +109,32 @@ pub enum DaemonLockAcquisition {
     /// This process now exclusively owns the daemon lock.
     Acquired(DaemonLockGuard),
     /// A healthy daemon already holds the lock; the caller must NOT daemonize.
-    AlreadyHeld,
+    AlreadyHeld {
+        owner: Option<DaemonLockMetadata>,
+        lock_path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonLockMetadata {
+    pub pid: u32,
+    pub boot_id: Option<String>,
+    pub binary_version: String,
+    pub db_path: String,
+    pub db_fingerprint: String,
+    pub profile: Option<String>,
+    pub started_at_unix_ms: u64,
+    pub executable_path: Option<String>,
+    pub executable_deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonLockPaths {
+    pub runtime_dir: PathBuf,
+    pub lock_path: PathBuf,
+    pub metadata_path: PathBuf,
+    pub db_path: PathBuf,
+    pub db_fingerprint: String,
 }
 
 /// RAII guard holding the daemon singleton lock for the process lifetime.
@@ -76,44 +147,296 @@ pub enum DaemonLockAcquisition {
 pub struct DaemonLockGuard {
     _file: File,
     path: PathBuf,
+    metadata_path: PathBuf,
+    metadata: DaemonLockMetadata,
 }
 
 impl DaemonLockGuard {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn metadata_path(&self) -> &Path {
+        &self.metadata_path
+    }
+
+    pub fn metadata(&self) -> &DaemonLockMetadata {
+        &self.metadata
+    }
+
+    pub fn refresh_metadata(&mut self) -> Result<(), DaemonLockError> {
+        let metadata = build_metadata(
+            &self.metadata.db_path,
+            self.metadata.db_fingerprint.clone(),
+            self.metadata.profile.clone(),
+        );
+        write_metadata_file(&self.metadata_path, &metadata)?;
+        self.metadata = metadata;
+        Ok(())
+    }
 }
 
-/// Try to acquire the daemon singleton lock at `<mempal_home>/daemon.lock`.
+impl Drop for DaemonLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.metadata_path);
+    }
+}
+
+/// Try to acquire the daemon singleton lock for a canonical database path.
 ///
 /// Non-blocking: on contention returns [`DaemonLockAcquisition::AlreadyHeld`]
 /// (no retry) so the race loser can exit instead of spinning. The open file
 /// description backing the returned guard survives `fork`/daemonize, so the
 /// lock persists into the final daemon process as long as the guard is held.
-pub fn try_acquire(mempal_home: &Path) -> Result<DaemonLockAcquisition, DaemonLockError> {
-    let lock_path = mempal_home.join(DAEMON_LOCK_FILE);
+pub fn try_acquire(db_path: &Path) -> Result<DaemonLockAcquisition, DaemonLockError> {
+    try_acquire_with_runtime_root(db_path, None, None)
+}
+
+#[doc(hidden)]
+pub fn try_acquire_for_test(
+    db_path: &Path,
+    runtime_root: &Path,
+) -> Result<DaemonLockAcquisition, DaemonLockError> {
+    try_acquire_with_runtime_root(db_path, None, Some(runtime_root))
+}
+
+fn try_acquire_with_runtime_root(
+    db_path: &Path,
+    profile: Option<&str>,
+    runtime_root: Option<&Path>,
+) -> Result<DaemonLockAcquisition, DaemonLockError> {
+    let paths = lock_paths_with_writable_runtime(db_path, profile, runtime_root)?;
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .truncate(false)
         .write(true)
-        .open(&lock_path)
+        .open(&paths.lock_path)
         .map_err(|source| DaemonLockError::Io {
-            path: lock_path.clone(),
+            path: paths.lock_path.clone(),
             source,
         })?;
 
     match imp::try_lock_exclusive(&file) {
-        Ok(true) => Ok(DaemonLockAcquisition::Acquired(DaemonLockGuard {
-            _file: file,
-            path: lock_path,
-        })),
-        Ok(false) => Ok(DaemonLockAcquisition::AlreadyHeld),
+        Ok(true) => {
+            let metadata = build_metadata(
+                &paths.db_path.to_string_lossy(),
+                paths.db_fingerprint.clone(),
+                profile.map(ToOwned::to_owned),
+            );
+            write_metadata_file(&paths.metadata_path, &metadata)?;
+            Ok(DaemonLockAcquisition::Acquired(DaemonLockGuard {
+                _file: file,
+                path: paths.lock_path,
+                metadata_path: paths.metadata_path,
+                metadata,
+            }))
+        }
+        Ok(false) => Ok(DaemonLockAcquisition::AlreadyHeld {
+            owner: read_metadata_file(&paths.metadata_path),
+            lock_path: paths.lock_path,
+        }),
         Err(source) => Err(DaemonLockError::Io {
-            path: lock_path,
+            path: paths.lock_path,
             source,
         }),
     }
+}
+
+fn lock_paths_with_writable_runtime(
+    db_path: &Path,
+    profile: Option<&str>,
+    runtime_root: Option<&Path>,
+) -> Result<DaemonLockPaths, DaemonLockError> {
+    let paths = daemon_lock_paths(db_path, profile, runtime_root)?;
+    match std::fs::create_dir_all(&paths.runtime_dir) {
+        Ok(()) => Ok(paths),
+        Err(source)
+            if runtime_root.is_none()
+                && env::var_os(MEMPAL_RUNTIME_DIR_ENV).is_none()
+                && env::var_os(XDG_RUNTIME_DIR_ENV).is_some() =>
+        {
+            let fallback_root = env::temp_dir().join("mempal-runtime");
+            let fallback_paths = daemon_lock_paths(db_path, profile, Some(&fallback_root))?;
+            std::fs::create_dir_all(&fallback_paths.runtime_dir).map_err(|fallback_source| {
+                DaemonLockError::Io {
+                    path: fallback_paths.runtime_dir.clone(),
+                    source: fallback_source,
+                }
+            })?;
+            tracing::warn!(
+                runtime_dir = %paths.runtime_dir.display(),
+                fallback_runtime_dir = %fallback_paths.runtime_dir.display(),
+                error = %source,
+                "daemon runtime directory is unavailable; using temp runtime directory"
+            );
+            Ok(fallback_paths)
+        }
+        Err(source) => Err(DaemonLockError::Io {
+            path: paths.runtime_dir,
+            source,
+        }),
+    }
+}
+
+#[doc(hidden)]
+pub fn daemon_lock_paths_for_test(
+    db_path: &Path,
+    runtime_root: &Path,
+) -> Result<DaemonLockPaths, DaemonLockError> {
+    daemon_lock_paths(db_path, None, Some(runtime_root))
+}
+
+fn daemon_lock_paths(
+    db_path: &Path,
+    profile: Option<&str>,
+    runtime_root: Option<&Path>,
+) -> Result<DaemonLockPaths, DaemonLockError> {
+    let db_path = canonical_db_scope_path(db_path).map_err(|source| DaemonLockError::Io {
+        path: db_path.to_path_buf(),
+        source,
+    })?;
+    let db_fingerprint = db_fingerprint(&db_path, profile);
+    let runtime_dir = runtime_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_runtime_dir)
+        .join("mempal");
+    let lock_path = runtime_dir.join(format!("{db_fingerprint}{DAEMON_LOCK_SUFFIX}"));
+    let metadata_path = runtime_dir.join(format!("{db_fingerprint}{DAEMON_METADATA_SUFFIX}"));
+    Ok(DaemonLockPaths {
+        runtime_dir,
+        lock_path,
+        metadata_path,
+        db_path,
+        db_fingerprint,
+    })
+}
+
+fn default_runtime_dir() -> PathBuf {
+    env::var_os(MEMPAL_RUNTIME_DIR_ENV)
+        .or_else(|| env::var_os(XDG_RUNTIME_DIR_ENV))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("mempal-runtime"))
+}
+
+fn canonical_db_scope_path(path: &Path) -> io::Result<PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let Some(file_name) = absolute.file_name() else {
+        return Ok(absolute);
+    };
+    let parent = absolute
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(std::fs::canonicalize(parent)?.join(file_name))
+}
+
+fn db_fingerprint(path: &Path, profile: Option<&str>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update(path.to_string_lossy().as_bytes());
+    }
+    if let Some(profile) = profile {
+        hasher.update(b"\0profile\0");
+        hasher.update(profile.as_bytes());
+    }
+    hasher.finalize().to_hex()[..16].to_string()
+}
+
+fn build_metadata(
+    db_path: &str,
+    db_fingerprint: String,
+    profile: Option<String>,
+) -> DaemonLockMetadata {
+    let executable_path = std::env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    let executable_deleted = executable_path
+        .as_deref()
+        .is_some_and(|path| path.ends_with(" (deleted)"));
+    DaemonLockMetadata {
+        pid: std::process::id(),
+        boot_id: boot_id(),
+        binary_version: env!("CARGO_PKG_VERSION").to_string(),
+        db_path: db_path.to_string(),
+        db_fingerprint,
+        profile,
+        started_at_unix_ms: unix_ms(),
+        executable_path,
+        executable_deleted,
+    }
+}
+
+fn write_metadata_file(
+    metadata_path: &Path,
+    metadata: &DaemonLockMetadata,
+) -> Result<(), DaemonLockError> {
+    let tmp_path = metadata_path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let payload = serde_json::to_vec_pretty(metadata).map_err(|source| DaemonLockError::Io {
+        path: metadata_path.to_path_buf(),
+        source: io::Error::other(source),
+    })?;
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .map_err(|source| DaemonLockError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+        file.write_all(&payload)
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_all())
+            .map_err(|source| DaemonLockError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+    }
+    std::fs::rename(&tmp_path, metadata_path).map_err(|source| DaemonLockError::Io {
+        path: metadata_path.to_path_buf(),
+        source,
+    })
+}
+
+fn read_metadata_file(metadata_path: &Path) -> Option<DaemonLockMetadata> {
+    let payload = std::fs::read(metadata_path).ok()?;
+    serde_json::from_slice(&payload).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn boot_id() -> Option<String> {
+    None
+}
+
+fn unix_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 /// Basename of the currently running executable (e.g. `"mempal"`), used to
@@ -386,18 +709,38 @@ mod tests {
     #[test]
     fn test_second_acquire_blocked_until_first_dropped() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        File::create(&db_path).expect("db file");
+        let runtime = tmp.path().join("runtime");
 
-        let guard1 = match try_acquire(tmp.path()).expect("first acquire") {
+        let guard1 = match try_acquire_for_test(&db_path, &runtime).expect("first acquire") {
             DaemonLockAcquisition::Acquired(guard) => guard,
-            DaemonLockAcquisition::AlreadyHeld => panic!("first acquire should win"),
+            DaemonLockAcquisition::AlreadyHeld { .. } => panic!("first acquire should win"),
         };
-        assert!(guard1.path().ends_with(DAEMON_LOCK_FILE));
+        assert!(
+            guard1
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(DAEMON_LOCK_SUFFIX))
+        );
+        assert_eq!(guard1.metadata().pid, std::process::id());
+        assert!(guard1.metadata_path().exists());
 
         // A second acquisition while the first guard is held must observe the
         // lock as already held (distinct open file descriptions conflict under
         // flock even within the same process).
-        match try_acquire(tmp.path()).expect("second acquire attempt") {
-            DaemonLockAcquisition::AlreadyHeld => {}
+        match try_acquire_for_test(&db_path, &runtime).expect("second acquire attempt") {
+            DaemonLockAcquisition::AlreadyHeld {
+                owner: Some(owner),
+                lock_path,
+            } => {
+                assert_eq!(owner.pid, std::process::id());
+                assert_eq!(lock_path, guard1.path());
+            }
+            DaemonLockAcquisition::AlreadyHeld { owner: None, .. } => {
+                panic!("already-held result should include owner metadata")
+            }
             DaemonLockAcquisition::Acquired(_) => {
                 panic!("second acquire must not win while first guard is held")
             }
@@ -406,12 +749,64 @@ mod tests {
         drop(guard1);
 
         // After release the lock is acquirable again.
-        match try_acquire(tmp.path()).expect("third acquire after drop") {
+        match try_acquire_for_test(&db_path, &runtime).expect("third acquire after drop") {
             DaemonLockAcquisition::Acquired(_) => {}
-            DaemonLockAcquisition::AlreadyHeld => {
+            DaemonLockAcquisition::AlreadyHeld { .. } => {
                 panic!("acquire after drop should win")
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_lock_scope_is_canonical_db_not_shared_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let runtime = tmp.path().join("runtime");
+        let db_a = tmp.path().join("profile-a").join("palace.db");
+        let db_b = tmp.path().join("profile-b").join("palace.db");
+        std::fs::create_dir_all(db_a.parent().expect("db a parent")).expect("db a parent");
+        std::fs::create_dir_all(db_b.parent().expect("db b parent")).expect("db b parent");
+        File::create(&db_a).expect("db a");
+        File::create(&db_b).expect("db b");
+
+        let guard_a = match try_acquire_for_test(&db_a, &runtime).expect("acquire a") {
+            DaemonLockAcquisition::Acquired(guard) => guard,
+            DaemonLockAcquisition::AlreadyHeld { .. } => panic!("db a should acquire"),
+        };
+        let guard_b = match try_acquire_for_test(&db_b, &runtime).expect("acquire b") {
+            DaemonLockAcquisition::Acquired(guard) => guard,
+            DaemonLockAcquisition::AlreadyHeld { .. } => panic!("db b should acquire"),
+        };
+
+        assert_ne!(guard_a.path(), guard_b.path());
+        assert_ne!(
+            guard_a.metadata().db_fingerprint,
+            guard_b.metadata().db_fingerprint
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_stale_metadata_without_live_lock_is_recovered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let runtime = tmp.path().join("runtime");
+        let db_path = tmp.path().join("palace.db");
+        File::create(&db_path).expect("db file");
+        let paths = daemon_lock_paths_for_test(&db_path, &runtime).expect("lock paths");
+        std::fs::create_dir_all(&paths.runtime_dir).expect("runtime dir");
+        std::fs::write(
+            &paths.metadata_path,
+            r#"{"pid":999999,"boot_id":"stale","binary_version":"old","db_path":"/stale","db_fingerprint":"stale","profile":null,"started_at_unix_ms":1,"executable_path":null,"executable_deleted":true}"#,
+        )
+        .expect("stale metadata");
+
+        let guard = match try_acquire_for_test(&db_path, &runtime).expect("acquire") {
+            DaemonLockAcquisition::Acquired(guard) => guard,
+            DaemonLockAcquisition::AlreadyHeld { .. } => panic!("stale metadata must not block"),
+        };
+
+        assert_eq!(guard.metadata().pid, std::process::id());
+        assert_eq!(guard.metadata().db_fingerprint, paths.db_fingerprint);
     }
 
     #[test]

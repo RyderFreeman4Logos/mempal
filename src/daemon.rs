@@ -18,7 +18,7 @@ use crate::core::{
     project::resolve_project_id,
     queue::{AsyncPendingMessageStore, ClaimedMessage, QueueFailureDisposition},
     strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
-    types::{BootstrapEvidenceArgs, Drawer, SourceType},
+    types::{BootstrapEvidenceArgs, Drawer, RuntimeWriterLease, SourceType},
     utils::{current_timestamp, route_room_from_taxonomy, synthetic_source_file},
 };
 use crate::embed::{
@@ -53,6 +53,9 @@ const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 pub const DAEMON_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 const DAEMON_HOOK_WORKER_LIMIT: usize = 4;
 const ENDPOINT_RECOVERY_REQUEUE_INTERVAL: Duration = Duration::from_secs(30);
+const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
+const DAEMON_WRITER_LEASE_TTL_SECS: u64 = 120;
+const DAEMON_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
     run_command_with_bootstrap_events(config_path, foreground, None)
@@ -67,11 +70,11 @@ pub fn run_command_with_bootstrap_events(
     let context =
         match DaemonContext::bootstrap_with_events(config_path, foreground, bootstrap_events) {
             Ok(context) => context,
-            // A concurrent daemon already holds the singleton lock (#257): this is
-            // a clean no-op, not a failure. Exit success without daemonizing.
+            // A concurrent daemon already holds the singleton lock (#496):
+            // fail before daemonizing or starting any workers, with owner
+            // metadata in the error for operators and scripts.
             Err(error) if error.is::<crate::daemon_singleton::DaemonAlreadyRunning>() => {
-                eprintln!("daemon already running; exiting");
-                return Ok(());
+                return Err(error);
             }
             Err(error) => return Err(error),
         };
@@ -84,6 +87,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         db.path().to_path_buf()
     };
     global_embed_status().set_audit_db_path(Some(db_path.clone()));
+    let _writer_lease = acquire_daemon_writer_lease(context, &db_path).await?;
     {
         let db = context.db.lock().await;
         db.prune_expired_audit_logs()
@@ -350,6 +354,140 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     Ok(())
 }
 
+struct RuntimeWriterLeaseHandle {
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+    heartbeat: tokio::task::JoinHandle<()>,
+}
+
+impl RuntimeWriterLeaseHandle {
+    fn new(db_path: PathBuf, lease: RuntimeWriterLease) -> Self {
+        let heartbeat = spawn_runtime_writer_lease_heartbeat(db_path.clone(), lease.clone());
+        Self {
+            db_path,
+            lease,
+            heartbeat,
+        }
+    }
+}
+
+impl Drop for RuntimeWriterLeaseHandle {
+    fn drop(&mut self) {
+        self.heartbeat.abort();
+        if let Ok(db) = Database::open(&self.db_path) {
+            let _ = db.runtime_writer_lease_release(
+                &self.lease.name,
+                &self.lease.owner,
+                &self.lease.session_id,
+            );
+        }
+    }
+}
+
+async fn acquire_daemon_writer_lease(
+    context: &DaemonContext,
+    db_path: &Path,
+) -> Result<RuntimeWriterLeaseHandle> {
+    let owner = format!("mempal-daemon-{}", std::process::id());
+    let metadata = json!({
+        "command": "daemon",
+        "db_path": db_path.to_string_lossy(),
+    })
+    .to_string();
+    let lease = {
+        let db = context.db.lock().await;
+        db.runtime_writer_lease_acquire(
+            SQLITE_WRITER_LEASE_NAME,
+            &owner,
+            "daemon",
+            DAEMON_WRITER_LEASE_TTL_SECS,
+            Some(&metadata),
+        )
+        .context("failed to acquire daemon writer lease")?
+    };
+    match lease {
+        Some(lease) => Ok(RuntimeWriterLeaseHandle::new(db_path.to_path_buf(), lease)),
+        None => {
+            let active = {
+                let db = context.db.lock().await;
+                db.runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+                    .unwrap_or_default()
+            };
+            Err(anyhow::anyhow!(
+                "SQLite writer lease `{}` is already held: {}",
+                SQLITE_WRITER_LEASE_NAME,
+                format_runtime_writer_leases(&active)
+            ))
+        }
+    }
+}
+
+fn spawn_runtime_writer_lease_heartbeat(
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DAEMON_WRITER_LEASE_RENEW_INTERVAL);
+        loop {
+            interval.tick().await;
+            let db_path = db_path.clone();
+            let lease_for_renew = lease.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let db =
+                    Database::open(&db_path).context("failed to open DB for writer lease renew")?;
+                db.runtime_writer_lease_renew(
+                    &lease_for_renew.name,
+                    &lease_for_renew.owner,
+                    &lease_for_renew.session_id,
+                    DAEMON_WRITER_LEASE_TTL_SECS,
+                )
+                .context("failed to renew daemon writer lease")
+            })
+            .await;
+            match result {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    tracing::error!(
+                        lease = %lease.name,
+                        owner = %lease.owner,
+                        "daemon writer lease was lost; requesting shutdown"
+                    );
+                    #[cfg(unix)]
+                    request_shutdown_and_notify();
+                    break;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "failed to renew daemon writer lease");
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "writer lease heartbeat task failed");
+                }
+            }
+        }
+    })
+}
+
+fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
+    if leases.is_empty() {
+        return "none visible".to_string();
+    }
+    leases
+        .iter()
+        .map(|lease| {
+            format!(
+                "name={} owner={} pid={} mode={} expires_at={} heartbeat_at={}",
+                lease.name,
+                lease.owner,
+                lease.pid,
+                lease.mode,
+                lease.expires_at,
+                lease.heartbeat_at
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn spawn_daemon_ingest_drain_worker(
     context: &DaemonContext,
     db_path: &Path,
@@ -361,7 +499,8 @@ fn spawn_daemon_ingest_drain_worker(
         Arc::new(crate::embed::ConfiguredEmbedderFactory::new_for_daemon(
             config,
         )),
-    )?;
+    )?
+    .with_external_ingest_writer_lease();
     let handle = server.spawn_scoped_ingest_drain_worker();
     tracing::info!("daemon async ingest worker started");
     Ok(handle)

@@ -841,6 +841,22 @@ pub struct LeaseInfo {
     pub remaining_secs: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeWriterLease {
+    pub name: String,
+    pub owner: String,
+    pub pid: u32,
+    pub boot_id: Option<String>,
+    pub session_id: String,
+    pub acquired_at: String,
+    pub expires_at: String,
+    pub heartbeat_at: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_json: Option<String>,
+    pub remaining_secs: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

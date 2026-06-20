@@ -294,6 +294,47 @@ fn test_daemon_context_bootstrap_ordering() {
     assert!(!pid_path.exists(), "pid file must be removed on drop");
 }
 
+#[test]
+fn test_duplicate_daemon_bootstrap_is_rejected_before_work_begins() {
+    let (tmp, db_path, _config_path) = setup_daemon_home();
+    let runtime_dir = tmp.path().join("runtime");
+    let _guard = match mempal::daemon_singleton::try_acquire_for_test(&db_path, &runtime_dir)
+        .expect("first acquire")
+    {
+        mempal::daemon_singleton::DaemonLockAcquisition::Acquired(guard) => guard,
+        mempal::daemon_singleton::DaemonLockAcquisition::AlreadyHeld { .. } => {
+            panic!("test lock should be free")
+        }
+    };
+
+    let output = Command::new(mempal_bin())
+        .args(["daemon", "--foreground"])
+        .env("HOME", tmp.path())
+        .env(
+            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+            &runtime_dir,
+        )
+        .stdin(Stdio::null())
+        .output()
+        .expect("run duplicate daemon");
+
+    assert!(
+        !output.status.success(),
+        "duplicate daemon must fail, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("daemon already running"),
+        "duplicate error should include owner metadata, stderr={stderr}"
+    );
+    assert!(
+        !tmp.path().join(".mempal/daemon.pid").exists(),
+        "duplicate daemon must fail before writing pidfile"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn test_daemon_restart_reaps_orphan_without_pidfile() {

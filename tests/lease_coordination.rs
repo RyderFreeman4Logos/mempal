@@ -114,3 +114,108 @@ fn lease_cleanup_expired() {
     assert_eq!(leases.len(), 1);
     assert_eq!(leases[0].resource_path, "c");
 }
+
+#[test]
+fn runtime_writer_lease_acquire_renew_release() {
+    let db = open_test_db();
+
+    let lease = db
+        .runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "daemon-owner",
+            "daemon",
+            300,
+            Some(r#"{"command":"daemon"}"#),
+        )
+        .unwrap()
+        .expect("acquire writer lease");
+
+    assert_eq!(lease.name, "sqlite-writer");
+    assert_eq!(lease.owner, "daemon-owner");
+    assert_eq!(lease.mode, "daemon");
+    assert_eq!(lease.pid, std::process::id());
+    assert!(lease.remaining_secs > 0);
+    assert_eq!(
+        lease.metadata_json.as_deref(),
+        Some(r#"{"command":"daemon"}"#)
+    );
+
+    assert!(
+        db.runtime_writer_lease_renew(&lease.name, &lease.owner, &lease.session_id, 600)
+            .unwrap()
+    );
+    let renewed = db
+        .runtime_writer_lease_status(Some("sqlite-writer"))
+        .unwrap();
+    assert_eq!(renewed.len(), 1);
+    assert!(renewed[0].remaining_secs > 0);
+
+    assert!(
+        db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)
+            .unwrap()
+    );
+    assert!(
+        db.runtime_writer_lease_status(Some("sqlite-writer"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn runtime_writer_lease_conflicts_until_expiry() {
+    let db = open_test_db();
+
+    let daemon = db
+        .runtime_writer_lease_acquire("sqlite-writer", "daemon-owner", "daemon", 1, None)
+        .unwrap()
+        .expect("daemon lease");
+
+    assert!(
+        db.runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "maintenance-owner",
+            "maintenance",
+            300,
+            None,
+        )
+        .unwrap()
+        .is_none(),
+        "maintenance writer must not acquire while daemon writer lease is active"
+    );
+    assert!(
+        !db.runtime_writer_lease_release("sqlite-writer", "maintenance-owner", &daemon.session_id)
+            .unwrap(),
+        "wrong owner/session must not release another writer lease"
+    );
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let maintenance = db
+        .runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "maintenance-owner",
+            "maintenance",
+            300,
+            None,
+        )
+        .unwrap()
+        .expect("expired daemon lease should be recoverable");
+    assert_eq!(maintenance.mode, "maintenance");
+}
+
+#[test]
+fn runtime_writer_lease_different_names_do_not_collide() {
+    let db = open_test_db();
+
+    let daemon = db
+        .runtime_writer_lease_acquire("sqlite-writer", "daemon-owner", "daemon", 300, None)
+        .unwrap()
+        .expect("daemon lease");
+    let independent = db
+        .runtime_writer_lease_acquire("analytics-writer", "other-owner", "maintenance", 300, None)
+        .unwrap()
+        .expect("independent lease");
+
+    assert_ne!(daemon.name, independent.name);
+    assert_eq!(db.runtime_writer_lease_status(None).unwrap().len(), 2);
+}

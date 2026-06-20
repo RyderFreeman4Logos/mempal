@@ -37,7 +37,7 @@ use crate::core::{
         AnchorKind, BootstrapIdentityParts, Drawer, DrawerSummary, ExplicitTunnel,
         KnowledgeCardFilter, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, Provenance,
         RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal, RuntimeAdoptionTrack,
-        SearchResult, SourceType, TriggerHints, Triple, default_confidence,
+        RuntimeWriterLease, SearchResult, SourceType, TriggerHints, Triple, default_confidence,
     },
     utils::{
         build_bootstrap_drawer_id_from_parts, build_triple_id, current_timestamp, expand_home,
@@ -143,6 +143,9 @@ const MCP_SEARCH_DB_DEADLINE: Duration = Duration::from_secs(30);
 const MCP_SEARCH_STALE_INDEX_DEADLINE: Duration = Duration::from_secs(2);
 const MCP_INGEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
+const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
+const MCP_INGEST_WRITER_LEASE_TTL_SECS: u64 = 120;
+const MCP_INGEST_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 
 fn mcp_ingest_idempotency_key(payload: &str) -> String {
     let now_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -183,8 +186,55 @@ pub struct MempalMcpServer {
     search_stale_index_deadline: Duration,
     ingest_admission_deadline: Duration,
     operation_status_deadline: Duration,
+    ingest_writer_lease_owned_externally: bool,
     #[cfg(any(test, feature = "db-test-seam"))]
     ingest_processing_delay: Option<Duration>,
+}
+
+struct McpIngestWriterLeaseGuard {
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    heartbeat: tokio::task::JoinHandle<()>,
+}
+
+impl McpIngestWriterLeaseGuard {
+    fn new(db_path: PathBuf, lease: RuntimeWriterLease) -> Self {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let heartbeat = MempalMcpServer::spawn_ingest_writer_lease_heartbeat(
+            db_path.clone(),
+            lease.clone(),
+            stop_rx,
+        );
+        Self {
+            db_path,
+            lease,
+            stop_tx: Some(stop_tx),
+            heartbeat,
+        }
+    }
+
+    async fn release(mut self) -> anyhow::Result<()> {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        let _ = self.heartbeat.await;
+        let db_path = self.db_path.clone();
+        let lease = self.lease.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = Database::open(&db_path).with_context(|| {
+                format!(
+                    "failed to open database to release MCP ingest writer lease: {}",
+                    db_path.display()
+                )
+            })?;
+            db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)
+                .context("failed to release MCP ingest writer lease")?;
+            Ok(())
+        })
+        .await
+        .context("MCP ingest writer lease release task failed")?
+    }
 }
 
 impl MempalMcpServer {
@@ -232,9 +282,15 @@ impl MempalMcpServer {
             search_stale_index_deadline: MCP_SEARCH_STALE_INDEX_DEADLINE,
             ingest_admission_deadline: MCP_INGEST_ADMISSION_DEADLINE,
             operation_status_deadline: MCP_OPERATION_STATUS_DEADLINE,
+            ingest_writer_lease_owned_externally: false,
             #[cfg(any(test, feature = "db-test-seam"))]
             ingest_processing_delay: None,
         })
+    }
+
+    pub fn with_external_ingest_writer_lease(mut self) -> Self {
+        self.ingest_writer_lease_owned_externally = true;
+        self
     }
 
     fn status_config_snapshot(&self) -> Arc<Config> {
@@ -536,6 +592,26 @@ impl MempalMcpServer {
 
         let (stop_tx, heartbeat) =
             Self::spawn_ingest_claim_heartbeat(queue.clone(), claim.id.clone(), worker_id);
+        let writer_lease = if self.ingest_writer_lease_owned_externally {
+            None
+        } else {
+            match self
+                .acquire_ingest_writer_lease(worker_id)
+                .await
+                .context("failed to acquire MCP ingest writer lease")?
+            {
+                Some(lease) => Some(lease),
+                None => {
+                    Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+                    queue
+                        .release_claim(claim)
+                        .await
+                        .context("failed to release ingest claim after writer lease conflict")?;
+                    tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+                    return Ok(());
+                }
+            }
+        };
         let outcome = match self
             .run_prepared_ingest_off_runtime(prepared.request.clone(), prepared.controls)
             .await
@@ -546,8 +622,15 @@ impl MempalMcpServer {
         };
 
         Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-        self.complete_ingest_claim_outcome(queue, &claim, queue_wait_ms, outcome)
-            .await
+        let completed = self
+            .complete_ingest_claim_outcome(queue, &claim, queue_wait_ms, outcome)
+            .await;
+        let released = match writer_lease {
+            Some(writer_lease) => writer_lease.release().await,
+            None => Ok(()),
+        };
+        completed?;
+        released
     }
 
     async fn process_ingest_claim_inline(
@@ -678,6 +761,85 @@ impl MempalMcpServer {
     ) {
         let _ = stop_tx.send(());
         let _ = heartbeat.await;
+    }
+
+    async fn acquire_ingest_writer_lease(
+        &self,
+        worker_id: &str,
+    ) -> anyhow::Result<Option<McpIngestWriterLeaseGuard>> {
+        let db_path = self.db_path.clone();
+        let owner = worker_id.to_string();
+        let metadata_json = serde_json::json!({
+            "component": "mcp-ingest-worker",
+            "db_path": db_path.display().to_string(),
+        })
+        .to_string();
+        let lease = tokio::task::spawn_blocking(move || {
+            let db = Database::open(&db_path).with_context(|| {
+                format!(
+                    "failed to open database for MCP ingest writer lease: {}",
+                    db_path.display()
+                )
+            })?;
+            db.runtime_writer_lease_acquire(
+                SQLITE_WRITER_LEASE_NAME,
+                &owner,
+                "mcp-ingest-worker",
+                MCP_INGEST_WRITER_LEASE_TTL_SECS,
+                Some(&metadata_json),
+            )
+            .context("failed to acquire MCP ingest writer lease")
+        })
+        .await
+        .context("MCP ingest writer lease task failed")??;
+        Ok(lease.map(|lease| McpIngestWriterLeaseGuard::new(self.db_path.clone(), lease)))
+    }
+
+    fn spawn_ingest_writer_lease_heartbeat(
+        db_path: PathBuf,
+        lease: RuntimeWriterLease,
+        mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(MCP_INGEST_WRITER_LEASE_RENEW_INTERVAL);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let db_path = db_path.clone();
+                        let lease_for_renew = lease.clone();
+                        let renew_result = tokio::task::spawn_blocking(move || {
+                            let db = Database::open(&db_path)?;
+                            db.runtime_writer_lease_renew(
+                                &lease_for_renew.name,
+                                &lease_for_renew.owner,
+                                &lease_for_renew.session_id,
+                                MCP_INGEST_WRITER_LEASE_TTL_SECS,
+                            )
+                        })
+                        .await;
+                        match renew_result {
+                            Ok(Ok(true)) => {}
+                            Ok(Ok(false)) => {
+                                tracing::error!(
+                                    lease_name = %lease.name,
+                                    owner = %lease.owner,
+                                    "MCP ingest writer lease lost; stopping lease heartbeat"
+                                );
+                                break;
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!(error = %error, "failed to renew MCP ingest writer lease");
+                            }
+                            Err(error) => {
+                                tracing::warn!(error = %error, "MCP ingest writer lease heartbeat task failed");
+                            }
+                        }
+                    }
+                    _ = &mut stop_rx => break,
+                }
+            }
+        })
     }
 
     async fn run_prepared_ingest_off_runtime(

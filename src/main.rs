@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "rest")]
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -55,8 +56,8 @@ use mempal::core::{
         KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink,
         KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
         Provenance, RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal,
-        RuntimeAdoptionTrack, SourceType, TaxonomyEntry, TriggerHints, TunnelEndpoint,
-        default_confidence,
+        RuntimeAdoptionTrack, RuntimeWriterLease, SourceType, TaxonomyEntry, TriggerHints,
+        TunnelEndpoint, default_confidence,
     },
     utils::{
         build_bootstrap_evidence_drawer_id, build_triple_id, current_timestamp,
@@ -2722,6 +2723,10 @@ const DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE: usize = 500;
 const DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY: usize = 1;
 const HISTORICAL_REJUDGE_CHECKPOINT_KEY: &str = "maintenance.rejudge.checkpoint";
 const HISTORICAL_REJUDGE_WORK_TABLE: &str = "historical_rejudge_work_items";
+const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
+const MAINTENANCE_WRITER_LEASE_TTL_SECS: u64 = 120;
+const MAINTENANCE_WRITER_LEASE_RENEW_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
 const HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT: &str = "sqlite_stream_v1";
 static HISTORICAL_REJUDGE_RUN_ID_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -4174,6 +4179,134 @@ where
         runtime.shutdown_timeout(std::time::Duration::from_millis(100));
     }
     result
+}
+
+struct MaintenanceWriterLeaseGuard {
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+    stop: Option<mpsc::Sender<()>>,
+    heartbeat: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for MaintenanceWriterLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.heartbeat.take() {
+            let _ = handle.join();
+        }
+        if let Ok(db) = Database::open(&self.db_path) {
+            let _ = db.runtime_writer_lease_release(
+                &self.lease.name,
+                &self.lease.owner,
+                &self.lease.session_id,
+            );
+        }
+    }
+}
+
+fn acquire_maintenance_writer_lease(
+    db: &Database,
+    command: &str,
+) -> Result<MaintenanceWriterLeaseGuard> {
+    let owner = format!("mempal-maintenance-{command}-{}", std::process::id());
+    let metadata = serde_json::json!({
+        "command": command,
+        "db_path": db.path().to_string_lossy(),
+    })
+    .to_string();
+    let lease = db
+        .runtime_writer_lease_acquire(
+            SQLITE_WRITER_LEASE_NAME,
+            &owner,
+            "maintenance",
+            MAINTENANCE_WRITER_LEASE_TTL_SECS,
+            Some(&metadata),
+        )
+        .with_context(|| format!("failed to acquire writer lease for {command}"))?;
+    let lease = match lease {
+        Some(lease) => lease,
+        None => {
+            let active = db
+                .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+                .unwrap_or_default();
+            bail!(
+                "SQLite writer lease `{}` is already held; refusing to run {command}: {}",
+                SQLITE_WRITER_LEASE_NAME,
+                format_runtime_writer_leases(&active)
+            );
+        }
+    };
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let heartbeat =
+        spawn_maintenance_writer_lease_heartbeat(db.path().to_path_buf(), lease.clone(), stop_rx);
+    Ok(MaintenanceWriterLeaseGuard {
+        db_path: db.path().to_path_buf(),
+        lease,
+        stop: Some(stop_tx),
+        heartbeat: Some(heartbeat),
+    })
+}
+
+fn spawn_maintenance_writer_lease_heartbeat(
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+    stop: mpsc::Receiver<()>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        loop {
+            match stop.recv_timeout(MAINTENANCE_WRITER_LEASE_RENEW_INTERVAL) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let result = Database::open(&db_path).and_then(|db| {
+                db.runtime_writer_lease_renew(
+                    &lease.name,
+                    &lease.owner,
+                    &lease.session_id,
+                    MAINTENANCE_WRITER_LEASE_TTL_SECS,
+                )
+            });
+            match result {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "warning: writer lease `{}` for {} was lost; stop this command before continuing writes",
+                        lease.name, lease.owner
+                    );
+                    break;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: failed to renew writer lease `{}` for {}: {error}",
+                        lease.name, lease.owner
+                    );
+                }
+            }
+        }
+    })
+}
+
+fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
+    if leases.is_empty() {
+        return "none visible".to_string();
+    }
+    leases
+        .iter()
+        .map(|lease| {
+            format!(
+                "name={} owner={} pid={} mode={} expires_at={} heartbeat_at={}",
+                lease.name,
+                lease.owner,
+                lease.pid,
+                lease.mode,
+                lease.expires_at,
+                lease.heartbeat_at
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 async fn bench_command(config: &Config, command: BenchCommands) -> Result<()> {
@@ -6975,6 +7108,7 @@ fn recompute_importance_command(db: &Database, only_zero: bool) -> Result<()> {
             (d.id, s)
         })
         .collect();
+    let _writer_lease = acquire_maintenance_writer_lease(db, "recompute-importance")?;
     let updated = db
         .bulk_update_importance(&updates)
         .context("failed to apply importance scores")?;
@@ -6983,6 +7117,7 @@ fn recompute_importance_command(db: &Database, only_zero: bool) -> Result<()> {
 }
 
 fn reindex_failed_queue_command(db: &Database) -> Result<()> {
+    let _writer_lease = acquire_maintenance_writer_lease(db, "reindex-failed-queue")?;
     let store = mempal::core::queue::PendingMessageStore::new(db.path())
         .context("failed to open pending message queue")?;
     let retried = store
@@ -7076,6 +7211,7 @@ fn normalize_added_at_command(db: &Database) -> Result<()> {
         return Ok(());
     }
     println!("normalising {to_update} rows (batches of 1000)...");
+    let _writer_lease = acquire_maintenance_writer_lease(db, "normalize-added-at")?;
     let updated = db
         .bulk_update_added_at(&updates)
         .context("failed to apply added_at normalisation")?;
@@ -7104,6 +7240,7 @@ async fn reindex_command_by_embedder(
         println!("dry-run: no vectors were written");
         return Ok(());
     }
+    let _writer_lease = acquire_maintenance_writer_lease(db, "reindex-embedder")?;
     let embedder = build_specific_embedder(config, embedder_name).await?;
     let new_dim = embedder.dimensions();
     let current_dim = current_vector_dim(db).context("failed to read embedding dim")?;
@@ -7608,6 +7745,7 @@ async fn reindex_command_sources(
             .await
             .context("failed to plan reindex")?
     } else {
+        let _writer_lease = acquire_maintenance_writer_lease(db, "reindex-sources")?;
         let embedder = build_embedder(config).await?;
         println!("embedder: {} ({}d)", embedder.name(), embedder.dimensions());
         reindex_sources(db, &*embedder, options)
@@ -14336,6 +14474,11 @@ async fn maintenance_rejudge_command_with_runtime(
 ) -> Result<()> {
     validate_historical_rejudge_options(options)?;
     validate_historical_rejudge_runtime_options(runtime)?;
+    let _writer_lease = if options.execute {
+        Some(acquire_maintenance_writer_lease(db, "maintenance-rejudge")?)
+    } else {
+        None
+    };
     let current_dir = env::current_dir().ok();
     let project_id = if options.project.is_some() {
         resolve_project_id(options.project, config, current_dir.as_deref())
@@ -17558,6 +17701,14 @@ fn maintenance_rejudge_restore_command(
         skipped_active_count: 0,
         conflict_count: 0,
         audit_count: 0,
+    };
+    let _writer_lease = if execute {
+        Some(acquire_maintenance_writer_lease(
+            db,
+            "maintenance-rejudge-restore",
+        )?)
+    } else {
+        None
     };
 
     for item in &backup.items {

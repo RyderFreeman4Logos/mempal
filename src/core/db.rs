@@ -29,8 +29,8 @@ use super::{
         KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink, KnowledgeEvidenceRole,
         KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind, NeighborChunk, Provenance,
         ReindexSource, RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal,
-        RuntimeAdoptionTrack, SleepStats, SourceType, TaxonomyEntry, Triple, TripleStats,
-        TunnelDrawer, TunnelEndpoint, TunnelFollowResult,
+        RuntimeAdoptionTrack, RuntimeWriterLease, SleepStats, SourceType, TaxonomyEntry, Triple,
+        TripleStats, TunnelDrawer, TunnelEndpoint, TunnelFollowResult,
     },
     utils::{
         build_drawer_id, build_scoped_drawer_id, build_tunnel_id, current_timestamp,
@@ -40,7 +40,7 @@ use super::{
 use crate::ingest::gating::GatingDecision;
 use crate::ingest::novelty::NoveltyAction;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 19;
+pub const CURRENT_SCHEMA_VERSION: u32 = 20;
 pub const CURRENT_VECTOR_INDEX_VERSION: &str = "v2";
 pub const VECTOR_DISTANCE_METRIC: &str = "cosine";
 /// SQLite page cache budget for issue #311's large-DB stale reindex path.
@@ -58,6 +58,35 @@ const CONTENT_HASH_BACKFILL_BATCH: usize = 1_000;
 
 fn content_hash_hex(content: &str) -> String {
     blake3::hash(content.as_bytes()).to_hex().to_string()
+}
+
+fn runtime_writer_session_id(name: &str, owner: &str) -> String {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(owner.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(std::process::id().to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now_nanos.to_string().as_bytes());
+    hasher.finalize().to_hex()[..16].to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runtime_boot_id() -> Option<String> {
+    None
 }
 
 fn truncate_preview(content: &str, max_chars: usize) -> String {
@@ -4844,6 +4873,23 @@ impl Database {
         Ok(total)
     }
 
+    fn with_immediate_tx<T, F>(&self, work: F) -> Result<T, DbError>
+    where
+        F: FnOnce() -> Result<T, DbError>,
+    {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match work() {
+            Ok(value) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     // --- Lease coordination ---
 
     pub fn lease_acquire(
@@ -4963,6 +5009,156 @@ impl Database {
     pub fn lease_cleanup_expired(&self) -> Result<usize, DbError> {
         let rows = self.conn.execute(
             "DELETE FROM leases WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            [],
+        )?;
+        Ok(rows)
+    }
+
+    // --- Runtime writer lease coordination ---
+
+    pub fn runtime_writer_lease_acquire(
+        &self,
+        name: &str,
+        owner: &str,
+        mode: &str,
+        ttl_secs: u64,
+        metadata_json: Option<&str>,
+    ) -> Result<Option<RuntimeWriterLease>, DbError> {
+        let mut session_id = String::new();
+        let mut acquired = false;
+        self.with_immediate_tx(|| {
+            self.runtime_writer_lease_cleanup_expired_tx()?;
+            session_id = runtime_writer_session_id(name, owner);
+            let now = crate::cowork::peek::format_rfc3339(SystemTime::now());
+            let expires_at =
+                crate::cowork::peek::format_rfc3339(SystemTime::now() + std::time::Duration::from_secs(ttl_secs));
+            let rows = self.conn.execute(
+                "INSERT OR IGNORE INTO runtime_writer_leases \
+                 (name, owner, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6, ?8, ?9)",
+                params![
+                    name,
+                    owner,
+                    std::process::id() as i64,
+                    runtime_boot_id(),
+                    &session_id,
+                    &now,
+                    &expires_at,
+                    mode,
+                    metadata_json
+                ],
+            )?;
+            acquired = rows > 0;
+            Ok(())
+        })?;
+        if acquired {
+            self.runtime_writer_lease_status(Some(name))
+                .map(|mut leases| leases.pop())
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn runtime_writer_lease_renew(
+        &self,
+        name: &str,
+        owner: &str,
+        session_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, DbError> {
+        let mut renewed = false;
+        self.with_immediate_tx(|| {
+            self.runtime_writer_lease_cleanup_expired_tx()?;
+            let now = crate::cowork::peek::format_rfc3339(SystemTime::now());
+            let expires_at = crate::cowork::peek::format_rfc3339(
+                SystemTime::now() + std::time::Duration::from_secs(ttl_secs),
+            );
+            let rows = self.conn.execute(
+                "UPDATE runtime_writer_leases \
+                 SET expires_at = ?4, heartbeat_at = ?5 \
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
+                params![name, owner, session_id, &expires_at, &now],
+            )?;
+            renewed = rows > 0;
+            Ok(())
+        })?;
+        Ok(renewed)
+    }
+
+    pub fn runtime_writer_lease_release(
+        &self,
+        name: &str,
+        owner: &str,
+        session_id: &str,
+    ) -> Result<bool, DbError> {
+        self.with_immediate_tx(|| {
+            let rows = self.conn.execute(
+                "DELETE FROM runtime_writer_leases \
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
+                params![name, owner, session_id],
+            )?;
+            Ok(rows > 0)
+        })
+    }
+
+    pub fn runtime_writer_lease_status(
+        &self,
+        name: Option<&str>,
+    ) -> Result<Vec<RuntimeWriterLease>, DbError> {
+        self.runtime_writer_lease_cleanup_expired()?;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let collect_row = |row: &rusqlite::Row| -> rusqlite::Result<RuntimeWriterLease> {
+            let expires_at: String = row.get(6)?;
+            let remaining_secs = crate::cowork::peek::parse_rfc3339(&expires_at)
+                .map(|expires| (expires - now_secs).max(0))
+                .unwrap_or(0);
+            let pid_i64: i64 = row.get(2)?;
+            Ok(RuntimeWriterLease {
+                name: row.get(0)?,
+                owner: row.get(1)?,
+                pid: u32::try_from(pid_i64).unwrap_or(0),
+                boot_id: row.get(3)?,
+                session_id: row.get(4)?,
+                acquired_at: row.get(5)?,
+                expires_at,
+                heartbeat_at: row.get(7)?,
+                mode: row.get(8)?,
+                metadata_json: row.get(9)?,
+                remaining_secs,
+            })
+        };
+        let mut leases = Vec::new();
+        if let Some(name) = name {
+            let mut stmt = self.conn.prepare(
+                "SELECT name, owner, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json \
+                 FROM runtime_writer_leases WHERE name = ?1",
+            )?;
+            for row in stmt.query_map([name], collect_row)? {
+                leases.push(row?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT name, owner, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json \
+                 FROM runtime_writer_leases ORDER BY name ASC",
+            )?;
+            for row in stmt.query_map([], collect_row)? {
+                leases.push(row?);
+            }
+        }
+        Ok(leases)
+    }
+
+    pub fn runtime_writer_lease_cleanup_expired(&self) -> Result<usize, DbError> {
+        self.with_immediate_tx(|| self.runtime_writer_lease_cleanup_expired_tx())
+    }
+
+    fn runtime_writer_lease_cleanup_expired_tx(&self) -> Result<usize, DbError> {
+        let rows = self.conn.execute(
+            "DELETE FROM runtime_writer_leases \
+             WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             [],
         )?;
         Ok(rows)
@@ -6281,6 +6477,27 @@ CREATE INDEX IF NOT EXISTS idx_foresights_validity
     ON foresights(valid_from, valid_until);
 "#;
 
+const V20_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS runtime_writer_leases (
+    name TEXT NOT NULL PRIMARY KEY,
+    owner TEXT NOT NULL,
+    pid INTEGER NOT NULL,
+    boot_id TEXT,
+    session_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    expires_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    metadata_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_writer_leases_expires
+    ON runtime_writer_leases(expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_writer_leases_mode
+    ON runtime_writer_leases(mode);
+"#;
+
 const V12_COMPACTION_SCHEMA_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_drawers_compacted_into
     ON drawers(compacted_into)
@@ -6439,6 +6656,10 @@ fn migrations() -> &'static [Migration] {
         Migration {
             version: 19,
             sql: V19_MIGRATION_SQL,
+        },
+        Migration {
+            version: 20,
+            sql: V20_MIGRATION_SQL,
         },
     ];
     MIGRATIONS
