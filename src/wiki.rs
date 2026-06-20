@@ -20,6 +20,8 @@ const WIKI_SEMANTICS: &str = "generated_read_only";
 const MANIFEST_FILE: &str = ".mempal-wiki.toml";
 const README_FILE: &str = "README.md";
 const INDEX_FILE: &str = "index.md";
+const PATH_COMPONENT_SLUG_MAX_BYTES: usize = 96;
+const PATH_HASH_DISPLAY_HEX_LEN: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct WikiBuildOptions {
@@ -1184,7 +1186,7 @@ fn triple_is_active(triple: &WikiTriple, now_secs: i64) -> bool {
 
 fn timestamp_expired(raw: Option<&str>, now_secs: i64) -> bool {
     raw.and_then(parse_temporal_timestamp_secs)
-        .is_some_and(|expires| expires <= now_secs)
+        .is_some_and(|expires| expires < now_secs)
 }
 
 fn triple_claim_hash(
@@ -1691,8 +1693,23 @@ fn path_component(value: &str) -> String {
 
 fn path_component_with_hash_display(slug_value: &str, hash_value: &str) -> String {
     let slug = path_component(slug_value);
+    let slug =
+        truncate_utf8_at_byte_limit(&slug, PATH_COMPONENT_SLUG_MAX_BYTES).trim_matches(['_', '.']);
+    let slug = if slug.is_empty() { "none" } else { slug };
     let digest = blake3::hash(hash_value.as_bytes()).to_hex();
-    format!("{slug}-{}", &digest[..8])
+    format!("{slug}-{}", &digest[..PATH_HASH_DISPLAY_HEX_LEN])
+}
+
+fn truncate_utf8_at_byte_limit(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn markdown_inline(value: &str) -> String {

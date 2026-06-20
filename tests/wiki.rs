@@ -148,6 +148,38 @@ fn read_all_generated_text(out_dir: &Path) -> String {
     output
 }
 
+fn generated_page_file_names(out_dir: &Path, directory: &str) -> Vec<String> {
+    let mut names = fs::read_dir(out_dir.join(directory))
+        .expect("read generated dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .path()
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn page_file_name_containing(out_dir: &Path, directory: &str, needle: &str) -> String {
+    for entry in fs::read_dir(out_dir.join(directory)).expect("read generated dir") {
+        let path = entry.expect("entry").path();
+        let markdown = fs::read_to_string(&path).expect("read generated page");
+        if markdown.contains(needle) {
+            return path
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    panic!("generated page containing {needle:?} not found");
+}
+
 #[test]
 fn wiki_build_writes_source_backed_entity_and_decision_pages() {
     let (_tmp, db, home) = setup_home();
@@ -323,6 +355,219 @@ fn wiki_build_omits_soft_deleted_supporting_drawers_from_active_refs() {
         "stdout={}\nstderr={}",
         String::from_utf8_lossy(&verify.stdout),
         String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
+fn wiki_build_and_verify_keep_equal_valid_bounds_active() {
+    let (_tmp, db, home) = setup_home();
+    seed_wiki_fixture(&db);
+    for drawer_id in ["drawer_entity_source", "drawer_decision"] {
+        db.conn()
+            .execute(
+                "UPDATE drawers SET valid_until = ?2 WHERE id = ?1",
+                (drawer_id, "2"),
+            )
+            .expect("set drawer valid_until boundary");
+    }
+    db.conn()
+        .execute(
+            "UPDATE triples SET valid_to = ?2 WHERE id = ?1",
+            ("triple_alice_sqlite", "2"),
+        )
+        .expect("set triple valid_to boundary");
+    drop(db);
+
+    let verify_fixture = home.join("wiki-verify-boundary");
+    let build_before_boundary = run_mempal(
+        &home,
+        &[
+            "wiki",
+            "build",
+            verify_fixture.to_str().expect("utf8 path"),
+            "--project",
+            "proj-wiki",
+            "--now",
+            "1",
+        ],
+    );
+    assert!(
+        build_before_boundary.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&build_before_boundary.stdout),
+        String::from_utf8_lossy(&build_before_boundary.stderr)
+    );
+
+    let verify_at_boundary = run_mempal(
+        &home,
+        &[
+            "wiki",
+            "verify",
+            verify_fixture.to_str().expect("utf8 path"),
+            "--now",
+            "2",
+        ],
+    );
+    assert!(
+        verify_at_boundary.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&verify_at_boundary.stdout),
+        String::from_utf8_lossy(&verify_at_boundary.stderr)
+    );
+
+    let build_fixture = home.join("wiki-build-boundary");
+    let build_at_boundary = run_mempal(
+        &home,
+        &[
+            "wiki",
+            "build",
+            build_fixture.to_str().expect("utf8 path"),
+            "--project",
+            "proj-wiki",
+            "--now",
+            "2",
+        ],
+    );
+    assert!(
+        build_at_boundary.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&build_at_boundary.stdout),
+        String::from_utf8_lossy(&build_at_boundary.stderr)
+    );
+
+    let alice_page = build_fixture
+        .join("entities")
+        .join(format!("{}.md", slug_with_hash("Alice")));
+    let alice = fs::read_to_string(alice_page).expect("read Alice page");
+    let alice_active = markdown_section(&alice, "## Active Claims");
+    assert!(
+        alice_active.contains("`Alice` --`chose`--> `SQLite`"),
+        "{alice}"
+    );
+    assert!(
+        alice_active.contains("`triple:triple_alice_sqlite`"),
+        "{alice}"
+    );
+    assert!(
+        alice_active.contains("`drawer:drawer_entity_source`"),
+        "{alice}"
+    );
+
+    let decision = read_decision_page(&build_fixture);
+    let decision_active = markdown_section(&decision, "## Active Claims");
+    let decision_superseded = markdown_section(&decision, "## Superseded Claims");
+    assert!(
+        decision_active.contains("`drawer:drawer_decision`"),
+        "{decision}"
+    );
+    assert!(
+        decision_active.contains("`drawer:drawer_entity_source`"),
+        "{decision}"
+    );
+    assert!(
+        !decision_superseded.contains("`drawer:drawer_decision`"),
+        "{decision}"
+    );
+}
+
+#[test]
+fn wiki_build_bounds_long_entity_and_decision_file_names() {
+    let (_tmp, db, home) = setup_home();
+    let long_entity = format!("Entity-{}", "abcdefghi".repeat(50));
+    let long_title = format!(
+        "Keep {} as the wiki page title",
+        "decision-title-".repeat(40)
+    );
+
+    let source = wiki_drawer(
+        "drawer_long_entity_source",
+        &format!("{long_entity} chose SQLite for generated wiki validation."),
+        "tests://wiki/long-entity-source.md",
+    );
+    db.insert_drawer_with_project(&source, Some("proj-wiki"))
+        .expect("insert long source");
+    db.insert_triple(&Triple {
+        id: "triple_long_entity_sqlite".to_string(),
+        subject: long_entity.clone(),
+        predicate: "chose".to_string(),
+        object: "SQLite".to_string(),
+        valid_from: Some("2026-06-19T12:00:00Z".to_string()),
+        valid_to: None,
+        confidence: 0.9,
+        source_drawer: Some("drawer_long_entity_source".to_string()),
+    })
+    .expect("insert long entity triple");
+
+    let mut decision = decision_drawer(
+        "drawer_long_decision",
+        &long_title,
+        "Long decision title should not become an unbounded wiki filename.",
+    );
+    decision.supporting_refs = vec!["drawer_long_entity_source".to_string()];
+    db.insert_drawer_with_project(&decision, Some("proj-wiki"))
+        .expect("insert long decision");
+    drop(db);
+
+    let out_dir = home.join("wiki-long-names");
+    let build = run_mempal(
+        &home,
+        &[
+            "wiki",
+            "build",
+            out_dir.to_str().expect("utf8 path"),
+            "--project",
+            "proj-wiki",
+            "--now",
+            "2000000000",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let entity_file = page_file_name_containing(&out_dir, "entities", &long_entity);
+    let decision_file = page_file_name_containing(&out_dir, "decisions", &long_title);
+    assert!(
+        entity_file.len() <= 128,
+        "entity filename should be bounded: {entity_file}"
+    );
+    assert!(
+        decision_file.len() <= 128,
+        "decision filename should be bounded: {decision_file}"
+    );
+    assert!(entity_file.ends_with(".md"), "{entity_file}");
+    assert!(decision_file.ends_with(".md"), "{decision_file}");
+
+    let first_entity_names = generated_page_file_names(&out_dir, "entities");
+    let first_decision_names = generated_page_file_names(&out_dir, "decisions");
+    let rebuild = run_mempal(
+        &home,
+        &[
+            "wiki",
+            "build",
+            out_dir.to_str().expect("utf8 path"),
+            "--project",
+            "proj-wiki",
+            "--now",
+            "2000000000",
+        ],
+    );
+    assert!(
+        rebuild.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&rebuild.stdout),
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+    assert_eq!(
+        first_entity_names,
+        generated_page_file_names(&out_dir, "entities")
+    );
+    assert_eq!(
+        first_decision_names,
+        generated_page_file_names(&out_dir, "decisions")
     );
 }
 
