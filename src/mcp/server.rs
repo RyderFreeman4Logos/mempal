@@ -12389,7 +12389,8 @@ quality_policy = "llm_required_for_keep"
 
     #[tokio::test]
     async fn test_mcp_ingest_returns_receipt_before_embedder_runs() {
-        let db_path = PathBuf::from("/tmp/mempal-async-receipt.db");
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open db");
 
         let call_count = Arc::new(AtomicUsize::new(0));
