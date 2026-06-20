@@ -1000,15 +1000,15 @@ After this, every time the agent runs `git commit`, it sees a reminder to save t
 
 Bad (just restating the diff):
 ```
-Added CI workflow
+Added local gates
 ```
 
 Good (captures context a future agent needs):
 ```
-Added CI with default + all-features matrix. Deliberately omitted rustfmt
-because formatting drift exists in 2 test files — cleanup is a separate
-commit. Follow-up: cargo fmt --all then add fmt check step. This completes
-priority #1 from drawer_mempal_default_a295458d.
+Replaced PR/push GitHub Actions with Linux-first `just local-gates` and
+lefthook enforcement. The gate now runs format check, strict clippy, default
+tests, REST feature tests, and release/package checks locally; exact-head
+CSA/Codex review remains required before push/merge.
 ```
 
 The difference: a future agent reading the good version knows what was omitted, why, and what to do next. The bad version tells them nothing they can't learn from `git log`.
@@ -1126,8 +1126,10 @@ Use it carefully anyway. `delete` is safer than hard removal, but once `mempal p
 If you modify code or behavior in this repository, the current validation baseline is:
 
 ```bash
-cargo test
-cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --all --check
+just local-gates
+csa review --range main...HEAD --sa-mode true
 ```
+
+GitHub Actions PR/push CI is not the project/agent gate for this repository.
+Use local `just`/`lefthook` gates and exact-head CSA/Codex review. Do not poll
+`gh pr checks` unless branch protection or the user explicitly requires it.

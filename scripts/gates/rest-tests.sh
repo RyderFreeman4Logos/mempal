@@ -2,7 +2,13 @@
 set -euo pipefail
 
 REST_TEST_TARGETS_PER_BATCH="${REST_TEST_TARGETS_PER_BATCH:-12}"
-REST_CI_DRY_RUN="${REST_CI_DRY_RUN:-0}"
+REST_GATE_DRY_RUN="${REST_GATE_DRY_RUN:-0}"
+
+if command -v mise >/dev/null 2>&1; then
+    cargo_cmd=(mise x rust@stable -- cargo)
+else
+    cargo_cmd=(cargo)
+fi
 
 if ! [[ "${REST_TEST_TARGETS_PER_BATCH}" =~ ^[1-9][0-9]*$ ]]; then
     echo "REST_TEST_TARGETS_PER_BATCH must be a positive integer" >&2
@@ -14,13 +20,13 @@ run_cmd() {
     printf ' %q' "$@"
     printf '\n'
 
-    if [[ "${REST_CI_DRY_RUN}" != "1" ]]; then
+    if [[ "${REST_GATE_DRY_RUN}" != "1" ]]; then
         "$@"
     fi
 }
 
 clean_mempal_artifacts() {
-    run_cmd cargo clean -p mempal
+    run_cmd "${cargo_cmd[@]}" clean -p mempal
 }
 
 run_integration_batch() {
@@ -34,14 +40,14 @@ run_integration_batch() {
     done
 
     printf 'rest integration batch %s: %s target(s)\n' "${batch_index}" "$#"
-    run_cmd cargo test --workspace --features rest "${target_args[@]}"
+    run_cmd "${cargo_cmd[@]}" test --workspace --features rest "${target_args[@]}"
     clean_mempal_artifacts
 }
 
 echo "rest target batch size: ${REST_TEST_TARGETS_PER_BATCH}"
 
-run_cmd cargo test --workspace --features rest --lib --bins
-run_cmd cargo test --workspace --features rest --doc
+run_cmd "${cargo_cmd[@]}" test --workspace --features rest --lib --bins
+run_cmd "${cargo_cmd[@]}" test --workspace --features rest --doc
 clean_mempal_artifacts
 
 mapfile -t integration_tests < <(
