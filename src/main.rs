@@ -15736,7 +15736,17 @@ async fn evaluate_historical_work_item(
     stage_mode: HistoricalRejudgeStageMode,
 ) -> Result<HistoricalRejudgeDecision> {
     if let Some(decision) = evaluate_historical_pre_llm(row, config) {
-        return Ok(decision);
+        if decision.delete_candidate && stage_mode == HistoricalRejudgeStageMode::ProposalOnly {
+            return persist_historical_rejudge_proposal_pending_decision(db, work_item, decision);
+        }
+        let drain_pending_delete = decision.delete_candidate
+            && stage_mode == HistoricalRejudgeStageMode::ConfirmPendingOnly
+            && work_item.llm_stage.as_deref() == Some("confirm_pending");
+        if !drain_pending_delete {
+            return Ok(decision);
+        }
+        // A split-stage proposal may have been created by Tier 1 before any
+        // LLM call. Drain it through the configured confirmation stage.
     }
 
     if let Some(context) = llm_context {
@@ -15746,7 +15756,52 @@ async fn evaluate_historical_work_item(
             .context("historical rejudge LLM gate failed");
     }
 
-    Ok(deterministic_historical_decision(&row.drawer))
+    let decision = deterministic_historical_decision(&row.drawer);
+    if decision.delete_candidate && stage_mode == HistoricalRejudgeStageMode::ProposalOnly {
+        return persist_historical_rejudge_proposal_pending_decision(db, work_item, decision);
+    }
+    if decision.delete_candidate
+        && stage_mode == HistoricalRejudgeStageMode::ConfirmPendingOnly
+        && work_item.llm_stage.as_deref() == Some("confirm_pending")
+    {
+        bail!("--confirm-pending-only requires an active confirmation LLM context");
+    }
+
+    Ok(decision)
+}
+
+fn persist_historical_rejudge_proposal_pending_decision(
+    db: &Database,
+    work_item: &HistoricalRejudgeWorkItem,
+    decision: HistoricalRejudgeDecision,
+) -> Result<HistoricalRejudgeDecision> {
+    let proposal_score = decision.score.unwrap_or(0.0);
+    match mark_historical_rejudge_work_item_llm_confirm_pending_or_keep(
+        db,
+        &work_item.run_id,
+        work_item.drawer_rowid,
+        proposal_score,
+    )? {
+        HistoricalRejudgeConfirmPendingPersistence::Persisted => {
+            Ok(historical_rejudge_proposal_pending_decision(decision))
+        }
+        HistoricalRejudgeConfirmPendingPersistence::Keep(decision) => Ok(decision),
+    }
+}
+
+fn historical_rejudge_proposal_pending_decision(
+    decision: HistoricalRejudgeDecision,
+) -> HistoricalRejudgeDecision {
+    HistoricalRejudgeDecision {
+        delete_candidate: true,
+        protected: false,
+        reason: format!("proposal_confirm_pending:{}", decision.reason),
+        label: decision.label,
+        score: decision.score,
+        tier: decision.tier,
+        judge: decision.judge,
+        requires_confirmation: true,
+    }
 }
 
 fn historical_rejudge_work_item_matches_snapshot(
@@ -15874,6 +15929,7 @@ fn finalize_prepared_historical_rejudge_work_items(
         if let (Some(row), Some(decision)) = (item.row.as_ref(), item.decision.as_ref())
             && decision.delete_candidate
             && !decision.requires_confirmation
+            && options.stage_mode.may_mutate()
         {
             match build_historical_rejudge_backup_item(db, row, decision, mutation)? {
                 Some(backup_item) => {
@@ -23805,6 +23861,102 @@ threshold = 0.7
             "{raw_progress}"
         );
         assert!(!raw_progress.contains("proposal_delete"), "{raw_progress}");
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_proposal_only_persists_tier1_backlog_without_mutation() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_would_delete",
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "proposal-only-tier1", "ok", "notes", None);
+        let rowid = drawer_rowid(&db, "proposal-only-tier1");
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                stage_mode: HistoricalRejudgeStageMode::ProposalOnly,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, None, 1)
+            },
+        )
+        .await
+        .expect("proposal-only tier1 candidate should persist confirmation backlog");
+
+        proposal_mock.assert_async().await;
+        assert!(
+            db.get_drawer("proposal-only-tier1")
+                .expect("load active drawer")
+                .is_some(),
+            "proposal-only must not delete Tier1 candidates"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_eq!(
+            audit_count(&db),
+            0,
+            "proposal-only must not audit a final Tier1 verdict"
+        );
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.status, "confirm_pending");
+        assert_eq!(checkpoint.scanned_count, 0);
+        assert_eq!(checkpoint.mutated_count, 0);
+        assert_eq!(
+            historical_rejudge_work_item_stage(&db, &checkpoint.run_id, rowid).as_deref(),
+            Some("confirm_pending")
+        );
+        assert_eq!(
+            historical_rejudge_work_item_decision(&db, &checkpoint.run_id, rowid),
+            None
+        );
+
+        let confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.02, "confirm_delete"))
+            .expect(1)
+            .create_async()
+            .await;
+        let backups = backup_dir(&tmp);
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                stage_mode: HistoricalRejudgeStageMode::ConfirmPendingOnly,
+                resume: true,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("confirm drain should delete Tier1 backlog only after Spark confirms");
+
+        proposal_mock.assert_async().await;
+        confirm_mock.assert_async().await;
+        assert!(
+            db.get_drawer("proposal-only-tier1")
+                .expect("load active drawer")
+                .is_none(),
+            "confirm drain should soft-delete after confirmation"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+        assert_eq!(sqlite_backup_item_count(&only_backup_file(&backups)), 1);
     }
 
     #[tokio::test]
