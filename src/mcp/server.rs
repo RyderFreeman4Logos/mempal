@@ -147,6 +147,7 @@ const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const MCP_INGEST_WRITER_LEASE_TTL_SECS: u64 = 120;
 const MCP_CONTENT_WRITER_LEASE_TTL_SECS: u64 = 120;
 const MCP_INGEST_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+const MCP_CONTENT_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 
 fn mcp_ingest_idempotency_key(payload: &str) -> String {
     let now_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -190,6 +191,12 @@ pub struct MempalMcpServer {
     external_ingest_writer_lease: Option<RuntimeWriterLease>,
     #[cfg(any(test, feature = "db-test-seam"))]
     ingest_processing_delay: Option<Duration>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    content_writer_lease_ttl_secs: u64,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    content_writer_lease_renew_interval: Duration,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    stale_penalty_delay: Option<Duration>,
 }
 
 struct McpIngestWriterLeaseGuard {
@@ -271,10 +278,43 @@ impl Drop for McpIngestWriterLeaseGuard {
 struct McpContentWriterLeaseGuard {
     db_path: PathBuf,
     lease: RuntimeWriterLease,
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl McpContentWriterLeaseGuard {
+    fn new(
+        db_path: PathBuf,
+        lease: RuntimeWriterLease,
+        ttl_secs: u64,
+        renew_interval: Duration,
+    ) -> Self {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let heartbeat = MempalMcpServer::spawn_mcp_writer_lease_heartbeat(
+            db_path.clone(),
+            lease.clone(),
+            ttl_secs,
+            renew_interval,
+            "content",
+            stop_rx,
+        );
+        Self {
+            db_path,
+            lease,
+            stop_tx: Some(stop_tx),
+            heartbeat: Some(heartbeat),
+        }
+    }
 }
 
 impl Drop for McpContentWriterLeaseGuard {
     fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
         if let Ok(db) = Database::open(&self.db_path) {
             let _ = db.runtime_writer_lease_release(
                 &self.lease.name,
@@ -378,6 +418,12 @@ impl MempalMcpServer {
             external_ingest_writer_lease: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             ingest_processing_delay: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            content_writer_lease_ttl_secs: MCP_CONTENT_WRITER_LEASE_TTL_SECS,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            content_writer_lease_renew_interval: MCP_CONTENT_WRITER_LEASE_RENEW_INTERVAL,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            stale_penalty_delay: None,
         })
     }
 
@@ -412,6 +458,23 @@ impl MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_ingest_processing_delay_for_test(mut self, delay: Duration) -> Self {
         self.ingest_processing_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_content_writer_lease_timing_for_test(
+        mut self,
+        ttl_secs: u64,
+        renew_interval: Duration,
+    ) -> Self {
+        self.content_writer_lease_ttl_secs = ttl_secs;
+        self.content_writer_lease_renew_interval = renew_interval;
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_stale_penalty_delay_for_test(mut self, delay: Duration) -> Self {
+        self.stale_penalty_delay = Some(delay);
         self
     }
 
@@ -964,19 +1027,47 @@ impl MempalMcpServer {
                 ));
             }
         };
-        Ok(McpContentWriterLeaseGuard {
-            db_path: db.path().to_path_buf(),
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let ttl_secs = self.content_writer_lease_ttl_secs;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let ttl_secs = MCP_CONTENT_WRITER_LEASE_TTL_SECS;
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let renew_interval = self.content_writer_lease_renew_interval;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let renew_interval = MCP_CONTENT_WRITER_LEASE_RENEW_INTERVAL;
+        Ok(McpContentWriterLeaseGuard::new(
+            db.path().to_path_buf(),
             lease,
-        })
+            ttl_secs,
+            renew_interval,
+        ))
     }
 
     fn spawn_ingest_writer_lease_heartbeat(
         db_path: PathBuf,
         lease: RuntimeWriterLease,
+        stop_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        Self::spawn_mcp_writer_lease_heartbeat(
+            db_path,
+            lease,
+            MCP_INGEST_WRITER_LEASE_TTL_SECS,
+            MCP_INGEST_WRITER_LEASE_RENEW_INTERVAL,
+            "ingest",
+            stop_rx,
+        )
+    }
+
+    fn spawn_mcp_writer_lease_heartbeat(
+        db_path: PathBuf,
+        lease: RuntimeWriterLease,
+        ttl_secs: u64,
+        renew_interval: Duration,
+        lease_kind: &'static str,
         mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(MCP_INGEST_WRITER_LEASE_RENEW_INTERVAL);
+            let mut interval = tokio::time::interval(renew_interval);
             interval.tick().await;
             loop {
                 tokio::select! {
@@ -989,7 +1080,7 @@ impl MempalMcpServer {
                                 &lease_for_renew.name,
                                 &lease_for_renew.owner,
                                 &lease_for_renew.session_id,
-                                MCP_INGEST_WRITER_LEASE_TTL_SECS,
+                                ttl_secs,
                             )
                         })
                         .await;
@@ -999,15 +1090,16 @@ impl MempalMcpServer {
                                 tracing::error!(
                                     lease_name = %lease.name,
                                     owner = %lease.owner,
-                                    "MCP ingest writer lease lost; stopping lease heartbeat"
+                                    lease_kind,
+                                    "MCP writer lease lost; stopping lease heartbeat"
                                 );
                                 break;
                             }
                             Ok(Err(error)) => {
-                                tracing::warn!(error = %error, "failed to renew MCP ingest writer lease");
+                                tracing::warn!(error = %error, lease_kind, "failed to renew MCP writer lease");
                             }
                             Err(error) => {
-                                tracing::warn!(error = %error, "MCP ingest writer lease heartbeat task failed");
+                                tracing::warn!(error = %error, lease_kind, "MCP writer lease heartbeat task failed");
                             }
                         }
                     }
@@ -7150,7 +7242,7 @@ impl MempalMcpServer {
                 }
             )
         });
-        let _writer_lease = if has_stale_penalty_targets {
+        let writer_lease = if has_stale_penalty_targets {
             Some(self.acquire_content_writer_lease(&db, "mempal_fact_check stale penalty")?)
         } else {
             None
@@ -7161,8 +7253,17 @@ impl MempalMcpServer {
                 ..
             } = issue
             {
+                ensure_mcp_runtime_writer_lease_active(
+                    &db,
+                    writer_lease.as_ref().map(|lease| &lease.lease),
+                    "apply fact-check stale penalty",
+                )?;
                 if let Err(err) = db.apply_stale_penalty_to_drawer(drawer_id, stale_penalty) {
                     tracing::warn!(drawer_id, error = %err, "stale penalty application failed");
+                }
+                #[cfg(any(test, feature = "db-test-seam"))]
+                if let Some(delay) = self.stale_penalty_delay {
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -13320,6 +13421,119 @@ quality_policy = "llm_required_for_keep"
         assert!(
             read_stale_penalty(&db_path, "fact-check-stale-success-target") < 1.0,
             "stale penalty should be applied"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mcp_fact_check_stale_penalty_keeps_content_writer_lease_renewed_during_batch() {
+        let (_tempdir, db_path, server) = setup_server();
+        let server = server
+            .with_content_writer_lease_timing_for_test(1, Duration::from_millis(100))
+            .with_stale_penalty_delay_for_test(Duration::from_millis(700));
+        let facts = [
+            (
+                "fact-check-stale-batch-alice",
+                "Alice works at Acme.",
+                "Alice",
+                "works_at",
+                "Acme",
+            ),
+            (
+                "fact-check-stale-batch-bob",
+                "Bob works at Beta.",
+                "Bob",
+                "works_at",
+                "Beta",
+            ),
+            (
+                "fact-check-stale-batch-carol",
+                "Carol is founder of Delta.",
+                "Carol",
+                "founder_of",
+                "Delta",
+            ),
+        ];
+        for (drawer_id, content, subject, predicate, object) in facts {
+            insert_drawer(
+                &db_path,
+                drawer_id,
+                content,
+                "mcp",
+                Some("lease"),
+                "/tmp/fact-check-stale-batch.md",
+                3,
+            );
+            insert_stale_triple_with_source_drawer(&db_path, subject, predicate, object, drawer_id);
+        }
+
+        let fact_check = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .mempal_fact_check(Parameters(FactCheckRequest {
+                        text: "Alice works at Acme. Bob works at Beta. Carol is founder of Delta."
+                            .to_string(),
+                        wing: None,
+                        room: None,
+                        now: Some("2028-01-15T08:00:00Z".to_string()),
+                    }))
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        let competing_lease = {
+            let db = Database::open(&db_path).expect("open db");
+            db.runtime_writer_lease_acquire(
+                SQLITE_WRITER_LEASE_NAME,
+                "competing-content-writer",
+                "daemon",
+                300,
+                None,
+            )
+            .expect("attempt competing writer lease")
+        };
+        assert!(
+            competing_lease.is_none(),
+            "content writer lease must remain active after the original 1s TTL while stale penalties are still being applied"
+        );
+
+        let response = fact_check
+            .await
+            .expect("fact check task joins")
+            .expect("fact check succeeds")
+            .0;
+        let stale_count = response
+            .issues
+            .iter()
+            .filter(|issue| matches!(issue, crate::factcheck::FactIssue::StaleFact { .. }))
+            .count();
+        assert_eq!(stale_count, facts.len(), "expected stale facts in response");
+        for (drawer_id, ..) in facts {
+            assert!(
+                read_stale_penalty(&db_path, drawer_id) < 1.0,
+                "stale penalty should be applied to {drawer_id}"
+            );
+        }
+
+        let db = Database::open(&db_path).expect("open db");
+        let post_release_lease = db
+            .runtime_writer_lease_acquire(
+                SQLITE_WRITER_LEASE_NAME,
+                "post-release-content-writer",
+                "daemon",
+                300,
+                None,
+            )
+            .expect("acquire writer lease after fact check")
+            .expect("content writer lease should be released after fact check");
+        assert!(
+            db.runtime_writer_lease_release(
+                &post_release_lease.name,
+                &post_release_lease.owner,
+                &post_release_lease.session_id
+            )
+            .expect("release post fact-check writer lease")
         );
     }
 
