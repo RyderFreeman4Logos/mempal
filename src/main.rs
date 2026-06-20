@@ -4473,9 +4473,11 @@ fn init_command(db: &Database, dir: &Path, dry_run: bool) -> Result<()> {
         .to_string();
     let rooms = detect_rooms(dir)?;
     if !dry_run {
+        let writer_lease = acquire_cli_content_writer_lease(db, "init")?;
         for room in &rooms {
             let keywords = serde_json::to_string(&vec![room.clone()])
                 .context("failed to serialize taxonomy keywords")?;
+            writer_lease.ensure_active("insert init taxonomy room")?;
             db.conn().execute("INSERT OR IGNORE INTO taxonomy (wing, room, display_name, keywords) VALUES (?1, ?2, ?3, ?4)", (&wing, room, room, keywords.as_str())).with_context(|| format!("failed to insert taxonomy room {room}"))?;
         }
     }
@@ -5568,6 +5570,7 @@ async fn checkpoint_command(
             let project_id = resolve_project_id(project.as_deref(), config, cwd.as_deref())
                 .context("failed to resolve checkpoint project id")?;
 
+            let writer_lease = acquire_cli_content_writer_lease(db, "checkpoint-save")?;
             let embedder = build_embedder(config).await?;
             let vectors = embedder
                 .embed(&[content.as_str()])
@@ -5594,8 +5597,10 @@ async fn checkpoint_command(
                 ..drawer
             };
 
+            writer_lease.ensure_active("insert checkpoint drawer")?;
             db.insert_drawer_with_project(&drawer, project_id.as_deref())
                 .with_context(|| format!("failed to insert checkpoint drawer {}", drawer.id))?;
+            writer_lease.ensure_active("insert checkpoint vector")?;
             db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
                 .with_context(|| format!("failed to insert vector for checkpoint {drawer_id}"))?;
 
@@ -5667,7 +5672,9 @@ async fn checkpoint_command(
                 )?;
                 println!("dry-run: would delete {count} checkpoints older than {cutoff_ts}");
             } else {
+                let writer_lease = acquire_cli_content_writer_lease(db, "checkpoint-cleanup")?;
                 let now_ts = iso_timestamp();
+                writer_lease.ensure_active("cleanup checkpoint drawers")?;
                 let affected = db.conn().execute(
                     "UPDATE drawers SET deleted_at = ?1 \
                      WHERE wing = 'session-checkpoint' AND deleted_at IS NULL \
@@ -6584,6 +6591,7 @@ fn effective_wake_up_text(drawer: &mempal::core::types::Drawer) -> &str {
 fn project_command(db: &Database, command: ProjectCommands) -> Result<()> {
     match command {
         ProjectCommands::Migrate { project, wing } => {
+            let _writer_lease = acquire_maintenance_writer_lease(db, "project-migrate")?;
             migrate_null_project_ids(db.path(), &project, wing.as_deref(), |event| match event {
                 ProjectMigrationEvent::Busy { delay_ms } => {
                     println!("batch busy, retrying in {delay_ms}ms");
@@ -6756,6 +6764,11 @@ fn consolidate_command(
     .context("failed to find similar drawer clusters")?;
 
     println!("clusters_found: {}", clusters.len());
+    let writer_lease = if options.dry_run {
+        None
+    } else {
+        Some(acquire_maintenance_writer_lease(db, "consolidate")?)
+    };
     let mut processed = 0usize;
     let mut drawers_merged = 0usize;
     for (index, cluster) in clusters.iter().take(limit).enumerate() {
@@ -6763,6 +6776,10 @@ fn consolidate_command(
             .iter()
             .map(|(drawer_id, _)| drawer_id.clone())
             .collect::<Vec<_>>();
+        ensure_maintenance_writer_lease_active(
+            writer_lease.as_ref(),
+            "merge consolidation cluster",
+        )?;
         let result = merge_cluster(db, &drawer_ids, strategy, options.dry_run)
             .context("failed to merge drawer cluster")?;
         processed += 1;
@@ -6808,6 +6825,11 @@ fn sleep_command(db: &Database, config: &Config, options: SleepCommandOptions) -
     let current_dir = env::current_dir().ok();
     let project_id = resolve_project_id(None, config, current_dir.as_deref())
         .context("failed to resolve project id for sleep cycle")?;
+    let _writer_lease = if options.dry_run {
+        None
+    } else {
+        Some(acquire_maintenance_writer_lease(db, "sleep")?)
+    };
     let summary = run_sleep_cycle(
         db,
         config,
@@ -6880,6 +6902,11 @@ async fn crystallize_command(
         Some(project) => Some(project),
         None => resolve_project_id(None, config, current_dir.as_deref())
             .context("failed to resolve project id for crystallization")?,
+    };
+    let _writer_lease = if options.dry_run {
+        None
+    } else {
+        Some(acquire_cli_content_writer_lease(db, "crystallize")?)
     };
     let summary = run_crystallization(
         db,
@@ -7292,6 +7319,8 @@ fn recompute_effective_importance_command(db: &Database) -> Result<()> {
         "recomputing effective_importance (decay_rate={}, floor={}, boost_cap={})...",
         imp.decay_rate, imp.floor, imp.boost_cap
     );
+    let writer_lease = acquire_maintenance_writer_lease(db, "recompute-effective-importance")?;
+    writer_lease.ensure_active("recompute effective_importance")?;
     let updated = db
         .recompute_all_effective_importance(now_ms, imp.decay_rate, imp.floor, imp.boost_cap)
         .context("failed to recompute effective_importance")?;
@@ -20287,6 +20316,102 @@ api_model = "text-embedding-3-large"
         vec![text.len() as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
     }
 
+    fn new_temp_db() -> (tempfile::TempDir, Database) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        (tmp, db)
+    }
+
+    fn hold_daemon_writer_lease(db: &Database) -> RuntimeWriterLease {
+        db.runtime_writer_lease_acquire(
+            SQLITE_WRITER_LEASE_NAME,
+            "test-daemon-writer",
+            "daemon",
+            MAINTENANCE_WRITER_LEASE_TTL_SECS,
+            None,
+        )
+        .expect("acquire daemon writer lease")
+        .expect("daemon writer lease")
+    }
+
+    fn assert_writer_lease_conflict(error: &anyhow::Error) {
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("SQLite writer lease `sqlite-writer` is already held"),
+            "{rendered}"
+        );
+    }
+
+    fn insert_checkpoint_drawer(db: &Database, id: &str, added_at: &str) {
+        let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: id.to_string(),
+            content: "checkpoint content".to_string(),
+            wing: "session-checkpoint".to_string(),
+            room: Some("claude".to_string()),
+            source_file: Some("session-checkpoint".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: added_at.to_string(),
+            chunk_index: Some(0),
+            importance: 4,
+        });
+        db.insert_drawer(&drawer).expect("insert checkpoint drawer");
+    }
+
+    fn insert_cli_test_drawer(db: &Database, id: &str) {
+        let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: id.to_string(),
+            content: "CLI writer lease regression drawer".to_string(),
+            wing: "lease-test".to_string(),
+            room: Some("cli".to_string()),
+            source_file: Some("tests://cli-writer-lease".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            chunk_index: Some(0),
+            importance: 3,
+        });
+        db.insert_drawer(&drawer).expect("insert CLI test drawer");
+    }
+
+    fn checkpoint_count(db: &Database) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawers WHERE wing = 'session-checkpoint'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count checkpoint drawers")
+    }
+
+    fn drawer_deleted_at(db: &Database, id: &str) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT deleted_at FROM drawers WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .expect("load drawer deleted_at")
+    }
+
+    fn drawer_project_id(db: &Database, id: &str) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT project_id FROM drawers WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .expect("load drawer project_id")
+    }
+
+    fn drawer_effective_importance(db: &Database, id: &str) -> f64 {
+        db.conn()
+            .query_row(
+                "SELECT effective_importance FROM drawers WHERE id = ?1",
+                [id],
+                |row| row.get::<_, f64>(0),
+            )
+            .expect("load drawer effective_importance")
+    }
+
     fn empty_reindex_target(limit: Option<usize>) -> ReindexVectorTarget {
         ReindexVectorTarget {
             drawer_ids: Vec::new(),
@@ -20399,6 +20524,178 @@ api_model = "text-embedding-3-large"
     fn char_safe_preview_returns_input_unchanged_when_short() {
         let content = "短文本"; // 3 chars, well under the limit
         assert_eq!(char_safe_preview(content, 300), content);
+    }
+
+    #[tokio::test]
+    async fn cli_checkpoint_writes_reject_existing_writer_lease() {
+        let (_tmp, db) = new_temp_db();
+        let config = Config::default();
+        insert_checkpoint_drawer(&db, "checkpoint-old", "2000-01-01T00:00:00Z");
+        let _daemon_lease = hold_daemon_writer_lease(&db);
+
+        let save_error = checkpoint_command(
+            &db,
+            &config,
+            CheckpointCommands::Save {
+                content: Some("new checkpoint content".to_string()),
+                project: Some("lease-project".to_string()),
+            },
+        )
+        .await
+        .expect_err("checkpoint save must reject under daemon writer lease");
+        assert_writer_lease_conflict(&save_error);
+
+        let cleanup_error = checkpoint_command(
+            &db,
+            &config,
+            CheckpointCommands::Cleanup {
+                max_age: "1h".to_string(),
+                dry_run: false,
+            },
+        )
+        .await
+        .expect_err("checkpoint cleanup must reject under daemon writer lease");
+        assert_writer_lease_conflict(&cleanup_error);
+
+        assert_eq!(
+            checkpoint_count(&db),
+            1,
+            "conflicting save must not insert a checkpoint drawer"
+        );
+        assert_eq!(
+            drawer_deleted_at(&db, "checkpoint-old"),
+            None,
+            "conflicting cleanup must not soft-delete checkpoint drawers"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_checkpoint_cleanup_succeeds_without_writer_conflict() {
+        let (_tmp, db) = new_temp_db();
+        let config = Config::default();
+        insert_checkpoint_drawer(&db, "checkpoint-cleanup", "2000-01-01T00:00:00Z");
+
+        checkpoint_command(
+            &db,
+            &config,
+            CheckpointCommands::Cleanup {
+                max_age: "1h".to_string(),
+                dry_run: false,
+            },
+        )
+        .await
+        .expect("checkpoint cleanup without writer conflict");
+
+        assert!(
+            drawer_deleted_at(&db, "checkpoint-cleanup").is_some(),
+            "checkpoint cleanup should soft-delete old checkpoint"
+        );
+    }
+
+    #[test]
+    fn cli_project_migrate_rejects_existing_writer_lease() {
+        let (_tmp, db) = new_temp_db();
+        insert_cli_test_drawer(&db, "project-migrate-conflict");
+        let _daemon_lease = hold_daemon_writer_lease(&db);
+
+        let error = project_command(
+            &db,
+            ProjectCommands::Migrate {
+                project: "lease-project".to_string(),
+                wing: None,
+            },
+        )
+        .expect_err("project migrate must reject under daemon writer lease");
+
+        assert_writer_lease_conflict(&error);
+        assert_eq!(
+            drawer_project_id(&db, "project-migrate-conflict"),
+            None,
+            "conflicting project migration must not update drawer project_id"
+        );
+    }
+
+    #[test]
+    fn cli_project_migrate_succeeds_without_writer_conflict() {
+        let (_tmp, db) = new_temp_db();
+        db.recreate_vectors_table(8).expect("create vector table");
+        insert_cli_test_drawer(&db, "project-migrate-success");
+
+        project_command(
+            &db,
+            ProjectCommands::Migrate {
+                project: "lease-project".to_string(),
+                wing: None,
+            },
+        )
+        .expect("project migrate without writer conflict");
+
+        assert_eq!(
+            drawer_project_id(&db, "project-migrate-success").as_deref(),
+            Some("lease-project")
+        );
+    }
+
+    #[test]
+    fn cli_effective_importance_recompute_rejects_existing_writer_lease() {
+        let (_tmp, db) = new_temp_db();
+        insert_cli_test_drawer(&db, "importance-conflict");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0 WHERE id = ?1",
+                ["importance-conflict"],
+            )
+            .expect("reset effective importance");
+        let _daemon_lease = hold_daemon_writer_lease(&db);
+
+        let error = recompute_effective_importance_command(&db)
+            .expect_err("effective importance recompute must reject under daemon writer lease");
+
+        assert_writer_lease_conflict(&error);
+        assert_eq!(
+            drawer_effective_importance(&db, "importance-conflict"),
+            0.0,
+            "conflicting recompute must not update effective_importance"
+        );
+    }
+
+    #[test]
+    fn cli_effective_importance_recompute_succeeds_without_writer_conflict() {
+        let (_tmp, db) = new_temp_db();
+        insert_cli_test_drawer(&db, "importance-success");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0 WHERE id = ?1",
+                ["importance-success"],
+            )
+            .expect("reset effective importance");
+
+        recompute_effective_importance_command(&db)
+            .expect("effective importance recompute without writer conflict");
+
+        assert!(
+            drawer_effective_importance(&db, "importance-success") > 0.0,
+            "successful recompute should update effective_importance"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_crystallize_dry_run_does_not_require_writer_lease() {
+        let (_tmp, db) = new_temp_db();
+        let config = Config::default();
+        let _daemon_lease = hold_daemon_writer_lease(&db);
+
+        crystallize_command(
+            &db,
+            &config,
+            CrystallizeCliOptions {
+                dry_run: true,
+                project: None,
+                json: true,
+            },
+        )
+        .await
+        .expect("crystallize dry-run should not require writer lease");
     }
 
     #[tokio::test]
