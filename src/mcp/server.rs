@@ -1495,6 +1495,12 @@ const INGEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS: u64 = 250;
 const INGEST_DRAIN_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngestWaitWorkerMode {
+    Background,
+    Scoped,
+}
+
 #[doc(hidden)]
 pub struct IngestDrainWorkerHandle {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -3986,6 +3992,30 @@ impl MempalMcpServer {
         request: IngestRequest,
         controls: IngestControls,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        self.mempal_ingest_with_controls_and_worker(
+            request,
+            controls,
+            IngestWaitWorkerMode::Background,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn mempal_ingest_with_controls_scoped_worker(
+        &self,
+        request: IngestRequest,
+        controls: IngestControls,
+    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        self.mempal_ingest_with_controls_and_worker(request, controls, IngestWaitWorkerMode::Scoped)
+            .await
+    }
+
+    async fn mempal_ingest_with_controls_and_worker(
+        &self,
+        request: IngestRequest,
+        controls: IngestControls,
+        worker_mode: IngestWaitWorkerMode,
+    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let dry_run = request.dry_run.unwrap_or(false);
         if !dry_run && global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
@@ -3997,7 +4027,6 @@ impl MempalMcpServer {
                 error.as_ref(),
             ));
         }
-        self.spawn_ingest_drain_worker();
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let room = request.room.as_deref();
         // Snapshot the request-wide warnings once so every early-return path reports a
@@ -4009,6 +4038,9 @@ impl MempalMcpServer {
             .await?;
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
+        if matches!(worker_mode, IngestWaitWorkerMode::Background) {
+            self.spawn_ingest_drain_worker();
+        }
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
             return Ok(Json(IngestResponse {
@@ -4126,7 +4158,13 @@ impl MempalMcpServer {
         };
 
         if wait {
-            if let Some(final_response) = self
+            let scoped_worker =
+                if matches!(worker_mode, IngestWaitWorkerMode::Scoped) && wait_timeout_secs > 0 {
+                    Some(self.spawn_scoped_ingest_drain_worker())
+                } else {
+                    None
+                };
+            let wait_result = self
                 .wait_for_operation_status(
                     queued_response
                         .operation_id
@@ -4135,12 +4173,34 @@ impl MempalMcpServer {
                     Duration::from_secs(wait_timeout_secs),
                     Duration::from_millis(150),
                 )
-                .await?
-            {
+                .await;
+            if let Some(worker) = scoped_worker {
+                worker.shutdown_and_drain().await;
+            }
+            if let Some(final_response) = wait_result? {
                 return Ok(Json(final_response));
             }
 
-            let mut timed_out_response = queued_response;
+            let mut timed_out_response = if matches!(worker_mode, IngestWaitWorkerMode::Scoped) {
+                let refreshed = self
+                    .operation_status_json_for_test(
+                        queued_response
+                            .operation_id
+                            .as_deref()
+                            .expect("queued receipt must include operation id"),
+                    )
+                    .await?;
+                if refreshed
+                    .state
+                    .map(IngestOperationState::is_terminal)
+                    .unwrap_or(false)
+                {
+                    return Ok(Json(refreshed));
+                }
+                refreshed
+            } else {
+                queued_response
+            };
             timed_out_response.timed_out = true;
             return Ok(Json(timed_out_response));
         }

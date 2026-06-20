@@ -4880,7 +4880,7 @@ async fn ingest_stdin_command(
         };
         let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone())?;
         let response = server
-            .mempal_ingest_with_controls(wait_request, controls)
+            .mempal_ingest_with_controls_scoped_worker(wait_request, controls)
             .await
             .map(|response| response.0)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;

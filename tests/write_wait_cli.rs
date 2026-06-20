@@ -5,7 +5,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
-use std::thread;
 use std::time::Duration;
 
 use common::harness::embed_mock::start as start_embed_mock;
@@ -16,7 +15,7 @@ use mempal::core::types::Triple;
 use mempal::core::utils::build_triple_id;
 use mempal::mcp::{IngestOperationState, IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
@@ -111,48 +110,6 @@ fn run_cli_with_stdin(home: &Path, args: &[&str], payload: &[u8]) -> Output {
         stdin.write_all(payload).expect("write stdin payload");
     }
     child.wait_with_output().expect("wait mempal")
-}
-
-fn run_cli_with_stdin_timeout(
-    home: &Path,
-    args: &[&str],
-    payload: &[u8],
-    timeout: Duration,
-) -> Output {
-    use std::io::Write as _;
-
-    let mut child = Command::new(mempal_bin())
-        .args(args)
-        .env("HOME", home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn mempal");
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(payload).expect("write stdin payload");
-    }
-
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => return child.wait_with_output().expect("wait mempal"),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let output = child.wait_with_output().expect("wait killed mempal");
-                    panic!(
-                        "mempal command timed out after {:?}: args={args:?} stdout={} stderr={}",
-                        timeout,
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => panic!("poll mempal child failed: {error}"),
-        }
-    }
 }
 
 fn spawn_cli(home: &Path, args: &[&str]) -> Child {
@@ -267,6 +224,18 @@ fn novelty_audit_count(home: &Path) -> i64 {
             row.get::<_, i64>(0)
         })
         .expect("count novelty audit")
+}
+
+fn first_ingest_async_operation(db_path: &Path) -> Option<(String, String)> {
+    Connection::open(db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT id, op_state FROM pending_messages WHERE kind = 'ingest_async' ORDER BY created_at ASC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .expect("query ingest async operation")
 }
 
 fn assert_bootstrap_stderr(output: &Output) {
@@ -536,10 +505,11 @@ async fn test_ingest_wait_json_matches_non_wait_json_output() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_ingest_wait_json_timeout_exits_after_receipt() {
+async fn test_ingest_wait_json_timeout_drains_active_scoped_worker_before_exit() {
     let home = setup_home();
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     let _config = write_config(home.path(), &format!("http://{addr}/v1"));
+    let db_path = home.path().join(".mempal/palace.db");
     handle.pause();
 
     let payload = serde_json::json!({
@@ -548,9 +518,8 @@ async fn test_ingest_wait_json_timeout_exits_after_receipt() {
     })
     .to_string();
 
-    let output = run_cli_with_stdin_timeout(
-        home.path(),
-        &[
+    let mut child = Command::new(mempal_bin())
+        .args([
             "ingest",
             "--stdin",
             "--project",
@@ -562,29 +531,68 @@ async fn test_ingest_wait_json_timeout_exits_after_receipt() {
             "--wait-timeout-secs",
             "1",
             "--json",
-        ],
-        payload.as_bytes(),
-        Duration::from_secs(4),
+        ])
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mempal");
+    {
+        use std::io::Write as _;
+
+        let mut stdin = child.stdin.take().expect("child stdin");
+        stdin
+            .write_all(payload.as_bytes())
+            .expect("write stdin payload");
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let operation_id = loop {
+        if let Some((operation_id, state)) = first_ingest_async_operation(&db_path)
+            && state == "running"
+        {
+            break operation_id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ingest wait worker did not claim operation"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let running = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load running status")
+        .expect("operation record exists");
+    assert_eq!(running.op_state, "running");
+
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert!(
+        child.try_wait().expect("poll ingest wait").is_none(),
+        "ingest --stdin --wait must not exit while its scoped worker is mid-ingest"
     );
+
     handle.resume();
+    let output = child.wait_with_output().expect("wait ingest child");
     handle.shutdown().await;
 
     assert!(
-        !output.status.success(),
-        "timeout must preserve non-zero CLI status: stdout={}, stderr={}",
+        output.status.success(),
+        "stdout={}, stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let receipt: Value =
-        serde_json::from_slice(&output.stdout).expect("timed-out receipt must be JSON");
-    assert!(receipt["operation_id"].as_str().is_some());
-    assert_eq!(receipt["state"], "queued");
-    assert_eq!(receipt["timed_out"], true);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("timed out waiting for ingest operation"),
-        "{stderr}"
-    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("completed ingest JSON");
+    assert_eq!(stdout["stats"]["files"], 1);
+    assert_eq!(stdout["stats"]["chunks"], 1);
+    assert_eq!(stdout["stats"]["skipped"], 0);
+    let completed = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load completed status")
+        .expect("operation record exists");
+    assert_eq!(completed.op_state, "completed");
+    let db = Database::open(&db_path).expect("open db");
+    assert_eq!(db.drawer_count().expect("drawer count"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
