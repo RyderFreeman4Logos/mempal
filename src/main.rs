@@ -16869,10 +16869,6 @@ fn create_historical_rejudge_sqlite_backup(
         ),
         ("judge_model", serde_json::to_string(&metadata.judge_model)?),
         ("config_version", metadata.config_version.clone()),
-        (
-            "payload_hash_format",
-            HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT.to_string(),
-        ),
     ] {
         transaction
             .execute(
@@ -16882,11 +16878,7 @@ fn create_historical_rejudge_sqlite_backup(
             .with_context(|| format!("failed to write backup metadata {key}"))?;
     }
     let initial_payload_hash = historical_rejudge_sqlite_payload_hash_in_transaction(&transaction)?;
-    transaction
-        .execute(
-            "INSERT INTO rejudge_backup_metadata (key, value) VALUES ('payload_sha256', ?1)",
-            [initial_payload_hash.as_str()],
-        )
+    write_historical_rejudge_sqlite_stream_integrity(&transaction, initial_payload_hash.as_str())
         .context("failed to write initial backup payload hash")?;
     transaction.commit().with_context(|| {
         format!(
@@ -17024,11 +17016,7 @@ fn append_historical_rejudge_backup_items_durable(
                 backup_path.display()
             )
         })?;
-    transaction
-        .execute(
-            "INSERT OR REPLACE INTO rejudge_backup_metadata (key, value) VALUES ('payload_sha256', ?1)",
-            [payload_sha256.as_str()],
-        )
+    write_historical_rejudge_sqlite_stream_integrity(&transaction, payload_sha256.as_str())
         .with_context(|| {
             format!(
                 "failed to write historical rejudge backup payload hash for {}",
@@ -17381,6 +17369,27 @@ fn historical_rejudge_backup_payload_hash(backup: &HistoricalRejudgeBackup) -> R
         "items": &backup.items,
     });
     Ok(sha256_hex(&serde_json::to_vec(&payload)?))
+}
+
+fn write_historical_rejudge_sqlite_stream_integrity(
+    transaction: &rusqlite::Transaction<'_>,
+    payload_sha256: &str,
+) -> Result<()> {
+    for (key, value) in [
+        (
+            "payload_hash_format",
+            HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT,
+        ),
+        ("payload_sha256", payload_sha256),
+    ] {
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO rejudge_backup_metadata (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .with_context(|| format!("failed to write backup integrity metadata {key}"))?;
+    }
+    Ok(())
 }
 
 fn historical_rejudge_sqlite_payload_hash_in_transaction(
@@ -21088,6 +21097,25 @@ threshold = 0.7
         .expect("load backup metadata")
     }
 
+    fn rewrite_sqlite_backup_to_legacy_integrity(path: &Path) {
+        let backup =
+            read_historical_rejudge_backup(path).expect("read backup before legacy rewrite");
+        let legacy_payload_hash =
+            historical_rejudge_backup_payload_hash(&backup).expect("compute legacy payload hash");
+        let conn = rusqlite::Connection::open(path).expect("open backup");
+        conn.execute(
+            "DELETE FROM rejudge_backup_metadata WHERE key = 'payload_hash_format'",
+            [],
+        )
+        .expect("remove stream hash marker");
+        conn.execute(
+            "UPDATE rejudge_backup_metadata SET value = ?1 WHERE key = 'payload_sha256'",
+            [legacy_payload_hash.as_str()],
+        )
+        .expect("write legacy payload hash");
+        sync_historical_rejudge_backup_storage(path).expect("sync legacy backup rewrite");
+    }
+
     fn full_rejudge_options<'a>(
         execute: bool,
         backup_dir: Option<&'a Path>,
@@ -24450,6 +24478,14 @@ threshold = 0.7
             Some(&backups),
         )
         .expect("prepare checkpoint");
+        let backup_path = checkpoint.backup_path.clone().expect("backup path");
+        rewrite_sqlite_backup_to_legacy_integrity(&backup_path);
+        assert!(
+            read_historical_rejudge_backup(&backup_path)
+                .expect("legacy backup remains readable before append")
+                .items
+                .is_empty()
+        );
         let first = next_historical_rejudge_work_items(&db, &checkpoint.run_id, 1)
             .expect("load first page")
             .pop()
@@ -24464,6 +24500,17 @@ threshold = 0.7
         )
         .await
         .expect("process first item");
+        assert_eq!(
+            sqlite_backup_metadata(&backup_path, "payload_hash_format"),
+            HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT
+        );
+        assert_eq!(
+            read_historical_rejudge_backup(&backup_path)
+                .expect("upgraded backup verifies after first append")
+                .items
+                .len(),
+            1
+        );
 
         maintenance_rejudge_command(
             &db,
@@ -24478,8 +24525,7 @@ threshold = 0.7
 
         assert_eq!(active_drawer_count(&db), 0);
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 3);
-        let backup = read_historical_rejudge_backup(&only_backup_file(&backups))
-            .expect("read resume backup");
+        let backup = read_historical_rejudge_backup(&backup_path).expect("read resume backup");
         assert_eq!(backup.items.len(), 3);
         let first_audit_count: i64 = db
             .conn()
@@ -24496,6 +24542,16 @@ threshold = 0.7
         assert_eq!(checkpoint.status, "done");
         assert_eq!(checkpoint.scanned_count, 3);
         assert_eq!(checkpoint.mutated_count, 3);
+        maintenance_rejudge_restore_command(
+            &db,
+            &backup_path,
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect("restore upgraded legacy backup");
+        assert_eq!(active_drawer_count(&db), 3);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
     }
 
     #[tokio::test]
