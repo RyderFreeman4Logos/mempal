@@ -276,6 +276,94 @@ fn test_doctor_rest_reports_server_error_routes_as_unhealthy() {
 }
 
 #[test]
+fn test_doctor_rest_surfaces_status_schema_skew_warning_as_degraded() {
+    let home = temp_home();
+    let mut server = Server::new();
+    let _status = server
+        .mock("GET", "/api/status")
+        .with_status(200)
+        .with_body(
+            r#"{"status_warnings":["status database snapshot unavailable because palace.db schema 20 is newer than this daemon supports (19); run `mempal daemon restart` after upgrading"]}"#,
+        )
+        .create();
+    let _search = server
+        .mock("GET", "/api/search")
+        .match_query(Matcher::Any)
+        .with_status(200)
+        .with_body("[]")
+        .create();
+    let _ingest = server
+        .mock("POST", "/api/ingest")
+        .match_body(Matcher::PartialJson(serde_json::json!({})))
+        .with_status(422)
+        .with_body(r#"{"error":"missing field `content`"}"#)
+        .create();
+    let _timeline = server
+        .mock("GET", "/api/timeline")
+        .match_query(Matcher::Any)
+        .with_status(200)
+        .with_body("[]")
+        .create();
+    let _pinned = server
+        .mock("GET", "/api/pinned_facts")
+        .match_query(Matcher::Any)
+        .with_status(200)
+        .with_body("[]")
+        .create();
+
+    let output = run_doctor_rest(&home, &["--addr", &server.url(), "--format", "json"]);
+
+    assert!(
+        output.status.success(),
+        "doctor rest failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor rest json");
+    if cfg!(feature = "rest") {
+        assert_eq!(report["status"], "degraded");
+    }
+    assert_eq!(report["endpoint_reachable"], true);
+    let status_route = report["routes"]
+        .as_array()
+        .expect("routes")
+        .iter()
+        .find(|route| route["method"] == "GET" && route["path"] == "/api/status")
+        .expect("status route");
+    assert_eq!(status_route["available"], true);
+    assert!(
+        status_route["degraded_reasons"]
+            .as_array()
+            .expect("degraded reasons")
+            .iter()
+            .any(|reason| reason
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("schema_skew:"))),
+        "status route should expose schema skew: {report:#}"
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("schema_skew"))),
+        "warnings should mention schema skew: {report:#}"
+    );
+    assert!(
+        report["recommendations"]
+            .as_array()
+            .expect("recommendations")
+            .iter()
+            .any(|recommendation| recommendation
+                .as_str()
+                .is_some_and(|recommendation| recommendation.contains("Restart or upgrade"))),
+        "recommendations should point to restart/upgrade: {report:#}"
+    );
+}
+
+#[test]
 fn test_doctor_rest_distinguishes_daemon_not_running_from_missing_rest_feature() {
     let home = temp_home();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");

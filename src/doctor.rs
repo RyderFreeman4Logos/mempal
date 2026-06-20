@@ -5,6 +5,7 @@ use std::{env, fs, io};
 
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::core::config::{Config, ConfigHandle};
 use crate::core::db::CURRENT_SCHEMA_VERSION;
@@ -184,6 +185,8 @@ pub struct RestRouteReport {
     pub available: bool,
     pub http_status: Option<u16>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -384,6 +387,10 @@ pub async fn build_rest_doctor_report(endpoint: &str, db_path: Option<&Path>) ->
         .iter()
         .filter_map(unhealthy_rest_route_detail)
         .collect::<Vec<_>>();
+    let degraded_reasons = routes
+        .iter()
+        .flat_map(|route| route.degraded_reasons.iter().cloned())
+        .collect::<Vec<_>>();
 
     let mut warnings = Vec::new();
     let mut recommendations = Vec::new();
@@ -444,7 +451,22 @@ pub async fn build_rest_doctor_report(endpoint: &str, db_path: Option<&Path>) ->
         recommendations.push(
             "Inspect the REST daemon logs and fix the failing route handler or database/profile configuration."
                 .to_string(),
-        );
+            );
+    }
+    if endpoint_reachable && !degraded_reasons.is_empty() {
+        warnings.push(format!(
+            "REST endpoint reports degraded status: {}",
+            degraded_reasons.join("; ")
+        ));
+        if degraded_reasons
+            .iter()
+            .any(|reason| reason.starts_with("schema_skew:") || reason.starts_with("stale_daemon:"))
+        {
+            recommendations.push(
+                "Restart or upgrade the mempal daemon serving this REST endpoint, then rerun `mempal doctor rest`."
+                    .to_string(),
+            );
+        }
     }
 
     if let (Some(db_path), Some(port)) = (db_path, &port)
@@ -476,6 +498,8 @@ pub async fn build_rest_doctor_report(endpoint: &str, db_path: Option<&Path>) ->
         "routes_unhealthy"
     } else if !missing_routes.is_empty() {
         "routes_missing"
+    } else if !degraded_reasons.is_empty() {
+        "degraded"
     } else {
         "ok"
     };
@@ -683,6 +707,7 @@ async fn probe_rest_routes(endpoint: &str) -> Vec<RestRouteReport> {
                     available: false,
                     http_status: None,
                     error: Some(error.to_string()),
+                    degraded_reasons: Vec::new(),
                 })
                 .collect();
         }
@@ -701,6 +726,7 @@ async fn probe_rest_routes(endpoint: &str) -> Vec<RestRouteReport> {
                     available: false,
                     http_status: None,
                     error: Some("unsupported route probe method".to_string()),
+                    degraded_reasons: Vec::new(),
                 });
                 continue;
             }
@@ -709,12 +735,19 @@ async fn probe_rest_routes(endpoint: &str) -> Vec<RestRouteReport> {
             Ok(response) => {
                 let status = response.status();
                 let (available, error) = classify_rest_route_probe(method, path, status);
+                let body = if *path == "/api/status" {
+                    response.text().await.ok()
+                } else {
+                    None
+                };
+                let degraded_reasons = status_route_degraded_reasons(path, status, body.as_deref());
                 reports.push(RestRouteReport {
                     method: (*method).to_string(),
                     path: (*path).to_string(),
                     available,
                     http_status: Some(status.as_u16()),
                     error,
+                    degraded_reasons,
                 });
             }
             Err(error) => reports.push(RestRouteReport {
@@ -723,10 +756,50 @@ async fn probe_rest_routes(endpoint: &str) -> Vec<RestRouteReport> {
                 available: false,
                 http_status: None,
                 error: Some(error.to_string()),
+                degraded_reasons: Vec::new(),
             }),
         }
     }
     reports
+}
+
+fn status_route_degraded_reasons(
+    path: &str,
+    status: reqwest::StatusCode,
+    body: Option<&str>,
+) -> Vec<String> {
+    if path != "/api/status" || !status.is_success() {
+        return Vec::new();
+    }
+    let Some(body) = body else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    value
+        .get("status_warnings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(rest_degraded_reason_from_status_warning)
+        .collect()
+}
+
+fn rest_degraded_reason_from_status_warning(warning: &str) -> String {
+    let safe = crate::core::config::scrub_sensitive_text(warning);
+    let lower = safe.to_ascii_lowercase();
+    if lower.contains("schema") && lower.contains("newer than") {
+        format!("schema_skew: {safe}")
+    } else if lower.contains("daemon binary")
+        || lower.contains("deleted or replaced")
+        || lower.contains("stale daemon")
+    {
+        format!("stale_daemon: {safe}")
+    } else {
+        format!("status_warning: {safe}")
+    }
 }
 
 fn classify_rest_route_probe(

@@ -19448,6 +19448,9 @@ fn print_rest_doctor_plain(report: &RestDoctorReport) {
         if let Some(error) = route.error.as_deref() {
             println!("    error={error}");
         }
+        for reason in &route.degraded_reasons {
+            println!("    degraded_reason={reason}");
+        }
     }
     for warning in &report.warnings {
         println!("warning: {warning}");

@@ -11,7 +11,7 @@ use std::{
 use crate::core::{
     anchor,
     config::ConfigHandle,
-    db::Database,
+    db::{Database, DbError},
     project::{ProjectSearchScope, resolve_project_id},
     remote_calls::{
         RemoteCallService, blocked_remote_endpoint_error, endpoint_policy_display_label,
@@ -29,6 +29,7 @@ use crate::core::{
 use crate::embed::global_embed_status;
 use crate::ingest::gating::evaluate_fact_check_gate;
 use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
+use crate::process_diagnostics::inspect_process_memory;
 use crate::search::{
     SearchMode, SearchOptions, VectorSearchCircuit, bm25_fallback_warning_degraded,
     bm25_fallback_warning_dimension_mismatch, bm25_fallback_warning_embed_error,
@@ -54,6 +55,8 @@ pub const DEFAULT_REST_ADDR: &str = "127.0.0.1:3080";
 const HERMES_COMPAT_VERSION: &str = "mempal-hermes-compat/1";
 const REST_SEARCH_WARNING_HEADER: &str = "mempal-warnings";
 const STATUS_DB_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(1);
+const REST_WRITE_RESTART_HINT: &str = "Restart the mempal daemon after upgrading so REST writes use a binary that supports this palace.db schema.";
+static REST_WRITE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub async fn serve(listener: tokio::net::TcpListener, state: ApiState) -> std::io::Result<()> {
     serve_with_shutdown(listener, state, shutdown_signal()).await
@@ -1080,6 +1083,7 @@ async fn ingest_handler(
     State(state): State<ApiState>,
     Json(request): Json<IngestRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    validate_rest_write_runtime(&state.db_path)?;
     validate_ingest_request(&request)?;
     if global_embed_status().should_block_writes() {
         return Err(ApiError::new(
@@ -1102,9 +1106,9 @@ async fn process_ingest_request(
             "mempal embed backend degraded; writes are paused until recovery. Read operations remain available.",
         ));
     }
+    let db = open_rest_write_database(&db_path)?;
     let embedder: Box<dyn crate::embed::Embedder> =
         embedder_factory.build().await.map_err(internal_error)?;
-    let db = Database::open(&db_path).map_err(internal_error)?;
     let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
     let validated = validate_ingest_request(&request)?;
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
@@ -1462,9 +1466,16 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         ),
         Err(error) => (
             StatusDbSnapshot::default(),
-            vec![status_database_snapshot_error_warning(error)],
+            vec![status_database_snapshot_error_warning(&error)],
         ),
     };
+    let mut status_warnings = status_warnings;
+    if current_executable_deleted() {
+        status_warnings.push(
+            "daemon binary has been deleted or replaced; run `mempal daemon restart` after upgrade"
+                .to_string(),
+        );
+    }
 
     Ok(Json(StatusResponse {
         drawer_count: db_snapshot.drawer_count,
@@ -1544,7 +1555,14 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
     }))
 }
 
-fn status_database_snapshot_error_warning(error: impl std::fmt::Display) -> String {
+fn status_database_snapshot_error_warning(error: &anyhow::Error) -> String {
+    if let Some(DbError::UnsupportedSchemaVersion { current, supported }) =
+        error.downcast_ref::<DbError>()
+    {
+        return format!(
+            "status database snapshot unavailable because palace.db schema {current} is newer than this daemon supports ({supported}); run `mempal daemon restart` after upgrading or install a mempal binary that supports this schema"
+        );
+    }
     let detail = crate::core::config::scrub_sensitive_text(&error.to_string());
     format!("status database snapshot unavailable; returning partial status: {detail}")
 }
@@ -1563,6 +1581,9 @@ fn current_embedding_status(snapshot: &crate::embed::EmbedHealthSnapshot) -> &'s
 struct ApiError {
     status: StatusCode,
     message: String,
+    kind: &'static str,
+    schema_skew: Option<SchemaSkew>,
+    recovery_hint: Option<&'static str>,
 }
 
 impl ApiError {
@@ -1570,19 +1591,59 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            kind: "http_error",
+            schema_skew: None,
+            recovery_hint: None,
+        }
+    }
+
+    fn schema_skew(current: u32, supported: u32) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "database schema version {current} is newer than this mempal daemon supports ({supported}); restart or upgrade the daemon before retrying REST writes"
+            ),
+            kind: "schema_skew",
+            schema_skew: Some(SchemaSkew { current, supported }),
+            recovery_hint: Some(REST_WRITE_RESTART_HINT),
+        }
+    }
+
+    fn stale_daemon() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "mempal daemon binary has been deleted or replaced; restart the daemon before retrying REST writes".to_string(),
+            kind: "stale_daemon",
+            schema_skew: None,
+            recovery_hint: Some(REST_WRITE_RESTART_HINT),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SchemaSkew {
+    current: u32,
+    supported: u32,
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let mut error = json!({
+            "message": self.message,
+            "status": self.status.as_u16(),
+            "kind": self.kind,
+        });
+        if let Some(schema_skew) = self.schema_skew {
+            error["schema_version"] = json!(schema_skew.current);
+            error["supported_schema_version"] = json!(schema_skew.supported);
+        }
+        if let Some(recovery_hint) = self.recovery_hint {
+            error["recovery_hint"] = json!(recovery_hint);
+        }
         (
             self.status,
             Json(json!({
-                "error": {
-                    "message": self.message,
-                    "status": self.status.as_u16(),
-                },
+                "error": error,
             })),
         )
             .into_response()
@@ -1613,6 +1674,7 @@ struct WriteQueueCounters {
 }
 
 struct WriteJob {
+    request_id: u64,
     request: IngestRequest,
     respond_to: oneshot::Sender<Result<IngestResponse, ApiError>>,
 }
@@ -1659,6 +1721,7 @@ impl WriteQueue {
 
         let (respond_to, response_rx) = oneshot::channel();
         let job = WriteJob {
+            request_id: next_rest_write_request_id(),
             request,
             respond_to,
         };
@@ -1721,7 +1784,7 @@ async fn write_worker(
     drained: Arc<Notify>,
 ) {
     while let Some(job) = receiver.recv().await {
-        let recovery_content = job.request.content.clone();
+        let log_metadata = RestWriteLogMetadata::from_request(job.request_id, &job.request);
         let result =
             process_ingest_request(db_path.clone(), Arc::clone(&embedder_factory), job.request)
                 .await;
@@ -1731,11 +1794,7 @@ async fn write_worker(
             }
             Err(error) => {
                 stats.failed.fetch_add(1, Ordering::SeqCst);
-                tracing::error!(
-                    error = %error.message,
-                    drawer_content = %recovery_content,
-                    "REST write failed; drawer content logged for manual recovery"
-                );
+                log_rest_write_failure(&log_metadata, error);
             }
         }
         stats.pending.fetch_sub(1, Ordering::SeqCst);
@@ -1744,8 +1803,96 @@ async fn write_worker(
     }
 }
 
+fn validate_rest_write_runtime(db_path: &std::path::Path) -> Result<(), ApiError> {
+    open_rest_write_database(db_path).map(|_| ())
+}
+
+fn open_rest_write_database(db_path: &std::path::Path) -> Result<Database, ApiError> {
+    if current_executable_deleted() {
+        return Err(ApiError::stale_daemon());
+    }
+    Database::open(db_path).map_err(db_error_to_api_error)
+}
+
+fn current_executable_deleted() -> bool {
+    let Ok(pid) = i32::try_from(std::process::id()) else {
+        return false;
+    };
+    inspect_process_memory(pid).exe_deleted
+}
+
+fn next_rest_write_request_id() -> u64 {
+    REST_WRITE_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+#[derive(Debug)]
+struct RestWriteLogMetadata {
+    request_id: u64,
+    content_len: usize,
+    content_hash_prefix: String,
+    source_type: &'static str,
+}
+
+impl RestWriteLogMetadata {
+    fn from_request(request_id: u64, request: &IngestRequest) -> Self {
+        Self {
+            request_id,
+            content_len: request.content.len(),
+            content_hash_prefix: blake3::hash(request.content.as_bytes()).to_hex()[..12]
+                .to_string(),
+            source_type: request.source_type_label(),
+        }
+    }
+}
+
+impl IngestRequest {
+    fn source_type_label(&self) -> &'static str {
+        match self.source_type.as_deref() {
+            Some("user_explicit") => "user_explicit",
+            Some("agent_observation") => "agent_observation",
+            Some("agent_inference") => "agent_inference",
+            Some("system_generated") => "system_generated",
+            Some(_) => "invalid",
+            None => "unspecified",
+        }
+    }
+}
+
+fn log_rest_write_failure(metadata: &RestWriteLogMetadata, error: &ApiError) {
+    let (schema_current, schema_supported) = error
+        .schema_skew
+        .map(|schema| (Some(schema.current), Some(schema.supported)))
+        .unwrap_or((None, None));
+    tracing::error!(
+        request_id = metadata.request_id,
+        route = "/api/ingest",
+        source_type = metadata.source_type,
+        content_len = metadata.content_len,
+        content_hash_prefix = %metadata.content_hash_prefix,
+        http_status = error.status.as_u16(),
+        error_kind = error.kind,
+        schema_version = schema_current,
+        supported_schema_version = schema_supported,
+        stale_binary = current_executable_deleted(),
+        recovery_hint = error.recovery_hint.unwrap_or("inspect REST daemon logs and retry after fixing the write path"),
+        "REST write failed"
+    );
+}
+
+fn db_error_to_api_error(error: DbError) -> ApiError {
+    match error {
+        DbError::UnsupportedSchemaVersion { current, supported } => {
+            ApiError::schema_skew(current, supported)
+        }
+        other => internal_error(other),
+    }
+}
+
 fn internal_error(error: impl std::fmt::Display) -> ApiError {
-    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::core::config::scrub_sensitive_text(&error.to_string()),
+    )
 }
 
 fn replacement_error(error: crate::core::db::DbError) -> ApiError {
