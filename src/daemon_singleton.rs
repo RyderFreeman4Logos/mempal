@@ -251,27 +251,6 @@ fn lock_paths_with_writable_runtime(
     let paths = daemon_lock_paths(db_path, profile, runtime_root)?;
     match std::fs::create_dir_all(&paths.runtime_dir) {
         Ok(()) => Ok(paths),
-        Err(source)
-            if runtime_root.is_none()
-                && env::var_os(MEMPAL_RUNTIME_DIR_ENV).is_none()
-                && env::var_os(XDG_RUNTIME_DIR_ENV).is_some() =>
-        {
-            let fallback_root = env::temp_dir().join("mempal-runtime");
-            let fallback_paths = daemon_lock_paths(db_path, profile, Some(&fallback_root))?;
-            std::fs::create_dir_all(&fallback_paths.runtime_dir).map_err(|fallback_source| {
-                DaemonLockError::Io {
-                    path: fallback_paths.runtime_dir.clone(),
-                    source: fallback_source,
-                }
-            })?;
-            tracing::warn!(
-                runtime_dir = %paths.runtime_dir.display(),
-                fallback_runtime_dir = %fallback_paths.runtime_dir.display(),
-                error = %source,
-                "daemon runtime directory is unavailable; using temp runtime directory"
-            );
-            Ok(fallback_paths)
-        }
         Err(source) => Err(DaemonLockError::Io {
             path: paths.runtime_dir,
             source,
@@ -701,6 +680,49 @@ mod imp {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            // SAFETY: daemon singleton tests serialize environment mutation with
+            // ENV_LOCK and restore the previous value when the guard is dropped.
+            unsafe {
+                env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+
+        fn set_path(key: &'static str, value: &Path) -> Self {
+            let previous = env::var_os(key);
+            // SAFETY: daemon singleton tests serialize environment mutation with
+            // ENV_LOCK and restore the previous value when the guard is dropped.
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: daemon singleton tests serialize environment mutation with
+            // ENV_LOCK and this drop restores the captured previous value.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    env::set_var(self.key, previous);
+                } else {
+                    env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
     }
@@ -755,6 +777,40 @@ mod tests {
                 panic!("acquire after drop should win")
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_xdg_runtime_creation_failure_does_not_fallback_to_temp() {
+        let _env_guard = ENV_LOCK.lock().expect("env lock");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        File::create(&db_path).expect("db file");
+        let runtime_file = tmp.path().join("runtime-file");
+        File::create(&runtime_file).expect("runtime file");
+        let fallback_root = env::temp_dir().join("mempal-runtime");
+        let fallback_paths =
+            daemon_lock_paths(&db_path, None, Some(&fallback_root)).expect("fallback paths");
+        let _ = std::fs::remove_file(&fallback_paths.lock_path);
+        let _ = std::fs::remove_file(&fallback_paths.metadata_path);
+
+        let _mempal_runtime_guard = EnvVarGuard::remove(MEMPAL_RUNTIME_DIR_ENV);
+        let _xdg_runtime_guard = EnvVarGuard::set_path(XDG_RUNTIME_DIR_ENV, &runtime_file);
+
+        let error = try_acquire(&db_path).expect_err("runtime dir failure must be fatal");
+        match error {
+            DaemonLockError::Io { path, .. } => {
+                assert_eq!(path, runtime_file.join("mempal"));
+            }
+        }
+        assert!(
+            !fallback_paths.lock_path.exists(),
+            "daemon singleton must not create a fallback temp lock"
+        );
+        assert!(
+            !fallback_paths.metadata_path.exists(),
+            "daemon singleton must not create fallback temp metadata"
+        );
     }
 
     #[cfg(unix)]

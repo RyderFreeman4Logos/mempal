@@ -2,7 +2,7 @@ mod common;
 
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,56 @@ log_path = "{}"
     )
     .expect("write config");
     (tmp, db_path, config_path)
+}
+
+fn daemon_runtime_dir(home: &Path) -> PathBuf {
+    home.join(".mempal").join("runtime")
+}
+
+trait DaemonCommandExt {
+    fn daemon_home(&mut self, home: &Path) -> &mut Self;
+}
+
+impl DaemonCommandExt for Command {
+    fn daemon_home(&mut self, home: &Path) -> &mut Self {
+        self.env("HOME", home).env(
+            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+            daemon_runtime_dir(home),
+        )
+    }
+}
+
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set_path(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: daemon lifecycle tests serialize process-wide environment
+        // mutation with ENV_LOCK and restore the previous value on drop.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: daemon lifecycle tests serialize process-wide environment
+        // mutation with ENV_LOCK and this restores the captured previous value.
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 }
 
 fn prepared_ingest_payload(content: &str) -> String {
@@ -231,7 +281,7 @@ fn spawn_db_backed_orphan_daemon(home: &std::path::Path, db_path: &std::path::Pa
     let pid_path = mempal_home.join("daemon.pid");
     let mut child = Command::new(mempal_bin())
         .args(["daemon", "--foreground"])
-        .env("HOME", home)
+        .daemon_home(home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -258,6 +308,11 @@ fn spawn_db_backed_orphan_daemon(home: &std::path::Path, db_path: &std::path::Pa
 #[test]
 fn test_daemon_context_bootstrap_ordering() {
     let (_tmp, _db_path, config_path) = setup_daemon_home();
+    let _env_lock = ENV_LOCK.lock().expect("env lock");
+    let _runtime_guard = EnvVarGuard::set_path(
+        mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+        &daemon_runtime_dir(_tmp.path()),
+    );
     let runtime = tokio::runtime::Runtime::new().expect("bootstrap runtime");
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
@@ -357,7 +412,7 @@ fn test_daemon_restart_reaps_orphan_without_pidfile() {
 
     let output = Command::new(mempal_bin())
         .args(["daemon", "restart"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .output()
         .expect("run daemon restart");
@@ -398,7 +453,7 @@ fn test_daemon_start_repairs_orphan_pidfile_before_reporting_running() {
 
     let output = Command::new(mempal_bin())
         .args(["daemon", "start"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .output()
         .expect("run daemon start");
@@ -435,7 +490,7 @@ fn test_daemon_stop_terminates_pidfile_only_process() -> Result<()> {
 
     let output = Command::new(mempal_bin())
         .args(["daemon", "stop"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .output()
         .context("run daemon stop")?;
@@ -469,7 +524,7 @@ fn test_daemon_restart_terminates_pidfile_only_process_and_restarts() -> Result<
 
     let output = Command::new(mempal_bin())
         .args(["daemon", "restart"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .output()
         .context("run daemon restart")?;
@@ -516,7 +571,7 @@ fn test_daemon_reap_repairs_single_orphan_pidfile() {
 
     let output = Command::new(mempal_bin())
         .args(["daemon", "reap"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .output()
         .expect("run daemon reap");
@@ -551,7 +606,7 @@ fn test_status_full_treats_single_orphan_as_running() {
 
     let output = Command::new(mempal_bin())
         .args(["status", "--full"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .output()
         .expect("run status --full");
@@ -587,7 +642,7 @@ fn test_daemon_reap_keeps_single_pidfile_process() -> Result<()> {
 
     let output = Command::new(mempal_bin())
         .args(["daemon", "reap"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .output()
         .context("run daemon reap")?;
@@ -622,7 +677,7 @@ fn test_daemon_processes_ingest_async_queue_rows() {
 
     let mut child = Command::new(mempal_bin())
         .args(["daemon", "--foreground"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -686,7 +741,7 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
 
     let mut child = Command::new(mempal_bin())
         .args(["daemon", "--foreground"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -736,7 +791,7 @@ async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
 
     let mut restarted = Command::new(mempal_bin())
         .args(["daemon", "--foreground"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -818,7 +873,7 @@ log_path = "{}"
 
     let mut child = Command::new(mempal_bin())
         .args(["daemon", "--foreground"])
-        .env("HOME", tmp.path())
+        .daemon_home(tmp.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -153,6 +153,7 @@ enabled = false
                 llm_gate: None,
                 config: &self.config,
                 mempal_home: &self.mempal_home,
+                runtime_writer_lease: None,
             },
         )
         .await
@@ -375,6 +376,7 @@ enabled = false
                 llm_gate: None,
                 config: &self.config,
                 mempal_home: &self.mempal_home,
+                runtime_writer_lease: None,
             },
         )
         .await

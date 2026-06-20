@@ -120,6 +120,7 @@ async fn test_daemon_heartbeat_fires_during_embed_retry() {
             llm_gate: None,
             config: &config,
             mempal_home: &mempal_home,
+            runtime_writer_lease: None,
         },
     )
     .await
@@ -230,6 +231,7 @@ enabled = true
             llm_gate: None,
             config: &config,
             mempal_home: &mempal_home,
+            runtime_writer_lease: None,
         },
     )
     .await
