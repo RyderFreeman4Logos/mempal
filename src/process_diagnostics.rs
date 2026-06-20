@@ -236,7 +236,13 @@ pub struct ProcessMemoryReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pss_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_hwm_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub private_dirty_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anonymous_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exe_path: Option<String>,
     pub exe_deleted: bool,
@@ -530,10 +536,13 @@ fn inspect_process_memory_in_proc(pid: i32, proc_root: &Path) -> ProcessMemoryRe
     }
     if let Ok(status) = fs::read_to_string(pid_dir.join("status")) {
         report.rss_bytes = parse_proc_kb_metric(&status, "VmRSS:");
+        report.vm_hwm_bytes = parse_proc_kb_metric(&status, "VmHWM:");
     }
     if let Ok(smaps) = fs::read_to_string(pid_dir.join("smaps_rollup")) {
         report.pss_bytes = parse_proc_kb_metric(&smaps, "Pss:");
         report.private_dirty_bytes = parse_proc_kb_metric(&smaps, "Private_Dirty:");
+        report.anonymous_bytes = parse_proc_kb_metric(&smaps, "Anonymous:");
+        report.swap_bytes = parse_proc_kb_metric(&smaps, "Swap:");
     }
     report
 }
@@ -1235,11 +1244,14 @@ mod tests {
             let proc_root = tmp.path();
             let pid_dir = proc_root.join("321");
             fs::create_dir_all(&pid_dir).expect("create pid dir");
-            fs::write(pid_dir.join("status"), "Name:\tmempal\nVmRSS:\t  2048 kB\n")
-                .expect("write status");
+            fs::write(
+                pid_dir.join("status"),
+                "Name:\tmempal\nVmRSS:\t  2048 kB\nVmHWM:\t  4096 kB\n",
+            )
+            .expect("write status");
             fs::write(
                 pid_dir.join("smaps_rollup"),
-                "Rss: 2048 kB\nPss: 1536 kB\nPrivate_Dirty: 1024 kB\n",
+                "Rss: 2048 kB\nPss: 1536 kB\nPrivate_Dirty: 1024 kB\nAnonymous: 768 kB\nSwap: 256 kB\n",
             )
             .expect("write smaps");
             symlink("/usr/local/bin/mempal (deleted)", pid_dir.join("exe")).expect("symlink exe");
@@ -1248,7 +1260,10 @@ mod tests {
 
             assert_eq!(report.rss_bytes, Some(2_097_152));
             assert_eq!(report.pss_bytes, Some(1_572_864));
+            assert_eq!(report.vm_hwm_bytes, Some(4_194_304));
             assert_eq!(report.private_dirty_bytes, Some(1_048_576));
+            assert_eq!(report.anonymous_bytes, Some(786_432));
+            assert_eq!(report.swap_bytes, Some(262_144));
             assert!(report.exe_deleted);
             assert_eq!(
                 report.exe_path.as_deref(),
