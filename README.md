@@ -383,12 +383,22 @@ Key design choices:
 
 ## Development
 
+This repository is Linux-first for project and agent gates. PR/push GitHub
+Actions CI is intentionally absent; GitHub Pages and release workflows are
+publishing/release automation, not the default completion gate. Before
+push/merge, run the local aggregate gate and keep exact-head CSA/Codex review
+as the review gate:
+
 ```bash
-cargo test
-cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --all --check
+just local-gates
+csa review --range main...HEAD --sa-mode true
 ```
+
+`just local-gates` runs `fmt-check`, strict clippy, default tests, REST feature
+tests, and release/package checks. `lefthook` enforces the same local gates on
+pre-push and keeps branch protection plus the exact-head review marker check.
+Do not spend agent time polling `gh pr checks` unless branch protection or the
+user explicitly asks for it.
 
 After changing the embedding model, re-embed existing drawers:
 
