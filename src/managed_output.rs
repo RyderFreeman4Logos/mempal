@@ -46,9 +46,7 @@ pub(crate) fn overwrite_existing_managed_file(
         );
     }
     #[cfg(unix)]
-    if expected_metadata.dev() != actual_metadata.dev()
-        || expected_metadata.ino() != actual_metadata.ino()
-    {
+    if !matches_validated_unix_file(expected_metadata, &actual_metadata) {
         bail!(
             "refusing to overwrite replaced {artifact_label} {}",
             path.display()
@@ -59,6 +57,21 @@ pub(crate) fn overwrite_existing_managed_file(
         .with_context(|| format!("failed to truncate {artifact_label} {}", path.display()))?;
     file.write_all(content)
         .with_context(|| format!("failed to write {artifact_label} {}", path.display()))
+}
+
+#[cfg(unix)]
+fn matches_validated_unix_file(expected: &fs::Metadata, actual: &fs::Metadata) -> bool {
+    expected.dev() == actual.dev()
+        && expected.ino() == actual.ino()
+        && expected.mode() == actual.mode()
+        && expected.nlink() == actual.nlink()
+        && expected.uid() == actual.uid()
+        && expected.gid() == actual.gid()
+        && expected.len() == actual.len()
+        && expected.mtime() == actual.mtime()
+        && expected.mtime_nsec() == actual.mtime_nsec()
+        && expected.ctime() == actual.ctime()
+        && expected.ctime_nsec() == actual.ctime_nsec()
 }
 
 #[cfg(test)]
@@ -108,7 +121,7 @@ mod tests {
         let expected = fs::symlink_metadata(&managed_path).expect("managed metadata");
 
         fs::remove_file(&managed_path).expect("remove managed");
-        fs::write(&managed_path, "attacker replacement").expect("write replacement");
+        fs::write(&managed_path, "evilmanaged").expect("write replacement");
 
         let error = overwrite_existing_managed_file(
             &managed_path,
@@ -126,7 +139,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(managed_path).expect("read replacement"),
-            "attacker replacement"
+            "evilmanaged"
         );
     }
 }
