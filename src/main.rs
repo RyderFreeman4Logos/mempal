@@ -2315,6 +2315,12 @@ struct MaintenanceRejudgeArgs {
     /// Write content-free JSONL progress telemetry to this file.
     #[arg(long = "progress-file")]
     progress_file: Option<PathBuf>,
+    /// Run only the proposal stage and persist confirmation backlog without deleting drawers.
+    #[arg(long = "proposal-only", default_value_t = false)]
+    proposal_only: bool,
+    /// Drain already persisted confirmation backlog without rerunning proposals.
+    #[arg(long = "confirm-pending-only", default_value_t = false)]
+    confirm_pending_only: bool,
     /// First-stage LLM endpoint id/model for streaming candidate proposals.
     #[arg(long = "proposal-llm-endpoint")]
     proposal_llm_endpoint: Option<String>,
@@ -2485,12 +2491,35 @@ struct HistoricalRejudgeOptions<'a> {
     unsafe_allow_config_version_drift: bool,
     page_size: usize,
     progress_file: Option<&'a Path>,
+    stage_mode: HistoricalRejudgeStageMode,
     proposal_llm_endpoint: Option<&'a str>,
     confirm_llm_endpoint: Option<&'a str>,
     wing: Option<&'a str>,
     room: Option<&'a str>,
     project: Option<&'a str>,
     format: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HistoricalRejudgeStageMode {
+    Paired,
+    ProposalOnly,
+    ConfirmPendingOnly,
+}
+
+impl HistoricalRejudgeStageMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Paired => "paired",
+            Self::ProposalOnly => "proposal_only",
+            Self::ConfirmPendingOnly => "confirm_pending_only",
+        }
+    }
+
+    fn may_mutate(self) -> bool {
+        !matches!(self, Self::ProposalOnly)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2528,6 +2557,10 @@ struct HistoricalRejudgeReport {
     progress_file: Option<PathBuf>,
     backup_path: Option<PathBuf>,
     backup_format: Option<String>,
+    stage_mode: String,
+    status: String,
+    no_stage_pending_count: usize,
+    confirm_pending_count: usize,
     wings_rooms: Vec<HistoricalRejudgeScopeCount>,
     examples: Vec<HistoricalRejudgeExample>,
 }
@@ -2549,6 +2582,9 @@ struct HistoricalRejudgeReportInput<'a> {
     progress_file: Option<PathBuf>,
     backup_path: Option<PathBuf>,
     backup_format: Option<String>,
+    stage_mode: HistoricalRejudgeStageMode,
+    status: &'a str,
+    backlog_counts: HistoricalRejudgeBacklogCounts,
     decisions: &'a [(
         &'a mempal::core::db::HistoricalRejudgeCandidate,
         HistoricalRejudgeDecision,
@@ -2583,6 +2619,7 @@ struct HistoricalRejudgeDecision {
     score: Option<f64>,
     tier: u8,
     judge: String,
+    requires_confirmation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2614,6 +2651,8 @@ struct HistoricalRejudgeCommandArgs {
     resume: bool,
     #[serde(default = "default_historical_rejudge_page_size")]
     page_size: usize,
+    #[serde(default = "default_historical_rejudge_stage_mode")]
+    stage_mode: HistoricalRejudgeStageMode,
     #[serde(default)]
     proposal_llm_endpoint: Option<String>,
     #[serde(default)]
@@ -2672,6 +2711,10 @@ fn default_historical_rejudge_page_size() -> usize {
     DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE
 }
 
+fn default_historical_rejudge_stage_mode() -> HistoricalRejudgeStageMode {
+    HistoricalRejudgeStageMode::Paired
+}
+
 fn build_historical_rejudge_progress_event(
     input: HistoricalRejudgeProgressEventInput<'_>,
 ) -> HistoricalRejudgeProgressEvent<'_> {
@@ -2700,6 +2743,8 @@ fn build_historical_rejudge_progress_event(
         protected_count: input.counts.protected_count,
         mutated_count: input.counts.mutated_count,
         estimated_bytes_reclaimed: input.counts.estimated_bytes_reclaimed,
+        no_stage_pending_count: input.counts.no_stage_pending_count,
+        confirm_pending_count: input.counts.confirm_pending_count,
         current_rowid: input.cursor_rowid,
         last_cursor_rowid: input.cursor_rowid,
         remaining_count: input.remaining_count,
@@ -2769,6 +2814,19 @@ struct HistoricalRejudgeWorkItem {
     llm_proposal_score: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct HistoricalRejudgeBacklogCounts {
+    no_stage_pending_count: usize,
+    confirm_pending_count: usize,
+}
+
+impl HistoricalRejudgeBacklogCounts {
+    fn remaining_count(self) -> usize {
+        self.no_stage_pending_count
+            .saturating_add(self.confirm_pending_count)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct HistoricalRejudgeWorkItemSnapshot {
     content_hash: String,
@@ -2811,6 +2869,8 @@ struct HistoricalRejudgeProgressCounts {
     protected_count: usize,
     mutated_count: usize,
     estimated_bytes_reclaimed: usize,
+    no_stage_pending_count: usize,
+    confirm_pending_count: usize,
 }
 
 impl HistoricalRejudgeProgressCounts {
@@ -2822,6 +2882,8 @@ impl HistoricalRejudgeProgressCounts {
             protected_count: checkpoint.protected_count,
             mutated_count: checkpoint.mutated_count,
             estimated_bytes_reclaimed: checkpoint.estimated_bytes_reclaimed,
+            no_stage_pending_count: 0,
+            confirm_pending_count: 0,
         }
     }
 
@@ -2833,7 +2895,15 @@ impl HistoricalRejudgeProgressCounts {
             protected_count: summary.protected_count,
             mutated_count: summary.mutated_count,
             estimated_bytes_reclaimed: summary.estimated_bytes_reclaimed,
+            no_stage_pending_count: 0,
+            confirm_pending_count: 0,
         }
+    }
+
+    fn with_backlog(mut self, backlog_counts: HistoricalRejudgeBacklogCounts) -> Self {
+        self.no_stage_pending_count = backlog_counts.no_stage_pending_count;
+        self.confirm_pending_count = backlog_counts.confirm_pending_count;
+        self
     }
 }
 
@@ -2857,6 +2927,8 @@ struct HistoricalRejudgeProgressEvent<'a> {
     protected_count: usize,
     mutated_count: usize,
     estimated_bytes_reclaimed: usize,
+    no_stage_pending_count: usize,
+    confirm_pending_count: usize,
     current_rowid: Option<i64>,
     last_cursor_rowid: Option<i64>,
     remaining_count: Option<usize>,
@@ -3718,6 +3790,8 @@ fn run() -> Result<()> {
                 page_size,
                 llm_concurrency,
                 progress_file,
+                proposal_only,
+                confirm_pending_only,
                 proposal_llm_endpoint,
                 confirm_llm_endpoint,
                 wing,
@@ -3725,6 +3799,14 @@ fn run() -> Result<()> {
                 project,
                 format,
             } = *args;
+            let stage_mode = match (proposal_only, confirm_pending_only) {
+                (false, false) => HistoricalRejudgeStageMode::Paired,
+                (true, false) => HistoricalRejudgeStageMode::ProposalOnly,
+                (false, true) => HistoricalRejudgeStageMode::ConfirmPendingOnly,
+                (true, true) => {
+                    bail!("--proposal-only and --confirm-pending-only are mutually exclusive")
+                }
+            };
             let options = HistoricalRejudgeOptions {
                 execute,
                 hard_delete,
@@ -3736,6 +3818,7 @@ fn run() -> Result<()> {
                 unsafe_allow_config_version_drift,
                 page_size,
                 progress_file: progress_file.as_deref(),
+                stage_mode,
                 proposal_llm_endpoint: proposal_llm_endpoint.as_deref(),
                 confirm_llm_endpoint: confirm_llm_endpoint.as_deref(),
                 wing: wing.as_deref(),
@@ -10914,11 +10997,12 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     }
     println!("Historical Rejudge:");
     if let Some(checkpoint) = historical_rejudge_checkpoint.as_ref() {
-        let remaining = historical_rejudge_remaining_work_count(db, &checkpoint.run_id)
-            .unwrap_or_else(|_| {
-                checkpoint
+        let backlog_counts = historical_rejudge_backlog_counts(db, &checkpoint.run_id)
+            .unwrap_or_else(|_| HistoricalRejudgeBacklogCounts {
+                no_stage_pending_count: checkpoint
                     .snapshot_count
-                    .saturating_sub(checkpoint.scanned_count)
+                    .saturating_sub(checkpoint.scanned_count),
+                confirm_pending_count: 0,
             });
         println!("  status: {}", checkpoint.status);
         println!("  run_id: {}", checkpoint.run_id);
@@ -10928,7 +11012,15 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
             Some(rowid) => println!("  cursor_rowid: {rowid}"),
             None => println!("  cursor_rowid: none"),
         }
-        println!("  remaining_count: {remaining}");
+        println!("  remaining_count: {}", backlog_counts.remaining_count());
+        println!(
+            "  no_stage_pending_count: {}",
+            backlog_counts.no_stage_pending_count
+        );
+        println!(
+            "  confirm_pending_count: {}",
+            backlog_counts.confirm_pending_count
+        );
         match checkpoint.judge_model.as_deref() {
             Some(model) => println!("  judge_model: {model}"),
             None => println!("  judge_model: none"),
@@ -14104,6 +14196,12 @@ Dry-run with machine-readable progress telemetry:
 Execute the full forget sweep with an explicit backup directory:
   mempal maintenance rejudge --all --execute --backup-dir /ssd/mirror-rootfs/home/obj/bak/mempal/
 
+Run Qwen proposals only while Spark confirmation quota is exhausted:
+  mempal maintenance rejudge --all --execute --proposal-only --proposal-llm-endpoint qwen --confirm-llm-endpoint spark --progress-file /tmp/mempal-rejudge-progress.jsonl
+
+Drain persisted Spark confirmations later without rerunning Qwen:
+  mempal maintenance rejudge --all --resume --execute --confirm-pending-only --backup-dir /ssd/mirror-rootfs/home/obj/bak/mempal/ --proposal-llm-endpoint qwen --confirm-llm-endpoint spark
+
 Resume an interrupted execute sweep:
   mempal maintenance rejudge --all --resume --execute --backup-dir /ssd/mirror-rootfs/home/obj/bak/mempal/
 
@@ -14120,6 +14218,8 @@ Operational notes
 - Progress files are JSONL sidecars containing counts, cursors, ETA, model
   summary, and config version only; they do not include drawer content, prompts,
   raw LLM responses, or provider credentials.
+- Split-stage runs expose no-stage and confirm-pending backlog counts only; they
+  do not print drawer content, prompts, raw model responses, URLs, or secrets.
 - If a provider/model fails during execute, stop and resume later rather than
   deleting based on uncertain fallback judgments.
 - Use --hard-delete only when you intentionally want irreversible deletion.
@@ -14238,6 +14338,29 @@ fn validate_historical_rejudge_options(options: HistoricalRejudgeOptions<'_>) ->
     }
     if options.confirm_llm_endpoint.is_some() && options.proposal_llm_endpoint.is_none() {
         bail!("--confirm-llm-endpoint requires --proposal-llm-endpoint");
+    }
+    match options.stage_mode {
+        HistoricalRejudgeStageMode::Paired => {}
+        HistoricalRejudgeStageMode::ProposalOnly => {
+            if !options.all || !options.execute {
+                bail!("--proposal-only requires --all --execute");
+            }
+            if options.proposal_llm_endpoint.is_none() || options.confirm_llm_endpoint.is_none() {
+                bail!(
+                    "--proposal-only requires --proposal-llm-endpoint and --confirm-llm-endpoint"
+                );
+            }
+        }
+        HistoricalRejudgeStageMode::ConfirmPendingOnly => {
+            if !options.all || !options.execute || !options.resume {
+                bail!("--confirm-pending-only requires --all --resume --execute");
+            }
+            if options.proposal_llm_endpoint.is_none() || options.confirm_llm_endpoint.is_none() {
+                bail!(
+                    "--confirm-pending-only requires --proposal-llm-endpoint and --confirm-llm-endpoint"
+                );
+            }
+        }
     }
     if let Some(backup_dir) = options.backup_dir {
         validate_absolute_path(backup_dir, "--backup-dir")?;
@@ -14465,6 +14588,9 @@ async fn maintenance_rejudge_limited_command(
         progress_file: progress.as_ref().map(|writer| writer.path().to_path_buf()),
         backup_format: backup_path.as_ref().map(|_| "sqlite".to_string()),
         backup_path,
+        stage_mode: options.stage_mode,
+        status: "done",
+        backlog_counts: HistoricalRejudgeBacklogCounts::default(),
         decisions: &decisions,
     });
     if let Some(writer) = progress.as_mut() {
@@ -14541,6 +14667,12 @@ fn historical_rejudge_effective_backup_dir(
     Ok(None)
 }
 
+fn historical_rejudge_backup_required(options: HistoricalRejudgeOptions<'_>) -> bool {
+    options.execute
+        && options.stage_mode.may_mutate()
+        && !(options.hard_delete && options.unsafe_no_backup)
+}
+
 async fn maintenance_rejudge_all_command(
     db: &Database,
     config: &Config,
@@ -14561,7 +14693,7 @@ async fn maintenance_rejudge_all_command(
         .transpose()?;
     let backup_dir = historical_rejudge_effective_backup_dir(
         options,
-        options.execute && !(options.hard_delete && options.unsafe_no_backup),
+        historical_rejudge_backup_required(options),
     )?;
 
     if !options.execute {
@@ -14588,9 +14720,20 @@ async fn maintenance_rejudge_all_command(
         project_id.as_deref(),
         &config_version,
         judge_model.clone(),
-        backup_dir.as_deref(),
+        options
+            .stage_mode
+            .may_mutate()
+            .then_some(backup_dir.as_deref())
+            .flatten(),
     )
     .context("failed to prepare historical rejudge checkpoint")?;
+
+    ensure_historical_rejudge_checkpoint_backup_for_mutation(
+        db,
+        options,
+        &mut checkpoint,
+        backup_dir.as_deref(),
+    )?;
 
     if let Some(writer) = progress.as_mut() {
         writer.write_event(build_historical_rejudge_progress_event(
@@ -14602,7 +14745,7 @@ async fn maintenance_rejudge_all_command(
                 page_size: checkpoint.page_size,
                 snapshot_count: Some(checkpoint.snapshot_count),
                 snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
-                counts: HistoricalRejudgeProgressCounts::from_checkpoint(&checkpoint),
+                counts: historical_rejudge_progress_counts_from_checkpoint(db, &checkpoint),
                 cursor_rowid: checkpoint.last_processed_rowid,
                 remaining_count: Some(
                     checkpoint
@@ -14620,14 +14763,18 @@ async fn maintenance_rejudge_all_command(
 
     if checkpoint.status == "done" {
         let remaining = historical_rejudge_remaining_work_count(db, &checkpoint.run_id)?;
-        let report = historical_rejudge_report_from_checkpoint(
-            &checkpoint,
-            !options.execute,
-            true,
-            remaining,
-            started.elapsed().as_millis(),
-            progress.as_ref().map(|writer| writer.path().to_path_buf()),
-        );
+        let report =
+            historical_rejudge_report_from_checkpoint(HistoricalRejudgeCheckpointReportInput {
+                checkpoint: &checkpoint,
+                dry_run: !options.execute,
+                completed: true,
+                remaining_count: remaining,
+                elapsed_ms: started.elapsed().as_millis(),
+                progress_file: progress.as_ref().map(|writer| writer.path().to_path_buf()),
+                stage_mode: options.stage_mode,
+                backlog_counts: historical_rejudge_backlog_counts(db, &checkpoint.run_id)
+                    .unwrap_or_default(),
+            });
         if let Some(writer) = progress.as_mut() {
             writer.write_event(build_historical_rejudge_progress_event(
                 HistoricalRejudgeProgressEventInput {
@@ -14638,7 +14785,7 @@ async fn maintenance_rejudge_all_command(
                     page_size: checkpoint.page_size,
                     snapshot_count: Some(checkpoint.snapshot_count),
                     snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
-                    counts: HistoricalRejudgeProgressCounts::from_checkpoint(&checkpoint),
+                    counts: historical_rejudge_progress_counts_from_checkpoint(db, &checkpoint),
                     cursor_rowid: checkpoint.last_processed_rowid,
                     remaining_count: Some(remaining),
                     judge_model: checkpoint.judge_model.as_deref(),
@@ -14657,8 +14804,12 @@ async fn maintenance_rejudge_all_command(
     save_historical_rejudge_checkpoint(db, &checkpoint)?;
 
     loop {
-        let page =
-            next_historical_rejudge_work_items(db, &checkpoint.run_id, checkpoint.page_size)?;
+        let page = next_historical_rejudge_work_items_for_stage(
+            db,
+            &checkpoint.run_id,
+            checkpoint.page_size,
+            options.stage_mode,
+        )?;
         if page.is_empty() {
             break;
         }
@@ -14721,7 +14872,7 @@ async fn maintenance_rejudge_all_command(
                         page_size: checkpoint.page_size,
                         snapshot_count: Some(checkpoint.snapshot_count),
                         snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
-                        counts: HistoricalRejudgeProgressCounts::from_checkpoint(&checkpoint),
+                        counts: historical_rejudge_progress_counts_from_checkpoint(db, &checkpoint),
                         cursor_rowid: checkpoint.last_processed_rowid,
                         remaining_count: Some(
                             checkpoint
@@ -14770,7 +14921,7 @@ async fn maintenance_rejudge_all_command(
                     page_size: checkpoint.page_size,
                     snapshot_count: Some(checkpoint.snapshot_count),
                     snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
-                    counts: HistoricalRejudgeProgressCounts::from_checkpoint(&checkpoint),
+                    counts: historical_rejudge_progress_counts_from_checkpoint(db, &checkpoint),
                     cursor_rowid: checkpoint.last_processed_rowid,
                     remaining_count: Some(
                         checkpoint
@@ -14787,7 +14938,14 @@ async fn maintenance_rejudge_all_command(
         }
     }
 
-    checkpoint.status = "done".to_string();
+    let final_backlog = historical_rejudge_backlog_counts(db, &checkpoint.run_id)?;
+    checkpoint.status = if final_backlog.remaining_count() == 0 {
+        "done".to_string()
+    } else if final_backlog.confirm_pending_count > 0 && final_backlog.no_stage_pending_count == 0 {
+        "confirm_pending".to_string()
+    } else {
+        "proposal_pending".to_string()
+    };
     checkpoint.updated_at = iso_timestamp();
     save_historical_rejudge_checkpoint(db, &checkpoint)?;
 
@@ -14806,19 +14964,26 @@ async fn maintenance_rejudge_all_command(
             "unsafe_no_backup": options.unsafe_no_backup,
             "snapshot_count": checkpoint.snapshot_count,
             "cursor_rowid": checkpoint.last_processed_rowid,
+            "stage_mode": options.stage_mode.as_str(),
+            "status": checkpoint.status.as_str(),
+            "no_stage_pending_count": final_backlog.no_stage_pending_count,
+            "confirm_pending_count": final_backlog.confirm_pending_count,
         }),
     )
     .context("failed to append historical rejudge audit log")?;
 
-    let remaining = historical_rejudge_remaining_work_count(db, &checkpoint.run_id)?;
-    let report = historical_rejudge_report_from_checkpoint(
-        &checkpoint,
-        !options.execute,
-        true,
-        remaining,
-        started.elapsed().as_millis(),
-        progress.as_ref().map(|writer| writer.path().to_path_buf()),
-    );
+    let remaining = final_backlog.remaining_count();
+    let report =
+        historical_rejudge_report_from_checkpoint(HistoricalRejudgeCheckpointReportInput {
+            checkpoint: &checkpoint,
+            dry_run: !options.execute,
+            completed: checkpoint.status == "done",
+            remaining_count: remaining,
+            elapsed_ms: started.elapsed().as_millis(),
+            progress_file: progress.as_ref().map(|writer| writer.path().to_path_buf()),
+            stage_mode: options.stage_mode,
+            backlog_counts: final_backlog,
+        });
     if let Some(writer) = progress.as_mut() {
         writer.write_event(build_historical_rejudge_progress_event(
             HistoricalRejudgeProgressEventInput {
@@ -14829,7 +14994,7 @@ async fn maintenance_rejudge_all_command(
                 page_size: checkpoint.page_size,
                 snapshot_count: Some(checkpoint.snapshot_count),
                 snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
-                counts: HistoricalRejudgeProgressCounts::from_checkpoint(&checkpoint),
+                counts: historical_rejudge_progress_counts_from_checkpoint(db, &checkpoint),
                 cursor_rowid: checkpoint.last_processed_rowid,
                 remaining_count: Some(remaining),
                 judge_model: checkpoint.judge_model.as_deref(),
@@ -15003,6 +15168,8 @@ async fn dry_run_historical_rejudge_all(
                     protected_count: report.protected_count,
                     mutated_count: report.mutated_count,
                     estimated_bytes_reclaimed: report.estimated_bytes_reclaimed,
+                    no_stage_pending_count: 0,
+                    confirm_pending_count: 0,
                 },
                 cursor_rowid: report.cursor_rowid,
                 remaining_count: Some(0),
@@ -15374,6 +15541,36 @@ fn start_historical_rejudge_checkpoint_with_observer(
     })
 }
 
+fn ensure_historical_rejudge_checkpoint_backup_for_mutation(
+    db: &Database,
+    options: HistoricalRejudgeOptions<'_>,
+    checkpoint: &mut HistoricalRejudgeCheckpoint,
+    backup_dir: Option<&Path>,
+) -> Result<()> {
+    if !historical_rejudge_backup_required(options)
+        || checkpoint.backup_path.is_some()
+        || checkpoint.status == "done"
+    {
+        return Ok(());
+    }
+    let Some(backup_dir) = backup_dir else {
+        return Ok(());
+    };
+    checkpoint.backup_path = Some(
+        create_historical_rejudge_sqlite_backup(
+            db,
+            backup_dir,
+            options,
+            checkpoint.judge_model.clone(),
+            checkpoint.config_version.clone(),
+        )
+        .context("failed to create historical rejudge confirmation backup")?,
+    );
+    checkpoint.updated_at = iso_timestamp();
+    save_historical_rejudge_checkpoint(db, checkpoint)?;
+    Ok(())
+}
+
 fn historical_rejudge_run_id(started_at: &str, options_hash: &str) -> String {
     let sequence =
         HISTORICAL_REJUDGE_RUN_ID_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -15423,9 +15620,15 @@ async fn process_historical_rejudge_work_page_with_concurrency(
     llm_context: Option<&HistoricalRejudgeLlmContext>,
     llm_concurrency: usize,
 ) -> Result<()> {
-    let prepared =
-        prepare_historical_rejudge_work_page(db, config, page, llm_context, llm_concurrency)
-            .await?;
+    let prepared = prepare_historical_rejudge_work_page(
+        db,
+        config,
+        page,
+        llm_context,
+        llm_concurrency,
+        options.stage_mode,
+    )
+    .await?;
     process_prepared_historical_rejudge_work_items(db, options, checkpoint, &prepared)
 }
 
@@ -15435,9 +15638,10 @@ async fn prepare_historical_rejudge_work_page(
     page: &[HistoricalRejudgeWorkItem],
     llm_context: Option<&HistoricalRejudgeLlmContext>,
     llm_concurrency: usize,
+    stage_mode: HistoricalRejudgeStageMode,
 ) -> Result<Vec<PreparedHistoricalRejudgeWorkItem>> {
     prepare_historical_rejudge_work_page_with(page, llm_concurrency, |work_item| {
-        prepare_historical_rejudge_work_item(db, config, work_item, llm_context)
+        prepare_historical_rejudge_work_item(db, config, work_item, llm_context, stage_mode)
     })
     .await
 }
@@ -15483,6 +15687,7 @@ async fn prepare_historical_rejudge_work_item(
     config: &Config,
     work_item: &HistoricalRejudgeWorkItem,
     llm_context: Option<&HistoricalRejudgeLlmContext>,
+    stage_mode: HistoricalRejudgeStageMode,
 ) -> Result<PreparedHistoricalRejudgeWorkItem> {
     let row = db
         .historical_rejudge_candidate_by_rowid(work_item.drawer_rowid, &work_item.drawer_id)
@@ -15511,7 +15716,8 @@ async fn prepare_historical_rejudge_work_item(
         });
     }
 
-    let decision = evaluate_historical_work_item(db, work_item, &row, config, llm_context).await?;
+    let decision =
+        evaluate_historical_work_item(db, work_item, &row, config, llm_context, stage_mode).await?;
     Ok(PreparedHistoricalRejudgeWorkItem {
         work_item: work_item.clone(),
         row: Some(row),
@@ -15527,6 +15733,7 @@ async fn evaluate_historical_work_item(
     row: &mempal::core::db::HistoricalRejudgeCandidate,
     config: &Config,
     llm_context: Option<&HistoricalRejudgeLlmContext>,
+    stage_mode: HistoricalRejudgeStageMode,
 ) -> Result<HistoricalRejudgeDecision> {
     if let Some(decision) = evaluate_historical_pre_llm(row, config) {
         return Ok(decision);
@@ -15534,7 +15741,7 @@ async fn evaluate_historical_work_item(
 
     if let Some(context) = llm_context {
         return context
-            .evaluate_work_item(db, work_item, &row.drawer, config)
+            .evaluate_work_item(db, work_item, &row.drawer, config, stage_mode)
             .await
             .context("historical rejudge LLM gate failed");
     }
@@ -15604,6 +15811,10 @@ fn process_prepared_historical_rejudge_work_items(
 
         for item in &finalized {
             if let (Some(row), Some(decision)) = (item.row.as_ref(), item.decision.as_ref()) {
+                if decision.requires_confirmation {
+                    next_checkpoint.last_processed_rowid = Some(item.work_item.drawer_rowid);
+                    continue;
+                }
                 record_historical_rejudge_decision_audit(
                     db,
                     row,
@@ -15662,6 +15873,7 @@ fn finalize_prepared_historical_rejudge_work_items(
         item.backup_item = None;
         if let (Some(row), Some(decision)) = (item.row.as_ref(), item.decision.as_ref())
             && decision.delete_candidate
+            && !decision.requires_confirmation
         {
             match build_historical_rejudge_backup_item(db, row, decision, mutation)? {
                 Some(backup_item) => {
@@ -15838,10 +16050,25 @@ fn append_rejudge_filter_sql(
     }
 }
 
+#[cfg(test)]
 fn next_historical_rejudge_work_items(
     db: &Database,
     run_id: &str,
     limit: usize,
+) -> Result<Vec<HistoricalRejudgeWorkItem>> {
+    next_historical_rejudge_work_items_for_stage(
+        db,
+        run_id,
+        limit,
+        HistoricalRejudgeStageMode::Paired,
+    )
+}
+
+fn next_historical_rejudge_work_items_for_stage(
+    db: &Database,
+    run_id: &str,
+    limit: usize,
+    stage_mode: HistoricalRejudgeStageMode,
 ) -> Result<Vec<HistoricalRejudgeWorkItem>> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let sql = format!(
@@ -15864,6 +16091,11 @@ fn next_historical_rejudge_work_items(
         FROM {HISTORICAL_REJUDGE_WORK_TABLE}
         WHERE run_id = ?1
           AND processed_at IS NULL
+          AND (
+              ?3 = 'paired'
+              OR (?3 = 'proposal_only' AND COALESCE(llm_stage, '') != 'confirm_pending')
+              OR (?3 = 'confirm_pending_only' AND llm_stage = 'confirm_pending')
+          )
         ORDER BY drawer_rowid ASC
         LIMIT ?2
         "#
@@ -15873,26 +16105,29 @@ fn next_historical_rejudge_work_items(
         .prepare(&sql)
         .context("failed to prepare historical rejudge work query")?;
     let rows = statement
-        .query_map(rusqlite::params![run_id, limit], |row| {
-            Ok(HistoricalRejudgeWorkItem {
-                run_id: row.get(0)?,
-                drawer_rowid: row.get(1)?,
-                drawer_id: row.get(2)?,
-                snapshot: HistoricalRejudgeWorkItemSnapshot {
-                    content_hash: row.get(3)?,
-                    added_at: row.get(4)?,
-                    wing: row.get(5)?,
-                    room: row.get(6)?,
-                    source_file: row.get(7)?,
-                    source_type: row.get(8)?,
-                    project_id: row.get(9)?,
-                    chunk_index: row.get(10)?,
-                    normalize_version: row.get(11)?,
-                },
-                llm_stage: row.get(12)?,
-                llm_proposal_score: row.get(13)?,
-            })
-        })?
+        .query_map(
+            rusqlite::params![run_id, limit, stage_mode.as_str()],
+            |row| {
+                Ok(HistoricalRejudgeWorkItem {
+                    run_id: row.get(0)?,
+                    drawer_rowid: row.get(1)?,
+                    drawer_id: row.get(2)?,
+                    snapshot: HistoricalRejudgeWorkItemSnapshot {
+                        content_hash: row.get(3)?,
+                        added_at: row.get(4)?,
+                        wing: row.get(5)?,
+                        room: row.get(6)?,
+                        source_file: row.get(7)?,
+                        source_type: row.get(8)?,
+                        project_id: row.get(9)?,
+                        chunk_index: row.get(10)?,
+                        normalize_version: row.get(11)?,
+                    },
+                    llm_stage: row.get(12)?,
+                    llm_proposal_score: row.get(13)?,
+                })
+            },
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -16010,18 +16245,73 @@ fn historical_rejudge_confirm_pending_lock_keep_decision(
         score: Some(proposal_score),
         tier: 3,
         judge: "llm".to_string(),
+        requires_confirmation: false,
+    }
+}
+
+fn historical_rejudge_confirmation_pending_decision(
+    proposal_score: f64,
+    proposal_reason: String,
+) -> HistoricalRejudgeDecision {
+    HistoricalRejudgeDecision {
+        delete_candidate: true,
+        protected: false,
+        reason: format!("llm_proposal_confirm_pending:{proposal_reason}"),
+        label: Some("llm_judge".to_string()),
+        score: Some(proposal_score),
+        tier: 3,
+        judge: "llm".to_string(),
+        requires_confirmation: true,
     }
 }
 
 fn historical_rejudge_remaining_work_count(db: &Database, run_id: &str) -> Result<usize> {
+    Ok(historical_rejudge_backlog_counts(db, run_id)?.remaining_count())
+}
+
+fn historical_rejudge_backlog_counts(
+    db: &Database,
+    run_id: &str,
+) -> Result<HistoricalRejudgeBacklogCounts> {
     let sql = format!(
-        "SELECT COUNT(*) FROM {HISTORICAL_REJUDGE_WORK_TABLE} WHERE run_id = ?1 AND processed_at IS NULL"
+        r#"
+        SELECT
+            COALESCE(SUM(CASE
+                WHEN processed_at IS NULL AND COALESCE(llm_stage, '') != 'confirm_pending'
+                THEN 1 ELSE 0
+            END), 0),
+            COALESCE(SUM(CASE
+                WHEN processed_at IS NULL AND llm_stage = 'confirm_pending'
+                THEN 1 ELSE 0
+            END), 0)
+        FROM {HISTORICAL_REJUDGE_WORK_TABLE}
+        WHERE run_id = ?1
+        "#
     );
-    let count: i64 = db
+    let (no_stage, confirm_pending): (i64, i64) = db
         .conn()
-        .query_row(&sql, [run_id], |row| row.get(0))
-        .context("failed to count remaining historical rejudge work")?;
-    Ok(usize::try_from(count).unwrap_or(usize::MAX))
+        .query_row(&sql, [run_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .context("failed to count historical rejudge backlog")?;
+    Ok(HistoricalRejudgeBacklogCounts {
+        no_stage_pending_count: usize::try_from(no_stage).unwrap_or(usize::MAX),
+        confirm_pending_count: usize::try_from(confirm_pending).unwrap_or(usize::MAX),
+    })
+}
+
+fn historical_rejudge_progress_counts_from_checkpoint(
+    db: &Database,
+    checkpoint: &HistoricalRejudgeCheckpoint,
+) -> HistoricalRejudgeProgressCounts {
+    let backlog_counts =
+        historical_rejudge_backlog_counts(db, &checkpoint.run_id).unwrap_or_else(|_| {
+            HistoricalRejudgeBacklogCounts {
+                no_stage_pending_count: checkpoint
+                    .snapshot_count
+                    .saturating_sub(checkpoint.scanned_count),
+                confirm_pending_count: 0,
+            }
+        });
+    HistoricalRejudgeProgressCounts::from_checkpoint(checkpoint).with_backlog(backlog_counts)
 }
 
 fn load_historical_rejudge_checkpoint(
@@ -16193,10 +16483,10 @@ fn update_historical_rejudge_checkpoint_stats(
     checkpoint.scanned_count += 1;
     if decision.protected {
         checkpoint.protected_count += 1;
-    } else if decision.delete_candidate {
+    } else if decision.delete_candidate && !decision.requires_confirmation {
         checkpoint.candidate_count += 1;
         checkpoint.estimated_bytes_reclaimed += row.drawer.content.len();
-    } else {
+    } else if !decision.requires_confirmation {
         checkpoint.kept_count += 1;
     }
     checkpoint.mutated_count += mutated_count;
@@ -16211,7 +16501,7 @@ fn record_historical_rejudge_summary(
     summary.scanned_count += 1;
     if decision.protected {
         summary.protected_count += 1;
-    } else if decision.delete_candidate {
+    } else if decision.delete_candidate && !decision.requires_confirmation {
         summary.candidate_count += 1;
         summary.estimated_bytes_reclaimed += row.drawer.content.len();
         *summary
@@ -16230,7 +16520,7 @@ fn record_historical_rejudge_summary(
                 preview: preview_one_line(&row.drawer.content, 120),
             });
         }
-    } else {
+    } else if !decision.requires_confirmation {
         summary.kept_count += 1;
     }
     summary.mutated_count += mutated_count;
@@ -16251,10 +16541,10 @@ fn historical_rejudge_progress_counts_from_decisions(
     for (row, decision) in decisions {
         if decision.protected {
             counts.protected_count += 1;
-        } else if decision.delete_candidate {
+        } else if decision.delete_candidate && !decision.requires_confirmation {
             counts.candidate_count += 1;
             counts.estimated_bytes_reclaimed += row.drawer.content.len();
-        } else {
+        } else if !decision.requires_confirmation {
             counts.kept_count += 1;
         }
     }
@@ -16290,22 +16580,29 @@ fn sync_historical_rejudge_backup_parent(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn historical_rejudge_report_from_checkpoint(
-    checkpoint: &HistoricalRejudgeCheckpoint,
+struct HistoricalRejudgeCheckpointReportInput<'a> {
+    checkpoint: &'a HistoricalRejudgeCheckpoint,
     dry_run: bool,
     completed: bool,
     remaining_count: usize,
     elapsed_ms: u128,
     progress_file: Option<PathBuf>,
+    stage_mode: HistoricalRejudgeStageMode,
+    backlog_counts: HistoricalRejudgeBacklogCounts,
+}
+
+fn historical_rejudge_report_from_checkpoint(
+    input: HistoricalRejudgeCheckpointReportInput<'_>,
 ) -> HistoricalRejudgeReport {
+    let checkpoint = input.checkpoint;
     HistoricalRejudgeReport {
-        dry_run,
+        dry_run: input.dry_run,
         mutation: checkpoint.mutation.clone(),
         all: true,
-        completed,
+        completed: input.completed,
         page_size: checkpoint.page_size,
         snapshot_count: checkpoint.snapshot_count,
-        remaining_count,
+        remaining_count: input.remaining_count,
         cursor_rowid: checkpoint.last_processed_rowid,
         scanned_count: checkpoint.scanned_count,
         candidate_count: checkpoint.candidate_count,
@@ -16313,15 +16610,19 @@ fn historical_rejudge_report_from_checkpoint(
         protected_count: checkpoint.protected_count,
         mutated_count: checkpoint.mutated_count,
         estimated_bytes_reclaimed: checkpoint.estimated_bytes_reclaimed,
-        elapsed_ms,
+        elapsed_ms: input.elapsed_ms,
         judge_model: checkpoint.judge_model.clone(),
         config_version: checkpoint.config_version.clone(),
-        progress_file,
+        progress_file: input.progress_file,
         backup_path: checkpoint.backup_path.clone(),
         backup_format: checkpoint
             .backup_path
             .as_ref()
             .map(|_| "sqlite".to_string()),
+        stage_mode: input.stage_mode.as_str().to_string(),
+        status: checkpoint.status.clone(),
+        no_stage_pending_count: input.backlog_counts.no_stage_pending_count,
+        confirm_pending_count: input.backlog_counts.confirm_pending_count,
         wings_rooms: Vec::new(),
         examples: Vec::new(),
     }
@@ -16357,6 +16658,15 @@ fn historical_rejudge_report_from_summary(
         progress_file: envelope.progress_file,
         backup_path: envelope.backup_path,
         backup_format: envelope.backup_format,
+        stage_mode: HistoricalRejudgeStageMode::Paired.as_str().to_string(),
+        status: if envelope.completed {
+            "done"
+        } else {
+            "running"
+        }
+        .to_string(),
+        no_stage_pending_count: 0,
+        confirm_pending_count: 0,
         wings_rooms,
         examples: summary.examples,
     }
@@ -16475,6 +16785,7 @@ fn historical_rejudge_backup_metadata(
             all: options.all,
             resume: options.resume,
             page_size: options.page_size,
+            stage_mode: options.stage_mode,
             proposal_llm_endpoint: options.proposal_llm_endpoint.map(ToOwned::to_owned),
             confirm_llm_endpoint: options.confirm_llm_endpoint.map(ToOwned::to_owned),
             wing: options.wing.map(ToOwned::to_owned),
@@ -17843,6 +18154,7 @@ fn evaluate_historical_pre_llm(
             score: decision.score.map(f64::from),
             tier: decision.tier,
             judge: "deterministic".to_string(),
+            requires_confirmation: false,
         });
     }
 
@@ -17962,6 +18274,7 @@ fn deterministic_historical_decision(drawer: &Drawer) -> HistoricalRejudgeDecisi
         score: Some(f64::from(score) / 5.0),
         tier: 0,
         judge: "deterministic".to_string(),
+        requires_confirmation: false,
     }
 }
 
@@ -17974,6 +18287,7 @@ fn protected_historical_decision(reason: String) -> HistoricalRejudgeDecision {
         score: Some(1.0),
         tier: 0,
         judge: "deterministic".to_string(),
+        requires_confirmation: false,
     }
 }
 
@@ -18045,6 +18359,7 @@ impl HistoricalRejudgeLlmContext {
                         score: Some(proposal_score),
                         tier: 3,
                         judge: "llm".to_string(),
+                        requires_confirmation: false,
                     });
                 }
 
@@ -18066,6 +18381,7 @@ impl HistoricalRejudgeLlmContext {
                     score: Some(confirm_score),
                     tier: 3,
                     judge: "llm".to_string(),
+                    requires_confirmation: false,
                 })
             }
         }
@@ -18077,6 +18393,7 @@ impl HistoricalRejudgeLlmContext {
         work_item: &HistoricalRejudgeWorkItem,
         drawer: &Drawer,
         config: &Config,
+        stage_mode: HistoricalRejudgeStageMode,
     ) -> Result<HistoricalRejudgeDecision> {
         match self {
             Self::Single { .. } => self.evaluate(drawer, config).await,
@@ -18086,6 +18403,13 @@ impl HistoricalRejudgeLlmContext {
                 ..
             } => {
                 let threshold = historical_llm_threshold(config);
+                if stage_mode == HistoricalRejudgeStageMode::ConfirmPendingOnly
+                    && work_item.llm_stage.as_deref() != Some("confirm_pending")
+                {
+                    bail!(
+                        "--confirm-pending-only selected a work item without a persisted proposal"
+                    );
+                }
                 let proposal_reason = if work_item.llm_stage.as_deref() == Some("confirm_pending") {
                     match work_item.llm_proposal_score {
                         Some(score) => format!("persisted_delete_candidate_score={score:.3}"),
@@ -18103,6 +18427,7 @@ impl HistoricalRejudgeLlmContext {
                             score: Some(proposal_score),
                             tier: 3,
                             judge: "llm".to_string(),
+                            requires_confirmation: false,
                         });
                     }
                     match mark_historical_rejudge_work_item_llm_confirm_pending_or_keep(
@@ -18115,6 +18440,12 @@ impl HistoricalRejudgeLlmContext {
                         HistoricalRejudgeConfirmPendingPersistence::Keep(decision) => {
                             return Ok(decision);
                         }
+                    }
+                    if stage_mode == HistoricalRejudgeStageMode::ProposalOnly {
+                        return Ok(historical_rejudge_confirmation_pending_decision(
+                            proposal_score,
+                            proposal_reason,
+                        ));
                     }
                     proposal_reason
                 };
@@ -18137,6 +18468,7 @@ impl HistoricalRejudgeLlmContext {
                     score: Some(confirm_score),
                     tier: 3,
                     judge: "llm".to_string(),
+                    requires_confirmation: false,
                 })
             }
         }
@@ -18312,6 +18644,7 @@ fn historical_llm_decision(
         score: Some(score),
         tier: 3,
         judge: judge.to_string(),
+        requires_confirmation: false,
     }
 }
 
@@ -18428,7 +18761,7 @@ fn build_historical_rejudge_report(
         } else if !decision.delete_candidate {
             kept_count += 1;
         }
-        if !decision.delete_candidate {
+        if !decision.delete_candidate || decision.requires_confirmation {
             continue;
         }
         candidate_count += 1;
@@ -18474,6 +18807,10 @@ fn build_historical_rejudge_report(
         progress_file: input.progress_file,
         backup_path: input.backup_path,
         backup_format: input.backup_format,
+        stage_mode: input.stage_mode.as_str().to_string(),
+        status: input.status.to_string(),
+        no_stage_pending_count: input.backlog_counts.no_stage_pending_count,
+        confirm_pending_count: input.backlog_counts.confirm_pending_count,
         wings_rooms,
         examples,
     }
@@ -18489,11 +18826,15 @@ fn print_historical_rejudge_report(report: &HistoricalRejudgeReport, format: &st
             println!("Historical Memory Rejudge");
             println!("dry_run={}", report.dry_run);
             println!("mutation={}", report.mutation);
+            println!("stage_mode={}", report.stage_mode);
+            println!("status={}", report.status);
             println!("all={}", report.all);
             println!("completed={}", report.completed);
             println!("page_size={}", report.page_size);
             println!("snapshot={}", report.snapshot_count);
             println!("remaining={}", report.remaining_count);
+            println!("no_stage_pending={}", report.no_stage_pending_count);
+            println!("confirm_pending={}", report.confirm_pending_count);
             println!(
                 "cursor_rowid={}",
                 report
@@ -20470,6 +20811,7 @@ threshold = 0.7
             unsafe_allow_config_version_drift: false,
             page_size,
             progress_file: None,
+            stage_mode: HistoricalRejudgeStageMode::Paired,
             proposal_llm_endpoint: None,
             confirm_llm_endpoint: None,
             wing: None,
@@ -20517,6 +20859,22 @@ threshold = 0.7
                 |row| row.get(0),
             )
             .expect("load historical rejudge work item decision")
+    }
+
+    fn historical_rejudge_work_item_stage(
+        db: &Database,
+        run_id: &str,
+        drawer_rowid: i64,
+    ) -> Option<String> {
+        db.conn()
+            .query_row(
+                &format!(
+                    "SELECT llm_stage FROM {HISTORICAL_REJUDGE_WORK_TABLE} WHERE run_id = ?1 AND drawer_rowid = ?2"
+                ),
+                rusqlite::params![run_id, drawer_rowid],
+                |row| row.get(0),
+            )
+            .expect("load historical rejudge work item stage")
     }
 
     fn test_historical_rejudge_work_item(run_id: &str, rowid: i64) -> HistoricalRejudgeWorkItem {
@@ -21384,6 +21742,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -21424,6 +21783,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -21463,6 +21823,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -21550,6 +21911,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -21616,6 +21978,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -21783,9 +22146,15 @@ threshold = 0.7
         let page = next_historical_rejudge_work_items(&db, &checkpoint.run_id, 1)
             .expect("load first work page");
         assert_eq!(page.len(), 1);
-        let prepared = prepare_historical_rejudge_work_item(&db, &config, &page[0], None)
-            .await
-            .expect("prepare stale deletion decision");
+        let prepared = prepare_historical_rejudge_work_item(
+            &db,
+            &config,
+            &page[0],
+            None,
+            HistoricalRejudgeStageMode::Paired,
+        )
+        .await
+        .expect("prepare stale deletion decision");
         assert!(
             prepared
                 .decision
@@ -21889,6 +22258,7 @@ threshold = 0.7
                     unsafe_allow_config_version_drift: false,
                     page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                     progress_file: None,
+                    stage_mode: HistoricalRejudgeStageMode::Paired,
                     proposal_llm_endpoint: None,
                     confirm_llm_endpoint: None,
                     wing: None,
@@ -21931,6 +22301,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -21966,6 +22337,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22002,6 +22374,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22036,6 +22409,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22075,6 +22449,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22121,6 +22496,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22187,6 +22563,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22259,6 +22636,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22338,6 +22716,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22434,6 +22813,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22527,6 +22907,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22620,6 +23001,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -22675,6 +23057,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -23322,6 +23705,189 @@ threshold = 0.7
             "successful Spark retry should soft-delete the confirmed candidate"
         );
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_proposal_only_persists_confirm_backlog_without_mutation() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_delete",
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.01, "confirm_would_delete"))
+            .expect(0)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(
+            &db,
+            "proposal-only-pending",
+            "Low-signal transient output that Qwen can propose while Spark quota is exhausted.",
+            "notes",
+            None,
+        );
+        let rowid = drawer_rowid(&db, "proposal-only-pending");
+        let progress_file = tmp.path().join("proposal-only-progress.jsonl");
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                stage_mode: HistoricalRejudgeStageMode::ProposalOnly,
+                progress_file: Some(&progress_file),
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, None, 1)
+            },
+        )
+        .await
+        .expect("proposal-only rejudge should persist confirmation backlog");
+
+        proposal_mock.assert_async().await;
+        confirm_mock.assert_async().await;
+        assert!(
+            db.get_drawer("proposal-only-pending")
+                .expect("load active drawer")
+                .is_some(),
+            "proposal-only must not delete the drawer"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_eq!(
+            audit_count(&db),
+            0,
+            "proposal-only must not audit a final verdict"
+        );
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.status, "confirm_pending");
+        assert_eq!(checkpoint.scanned_count, 0);
+        assert_eq!(checkpoint.mutated_count, 0);
+        assert_eq!(
+            historical_rejudge_work_item_stage(&db, &checkpoint.run_id, rowid).as_deref(),
+            Some("confirm_pending")
+        );
+        assert_eq!(
+            historical_rejudge_work_item_decision(&db, &checkpoint.run_id, rowid),
+            None
+        );
+        let backlog = historical_rejudge_backlog_counts(&db, &checkpoint.run_id)
+            .expect("load backlog counts");
+        assert_eq!(backlog.no_stage_pending_count, 0);
+        assert_eq!(backlog.confirm_pending_count, 1);
+
+        let events = rejudge_progress_events(&progress_file);
+        let completed = events.last().expect("completed progress event");
+        assert_eq!(completed["remaining_count"].as_u64(), Some(1));
+        assert_eq!(completed["no_stage_pending_count"].as_u64(), Some(0));
+        assert_eq!(completed["confirm_pending_count"].as_u64(), Some(1));
+        assert_eq!(completed["mutated_count"].as_u64(), Some(0));
+        let raw_progress = std::fs::read_to_string(&progress_file).expect("read progress");
+        assert!(
+            !raw_progress.contains("Low-signal transient output"),
+            "{raw_progress}"
+        );
+        assert!(
+            !raw_progress.contains("proposal-only-pending"),
+            "{raw_progress}"
+        );
+        assert!(!raw_progress.contains("proposal_delete"), "{raw_progress}");
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_confirm_pending_only_reuses_persisted_proposal_without_qwen() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_delete",
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(
+            &db,
+            "confirm-drain-pending",
+            "Low-signal transient output with a persisted Qwen proposal for later Spark drain.",
+            "notes",
+            None,
+        );
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                stage_mode: HistoricalRejudgeStageMode::ProposalOnly,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, None, 1)
+            },
+        )
+        .await
+        .expect("seed persisted proposal backlog");
+        proposal_mock.assert_async().await;
+
+        let confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.02, "confirm_delete"))
+            .expect(1)
+            .create_async()
+            .await;
+        let backups = backup_dir(&tmp);
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                stage_mode: HistoricalRejudgeStageMode::ConfirmPendingOnly,
+                resume: true,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("confirm drain should reuse persisted proposal and delete after Spark confirms");
+
+        proposal_mock.assert_async().await;
+        confirm_mock.assert_async().await;
+        assert!(
+            db.get_drawer("confirm-drain-pending")
+                .expect("load active drawer")
+                .is_none(),
+            "confirm drain should soft-delete only after Spark confirms"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+        assert_eq!(sqlite_backup_item_count(&only_backup_file(&backups)), 1);
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.status, "done");
+        assert_eq!(checkpoint.candidate_count, 1);
+        assert_eq!(checkpoint.mutated_count, 1);
+        let backlog = historical_rejudge_backlog_counts(&db, &checkpoint.run_id)
+            .expect("load backlog counts");
+        assert_eq!(backlog.remaining_count(), 0);
     }
 
     #[tokio::test]
@@ -24239,6 +24805,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: None,
@@ -24290,6 +24857,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
                 wing: Some("hooks-raw"),
