@@ -3516,6 +3516,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_daemon_claim_skips_ingest_async_rows() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let sync_store = PendingMessageStore::new_without_reclaim(&db_path);
+        let ingest_id = sync_store
+            .enqueue("ingest_async", r#"{"request":{}}"#)
+            .expect("enqueue async ingest");
+        let hook_id = sync_store
+            .enqueue("hook_user_prompt", r#"{"event":"UserPromptSubmit"}"#)
+            .expect("enqueue hook");
+        let async_store = AsyncPendingMessageStore::from_store(sync_store.clone());
+
+        let claimed = poll_claim_next(&async_store, "daemon-hook-worker", 60, |_| {
+            Box::pin(std::future::ready(()))
+        })
+        .await;
+
+        match claimed {
+            ClaimPollResult::Claimed(message) => {
+                assert_eq!(message.id, hook_id);
+                assert_eq!(message.kind, "hook_user_prompt");
+            }
+            ClaimPollResult::Idle | ClaimPollResult::RetryAfterError => {
+                panic!("daemon hook worker should claim the hook row")
+            }
+        }
+
+        let ingest_status = sync_store
+            .operation_status(&ingest_id)
+            .expect("load async ingest operation status")
+            .expect("async ingest row remains pending for its dedicated worker");
+        assert_eq!(ingest_status.op_state, "queued");
+        assert!(ingest_status.claimed_at.is_none());
+    }
+
     #[cfg(unix)]
     async fn send_hook_ipc_request(
         store: AsyncPendingMessageStore,

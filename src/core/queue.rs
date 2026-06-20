@@ -494,7 +494,7 @@ impl PendingMessageStore {
                 SELECT id, kind, payload, retry_count, source_hash, created_at
                 FROM pending_messages
                 WHERE status = 'pending' AND next_attempt_at <= ?1
-                  AND kind != 'llm_task'
+                  AND kind NOT IN ('llm_task', 'ingest_async')
                 ORDER BY next_attempt_at ASC, id ASC
                 LIMIT 1
                 "#,
@@ -1557,5 +1557,33 @@ mod tests {
             "ticker advanced {observed} times while delayed claim/confirm ran; \
              queue SQLite must run off the Tokio worker"
         );
+    }
+
+    #[test]
+    fn claim_next_skips_ingest_async_rows_for_dedicated_workers() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(&db_path).expect("open queue");
+        let ingest_id = store
+            .enqueue("ingest_async", r#"{"request":{}}"#)
+            .expect("enqueue async ingest");
+        let hook_id = store
+            .enqueue("hook_user_prompt", r#"{"event":"UserPromptSubmit"}"#)
+            .expect("enqueue hook");
+
+        let claimed = store
+            .claim_next("hook-worker", 60)
+            .expect("claim next")
+            .expect("hook row should be claimed");
+
+        assert_eq!(claimed.id, hook_id);
+        assert_eq!(claimed.kind, "hook_user_prompt");
+        let ingest_status = store
+            .operation_status(&ingest_id)
+            .expect("load async ingest status")
+            .expect("async ingest row remains visible");
+        assert_eq!(ingest_status.op_state, "queued");
+        assert!(ingest_status.claimed_at.is_none());
     }
 }
