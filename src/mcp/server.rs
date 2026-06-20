@@ -387,6 +387,21 @@ impl MempalMcpServer {
         self.spawn_ingest_drain_worker();
     }
 
+    #[doc(hidden)]
+    pub fn spawn_scoped_ingest_drain_worker(&self) -> IngestDrainWorkerHandle {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = self.clone();
+        let handle = tokio::spawn(async move {
+            worker
+                .run_ingest_drain_worker_until_shutdown(shutdown_rx)
+                .await;
+        });
+        IngestDrainWorkerHandle {
+            shutdown_tx,
+            handle,
+        }
+    }
+
     async fn supervise_ingest_drain_worker(self) {
         let mut restart_backoff_ms = INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS;
         loop {
@@ -415,6 +430,60 @@ impl MempalMcpServer {
             restart_backoff_ms = restart_backoff_ms
                 .saturating_mul(2)
                 .min(INGEST_DRAIN_RESTART_BACKOFF_MAX_MS);
+        }
+    }
+
+    async fn run_ingest_drain_worker_until_shutdown(
+        self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let worker_id = format!(
+            "mcp-ingest-scoped-worker-{:x}-{:x}",
+            std::process::id(),
+            Arc::as_ptr(&self.ingest_worker_started) as usize
+        );
+        let queue = self.async_queue.clone();
+
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+
+            match queue
+                .claim_next_by_kind(
+                    worker_id.clone(),
+                    INGEST_CLAIM_TTL_SECS,
+                    INGEST_ASYNC_KIND.to_string(),
+                )
+                .await
+            {
+                Ok(Some(claim)) => {
+                    if let Err(error) = self.process_ingest_claim(&queue, &worker_id, claim).await {
+                        tracing::warn!(error = %error, "scoped async ingest worker failed to process op");
+                    }
+                }
+                Ok(None) => {
+                    tokio::select! {
+                        result = shutdown_rx.changed() => {
+                            if result.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(INGEST_POLL_INTERVAL) => {}
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "scoped async ingest worker claim failed");
+                    tokio::select! {
+                        result = shutdown_rx.changed() => {
+                            if result.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(INGEST_POLL_INTERVAL) => {}
+                    }
+                }
+            }
         }
     }
 
@@ -1425,6 +1494,27 @@ const INGEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const INGEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS: u64 = 250;
 const INGEST_DRAIN_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
+
+#[doc(hidden)]
+pub struct IngestDrainWorkerHandle {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl IngestDrainWorkerHandle {
+    #[doc(hidden)]
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    #[doc(hidden)]
+    pub async fn shutdown_and_drain(self) {
+        self.request_shutdown();
+        if let Err(error) = self.handle.await {
+            tracing::warn!(error = %error, "scoped async ingest worker did not shut down cleanly");
+        }
+    }
+}
 
 struct IngestDrainWorkerStartedGuard {
     started: Arc<AtomicBool>,

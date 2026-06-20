@@ -5246,6 +5246,16 @@ fn clamp_wait_timeout(timeout: std::time::Duration) -> std::time::Duration {
     timeout.min(std::time::Duration::from_secs(MAX_WAIT_TIMEOUT_SECS))
 }
 
+fn finish_operation_wait_response(response: IngestResponse, operation_id: &str) -> Result<()> {
+    print_operation_response(&response)?;
+    match response.state {
+        Some(IngestOperationState::Completed) => Ok(()),
+        Some(IngestOperationState::Rejected) => bail!("operation {operation_id} was rejected"),
+        Some(IngestOperationState::Failed) => bail!("operation {operation_id} failed"),
+        _ => Ok(()),
+    }
+}
+
 async fn operation_command(
     db: &Database,
     config: &Config,
@@ -5268,32 +5278,21 @@ async fn operation_command(
             operation_id,
             timeout_secs,
         } => {
-            server.ensure_ingest_drain_worker_started();
+            let ingest_drain_worker = server.spawn_scoped_ingest_drain_worker();
             eprintln!(
                 "waiting for operation_id={} timeout_secs={timeout_secs}",
                 operation_id
             );
-            match wait_for_operation_status_with_progress(
+            let wait_result = wait_for_operation_status_with_progress(
                 &server,
                 &operation_id,
                 std::time::Duration::from_secs(timeout_secs),
                 std::time::Duration::from_millis(150),
             )
-            .await?
-            {
-                Some(response) => {
-                    print_operation_response(&response)?;
-                    match response.state {
-                        Some(IngestOperationState::Completed) => Ok(()),
-                        Some(IngestOperationState::Rejected) => {
-                            bail!("operation {operation_id} was rejected")
-                        }
-                        Some(IngestOperationState::Failed) => {
-                            bail!("operation {operation_id} failed")
-                        }
-                        _ => Ok(()),
-                    }
-                }
+            .await;
+            ingest_drain_worker.shutdown_and_drain().await;
+            match wait_result? {
+                Some(response) => finish_operation_wait_response(response, &operation_id),
                 None => {
                     let mut response = server
                         .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
@@ -5304,6 +5303,13 @@ async fn operation_command(
                         .await
                         .context("failed to load timed-out operation status")?
                         .0;
+                    if response
+                        .state
+                        .map(IngestOperationState::is_terminal)
+                        .unwrap_or(false)
+                    {
+                        return finish_operation_wait_response(response, &operation_id);
+                    }
                     response.timed_out = true;
                     print_operation_response(&response)?;
                     bail!("timed out waiting for operation {operation_id}")

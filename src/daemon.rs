@@ -205,7 +205,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .await
         .context("failed to reclaim stale daemon claims")?;
     tracing::info!("daemon startup reclaim_stale reclaimed={reclaimed}");
-    spawn_daemon_ingest_drain_worker(context, &db_path)
+    let ingest_drain_worker = spawn_daemon_ingest_drain_worker(context, &db_path)
         .context("failed to start daemon async ingest worker")?;
     let stall_watchdog_handle = spawn_stall_watchdog(
         context.write_observer.clone(),
@@ -301,6 +301,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         );
         wait_for_hook_worker_or_tick(&mut hook_workers, poll_interval).await;
     }
+    ingest_drain_worker.request_shutdown();
 
     #[cfg(unix)]
     hook_ipc_service.shutdown().await;
@@ -331,6 +332,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     let _ = stall_watchdog_handle.await;
     endpoint_requeue_handle.abort();
     let _ = endpoint_requeue_handle.await;
+    ingest_drain_worker.shutdown_and_drain().await;
 
     // Release any tasks still claimed by workers that were aborted or did not finish.
     let released = context
@@ -348,7 +350,10 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     Ok(())
 }
 
-fn spawn_daemon_ingest_drain_worker(context: &DaemonContext, db_path: &Path) -> Result<()> {
+fn spawn_daemon_ingest_drain_worker(
+    context: &DaemonContext,
+    db_path: &Path,
+) -> Result<crate::mcp::IngestDrainWorkerHandle> {
     let config = context.config.as_ref().clone();
     let server = crate::mcp::MempalMcpServer::new_with_factory_and_config(
         db_path.to_path_buf(),
@@ -357,9 +362,9 @@ fn spawn_daemon_ingest_drain_worker(context: &DaemonContext, db_path: &Path) -> 
             config,
         )),
     )?;
-    server.ensure_ingest_drain_worker_started();
+    let handle = server.spawn_scoped_ingest_drain_worker();
     tracing::info!("daemon async ingest worker started");
-    Ok(())
+    Ok(handle)
 }
 
 #[derive(Clone)]

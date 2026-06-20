@@ -1137,3 +1137,66 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
         "{stderr}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_operation_wait_timeout_drains_active_scoped_worker_before_exit() {
+    let home = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    let config_path = write_config(home.path(), &format!("http://{addr}/v1"));
+    let _guard = ConfigOverrideGuard::install(&config_path);
+    let db_path = home.path().join(".mempal/palace.db");
+
+    let operation_id = enqueue_prepared_operation(
+        &db_path,
+        "wait timeout drains active worker",
+        "mcp",
+        Some("wait-timeout"),
+    );
+
+    handle.pause();
+    let mut child = spawn_cli(
+        home.path(),
+        &["operation", "wait", &operation_id, "--timeout-secs", "1"],
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(&operation_id)
+            .expect("load operation status")
+            .expect("operation record exists");
+        if record.op_state == "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let running = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load running status")
+        .expect("operation record exists");
+    assert_eq!(running.op_state, "running");
+
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert!(
+        child.try_wait().expect("poll operation wait").is_none(),
+        "operation wait must not exit while its scoped worker is mid-ingest"
+    );
+
+    handle.resume();
+    let output = child.wait_with_output().expect("wait operation child");
+    handle.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (stdout, stderr) = print_lines(&output);
+    assert!(stdout.contains("state=completed"), "{stdout}");
+    assert!(stdout.contains("timed_out=false"), "{stdout}");
+    assert!(stderr.contains("waiting for operation_id="), "{stderr}");
+
+    let db = Database::open(&db_path).expect("open db");
+    assert_eq!(db.drawer_count().expect("drawer count"), 1);
+}

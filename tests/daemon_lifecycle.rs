@@ -1,9 +1,12 @@
+mod common;
+
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::harness::embed_mock::start as start_embed_mock;
 use mempal::bootstrap_events::BootstrapEvent;
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
@@ -118,6 +121,44 @@ fn prepared_ingest_payload(content: &str) -> String {
         "drawer_importance": 0
     }))
     .expect("serialize prepared ingest payload")
+}
+
+fn write_openai_daemon_config(
+    config_path: &std::path::Path,
+    db_path: &std::path::Path,
+    log_path: &std::path::Path,
+    base_url: &str,
+) {
+    fs::write(
+        config_path,
+        format!(
+            r#"
+db_path = "{}"
+
+[embed]
+backend = "openai_compat"
+api_model = "test-embed"
+base_url = "{base_url}"
+dim = 4
+
+[embed.openai_compat]
+base_url = "{base_url}"
+model = "test-embed"
+dim = 4
+request_timeout_secs = 5
+
+[hooks]
+enabled = true
+daemon_poll_interval_ms = 100
+
+[daemon]
+log_path = "{}"
+"#,
+            db_path.display(),
+            log_path.display()
+        ),
+    )
+    .expect("write openai daemon config");
 }
 
 #[cfg(unix)]
@@ -561,6 +602,7 @@ fn test_daemon_processes_ingest_async_queue_rows() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    // SAFETY: this test owns the foreground daemon child process.
     let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     assert_eq!(rc, 0, "failed to send SIGTERM");
     let status = child.wait().expect("wait child");
@@ -575,6 +617,105 @@ fn test_daemon_processes_ingest_async_queue_rows() {
     );
     let db = Database::open(&db_path).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_daemon_sigterm_drains_running_ingest_async_before_reclaim() {
+    let (tmp, db_path, config_path) = setup_daemon_home();
+    let _cleanup = DaemonHomeCleanup {
+        db_path: db_path.clone(),
+    };
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    handle.pause();
+    write_openai_daemon_config(
+        &config_path,
+        &db_path,
+        &tmp.path().join(".mempal/daemon.log"),
+        &format!("http://{addr}/v1"),
+    );
+
+    let store = PendingMessageStore::new(&db_path).expect("store");
+    let operation_id = store
+        .enqueue(
+            "ingest_async",
+            &prepared_ingest_payload("daemon drains active ingest_async row"),
+        )
+        .expect("enqueue async ingest");
+
+    let mut child = Command::new(mempal_bin())
+        .args(["daemon", "--foreground"])
+        .env("HOME", tmp.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(&operation_id)
+            .expect("load operation status")
+            .expect("operation record exists");
+        if record.op_state == "running" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let running = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load running status")
+        .expect("operation record exists");
+    assert_eq!(running.op_state, "running");
+
+    // SAFETY: this test owns the foreground daemon child process.
+    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(rc, 0, "failed to send SIGTERM");
+    assert!(
+        !wait_for_child_exit(&mut child, Duration::from_millis(300)),
+        "daemon must not exit while the active ingest_async claim is mid-ingest"
+    );
+
+    handle.resume();
+    let status = child.wait().expect("wait child");
+    handle.shutdown().await;
+    assert!(
+        status.success(),
+        "daemon must exit cleanly after draining active ingest: {status:?}"
+    );
+
+    let completed = PendingMessageStore::new_without_reclaim(&db_path)
+        .operation_status(&operation_id)
+        .expect("load completed status")
+        .expect("operation record exists");
+    assert_eq!(completed.op_state, "completed");
+    let db = Database::open(&db_path).expect("open db");
+    assert_eq!(db.drawer_count().expect("drawer count"), 1);
+
+    let mut restarted = Command::new(mempal_bin())
+        .args(["daemon", "--foreground"])
+        .env("HOME", tmp.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("restart daemon");
+    std::thread::sleep(Duration::from_millis(300));
+    // SAFETY: this test owns the restarted foreground daemon child process.
+    let rc = unsafe { libc::kill(restarted.id() as i32, libc::SIGTERM) };
+    assert_eq!(rc, 0, "failed to stop restarted daemon");
+    let restart_status = restarted.wait().expect("wait restarted daemon");
+    assert!(
+        restart_status.success(),
+        "restarted daemon must exit cleanly: {restart_status:?}"
+    );
+    let db = Database::open(&db_path).expect("open db after restart");
+    assert_eq!(
+        db.drawer_count().expect("drawer count after restart"),
+        1,
+        "completed async ingest must not be reprocessed after restart"
+    );
 }
 
 #[cfg(unix)]
