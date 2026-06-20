@@ -1121,6 +1121,29 @@ pub(crate) fn scrub_sensitive_text(input: &str) -> String {
     content
 }
 
+pub(crate) fn scrub_export_sensitive_text(input: &str) -> String {
+    let mut redacted = scrub_sensitive_text(input);
+    for regex in export_redaction_patterns() {
+        redacted = regex
+            .replace_all(&redacted, "[REDACTED:secret_like]")
+            .into_owned();
+    }
+    redacted
+}
+
+fn export_redaction_patterns() -> &'static [Regex] {
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            r#"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)\s*[:=]\s*["']?[^\s"']{8,}"#,
+            r#"(?i)\bAuthorization:\s*Basic\s+[A-Za-z0-9+/=]{12,}"#,
+        ]
+        .into_iter()
+        .filter_map(|pattern| Regex::new(pattern).ok())
+        .collect()
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HooksConfig {
