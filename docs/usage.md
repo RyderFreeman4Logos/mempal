@@ -224,6 +224,36 @@ Behavior:
   pending, the checkpoint status becomes `waiting_llm`, and `mempal status`
   shows a warning instead of silently keeping low-quality records.
 
+When Spark quota is exhausted for days, split the two stages explicitly. First,
+run only Qwen proposals; delete candidates are persisted as SQLite
+`confirm_pending` work items and no drawer is soft-deleted or hard-deleted:
+
+```bash
+mempal maintenance rejudge \
+  --all --execute \
+  --proposal-only \
+  --progress-file /absolute/path/to/rejudge-progress.jsonl \
+  --proposal-llm-endpoint qwen \
+  --confirm-llm-endpoint spark
+```
+
+When Spark quota returns, drain only the persisted confirmation backlog. This
+mode reuses the stored Qwen proposal score and does not call Qwen again for
+`confirm_pending` rows:
+
+```bash
+mempal maintenance rejudge \
+  --all --resume --execute \
+  --confirm-pending-only \
+  --backup-dir /absolute/path/to/rejudge-backups \
+  --proposal-llm-endpoint qwen \
+  --confirm-llm-endpoint spark
+```
+
+Progress files and `mempal status` expose aggregate `no_stage_pending_count` and
+`confirm_pending_count` values only. They do not include drawer content, prompts,
+model responses, endpoint credentials, URLs with secrets, or other raw payloads.
+
 For unattended runs, wrap the command with `nohup` and retry with `--resume`.
 Keep logs/progress content-free: inspect counts, status, cursor, and model names,
 not raw drawer text or model responses.

@@ -136,6 +136,28 @@ mempal maintenance rejudge --all --execute \
 If an endpoint is unavailable, rerun with `--resume`; `mempal status` shows the
 `waiting_llm` checkpoint and pending aggregate counts.
 
+When Spark confirmation quota is exhausted for a long window, keep Qwen
+proposal capacity busy without holding the old paired runner in memory:
+
+```bash
+mempal maintenance rejudge --all --execute \
+  --proposal-only \
+  --progress-file /absolute/path/to/rejudge-progress.jsonl \
+  --proposal-llm-endpoint qwen \
+  --confirm-llm-endpoint spark
+```
+
+Later, drain only the persisted Spark confirmation backlog; Qwen is not called
+again for rows already marked `confirm_pending`:
+
+```bash
+mempal maintenance rejudge --all --resume --execute \
+  --confirm-pending-only \
+  --backup-dir /absolute/path/to/rejudge-backups \
+  --proposal-llm-endpoint qwen \
+  --confirm-llm-endpoint spark
+```
+
 Other backends:
 
 ```toml

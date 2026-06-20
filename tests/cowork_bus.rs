@@ -2148,6 +2148,8 @@ fn test_cli_maintenance_rejudge_help_shows_progress_file() {
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("--progress-file"), "{out}");
+    assert!(out.contains("--proposal-only"), "{out}");
+    assert!(out.contains("--confirm-pending-only"), "{out}");
     assert!(out.contains("JSONL progress"), "{out}");
     assert!(!home.path().join(".mempal").exists());
 }
