@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::config::scrub_export_sensitive_text;
 use crate::core::db::Database;
 use crate::core::project::{ProjectFilterMode, ProjectSearchScope};
+use crate::managed_output::overwrite_existing_managed_file;
 
 const FORMAT_VERSION: &str = "markdown_mirror_v1";
 const CANONICAL_SOURCE: &str = "sqlite";
@@ -487,10 +488,8 @@ fn write_generated_file(
                     path.display()
                 );
             }
-            Ok(_) => {
-                fs::write(&path, content).with_context(|| {
-                    format!("failed to write markdown export {}", path.display())
-                })?;
+            Ok(metadata) => {
+                overwrite_existing_managed_file(&path, &metadata, content, "markdown export file")?;
                 return Ok(());
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -571,13 +570,13 @@ fn write_manifest(
                     manifest_path.display()
                 );
             }
-            Ok(_) => {
-                fs::write(&manifest_path, content).with_context(|| {
-                    format!(
-                        "failed to write markdown export manifest {}",
-                        manifest_path.display()
-                    )
-                })?;
+            Ok(metadata) => {
+                overwrite_existing_managed_file(
+                    &manifest_path,
+                    &metadata,
+                    content.as_bytes(),
+                    "markdown export manifest",
+                )?;
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 create_generated_file(&manifest_path, content.as_bytes())?;

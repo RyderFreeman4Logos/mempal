@@ -12,6 +12,7 @@ use crate::core::config::scrub_export_sensitive_text;
 use crate::core::db::Database;
 use crate::core::decay::parse_temporal_timestamp_secs;
 use crate::core::project::ProjectSearchScope;
+use crate::managed_output::overwrite_existing_managed_file;
 
 const FORMAT_VERSION: &str = "knowledge_wiki_v1";
 const CANONICAL_SOURCE: &str = "sqlite";
@@ -1550,10 +1551,8 @@ fn write_generated_file(
                     path.display()
                 );
             }
-            Ok(_) => {
-                fs::write(&path, content).with_context(|| {
-                    format!("failed to write knowledge wiki {}", path.display())
-                })?;
+            Ok(metadata) => {
+                overwrite_existing_managed_file(&path, &metadata, content, "knowledge wiki file")?;
                 return Ok(());
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -1635,13 +1634,13 @@ fn write_manifest(
                     manifest_path.display()
                 );
             }
-            Ok(_) => {
-                fs::write(&manifest_path, content).with_context(|| {
-                    format!(
-                        "failed to write knowledge wiki manifest {}",
-                        manifest_path.display()
-                    )
-                })?;
+            Ok(metadata) => {
+                overwrite_existing_managed_file(
+                    &manifest_path,
+                    &metadata,
+                    content.as_bytes(),
+                    "knowledge wiki manifest",
+                )?;
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 create_generated_file(&manifest_path, content.as_bytes())?;
