@@ -145,6 +145,7 @@ const MCP_INGEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const MCP_INGEST_WRITER_LEASE_TTL_SECS: u64 = 120;
+const MCP_CONTENT_WRITER_LEASE_TTL_SECS: u64 = 120;
 const MCP_INGEST_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 
 fn mcp_ingest_idempotency_key(payload: &str) -> String {
@@ -267,6 +268,23 @@ impl Drop for McpIngestWriterLeaseGuard {
     }
 }
 
+struct McpContentWriterLeaseGuard {
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+}
+
+impl Drop for McpContentWriterLeaseGuard {
+    fn drop(&mut self) {
+        if let Ok(db) = Database::open(&self.db_path) {
+            let _ = db.runtime_writer_lease_release(
+                &self.lease.name,
+                &self.lease.owner,
+                &self.lease.session_id,
+            );
+        }
+    }
+}
+
 fn ensure_mcp_runtime_writer_lease_active(
     db: &Database,
     lease: Option<&RuntimeWriterLease>,
@@ -289,6 +307,27 @@ fn ensure_mcp_runtime_writer_lease_active(
             None,
         ))
     }
+}
+
+fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
+    if leases.is_empty() {
+        return "none visible".to_string();
+    }
+    leases
+        .iter()
+        .map(|lease| {
+            format!(
+                "name={} owner={} pid={} mode={} expires_at={} heartbeat_at={}",
+                lease.name,
+                lease.owner,
+                lease.pid,
+                lease.mode,
+                lease.expires_at,
+                lease.heartbeat_at
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl MempalMcpServer {
@@ -886,6 +925,49 @@ impl MempalMcpServer {
         .await
         .context("MCP ingest writer lease task failed")??;
         Ok(lease.map(|lease| McpIngestWriterLeaseGuard::new(self.db_path.clone(), lease)))
+    }
+
+    fn acquire_content_writer_lease(
+        &self,
+        db: &Database,
+        operation: &'static str,
+    ) -> std::result::Result<McpContentWriterLeaseGuard, ErrorData> {
+        let owner = format!("mempal-mcp-{operation}-{}", std::process::id());
+        let metadata_json = serde_json::json!({
+            "component": "mcp-content-writer",
+            "operation": operation,
+            "db_path": db.path().display().to_string(),
+        })
+        .to_string();
+        let lease = db
+            .runtime_writer_lease_acquire(
+                SQLITE_WRITER_LEASE_NAME,
+                &owner,
+                "mcp-content-write",
+                MCP_CONTENT_WRITER_LEASE_TTL_SECS,
+                Some(&metadata_json),
+            )
+            .map_err(|error| database_write_refused_error(db.path(), operation, &error))?;
+        let lease = match lease {
+            Some(lease) => lease,
+            None => {
+                let active = db
+                    .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+                    .unwrap_or_default();
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "SQLite writer lease `{}` is already held; refusing to run {operation}: {}",
+                        SQLITE_WRITER_LEASE_NAME,
+                        format_runtime_writer_leases(&active)
+                    ),
+                    None,
+                ));
+            }
+        };
+        Ok(McpContentWriterLeaseGuard {
+            db_path: db.path().to_path_buf(),
+            lease,
+        })
     }
 
     fn spawn_ingest_writer_lease_heartbeat(
@@ -4060,6 +4142,7 @@ impl MempalMcpServer {
             .next()
             .ok_or_else(|| ErrorData::internal_error("embedder returned no vector", None))?;
         let db = self.open_db()?;
+        let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_knowledge_distill")?;
         let outcome = commit_distill(&db, *prepared, &vector).map_err(knowledge_distill_error)?;
         Ok(Json(KnowledgeDistillResponse::from(outcome)))
     }
@@ -4268,6 +4351,8 @@ impl MempalMcpServer {
             }
             "promote" => {
                 let db = self.open_db()?;
+                let _writer_lease =
+                    self.acquire_content_writer_lease(&db, "mempal_knowledge_cards promote")?;
                 let card_id = required_string(request.card_id.as_deref(), "card_id")?;
                 let status = required_string(request.status.as_deref(), "status")?.to_string();
                 let reason = required_string(request.reason.as_deref(), "reason")?.to_string();
@@ -4296,6 +4381,8 @@ impl MempalMcpServer {
             }
             "demote" => {
                 let db = self.open_db()?;
+                let _writer_lease =
+                    self.acquire_content_writer_lease(&db, "mempal_knowledge_cards demote")?;
                 let card_id = required_string(request.card_id.as_deref(), "card_id")?;
                 let status = required_string(request.status.as_deref(), "status")?.to_string();
                 let reason = required_string(request.reason.as_deref(), "reason")?.to_string();
@@ -4340,6 +4427,7 @@ impl MempalMcpServer {
         Parameters(request): Parameters<KnowledgePromoteRequest>,
     ) -> std::result::Result<Json<KnowledgePromoteResponse>, ErrorData> {
         let db = self.open_db()?;
+        let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_knowledge_promote")?;
         let outcome = promote_knowledge(
             &db,
             CorePromoteRequest {
@@ -4366,6 +4454,7 @@ impl MempalMcpServer {
         Parameters(request): Parameters<KnowledgeDemoteRequest>,
     ) -> std::result::Result<Json<KnowledgeDemoteResponse>, ErrorData> {
         let db = self.open_db()?;
+        let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_knowledge_demote")?;
         let outcome = demote_knowledge(
             &db,
             CoreDemoteRequest {
@@ -4390,6 +4479,8 @@ impl MempalMcpServer {
         Parameters(request): Parameters<KnowledgePublishAnchorRequest>,
     ) -> std::result::Result<Json<KnowledgePublishAnchorResponse>, ErrorData> {
         let db = self.open_db()?;
+        let _writer_lease =
+            self.acquire_content_writer_lease(&db, "mempal_knowledge_publish_anchor")?;
         let outcome = publish_anchor(
             &db,
             CorePublishAnchorRequest {
@@ -5746,6 +5837,7 @@ impl MempalMcpServer {
         Parameters(request): Parameters<DeleteRequest>,
     ) -> std::result::Result<Json<DeleteResponse>, ErrorData> {
         let db = self.open_db()?;
+        let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_delete")?;
         let deleted = db
             .soft_delete_drawer(&request.drawer_id)
             .map_err(db_error)?;
@@ -5798,6 +5890,7 @@ impl MempalMcpServer {
                 .map_err(db_error)?;
             (count.max(0) as usize, Vec::new())
         } else {
+            let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_rollback")?;
             let drawer_ids = db
                 .soft_delete_drawers_since(
                     &since,
@@ -5958,6 +6051,8 @@ impl MempalMcpServer {
                 }))
             }
             "edit" => {
+                let _writer_lease =
+                    self.acquire_content_writer_lease(&db, "mempal_taxonomy edit")?;
                 let wing = request
                     .wing
                     .ok_or_else(|| ErrorData::invalid_params("missing wing", None))?;
@@ -6017,6 +6112,7 @@ impl MempalMcpServer {
                 if block_writes {
                     return Err(degraded_write_error());
                 }
+                let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_kg add")?;
                 let subject = request
                     .subject
                     .ok_or_else(|| ErrorData::invalid_params("missing subject", None))?;
@@ -6066,6 +6162,8 @@ impl MempalMcpServer {
                 if block_writes {
                     return Err(degraded_write_error());
                 }
+                let _writer_lease =
+                    self.acquire_content_writer_lease(&db, "mempal_kg invalidate")?;
                 let triple_id = request
                     .triple_id
                     .ok_or_else(|| ErrorData::invalid_params("missing triple_id", None))?;
@@ -6157,6 +6255,7 @@ impl MempalMcpServer {
                 }))
             }
             "add" => {
+                let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_tunnels add")?;
                 let left = request
                     .left
                     .ok_or_else(|| ErrorData::invalid_params("missing left endpoint", None))?;
@@ -6179,6 +6278,8 @@ impl MempalMcpServer {
                 }))
             }
             "delete" => {
+                let _writer_lease =
+                    self.acquire_content_writer_lease(&db, "mempal_tunnels delete")?;
                 let tunnel_id = trim_to_option(request.tunnel_id.as_deref())
                     .ok_or_else(|| ErrorData::invalid_params("missing tunnel_id", None))?;
                 if tunnel_id.starts_with("passive_") {
@@ -7382,6 +7483,11 @@ impl MempalMcpServer {
                         &capture.record_quality,
                         request.allow_warnings.unwrap_or(false),
                     );
+                    let _writer_lease = if should_write {
+                        Some(self.acquire_content_writer_lease(&db, "mempal_phase3 capture")?)
+                    } else {
+                        None
+                    };
                     let event = if should_write {
                         let event = RuntimeAdoptionEvent {
                             id: record_input.id.unwrap_or_else(|| {
@@ -7655,6 +7761,11 @@ impl MempalMcpServer {
                 let quality = check_runtime_adoption_record(&input);
                 let should_write =
                     should_write_checked_record(&quality, request.allow_warnings.unwrap_or(false));
+                let _writer_lease = if should_write {
+                    Some(self.acquire_content_writer_lease(&db, "mempal_phase3 record_checked")?)
+                } else {
+                    None
+                };
                 let event = if should_write {
                     let event = RuntimeAdoptionEvent {
                         id: input
@@ -7819,6 +7930,8 @@ impl MempalMcpServer {
             }
             "record" => {
                 let db = self.open_db()?;
+                let _writer_lease =
+                    self.acquire_content_writer_lease(&db, "mempal_phase3 record")?;
                 let track = parse_runtime_adoption_track(required_string(
                     request.track.as_deref(),
                     "track",
@@ -9710,6 +9823,27 @@ quality_policy = "llm_required_for_keep"
         .expect("insert drawer");
         db.insert_vector(id, &[0.1, 0.2, 0.3])
             .expect("insert vector");
+    }
+
+    fn hold_daemon_writer_lease(db_path: &Path) -> RuntimeWriterLease {
+        let db = Database::open(db_path).expect("open db");
+        db.runtime_writer_lease_acquire(
+            SQLITE_WRITER_LEASE_NAME,
+            "daemon-owner",
+            "daemon",
+            300,
+            None,
+        )
+        .expect("acquire daemon writer lease")
+        .expect("daemon writer lease")
+    }
+
+    fn assert_writer_lease_conflict(error: &ErrorData) {
+        let message = error.to_string();
+        assert!(
+            message.contains("SQLite writer lease `sqlite-writer` is already held"),
+            "{message}"
+        );
     }
 
     fn spawn_runtime_ticker() -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
@@ -12772,6 +12906,201 @@ quality_policy = "llm_required_for_keep"
         assert_eq!(second.drawer_ids, vec![first.drawer_id.clone()]);
         let db = Database::open(&db_path).expect("open db");
         assert_eq!(db.drawer_count().expect("drawer count"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_rejects_existing_content_writer_lease() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "mcp-delete-lease-target",
+            "delete target must survive lease conflict",
+            "mcp",
+            Some("lease"),
+            "/tmp/mcp-delete.md",
+            2,
+        );
+        let _daemon_lease = hold_daemon_writer_lease(&db_path);
+
+        let error = match server
+            .mempal_delete(Parameters(DeleteRequest {
+                drawer_id: "mcp-delete-lease-target".to_string(),
+            }))
+            .await
+        {
+            Ok(_) => panic!("delete must reject under daemon writer lease"),
+            Err(error) => error,
+        };
+
+        assert_writer_lease_conflict(&error);
+        let db = Database::open(&db_path).expect("open db");
+        assert!(
+            db.drawer_exists("mcp-delete-lease-target")
+                .expect("drawer exists")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_kg_taxonomy_and_tunnel_reject_existing_content_writer_lease() {
+        let (_tempdir, db_path, server) = setup_server();
+        let db = Database::open(&db_path).expect("open db");
+        let baseline_triples = db.triple_count().expect("triple count");
+        let baseline_taxonomy = db.taxonomy_count().expect("taxonomy count");
+        let baseline_tunnels = db.list_explicit_tunnels(None).expect("list tunnels").len();
+        drop(db);
+        let _daemon_lease = hold_daemon_writer_lease(&db_path);
+
+        let kg_error = match server
+            .mempal_kg(Parameters(KgRequest {
+                action: "add".to_string(),
+                subject: Some("subject".to_string()),
+                predicate: Some("relates_to".to_string()),
+                object: Some("object".to_string()),
+                triple_id: None,
+                active_only: None,
+                source_drawer: None,
+            }))
+            .await
+        {
+            Ok(_) => panic!("kg add must reject under daemon writer lease"),
+            Err(error) => error,
+        };
+        assert_writer_lease_conflict(&kg_error);
+
+        let taxonomy_error = match server
+            .mempal_taxonomy(Parameters(TaxonomyRequest {
+                action: "edit".to_string(),
+                wing: Some("mcp".to_string()),
+                room: Some("lease-taxonomy".to_string()),
+                keywords: Some(vec!["lease".to_string()]),
+            }))
+            .await
+        {
+            Ok(_) => panic!("taxonomy edit must reject under daemon writer lease"),
+            Err(error) => error,
+        };
+        assert_writer_lease_conflict(&taxonomy_error);
+
+        let tunnel_error = match server
+            .mempal_tunnels(Parameters(TunnelsRequest {
+                action: Some("add".to_string()),
+                left: Some(TunnelEndpointDto {
+                    wing: "left".to_string(),
+                    room: Some("room".to_string()),
+                }),
+                right: Some(TunnelEndpointDto {
+                    wing: "right".to_string(),
+                    room: Some("room".to_string()),
+                }),
+                from: None,
+                label: Some("related".to_string()),
+                tunnel_id: None,
+                wing: None,
+                kind: None,
+                max_hops: None,
+            }))
+            .await
+        {
+            Ok(_) => panic!("tunnel add must reject under daemon writer lease"),
+            Err(error) => error,
+        };
+        assert_writer_lease_conflict(&tunnel_error);
+
+        let db = Database::open(&db_path).expect("open db");
+        assert_eq!(db.triple_count().expect("triple count"), baseline_triples);
+        assert_eq!(
+            db.taxonomy_count().expect("taxonomy count"),
+            baseline_taxonomy
+        );
+        assert_eq!(
+            db.list_explicit_tunnels(None).expect("list tunnels").len(),
+            baseline_tunnels
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_non_ingest_writes_succeed_without_content_writer_conflict() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "mcp-delete-success-target",
+            "delete target can be soft deleted without lease conflict",
+            "mcp",
+            Some("lease"),
+            "/tmp/mcp-delete-success.md",
+            2,
+        );
+        let db = Database::open(&db_path).expect("open db");
+        let baseline_taxonomy = db.taxonomy_count().expect("taxonomy count");
+        drop(db);
+
+        let delete = server
+            .mempal_delete(Parameters(DeleteRequest {
+                drawer_id: "mcp-delete-success-target".to_string(),
+            }))
+            .await
+            .expect("delete succeeds")
+            .0;
+        assert!(delete.deleted);
+
+        server
+            .mempal_kg(Parameters(KgRequest {
+                action: "add".to_string(),
+                subject: Some("subject".to_string()),
+                predicate: Some("relates_to".to_string()),
+                object: Some("object".to_string()),
+                triple_id: None,
+                active_only: None,
+                source_drawer: None,
+            }))
+            .await
+            .expect("kg add succeeds");
+
+        server
+            .mempal_taxonomy(Parameters(TaxonomyRequest {
+                action: "edit".to_string(),
+                wing: Some("mcp".to_string()),
+                room: Some("lease-taxonomy".to_string()),
+                keywords: Some(vec!["lease".to_string()]),
+            }))
+            .await
+            .expect("taxonomy edit succeeds");
+
+        server
+            .mempal_tunnels(Parameters(TunnelsRequest {
+                action: Some("add".to_string()),
+                left: Some(TunnelEndpointDto {
+                    wing: "left".to_string(),
+                    room: Some("room".to_string()),
+                }),
+                right: Some(TunnelEndpointDto {
+                    wing: "right".to_string(),
+                    room: Some("room".to_string()),
+                }),
+                from: None,
+                label: Some("related".to_string()),
+                tunnel_id: None,
+                wing: None,
+                kind: None,
+                max_hops: None,
+            }))
+            .await
+            .expect("tunnel add succeeds");
+
+        let db = Database::open(&db_path).expect("open db");
+        assert!(
+            !db.drawer_exists("mcp-delete-success-target")
+                .expect("drawer exists")
+        );
+        assert_eq!(db.triple_count().expect("triple count"), 1);
+        assert_eq!(
+            db.taxonomy_count().expect("taxonomy count"),
+            baseline_taxonomy + 1
+        );
+        assert_eq!(
+            db.list_explicit_tunnels(None).expect("list tunnels").len(),
+            1
+        );
     }
 
     #[tokio::test]

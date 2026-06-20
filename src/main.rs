@@ -4272,6 +4272,13 @@ fn acquire_cli_ingest_writer_lease(
     acquire_runtime_writer_lease(db, command, "ingest", "mempal-ingest")
 }
 
+fn acquire_cli_content_writer_lease(
+    db: &Database,
+    command: &str,
+) -> Result<MaintenanceWriterLeaseGuard> {
+    acquire_runtime_writer_lease(db, command, "cli-content-write", "mempal-cli")
+}
+
 fn acquire_runtime_writer_lease(
     db: &Database,
     command: &str,
@@ -6993,6 +7000,7 @@ fn set_pending_auto_card_status(
     let old_status = card.status.clone();
     card.status = status.clone();
     card.updated_at = current_timestamp();
+    let _writer_lease = acquire_cli_content_writer_lease(db, "cards-review")?;
     db.update_knowledge_card(&card)
         .context("failed to update knowledge card")?;
     db.append_knowledge_event(&KnowledgeCardEvent {
@@ -7992,6 +8000,7 @@ async fn knowledge_command(
                         .into_iter()
                         .next()
                         .context("embedder returned no vector")?;
+                    let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-distill")?;
                     commit_distill(db, *prepared, &vector)?
                 }
             };
@@ -8011,6 +8020,7 @@ async fn knowledge_command(
             reason,
             reviewer,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-promote")?;
             let outcome = promote_knowledge(
                 db,
                 PromoteRequest {
@@ -8035,6 +8045,7 @@ async fn knowledge_command(
             reason,
             reason_type,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-demote")?;
             let outcome = demote_knowledge(
                 db,
                 DemoteRequest {
@@ -8094,6 +8105,7 @@ async fn knowledge_command(
             reason,
             reviewer,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-publish-anchor")?;
             let outcome = publish_anchor(
                 db,
                 PublishAnchorRequest {
@@ -8181,6 +8193,7 @@ async fn knowledge_card_command(
                 created_at: now.clone(),
                 updated_at: now,
             };
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-card-create")?;
             db.insert_knowledge_card(&card)
                 .context("failed to insert knowledge card")?;
             match format.as_str() {
@@ -8281,6 +8294,7 @@ async fn knowledge_card_command(
                 note,
                 created_at: current_timestamp(),
             };
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-card-link")?;
             db.insert_knowledge_evidence_link(&link)
                 .context("failed to insert knowledge evidence link")?;
             println!("link_id={id} created=true");
@@ -8332,6 +8346,7 @@ async fn knowledge_card_command(
                 metadata,
                 created_at,
             };
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-card-event")?;
             db.append_knowledge_event(&event)
                 .context("failed to append knowledge card event")?;
             println!("event_id={id} created=true");
@@ -8369,6 +8384,7 @@ async fn knowledge_card_command(
             enforce_gate,
             format,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-card-promote")?;
             let outcome = promote_card(
                 db,
                 PromoteCardRequest {
@@ -8392,6 +8408,7 @@ async fn knowledge_card_command(
             reason_type,
             format,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-card-demote")?;
             let outcome = demote_card(
                 db,
                 DemoteCardRequest {
@@ -8445,6 +8462,14 @@ async fn knowledge_card_command(
                 anchor_kind: anchor_kind.as_deref().map(parse_anchor_kind).transpose()?,
                 anchor_id,
                 ..KnowledgeCardFilter::default()
+            };
+            let _writer_lease = if execute {
+                Some(acquire_cli_content_writer_lease(
+                    db,
+                    "knowledge-card-backfill-apply",
+                )?)
+            } else {
+                None
             };
             let result = apply_backfill(db, &filter, KnowledgeCardBackfillApplyOptions { execute })
                 .context("failed to apply knowledge card backfill")?;
@@ -8955,6 +8980,8 @@ async fn research_ingest_plan_command(
                 .await
                 .context("failed to embed research evidence drawers")?;
 
+            let _writer_lease =
+                acquire_cli_content_writer_lease(db, "phase3-research-ingest-plan")?;
             for ((index, drawer_id, content), vector) in pending.into_iter().zip(vectors) {
                 let source_file = report.evidence_drawers[index].source_file.clone();
                 let drawer = research_evidence_drawer(
@@ -9079,6 +9106,14 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
                 let signal = parse_runtime_adoption_signal(&record_input.signal)?;
                 let should_write =
                     should_write_checked_record(&report.record_quality, allow_warnings);
+                let _writer_lease = if should_write {
+                    Some(acquire_cli_content_writer_lease(
+                        db,
+                        "phase3-adoption-capture",
+                    )?)
+                } else {
+                    None
+                };
                 let event = if should_write {
                     let event = runtime_adoption_event_from_input(record_input, track, signal);
                     db.insert_runtime_adoption_event(&event)
@@ -9171,6 +9206,14 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
             };
             let quality = check_runtime_adoption_record(&input);
             let should_write = should_write_checked_record(&quality, allow_warnings);
+            let _writer_lease = if should_write {
+                Some(acquire_cli_content_writer_lease(
+                    db,
+                    "phase3-adoption-record-checked",
+                )?)
+            } else {
+                None
+            };
             let event = if should_write {
                 let event = runtime_adoption_event_from_input(input, track, signal);
                 db.insert_runtime_adoption_event(&event)
@@ -9267,6 +9310,7 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
                 signal,
             );
             let id = event.id.clone();
+            let _writer_lease = acquire_cli_content_writer_lease(db, "phase3-adoption-record")?;
             db.insert_runtime_adoption_event(&event)
                 .context("failed to insert runtime adoption event")?;
             match format.as_str() {
@@ -10283,6 +10327,7 @@ fn print_promotion_policy(policy: &[PromotionPolicyEntry]) {
 }
 
 fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
+    let _writer_lease = acquire_cli_content_writer_lease(db, "delete")?;
     let drawer = db
         .get_drawer(drawer_id)
         .context("failed to look up drawer")?;
@@ -10308,6 +10353,7 @@ fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
 }
 
 fn pin_command(db: &Database, drawer_id: &str) -> Result<()> {
+    let _writer_lease = acquire_cli_content_writer_lease(db, "pin")?;
     if !db
         .pin_drawer(drawer_id, None)
         .context("failed to pin drawer")?
@@ -10321,6 +10367,7 @@ fn pin_command(db: &Database, drawer_id: &str) -> Result<()> {
 }
 
 fn unpin_command(db: &Database, drawer_id: &str) -> Result<()> {
+    let _writer_lease = acquire_cli_content_writer_lease(db, "unpin")?;
     if !db
         .unpin_drawer(drawer_id)
         .context("failed to unpin drawer")?
@@ -10341,6 +10388,7 @@ fn pinned_command(
     json: bool,
 ) -> Result<()> {
     if !reorder.is_empty() {
+        let _writer_lease = acquire_cli_content_writer_lease(db, "pinned-reorder")?;
         for drawer_id in reorder {
             if db
                 .get_drawer(drawer_id)
@@ -10436,6 +10484,7 @@ fn rollback_command(
             dry_run: true,
         }
     } else {
+        let _writer_lease = acquire_cli_content_writer_lease(db, "rollback")?;
         let drawer_ids = db
             .soft_delete_drawers_since(&since, options.wing, options.room, project_id.as_deref())
             .context("failed to rollback drawers")?;
@@ -10469,6 +10518,7 @@ fn rollback_command(
 }
 
 fn purge_command(db: &Database, before: Option<&str>) -> Result<()> {
+    let _writer_lease = acquire_cli_content_writer_lease(db, "purge")?;
     let deleted_count = db
         .deleted_drawer_count()
         .context("failed to count deleted drawers")?;
@@ -10515,6 +10565,7 @@ fn kg_command(db: &Database, command: KgCommands) -> Result<()> {
             object,
             source_drawer,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "kg-add")?;
             let id = build_triple_id(&subject, &predicate, &object);
             let triple = Triple {
                 id: id.clone(),
@@ -10563,6 +10614,7 @@ fn kg_command(db: &Database, command: KgCommands) -> Result<()> {
             }
         }
         KgCommands::Invalidate { triple_id } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "kg-invalidate")?;
             if !db
                 .triple_exists(&triple_id)
                 .context("failed to check triple existence")?
@@ -10632,6 +10684,7 @@ fn tunnels_command(db: &Database, command: Option<TunnelCommands>) -> Result<()>
     match command {
         None => tunnels_discover_command(db),
         Some(TunnelCommands::Add { left, right, label }) => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "tunnels-add")?;
             let tunnel = db
                 .create_tunnel(
                     &parse_tunnel_endpoint(&left)?,
@@ -10653,6 +10706,7 @@ fn tunnels_command(db: &Database, command: Option<TunnelCommands>) -> Result<()>
             tunnels_list_command(db, wing.as_deref(), &kind)
         }
         Some(TunnelCommands::Delete { tunnel_id }) => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "tunnels-delete")?;
             if tunnel_id.starts_with("passive_") {
                 bail!("cannot delete passive tunnel");
             }
@@ -10790,6 +10844,7 @@ fn taxonomy_list_command(db: &Database) -> Result<()> {
     Ok(())
 }
 fn taxonomy_edit_command(db: &Database, wing: &str, room: &str, keywords: &str) -> Result<()> {
+    let _writer_lease = acquire_cli_content_writer_lease(db, "taxonomy-edit")?;
     let entry = TaxonomyEntry {
         wing: wing.to_string(),
         room: room.to_string(),
@@ -19968,6 +20023,14 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
         let track = parse_runtime_adoption_track(&record_input.track)?;
         let signal = parse_runtime_adoption_signal(&record_input.signal)?;
         let should_write = should_write_checked_record(&capture.record_quality, allow_warnings);
+        let _writer_lease = if should_write {
+            Some(acquire_cli_content_writer_lease(
+                db,
+                "phase3-adoption-wrap",
+            )?)
+        } else {
+            None
+        };
         let event = if should_write {
             let ev = runtime_adoption_event_from_input(record_input, track, signal);
             db.insert_runtime_adoption_event(&ev)
