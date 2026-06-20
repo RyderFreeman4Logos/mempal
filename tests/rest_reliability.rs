@@ -1,9 +1,10 @@
 #![cfg(feature = "rest")]
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,7 +14,7 @@ use mempal::api::ApiState;
 #[cfg(feature = "db-test-seam")]
 use mempal::core::AsyncDb;
 use mempal::core::config::ConfigHandle;
-use mempal::core::db::Database;
+use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use mempal::core::utils::iso_timestamp;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory, global_embed_status};
@@ -86,6 +87,12 @@ search_db_deadline_secs = {api_search_deadline_secs}
 
     fn db(&self) -> Database {
         Database::open(&self.db_path).expect("open db")
+    }
+
+    fn force_future_schema(&self) {
+        let conn = rusqlite::Connection::open(&self.db_path).expect("open raw sqlite");
+        conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .expect("set future schema version");
     }
 
     fn state(&self, factory: Arc<dyn EmbedderFactory>) -> ApiState {
@@ -166,6 +173,42 @@ impl EmbedderFactory for BuildFailFactory {
     async fn build(&self) -> Result<Box<dyn Embedder>, EmbedError> {
         Err(EmbedError::Runtime("embedder unavailable".to_string()))
     }
+}
+
+struct LogCapture {
+    buffer: Arc<StdMutex<Vec<u8>>>,
+}
+
+impl Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer
+            .lock()
+            .expect("log mutex poisoned")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn install_log_capture() -> (Arc<StdMutex<Vec<u8>>>, tracing::dispatcher::DefaultGuard) {
+    let logs = Arc::new(StdMutex::new(Vec::new()));
+    let writer_logs = Arc::clone(&logs);
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || LogCapture {
+            buffer: Arc::clone(&writer_logs),
+        })
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (logs, guard)
+}
+
+fn captured_logs(logs: &Arc<StdMutex<Vec<u8>>>) -> String {
+    String::from_utf8(logs.lock().expect("log mutex poisoned").clone()).expect("utf8 logs")
 }
 
 #[derive(Clone)]
@@ -256,6 +299,142 @@ async fn post_json(state: ApiState, uri: &str, body: Value) -> (StatusCode, Valu
         .expect("read body");
     let body = serde_json::from_slice(&bytes).expect("parse json");
     (status, body)
+}
+
+#[tokio::test]
+async fn test_ingest_rejects_future_schema_without_leaking_content() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    env.force_future_schema();
+    let (logs, _log_guard) = install_log_capture();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+    let secret = "REST_SCHEMA_SKEW_SECRET_503_DO_NOT_LEAK";
+
+    let (status, body) = post_json(
+        state,
+        "/api/ingest",
+        json!({
+            "content": format!("write should be rejected before queueing {secret}"),
+            "wing": "test",
+            "room": "schema",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
+    let rendered = serde_json::to_string(&body).expect("serialize body");
+    assert!(rendered.contains("schema_skew"), "{rendered}");
+    assert!(rendered.contains("restart"), "{rendered}");
+    assert!(rendered.contains("supported_schema_version"), "{rendered}");
+    assert!(!rendered.contains(secret), "{rendered}");
+    let logs = captured_logs(&logs);
+    assert!(!logs.contains(secret), "{logs}");
+    assert!(!logs.contains("drawer_content"), "{logs}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_worker_schema_skew_log_uses_metadata_not_drawer_content() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let (logs, _log_guard) = install_log_capture();
+    let started = Arc::new(Notify::new());
+    let released = Arc::new(Notify::new());
+    let has_started = Arc::new(AtomicBool::new(false));
+    let state = env.state(Arc::new(BlockingEmbedderFactory {
+        started: Arc::clone(&started),
+        released: Arc::clone(&released),
+        has_started: Arc::clone(&has_started),
+    }));
+
+    let first = tokio::spawn({
+        let state = state.clone();
+        async move {
+            post_json(
+                state,
+                "/api/ingest",
+                json!({
+                    "content": "first queued write blocks the worker",
+                    "wing": "test",
+                    "room": "schema",
+                }),
+            )
+            .await
+        }
+    });
+
+    while !has_started.load(Ordering::SeqCst) {
+        started.notified().await;
+    }
+
+    let secret = "WORKER_SCHEMA_SKEW_SECRET_503_DO_NOT_LEAK";
+    let second = tokio::spawn({
+        let state = state.clone();
+        async move {
+            post_json(
+                state,
+                "/api/ingest",
+                json!({
+                    "content": format!("second write should fail after enqueue {secret}"),
+                    "wing": "test",
+                    "room": "schema",
+                }),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !second.is_finished(),
+        "second write should be queued behind the blocking first write"
+    );
+
+    env.force_future_schema();
+    released.notify_waiters();
+
+    let (first_status, first_body) = first.await.expect("join first write");
+    assert_eq!(first_status, StatusCode::CREATED, "body={first_body}");
+    let (second_status, second_body) = second.await.expect("join second write");
+    assert_eq!(
+        second_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "body={second_body}"
+    );
+    let rendered = serde_json::to_string(&second_body).expect("serialize body");
+    assert!(rendered.contains("schema_skew"), "{rendered}");
+    assert!(!rendered.contains(secret), "{rendered}");
+
+    let logs = captured_logs(&logs);
+    assert!(logs.contains("REST write failed"), "{logs}");
+    assert!(logs.contains("content_len"), "{logs}");
+    assert!(logs.contains("content_hash_prefix"), "{logs}");
+    assert!(logs.contains("schema_skew"), "{logs}");
+    assert!(!logs.contains(secret), "{logs}");
+    assert!(!logs.contains("drawer_content"), "{logs}");
+    assert!(!logs.contains("manual recovery"), "{logs}");
+}
+
+#[tokio::test]
+async fn test_status_reports_schema_skew_restart_warning() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    env.force_future_schema();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (status, _headers, body) = get_json(state, "/api/status").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let warnings = body["status_warnings"].as_array().expect("status warnings");
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.as_str().is_some_and(|warning| {
+                warning.contains("palace.db schema")
+                    && warning.contains("newer than this daemon supports")
+                    && warning.contains("mempal daemon restart")
+            })
+        }),
+        "status warnings should surface schema skew: {body:#}"
+    );
+    assert_eq!(body["drawer_count"].as_i64(), Some(0));
 }
 
 fn insert_search_drawer(db: &Database) {
