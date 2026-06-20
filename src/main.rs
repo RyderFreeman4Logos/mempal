@@ -23617,10 +23617,41 @@ threshold = 0.7
         assert!(completed["last_cursor_rowid"].as_i64().is_some());
         assert!(completed["eta_secs"].as_f64().is_some());
         let memory = completed["memory"].as_object().expect("memory object");
-        assert_eq!(
-            memory.get("available").and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        let memory_available = memory
+            .get("available")
+            .and_then(|value| value.as_bool())
+            .expect("memory availability flag");
+        const MEMORY_METRIC_KEYS: &[&str] = &[
+            "rss_bytes",
+            "pss_bytes",
+            "vm_hwm_bytes",
+            "private_dirty_bytes",
+            "anonymous_bytes",
+            "swap_bytes",
+        ];
+        #[cfg(target_os = "linux")]
+        {
+            assert!(memory_available, "Linux should report memory diagnostics");
+            assert!(
+                MEMORY_METRIC_KEYS
+                    .iter()
+                    .any(|key| memory.get(*key).and_then(Value::as_u64).is_some()),
+                "Linux memory diagnostics should include at least one byte metric: {memory:?}"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(
+                !memory_available,
+                "unsupported platforms should report memory diagnostics unavailable"
+            );
+            assert!(
+                MEMORY_METRIC_KEYS
+                    .iter()
+                    .all(|key| !memory.contains_key(*key)),
+                "unsupported platforms should not emit Linux-only memory metrics: {memory:?}"
+            );
+        }
         assert!(
             memory.keys().all(|key| matches!(
                 key.as_str(),
@@ -23634,6 +23665,14 @@ threshold = 0.7
             )),
             "unexpected memory keys: {memory:?}"
         );
+        for key in MEMORY_METRIC_KEYS {
+            if let Some(value) = memory.get(*key) {
+                assert!(
+                    value.as_u64().is_some(),
+                    "memory metric {key} should be an aggregate byte count: {memory:?}"
+                );
+            }
+        }
 
         let raw_progress = std::fs::read_to_string(&progress_file).expect("read progress");
         assert!(
