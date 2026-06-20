@@ -254,6 +254,28 @@ Progress files and `mempal status` expose aggregate `no_stage_pending_count` and
 `confirm_pending_count` values only. They do not include drawer content, prompts,
 model responses, endpoint credentials, URLs with secrets, or other raw payloads.
 
+Maintenance rejudge is designed as an IO-first service path when proposal and
+confirmation judges are external endpoints. Full `--all` runs snapshot work into
+SQLite `historical_rejudge_work_items`, page through that table with
+`--page-size`, and persist split-stage proposal backlog as `confirm_pending`
+rows. New SQLite backup files use a streaming payload hash so each page append
+does not reload or parse the complete backup history into memory.
+
+Memory budget discipline:
+
+- Idle/lightweight daemon paths should stay in the tens of MiB when configured
+  for remote embedding.
+- Large historical maintenance runs should use bounded page buffers and stay in
+  the low hundreds of MiB, excluding memory used by external model services.
+- Avoid increasing `--page-size` beyond what the host can comfortably keep in
+  memory with the current drawer size distribution.
+- Progress JSONL and final reports include a `memory` object with aggregate
+  fields only: `rss_bytes`, `pss_bytes`, `vm_hwm_bytes`,
+  `private_dirty_bytes`, `anonymous_bytes`, and `swap_bytes` when the platform
+  exposes them. Unsupported platforms report `available=false`.
+- Memory reports never include drawer content, prompts, model responses,
+  endpoint URLs, API keys, or other raw payloads.
+
 For unattended runs, wrap the command with `nohup` and retry with `--resume`.
 Keep logs/progress content-free: inspect counts, status, cursor, and model names,
 not raw drawer text or model responses.

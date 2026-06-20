@@ -2561,8 +2561,26 @@ struct HistoricalRejudgeReport {
     status: String,
     no_stage_pending_count: usize,
     confirm_pending_count: usize,
+    memory: HistoricalRejudgeMemoryReport,
     wings_rooms: Vec<HistoricalRejudgeScopeCount>,
     examples: Vec<HistoricalRejudgeExample>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct HistoricalRejudgeMemoryReport {
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rss_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pss_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vm_hwm_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private_dirty_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anonymous_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap_bytes: Option<u64>,
 }
 
 struct HistoricalRejudgeReportInput<'a> {
@@ -2704,6 +2722,7 @@ const DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE: usize = 500;
 const DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY: usize = 1;
 const HISTORICAL_REJUDGE_CHECKPOINT_KEY: &str = "maintenance.rejudge.checkpoint";
 const HISTORICAL_REJUDGE_WORK_TABLE: &str = "historical_rejudge_work_items";
+const HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT: &str = "sqlite_stream_v1";
 static HISTORICAL_REJUDGE_RUN_ID_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2713,6 +2732,28 @@ fn default_historical_rejudge_page_size() -> usize {
 
 fn default_historical_rejudge_stage_mode() -> HistoricalRejudgeStageMode {
     HistoricalRejudgeStageMode::Paired
+}
+
+fn current_historical_rejudge_memory_report() -> HistoricalRejudgeMemoryReport {
+    let Ok(pid) = i32::try_from(std::process::id()) else {
+        return HistoricalRejudgeMemoryReport::default();
+    };
+    let report = mempal::process_diagnostics::inspect_process_memory(pid);
+    let available = report.rss_bytes.is_some()
+        || report.pss_bytes.is_some()
+        || report.vm_hwm_bytes.is_some()
+        || report.private_dirty_bytes.is_some()
+        || report.anonymous_bytes.is_some()
+        || report.swap_bytes.is_some();
+    HistoricalRejudgeMemoryReport {
+        available,
+        rss_bytes: report.rss_bytes,
+        pss_bytes: report.pss_bytes,
+        vm_hwm_bytes: report.vm_hwm_bytes,
+        private_dirty_bytes: report.private_dirty_bytes,
+        anonymous_bytes: report.anonymous_bytes,
+        swap_bytes: report.swap_bytes,
+    }
 }
 
 fn build_historical_rejudge_progress_event(
@@ -2754,6 +2795,7 @@ fn build_historical_rejudge_progress_event(
         eta_secs,
         timestamp: iso_timestamp(),
         last_successful_page_at: input.last_successful_page_at,
+        memory: current_historical_rejudge_memory_report(),
         error: input.error,
     }
 }
@@ -2938,6 +2980,7 @@ struct HistoricalRejudgeProgressEvent<'a> {
     eta_secs: Option<f64>,
     timestamp: String,
     last_successful_page_at: Option<&'a str>,
+    memory: HistoricalRejudgeMemoryReport,
     error: Option<&'a str>,
 }
 
@@ -13250,8 +13293,20 @@ fn print_daemon_process_report(pid: i32, prefix: &str) {
         display_opt_u64(report.pss_bytes)
     );
     println!(
+        "{prefix}memory.vm_hwm_bytes: {}",
+        display_opt_u64(report.vm_hwm_bytes)
+    );
+    println!(
         "{prefix}memory.private_dirty_bytes: {}",
         display_opt_u64(report.private_dirty_bytes)
+    );
+    println!(
+        "{prefix}memory.anonymous_bytes: {}",
+        display_opt_u64(report.anonymous_bytes)
+    );
+    println!(
+        "{prefix}memory.swap_bytes: {}",
+        display_opt_u64(report.swap_bytes)
     );
     if report.exe_deleted {
         println!(
@@ -16679,6 +16734,7 @@ fn historical_rejudge_report_from_checkpoint(
         status: checkpoint.status.clone(),
         no_stage_pending_count: input.backlog_counts.no_stage_pending_count,
         confirm_pending_count: input.backlog_counts.confirm_pending_count,
+        memory: current_historical_rejudge_memory_report(),
         wings_rooms: Vec::new(),
         examples: Vec::new(),
     }
@@ -16723,6 +16779,7 @@ fn historical_rejudge_report_from_summary(
         .to_string(),
         no_stage_pending_count: 0,
         confirm_pending_count: 0,
+        memory: current_historical_rejudge_memory_report(),
         wings_rooms,
         examples: summary.examples,
     }
@@ -16772,7 +16829,7 @@ fn create_historical_rejudge_sqlite_backup(
         .with_context(|| format!("failed to sync backup {}", final_path.display()))?;
     drop(file);
 
-    let conn = rusqlite::Connection::open(&final_path)
+    let mut conn = rusqlite::Connection::open(&final_path)
         .with_context(|| format!("failed to open backup {}", final_path.display()))?;
     conn.execute_batch(
         r#"
@@ -16791,14 +16848,14 @@ fn create_historical_rejudge_sqlite_backup(
         "#,
     )
     .with_context(|| format!("failed to initialize backup {}", final_path.display()))?;
-    let initial_payload_hash = historical_rejudge_backup_payload_hash(&HistoricalRejudgeBackup {
-        version: 2,
-        metadata: metadata.clone(),
-        items: Vec::new(),
-        integrity: HistoricalRejudgeBackupIntegrity {
-            payload_sha256: String::new(),
-        },
-    })?;
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .with_context(|| {
+            format!(
+                "failed to begin historical rejudge backup metadata transaction {}",
+                final_path.display()
+            )
+        })?;
     for (key, value) in [
         ("version", "2".to_string()),
         ("created_at", metadata.created_at.clone()),
@@ -16812,14 +16869,23 @@ fn create_historical_rejudge_sqlite_backup(
         ),
         ("judge_model", serde_json::to_string(&metadata.judge_model)?),
         ("config_version", metadata.config_version.clone()),
-        ("payload_sha256", initial_payload_hash),
     ] {
-        conn.execute(
-            "INSERT INTO rejudge_backup_metadata (key, value) VALUES (?1, ?2)",
-            rusqlite::params![key, value],
-        )
-        .with_context(|| format!("failed to write backup metadata {key}"))?;
+        transaction
+            .execute(
+                "INSERT INTO rejudge_backup_metadata (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .with_context(|| format!("failed to write backup metadata {key}"))?;
     }
+    let initial_payload_hash = historical_rejudge_sqlite_payload_hash_in_transaction(&transaction)?;
+    write_historical_rejudge_sqlite_stream_integrity(&transaction, initial_payload_hash.as_str())
+        .context("failed to write initial backup payload hash")?;
+    transaction.commit().with_context(|| {
+        format!(
+            "failed to commit historical rejudge backup metadata {}",
+            final_path.display()
+        )
+    })?;
     sync_historical_rejudge_backup_storage(&final_path)?;
     Ok(final_path)
 }
@@ -16950,11 +17016,7 @@ fn append_historical_rejudge_backup_items_durable(
                 backup_path.display()
             )
         })?;
-    transaction
-        .execute(
-            "INSERT OR REPLACE INTO rejudge_backup_metadata (key, value) VALUES ('payload_sha256', ?1)",
-            [payload_sha256.as_str()],
-        )
+    write_historical_rejudge_sqlite_stream_integrity(&transaction, payload_sha256.as_str())
         .with_context(|| {
             format!(
                 "failed to write historical rejudge backup payload hash for {}",
@@ -17309,52 +17371,129 @@ fn historical_rejudge_backup_payload_hash(backup: &HistoricalRejudgeBackup) -> R
     Ok(sha256_hex(&serde_json::to_vec(&payload)?))
 }
 
+fn write_historical_rejudge_sqlite_stream_integrity(
+    transaction: &rusqlite::Transaction<'_>,
+    payload_sha256: &str,
+) -> Result<()> {
+    for (key, value) in [
+        (
+            "payload_hash_format",
+            HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT,
+        ),
+        ("payload_sha256", payload_sha256),
+    ] {
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO rejudge_backup_metadata (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .with_context(|| format!("failed to write backup integrity metadata {key}"))?;
+    }
+    Ok(())
+}
+
 fn historical_rejudge_sqlite_payload_hash_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<String> {
-    let version = sqlite_backup_metadata_value_in_transaction(transaction, "version")?
-        .parse::<u32>()
-        .context("invalid rejudge SQLite backup version")?;
-    let created_at = sqlite_backup_metadata_value_in_transaction(transaction, "created_at")?;
-    let source_db_path = PathBuf::from(sqlite_backup_metadata_value_in_transaction(
-        transaction,
-        "source_db_path",
-    )?);
-    let command_args = serde_json::from_str::<HistoricalRejudgeCommandArgs>(
-        &sqlite_backup_metadata_value_in_transaction(transaction, "command_args")?,
-    )
-    .context("failed to parse rejudge SQLite backup command args")?;
-    let judge_model = serde_json::from_str::<Option<String>>(
-        &sqlite_backup_metadata_value_in_transaction(transaction, "judge_model")?,
-    )
-    .context("failed to parse rejudge SQLite backup judge model")?;
-    let config_version =
-        sqlite_backup_metadata_value_in_transaction(transaction, "config_version")?;
+    let mut hasher = historical_rejudge_sqlite_payload_hasher();
+    for key in HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_METADATA_KEYS {
+        let value = sqlite_backup_metadata_value_in_transaction(transaction, key)?;
+        update_historical_rejudge_sqlite_payload_hash(&mut hasher, key, &value);
+    }
     let mut statement = transaction
-        .prepare("SELECT item_json FROM rejudge_backup_items ORDER BY rowid ASC")
+        .prepare(HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_ITEMS_SQL)
         .context("failed to prepare rejudge SQLite backup item hash query")?;
-    let items = statement
-        .query_map([], |row| {
-            let raw = row.get::<_, String>(0)?;
-            parse_historical_rejudge_backup_item_json(&raw)
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to load rejudge SQLite backup items for payload hash")?;
+    let mut rows = statement
+        .query([])
+        .context("failed to query rejudge SQLite backup item hash rows")?;
+    while let Some(row) = rows
+        .next()
+        .context("failed to read rejudge SQLite backup item hash row")?
+    {
+        for (index, key) in HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_ITEM_KEYS
+            .iter()
+            .enumerate()
+        {
+            let value: Option<String> = row.get(index)?;
+            update_historical_rejudge_sqlite_payload_hash(
+                &mut hasher,
+                key,
+                value.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    Ok(bytes_to_hex(&hasher.finalize()))
+}
 
-    historical_rejudge_backup_payload_hash(&HistoricalRejudgeBackup {
-        version,
-        metadata: HistoricalRejudgeBackupMetadata {
-            created_at,
-            source_db_path,
-            command_args,
-            judge_model,
-            config_version,
-        },
-        items,
-        integrity: HistoricalRejudgeBackupIntegrity {
-            payload_sha256: String::new(),
-        },
-    })
+fn historical_rejudge_sqlite_payload_hash_in_connection(
+    conn: &rusqlite::Connection,
+) -> Result<String> {
+    let mut hasher = historical_rejudge_sqlite_payload_hasher();
+    for key in HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_METADATA_KEYS {
+        let value = sqlite_backup_metadata_value(conn, key)?;
+        update_historical_rejudge_sqlite_payload_hash(&mut hasher, key, &value);
+    }
+    let mut statement = conn
+        .prepare(HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_ITEMS_SQL)
+        .context("failed to prepare rejudge SQLite backup item hash query")?;
+    let mut rows = statement
+        .query([])
+        .context("failed to query rejudge SQLite backup item hash rows")?;
+    while let Some(row) = rows
+        .next()
+        .context("failed to read rejudge SQLite backup item hash row")?
+    {
+        for (index, key) in HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_ITEM_KEYS
+            .iter()
+            .enumerate()
+        {
+            let value: Option<String> = row.get(index)?;
+            update_historical_rejudge_sqlite_payload_hash(
+                &mut hasher,
+                key,
+                value.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    Ok(bytes_to_hex(&hasher.finalize()))
+}
+
+const HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_METADATA_KEYS: &[&str] = &[
+    "version",
+    "created_at",
+    "source_db_path",
+    "command_args",
+    "judge_model",
+    "config_version",
+];
+
+const HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_ITEM_KEYS: &[&str] = &[
+    "drawer_id",
+    "item_json",
+    "content_sha256",
+    "project_id",
+    "backed_up_at",
+];
+
+const HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_ITEMS_SQL: &str = r#"
+    SELECT drawer_id, item_json, content_sha256, project_id, backed_up_at
+    FROM rejudge_backup_items
+    ORDER BY rowid ASC
+"#;
+
+fn historical_rejudge_sqlite_payload_hasher() -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mempal:historical_rejudge:sqlite_backup:payload:v1\n");
+    hasher
+}
+
+fn update_historical_rejudge_sqlite_payload_hash(hasher: &mut Sha256, key: &str, value: &str) {
+    hasher.update(key.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.len().to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.as_bytes());
+    hasher.update(b"\n");
 }
 
 fn sqlite_backup_metadata_value_in_transaction(
@@ -17525,6 +17664,7 @@ fn read_historical_rejudge_sqlite_backup(path: &Path) -> Result<HistoricalRejudg
     .context("failed to parse rejudge SQLite backup judge model")?;
     let config_version = sqlite_backup_metadata_value(&conn, "config_version")?;
     let payload_sha256 = sqlite_backup_metadata_value(&conn, "payload_sha256")?;
+    let payload_hash_format = optional_sqlite_backup_metadata_value(&conn, "payload_hash_format")?;
     let mut statement = conn
         .prepare("SELECT item_json FROM rejudge_backup_items ORDER BY rowid ASC")
         .context("failed to prepare rejudge SQLite backup item query")?;
@@ -17548,7 +17688,13 @@ fn read_historical_rejudge_sqlite_backup(path: &Path) -> Result<HistoricalRejudg
         items,
         integrity: HistoricalRejudgeBackupIntegrity { payload_sha256 },
     };
-    validate_historical_rejudge_backup(backup)
+    match payload_hash_format.as_deref() {
+        Some(HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT) => {
+            validate_historical_rejudge_sqlite_stream_backup(&conn, backup)
+        }
+        Some(other) => bail!("unsupported historical rejudge SQLite backup hash format: {other}"),
+        None => validate_historical_rejudge_backup(backup),
+    }
 }
 
 fn sqlite_backup_metadata_value(conn: &rusqlite::Connection, key: &str) -> Result<String> {
@@ -17558,6 +17704,21 @@ fn sqlite_backup_metadata_value(conn: &rusqlite::Connection, key: &str) -> Resul
         |row| row.get(0),
     )
     .with_context(|| format!("missing rejudge SQLite backup metadata: {key}"))
+}
+
+fn optional_sqlite_backup_metadata_value(
+    conn: &rusqlite::Connection,
+    key: &str,
+) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+
+    conn.query_row(
+        "SELECT value FROM rejudge_backup_metadata WHERE key = ?1",
+        [key],
+        |row| row.get(0),
+    )
+    .optional()
+    .with_context(|| format!("failed to read rejudge SQLite backup metadata: {key}"))
 }
 
 fn validate_historical_rejudge_backup(
@@ -17576,6 +17737,32 @@ fn validate_historical_rejudge_backup(
     if backup.integrity.payload_sha256 != expected_payload_hash {
         bail!("historical rejudge backup integrity mismatch");
     }
+    validate_historical_rejudge_backup_items(&backup)?;
+    Ok(backup)
+}
+
+fn validate_historical_rejudge_sqlite_stream_backup(
+    conn: &rusqlite::Connection,
+    backup: HistoricalRejudgeBackup,
+) -> Result<HistoricalRejudgeBackup> {
+    if !matches!(backup.version, 1 | 2) {
+        bail!(
+            "unsupported historical rejudge backup version {}",
+            backup.version
+        );
+    }
+    if backup.integrity.payload_sha256.is_empty() {
+        bail!("historical rejudge backup missing payload integrity hash");
+    }
+    let expected_payload_hash = historical_rejudge_sqlite_payload_hash_in_connection(conn)?;
+    if backup.integrity.payload_sha256 != expected_payload_hash {
+        bail!("historical rejudge backup integrity mismatch");
+    }
+    validate_historical_rejudge_backup_items(&backup)?;
+    Ok(backup)
+}
+
+fn validate_historical_rejudge_backup_items(backup: &HistoricalRejudgeBackup) -> Result<()> {
     for item in &backup.items {
         if item.content_sha256 != sha256_hex(item.drawer.content.as_bytes()) {
             bail!(
@@ -17593,7 +17780,7 @@ fn validate_historical_rejudge_backup(
             }
         }
     }
-    Ok(backup)
+    Ok(())
 }
 
 fn drawer_deleted_at(db: &Database, drawer_id: &str) -> Result<Option<Option<String>>> {
@@ -18867,6 +19054,7 @@ fn build_historical_rejudge_report(
         status: input.status.to_string(),
         no_stage_pending_count: input.backlog_counts.no_stage_pending_count,
         confirm_pending_count: input.backlog_counts.confirm_pending_count,
+        memory: current_historical_rejudge_memory_report(),
         wings_rooms,
         examples,
     }
@@ -18908,6 +19096,31 @@ fn print_historical_rejudge_report(report: &HistoricalRejudgeReport, format: &st
                 report.estimated_bytes_reclaimed
             );
             println!("elapsed_ms={}", report.elapsed_ms);
+            println!("memory.available={}", report.memory.available);
+            println!(
+                "memory.rss_bytes={}",
+                display_opt_u64(report.memory.rss_bytes)
+            );
+            println!(
+                "memory.pss_bytes={}",
+                display_opt_u64(report.memory.pss_bytes)
+            );
+            println!(
+                "memory.vm_hwm_bytes={}",
+                display_opt_u64(report.memory.vm_hwm_bytes)
+            );
+            println!(
+                "memory.private_dirty_bytes={}",
+                display_opt_u64(report.memory.private_dirty_bytes)
+            );
+            println!(
+                "memory.anonymous_bytes={}",
+                display_opt_u64(report.memory.anonymous_bytes)
+            );
+            println!(
+                "memory.swap_bytes={}",
+                display_opt_u64(report.memory.swap_bytes)
+            );
             println!(
                 "judge_model={}",
                 report.judge_model.as_deref().unwrap_or("none")
@@ -19083,9 +19296,30 @@ fn doctor_command(format: String) -> Result<()> {
                         .unwrap_or_else(|| "none".to_string())
                 );
                 println!(
+                    "daemon_vm_hwm_bytes={}",
+                    process
+                        .vm_hwm_bytes
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                println!(
                     "daemon_private_dirty_bytes={}",
                     process
                         .private_dirty_bytes
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                println!(
+                    "daemon_anonymous_bytes={}",
+                    process
+                        .anonymous_bytes
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                println!(
+                    "daemon_swap_bytes={}",
+                    process
+                        .swap_bytes
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "none".to_string())
                 );
@@ -20849,6 +21083,37 @@ threshold = 0.7
             row.get(0)
         })
         .expect("count backup items")
+    }
+
+    fn sqlite_backup_metadata(path: &Path, key: &str) -> String {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open backup read-only");
+        conn.query_row(
+            "SELECT value FROM rejudge_backup_metadata WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .expect("load backup metadata")
+    }
+
+    fn rewrite_sqlite_backup_to_legacy_integrity(path: &Path) {
+        let backup =
+            read_historical_rejudge_backup(path).expect("read backup before legacy rewrite");
+        let legacy_payload_hash =
+            historical_rejudge_backup_payload_hash(&backup).expect("compute legacy payload hash");
+        let conn = rusqlite::Connection::open(path).expect("open backup");
+        conn.execute(
+            "DELETE FROM rejudge_backup_metadata WHERE key = 'payload_hash_format'",
+            [],
+        )
+        .expect("remove stream hash marker");
+        conn.execute(
+            "UPDATE rejudge_backup_metadata SET value = ?1 WHERE key = 'payload_sha256'",
+            [legacy_payload_hash.as_str()],
+        )
+        .expect("write legacy payload hash");
+        sync_historical_rejudge_backup_storage(path).expect("sync legacy backup rewrite");
     }
 
     fn full_rejudge_options<'a>(
@@ -23125,6 +23390,10 @@ threshold = 0.7
         .await
         .expect("execute rejudge");
         let backup_path = only_backup_file(&backups);
+        assert_eq!(
+            sqlite_backup_metadata(&backup_path, "payload_hash_format"),
+            HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT
+        );
         let conn = rusqlite::Connection::open(&backup_path).expect("open SQLite backup");
         let raw_item: String = conn
             .query_row(
@@ -23347,6 +23616,63 @@ threshold = 0.7
         assert_eq!(completed["remaining_count"].as_u64(), Some(0));
         assert!(completed["last_cursor_rowid"].as_i64().is_some());
         assert!(completed["eta_secs"].as_f64().is_some());
+        let memory = completed["memory"].as_object().expect("memory object");
+        let memory_available = memory
+            .get("available")
+            .and_then(|value| value.as_bool())
+            .expect("memory availability flag");
+        const MEMORY_METRIC_KEYS: &[&str] = &[
+            "rss_bytes",
+            "pss_bytes",
+            "vm_hwm_bytes",
+            "private_dirty_bytes",
+            "anonymous_bytes",
+            "swap_bytes",
+        ];
+        #[cfg(target_os = "linux")]
+        {
+            assert!(memory_available, "Linux should report memory diagnostics");
+            assert!(
+                MEMORY_METRIC_KEYS
+                    .iter()
+                    .any(|key| memory.get(*key).and_then(Value::as_u64).is_some()),
+                "Linux memory diagnostics should include at least one byte metric: {memory:?}"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(
+                !memory_available,
+                "unsupported platforms should report memory diagnostics unavailable"
+            );
+            assert!(
+                MEMORY_METRIC_KEYS
+                    .iter()
+                    .all(|key| !memory.contains_key(*key)),
+                "unsupported platforms should not emit Linux-only memory metrics: {memory:?}"
+            );
+        }
+        assert!(
+            memory.keys().all(|key| matches!(
+                key.as_str(),
+                "available"
+                    | "rss_bytes"
+                    | "pss_bytes"
+                    | "vm_hwm_bytes"
+                    | "private_dirty_bytes"
+                    | "anonymous_bytes"
+                    | "swap_bytes"
+            )),
+            "unexpected memory keys: {memory:?}"
+        );
+        for key in MEMORY_METRIC_KEYS {
+            if let Some(value) = memory.get(*key) {
+                assert!(
+                    value.as_u64().is_some(),
+                    "memory metric {key} should be an aggregate byte count: {memory:?}"
+                );
+            }
+        }
 
         let raw_progress = std::fs::read_to_string(&progress_file).expect("read progress");
         assert!(
@@ -23864,6 +24190,97 @@ threshold = 0.7
     }
 
     #[tokio::test]
+    async fn historical_rejudge_proposal_only_backlog_is_sqlite_backed_across_pages() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_delete",
+            ))
+            .expect(3)
+            .create_async()
+            .await;
+        let confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.01, "confirm_would_delete"))
+            .expect(0)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        for index in 0..3 {
+            insert_drawer(
+                &db,
+                &format!("proposal-only-sqlite-{index}"),
+                &format!(
+                    "Low-signal transient output {index} that Qwen can propose while Spark is unavailable."
+                ),
+                "notes",
+                None,
+            );
+        }
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                stage_mode: HistoricalRejudgeStageMode::ProposalOnly,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, None, 1)
+            },
+        )
+        .await
+        .expect("proposal-only rejudge should persist a multi-page confirmation backlog");
+
+        proposal_mock.assert_async().await;
+        confirm_mock.assert_async().await;
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.status, "confirm_pending");
+        assert_eq!(
+            historical_rejudge_work_item_count(&db, &checkpoint.run_id),
+            3,
+            "proposal backlog must be persisted as SQLite work rows"
+        );
+        let backlog = historical_rejudge_backlog_counts(&db, &checkpoint.run_id)
+            .expect("load backlog counts");
+        assert_eq!(backlog.no_stage_pending_count, 0);
+        assert_eq!(backlog.confirm_pending_count, 3);
+        assert!(
+            next_historical_rejudge_work_items_for_stage(
+                &db,
+                &checkpoint.run_id,
+                1,
+                HistoricalRejudgeStageMode::ProposalOnly,
+            )
+            .expect("load proposal-only work page")
+            .is_empty(),
+            "proposal-only resume must not keep an in-memory proposal backlog"
+        );
+        let confirm_page = next_historical_rejudge_work_items_for_stage(
+            &db,
+            &checkpoint.run_id,
+            2,
+            HistoricalRejudgeStageMode::ConfirmPendingOnly,
+        )
+        .expect("load bounded confirm work page");
+        assert_eq!(
+            confirm_page.len(),
+            2,
+            "confirmation drain should page through SQLite backlog with the requested limit"
+        );
+    }
+
+    #[tokio::test]
     async fn historical_rejudge_proposal_only_persists_tier1_backlog_without_mutation() {
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
@@ -24100,6 +24517,14 @@ threshold = 0.7
             Some(&backups),
         )
         .expect("prepare checkpoint");
+        let backup_path = checkpoint.backup_path.clone().expect("backup path");
+        rewrite_sqlite_backup_to_legacy_integrity(&backup_path);
+        assert!(
+            read_historical_rejudge_backup(&backup_path)
+                .expect("legacy backup remains readable before append")
+                .items
+                .is_empty()
+        );
         let first = next_historical_rejudge_work_items(&db, &checkpoint.run_id, 1)
             .expect("load first page")
             .pop()
@@ -24114,6 +24539,17 @@ threshold = 0.7
         )
         .await
         .expect("process first item");
+        assert_eq!(
+            sqlite_backup_metadata(&backup_path, "payload_hash_format"),
+            HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT
+        );
+        assert_eq!(
+            read_historical_rejudge_backup(&backup_path)
+                .expect("upgraded backup verifies after first append")
+                .items
+                .len(),
+            1
+        );
 
         maintenance_rejudge_command(
             &db,
@@ -24128,8 +24564,7 @@ threshold = 0.7
 
         assert_eq!(active_drawer_count(&db), 0);
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 3);
-        let backup = read_historical_rejudge_backup(&only_backup_file(&backups))
-            .expect("read resume backup");
+        let backup = read_historical_rejudge_backup(&backup_path).expect("read resume backup");
         assert_eq!(backup.items.len(), 3);
         let first_audit_count: i64 = db
             .conn()
@@ -24146,6 +24581,16 @@ threshold = 0.7
         assert_eq!(checkpoint.status, "done");
         assert_eq!(checkpoint.scanned_count, 3);
         assert_eq!(checkpoint.mutated_count, 3);
+        maintenance_rejudge_restore_command(
+            &db,
+            &backup_path,
+            true,
+            RejudgeRestoreConflictPolicy::Skip,
+            "json",
+        )
+        .expect("restore upgraded legacy backup");
+        assert_eq!(active_drawer_count(&db), 3);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
     }
 
     #[tokio::test]
