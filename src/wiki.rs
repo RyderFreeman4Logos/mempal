@@ -100,6 +100,8 @@ struct WikiTripleRef {
     triple_id: String,
     role: String,
     require_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_hash: Option<String>,
     valid_to: Option<String>,
     source_drawer: Option<String>,
 }
@@ -125,6 +127,7 @@ struct WikiDecision {
     counterexample_refs: Vec<String>,
     verification_refs: Vec<String>,
     supersedes: Option<String>,
+    valid_until: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -458,7 +461,7 @@ fn render_decision_page(
     markdown.push_str(DERIVED_NOTICE);
     let mut drawer_refs = Vec::new();
     let triple_refs = Vec::new();
-    let decision_active = decision_is_active(decision.status.as_deref());
+    let decision_active = decision_is_active(decision, now_secs);
 
     markdown.push_str("## Active Claims\n\n");
     if decision_active {
@@ -603,6 +606,12 @@ fn push_triple_citation(
             "superseded_claim".to_string()
         },
         require_active,
+        claim_hash: Some(triple_claim_hash(
+            &triple.subject,
+            &triple.predicate,
+            &triple.object,
+            triple.valid_from.as_deref(),
+        )),
         valid_to: triple.valid_to.clone(),
         source_drawer: triple.source_drawer.clone(),
     });
@@ -937,7 +946,8 @@ fn load_decisions(db: &Database, scope: &ProjectSearchScope) -> Result<Vec<WikiD
                 supporting_refs,
                 counterexample_refs,
                 verification_refs,
-                supersedes
+                supersedes,
+                valid_until
             FROM drawers
             WHERE deleted_at IS NULL
               AND memory_kind = 'decision'
@@ -957,6 +967,7 @@ fn load_decisions(db: &Database, scope: &ProjectSearchScope) -> Result<Vec<WikiD
                 counterexample_refs: decode_refs(row.get::<_, Option<String>>(6)?)?,
                 verification_refs: decode_refs(row.get::<_, Option<String>>(7)?)?,
                 supersedes: row.get(8)?,
+                valid_until: row.get(9)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -1010,18 +1021,28 @@ fn load_triple_ref(
     db.conn()
         .query_row(
             r#"
-            SELECT id, valid_to, source_drawer
+            SELECT id, subject, predicate, object, valid_from, valid_to, source_drawer
             FROM triples
             WHERE id = ?1
             "#,
             [triple_id],
             |row| {
+                let subject: String = row.get(1)?;
+                let predicate: String = row.get(2)?;
+                let object: String = row.get(3)?;
+                let valid_from: Option<String> = row.get(4)?;
                 Ok(WikiTripleRef {
                     triple_id: row.get(0)?,
                     role: role.to_string(),
                     require_active,
-                    valid_to: row.get(1)?,
-                    source_drawer: row.get(2)?,
+                    claim_hash: Some(triple_claim_hash(
+                        &subject,
+                        &predicate,
+                        &object,
+                        valid_from.as_deref(),
+                    )),
+                    valid_to: row.get(5)?,
+                    source_drawer: row.get(6)?,
                 })
             },
         )
@@ -1095,6 +1116,23 @@ fn compare_triple_ref(
     now_secs: i64,
     stale_refs: &mut Vec<WikiStaleRef>,
 ) {
+    match (&expected.claim_hash, &current.claim_hash) {
+        (Some(expected_hash), Some(current_hash)) if expected_hash != current_hash => push_stale(
+            stale_refs,
+            page,
+            "triple",
+            &expected.triple_id,
+            "claim content changed",
+        ),
+        (None, _) => push_stale(
+            stale_refs,
+            page,
+            "triple",
+            &expected.triple_id,
+            "claim content fingerprint missing",
+        ),
+        _ => {}
+    }
     if expected.valid_to != current.valid_to {
         push_stale(
             stale_refs,
@@ -1148,11 +1186,33 @@ fn timestamp_expired(raw: Option<&str>, now_secs: i64) -> bool {
         .is_some_and(|expires| expires <= now_secs)
 }
 
-fn decision_is_active(status: Option<&str>) -> bool {
+fn triple_claim_hash(
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    valid_from: Option<&str>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for value in [Some(subject), Some(predicate), Some(object), valid_from] {
+        match value {
+            Some(value) => {
+                hasher.update(&[1]);
+                hasher.update(value.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(&[0xff]);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn decision_is_active(decision: &WikiDecision, now_secs: i64) -> bool {
     !matches!(
-        status,
+        decision.status.as_deref(),
         Some("superseded" | "demoted" | "retired" | "pending_review" | "candidate")
-    )
+    ) && !timestamp_expired(decision.valid_until.as_deref(), now_secs)
 }
 
 fn decision_title(decision: &WikiDecision) -> String {
@@ -1562,12 +1622,39 @@ fn write_manifest(
     let content =
         toml::to_string_pretty(&manifest).context("failed to serialize knowledge wiki manifest")?;
     if had_manifest {
-        fs::write(&manifest_path, content).with_context(|| {
-            format!(
-                "failed to write knowledge wiki manifest {}",
-                manifest_path.display()
-            )
-        })?;
+        match fs::symlink_metadata(&manifest_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "refusing to overwrite symlinked knowledge wiki manifest {}",
+                    manifest_path.display()
+                );
+            }
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                bail!(
+                    "refusing to overwrite non-regular knowledge wiki manifest {}",
+                    manifest_path.display()
+                );
+            }
+            Ok(_) => {
+                fs::write(&manifest_path, content).with_context(|| {
+                    format!(
+                        "failed to write knowledge wiki manifest {}",
+                        manifest_path.display()
+                    )
+                })?;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                create_generated_file(&manifest_path, content.as_bytes())?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect knowledge wiki manifest {}",
+                        manifest_path.display()
+                    )
+                });
+            }
+        }
     } else {
         create_generated_file(&manifest_path, content.as_bytes())?;
     }
@@ -1630,4 +1717,39 @@ fn push_yaml_str(output: &mut String, key: &str, value: &str) {
         }
     }
     output.push_str("\"\n");
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs as unix_fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_manifest_refuses_symlinked_existing_manifest_at_final_write() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let output_dir = tmp.path().join("wiki");
+        fs::create_dir(&output_dir).expect("create wiki dir");
+        let outside = tmp.path().join("outside.toml");
+        fs::write(&outside, "outside").expect("write outside target");
+        unix_fs::symlink(&outside, output_dir.join(MANIFEST_FILE)).expect("symlink manifest");
+
+        let mut generated_paths = BTreeSet::new();
+        generated_paths.insert(README_FILE.to_string());
+        let error = write_manifest(&output_dir, &generated_paths, &[], true)
+            .expect_err("symlinked manifest must be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to overwrite symlinked knowledge wiki manifest"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(outside).expect("read outside target"),
+            "outside"
+        );
+    }
 }

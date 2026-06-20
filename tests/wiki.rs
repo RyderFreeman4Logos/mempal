@@ -124,6 +124,13 @@ fn read_decision_page(out_dir: &Path) -> String {
     panic!("decision page not found");
 }
 
+fn markdown_section<'a>(markdown: &'a str, heading: &str) -> &'a str {
+    let start = markdown.find(heading).expect("section heading");
+    let rest = &markdown[start + heading.len()..];
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    &rest[..end]
+}
+
 fn read_all_generated_text(out_dir: &Path) -> String {
     let mut output = String::new();
     for relative in ["README.md", "index.md", ".mempal-wiki.toml"] {
@@ -390,6 +397,109 @@ fn wiki_verify_flags_changed_and_expired_supporting_refs() {
     assert!(
         stderr.contains("knowledge wiki verification failed"),
         "stdout={stdout}\nstderr={stderr}"
+    );
+}
+
+#[test]
+fn wiki_verify_flags_changed_triple_claim_text() {
+    let (_tmp, db, home) = setup_home();
+    seed_wiki_fixture(&db);
+    drop(db);
+
+    let out_dir = home.join("wiki");
+    let build = run_mempal(
+        &home,
+        &[
+            "wiki",
+            "build",
+            out_dir.to_str().expect("utf8 path"),
+            "--project",
+            "proj-wiki",
+            "--now",
+            "2000000000",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let db = Database::open(&home.join(".mempal").join("palace.db")).expect("reopen db");
+    db.conn()
+        .execute(
+            "UPDATE triples SET object = ?2 WHERE id = ?1",
+            ("triple_alice_sqlite", "Postgres"),
+        )
+        .expect("change triple object");
+    drop(db);
+
+    let verify = run_mempal(
+        &home,
+        &[
+            "wiki",
+            "verify",
+            out_dir.to_str().expect("utf8 path"),
+            "--now",
+            "2000000000",
+        ],
+    );
+    assert!(!verify.status.success());
+    let stdout = String::from_utf8_lossy(&verify.stdout);
+    let stderr = String::from_utf8_lossy(&verify.stderr);
+    assert!(
+        stdout.contains("triple_alice_sqlite") && stdout.contains("claim content changed"),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+}
+
+#[test]
+fn wiki_build_classifies_expired_decision_drawer_as_superseded() {
+    let (_tmp, db, home) = setup_home();
+    seed_wiki_fixture(&db);
+    db.conn()
+        .execute(
+            "UPDATE drawers SET valid_until = ?2 WHERE id = ?1",
+            ("drawer_decision", "1"),
+        )
+        .expect("expire decision drawer");
+    drop(db);
+
+    let out_dir = home.join("wiki");
+    let build = run_mempal(
+        &home,
+        &[
+            "wiki",
+            "build",
+            out_dir.to_str().expect("utf8 path"),
+            "--project",
+            "proj-wiki",
+            "--now",
+            "2",
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let decision = read_decision_page(&out_dir);
+    let active = markdown_section(&decision, "## Active Claims");
+    let superseded = markdown_section(&decision, "## Superseded Claims");
+    assert!(
+        active.contains("No source-backed active claims were found"),
+        "{decision}"
+    );
+    assert!(
+        !active.contains("`drawer:drawer_decision`"),
+        "expired decision must not be cited as active: {decision}"
+    );
+    assert!(
+        superseded.contains("`drawer:drawer_decision`"),
+        "expired decision should remain visible as a superseded claim: {decision}"
     );
 }
 
