@@ -5,7 +5,7 @@ mod server;
 mod timeline;
 mod tools;
 
-pub use server::MempalMcpServer;
+pub use server::{IngestDrainWorkerHandle, MempalMcpServer};
 pub use timeline::{TimelineRequest, TimelineResponse};
 pub use tools::{
     IngestControls, IngestOperationState, IngestRequest, IngestResponse,

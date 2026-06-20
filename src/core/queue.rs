@@ -234,6 +234,19 @@ impl AsyncPendingMessageStore {
             .await
     }
 
+    pub async fn claim_by_id_and_kind(
+        &self,
+        worker_id: String,
+        claim_ttl_secs: i64,
+        id: String,
+        kind_filter: String,
+    ) -> Result<Option<ClaimedMessage>> {
+        self.run(move |store| {
+            store.claim_by_id_and_kind(&worker_id, claim_ttl_secs, &id, &kind_filter)
+        })
+        .await
+    }
+
     pub async fn confirm(&self, claim: ClaimedMessage) -> Result<()> {
         self.run(move |store| store.confirm(&claim)).await
     }
@@ -601,6 +614,80 @@ impl PendingMessageStore {
             WHERE id = ?1 AND status = 'pending'
             "#,
             params![id, claim_token, now],
+        )?;
+        if updated == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        tx.commit()?;
+        Ok(Some(ClaimedMessage {
+            id,
+            kind,
+            payload,
+            retry_count,
+            claim_token,
+            source_hash,
+            created_at,
+            claimed_at: now,
+        }))
+    }
+
+    pub fn claim_by_id_and_kind(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+        id_filter: &str,
+        kind_filter: &str,
+    ) -> Result<Option<ClaimedMessage>> {
+        let mut conn = self.open_connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+
+        let now = now_secs();
+        let row = tx
+            .query_row(
+                r#"
+                SELECT id, kind, payload, retry_count, source_hash, created_at
+                FROM pending_messages
+                WHERE id = ?1
+                  AND status = 'pending'
+                  AND next_attempt_at <= ?2
+                  AND kind = ?3
+                LIMIT 1
+                "#,
+                params![id_filter, now, kind_filter],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((id, kind, payload, retry_count_i64, source_hash, created_at)) = row else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let retry_count = u32::try_from(retry_count_i64)
+            .map_err(|_| QueueError::RetryCountOverflow { id: id.clone() })?;
+        let claim_token = format!("{worker_id}:{}", next_id("claim"));
+        let updated = tx.execute(
+            r#"
+            UPDATE pending_messages
+            SET status = 'claimed',
+                claim_token = ?2,
+                claimed_at = ?3,
+                heartbeat_at = ?3,
+                op_state = 'running'
+            WHERE id = ?1 AND status = 'pending' AND kind = ?4
+            "#,
+            params![id, claim_token, now, kind_filter],
         )?;
         if updated == 0 {
             tx.commit()?;

@@ -4880,7 +4880,7 @@ async fn ingest_stdin_command(
         };
         let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone())?;
         let response = server
-            .mempal_ingest_with_controls(wait_request, controls)
+            .mempal_ingest_with_controls_scoped_worker(wait_request, controls)
             .await
             .map(|response| response.0)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -5201,49 +5201,14 @@ fn ingest_stdin_wait_stats_from_response(response: &IngestResponse) -> IngestSta
     stats
 }
 
-async fn wait_for_operation_status_with_progress(
-    server: &MempalMcpServer,
-    operation_id: &str,
-    timeout: std::time::Duration,
-    poll_interval: std::time::Duration,
-) -> Result<Option<IngestResponse>> {
-    let deadline = std::time::Instant::now() + clamp_wait_timeout(timeout);
-    loop {
-        let response = server
-            .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
-                OperationStatusRequest {
-                    operation_id: operation_id.to_string(),
-                },
-            ))
-            .await
-            .context("failed to load operation status")?
-            .0;
-        if response
-            .state
-            .map(IngestOperationState::is_terminal)
-            .unwrap_or(false)
-        {
-            return Ok(Some(response));
-        }
-        if timeout.is_zero() || std::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        eprintln!(
-            "waiting operation_id={} state={}",
-            operation_id,
-            response
-                .state
-                .map(|state| state.as_str())
-                .unwrap_or("unknown")
-        );
-        tokio::time::sleep(poll_interval).await;
+fn finish_operation_wait_response(response: IngestResponse, operation_id: &str) -> Result<()> {
+    print_operation_response(&response)?;
+    match response.state {
+        Some(IngestOperationState::Completed) => Ok(()),
+        Some(IngestOperationState::Rejected) => bail!("operation {operation_id} was rejected"),
+        Some(IngestOperationState::Failed) => bail!("operation {operation_id} failed"),
+        _ => Ok(()),
     }
-}
-
-const MAX_WAIT_TIMEOUT_SECS: u64 = 86_400;
-
-fn clamp_wait_timeout(timeout: std::time::Duration) -> std::time::Duration {
-    timeout.min(std::time::Duration::from_secs(MAX_WAIT_TIMEOUT_SECS))
 }
 
 async fn operation_command(
@@ -5272,27 +5237,40 @@ async fn operation_command(
                 "waiting for operation_id={} timeout_secs={timeout_secs}",
                 operation_id
             );
-            match wait_for_operation_status_with_progress(
-                &server,
-                &operation_id,
-                std::time::Duration::from_secs(timeout_secs),
-                std::time::Duration::from_millis(150),
-            )
-            .await?
+            let initial_status = server
+                .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
+                    OperationStatusRequest {
+                        operation_id: operation_id.clone(),
+                    },
+                ))
+                .await
+                .context("failed to load initial operation status")?
+                .0;
+            eprintln!(
+                "waiting operation_id={} state={}",
+                operation_id,
+                initial_status
+                    .state
+                    .map(|state| state.as_str())
+                    .unwrap_or("unknown")
+            );
+            if initial_status
+                .state
+                .map(IngestOperationState::is_terminal)
+                .unwrap_or(false)
             {
-                Some(response) => {
-                    print_operation_response(&response)?;
-                    match response.state {
-                        Some(IngestOperationState::Completed) => Ok(()),
-                        Some(IngestOperationState::Rejected) => {
-                            bail!("operation {operation_id} was rejected")
-                        }
-                        Some(IngestOperationState::Failed) => {
-                            bail!("operation {operation_id} failed")
-                        }
-                        _ => Ok(()),
-                    }
-                }
+                return finish_operation_wait_response(initial_status, &operation_id);
+            }
+            let wait_result = server
+                .wait_for_operation_status_with_scoped_worker(
+                    &operation_id,
+                    std::time::Duration::from_secs(timeout_secs),
+                    std::time::Duration::from_millis(150),
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            match wait_result {
+                Some(response) => finish_operation_wait_response(response, &operation_id),
                 None => {
                     let mut response = server
                         .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
@@ -5303,6 +5281,13 @@ async fn operation_command(
                         .await
                         .context("failed to load timed-out operation status")?
                         .0;
+                    if response
+                        .state
+                        .map(IngestOperationState::is_terminal)
+                        .unwrap_or(false)
+                    {
+                        return finish_operation_wait_response(response, &operation_id);
+                    }
                     response.timed_out = true;
                     print_operation_response(&response)?;
                     bail!("timed out waiting for operation {operation_id}")

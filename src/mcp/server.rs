@@ -382,6 +382,26 @@ impl MempalMcpServer {
         });
     }
 
+    #[doc(hidden)]
+    pub fn ensure_ingest_drain_worker_started(&self) {
+        self.spawn_ingest_drain_worker();
+    }
+
+    #[doc(hidden)]
+    pub fn spawn_scoped_ingest_drain_worker(&self) -> IngestDrainWorkerHandle {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = self.clone();
+        let handle = tokio::spawn(async move {
+            worker
+                .run_ingest_drain_worker_until_shutdown(shutdown_rx)
+                .await;
+        });
+        IngestDrainWorkerHandle {
+            shutdown_tx,
+            handle,
+        }
+    }
+
     async fn supervise_ingest_drain_worker(self) {
         let mut restart_backoff_ms = INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS;
         loop {
@@ -410,6 +430,60 @@ impl MempalMcpServer {
             restart_backoff_ms = restart_backoff_ms
                 .saturating_mul(2)
                 .min(INGEST_DRAIN_RESTART_BACKOFF_MAX_MS);
+        }
+    }
+
+    async fn run_ingest_drain_worker_until_shutdown(
+        self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let worker_id = format!(
+            "mcp-ingest-scoped-worker-{:x}-{:x}",
+            std::process::id(),
+            Arc::as_ptr(&self.ingest_worker_started) as usize
+        );
+        let queue = self.async_queue.clone();
+
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+
+            match queue
+                .claim_next_by_kind(
+                    worker_id.clone(),
+                    INGEST_CLAIM_TTL_SECS,
+                    INGEST_ASYNC_KIND.to_string(),
+                )
+                .await
+            {
+                Ok(Some(claim)) => {
+                    if let Err(error) = self.process_ingest_claim(&queue, &worker_id, claim).await {
+                        tracing::warn!(error = %error, "scoped async ingest worker failed to process op");
+                    }
+                }
+                Ok(None) => {
+                    tokio::select! {
+                        result = shutdown_rx.changed() => {
+                            if result.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(INGEST_POLL_INTERVAL) => {}
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "scoped async ingest worker claim failed");
+                    tokio::select! {
+                        result = shutdown_rx.changed() => {
+                            if result.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(INGEST_POLL_INTERVAL) => {}
+                    }
+                }
+            }
         }
     }
 
@@ -460,26 +534,8 @@ impl MempalMcpServer {
             }
         };
 
-        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let heartbeat_queue = queue.clone();
-        let heartbeat_id = claim.id.clone();
-        let heartbeat_worker_id = worker_id.to_string();
-        let heartbeat = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(INGEST_HEARTBEAT_INTERVAL);
-            interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if let Err(error) = heartbeat_queue.refresh_heartbeat(heartbeat_id.clone(), heartbeat_worker_id.clone()).await {
-                            tracing::warn!(error = %error, claim_id = %heartbeat_id, "failed to refresh async ingest heartbeat");
-                            break;
-                        }
-                    }
-                    _ = &mut stop_rx => break,
-                }
-            }
-        });
-
+        let (stop_tx, heartbeat) =
+            Self::spawn_ingest_claim_heartbeat(queue.clone(), claim.id.clone(), worker_id);
         let outcome = match self
             .run_prepared_ingest_off_runtime(prepared.request.clone(), prepared.controls)
             .await
@@ -489,9 +545,49 @@ impl MempalMcpServer {
             Err(error) => Err(error.to_string()),
         };
 
-        let _ = stop_tx.send(());
-        let _ = heartbeat.await;
+        Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+        self.complete_ingest_claim_outcome(queue, &claim, queue_wait_ms, outcome)
+            .await
+    }
 
+    async fn process_ingest_claim_inline(
+        &self,
+        queue: &AsyncPendingMessageStore,
+        worker_id: &str,
+        claim: ClaimedMessage,
+    ) -> anyhow::Result<()> {
+        let queue_wait_ms = queue_wait_ms(claim.created_at, claim.claimed_at);
+        let prepared: PreparedIngestOperation = match serde_json::from_str(&claim.payload) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let detail = format!("failed to decode ingest operation {}: {error}", claim.id);
+                complete_failed_ingest_claim(queue, &claim, queue_wait_ms, detail).await?;
+                return Ok(());
+            }
+        };
+
+        let (stop_tx, heartbeat) =
+            Self::spawn_ingest_claim_heartbeat(queue.clone(), claim.id.clone(), worker_id);
+        let outcome = match self
+            .mempal_ingest_sync(prepared.request.clone(), prepared.controls)
+            .await
+        {
+            Ok(response) => Ok(response.0),
+            Err(error) => Err(error.to_string()),
+        };
+
+        Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+        self.complete_ingest_claim_outcome(queue, &claim, queue_wait_ms, outcome)
+            .await
+    }
+
+    async fn complete_ingest_claim_outcome(
+        &self,
+        queue: &AsyncPendingMessageStore,
+        claim: &ClaimedMessage,
+        queue_wait_ms: u64,
+        outcome: std::result::Result<IngestResponse, String>,
+    ) -> anyhow::Result<()> {
         match outcome {
             Ok(mut response) => {
                 let rejected_reason = response
@@ -541,11 +637,47 @@ impl MempalMcpServer {
                     })?;
             }
             Err(detail) => {
-                complete_failed_ingest_claim(queue, &claim, queue_wait_ms, detail).await?;
+                complete_failed_ingest_claim(queue, claim, queue_wait_ms, detail).await?;
             }
         }
 
         Ok(())
+    }
+
+    fn spawn_ingest_claim_heartbeat(
+        queue: AsyncPendingMessageStore,
+        claim_id: String,
+        worker_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let heartbeat_worker_id = worker_id.to_string();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let heartbeat = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(INGEST_HEARTBEAT_INTERVAL);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(error) = queue.refresh_heartbeat(claim_id.clone(), heartbeat_worker_id.clone()).await {
+                            tracing::warn!(error = %error, claim_id = %claim_id, "failed to refresh async ingest heartbeat");
+                            break;
+                        }
+                    }
+                    _ = &mut stop_rx => break,
+                }
+            }
+        });
+        (stop_tx, heartbeat)
+    }
+
+    async fn stop_ingest_claim_heartbeat(
+        stop_tx: tokio::sync::oneshot::Sender<()>,
+        heartbeat: tokio::task::JoinHandle<()>,
+    ) {
+        let _ = stop_tx.send(());
+        let _ = heartbeat.await;
     }
 
     async fn run_prepared_ingest_off_runtime(
@@ -772,6 +904,96 @@ impl MempalMcpServer {
                 return Ok(None);
             }
             tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn wait_for_operation_status_with_scoped_worker(
+        &self,
+        operation_id: &str,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> std::result::Result<Option<IngestResponse>, ErrorData> {
+        let timeout = clamp_wait_timeout(timeout);
+        let deadline = Instant::now() + timeout;
+        let worker_id = format!(
+            "mcp-ingest-scoped-wait-{:x}-{:x}",
+            std::process::id(),
+            Arc::as_ptr(&self.ingest_worker_started) as usize
+        );
+        let queue = self.async_queue.clone();
+
+        loop {
+            let response = self.operation_status_json_for_test(operation_id).await?;
+            if response
+                .state
+                .map(IngestOperationState::is_terminal)
+                .unwrap_or(false)
+            {
+                return Ok(Some(response));
+            }
+            if timeout.is_zero() || Instant::now() >= deadline {
+                return Ok(None);
+            }
+
+            match queue
+                .claim_by_id_and_kind(
+                    worker_id.clone(),
+                    INGEST_CLAIM_TTL_SECS,
+                    operation_id.to_string(),
+                    INGEST_ASYNC_KIND.to_string(),
+                )
+                .await
+            {
+                Ok(Some(claim)) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        queue.release_claim(claim).await.map_err(|error| {
+                            ErrorData::internal_error(
+                                format!("failed to release timed-out scoped ingest claim: {error}"),
+                                None,
+                            )
+                        })?;
+                        return Ok(None);
+                    }
+
+                    let process =
+                        self.process_ingest_claim_inline(&queue, &worker_id, claim.clone());
+                    tokio::pin!(process);
+                    tokio::select! {
+                        result = &mut process => {
+                            result.map_err(|error| {
+                                ErrorData::internal_error(
+                                    format!("scoped async ingest worker failed: {error}"),
+                                    None,
+                                )
+                            })?;
+                        }
+                        _ = tokio::time::sleep(remaining) => {
+                            queue.release_claim(claim).await.map_err(|error| {
+                                ErrorData::internal_error(
+                                    format!("failed to release timed-out scoped ingest claim: {error}"),
+                                    None,
+                                )
+                            })?;
+                            return Ok(None);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
+                    tokio::time::sleep(poll_interval.min(remaining)).await;
+                }
+                Err(error) => {
+                    return Err(ErrorData::internal_error(
+                        format!("scoped async ingest worker claim failed: {error}"),
+                        None,
+                    ));
+                }
+            }
         }
     }
 
@@ -1420,6 +1642,33 @@ const INGEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const INGEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS: u64 = 250;
 const INGEST_DRAIN_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngestWaitWorkerMode {
+    Background,
+    Scoped,
+}
+
+#[doc(hidden)]
+pub struct IngestDrainWorkerHandle {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl IngestDrainWorkerHandle {
+    #[doc(hidden)]
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    #[doc(hidden)]
+    pub async fn shutdown_and_drain(self) {
+        self.request_shutdown();
+        if let Err(error) = self.handle.await {
+            tracing::warn!(error = %error, "scoped async ingest worker did not shut down cleanly");
+        }
+    }
+}
 
 struct IngestDrainWorkerStartedGuard {
     started: Arc<AtomicBool>,
@@ -3891,6 +4140,30 @@ impl MempalMcpServer {
         request: IngestRequest,
         controls: IngestControls,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        self.mempal_ingest_with_controls_and_worker(
+            request,
+            controls,
+            IngestWaitWorkerMode::Background,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn mempal_ingest_with_controls_scoped_worker(
+        &self,
+        request: IngestRequest,
+        controls: IngestControls,
+    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        self.mempal_ingest_with_controls_and_worker(request, controls, IngestWaitWorkerMode::Scoped)
+            .await
+    }
+
+    async fn mempal_ingest_with_controls_and_worker(
+        &self,
+        request: IngestRequest,
+        controls: IngestControls,
+        worker_mode: IngestWaitWorkerMode,
+    ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let dry_run = request.dry_run.unwrap_or(false);
         if !dry_run && global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
@@ -3902,7 +4175,6 @@ impl MempalMcpServer {
                 error.as_ref(),
             ));
         }
-        self.spawn_ingest_drain_worker();
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let room = request.room.as_deref();
         // Snapshot the request-wide warnings once so every early-return path reports a
@@ -3914,6 +4186,9 @@ impl MempalMcpServer {
             .await?;
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
+        if matches!(worker_mode, IngestWaitWorkerMode::Background) {
+            self.spawn_ingest_drain_worker();
+        }
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
             return Ok(Json(IngestResponse {
@@ -4031,21 +4306,50 @@ impl MempalMcpServer {
         };
 
         if wait {
-            if let Some(final_response) = self
-                .wait_for_operation_status(
-                    queued_response
-                        .operation_id
-                        .as_deref()
-                        .expect("queued receipt must include operation id"),
-                    Duration::from_secs(wait_timeout_secs),
-                    Duration::from_millis(150),
-                )
-                .await?
-            {
+            let operation_id = queued_response
+                .operation_id
+                .as_deref()
+                .expect("queued receipt must include operation id");
+            let wait_result =
+                if matches!(worker_mode, IngestWaitWorkerMode::Scoped) && wait_timeout_secs > 0 {
+                    self.wait_for_operation_status_with_scoped_worker(
+                        operation_id,
+                        Duration::from_secs(wait_timeout_secs),
+                        Duration::from_millis(150),
+                    )
+                    .await
+                } else {
+                    self.wait_for_operation_status(
+                        operation_id,
+                        Duration::from_secs(wait_timeout_secs),
+                        Duration::from_millis(150),
+                    )
+                    .await
+                };
+            if let Some(final_response) = wait_result? {
                 return Ok(Json(final_response));
             }
 
-            let mut timed_out_response = queued_response;
+            let mut timed_out_response = if matches!(worker_mode, IngestWaitWorkerMode::Scoped) {
+                let refreshed = self
+                    .operation_status_json_for_test(
+                        queued_response
+                            .operation_id
+                            .as_deref()
+                            .expect("queued receipt must include operation id"),
+                    )
+                    .await?;
+                if refreshed
+                    .state
+                    .map(IngestOperationState::is_terminal)
+                    .unwrap_or(false)
+                {
+                    return Ok(Json(refreshed));
+                }
+                refreshed
+            } else {
+                queued_response
+            };
             timed_out_response.timed_out = true;
             return Ok(Json(timed_out_response));
         }
