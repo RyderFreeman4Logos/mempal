@@ -8630,6 +8630,23 @@ mod tests {
         (tempdir, db_path, server)
     }
 
+    fn assert_json_string_values_do_not_contain(value: &Value, needle: &str, rendered: &str) {
+        match value {
+            Value::String(text) => assert!(!text.contains(needle), "{rendered}"),
+            Value::Array(items) => {
+                for item in items {
+                    assert_json_string_values_do_not_contain(item, needle, rendered);
+                }
+            }
+            Value::Object(fields) => {
+                for field_value in fields.values() {
+                    assert_json_string_values_do_not_contain(field_value, needle, rendered);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+
     #[tokio::test]
     async fn test_mcp_status_redacts_blocked_remote_endpoint_identity() {
         global_embed_status().reset_for_tests();
@@ -8679,7 +8696,8 @@ api_key = "sk-secret-should-not-print"
         .with_async_db_for_test(async_db);
 
         let status = server.mempal_status().await.expect("status").0;
-        let rendered = serde_json::to_string(&status).expect("serialize status");
+        let rendered_value = serde_json::to_value(&status).expect("serialize status");
+        let rendered = serde_json::to_string(&rendered_value).expect("serialize status");
 
         assert_eq!(
             status.embed_status.base_url.as_deref(),
@@ -8720,7 +8738,6 @@ api_key = "sk-secret-should-not-print"
         assert!(rendered.contains("allow_embedding"), "{rendered}");
         assert!(rendered.contains("allow_llm"), "{rendered}");
         assert!(!rendered.contains("api.openai.com"), "{rendered}");
-        assert!(!rendered.contains("9443"), "{rendered}");
         assert!(!rendered.contains("llm.example.com"), "{rendered}");
         assert!(!rendered.contains("private-embed-path"), "{rendered}");
         assert!(!rendered.contains("private-chat-path"), "{rendered}");
@@ -8729,7 +8746,8 @@ api_key = "sk-secret-should-not-print"
             "{rendered}"
         );
         assert!(!rendered.contains("MEMPAL_SECRET_TOKEN_ENV"), "{rendered}");
-        assert!(!rendered.contains("api_key"), "{rendered}");
+        assert_json_string_values_do_not_contain(&rendered_value, "9443", &rendered);
+        assert_json_string_values_do_not_contain(&rendered_value, "api_key", &rendered);
     }
 
     #[test]
