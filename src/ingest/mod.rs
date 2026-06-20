@@ -21,7 +21,8 @@ use crate::core::{
     db::Database,
     strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
-        BootstrapEvidenceArgs, Drawer, MemoryDomain, MemoryKind, SourceType, default_confidence,
+        BootstrapEvidenceArgs, Drawer, MemoryDomain, MemoryKind, RuntimeWriterLease, SourceType,
+        default_confidence,
     },
     utils::{
         build_bootstrap_evidence_drawer_id, build_drawer_id, iso_timestamp, link_superseded_drawer,
@@ -201,6 +202,40 @@ pub enum IngestError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to verify runtime SQLite writer lease before {operation}")]
+    RuntimeWriterLeaseCheck {
+        operation: &'static str,
+        #[source]
+        source: crate::core::db::DbError,
+    },
+    #[error("runtime SQLite writer lease `{lease_name}` for {owner} was lost before {operation}")]
+    RuntimeWriterLeaseLost {
+        lease_name: String,
+        owner: String,
+        operation: &'static str,
+    },
+}
+
+fn ensure_runtime_writer_lease_active(
+    db: &Database,
+    lease: Option<&RuntimeWriterLease>,
+    operation: &'static str,
+) -> Result<()> {
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+    let active = db
+        .runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
+        .map_err(|source| IngestError::RuntimeWriterLeaseCheck { operation, source })?;
+    if active {
+        Ok(())
+    } else {
+        Err(IngestError::RuntimeWriterLeaseLost {
+            lease_name: lease.name.clone(),
+            owner: lease.owner.clone(),
+            operation,
+        })
+    }
 }
 
 /// Chunk content for embedding using the token-aware chunker.
@@ -267,6 +302,17 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
     wing: &str,
     options: IngestOptions<'_>,
 ) -> Result<IngestStats> {
+    ingest_file_with_options_and_writer_lease(db, embedder, path, wing, options, None).await
+}
+
+pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    path: &Path,
+    wing: &str,
+    options: IngestOptions<'_>,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
+) -> Result<IngestStats> {
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|source| IngestError::ReadFile {
@@ -304,6 +350,9 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
 
     // Stage 3: Diary rollup early-return (upstream)
     if options.diary_rollup {
+        if !options.dry_run {
+            ensure_runtime_writer_lease_active(db, runtime_writer_lease, "diary rollup")?;
+        }
         let mut outcome = diary::ingest_diary_rollup(
             db,
             embedder,
@@ -413,6 +462,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         .confidence
         .unwrap_or_else(|| default_confidence(source_type));
     if options.replace_existing_source && !options.dry_run {
+        ensure_runtime_writer_lease_active(db, runtime_writer_lease, "source replacement")?;
         let replace_result = if options.replace_across_rooms {
             db.replace_active_source_drawers_across_rooms(
                 &source_file,
@@ -469,6 +519,11 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             .find(|summary| Some(summary.id.as_str()) != replacement_target_id);
         if let Some(existing) = exact_duplicate {
             if options.is_pinned {
+                ensure_runtime_writer_lease_active(
+                    db,
+                    runtime_writer_lease,
+                    "pin duplicate drawer",
+                )?;
                 db.pin_drawer(&existing.id, None)
                     .map_err(|source| IngestError::InsertDrawer {
                         drawer_id: existing.id.clone(),
@@ -530,6 +585,11 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
                 gating_decision = Some(tier2.decision);
             }
             if let Some(decision) = gating_decision.as_ref() {
+                ensure_runtime_writer_lease_active(
+                    db,
+                    runtime_writer_lease,
+                    "record gating audit",
+                )?;
                 db.record_gating_audit(&drawer_id, decision, options.project_id, Some(chunk))
                     .map_err(|source| IngestError::InsertDrawer {
                         drawer_id: drawer_id.clone(),
@@ -542,6 +602,14 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             }
 
             if !raw_turn
+                && {
+                    ensure_runtime_writer_lease_active(
+                        db,
+                        runtime_writer_lease,
+                        "record fact-check audit",
+                    )?;
+                    true
+                }
                 && let Some(outcome) = evaluate_fact_check_gate(
                     &drawer_id,
                     chunk,
@@ -568,6 +636,11 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
 
     if options.dry_run || pending.is_empty() {
         if !options.dry_run {
+            ensure_runtime_writer_lease_active(
+                db,
+                runtime_writer_lease,
+                "supersede replacement target",
+            )?;
             supersede_after_successful_replacement(db, replacement_target_id, &mut stats)?;
         }
         return Ok(stats);
@@ -616,6 +689,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
 
     // Stage 7: Storage with all fields from both sides
     for ((chunk_index, chunk, drawer_id), vector) in pending.into_iter().zip(vectors) {
+        ensure_runtime_writer_lease_active(db, runtime_writer_lease, "insert drawer")?;
         let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
             id: drawer_id.clone(),
             content: chunk.to_string(),
@@ -658,6 +732,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
             drawer_id: drawer.id.clone(),
             source,
         })?;
+        ensure_runtime_writer_lease_active(db, runtime_writer_lease, "insert vector")?;
         db.insert_vector_with_project(&drawer_id, &vector, options.project_id)
             .map_err(|source| IngestError::InsertVector {
                 drawer_id: drawer.id.clone(),
@@ -668,6 +743,11 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         {
             let config_snap = ConfigHandle::current();
             if config_snap.repair.enabled {
+                ensure_runtime_writer_lease_active(
+                    db,
+                    runtime_writer_lease,
+                    "record repair signal",
+                )?;
                 crate::repair::try_record_failure(
                     db.path(),
                     &drawer_id,
@@ -684,6 +764,11 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         {
             let config_snap = ConfigHandle::current();
             if config_snap.patterns.enabled {
+                ensure_runtime_writer_lease_active(
+                    db,
+                    runtime_writer_lease,
+                    "record pattern signal",
+                )?;
                 let model_id = config_snap.embed.model.clone().unwrap_or_else(|| {
                     if config_snap.embed.backend == "model2vec" {
                         "model2vec/potion-multilingual-128M".to_string()
@@ -714,6 +799,7 @@ pub async fn ingest_file_with_options<E: Embedder + ?Sized>(
         stats.chunks += 1;
     }
 
+    ensure_runtime_writer_lease_active(db, runtime_writer_lease, "supersede replacement target")?;
     supersede_after_successful_replacement(db, replacement_target_id, &mut stats)?;
 
     Ok(stats)
@@ -766,6 +852,17 @@ pub async fn ingest_dir_with_options<E: Embedder + ?Sized>(
     wing: &str,
     options: IngestOptions<'_>,
 ) -> Result<IngestStats> {
+    ingest_dir_with_options_and_writer_lease(db, embedder, dir, wing, options, None).await
+}
+
+pub async fn ingest_dir_with_options_and_writer_lease<E: Embedder + ?Sized>(
+    db: &Database,
+    embedder: &E,
+    dir: &Path,
+    wing: &str,
+    options: IngestOptions<'_>,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
+) -> Result<IngestStats> {
     let mut stats = IngestStats::default();
     let mut stack = vec![dir.to_path_buf()];
 
@@ -789,8 +886,15 @@ pub async fn ingest_dir_with_options<E: Embedder + ?Sized>(
             }
 
             if path.is_file() {
-                let file_stats =
-                    ingest_file_with_options(db, embedder, &path, wing, options).await?;
+                let file_stats = ingest_file_with_options_and_writer_lease(
+                    db,
+                    embedder,
+                    &path,
+                    wing,
+                    options,
+                    runtime_writer_lease,
+                )
+                .await?;
                 stats.files += file_stats.files;
                 stats.chunks += file_stats.chunks;
                 stats.skipped += file_stats.skipped;

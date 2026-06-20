@@ -26,7 +26,7 @@ use crate::core::{
         runtime_adoption_instrumentation_policy, should_write_checked_record,
     },
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
-    queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore},
+    queue::{AsyncPendingMessageStore, ClaimedMessage, PendingMessageStore, QueueError},
     reindex::ReindexProgressStore,
     remote_calls::{
         RemoteCallService, endpoint_policy_diagnostic_label, endpoint_policy_global_runtime_error,
@@ -186,7 +186,7 @@ pub struct MempalMcpServer {
     search_stale_index_deadline: Duration,
     ingest_admission_deadline: Duration,
     operation_status_deadline: Duration,
-    ingest_writer_lease_owned_externally: bool,
+    external_ingest_writer_lease: Option<RuntimeWriterLease>,
     #[cfg(any(test, feature = "db-test-seam"))]
     ingest_processing_delay: Option<Duration>,
 }
@@ -195,7 +195,8 @@ struct McpIngestWriterLeaseGuard {
     db_path: PathBuf,
     lease: RuntimeWriterLease,
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    heartbeat: tokio::task::JoinHandle<()>,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    released: bool,
 }
 
 impl McpIngestWriterLeaseGuard {
@@ -210,15 +211,22 @@ impl McpIngestWriterLeaseGuard {
             db_path,
             lease,
             stop_tx: Some(stop_tx),
-            heartbeat,
+            heartbeat: Some(heartbeat),
+            released: false,
         }
+    }
+
+    fn lease(&self) -> &RuntimeWriterLease {
+        &self.lease
     }
 
     async fn release(mut self) -> anyhow::Result<()> {
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
-        let _ = self.heartbeat.await;
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.await;
+        }
         let db_path = self.db_path.clone();
         let lease = self.lease.clone();
         tokio::task::spawn_blocking(move || {
@@ -230,10 +238,56 @@ impl McpIngestWriterLeaseGuard {
             })?;
             db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)
                 .context("failed to release MCP ingest writer lease")?;
-            Ok(())
+            Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("MCP ingest writer lease release task failed")?
+        .context("MCP ingest writer lease release task failed")??;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for McpIngestWriterLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+        if !self.released
+            && let Ok(db) = Database::open(&self.db_path)
+        {
+            let _ = db.runtime_writer_lease_release(
+                &self.lease.name,
+                &self.lease.owner,
+                &self.lease.session_id,
+            );
+        }
+    }
+}
+
+fn ensure_mcp_runtime_writer_lease_active(
+    db: &Database,
+    lease: Option<&RuntimeWriterLease>,
+    operation: &'static str,
+) -> std::result::Result<(), ErrorData> {
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+    let active = db
+        .runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
+        .map_err(|error| database_write_refused_error(db.path(), operation, &error))?;
+    if active {
+        Ok(())
+    } else {
+        Err(ErrorData::internal_error(
+            format!(
+                "SQLite writer lease `{}` for {} was lost before {operation}",
+                lease.name, lease.owner
+            ),
+            None,
+        ))
     }
 }
 
@@ -282,14 +336,14 @@ impl MempalMcpServer {
             search_stale_index_deadline: MCP_SEARCH_STALE_INDEX_DEADLINE,
             ingest_admission_deadline: MCP_INGEST_ADMISSION_DEADLINE,
             operation_status_deadline: MCP_OPERATION_STATUS_DEADLINE,
-            ingest_writer_lease_owned_externally: false,
+            external_ingest_writer_lease: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             ingest_processing_delay: None,
         })
     }
 
-    pub fn with_external_ingest_writer_lease(mut self) -> Self {
-        self.ingest_writer_lease_owned_externally = true;
+    pub fn with_external_ingest_writer_lease(mut self, lease: RuntimeWriterLease) -> Self {
+        self.external_ingest_writer_lease = Some(lease);
         self
     }
 
@@ -592,7 +646,8 @@ impl MempalMcpServer {
 
         let (stop_tx, heartbeat) =
             Self::spawn_ingest_claim_heartbeat(queue.clone(), claim.id.clone(), worker_id);
-        let writer_lease = if self.ingest_writer_lease_owned_externally {
+        let external_writer_lease = self.external_ingest_writer_lease.clone();
+        let writer_lease = if external_writer_lease.is_some() {
             None
         } else {
             match self
@@ -612,8 +667,14 @@ impl MempalMcpServer {
                 }
             }
         };
+        let runtime_writer_lease = external_writer_lease
+            .or_else(|| writer_lease.as_ref().map(|lease| lease.lease().clone()));
         let outcome = match self
-            .run_prepared_ingest_off_runtime(prepared.request.clone(), prepared.controls)
+            .run_prepared_ingest_off_runtime(
+                prepared.request.clone(),
+                prepared.controls,
+                runtime_writer_lease,
+            )
             .await
         {
             Ok(Ok(response)) => Ok(response),
@@ -651,8 +712,33 @@ impl MempalMcpServer {
 
         let (stop_tx, heartbeat) =
             Self::spawn_ingest_claim_heartbeat(queue.clone(), claim.id.clone(), worker_id);
+        let external_writer_lease = self.external_ingest_writer_lease.as_ref();
+        let writer_lease = if external_writer_lease.is_some() {
+            None
+        } else {
+            match self
+                .acquire_ingest_writer_lease(worker_id)
+                .await
+                .context("failed to acquire scoped MCP ingest writer lease")?
+            {
+                Some(lease) => Some(lease),
+                None => {
+                    Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+                    queue.release_claim(claim).await.context(
+                        "failed to release scoped ingest claim after writer lease conflict",
+                    )?;
+                    tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+                    return Ok(());
+                }
+            }
+        };
         let outcome = match self
-            .mempal_ingest_sync(prepared.request.clone(), prepared.controls)
+            .mempal_ingest_sync(
+                prepared.request.clone(),
+                prepared.controls,
+                external_writer_lease
+                    .or_else(|| writer_lease.as_ref().map(McpIngestWriterLeaseGuard::lease)),
+            )
             .await
         {
             Ok(response) => Ok(response.0),
@@ -660,8 +746,15 @@ impl MempalMcpServer {
         };
 
         Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-        self.complete_ingest_claim_outcome(queue, &claim, queue_wait_ms, outcome)
-            .await
+        let completed = self
+            .complete_ingest_claim_outcome(queue, &claim, queue_wait_ms, outcome)
+            .await;
+        let released = match writer_lease {
+            Some(writer_lease) => writer_lease.release().await,
+            None => Ok(()),
+        };
+        completed?;
+        released
     }
 
     async fn complete_ingest_claim_outcome(
@@ -846,6 +939,7 @@ impl MempalMcpServer {
         &self,
         request: IngestRequest,
         controls: IngestControls,
+        runtime_writer_lease: Option<RuntimeWriterLease>,
     ) -> anyhow::Result<std::result::Result<IngestResponse, ErrorData>> {
         let worker = self.clone();
         #[cfg(any(test, feature = "db-test-seam"))]
@@ -862,7 +956,11 @@ impl MempalMcpServer {
                     .build()
                     .context("failed to build blocking ingest runtime")?;
                 Ok(runtime
-                    .block_on(worker.mempal_ingest_sync(request, controls))
+                    .block_on(worker.mempal_ingest_sync(
+                        request,
+                        controls,
+                        runtime_writer_lease.as_ref(),
+                    ))
                     .map(|response| response.0))
             })
         })
@@ -1110,12 +1208,7 @@ impl MempalMcpServer {
                 Ok(Some(claim)) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        queue.release_claim(claim).await.map_err(|error| {
-                            ErrorData::internal_error(
-                                format!("failed to release timed-out scoped ingest claim: {error}"),
-                                None,
-                            )
-                        })?;
+                        Self::release_scoped_claim_after_timeout(&queue, claim).await?;
                         return Ok(None);
                     }
 
@@ -1132,12 +1225,7 @@ impl MempalMcpServer {
                             })?;
                         }
                         _ = tokio::time::sleep(remaining) => {
-                            queue.release_claim(claim).await.map_err(|error| {
-                                ErrorData::internal_error(
-                                    format!("failed to release timed-out scoped ingest claim: {error}"),
-                                    None,
-                                )
-                            })?;
+                            Self::release_scoped_claim_after_timeout(&queue, claim).await?;
                             return Ok(None);
                         }
                     }
@@ -1156,6 +1244,19 @@ impl MempalMcpServer {
                     ));
                 }
             }
+        }
+    }
+
+    async fn release_scoped_claim_after_timeout(
+        queue: &AsyncPendingMessageStore,
+        claim: ClaimedMessage,
+    ) -> std::result::Result<(), ErrorData> {
+        match queue.release_claim(claim).await {
+            Ok(()) | Err(QueueError::ClaimLost(_)) => Ok(()),
+            Err(error) => Err(ErrorData::internal_error(
+                format!("failed to release timed-out scoped ingest claim: {error}"),
+                None,
+            )),
         }
     }
 
@@ -1466,8 +1567,14 @@ impl MempalMcpServer {
         confidence: f64,
         inserted_drawer_ids: &mut Vec<String>,
         newly_created_drawer_ids: &mut Vec<String>,
+        runtime_writer_lease: Option<&RuntimeWriterLease>,
     ) -> std::result::Result<(), ErrorData> {
         let metadata = validate_ingest_request(request, &source_type)?;
+        ensure_mcp_runtime_writer_lease_active(
+            db,
+            runtime_writer_lease,
+            "record MCP ingest fallback novelty audit",
+        )?;
         db.record_novelty_audit(
             primary_drawer_id,
             NoveltyAction::Insert,
@@ -1504,6 +1611,11 @@ impl MempalMcpServer {
                 // Dedup-resolved: drawer pre-existed; include in response list but NOT
                 // in newly_created_drawer_ids so LLM reject cannot soft-delete it.
                 if metadata.is_pinned {
+                    ensure_mcp_runtime_writer_lease_active(
+                        db,
+                        runtime_writer_lease,
+                        "pin MCP ingest fallback duplicate drawer",
+                    )?;
                     db.pin_drawer(chunk_did, None).map_err(db_error)?;
                 }
                 inserted_drawer_ids.push(chunk_did.clone());
@@ -1521,6 +1633,11 @@ impl MempalMcpServer {
                 },
                 importance,
             );
+            ensure_mcp_runtime_writer_lease_active(
+                db,
+                runtime_writer_lease,
+                "insert MCP ingest fallback drawer",
+            )?;
             db.insert_drawer_with_project_validity(
                 &drawer,
                 project_id,
@@ -1529,6 +1646,11 @@ impl MempalMcpServer {
                 request.valid_until.as_deref(),
             )
             .map_err(db_error)?;
+            ensure_mcp_runtime_writer_lease_active(
+                db,
+                runtime_writer_lease,
+                "insert MCP ingest fallback vector",
+            )?;
             db.insert_vector_with_project(chunk_did, vector, project_id)
                 .map_err(db_error)?;
             inserted_drawer_ids.push(chunk_did.clone());
@@ -4378,7 +4500,7 @@ impl MempalMcpServer {
         if dry_run {
             let response = match tokio::time::timeout(
                 self.ingest_admission_deadline,
-                self.run_prepared_ingest_off_runtime(request, controls),
+                self.run_prepared_ingest_off_runtime(request, controls, None),
             )
             .await
             {
@@ -4649,6 +4771,7 @@ impl MempalMcpServer {
         &self,
         request: IngestRequest,
         controls: IngestControls,
+        runtime_writer_lease: Option<&RuntimeWriterLease>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let dry_run = request.dry_run.unwrap_or(false);
         if !dry_run && global_embed_status().should_block_writes() {
@@ -4793,11 +4916,21 @@ impl MempalMcpServer {
                 .map(|(_, id, _)| id.clone())
                 .collect::<Vec<_>>();
             if metadata.is_pinned {
+                ensure_mcp_runtime_writer_lease_active(
+                    &db,
+                    runtime_writer_lease,
+                    "pin duplicate MCP ingest drawer",
+                )?;
                 for id in &all_ids {
                     db.pin_drawer(id, None).map_err(db_error)?;
                 }
             }
             if let Some(old_id) = superseded_drawer_id.as_deref() {
+                ensure_mcp_runtime_writer_lease_active(
+                    &db,
+                    runtime_writer_lease,
+                    "supersede duplicate MCP ingest drawer",
+                )?;
                 let replacement_id = all_ids.first().map(String::as_str).unwrap_or("existing");
                 supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
                 superseded_response_id = Some(old_id.to_string());
@@ -4836,6 +4969,11 @@ impl MempalMcpServer {
             if let Some(decision) = gating_decision.as_ref()
                 && decision.is_rejected()
             {
+                ensure_mcp_runtime_writer_lease_active(
+                    &db,
+                    runtime_writer_lease,
+                    "record MCP ingest gating audit",
+                )?;
                 db.record_gating_audit(
                     &drawer_id,
                     decision,
@@ -4890,6 +5028,11 @@ impl MempalMcpServer {
                     {
                         let llm_decision =
                             GatingDecision::accepted(0, Some("llm_pending".to_string()), None);
+                        ensure_mcp_runtime_writer_lease_active(
+                            &db,
+                            runtime_writer_lease,
+                            "record MCP ingest LLM gating audit",
+                        )?;
                         db.record_gating_audit(
                             &drawer_id,
                             &llm_decision,
@@ -4901,6 +5044,11 @@ impl MempalMcpServer {
                         gating_decision = Some(llm_decision);
                         should_enqueue_llm_task = true;
                     } else {
+                        ensure_mcp_runtime_writer_lease_active(
+                            &db,
+                            runtime_writer_lease,
+                            "record MCP ingest tier2 audit",
+                        )?;
                         db.record_gating_audit(
                             &drawer_id,
                             &tier2.decision,
@@ -4940,6 +5088,11 @@ impl MempalMcpServer {
                 }));
             }
             if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
+                ensure_mcp_runtime_writer_lease_active(
+                    &db,
+                    runtime_writer_lease,
+                    "record MCP ingest gating audit",
+                )?;
                 db.record_gating_audit(
                     &drawer_id,
                     decision,
@@ -4969,7 +5122,14 @@ impl MempalMcpServer {
         if !no_gate
             && !raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
-                &drawer_id,
+                {
+                    ensure_mcp_runtime_writer_lease_active(
+                        &db,
+                        runtime_writer_lease,
+                        "record MCP ingest fact-check audit",
+                    )?;
+                    &drawer_id
+                },
                 &candidate.content,
                 &db,
                 project_id.as_deref(),
@@ -5083,6 +5243,11 @@ impl MempalMcpServer {
         match novelty.action {
             NoveltyAction::Insert => {
                 if novelty.should_audit {
+                    ensure_mcp_runtime_writer_lease_active(
+                        &db,
+                        runtime_writer_lease,
+                        "record MCP ingest novelty audit",
+                    )?;
                     db.record_novelty_audit(
                         &drawer_id,
                         NoveltyAction::Insert,
@@ -5104,6 +5269,11 @@ impl MempalMcpServer {
                         // Dedup-resolved pre-lock: include in response but NOT in
                         // newly_created_drawer_ids so LLM reject cannot delete it.
                         if metadata.is_pinned {
+                            ensure_mcp_runtime_writer_lease_active(
+                                &db,
+                                runtime_writer_lease,
+                                "pin MCP ingest duplicate drawer",
+                            )?;
                             db.pin_drawer(chunk_did, None).map_err(db_error)?;
                         }
                         inserted_drawer_ids.push(chunk_did.clone());
@@ -5131,6 +5301,11 @@ impl MempalMcpServer {
                         // Dedup-resolved post-lock: include in response but NOT in
                         // newly_created_drawer_ids so LLM reject cannot delete it.
                         if metadata.is_pinned {
+                            ensure_mcp_runtime_writer_lease_active(
+                                &db,
+                                runtime_writer_lease,
+                                "pin MCP ingest duplicate drawer",
+                            )?;
                             db.pin_drawer(chunk_did, None).map_err(db_error)?;
                         }
                         inserted_drawer_ids.push(chunk_did.clone());
@@ -5151,6 +5326,11 @@ impl MempalMcpServer {
                     if let Some(old_id) = superseded_drawer_id.as_deref() {
                         link_superseded_drawer(&mut drawer, old_id);
                     }
+                    ensure_mcp_runtime_writer_lease_active(
+                        &db,
+                        runtime_writer_lease,
+                        "insert MCP ingest drawer",
+                    )?;
                     db.insert_drawer_with_project_validity(
                         &drawer,
                         project_id.as_deref(),
@@ -5159,6 +5339,11 @@ impl MempalMcpServer {
                         request.valid_until.as_deref(),
                     )
                     .map_err(db_error)?;
+                    ensure_mcp_runtime_writer_lease_active(
+                        &db,
+                        runtime_writer_lease,
+                        "insert MCP ingest vector",
+                    )?;
                     db.insert_vector_with_project(chunk_did, vector, project_id.as_deref())
                         .map_err(db_error)?;
                     inserted_drawer_ids.push(chunk_did.clone());
@@ -5167,6 +5352,11 @@ impl MempalMcpServer {
             }
             NoveltyAction::Drop => {
                 if novelty.should_audit {
+                    ensure_mcp_runtime_writer_lease_active(
+                        &db,
+                        runtime_writer_lease,
+                        "record MCP ingest novelty drop audit",
+                    )?;
                     db.record_novelty_audit(
                         &drawer_id,
                         NoveltyAction::Drop,
@@ -5231,6 +5421,7 @@ impl MempalMcpServer {
                         confidence,
                         &mut inserted_drawer_ids,
                         &mut newly_created_drawer_ids,
+                        runtime_writer_lease,
                     )?;
                     novelty_action = Some(NoveltyAction::Insert);
                     near_drawer_id = Some(target_id);
@@ -5239,6 +5430,11 @@ impl MempalMcpServer {
                         Ok(merged_vectors) => match merged_vectors.into_iter().next() {
                             Some(merged_vector) => {
                                 ensure_vector_dim_matches(&db, merged_vector.len())?;
+                                ensure_mcp_runtime_writer_lease_active(
+                                    &db,
+                                    runtime_writer_lease,
+                                    "merge MCP ingest drawer",
+                                )?;
                                 db.update_drawer_after_merge_and_record_novelty_audit(
                                     &target_id,
                                     &merged_content,
@@ -5284,6 +5480,7 @@ impl MempalMcpServer {
                                     confidence,
                                     &mut inserted_drawer_ids,
                                     &mut newly_created_drawer_ids,
+                                    runtime_writer_lease,
                                 )?;
                                 novelty_action = Some(NoveltyAction::Insert);
                                 near_drawer_id = Some(target_id);
@@ -5312,6 +5509,7 @@ impl MempalMcpServer {
                                 confidence,
                                 &mut inserted_drawer_ids,
                                 &mut newly_created_drawer_ids,
+                                runtime_writer_lease,
                             )?;
                             novelty_action = Some(NoveltyAction::Insert);
                             near_drawer_id = Some(target_id);
@@ -5329,6 +5527,11 @@ impl MempalMcpServer {
         if let Some(old_id) = superseded_drawer_id.as_deref()
             && let Some(replacement_id) = inserted_drawer_ids.first()
         {
+            ensure_mcp_runtime_writer_lease_active(
+                &db,
+                runtime_writer_lease,
+                "supersede MCP ingest replacement target",
+            )?;
             supersede_drawer_for_ingest(&db, old_id, replacement_id)?;
             superseded_response_id = Some(old_id.to_string());
         }
@@ -5347,6 +5550,11 @@ impl MempalMcpServer {
                 })
                 .unwrap_or_default();
             if !hit_ids.is_empty() {
+                ensure_mcp_runtime_writer_lease_active(
+                    &db,
+                    runtime_writer_lease,
+                    "apply MCP ingest boost",
+                )?;
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -5377,6 +5585,11 @@ impl MempalMcpServer {
         // found by hash) are excluded from newly_created_drawer_ids so a subsequent LLM reject
         // cannot soft-delete a drawer that predated this ingest request.
         if should_enqueue_llm_task && !newly_created_drawer_ids.is_empty() {
+            ensure_mcp_runtime_writer_lease_active(
+                &db,
+                runtime_writer_lease,
+                "enqueue MCP ingest LLM task",
+            )?;
             let system_prompt = config
                 .ingest_gating
                 .llm_judge
@@ -12559,6 +12772,44 @@ quality_policy = "llm_required_for_keep"
         assert_eq!(second.drawer_ids, vec![first.drawer_id.clone()]);
         let db = Database::open(&db_path).expect("open db");
         assert_eq!(db.drawer_count().expect("drawer count"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_scoped_ingest_worker_respects_existing_writer_lease() {
+        let (_tempdir, db_path, server) = setup_server();
+        let db = Database::open(&db_path).expect("open db");
+        let _daemon_lease = db
+            .runtime_writer_lease_acquire(
+                SQLITE_WRITER_LEASE_NAME,
+                "daemon-owner",
+                "daemon",
+                300,
+                None,
+            )
+            .expect("acquire daemon lease")
+            .expect("daemon lease");
+
+        let response = server
+            .mempal_ingest_with_controls_scoped_worker(
+                IngestRequest {
+                    content: "scoped worker must not bypass writer lease".to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("lease".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(1),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
+            )
+            .await
+            .expect("scoped worker response")
+            .0;
+
+        assert!(response.timed_out, "{response:?}");
+        assert_eq!(db.drawer_count().expect("drawer count"), 0);
     }
 
     #[tokio::test]

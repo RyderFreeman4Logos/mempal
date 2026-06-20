@@ -87,7 +87,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         db.path().to_path_buf()
     };
     global_embed_status().set_audit_db_path(Some(db_path.clone()));
-    let _writer_lease = acquire_daemon_writer_lease(context, &db_path).await?;
+    let writer_lease = acquire_daemon_writer_lease(context, &db_path).await?;
     {
         let db = context.db.lock().await;
         db.prune_expired_audit_logs()
@@ -209,7 +209,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .await
         .context("failed to reclaim stale daemon claims")?;
     tracing::info!("daemon startup reclaim_stale reclaimed={reclaimed}");
-    let ingest_drain_worker = spawn_daemon_ingest_drain_worker(context, &db_path)
+    let ingest_drain_worker = spawn_daemon_ingest_drain_worker(context, &db_path, &writer_lease)
         .context("failed to start daemon async ingest worker")?;
     let stall_watchdog_handle = spawn_stall_watchdog(
         context.write_observer.clone(),
@@ -369,6 +369,10 @@ impl RuntimeWriterLeaseHandle {
             heartbeat,
         }
     }
+
+    fn lease(&self) -> &RuntimeWriterLease {
+        &self.lease
+    }
 }
 
 impl Drop for RuntimeWriterLeaseHandle {
@@ -491,6 +495,7 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
 fn spawn_daemon_ingest_drain_worker(
     context: &DaemonContext,
     db_path: &Path,
+    writer_lease: &RuntimeWriterLeaseHandle,
 ) -> Result<crate::mcp::IngestDrainWorkerHandle> {
     let config = context.config.as_ref().clone();
     let server = crate::mcp::MempalMcpServer::new_with_factory_and_config(
@@ -500,7 +505,7 @@ fn spawn_daemon_ingest_drain_worker(
             config,
         )),
     )?
-    .with_external_ingest_writer_lease();
+    .with_external_ingest_writer_lease(writer_lease.lease().clone());
     let handle = server.spawn_scoped_ingest_drain_worker();
     tracing::info!("daemon async ingest worker started");
     Ok(handle)

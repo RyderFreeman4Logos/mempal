@@ -5085,6 +5085,24 @@ impl Database {
         Ok(renewed)
     }
 
+    pub fn runtime_writer_lease_is_active(
+        &self,
+        name: &str,
+        owner: &str,
+        session_id: &str,
+    ) -> Result<bool, DbError> {
+        self.runtime_writer_lease_cleanup_expired()?;
+        let active = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM runtime_writer_leases
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3
+             )",
+            params![name, owner, session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(active != 0)
+    }
+
     pub fn runtime_writer_lease_release(
         &self,
         name: &str,

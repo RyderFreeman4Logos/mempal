@@ -75,6 +75,14 @@ fn run_ingest_stdin_bytes(home: &Path, payload: &[u8], args: &[&str]) -> Output 
         .expect("wait mempal ingest --stdin")
 }
 
+fn hold_daemon_writer_lease(home: &Path) -> mempal::core::types::RuntimeWriterLease {
+    let db =
+        mempal::core::db::Database::open(&home.join(".mempal").join("palace.db")).expect("open db");
+    db.runtime_writer_lease_acquire("sqlite-writer", "daemon-owner", "daemon", 300, None)
+        .expect("acquire daemon writer lease")
+        .expect("daemon writer lease")
+}
+
 fn write_embed_config(home: &Path, base_url: &str) {
     write_embed_config_with_privacy(home, base_url, false);
 }
@@ -707,6 +715,64 @@ fn test_ingest_stdin_rejects_format() {
     );
 
     assert_stdin_error(output, "--format is only supported for directory ingest");
+}
+
+#[test]
+fn test_directory_ingest_respects_existing_writer_lease() {
+    let tmp = setup_home();
+    let _lease = hold_daemon_writer_lease(tmp.path());
+    let input_dir = tmp.path().join("input");
+    fs::create_dir_all(&input_dir).expect("create input dir");
+    fs::write(
+        input_dir.join("memory.md"),
+        "directory lease conflict memory",
+    )
+    .expect("write input");
+
+    let output = run_ingest(
+        tmp.path(),
+        input_dir.to_str().expect("input path utf8"),
+        "lease-wing",
+    );
+
+    assert!(
+        !output.status.success(),
+        "directory ingest must fail under writer lease"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
+        "{stderr}"
+    );
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    assert_eq!(db.drawer_count().expect("drawer count"), 0);
+}
+
+#[test]
+fn test_stdin_non_wait_ingest_respects_existing_writer_lease() {
+    let tmp = setup_home();
+    let _lease = hold_daemon_writer_lease(tmp.path());
+    let payload = r#"{
+        "content": "stdin direct lease conflict memory",
+        "wing": "lease-wing",
+        "room": "lease-room"
+    }"#;
+
+    let output = run_ingest_stdin_json(tmp.path(), payload, &["--no-gate", "--json"]);
+
+    assert!(
+        !output.status.success(),
+        "stdin ingest must fail under writer lease"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
+        "{stderr}"
+    );
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    assert_eq!(db.drawer_count().expect("drawer count"), 0);
 }
 
 #[test]

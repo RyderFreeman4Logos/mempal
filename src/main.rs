@@ -4,9 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "rest")]
-use std::sync::Arc;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -80,7 +78,7 @@ use mempal::ingest::{
     IngestOptions, IngestStats,
     detect::detect_format,
     gating::{IngestCandidate, evaluate_fact_check_gate, evaluate_tier1, evaluate_tier2},
-    ingest_dir_with_options, ingest_file_with_options,
+    ingest_dir_with_options_and_writer_lease, ingest_file_with_options_and_writer_lease,
     normalize::{CURRENT_NORMALIZE_VERSION, NormalizeOptions, normalize_content_with_options},
     reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
 };
@@ -4184,8 +4182,62 @@ where
 struct MaintenanceWriterLeaseGuard {
     db_path: PathBuf,
     lease: RuntimeWriterLease,
+    active: Arc<std::sync::atomic::AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     heartbeat: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MaintenanceWriterLeaseGuard {
+    fn lease(&self) -> &RuntimeWriterLease {
+        &self.lease
+    }
+
+    fn ensure_active(&self, operation: &'static str) -> Result<()> {
+        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!(
+                "SQLite writer lease `{}` for {} was lost before {operation}",
+                self.lease.name,
+                self.lease.owner
+            );
+        }
+        let db = Database::open(&self.db_path).with_context(|| {
+            format!(
+                "failed to verify writer lease `{}` before {operation}",
+                self.lease.name
+            )
+        })?;
+        if db
+            .runtime_writer_lease_is_active(
+                &self.lease.name,
+                &self.lease.owner,
+                &self.lease.session_id,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to verify writer lease `{}` before {operation}",
+                    self.lease.name
+                )
+            })?
+        {
+            Ok(())
+        } else {
+            bail!(
+                "SQLite writer lease `{}` for {} was lost before {operation}",
+                self.lease.name,
+                self.lease.owner
+            )
+        }
+    }
+}
+
+fn ensure_maintenance_writer_lease_active(
+    lease: Option<&MaintenanceWriterLeaseGuard>,
+    operation: &'static str,
+) -> Result<()> {
+    if let Some(lease) = lease {
+        lease.ensure_active(operation)?;
+    }
+    Ok(())
 }
 
 impl Drop for MaintenanceWriterLeaseGuard {
@@ -4210,7 +4262,23 @@ fn acquire_maintenance_writer_lease(
     db: &Database,
     command: &str,
 ) -> Result<MaintenanceWriterLeaseGuard> {
-    let owner = format!("mempal-maintenance-{command}-{}", std::process::id());
+    acquire_runtime_writer_lease(db, command, "maintenance", "mempal-maintenance")
+}
+
+fn acquire_cli_ingest_writer_lease(
+    db: &Database,
+    command: &str,
+) -> Result<MaintenanceWriterLeaseGuard> {
+    acquire_runtime_writer_lease(db, command, "ingest", "mempal-ingest")
+}
+
+fn acquire_runtime_writer_lease(
+    db: &Database,
+    command: &str,
+    mode: &str,
+    owner_prefix: &str,
+) -> Result<MaintenanceWriterLeaseGuard> {
+    let owner = format!("{owner_prefix}-{command}-{}", std::process::id());
     let metadata = serde_json::json!({
         "command": command,
         "db_path": db.path().to_string_lossy(),
@@ -4220,7 +4288,7 @@ fn acquire_maintenance_writer_lease(
         .runtime_writer_lease_acquire(
             SQLITE_WRITER_LEASE_NAME,
             &owner,
-            "maintenance",
+            mode,
             MAINTENANCE_WRITER_LEASE_TTL_SECS,
             Some(&metadata),
         )
@@ -4239,11 +4307,17 @@ fn acquire_maintenance_writer_lease(
         }
     };
     let (stop_tx, stop_rx) = mpsc::channel();
-    let heartbeat =
-        spawn_maintenance_writer_lease_heartbeat(db.path().to_path_buf(), lease.clone(), stop_rx);
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let heartbeat = spawn_maintenance_writer_lease_heartbeat(
+        db.path().to_path_buf(),
+        lease.clone(),
+        Arc::clone(&active),
+        stop_rx,
+    );
     Ok(MaintenanceWriterLeaseGuard {
         db_path: db.path().to_path_buf(),
         lease,
+        active,
         stop: Some(stop_tx),
         heartbeat: Some(heartbeat),
     })
@@ -4252,6 +4326,7 @@ fn acquire_maintenance_writer_lease(
 fn spawn_maintenance_writer_lease_heartbeat(
     db_path: PathBuf,
     lease: RuntimeWriterLease,
+    active: Arc<std::sync::atomic::AtomicBool>,
     stop: mpsc::Receiver<()>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -4271,6 +4346,7 @@ fn spawn_maintenance_writer_lease_heartbeat(
             match result {
                 Ok(true) => {}
                 Ok(false) => {
+                    active.store(false, std::sync::atomic::Ordering::SeqCst);
                     eprintln!(
                         "warning: writer lease `{}` for {} was lost; stop this command before continuing writes",
                         lease.name, lease.owner
@@ -4495,8 +4571,9 @@ async fn ingest_command(
     };
 
     let stats = if options.dry_run {
-        ingest_path_with_options(db, &NoopEmbedder, path, wing, base_options).await?
+        ingest_path_with_options(db, &NoopEmbedder, path, wing, base_options, None).await?
     } else {
+        let writer_lease = acquire_cli_ingest_writer_lease(db, "ingest")?;
         let prototype_classifier = if config.ingest_gating.enabled && !options.no_gate {
             compile_classifier_from_config(config)
                 .await
@@ -4530,7 +4607,15 @@ async fn ingest_command(
             valid_from,
             valid_until,
         };
-        ingest_path_with_options(db, &*embedder, path, wing, live_options).await?
+        ingest_path_with_options(
+            db,
+            &*embedder,
+            path,
+            wing,
+            live_options,
+            Some(writer_lease.lease()),
+        )
+        .await?
     };
 
     append_ingest_audit_log(
@@ -4992,6 +5077,7 @@ async fn ingest_stdin_command(
     // terminal stats/audit path as the direct stdin ingest instead of
     // queueing a receipt that would report different skip semantics.
     if options.wait && exact_duplicate.is_some() {
+        let _writer_lease = acquire_cli_ingest_writer_lease(db, "ingest-stdin")?;
         finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
             db,
             wing: &resolved.wing,
@@ -5055,7 +5141,10 @@ async fn ingest_stdin_command(
         }
     }
 
+    let writer_lease = acquire_cli_ingest_writer_lease(db, "ingest-stdin")?;
+
     if exact_duplicate.is_some() {
+        writer_lease.ensure_active("finalize duplicate stdin ingest")?;
         finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
             db,
             wing: &resolved.wing,
@@ -5100,6 +5189,7 @@ async fn ingest_stdin_command(
             gating_decision = Some(tier2.decision);
         }
         if let Some(decision) = gating_decision.as_ref() {
+            writer_lease.ensure_active("record stdin gating audit")?;
             db.record_gating_audit(
                 &drawer_id,
                 decision,
@@ -5119,7 +5209,10 @@ async fn ingest_stdin_command(
 
         if !resolved.raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
-                &drawer_id,
+                {
+                    writer_lease.ensure_active("record stdin fact-check audit")?;
+                    &drawer_id
+                },
                 &resolved.content,
                 db,
                 resolved.project_id.as_deref(),
@@ -5180,6 +5273,7 @@ async fn ingest_stdin_command(
         link_superseded_drawer(&mut drawer, old_id);
     }
 
+    writer_lease.ensure_active("insert stdin drawer")?;
     db.insert_drawer_with_project_validity(
         &drawer,
         resolved.project_id.as_deref(),
@@ -5188,10 +5282,12 @@ async fn ingest_stdin_command(
         resolved.valid_until.as_deref(),
     )
     .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
+    writer_lease.ensure_active("insert stdin vector")?;
     db.insert_vector_with_project(&drawer_id, &vector, resolved.project_id.as_deref())
         .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
 
     if let Some(old_id) = superseded_drawer_id.as_deref() {
+        writer_lease.ensure_active("supersede stdin replacement target")?;
         db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
             .with_context(|| format!("failed to supersede drawer {old_id}"))?;
         stats.superseded_drawer_id = Some(old_id.to_string());
@@ -5201,6 +5297,7 @@ async fn ingest_stdin_command(
     {
         let config_snap = ConfigHandle::current();
         if config_snap.repair.enabled {
+            writer_lease.ensure_active("record stdin repair signal")?;
             mempal::repair::try_record_failure(
                 db.path(),
                 &drawer_id,
@@ -5707,11 +5804,28 @@ async fn ingest_path_with_options<'a, E: Embedder + ?Sized>(
     path: &'a Path,
     wing: &'a str,
     options: IngestOptions<'a>,
+    runtime_writer_lease: Option<&'a RuntimeWriterLease>,
 ) -> mempal::ingest::Result<IngestStats> {
     if path.is_file() {
-        ingest_file_with_options(db, embedder, path, wing, options).await
+        ingest_file_with_options_and_writer_lease(
+            db,
+            embedder,
+            path,
+            wing,
+            options,
+            runtime_writer_lease,
+        )
+        .await
     } else {
-        ingest_dir_with_options(db, embedder, path, wing, options).await
+        ingest_dir_with_options_and_writer_lease(
+            db,
+            embedder,
+            path,
+            wing,
+            options,
+            runtime_writer_lease,
+        )
+        .await
     }
 }
 
@@ -7240,7 +7354,7 @@ async fn reindex_command_by_embedder(
         println!("dry-run: no vectors were written");
         return Ok(());
     }
-    let _writer_lease = acquire_maintenance_writer_lease(db, "reindex-embedder")?;
+    let writer_lease = acquire_maintenance_writer_lease(db, "reindex-embedder")?;
     let embedder = build_specific_embedder(config, embedder_name).await?;
     let new_dim = embedder.dimensions();
     let current_dim = current_vector_dim(db).context("failed to read embedding dim")?;
@@ -7303,9 +7417,11 @@ async fn reindex_command_by_embedder(
             );
             resume_checkpoint = None;
         }
+        writer_lease.ensure_active("stash vectors before recreate")?;
         let stash = db
             .stash_vectors_before_recreate()
             .context("failed to stash existing vectors before recreate")?;
+        writer_lease.ensure_active("recreate vector table")?;
         println!("recreating drawer_vectors with {new_dim} dimensions...");
         db.recreate_vectors_table(new_dim)
             .context("failed to recreate vectors table")?;
@@ -7330,9 +7446,12 @@ async fn reindex_command_by_embedder(
             embedder.as_ref(),
             embedder_name,
             &target_fingerprint_for_reindex,
-            batch.batch_size,
             target,
-            policy,
+            StaleBatchExecution {
+                batch_size: batch.batch_size,
+                policy,
+                writer_lease: Some(&writer_lease),
+            },
         )
         .await;
     }
@@ -7378,11 +7497,14 @@ async fn reindex_command_by_embedder(
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("embedder returned no vector during reindex"))?;
+        writer_lease.ensure_active("write reindex vector")?;
         db.conn()
             .execute("DELETE FROM drawer_vectors WHERE id = ?1", [&row.id])
             .with_context(|| format!("failed to clear existing vector for {}", row.id))?;
+        writer_lease.ensure_active("insert reindex vector")?;
         db.insert_vector_with_project(&row.id, &vector, row.project_id.as_deref())
             .with_context(|| format!("failed to insert vector for {}", row.id))?;
+        writer_lease.ensure_active("record reindex metadata")?;
         record_reindex_metadata(
             db,
             &row.id,
@@ -7390,6 +7512,7 @@ async fn reindex_command_by_embedder(
             &target_fingerprint_for_reindex,
         )
         .with_context(|| format!("failed to record reindex metadata for {}", row.id))?;
+        writer_lease.ensure_active("persist reindex checkpoint")?;
         progress_store_for_reindex
             .upsert_running(&row.source_path, Some(row.chunk_index), embedder_name)
             .context("failed to persist reindex checkpoint")?;
@@ -7539,6 +7662,12 @@ struct StaleBatchTuning {
     max_batch_retries: usize,
 }
 
+struct StaleBatchExecution<'a> {
+    batch_size: usize,
+    policy: BatchRetryPolicy,
+    writer_lease: Option<&'a MaintenanceWriterLeaseGuard>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReindexEmbedderMode {
     resume: bool,
@@ -7587,10 +7716,14 @@ async fn reindex_stale_batches(
     embedder: &dyn Embedder,
     embedder_name: &str,
     target_fingerprint: &str,
-    batch_size: usize,
     target: ReindexVectorTarget,
-    policy: BatchRetryPolicy,
+    execution: StaleBatchExecution<'_>,
 ) -> Result<()> {
+    let StaleBatchExecution {
+        batch_size,
+        policy,
+        writer_lease,
+    } = execution;
     if batch_size == 0 {
         bail!("--batch-size must be greater than 0");
     }
@@ -7627,10 +7760,13 @@ async fn reindex_stale_batches(
     // of an in-memory list expanded into `NOT IN (?, ?, ...)` placeholders,
     // whose bind-variable count would overflow SQLITE_MAX_VARIABLE_NUMBER
     // (32766) on a pathological run and crash the skip-continue (issue #304).
+    ensure_maintenance_writer_lease_active(writer_lease, "create stale reindex skip table")?;
     ensure_reindex_skipped_table(db).context("failed to create reindex skip table")?;
+    ensure_maintenance_writer_lease_active(writer_lease, "reset stale reindex skip table")?;
     db.conn()
         .execute_batch(&format!("DELETE FROM {REINDEX_SKIPPED_TABLE};"))
         .context("failed to reset reindex skip table")?;
+    ensure_maintenance_writer_lease_active(writer_lease, "snapshot stale reindex work")?;
     build_reindex_stale_pending_rows(db, target_fingerprint, &target)
         .context("failed to snapshot stale reindex work list")?;
     let mut batch_index = 0usize;
@@ -7665,11 +7801,23 @@ async fn reindex_stale_batches(
                 skipped_failed_batches += 1;
                 skipped_failed_drawers += rows.len();
                 let failed_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+                ensure_maintenance_writer_lease_active(
+                    writer_lease,
+                    "record skipped stale reindex ids",
+                )?;
                 stage_reindex_skipped_ids(db, &failed_ids)
                     .context("failed to record skipped drawer ids")?;
+                ensure_maintenance_writer_lease_active(
+                    writer_lease,
+                    "delete skipped stale reindex work",
+                )?;
                 delete_reindex_pending_ids(db, &failed_ids)
                     .context("failed to delete skipped stale reindex work")?;
                 for (source_path, chunk_index) in reindex_source_checkpoints(&rows) {
+                    ensure_maintenance_writer_lease_active(
+                        writer_lease,
+                        "record failed stale reindex checkpoint",
+                    )?;
                     progress_store
                         .mark_failed(&source_path, Some(chunk_index), embedder_name)
                         .context("failed to record failed reindex checkpoint")?;
@@ -7678,9 +7826,14 @@ async fn reindex_stale_batches(
                 continue;
             }
         };
+        ensure_maintenance_writer_lease_active(writer_lease, "write stale reindex vector batch")?;
         let stats = write_reindex_vector_batch(db, &rows, &vectors, target_fingerprint)
             .context("failed to write stale reindex batch")?;
         let pulled_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        ensure_maintenance_writer_lease_active(
+            writer_lease,
+            "delete completed stale reindex work",
+        )?;
         delete_reindex_pending_ids(db, &pulled_ids)
             .context("failed to delete completed stale reindex work")?;
         processed += stats.reindexed;
@@ -7697,6 +7850,10 @@ async fn reindex_stale_batches(
             );
         }
         for (source_path, chunk_index) in reindex_source_checkpoints(&rows) {
+            ensure_maintenance_writer_lease_active(
+                writer_lease,
+                "persist stale reindex checkpoint",
+            )?;
             let checkpoint = if failed_sources.contains(source_path.as_str()) {
                 progress_store.mark_failed(&source_path, Some(chunk_index), embedder_name)
             } else {
@@ -7705,6 +7862,7 @@ async fn reindex_stale_batches(
             checkpoint.context("failed to persist reindex checkpoint")?;
         }
     }
+    ensure_maintenance_writer_lease_active(writer_lease, "finalize stale reindex checkpoints")?;
     progress_store
         .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, target_fingerprint)
         .context("failed to finalize completed reindex sources")?;
@@ -19987,6 +20145,11 @@ api_model = "text-embedding-3-large"
         calls: AtomicUsize,
     }
 
+    struct LeaseDroppingEmbedder {
+        db_path: PathBuf,
+        lease: RuntimeWriterLease,
+    }
+
     #[async_trait::async_trait]
     impl Embedder for FailFirstBatchEmbedder {
         async fn embed(
@@ -20008,6 +20171,37 @@ api_model = "text-embedding-3-large"
 
         fn name(&self) -> &str {
             "fail-first-test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for LeaseDroppingEmbedder {
+        async fn embed(
+            &self,
+            texts: &[&str],
+        ) -> std::result::Result<Vec<Vec<f32>>, mempal::embed::EmbedError> {
+            let db = Database::open(&self.db_path).map_err(|error| {
+                mempal::embed::EmbedError::Runtime(format!("open db in test embedder: {error}"))
+            })?;
+            db.runtime_writer_lease_release(
+                &self.lease.name,
+                &self.lease.owner,
+                &self.lease.session_id,
+            )
+            .map_err(|error| {
+                mempal::embed::EmbedError::Runtime(format!(
+                    "release writer lease in test embedder: {error}"
+                ))
+            })?;
+            Ok(texts.iter().map(|text| test_vector(text)).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        fn name(&self) -> &str {
+            "lease-dropping-test"
         }
     }
 
@@ -20150,11 +20344,14 @@ api_model = "text-embedding-3-large"
             &embedder,
             "recording-test",
             TEST_TARGET_FINGERPRINT,
-            2,
             empty_reindex_target(None),
-            BatchRetryPolicy {
-                interval: std::time::Duration::from_millis(0),
-                max_retries: 0,
+            StaleBatchExecution {
+                batch_size: 2,
+                policy: BatchRetryPolicy {
+                    interval: std::time::Duration::from_millis(0),
+                    max_retries: 0,
+                },
+                writer_lease: None,
             },
         )
         .await
@@ -20205,11 +20402,14 @@ api_model = "text-embedding-3-large"
             &embedder,
             "fail-first-test",
             TEST_TARGET_FINGERPRINT,
-            2,
             empty_reindex_target(None),
-            BatchRetryPolicy {
-                interval: std::time::Duration::from_millis(0),
-                max_retries: 0,
+            StaleBatchExecution {
+                batch_size: 2,
+                policy: BatchRetryPolicy {
+                    interval: std::time::Duration::from_millis(0),
+                    max_retries: 0,
+                },
+                writer_lease: None,
             },
         )
         .await
@@ -20238,6 +20438,62 @@ api_model = "text-embedding-3-large"
             reindex_vector_ids(&db).expect("vector ids"),
             vec!["d-2".to_string(), "d-3".to_string()],
             "later batches still complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_stale_batches_stops_before_write_after_writer_lease_loss() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        db.recreate_vectors_table(8).expect("create vector table");
+        for i in 0i64..2 {
+            insert_reindex_test_drawer(
+                &db,
+                &format!("d-{i}"),
+                &format!("content {i}"),
+                "fixtures/source.txt",
+                i,
+            );
+        }
+        let writer_lease =
+            acquire_maintenance_writer_lease(&db, "test-stale-lease-loss").expect("writer lease");
+        let embedder = LeaseDroppingEmbedder {
+            db_path: db.path().to_path_buf(),
+            lease: writer_lease.lease().clone(),
+        };
+
+        let error = reindex_stale_batches(
+            &db,
+            &embedder,
+            "lease-dropping-test",
+            TEST_TARGET_FINGERPRINT,
+            empty_reindex_target(None),
+            StaleBatchExecution {
+                batch_size: 2,
+                policy: BatchRetryPolicy {
+                    interval: std::time::Duration::from_millis(0),
+                    max_retries: 0,
+                },
+                writer_lease: Some(&writer_lease),
+            },
+        )
+        .await
+        .expect_err("lost writer lease must stop stale reindex");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("lost before write stale reindex vector batch"),
+            "{rendered}"
+        );
+        assert_eq!(
+            db.vector_row_count().expect("vector count"),
+            0,
+            "lease loss must stop before writing vectors"
+        );
+        assert_eq!(
+            reindex_pending_count(&db).expect("pending count"),
+            2,
+            "lease loss must not delete pending work"
         );
     }
 
@@ -20387,11 +20643,14 @@ api_model = "text-embedding-3-large"
             &embedder,
             "recording-test",
             TEST_TARGET_FINGERPRINT,
-            2,
             empty_reindex_target(Some(3)),
-            BatchRetryPolicy {
-                interval: std::time::Duration::from_millis(0),
-                max_retries: 0,
+            StaleBatchExecution {
+                batch_size: 2,
+                policy: BatchRetryPolicy {
+                    interval: std::time::Duration::from_millis(0),
+                    max_retries: 0,
+                },
+                writer_lease: None,
             },
         )
         .await
