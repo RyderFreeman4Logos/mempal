@@ -382,6 +382,11 @@ impl MempalMcpServer {
         });
     }
 
+    #[doc(hidden)]
+    pub fn ensure_ingest_drain_worker_started(&self) {
+        self.spawn_ingest_drain_worker();
+    }
+
     async fn supervise_ingest_drain_worker(self) {
         let mut restart_backoff_ms = INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS;
         loop {

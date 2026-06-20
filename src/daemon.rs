@@ -83,7 +83,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         let db = context.db.lock().await;
         db.path().to_path_buf()
     };
-    global_embed_status().set_audit_db_path(Some(db_path));
+    global_embed_status().set_audit_db_path(Some(db_path.clone()));
     {
         let db = context.db.lock().await;
         db.prune_expired_audit_logs()
@@ -205,6 +205,8 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .await
         .context("failed to reclaim stale daemon claims")?;
     tracing::info!("daemon startup reclaim_stale reclaimed={reclaimed}");
+    spawn_daemon_ingest_drain_worker(context, &db_path)
+        .context("failed to start daemon async ingest worker")?;
     let stall_watchdog_handle = spawn_stall_watchdog(
         context.write_observer.clone(),
         context.store.clone(),
@@ -343,6 +345,20 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         tracing::info!("released {released} claimed messages back to pending on shutdown");
     }
 
+    Ok(())
+}
+
+fn spawn_daemon_ingest_drain_worker(context: &DaemonContext, db_path: &Path) -> Result<()> {
+    let config = context.config.as_ref().clone();
+    let server = crate::mcp::MempalMcpServer::new_with_factory_and_config(
+        db_path.to_path_buf(),
+        config.clone(),
+        Arc::new(crate::embed::ConfiguredEmbedderFactory::new_for_daemon(
+            config,
+        )),
+    )?;
+    server.ensure_ingest_drain_worker_started();
+    tracing::info!("daemon async ingest worker started");
     Ok(())
 }
 

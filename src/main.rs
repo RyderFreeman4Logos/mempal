@@ -5268,6 +5268,7 @@ async fn operation_command(
             operation_id,
             timeout_secs,
         } => {
+            server.ensure_ingest_drain_worker_started();
             eprintln!(
                 "waiting for operation_id={} timeout_secs={timeout_secs}",
                 operation_id

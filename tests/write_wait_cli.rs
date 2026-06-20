@@ -1092,9 +1092,7 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     let config_path = write_config(home.path(), &format!("http://{addr}/v1"));
     let _guard = ConfigOverrideGuard::install(&config_path);
-    let config = Config::load_from(&config_path).expect("load config");
     let db_path = home.path().join(".mempal/palace.db");
-    let server = MempalMcpServer::new(db_path.clone(), config).expect("create MCP server");
 
     let operation_id =
         enqueue_prepared_operation(&db_path, "wait cli content", "mcp", Some("wait"));
@@ -1113,12 +1111,10 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
     );
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let warmup = start_worker(server.clone());
     tokio::time::sleep(Duration::from_millis(150)).await;
     handle.resume();
 
     let output = child.wait_with_output().expect("wait operation child");
-    warmup.await.expect("warmup join");
     handle.shutdown().await;
 
     assert!(
