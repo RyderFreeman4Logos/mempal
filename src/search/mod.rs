@@ -1,5 +1,6 @@
 #![warn(clippy::all)]
 
+use crate::algo::ranking::{RankedMemoryItem, ReciprocalRankFusion};
 use crate::core::decay::{search_decay_factor_at, validity_window_contains_at};
 use crate::core::{
     db::{Database, FtsMetadataFilters, FtsSearchScope},
@@ -27,6 +28,20 @@ pub mod tiered;
 const EXACT_VECTOR_CANDIDATE_LIMIT: i64 = 4_096;
 
 pub type Result<T> = std::result::Result<T, SearchError>;
+
+impl RankedMemoryItem for SearchResult {
+    fn memory_id(&self) -> &str {
+        &self.drawer_id
+    }
+
+    fn similarity_score(&self) -> f32 {
+        self.similarity
+    }
+
+    fn effective_importance(&self) -> f64 {
+        self.effective_importance
+    }
+}
 
 // --- Upstream knowledge-filter types ---
 
@@ -760,12 +775,7 @@ fn apply_temporal_decay(
         result.similarity *= factor as f32;
         result.effective_importance *= factor;
     }
-    results.sort_by(|a, b| {
-        b.similarity
-            .partial_cmp(&a.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.drawer_id.cmp(&b.drawer_id))
-    });
+    crate::algo::ranking::sort_by_similarity_desc_then_id(results);
 }
 
 /// Apply active-pattern score boost to matching exemplar drawers.
@@ -833,11 +843,7 @@ fn apply_pattern_boost(
 /// Uses a stable sort so ties preserve the RRF score ordering.
 /// Per spec: must not modify the `similarity` field.
 fn rerank_by_effective_importance(results: &mut [SearchResult]) {
-    results.sort_by(|a, b| {
-        b.effective_importance
-            .partial_cmp(&a.effective_importance)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    crate::algo::ranking::rerank_by_effective_importance(results);
 }
 
 /// Dispatch an async task to update access tracking fields for the given drawer IDs.
@@ -1225,24 +1231,22 @@ fn rrf_merge(
 ) -> Vec<SearchResult> {
     use std::collections::HashMap;
 
-    const RRF_K: f64 = 60.0;
-
-    let mut scores: HashMap<String, f64> = HashMap::new();
+    let vector_ids = vector_results
+        .iter()
+        .map(|result| result.drawer_id.as_str())
+        .collect::<Vec<_>>();
+    let fts_ranked_ids = fts_ids
+        .iter()
+        .map(|(id, _bm25_score)| id.as_str())
+        .collect::<Vec<_>>();
+    let fused = ReciprocalRankFusion::default().fuse([vector_ids, fts_ranked_ids]);
     let mut result_map: HashMap<String, SearchResult> = HashMap::new();
 
-    // Score vector results
-    for (rank, result) in vector_results.into_iter().enumerate() {
-        let score = 1.0 / (RRF_K + rank as f64 + 1.0);
-        scores.insert(result.drawer_id.clone(), score);
+    for result in vector_results {
         result_map.insert(result.drawer_id.clone(), result);
     }
 
-    // Score FTS results and merge
-    for (rank, (id, _bm25_score)) in fts_ids.iter().enumerate() {
-        let score = 1.0 / (RRF_K + rank as f64 + 1.0);
-        *scores.entry(id.clone()).or_default() += score;
-
-        // If this ID wasn't in vector results, load the drawer
+    for (id, _bm25_score) in fts_ids {
         if !result_map.contains_key(id) {
             if let Ok(Some(drawer)) = db.get_drawer(id) {
                 let source = scope.classify_row(db.drawer_project_id(id).ok().flatten().as_deref());
@@ -1254,21 +1258,14 @@ fn rrf_merge(
         }
     }
 
-    // Sort by RRF score descending, fill in similarity field
-    let mut merged: Vec<SearchResult> = scores
+    let mut merged: Vec<SearchResult> = fused
         .into_iter()
-        .filter_map(|(id, rrf_score)| {
-            let mut result = result_map.remove(&id)?;
-            result.similarity = rrf_score as f32;
+        .filter_map(|rank| {
+            let mut result = result_map.remove(&rank.id)?;
+            result.similarity = rank.score as f32;
             Some(result)
         })
         .collect();
-    merged.sort_by(|a, b| {
-        b.similarity
-            .partial_cmp(&a.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.drawer_id.cmp(&b.drawer_id))
-    });
     merged.truncate(top_k);
     merged
 }
