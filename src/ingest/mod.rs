@@ -9,6 +9,7 @@ pub mod lock;
 pub mod noise;
 pub mod normalize;
 pub mod novelty;
+pub mod parsers;
 pub mod reindex;
 
 use std::path::{Path, PathBuf};
@@ -37,10 +38,11 @@ use thiserror::Error;
 
 use crate::ingest::{
     chunk::{chunk_conversation_token_aware, chunk_text_token_aware},
-    detect::{Format, detect_format},
+    detect::Format,
     normalize::{
         CURRENT_NORMALIZE_VERSION, NormalizeError, NormalizeOptions, normalize_content_with_options,
     },
+    parsers::{ParseContext, ParserMode, parse_document},
 };
 
 /// Max wait for per-source ingest lock before returning LockError::Timeout.
@@ -99,6 +101,8 @@ pub struct IngestOptions<'a> {
     pub replace_text: Option<&'a str>,
     pub valid_from: Option<&'a str>,
     pub valid_until: Option<&'a str>,
+    pub parser: ParserMode,
+    pub allow_llm_parsers: bool,
 }
 
 pub type Result<T> = std::result::Result<T, IngestError>;
@@ -122,6 +126,12 @@ pub enum IngestError {
         path: PathBuf,
         #[source]
         source: NormalizeError,
+    },
+    #[error("failed to parse {path}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: parsers::ParserError,
     },
     #[error("failed to load taxonomy for wing {wing}")]
     LoadTaxonomy {
@@ -290,6 +300,8 @@ pub async fn ingest_file<E: Embedder + ?Sized>(
             replace_text: None,
             valid_from: None,
             valid_until: None,
+            parser: ParserMode::Auto,
+            allow_llm_parsers: false,
         },
     )
     .await
@@ -319,7 +331,19 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
             path: path.to_path_buf(),
             source,
         })?;
-    let content = String::from_utf8_lossy(&bytes).to_string();
+    let parsed = parse_document(
+        path,
+        &bytes,
+        ParseContext {
+            mode: options.parser,
+            allow_llm: options.allow_llm_parsers,
+        },
+    )
+    .map_err(|source| IngestError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let content = parsed.content;
     if content.trim().is_empty() {
         return Ok(IngestStats {
             files: 1,
@@ -327,7 +351,7 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
         });
     }
 
-    let format = detect_format(&content);
+    let format = parsed.format;
 
     // Stage 1: Normalize (upstream noise stripping integrated)
     let normalize_output = normalize_content_with_options(
@@ -840,6 +864,8 @@ pub async fn ingest_dir<E: Embedder + ?Sized>(
             replace_text: None,
             valid_from: None,
             valid_until: None,
+            parser: ParserMode::Auto,
+            allow_llm_parsers: false,
         },
     )
     .await

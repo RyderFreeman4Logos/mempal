@@ -80,6 +80,7 @@ use mempal::ingest::{
     gating::{IngestCandidate, evaluate_fact_check_gate, evaluate_tier1, evaluate_tier2},
     ingest_dir_with_options_and_writer_lease, ingest_file_with_options_and_writer_lease,
     normalize::{CURRENT_NORMALIZE_VERSION, NormalizeOptions, normalize_content_with_options},
+    parsers::ParserMode,
     reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
 };
 use mempal::knowledge_anchor::{PublishAnchorRequest, publish_anchor};
@@ -171,6 +172,9 @@ struct IngestCommandOptions<'a> {
     dry_run: bool,
     json: bool,
     no_strip_noise: bool,
+    parser: ParserMode,
+    no_llm: bool,
+    allow_llm: bool,
     diary_rollup: bool,
     wait: bool,
     wait_timeout_secs: Option<u64>,
@@ -305,6 +309,38 @@ impl From<ReflectModeArg> for ReflectionMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum IngestParserArg {
+    Auto,
+    Text,
+    Markdown,
+    Code,
+    Jsonl,
+    Pdf,
+    Office,
+    Ocr,
+    Vlm,
+    MmLlm,
+}
+
+impl From<IngestParserArg> for ParserMode {
+    fn from(value: IngestParserArg) -> Self {
+        match value {
+            IngestParserArg::Auto => Self::Auto,
+            IngestParserArg::Text => Self::Text,
+            IngestParserArg::Markdown => Self::Markdown,
+            IngestParserArg::Code => Self::Code,
+            IngestParserArg::Jsonl => Self::Jsonl,
+            IngestParserArg::Pdf => Self::Pdf,
+            IngestParserArg::Office => Self::Office,
+            IngestParserArg::Ocr => Self::Ocr,
+            IngestParserArg::Vlm => Self::Vlm,
+            IngestParserArg::MmLlm => Self::MmLlm,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize taxonomy rooms from a directory.
@@ -338,6 +374,12 @@ enum Commands {
         wait_timeout_secs: Option<u64>,
         #[arg(long)]
         no_strip_noise: bool,
+        #[arg(long, value_enum, default_value_t = IngestParserArg::Auto)]
+        parser: IngestParserArg,
+        #[arg(long = "no-llm", default_value_t = false, conflicts_with = "allow_llm")]
+        no_llm: bool,
+        #[arg(long = "allow-llm", default_value_t = false)]
+        allow_llm: bool,
         #[arg(long)]
         diary_rollup: bool,
         #[arg(long = "source-type")]
@@ -3455,6 +3497,9 @@ fn run() -> Result<()> {
             wait,
             wait_timeout_secs,
             no_strip_noise,
+            parser,
+            no_llm,
+            allow_llm,
             diary_rollup,
             source_type,
             memory_kind,
@@ -3482,6 +3527,9 @@ fn run() -> Result<()> {
                 wait,
                 wait_timeout_secs,
                 no_strip_noise,
+                parser: parser.into(),
+                no_llm,
+                allow_llm,
                 diary_rollup,
                 source_type: source_type.as_deref(),
                 memory_kind: memory_kind.as_deref(),
@@ -4584,6 +4632,8 @@ async fn ingest_command(
         replace_text: options.replace_text,
         valid_from,
         valid_until,
+        parser: options.parser,
+        allow_llm_parsers: options.allow_llm && !options.no_llm,
     };
 
     let stats = if options.dry_run {
@@ -4622,6 +4672,8 @@ async fn ingest_command(
             replace_text: options.replace_text,
             valid_from,
             valid_until,
+            parser: options.parser,
+            allow_llm_parsers: options.allow_llm && !options.no_llm,
         };
         ingest_path_with_options(
             db,
@@ -4994,6 +5046,12 @@ async fn ingest_stdin_command(
     }
     if options.diary_rollup {
         bail!("--diary-rollup is only supported for directory ingest");
+    }
+    if !options.parser.is_auto() {
+        bail!("--parser is only supported for path ingest");
+    }
+    if options.allow_llm {
+        bail!("--allow-llm is only supported for path ingest");
     }
 
     let mut input = Vec::new();

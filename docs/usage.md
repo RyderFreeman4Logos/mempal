@@ -316,7 +316,7 @@ Use this when you already know the concepts and just need the right command quic
 | Command | Purpose |
 |---------|---------|
 | `mempal init <DIR> [--dry-run]` | infer a `wing` and seed initial taxonomy rooms from a project tree |
-| `mempal ingest --wing <WING> <DIR> [--dry-run]` | chunk, embed, and store a project tree |
+| `mempal ingest --wing <WING> <DIR> [--parser auto --no-llm] [--dry-run]` | chunk, embed, and store a project tree or deterministic document set |
 | `mempal search <QUERY> [--wing W] [--room R] [--json]` | hybrid search (BM25 + vector + RRF) with tunnel hints |
 | `mempal context <QUERY> [--format json] [--include-evidence] [--dao-tian-limit N]` | assemble mind-model runtime context (`dao_tian -> dao_ren -> shu -> qi`); default `dao_tian` budget is 1 |
 | `mempal field-taxonomy [--format json]` | inspect read-only recommended `field` values for typed memory |
@@ -384,6 +384,20 @@ dry_run=true files=12 chunks=34 skipped=2
 
 This reads, normalizes, chunks, and counts, but does not write drawers or vectors.
 
+For document folders, keep parser selection deterministic:
+
+```bash
+mempal ingest docs/ --wing docs --parser auto --no-llm --dry-run
+```
+
+`--parser auto` dispatches through built-in Rust parsers for text, Markdown,
+code, JSONL, and OOXML Office files (`.docx`, `.pptx`, `.xlsx`). Deterministic
+PDF text parsing is disabled unless a bounded extractor is added; use an
+explicit OCR/LLM parser only when that provider is configured and acceptable.
+Image, audio, video, OCR, VLM, and MM-LLM parsing require explicit
+`--allow-llm`; without that opt-in, `--no-llm`/default policy rejects those
+inputs instead of making remote calls.
+
 ### 3. Ingest the project
 
 ```bash
@@ -394,6 +408,12 @@ Optional explicit format selector:
 
 ```bash
 mempal ingest ~/code/myapp --wing myapp --format convos
+```
+
+Optional explicit parser selector:
+
+```bash
+mempal ingest docs/ --wing docs --parser office --no-llm
 ```
 
 Every ingest appends a JSONL audit record to:

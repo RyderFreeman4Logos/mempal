@@ -503,7 +503,20 @@ fn test_no_new_runtime_dependencies_introduced() {
 
     // Intentional additions approved in feat/integrate-upstream-subcommands:
     // dotenvy — lightweight .env loader for hermetic subprocess test harnesses.
-    let allowed_new: std::collections::HashSet<&str> = ["dotenvy"].into_iter().collect();
+    //
+    // Intentional additions approved in #478:
+    // quick-xml + zip — deterministic OOXML Office text parser.
+    let allowed_new: std::collections::HashSet<&str> = [
+        "arbitrary",
+        "derive_arbitrary",
+        "dotenvy",
+        "quick-xml",
+        "zip",
+        "zlib-rs",
+        "zopfli",
+    ]
+    .into_iter()
+    .collect();
 
     let new_runtime_packages = runtime_packages
         .difference(&baseline_packages)
