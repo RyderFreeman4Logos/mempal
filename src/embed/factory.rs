@@ -5,7 +5,7 @@ use crate::core::config::{Config, ConfigHandle};
 use async_trait::async_trait;
 use serde::Serialize;
 
-use super::{Embedder, Result};
+use super::{EmbedError, Embedder, Result};
 
 #[async_trait]
 pub trait EmbedderFactory: Send + Sync {
@@ -33,7 +33,7 @@ impl ConfiguredEmbedderFactory {
         }
     }
 
-    fn active_config(&self) -> Config {
+    fn active_config(&self) -> Result<Config> {
         let current = ConfigHandle::current();
         let config = if current.db_path == self.config.db_path
             && !config_is_default_snapshot(current.as_ref())
@@ -43,9 +43,12 @@ impl ConfiguredEmbedderFactory {
             self.config.clone()
         };
         if self.daemon_mode {
-            config.daemon_embedder_config()
-        } else {
             config
+                .validate_daemon_embedder_mode()
+                .map_err(|error| EmbedError::InvalidConfiguration(error.to_string()))?;
+            Ok(config.daemon_embedder_config())
+        } else {
+            Ok(config)
         }
     }
 }
@@ -53,7 +56,7 @@ impl ConfiguredEmbedderFactory {
 #[async_trait]
 impl EmbedderFactory for ConfiguredEmbedderFactory {
     async fn build(&self) -> Result<Box<dyn Embedder>> {
-        let config = self.active_config();
+        let config = self.active_config()?;
         let signature = embedder_runtime_signature(&config);
         let cache = shared_embedder_cache();
         let mut guard = cache.lock().await;

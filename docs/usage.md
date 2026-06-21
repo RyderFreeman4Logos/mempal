@@ -143,8 +143,8 @@ dim = 4096
 
 `remote` mode is daemon-only: normal one-shot CLI commands still use `[embed]`
 as configured, while daemon workers and daemon REST embedding avoid loading the
-in-process local embedder cache. If you need an all-local low-memory daemon, set
-`embedder_mode = "small_local"` to use `minishlab/potion-base-8M`. After
+in-process local embedder cache. If you need an all-local low-memory daemon, install
+with `--features model2vec` and set `embedder_mode = "small_local"` to use `minishlab/potion-base-8M`. After
 changing backend/model/dimensions, run `mempal reindex` and restart the daemon.
 
 Notes:

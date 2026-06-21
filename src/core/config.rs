@@ -304,6 +304,7 @@ impl Config {
             ));
         }
         self.embed.validate_endpoint_pool()?;
+        self.validate_daemon_embedder_mode()?;
         self.llm.validate_endpoint_pool()?;
         self.validate_llm_judge_guardrails()?;
         if self.llm.enabled && self.llm.effective_endpoints()?.is_empty() {
@@ -530,6 +531,20 @@ impl Config {
             }
         }
         config
+    }
+
+    /// Validates that the configured daemon embedder mode is available in this build.
+    pub fn validate_daemon_embedder_mode(&self) -> Result<(), ConfigError> {
+        #[cfg(not(feature = "model2vec"))]
+        if matches!(self.daemon.embedder_mode, DaemonEmbedderMode::SmallLocal) {
+            return Err(ConfigError::InvalidConfig(
+                "daemon.embedder_mode = \"small_local\" requires building mempal with the \
+                 `model2vec` Cargo feature; use \"remote\"/\"configured\" or reinstall with \
+                 `--features model2vec`"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn compile_privacy(&self) -> Result<CompiledPrivacyConfig, ConfigError> {
@@ -3097,10 +3112,9 @@ impl Default for SleepConfig {
 mod tests {
     use std::sync::{Mutex, OnceLock};
 
-    use super::{
-        Config, DAEMON_SMALL_LOCAL_EMBED_MODEL, DaemonEmbedderMode, DecayMode,
-        endpoint_url_display_label,
-    };
+    #[cfg(feature = "model2vec")]
+    use super::DAEMON_SMALL_LOCAL_EMBED_MODEL;
+    use super::{Config, DaemonEmbedderMode, DecayMode, endpoint_url_display_label};
 
     // Serialize env-mutating tests to prevent flaky parallel interference.
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3427,6 +3441,25 @@ embedder_mode = "remote"
     }
 
     #[test]
+    #[cfg(not(feature = "model2vec"))]
+    fn daemon_embedder_small_local_requires_model2vec_feature() {
+        let error = Config::parse(
+            r#"
+[daemon]
+embedder_mode = "small_local"
+"#,
+        )
+        .expect_err("small_local must fail fast when model2vec is not compiled");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("requires building mempal with the `model2vec` Cargo feature"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "model2vec")]
     fn daemon_embedder_small_local_mode_uses_small_model_without_fallback() {
         let _guard = env_lock();
         let saved_env = save_embed_env();

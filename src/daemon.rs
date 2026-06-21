@@ -3267,6 +3267,9 @@ impl DaemonEmbedder {
         config: &crate::core::config::Config,
         mempal_home: &Path,
     ) -> crate::embed::Result<Self> {
+        config
+            .validate_daemon_embedder_mode()
+            .map_err(|error| crate::embed::EmbedError::InvalidConfiguration(error.to_string()))?;
         let daemon_config = config.daemon_embedder_config();
         let name = daemon_config
             .embed
@@ -3514,6 +3517,9 @@ mod tests {
     use std::pin::Pin;
     use tokio::sync::Notify;
 
+    #[cfg(not(feature = "model2vec"))]
+    use crate::core::config::DaemonEmbedderMode;
+
     use super::{
         ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext,
         EndpointRecoveryConfigProvider, EndpointRecoveryRequeuePlan, EndpointRecoveryRequeueState,
@@ -3546,6 +3552,30 @@ mod tests {
             "daemon startup/status path must not load the configured embedder"
         );
         assert_eq!(status.dimensions, None);
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "model2vec"))]
+    async fn daemon_embedder_from_config_rejects_small_local_without_model2vec_feature() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = Config {
+            db_path: tmp.path().join("palace.db").display().to_string(),
+            ..Config::default()
+        };
+        config.daemon.embedder_mode = DaemonEmbedderMode::SmallLocal;
+
+        let error = match DaemonEmbedder::from_config(&config, tmp.path()).await {
+            Ok(_) => {
+                panic!("small_local must fail before daemon embedder startup without model2vec")
+            }
+            Err(error) => error,
+        };
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("requires building mempal with the `model2vec` Cargo feature"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

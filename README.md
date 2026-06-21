@@ -175,7 +175,7 @@ Daemon low-memory mode:
 
 - `[daemon].embedder_mode = "configured"` uses the normal `[embed]` backend.
 - `"remote"` forces daemon workers and daemon REST embedding to use the configured OpenAI-compatible/API endpoint and disables daemon fallback to local model2vec.
-- `"small_local"` forces the daemon to use `minishlab/potion-base-8M` instead of a larger explicitly configured in-process model.
+- `"small_local"` forces the daemon to use `minishlab/potion-base-8M` instead of a larger explicitly configured in-process model; it requires installing with `--features model2vec`.
 - After changing backend/model/dimensions, run `mempal reindex`, then `mempal daemon restart`.
 - `mempal daemon status` and `mempal doctor` report daemon RSS/PSS, whether the daemon executable is deleted/replaced, and whether the daemon embedder cache is loaded.
 
