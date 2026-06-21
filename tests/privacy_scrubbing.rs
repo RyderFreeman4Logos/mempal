@@ -503,7 +503,46 @@ fn test_no_new_runtime_dependencies_introduced() {
 
     // Intentional additions approved in feat/integrate-upstream-subcommands:
     // dotenvy — lightweight .env loader for hermetic subprocess test harnesses.
-    let allowed_new: std::collections::HashSet<&str> = ["dotenvy"].into_iter().collect();
+    //
+    // Intentional additions approved in #478:
+    // pdf-extract — deterministic PDF text parser.
+    // quick-xml + zip — deterministic OOXML Office text parser.
+    let allowed_new: std::collections::HashSet<&str> = [
+        "adobe-cmap-parser",
+        "aes",
+        "arbitrary",
+        "block-padding",
+        "bytecount",
+        "cbc",
+        "cff-parser",
+        "cipher",
+        "derive_arbitrary",
+        "dotenvy",
+        "ecb",
+        "encoding_rs",
+        "euclid",
+        "inout",
+        "lopdf",
+        "md-5",
+        "nom_locate",
+        "pdf-extract",
+        "pom",
+        "postscript",
+        "quick-xml",
+        "rangemap",
+        "stringprep",
+        "ttf-parser",
+        "type1-encoding-parser",
+        "unicode-bidi",
+        "unicode-normalization",
+        "unicode-properties",
+        "weezl",
+        "zip",
+        "zlib-rs",
+        "zopfli",
+    ]
+    .into_iter()
+    .collect();
 
     let new_runtime_packages = runtime_packages
         .difference(&baseline_packages)
