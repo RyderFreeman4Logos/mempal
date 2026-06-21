@@ -192,6 +192,8 @@ pub struct MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     ingest_processing_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    async_db_open_error: Option<String>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     content_writer_lease_ttl_secs: u64,
     #[cfg(any(test, feature = "db-test-seam"))]
     content_writer_lease_renew_interval: Duration,
@@ -428,6 +430,8 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             ingest_processing_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            async_db_open_error: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
             content_writer_lease_ttl_secs: MCP_CONTENT_WRITER_LEASE_TTL_SECS,
             #[cfg(any(test, feature = "db-test-seam"))]
             content_writer_lease_renew_interval: MCP_CONTENT_WRITER_LEASE_RENEW_INTERVAL,
@@ -469,6 +473,12 @@ impl MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_ingest_processing_delay_for_test(mut self, delay: Duration) -> Self {
         self.ingest_processing_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_async_db_open_error_for_test(mut self, error: impl Into<String>) -> Self {
+        self.async_db_open_error = Some(error.into());
         self
     }
 
@@ -1176,6 +1186,11 @@ impl MempalMcpServer {
     }
 
     async fn async_db(&self) -> anyhow::Result<AsyncDb> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if let Some(error) = self.async_db_open_error.as_deref() {
+            anyhow::bail!("{error}");
+        }
+
         let db_path = self.db_path.clone();
         let async_db = self
             .async_db
@@ -1542,10 +1557,9 @@ impl MempalMcpServer {
         match self
             .run_read_anyhow_bounded(|db| Ok(system_warnings_with_stale_index(db)), deadline)
             .await
-            .map_err(db_error)?
         {
-            Some(warnings) => Ok(warnings),
-            None => {
+            Ok(Some(warnings)) => Ok(warnings),
+            Ok(None) => {
                 let mut warnings = current_system_warnings();
                 warnings.push(SystemWarning {
                     level: "warn".to_string(),
@@ -1554,6 +1568,12 @@ impl MempalMcpServer {
                 });
                 Ok(warnings)
             }
+            Err(error) => Ok(database_warning_snapshot(
+                current_system_warnings(),
+                &self.db_path,
+                "stale vector index check",
+                error.as_ref(),
+            )),
         }
     }
 
@@ -1575,7 +1595,8 @@ impl MempalMcpServer {
                 });
                 Ok(warnings)
             }
-            Err(error) => Err(database_write_refused_error(
+            Err(error) => Ok(database_warning_snapshot(
+                current_system_warnings(),
                 &self.db_path,
                 "stale vector index check",
                 error.as_ref(),
@@ -4662,13 +4683,6 @@ impl MempalMcpServer {
         if !dry_run && global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
         }
-        if !dry_run && let Err(error) = self.async_db().await {
-            return Err(database_write_refused_error(
-                &self.db_path,
-                "async_db",
-                error.as_ref(),
-            ));
-        }
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
         let room = request.room.as_deref();
         // Snapshot the request-wide warnings once so every early-return path reports a
@@ -4962,7 +4976,17 @@ impl MempalMcpServer {
         room: Option<String>,
         project_id: Option<String>,
     ) -> std::result::Result<Option<DrawerSummary>, ErrorData> {
-        let async_db = self.async_db().await.map_err(db_error)?;
+        if supersedes.is_none() && replace_text.is_none() {
+            return Ok(None);
+        }
+
+        let async_db = self.async_db().await.map_err(|error| {
+            database_write_refused_error(
+                &self.db_path,
+                "resolve replacement target",
+                error.as_ref(),
+            )
+        })?;
         async_db
             .run_read(move |db| {
                 db.resolve_replacement_target(
@@ -8962,6 +8986,24 @@ fn database_write_refused_error(
     database_write_refused_error_from_diagnostic(diagnostic)
 }
 
+fn database_warning_snapshot(
+    mut warnings: Vec<SystemWarning>,
+    db_path: &Path,
+    stage: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> Vec<SystemWarning> {
+    let diagnostic = status_database_diagnostic(db_path, stage, error);
+    warnings.push(SystemWarning {
+        level: "warn".to_string(),
+        message: format!(
+            "database diagnostic degraded at {}: {} ({})",
+            diagnostic.source, diagnostic.summary, diagnostic.failure_kind
+        ),
+        source: "database".to_string(),
+    });
+    warnings
+}
+
 fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDto) -> ErrorData {
     let warning = SystemWarning {
         level: "warn".to_string(),
@@ -10313,7 +10355,7 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_mcp_ingest_admission_returns_error_when_db_reads_exceed_deadline() {
+    async fn test_mcp_ingest_admission_warning_timeout_still_returns_receipt() {
         let (_tempdir, db_path, server) = setup_server();
         let async_db = AsyncDb::open(&db_path, 4)
             .expect("open async db")
@@ -10334,9 +10376,57 @@ pattern_boost = 0.2
             })),
         )
         .await
+        .expect("MCP ingest should return before client timeout")
+        .expect("stale-index warning timeout must not reject a durable queue receipt")
+        .0;
+
+        assert_eq!(result.state, Some(IngestOperationState::Queued));
+        assert!(result.operation_id.is_some());
+        assert!(result.system_warnings.iter().any(|warning| {
+            warning.source == "mcp_timeout"
+                && warning
+                    .message
+                    .contains("stale vector index check exceeded")
+        }));
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_replacement_target_timeout_rejects_admission() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "replacement-timeout-target",
+            "replacement target before timeout",
+            "mcp",
+            Some("deadline"),
+            "/tmp/replacement-timeout.md",
+            2,
+        );
+        let async_db = AsyncDb::open(&db_path, 4)
+            .expect("open async db")
+            .with_read_delay(Duration::from_millis(150));
+        let server = server
+            .with_async_db_for_test(async_db)
+            .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.mempal_ingest(Parameters(IngestRequest {
+                content: "replacement target timeout should reject admission".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("deadline".to_string()),
+                replace_text: Some("replacement target before timeout".to_string()),
+                dry_run: Some(false),
+                wait: Some(false),
+                ..IngestRequest::default()
+            })),
+        )
+        .await
         .expect("MCP ingest should return before client timeout");
         let error = match result {
-            Ok(_) => panic!("slow admission should not claim durable acceptance"),
+            Ok(_) => panic!("slow replacement target resolution should reject admission"),
             Err(error) => error,
         };
 
@@ -14465,6 +14555,57 @@ pattern_boost = 0.2
         assert!(
             completed_status.timings.contains_key("db_write_ms"),
             "completed status must include db_write_ms timing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_wait_succeeds_when_async_db_diagnostic_reports_current_lock() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_async_db_open_error_for_test(
+            "failed to open MCP async database pool: database is locked: current_mcp_server",
+        );
+
+        let response = server
+            .mempal_ingest_with_controls_scoped_worker(
+                IngestRequest {
+                    content: "current MCP DB holder must not block ingest".to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("current-lock".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(5),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
+            )
+            .await
+            .expect("current MCP holder should not reject ingest")
+            .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(!response.drawer_id.is_empty());
+        assert!(response.system_warnings.iter().any(|warning| {
+            warning.source == "database"
+                && warning.message.contains("locked_or_busy")
+                && warning.message.contains("current_mcp_server")
+        }));
+        assert_eq!(
+            Database::open(&db_path)
+                .expect("open db")
+                .drawer_count()
+                .expect("drawer count"),
+            1
         );
     }
 
