@@ -187,7 +187,7 @@ db_path = "{}"
 enabled = false
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [llm]
 enabled = false

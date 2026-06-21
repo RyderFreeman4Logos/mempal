@@ -52,7 +52,7 @@ request_timeout_secs = 2
         } else {
             r#"
 [embed]
-backend = "model2vec"
+backend = "stub"
 "#
             .to_string()
         };

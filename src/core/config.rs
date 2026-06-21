@@ -173,7 +173,6 @@ impl Config {
             Ok(contents) => Self::parse(&contents),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut config = Self::default();
-                config.embed.backend = "model2vec".to_string();
                 config.apply_env_overrides();
                 config.validate()?;
                 Ok(config)
@@ -189,9 +188,6 @@ impl Config {
         let root: toml::Value = toml::from_str(contents)?;
         validate_llm_endpoint_pool_toml(&root)?;
         let mut config: Self = toml::from_str(contents)?;
-        if root.get("embed").is_none() && root.get("embedder").is_none() {
-            config.embed.backend = "model2vec".to_string();
-        }
         config.apply_env_overrides();
         config.validate()?;
         Ok(config)
@@ -3367,8 +3363,9 @@ mod tests {
                 std::env::set_var("MEMPAL_EMBED_DIM", v);
             }
         }
-        // Empty config.toml with no env overrides → model2vec fallback; dim keeps struct default
-        assert_eq!(config.embed.backend, "model2vec");
+        // Empty config.toml with no env overrides keeps the configured-provider default;
+        // it must not silently select or load the upstream model2vec model.
+        assert_eq!(config.embed.backend, "openai_compat");
         assert!(config.embed.openai_compat.base_url.is_none());
         assert!(config.embed.openai_compat.model.is_none());
         assert_eq!(
@@ -3378,7 +3375,7 @@ mod tests {
     }
 
     #[test]
-    fn load_from_missing_config_uses_model2vec_default() {
+    fn load_from_missing_config_uses_configured_provider_default() {
         let _guard = env_lock();
         let saved_env = save_embed_env();
         clear_embed_env();
@@ -3388,7 +3385,7 @@ mod tests {
         let config = Config::load_from(&config_path).expect("missing config should load defaults");
 
         restore_embed_env(saved_env);
-        assert_eq!(config.embed.backend, "model2vec");
+        assert_eq!(config.embed.backend, "openai_compat");
         assert!(config.embed.openai_compat.base_url.is_none());
         assert!(config.embed.openai_compat.model.is_none());
     }

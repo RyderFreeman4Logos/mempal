@@ -18,7 +18,7 @@ Before using the CLI, keep four nouns straight:
 - original text lives in the `drawers` table
 - vectors live in `drawer_vectors`
 - AAAK is output-only and does not replace stored raw text
-- default operation is local-first: SQLite + model2vec, with no cloud LLM, embedding, or rerank calls unless configured explicitly
+- default storage is local-first: SQLite only, with no hidden model2vec load and no cloud LLM, embedding, or rerank calls unless configured explicitly
 
 ## Install
 
@@ -68,18 +68,22 @@ Config file path:
 ~/.mempal/config.toml
 ```
 
-Default config:
+Recommended explicit embedder config:
 
 ```toml
 db_path = "~/.mempal/palace.db"
 
 [embed]
-backend = "model2vec"
-# model = "minishlab/potion-multilingual-128M" # default multilingual model
+backend = "openai_compat"
+
+[embed.openai_compat]
+base_url = "http://127.0.0.1:18002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 4096
 
 [daemon]
 # configured: use [embed] as-is
-# remote: daemon uses [embed.openai_compat] / [[embed.endpoints]] and does not load local model2vec fallback
+# remote: daemon uses [embed.openai_compat] / [[embed.endpoints]]
 # small_local: daemon uses minishlab/potion-base-8M
 embedder_mode = "configured"
 
@@ -97,11 +101,11 @@ allow_llm = false
 allow_rerank = false
 ```
 
-With no config file, `mempal` uses the local SQLite database at `~/.mempal/palace.db`, the local model2vec embedder, and no reranker or LLM calls. OpenAI-compatible embeddings, LLM gating, and reranking are opt-in.
+With no config file, `mempal` uses the local SQLite database at `~/.mempal/palace.db` and does not silently download or load model2vec. Configure an embedding endpoint for ingest/search, or explicitly enable `backend = "model2vec"` with the `model2vec` Cargo feature for local static models.
 
 Use `mempal cost status` to print redacted remote-call status for embedding, LLM, and rerank paths. Set `[privacy.remote_calls] fail_closed = true` to block external endpoints unless the matching `allow_*` toggle is also true.
 
-Use local ONNX instead of the default model2vec backend:
+Use local ONNX instead of the default OpenAI-compatible provider family:
 
 ```toml
 db_path = "~/.mempal/palace.db"
@@ -139,14 +143,14 @@ dim = 4096
 
 `remote` mode is daemon-only: normal one-shot CLI commands still use `[embed]`
 as configured, while daemon workers and daemon REST embedding avoid loading the
-in-process model2vec cache. If you need an all-local low-memory daemon, set
+in-process local embedder cache. If you need an all-local low-memory daemon, set
 `embedder_mode = "small_local"` to use `minishlab/potion-base-8M`. After
 changing backend/model/dimensions, run `mempal reindex` and restart the daemon.
 
 Notes:
 
-- `model2vec` is the default backend.
-- The default local model is `minishlab/potion-multilingual-128M`.
+- `openai_compat` is the default backend family, but real embedding work needs a configured endpoint.
+- `model2vec` is explicit opt-in through both Cargo feature and `backend = "model2vec"`.
 - First use of `model2vec` or `onnx` may download model assets.
 - If `config.toml` is missing, `mempal` still works with defaults.
 - The benchmark and search commands use whatever embedder backend is configured here.
@@ -1152,7 +1156,7 @@ Working style: small reversible edits, verify before asserting.
 
 ### Search returns irrelevant results for Chinese (or other non-English) queries
 
-The default embedder is now a multilingual `model2vec` model, but English queries still retrieve more reliably than Chinese (and other non-English) queries in practice.
+The configured embedder can affect multilingual retrieval quality; English query normalization still tends to retrieve more reliably for Chinese and other non-English prompts in practice.
 
 **For AI agents**: MEMORY_PROTOCOL rule 3a tells agents to translate queries to English before calling `mempal_search`. This is handled automatically by agents that read the protocol.
 

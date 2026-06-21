@@ -437,7 +437,7 @@ dim = 3
 }
 
 #[tokio::test]
-async fn test_daemon_embedder_factory_remote_mode_avoids_local_model2vec() {
+async fn test_daemon_embedder_factory_remote_mode_uses_configured_remote_provider() {
     let _cache_guard = shared_embedder_cache_test_lock().lock().await;
     let (base_url, request_count, server) =
         spawn_counting_embedding_server(Duration::from_millis(1)).await;
@@ -448,7 +448,7 @@ async fn test_daemon_embedder_factory_remote_mode_avoids_local_model2vec() {
 db_path = "{}"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [embed.openai_compat]
 base_url = "{base_url}"

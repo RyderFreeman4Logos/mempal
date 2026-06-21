@@ -41,7 +41,7 @@ impl PrimeEnv {
 db_path = "{}"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [search]
 strict_project_isolation = false

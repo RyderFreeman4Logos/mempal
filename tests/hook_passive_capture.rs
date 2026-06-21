@@ -66,7 +66,7 @@ request_timeout_secs = 2
         ),
         None => r#"
 [embed]
-backend = "model2vec"
+backend = "stub"
 "#
         .to_string(),
     };

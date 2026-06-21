@@ -1208,6 +1208,7 @@ async fn test_reindex_dim_change_invalidates_existing() {
     handle6.shutdown().await;
 }
 
+#[cfg(feature = "model2vec")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_default_model2vec_reindex_records_non_stale_fingerprint() {
     let _guard = test_guard().await;
@@ -1257,7 +1258,7 @@ async fn test_embed_degraded_blocks_writes_when_configured() {
 db_path = "__DB_PATH__"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [embed.degradation]
 degrade_after_n_failures = 2
