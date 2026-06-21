@@ -119,7 +119,7 @@ fn no_llm_policy_rejects_multimodal_auto_parser() {
 }
 
 #[test]
-fn auto_parser_dispatches_pdf_to_text_extractor() {
+fn auto_parser_fails_closed_for_pdf_without_bounded_extractor() {
     let error = parse_document(
         Path::new("paper.pdf"),
         b"not a real pdf",
@@ -128,13 +128,19 @@ fn auto_parser_dispatches_pdf_to_text_extractor() {
             allow_llm: false,
         },
     )
-    .expect_err("invalid PDF should still dispatch to PDF extractor");
+    .expect_err("deterministic PDF parser must fail closed");
 
-    assert!(matches!(error, ParserError::PdfText { .. }));
+    assert!(matches!(
+        error,
+        ParserError::UnsafeDeterministicParser {
+            parser: ParserMode::Pdf,
+            ..
+        }
+    ));
 }
 
 #[test]
-fn pdf_parser_rejects_raw_input_over_limit_before_pdf_extract() {
+fn pdf_parser_rejects_raw_input_over_limit_before_disabled_parser() {
     let limits = ParserResourceLimits::default();
     let oversized_pdf = vec![b'%'; limits.max_pdf_input_bytes + 1];
     let error = parse_document(
@@ -145,12 +151,78 @@ fn pdf_parser_rejects_raw_input_over_limit_before_pdf_extract() {
             allow_llm: false,
         },
     )
-    .expect_err("oversized PDF should fail before pdf_extract");
+    .expect_err("oversized PDF should fail before parser dispatch");
 
     assert!(matches!(
         error,
         ParserError::ResourceLimitExceeded {
             limit: ParserResourceLimit::PdfInputBytes,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn office_parser_rejects_aggregate_compressed_xml_bytes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let source = tmp.path().join("aggregate-bytes.pptx");
+    let limits = ParserResourceLimits::default();
+    let payload_len = limits.max_ooxml_xml_member_bytes - 128;
+    let xml = format!("<p:sld><!--{}--></p:sld>", "a".repeat(payload_len));
+    let entries_needed = (limits.max_ooxml_xml_document_bytes / xml.len()).saturating_add(1);
+    let entries: Vec<_> = (0..entries_needed)
+        .map(|index| (format!("ppt/slides/slide{index}.xml"), xml.as_str()))
+        .collect();
+    write_docx_with_method(&source, &entries, zip::CompressionMethod::Deflated);
+    let bytes = fs::read(&source).expect("read pptx");
+
+    let error = parse_document(
+        &source,
+        &bytes,
+        ParseContext {
+            mode: ParserMode::Auto,
+            allow_llm: false,
+        },
+    )
+    .expect_err("cumulative OOXML bytes should hit the document limit");
+
+    assert!(matches!(
+        error,
+        ParserError::ResourceLimitExceeded {
+            limit: ParserResourceLimit::OoxmlXmlDocumentBytes,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn office_parser_rejects_aggregate_xml_nodes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let source = tmp.path().join("aggregate-nodes.pptx");
+    let limits = ParserResourceLimits::default();
+    let nodes_per_member = 512usize;
+    let xml = format!("<p:sld>{}</p:sld>", "<p:sp/>".repeat(nodes_per_member));
+    let entries_needed = (limits.max_xml_nodes / nodes_per_member).saturating_add(1);
+    let entries: Vec<_> = (0..entries_needed)
+        .map(|index| (format!("ppt/slides/slide{index}.xml"), xml.as_str()))
+        .collect();
+    write_docx_with_method(&source, &entries, zip::CompressionMethod::Deflated);
+    let bytes = fs::read(&source).expect("read pptx");
+
+    let error = parse_document(
+        &source,
+        &bytes,
+        ParseContext {
+            mode: ParserMode::Auto,
+            allow_llm: false,
+        },
+    )
+    .expect_err("cumulative OOXML nodes should hit the document limit");
+
+    assert!(matches!(
+        error,
+        ParserError::ResourceLimitExceeded {
+            limit: ParserResourceLimit::XmlNodeCount,
             ..
         }
     ));

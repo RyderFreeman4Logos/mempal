@@ -14,13 +14,14 @@ use super::detect::{Format, detect_format};
 /// Resource limits for deterministic in-process parsers.
 ///
 /// These defaults keep plugin parsing bounded while still allowing ordinary
-/// notes, source files, PDFs, and Office documents to ingest without config.
+/// notes, source files, and Office documents to ingest without config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParserResourceLimits {
     pub max_deterministic_input_bytes: usize,
     pub max_pdf_input_bytes: usize,
     pub max_ooxml_archive_entries: usize,
     pub max_ooxml_xml_member_bytes: usize,
+    pub max_ooxml_xml_document_bytes: usize,
     pub max_extracted_text_bytes: usize,
     pub max_extracted_text_fragments: usize,
     pub max_xml_nodes: usize,
@@ -33,6 +34,7 @@ impl Default for ParserResourceLimits {
             max_pdf_input_bytes: 8 * 1024 * 1024,
             max_ooxml_archive_entries: 1024,
             max_ooxml_xml_member_bytes: 2 * 1024 * 1024,
+            max_ooxml_xml_document_bytes: 8 * 1024 * 1024,
             max_extracted_text_bytes: 1024 * 1024,
             max_extracted_text_fragments: 16_384,
             max_xml_nodes: 131_072,
@@ -46,6 +48,7 @@ pub enum ParserResourceLimit {
     PdfInputBytes,
     OoxmlArchiveEntries,
     OoxmlXmlMemberBytes,
+    OoxmlXmlDocumentBytes,
     ExtractedTextBytes,
     ExtractedTextFragments,
     XmlNodeCount,
@@ -58,6 +61,7 @@ impl fmt::Display for ParserResourceLimit {
             Self::PdfInputBytes => "pdf_input_bytes",
             Self::OoxmlArchiveEntries => "ooxml_archive_entries",
             Self::OoxmlXmlMemberBytes => "ooxml_xml_member_bytes",
+            Self::OoxmlXmlDocumentBytes => "ooxml_xml_document_bytes",
             Self::ExtractedTextBytes => "extracted_text_bytes",
             Self::ExtractedTextFragments => "extracted_text_fragments",
             Self::XmlNodeCount => "xml_node_count",
@@ -141,18 +145,18 @@ pub enum ParserError {
     LlmParserUnavailable { parser: ParserMode, path: PathBuf },
     #[error("unsupported parser `{parser}` for {path}")]
     UnsupportedParser { parser: ParserMode, path: PathBuf },
+    #[error("deterministic parser `{parser}` is disabled for {path}: {reason}")]
+    UnsafeDeterministicParser {
+        parser: ParserMode,
+        path: PathBuf,
+        reason: &'static str,
+    },
     #[error("parser resource limit `{limit}` exceeded for {path}: actual={actual}, max={max}")]
     ResourceLimitExceeded {
         path: PathBuf,
         limit: ParserResourceLimit,
         actual: u64,
         max: u64,
-    },
-    #[error("failed to extract text from PDF {path}")]
-    PdfText {
-        path: PathBuf,
-        #[source]
-        source: pdf_extract::OutputError,
     },
     #[error("failed to read Office archive {path}")]
     OfficeZip {
@@ -430,16 +434,10 @@ impl DocumentParser for PdfParser {
             ParserResourceLimit::PdfInputBytes,
             ParserResourceLimits::default().max_pdf_input_bytes,
         )?;
-        let content = pdf_extract::extract_text_from_mem(input.bytes).map_err(|source| {
-            ParserError::PdfText {
-                path: input.path.to_path_buf(),
-                source,
-            }
-        })?;
-        Ok(ParsedDocument {
-            content,
-            format: Format::PlainText,
-            parser_id: self.id(),
+        Err(ParserError::UnsafeDeterministicParser {
+            parser: ParserMode::Pdf,
+            path: input.path.to_path_buf(),
+            reason: "no bounded in-process PDF extractor is available; use an explicit LLM/OCR parser when configured",
         })
     }
 }
@@ -487,6 +485,7 @@ fn extract_office_text(path: &Path, bytes: &[u8]) -> Result<String, ParserError>
         limits.max_ooxml_archive_entries,
     )?;
     let mut content = BoundedText::default();
+    let mut budget = OoxmlDocumentBudget::default();
 
     for index in 0..archive.len() {
         let mut file = archive
@@ -501,8 +500,10 @@ fn extract_office_text(path: &Path, bytes: &[u8]) -> Result<String, ParserError>
         }
 
         let uncompressed_size = file.size();
+        budget.ensure_next_xml_member(path, uncompressed_size, &limits)?;
         let xml = read_ooxml_member(path, &mut file, uncompressed_size, &limits)?;
-        extract_xml_text(path, &xml, &limits, &mut content)?;
+        budget.add_xml_bytes(path, xml.len() as u64, &limits)?;
+        extract_xml_text(path, &xml, &limits, &mut budget, &mut content)?;
     }
 
     let content = content.into_string();
@@ -552,21 +553,15 @@ fn extract_xml_text(
     path: &Path,
     xml: &str,
     limits: &ParserResourceLimits,
+    budget: &mut OoxmlDocumentBudget,
     output: &mut BoundedText,
 ) -> Result<(), ParserError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-    let mut xml_nodes = 0usize;
     let mut member_has_text = false;
 
     loop {
-        xml_nodes = xml_nodes.saturating_add(1);
-        ensure_input_within_limit(
-            path,
-            xml_nodes,
-            ParserResourceLimit::XmlNodeCount,
-            limits.max_xml_nodes,
-        )?;
+        budget.add_xml_node(path, limits)?;
         match reader.read_event() {
             Ok(Event::Text(text)) => {
                 let decoded = text
@@ -614,6 +609,57 @@ fn extract_xml_text(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct OoxmlDocumentBudget {
+    xml_bytes: u64,
+    xml_nodes: u64,
+}
+
+impl OoxmlDocumentBudget {
+    fn ensure_next_xml_member(
+        &self,
+        path: &Path,
+        uncompressed_size: u64,
+        limits: &ParserResourceLimits,
+    ) -> Result<(), ParserError> {
+        ensure_resource_limit(
+            path,
+            self.xml_bytes.saturating_add(uncompressed_size),
+            ParserResourceLimit::OoxmlXmlDocumentBytes,
+            limits.max_ooxml_xml_document_bytes as u64,
+        )
+    }
+
+    fn add_xml_bytes(
+        &mut self,
+        path: &Path,
+        bytes: u64,
+        limits: &ParserResourceLimits,
+    ) -> Result<(), ParserError> {
+        self.xml_bytes = self.xml_bytes.saturating_add(bytes);
+        ensure_resource_limit(
+            path,
+            self.xml_bytes,
+            ParserResourceLimit::OoxmlXmlDocumentBytes,
+            limits.max_ooxml_xml_document_bytes as u64,
+        )
+    }
+
+    fn add_xml_node(
+        &mut self,
+        path: &Path,
+        limits: &ParserResourceLimits,
+    ) -> Result<(), ParserError> {
+        self.xml_nodes = self.xml_nodes.saturating_add(1);
+        ensure_resource_limit(
+            path,
+            self.xml_nodes,
+            ParserResourceLimit::XmlNodeCount,
+            limits.max_xml_nodes as u64,
+        )
+    }
 }
 
 #[derive(Debug, Default)]

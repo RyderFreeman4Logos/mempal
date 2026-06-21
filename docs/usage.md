@@ -391,7 +391,9 @@ mempal ingest docs/ --wing docs --parser auto --no-llm --dry-run
 ```
 
 `--parser auto` dispatches through built-in Rust parsers for text, Markdown,
-code, JSONL, PDF text, and OOXML Office files (`.docx`, `.pptx`, `.xlsx`).
+code, JSONL, and OOXML Office files (`.docx`, `.pptx`, `.xlsx`). Deterministic
+PDF text parsing is disabled unless a bounded extractor is added; use an
+explicit OCR/LLM parser only when that provider is configured and acceptable.
 Image, audio, video, OCR, VLM, and MM-LLM parsing require explicit
 `--allow-llm`; without that opt-in, `--no-llm`/default policy rejects those
 inputs instead of making remote calls.
