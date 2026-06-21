@@ -62,6 +62,17 @@ fn write_docx_with_method(path: &Path, entries: &[(String, &str)], method: zip::
     writer.finish().expect("finish docx");
 }
 
+fn write_xlsx(path: &Path, shared_strings: &str, worksheet: &str) {
+    write_docx_with_method(
+        path,
+        &[
+            ("xl/sharedStrings.xml".to_string(), shared_strings),
+            ("xl/worksheets/sheet1.xml".to_string(), worksheet),
+        ],
+        zip::CompressionMethod::Stored,
+    );
+}
+
 fn only_active_content(db: &Database) -> String {
     db.conn()
         .query_row(
@@ -160,6 +171,30 @@ fn pdf_parser_rejects_raw_input_over_limit_before_disabled_parser() {
             ..
         }
     ));
+}
+
+#[test]
+fn office_parser_does_not_emit_xlsx_shared_string_indexes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let source = tmp.path().join("names.xlsx");
+    write_xlsx(
+        &source,
+        r#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Alice</t></si></sst>"#,
+        r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>"#,
+    );
+    let bytes = fs::read(&source).expect("read xlsx");
+
+    let parsed = parse_document(
+        &source,
+        &bytes,
+        ParseContext {
+            mode: ParserMode::Auto,
+            allow_llm: false,
+        },
+    )
+    .expect("parse xlsx");
+
+    assert_eq!(parsed.content, "Alice");
 }
 
 #[test]

@@ -11,6 +11,16 @@ use zip::ZipArchive;
 
 use super::detect::{Format, detect_format};
 
+const ZIP_EOCD_SIGNATURE: u32 = 0x0605_4b50;
+const ZIP64_EOCD_SIGNATURE: u32 = 0x0606_4b50;
+const ZIP64_EOCD_LOCATOR_SIGNATURE: u32 = 0x0706_4b50;
+const ZIP_EOCD_MIN_LEN: usize = 22;
+const ZIP64_EOCD_MIN_LEN: usize = 56;
+const ZIP64_EOCD_LOCATOR_LEN: usize = 20;
+const ZIP_MAX_COMMENT_LEN: usize = u16::MAX as usize;
+const ZIP16_ENTRY_COUNT_SENTINEL: u16 = u16::MAX;
+const ZIP32_SIZE_SENTINEL: u32 = u32::MAX;
+
 /// Resource limits for deterministic in-process parsers.
 ///
 /// These defaults keep plugin parsing bounded while still allowing ordinary
@@ -20,6 +30,7 @@ pub struct ParserResourceLimits {
     pub max_deterministic_input_bytes: usize,
     pub max_pdf_input_bytes: usize,
     pub max_ooxml_archive_entries: usize,
+    pub max_ooxml_central_directory_bytes: usize,
     pub max_ooxml_xml_member_bytes: usize,
     pub max_ooxml_xml_document_bytes: usize,
     pub max_extracted_text_bytes: usize,
@@ -33,6 +44,7 @@ impl Default for ParserResourceLimits {
             max_deterministic_input_bytes: 64 * 1024 * 1024,
             max_pdf_input_bytes: 8 * 1024 * 1024,
             max_ooxml_archive_entries: 1024,
+            max_ooxml_central_directory_bytes: 4 * 1024 * 1024,
             max_ooxml_xml_member_bytes: 2 * 1024 * 1024,
             max_ooxml_xml_document_bytes: 8 * 1024 * 1024,
             max_extracted_text_bytes: 1024 * 1024,
@@ -47,6 +59,7 @@ pub enum ParserResourceLimit {
     DeterministicInputBytes,
     PdfInputBytes,
     OoxmlArchiveEntries,
+    OoxmlCentralDirectoryBytes,
     OoxmlXmlMemberBytes,
     OoxmlXmlDocumentBytes,
     ExtractedTextBytes,
@@ -60,6 +73,7 @@ impl fmt::Display for ParserResourceLimit {
             Self::DeterministicInputBytes => "deterministic_input_bytes",
             Self::PdfInputBytes => "pdf_input_bytes",
             Self::OoxmlArchiveEntries => "ooxml_archive_entries",
+            Self::OoxmlCentralDirectoryBytes => "ooxml_central_directory_bytes",
             Self::OoxmlXmlMemberBytes => "ooxml_xml_member_bytes",
             Self::OoxmlXmlDocumentBytes => "ooxml_xml_document_bytes",
             Self::ExtractedTextBytes => "extracted_text_bytes",
@@ -164,6 +178,8 @@ pub enum ParserError {
         #[source]
         source: zip::result::ZipError,
     },
+    #[error("failed to preflight Office archive {path}: {reason}")]
+    OfficeZipPreflight { path: PathBuf, reason: &'static str },
     #[error("failed to read Office XML member from {path}")]
     OfficeIo {
         path: PathBuf,
@@ -175,6 +191,12 @@ pub enum ParserError {
         path: PathBuf,
         #[source]
         source: quick_xml::Error,
+    },
+    #[error("failed to parse Office XML attributes from {path}")]
+    OfficeXmlAttribute {
+        path: PathBuf,
+        #[source]
+        source: quick_xml::events::attributes::AttrError,
     },
     #[error("failed to decode Office XML text from {path}")]
     OfficeXmlDecode {
@@ -473,6 +495,7 @@ impl DocumentParser for OfficeParser {
 
 fn extract_office_text(path: &Path, bytes: &[u8]) -> Result<String, ParserError> {
     let limits = ParserResourceLimits::default();
+    preflight_ooxml_zip(path, bytes, &limits)?;
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor).map_err(|source| ParserError::OfficeZip {
         path: path.to_path_buf(),
@@ -495,15 +518,15 @@ fn extract_office_text(path: &Path, bytes: &[u8]) -> Result<String, ParserError>
                 source,
             })?;
         let name = file.name().to_string();
-        if !is_office_text_xml(&name) {
+        let Some(xml_kind) = office_text_xml_kind(&name) else {
             continue;
-        }
+        };
 
         let uncompressed_size = file.size();
         budget.ensure_next_xml_member(path, uncompressed_size, &limits)?;
         let xml = read_ooxml_member(path, &mut file, uncompressed_size, &limits)?;
         budget.add_xml_bytes(path, xml.len() as u64, &limits)?;
-        extract_xml_text(path, &xml, &limits, &mut budget, &mut content)?;
+        extract_xml_text(path, &xml, xml_kind, &limits, &mut budget, &mut content)?;
     }
 
     let content = content.into_string();
@@ -513,6 +536,157 @@ fn extract_office_text(path: &Path, bytes: &[u8]) -> Result<String, ParserError>
         });
     }
     Ok(content)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OoxmlZipMetadata {
+    entries: u64,
+    central_directory_size: u64,
+    central_directory_offset: u64,
+}
+
+pub(crate) fn preflight_ooxml_zip(
+    path: &Path,
+    bytes: &[u8],
+    limits: &ParserResourceLimits,
+) -> Result<OoxmlZipMetadata, ParserError> {
+    let metadata = read_zip_metadata(path, bytes)?;
+    ensure_resource_limit(
+        path,
+        metadata.entries,
+        ParserResourceLimit::OoxmlArchiveEntries,
+        limits.max_ooxml_archive_entries as u64,
+    )?;
+    ensure_resource_limit(
+        path,
+        metadata.central_directory_size,
+        ParserResourceLimit::OoxmlCentralDirectoryBytes,
+        limits.max_ooxml_central_directory_bytes as u64,
+    )?;
+    let archive_len = bytes.len() as u64;
+    let central_directory_end = metadata
+        .central_directory_offset
+        .checked_add(metadata.central_directory_size)
+        .ok_or_else(|| ooxml_preflight_error(path, "central directory bounds overflow"))?;
+    if central_directory_end > archive_len {
+        return Err(ooxml_preflight_error(
+            path,
+            "central directory extends beyond archive bytes",
+        ));
+    }
+    Ok(metadata)
+}
+
+fn read_zip_metadata(path: &Path, bytes: &[u8]) -> Result<OoxmlZipMetadata, ParserError> {
+    let eocd_offset = find_zip_eocd(bytes)
+        .ok_or_else(|| ooxml_preflight_error(path, "end-of-central-directory record not found"))?;
+    let entries16 = read_u16_le(bytes, eocd_offset + 10)
+        .ok_or_else(|| ooxml_preflight_error(path, "truncated end-of-central-directory record"))?;
+    let central_directory_size32 = read_u32_le(bytes, eocd_offset + 12)
+        .ok_or_else(|| ooxml_preflight_error(path, "truncated end-of-central-directory record"))?;
+    let central_directory_offset32 = read_u32_le(bytes, eocd_offset + 16)
+        .ok_or_else(|| ooxml_preflight_error(path, "truncated end-of-central-directory record"))?;
+
+    if entries16 == ZIP16_ENTRY_COUNT_SENTINEL
+        || central_directory_size32 == ZIP32_SIZE_SENTINEL
+        || central_directory_offset32 == ZIP32_SIZE_SENTINEL
+    {
+        return read_zip64_metadata(path, bytes, eocd_offset);
+    }
+
+    Ok(OoxmlZipMetadata {
+        entries: u64::from(entries16),
+        central_directory_size: u64::from(central_directory_size32),
+        central_directory_offset: u64::from(central_directory_offset32),
+    })
+}
+
+fn read_zip64_metadata(
+    path: &Path,
+    bytes: &[u8],
+    eocd_offset: usize,
+) -> Result<OoxmlZipMetadata, ParserError> {
+    let locator_offset = eocd_offset
+        .checked_sub(ZIP64_EOCD_LOCATOR_LEN)
+        .ok_or_else(|| ooxml_preflight_error(path, "missing Zip64 locator"))?;
+    let locator_signature = read_u32_le(bytes, locator_offset)
+        .ok_or_else(|| ooxml_preflight_error(path, "truncated Zip64 locator"))?;
+    if locator_signature != ZIP64_EOCD_LOCATOR_SIGNATURE {
+        return Err(ooxml_preflight_error(path, "missing Zip64 locator"));
+    }
+    let zip64_eocd_offset = read_u64_le(bytes, locator_offset + 8)
+        .ok_or_else(|| ooxml_preflight_error(path, "truncated Zip64 locator"))?;
+    let zip64_eocd_offset = usize::try_from(zip64_eocd_offset)
+        .map_err(|_| ooxml_preflight_error(path, "Zip64 record offset is too large"))?;
+    let zip64_signature = read_u32_le(bytes, zip64_eocd_offset)
+        .ok_or_else(|| ooxml_preflight_error(path, "truncated Zip64 record"))?;
+    if zip64_signature != ZIP64_EOCD_SIGNATURE {
+        return Err(ooxml_preflight_error(path, "missing Zip64 record"));
+    }
+    let zip64_record_size = read_u64_le(bytes, zip64_eocd_offset + 4)
+        .ok_or_else(|| ooxml_preflight_error(path, "truncated Zip64 record"))?;
+    if zip64_record_size < 44 {
+        return Err(ooxml_preflight_error(path, "invalid Zip64 record size"));
+    }
+    let zip64_min_end = zip64_eocd_offset
+        .checked_add(ZIP64_EOCD_MIN_LEN)
+        .ok_or_else(|| ooxml_preflight_error(path, "Zip64 record bounds overflow"))?;
+    if zip64_min_end > bytes.len() {
+        return Err(ooxml_preflight_error(path, "truncated Zip64 record"));
+    }
+
+    Ok(OoxmlZipMetadata {
+        entries: read_u64_le(bytes, zip64_eocd_offset + 32)
+            .ok_or_else(|| ooxml_preflight_error(path, "truncated Zip64 record"))?,
+        central_directory_size: read_u64_le(bytes, zip64_eocd_offset + 40)
+            .ok_or_else(|| ooxml_preflight_error(path, "truncated Zip64 record"))?,
+        central_directory_offset: read_u64_le(bytes, zip64_eocd_offset + 48)
+            .ok_or_else(|| ooxml_preflight_error(path, "truncated Zip64 record"))?,
+    })
+}
+
+fn find_zip_eocd(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < ZIP_EOCD_MIN_LEN {
+        return None;
+    }
+    let search_start = bytes
+        .len()
+        .saturating_sub(ZIP_EOCD_MIN_LEN + ZIP_MAX_COMMENT_LEN);
+    let latest_start = bytes.len() - ZIP_EOCD_MIN_LEN;
+    for offset in (search_start..=latest_start).rev() {
+        if read_u32_le(bytes, offset) != Some(ZIP_EOCD_SIGNATURE) {
+            continue;
+        }
+        let comment_len = read_u16_le(bytes, offset + 20)? as usize;
+        if offset + ZIP_EOCD_MIN_LEN + comment_len == bytes.len() {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
+    let slice = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    let slice = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
+    let slice = bytes.get(offset..offset.checked_add(8)?)?;
+    Some(u64::from_le_bytes([
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]))
+}
+
+fn ooxml_preflight_error(path: &Path, reason: &'static str) -> ParserError {
+    ParserError::OfficeZipPreflight {
+        path: path.to_path_buf(),
+        reason,
+    }
 }
 
 fn read_ooxml_member<R: Read>(
@@ -552,6 +726,7 @@ fn read_ooxml_member<R: Read>(
 fn extract_xml_text(
     path: &Path,
     xml: &str,
+    xml_kind: OfficeXmlKind,
     limits: &ParserResourceLimits,
     budget: &mut OoxmlDocumentBudget,
     output: &mut BoundedText,
@@ -559,10 +734,21 @@ fn extract_xml_text(
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut member_has_text = false;
+    let mut worksheet_state = WorksheetTextState::default();
 
     loop {
         budget.add_xml_node(path, limits)?;
         match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                if xml_kind == OfficeXmlKind::SpreadsheetWorksheet {
+                    worksheet_state.enter_start(path, &element)?;
+                }
+            }
+            Ok(Event::End(element)) => {
+                if xml_kind == OfficeXmlKind::SpreadsheetWorksheet {
+                    worksheet_state.exit_end(&element);
+                }
+            }
             Ok(Event::Text(text)) => {
                 let decoded = text
                     .decode()
@@ -577,7 +763,14 @@ fn extract_xml_text(
                     })?;
                 let value = unescaped.trim();
                 if !value.is_empty() {
-                    output.push_fragment(path, value, &mut member_has_text, limits)?;
+                    push_xml_fragment(
+                        path,
+                        value,
+                        &worksheet_state,
+                        output,
+                        &mut member_has_text,
+                        limits,
+                    )?;
                 }
             }
             Ok(Event::CData(text)) => {
@@ -589,12 +782,26 @@ fn extract_xml_text(
                     })?;
                 let value = decoded.trim();
                 if !value.is_empty() {
-                    output.push_fragment(path, value, &mut member_has_text, limits)?;
+                    push_xml_fragment(
+                        path,
+                        value,
+                        &worksheet_state,
+                        output,
+                        &mut member_has_text,
+                        limits,
+                    )?;
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
                 if let Some(value) = resolve_general_ref(path, &reference)? {
-                    output.push_fragment(path, &value, &mut member_has_text, limits)?;
+                    push_xml_fragment(
+                        path,
+                        &value,
+                        &worksheet_state,
+                        output,
+                        &mut member_has_text,
+                        limits,
+                    )?;
                 }
             }
             Ok(Event::Eof) => break,
@@ -609,6 +816,100 @@ fn extract_xml_text(
     }
 
     Ok(())
+}
+
+fn push_xml_fragment(
+    path: &Path,
+    value: &str,
+    worksheet_state: &WorksheetTextState,
+    output: &mut BoundedText,
+    member_has_text: &mut bool,
+    limits: &ParserResourceLimits,
+) -> Result<(), ParserError> {
+    if worksheet_state.should_skip_text() {
+        return Ok(());
+    }
+    output.push_fragment(path, value, member_has_text, limits)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OfficeXmlKind {
+    PlainText,
+    SpreadsheetWorksheet,
+}
+
+#[derive(Debug, Default)]
+struct WorksheetTextState {
+    cell_depth: u32,
+    shared_string_cell: bool,
+    shared_string_value_depth: u32,
+}
+
+impl WorksheetTextState {
+    fn enter_start(
+        &mut self,
+        path: &Path,
+        element: &quick_xml::events::BytesStart<'_>,
+    ) -> Result<(), ParserError> {
+        let name = element.name();
+        if xml_local_name_eq(name.as_ref(), b"c") {
+            self.cell_depth = self.cell_depth.saturating_add(1);
+            if self.cell_depth == 1 {
+                self.shared_string_cell = element_has_raw_attribute(path, element, b"t", b"s")?;
+            }
+            return Ok(());
+        }
+        if self.cell_depth > 0 && self.shared_string_cell && xml_local_name_eq(name.as_ref(), b"v")
+        {
+            self.shared_string_value_depth = self.shared_string_value_depth.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn exit_end(&mut self, element: &quick_xml::events::BytesEnd<'_>) {
+        let name = element.name();
+        if self.shared_string_value_depth > 0 && xml_local_name_eq(name.as_ref(), b"v") {
+            self.shared_string_value_depth -= 1;
+            return;
+        }
+        if self.cell_depth > 0 && xml_local_name_eq(name.as_ref(), b"c") {
+            self.cell_depth -= 1;
+            if self.cell_depth == 0 {
+                self.shared_string_cell = false;
+                self.shared_string_value_depth = 0;
+            }
+        }
+    }
+
+    fn should_skip_text(&self) -> bool {
+        self.shared_string_value_depth > 0
+    }
+}
+
+fn element_has_raw_attribute(
+    path: &Path,
+    element: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+    value: &[u8],
+) -> Result<bool, ParserError> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|source| ParserError::OfficeXmlAttribute {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if xml_local_name_eq(attribute.key.as_ref(), key) && attribute.value.as_ref() == value {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn xml_local_name_eq(name: &[u8], expected: &[u8]) -> bool {
+    name == expected
+        || name
+            .rsplit(|byte| *byte == b':')
+            .next()
+            .is_some_and(|local_name| local_name == expected)
 }
 
 #[derive(Debug, Default)]
@@ -771,11 +1072,17 @@ fn resolve_general_ref(
     Ok(Some(value.to_string()))
 }
 
-fn is_office_text_xml(name: &str) -> bool {
-    name == "word/document.xml"
+fn office_text_xml_kind(name: &str) -> Option<OfficeXmlKind> {
+    if name == "word/document.xml"
         || name == "xl/sharedStrings.xml"
         || (name.starts_with("ppt/slides/slide") && name.ends_with(".xml"))
-        || (name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml"))
+    {
+        return Some(OfficeXmlKind::PlainText);
+    }
+    if name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml") {
+        return Some(OfficeXmlKind::SpreadsheetWorksheet);
+    }
+    None
 }
 
 fn llm_parser_for_path(path: &Path, mode: ParserMode) -> Option<ParserMode> {
@@ -829,4 +1136,104 @@ fn matches_extension(path: &Path, candidates: &[&str]) -> bool {
                 .any(|candidate| extension.eq_ignore_ascii_case(candidate))
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Write};
+
+    use zip::write::SimpleFileOptions;
+
+    use super::*;
+
+    fn zip_with_empty_entries(entry_count: usize) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        for index in 0..entry_count {
+            writer
+                .start_file(
+                    format!("ppt/slides/slide{index}.xml"),
+                    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+                )
+                .expect("start zip member");
+            writer.write_all(b"<p:sld/>").expect("write zip member");
+        }
+        writer.finish().expect("finish zip").into_inner()
+    }
+
+    #[test]
+    fn ooxml_zip_preflight_rejects_entry_count_before_archive_open() {
+        let limits = ParserResourceLimits::default();
+        let archive = zip_with_empty_entries(limits.max_ooxml_archive_entries + 1);
+
+        let error = preflight_ooxml_zip(Path::new("many-slides.pptx"), &archive, &limits)
+            .expect_err("preflight should reject too many entries directly");
+
+        assert!(matches!(
+            error,
+            ParserError::ResourceLimitExceeded {
+                limit: ParserResourceLimit::OoxmlArchiveEntries,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ooxml_zip_preflight_rejects_central_directory_bytes() {
+        let limits = ParserResourceLimits {
+            max_ooxml_central_directory_bytes: 32,
+            ..ParserResourceLimits::default()
+        };
+        let archive = zip_with_empty_entries(2);
+
+        let error = preflight_ooxml_zip(Path::new("wide-directory.docx"), &archive, &limits)
+            .expect_err("preflight should cap the central directory directly");
+
+        assert!(matches!(
+            error,
+            ParserError::ResourceLimitExceeded {
+                limit: ParserResourceLimit::OoxmlCentralDirectoryBytes,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ooxml_zip_preflight_reads_zip64_metadata() {
+        let limits = ParserResourceLimits::default();
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&ZIP64_EOCD_SIGNATURE.to_le_bytes());
+        archive.extend_from_slice(&44u64.to_le_bytes());
+        archive.extend_from_slice(&45u16.to_le_bytes());
+        archive.extend_from_slice(&45u16.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&0u64.to_le_bytes());
+        archive.extend_from_slice(&((limits.max_ooxml_archive_entries + 1) as u64).to_le_bytes());
+        archive.extend_from_slice(&0u64.to_le_bytes());
+        archive.extend_from_slice(&0u64.to_le_bytes());
+        archive.extend_from_slice(&ZIP64_EOCD_LOCATOR_SIGNATURE.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&0u64.to_le_bytes());
+        archive.extend_from_slice(&1u32.to_le_bytes());
+        archive.extend_from_slice(&ZIP_EOCD_SIGNATURE.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(&ZIP16_ENTRY_COUNT_SENTINEL.to_le_bytes());
+        archive.extend_from_slice(&ZIP16_ENTRY_COUNT_SENTINEL.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+
+        let error = preflight_ooxml_zip(Path::new("zip64.docx"), &archive, &limits)
+            .expect_err("preflight should use Zip64 entry metadata");
+
+        assert!(matches!(
+            error,
+            ParserError::ResourceLimitExceeded {
+                limit: ParserResourceLimit::OoxmlArchiveEntries,
+                ..
+            }
+        ));
+    }
 }
