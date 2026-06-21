@@ -211,19 +211,19 @@ fn bootstrap_inner(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    // Atomic singleton gate (#257): acquire the exclusive daemon lock BEFORE
+    // Atomic singleton gate (#496): acquire the DB-scoped exclusive daemon lock BEFORE
     // daemonizing. A race loser that cannot get the lock concludes a healthy
     // daemon already holds it and returns `DaemonAlreadyRunning` so the caller
     // can exit cleanly WITHOUT daemonizing. The lock's open file description
     // survives the double-fork in `perform_daemonize`, keeping the singleton
     // guarantee through the daemon's whole lifetime.
-    let lock_guard = match crate::daemon_singleton::try_acquire(&mempal_home)
+    let mut lock_guard = match crate::daemon_singleton::try_acquire(&db_path)
         .context("failed to acquire daemon singleton lock")?
     {
         crate::daemon_singleton::DaemonLockAcquisition::Acquired(guard) => guard,
-        crate::daemon_singleton::DaemonLockAcquisition::AlreadyHeld => {
+        crate::daemon_singleton::DaemonLockAcquisition::AlreadyHeld { owner, lock_path } => {
             return Err(anyhow::Error::new(
-                crate::daemon_singleton::DaemonAlreadyRunning,
+                crate::daemon_singleton::DaemonAlreadyRunning::new(owner, Some(lock_path)),
             ));
         }
     };
@@ -231,6 +231,9 @@ fn bootstrap_inner(
     // harness-point: PR0
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::Daemonize);
     perform_daemonize(foreground, &mempal_home, &log_path)?;
+    lock_guard
+        .refresh_metadata()
+        .context("failed to refresh daemon singleton metadata")?;
 
     // harness-point: PR0
     emit_bootstrap_event(bootstrap_events.as_ref(), BootstrapEvent::RuntimeInit);

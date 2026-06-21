@@ -4,8 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "rest")]
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -55,8 +54,8 @@ use mempal::core::{
         KnowledgeCardEvent, KnowledgeCardFilter, KnowledgeEventType, KnowledgeEvidenceLink,
         KnowledgeEvidenceRole, KnowledgeStatus, KnowledgeTier, MemoryDomain, MemoryKind,
         Provenance, RuntimeAdoptionEvent, RuntimeAdoptionFilter, RuntimeAdoptionSignal,
-        RuntimeAdoptionTrack, SourceType, TaxonomyEntry, TriggerHints, TunnelEndpoint,
-        default_confidence,
+        RuntimeAdoptionTrack, RuntimeWriterLease, SourceType, TaxonomyEntry, TriggerHints,
+        TunnelEndpoint, default_confidence,
     },
     utils::{
         build_bootstrap_evidence_drawer_id, build_triple_id, current_timestamp,
@@ -79,7 +78,7 @@ use mempal::ingest::{
     IngestOptions, IngestStats,
     detect::detect_format,
     gating::{IngestCandidate, evaluate_fact_check_gate, evaluate_tier1, evaluate_tier2},
-    ingest_dir_with_options, ingest_file_with_options,
+    ingest_dir_with_options_and_writer_lease, ingest_file_with_options_and_writer_lease,
     normalize::{CURRENT_NORMALIZE_VERSION, NormalizeOptions, normalize_content_with_options},
     reindex::{ReindexMode, ReindexOptions, ReindexReport, reindex_sources},
 };
@@ -2722,6 +2721,10 @@ const DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE: usize = 500;
 const DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY: usize = 1;
 const HISTORICAL_REJUDGE_CHECKPOINT_KEY: &str = "maintenance.rejudge.checkpoint";
 const HISTORICAL_REJUDGE_WORK_TABLE: &str = "historical_rejudge_work_items";
+const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
+const MAINTENANCE_WRITER_LEASE_TTL_SECS: u64 = 120;
+const MAINTENANCE_WRITER_LEASE_RENEW_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
 const HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT: &str = "sqlite_stream_v1";
 static HISTORICAL_REJUDGE_RUN_ID_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -2844,6 +2847,13 @@ struct HistoricalRejudgeCheckpointStart<'a> {
     judge_model: Option<String>,
     backup_dir: Option<&'a Path>,
     options_hash: String,
+    writer_lease: Option<&'a MaintenanceWriterLeaseGuard>,
+}
+
+#[derive(Clone, Copy)]
+struct HistoricalRejudgeWorkContext<'a> {
+    llm_context: Option<&'a HistoricalRejudgeLlmContext>,
+    writer_lease: Option<&'a MaintenanceWriterLeaseGuard>,
 }
 
 #[derive(Debug, Clone)]
@@ -4176,6 +4186,219 @@ where
     result
 }
 
+struct MaintenanceWriterLeaseGuard {
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+    active: Arc<std::sync::atomic::AtomicBool>,
+    stop: Option<mpsc::Sender<()>>,
+    heartbeat: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MaintenanceWriterLeaseGuard {
+    fn lease(&self) -> &RuntimeWriterLease {
+        &self.lease
+    }
+
+    fn ensure_active(&self, operation: &'static str) -> Result<()> {
+        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!(
+                "SQLite writer lease `{}` for {} was lost before {operation}",
+                self.lease.name,
+                self.lease.owner
+            );
+        }
+        let db = Database::open(&self.db_path).with_context(|| {
+            format!(
+                "failed to verify writer lease `{}` before {operation}",
+                self.lease.name
+            )
+        })?;
+        if db
+            .runtime_writer_lease_is_active(
+                &self.lease.name,
+                &self.lease.owner,
+                &self.lease.session_id,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to verify writer lease `{}` before {operation}",
+                    self.lease.name
+                )
+            })?
+        {
+            Ok(())
+        } else {
+            bail!(
+                "SQLite writer lease `{}` for {} was lost before {operation}",
+                self.lease.name,
+                self.lease.owner
+            )
+        }
+    }
+}
+
+fn ensure_maintenance_writer_lease_active(
+    lease: Option<&MaintenanceWriterLeaseGuard>,
+    operation: &'static str,
+) -> Result<()> {
+    if let Some(lease) = lease {
+        lease.ensure_active(operation)?;
+    }
+    Ok(())
+}
+
+impl Drop for MaintenanceWriterLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.heartbeat.take() {
+            let _ = handle.join();
+        }
+        if let Ok(db) = Database::open(&self.db_path) {
+            let _ = db.runtime_writer_lease_release(
+                &self.lease.name,
+                &self.lease.owner,
+                &self.lease.session_id,
+            );
+        }
+    }
+}
+
+fn acquire_maintenance_writer_lease(
+    db: &Database,
+    command: &str,
+) -> Result<MaintenanceWriterLeaseGuard> {
+    acquire_runtime_writer_lease(db, command, "maintenance", "mempal-maintenance")
+}
+
+fn acquire_cli_ingest_writer_lease(
+    db: &Database,
+    command: &str,
+) -> Result<MaintenanceWriterLeaseGuard> {
+    acquire_runtime_writer_lease(db, command, "ingest", "mempal-ingest")
+}
+
+fn acquire_cli_content_writer_lease(
+    db: &Database,
+    command: &str,
+) -> Result<MaintenanceWriterLeaseGuard> {
+    acquire_runtime_writer_lease(db, command, "cli-content-write", "mempal-cli")
+}
+
+fn acquire_runtime_writer_lease(
+    db: &Database,
+    command: &str,
+    mode: &str,
+    owner_prefix: &str,
+) -> Result<MaintenanceWriterLeaseGuard> {
+    let owner = format!("{owner_prefix}-{command}-{}", std::process::id());
+    let metadata = serde_json::json!({
+        "command": command,
+        "db_path": db.path().to_string_lossy(),
+    })
+    .to_string();
+    let lease = db
+        .runtime_writer_lease_acquire(
+            SQLITE_WRITER_LEASE_NAME,
+            &owner,
+            mode,
+            MAINTENANCE_WRITER_LEASE_TTL_SECS,
+            Some(&metadata),
+        )
+        .with_context(|| format!("failed to acquire writer lease for {command}"))?;
+    let lease = match lease {
+        Some(lease) => lease,
+        None => {
+            let active = db
+                .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+                .unwrap_or_default();
+            bail!(
+                "SQLite writer lease `{}` is already held; refusing to run {command}: {}",
+                SQLITE_WRITER_LEASE_NAME,
+                format_runtime_writer_leases(&active)
+            );
+        }
+    };
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let heartbeat = spawn_maintenance_writer_lease_heartbeat(
+        db.path().to_path_buf(),
+        lease.clone(),
+        Arc::clone(&active),
+        stop_rx,
+    );
+    Ok(MaintenanceWriterLeaseGuard {
+        db_path: db.path().to_path_buf(),
+        lease,
+        active,
+        stop: Some(stop_tx),
+        heartbeat: Some(heartbeat),
+    })
+}
+
+fn spawn_maintenance_writer_lease_heartbeat(
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+    active: Arc<std::sync::atomic::AtomicBool>,
+    stop: mpsc::Receiver<()>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        loop {
+            match stop.recv_timeout(MAINTENANCE_WRITER_LEASE_RENEW_INTERVAL) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let result = Database::open(&db_path).and_then(|db| {
+                db.runtime_writer_lease_renew(
+                    &lease.name,
+                    &lease.owner,
+                    &lease.session_id,
+                    MAINTENANCE_WRITER_LEASE_TTL_SECS,
+                )
+            });
+            match result {
+                Ok(true) => {}
+                Ok(false) => {
+                    active.store(false, std::sync::atomic::Ordering::SeqCst);
+                    eprintln!(
+                        "warning: writer lease `{}` for {} was lost; stop this command before continuing writes",
+                        lease.name, lease.owner
+                    );
+                    break;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: failed to renew writer lease `{}` for {}: {error}",
+                        lease.name, lease.owner
+                    );
+                }
+            }
+        }
+    })
+}
+
+fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
+    if leases.is_empty() {
+        return "none visible".to_string();
+    }
+    leases
+        .iter()
+        .map(|lease| {
+            format!(
+                "name={} owner={} pid={} mode={} expires_at={} heartbeat_at={}",
+                lease.name,
+                lease.owner,
+                lease.pid,
+                lease.mode,
+                lease.expires_at,
+                lease.heartbeat_at
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 async fn bench_command(config: &Config, command: BenchCommands) -> Result<()> {
     match command {
         BenchCommands::LongMemEval {
@@ -4257,9 +4480,11 @@ fn init_command(db: &Database, dir: &Path, dry_run: bool) -> Result<()> {
         .to_string();
     let rooms = detect_rooms(dir)?;
     if !dry_run {
+        let writer_lease = acquire_cli_content_writer_lease(db, "init")?;
         for room in &rooms {
             let keywords = serde_json::to_string(&vec![room.clone()])
                 .context("failed to serialize taxonomy keywords")?;
+            writer_lease.ensure_active("insert init taxonomy room")?;
             db.conn().execute("INSERT OR IGNORE INTO taxonomy (wing, room, display_name, keywords) VALUES (?1, ?2, ?3, ?4)", (&wing, room, room, keywords.as_str())).with_context(|| format!("failed to insert taxonomy room {room}"))?;
         }
     }
@@ -4362,8 +4587,9 @@ async fn ingest_command(
     };
 
     let stats = if options.dry_run {
-        ingest_path_with_options(db, &NoopEmbedder, path, wing, base_options).await?
+        ingest_path_with_options(db, &NoopEmbedder, path, wing, base_options, None).await?
     } else {
+        let writer_lease = acquire_cli_ingest_writer_lease(db, "ingest")?;
         let prototype_classifier = if config.ingest_gating.enabled && !options.no_gate {
             compile_classifier_from_config(config)
                 .await
@@ -4397,7 +4623,15 @@ async fn ingest_command(
             valid_from,
             valid_until,
         };
-        ingest_path_with_options(db, &*embedder, path, wing, live_options).await?
+        ingest_path_with_options(
+            db,
+            &*embedder,
+            path,
+            wing,
+            live_options,
+            Some(writer_lease.lease()),
+        )
+        .await?
     };
 
     append_ingest_audit_log(
@@ -4859,6 +5093,7 @@ async fn ingest_stdin_command(
     // terminal stats/audit path as the direct stdin ingest instead of
     // queueing a receipt that would report different skip semantics.
     if options.wait && exact_duplicate.is_some() {
+        let _writer_lease = acquire_cli_ingest_writer_lease(db, "ingest-stdin")?;
         finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
             db,
             wing: &resolved.wing,
@@ -4922,7 +5157,10 @@ async fn ingest_stdin_command(
         }
     }
 
+    let writer_lease = acquire_cli_ingest_writer_lease(db, "ingest-stdin")?;
+
     if exact_duplicate.is_some() {
+        writer_lease.ensure_active("finalize duplicate stdin ingest")?;
         finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
             db,
             wing: &resolved.wing,
@@ -4967,6 +5205,7 @@ async fn ingest_stdin_command(
             gating_decision = Some(tier2.decision);
         }
         if let Some(decision) = gating_decision.as_ref() {
+            writer_lease.ensure_active("record stdin gating audit")?;
             db.record_gating_audit(
                 &drawer_id,
                 decision,
@@ -4986,7 +5225,10 @@ async fn ingest_stdin_command(
 
         if !resolved.raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
-                &drawer_id,
+                {
+                    writer_lease.ensure_active("record stdin fact-check audit")?;
+                    &drawer_id
+                },
                 &resolved.content,
                 db,
                 resolved.project_id.as_deref(),
@@ -5047,6 +5289,7 @@ async fn ingest_stdin_command(
         link_superseded_drawer(&mut drawer, old_id);
     }
 
+    writer_lease.ensure_active("insert stdin drawer")?;
     db.insert_drawer_with_project_validity(
         &drawer,
         resolved.project_id.as_deref(),
@@ -5055,10 +5298,12 @@ async fn ingest_stdin_command(
         resolved.valid_until.as_deref(),
     )
     .with_context(|| format!("failed to insert drawer {}", drawer.id))?;
+    writer_lease.ensure_active("insert stdin vector")?;
     db.insert_vector_with_project(&drawer_id, &vector, resolved.project_id.as_deref())
         .with_context(|| format!("failed to insert vector for drawer {drawer_id}"))?;
 
     if let Some(old_id) = superseded_drawer_id.as_deref() {
+        writer_lease.ensure_active("supersede stdin replacement target")?;
         db.supersede_drawer(old_id, &format!("replaced by {drawer_id}"))
             .with_context(|| format!("failed to supersede drawer {old_id}"))?;
         stats.superseded_drawer_id = Some(old_id.to_string());
@@ -5068,6 +5313,7 @@ async fn ingest_stdin_command(
     {
         let config_snap = ConfigHandle::current();
         if config_snap.repair.enabled {
+            writer_lease.ensure_active("record stdin repair signal")?;
             mempal::repair::try_record_failure(
                 db.path(),
                 &drawer_id,
@@ -5331,6 +5577,7 @@ async fn checkpoint_command(
             let project_id = resolve_project_id(project.as_deref(), config, cwd.as_deref())
                 .context("failed to resolve checkpoint project id")?;
 
+            let writer_lease = acquire_cli_content_writer_lease(db, "checkpoint-save")?;
             let embedder = build_embedder(config).await?;
             let vectors = embedder
                 .embed(&[content.as_str()])
@@ -5357,8 +5604,10 @@ async fn checkpoint_command(
                 ..drawer
             };
 
+            writer_lease.ensure_active("insert checkpoint drawer")?;
             db.insert_drawer_with_project(&drawer, project_id.as_deref())
                 .with_context(|| format!("failed to insert checkpoint drawer {}", drawer.id))?;
+            writer_lease.ensure_active("insert checkpoint vector")?;
             db.insert_vector_with_project(&drawer_id, &vector, project_id.as_deref())
                 .with_context(|| format!("failed to insert vector for checkpoint {drawer_id}"))?;
 
@@ -5430,7 +5679,9 @@ async fn checkpoint_command(
                 )?;
                 println!("dry-run: would delete {count} checkpoints older than {cutoff_ts}");
             } else {
+                let writer_lease = acquire_cli_content_writer_lease(db, "checkpoint-cleanup")?;
                 let now_ts = iso_timestamp();
+                writer_lease.ensure_active("cleanup checkpoint drawers")?;
                 let affected = db.conn().execute(
                     "UPDATE drawers SET deleted_at = ?1 \
                      WHERE wing = 'session-checkpoint' AND deleted_at IS NULL \
@@ -5574,11 +5825,28 @@ async fn ingest_path_with_options<'a, E: Embedder + ?Sized>(
     path: &'a Path,
     wing: &'a str,
     options: IngestOptions<'a>,
+    runtime_writer_lease: Option<&'a RuntimeWriterLease>,
 ) -> mempal::ingest::Result<IngestStats> {
     if path.is_file() {
-        ingest_file_with_options(db, embedder, path, wing, options).await
+        ingest_file_with_options_and_writer_lease(
+            db,
+            embedder,
+            path,
+            wing,
+            options,
+            runtime_writer_lease,
+        )
+        .await
     } else {
-        ingest_dir_with_options(db, embedder, path, wing, options).await
+        ingest_dir_with_options_and_writer_lease(
+            db,
+            embedder,
+            path,
+            wing,
+            options,
+            runtime_writer_lease,
+        )
+        .await
     }
 }
 
@@ -6330,6 +6598,7 @@ fn effective_wake_up_text(drawer: &mempal::core::types::Drawer) -> &str {
 fn project_command(db: &Database, command: ProjectCommands) -> Result<()> {
     match command {
         ProjectCommands::Migrate { project, wing } => {
+            let _writer_lease = acquire_maintenance_writer_lease(db, "project-migrate")?;
             migrate_null_project_ids(db.path(), &project, wing.as_deref(), |event| match event {
                 ProjectMigrationEvent::Busy { delay_ms } => {
                     println!("batch busy, retrying in {delay_ms}ms");
@@ -6502,6 +6771,11 @@ fn consolidate_command(
     .context("failed to find similar drawer clusters")?;
 
     println!("clusters_found: {}", clusters.len());
+    let writer_lease = if options.dry_run {
+        None
+    } else {
+        Some(acquire_maintenance_writer_lease(db, "consolidate")?)
+    };
     let mut processed = 0usize;
     let mut drawers_merged = 0usize;
     for (index, cluster) in clusters.iter().take(limit).enumerate() {
@@ -6509,6 +6783,10 @@ fn consolidate_command(
             .iter()
             .map(|(drawer_id, _)| drawer_id.clone())
             .collect::<Vec<_>>();
+        ensure_maintenance_writer_lease_active(
+            writer_lease.as_ref(),
+            "merge consolidation cluster",
+        )?;
         let result = merge_cluster(db, &drawer_ids, strategy, options.dry_run)
             .context("failed to merge drawer cluster")?;
         processed += 1;
@@ -6554,6 +6832,11 @@ fn sleep_command(db: &Database, config: &Config, options: SleepCommandOptions) -
     let current_dir = env::current_dir().ok();
     let project_id = resolve_project_id(None, config, current_dir.as_deref())
         .context("failed to resolve project id for sleep cycle")?;
+    let _writer_lease = if options.dry_run {
+        None
+    } else {
+        Some(acquire_maintenance_writer_lease(db, "sleep")?)
+    };
     let summary = run_sleep_cycle(
         db,
         config,
@@ -6626,6 +6909,11 @@ async fn crystallize_command(
         Some(project) => Some(project),
         None => resolve_project_id(None, config, current_dir.as_deref())
             .context("failed to resolve project id for crystallization")?,
+    };
+    let _writer_lease = if options.dry_run {
+        None
+    } else {
+        Some(acquire_cli_content_writer_lease(db, "crystallize")?)
     };
     let summary = run_crystallization(
         db,
@@ -6746,6 +7034,7 @@ fn set_pending_auto_card_status(
     let old_status = card.status.clone();
     card.status = status.clone();
     card.updated_at = current_timestamp();
+    let _writer_lease = acquire_cli_content_writer_lease(db, "cards-review")?;
     db.update_knowledge_card(&card)
         .context("failed to update knowledge card")?;
     db.append_knowledge_event(&KnowledgeCardEvent {
@@ -6975,6 +7264,7 @@ fn recompute_importance_command(db: &Database, only_zero: bool) -> Result<()> {
             (d.id, s)
         })
         .collect();
+    let _writer_lease = acquire_maintenance_writer_lease(db, "recompute-importance")?;
     let updated = db
         .bulk_update_importance(&updates)
         .context("failed to apply importance scores")?;
@@ -6983,6 +7273,7 @@ fn recompute_importance_command(db: &Database, only_zero: bool) -> Result<()> {
 }
 
 fn reindex_failed_queue_command(db: &Database) -> Result<()> {
+    let _writer_lease = acquire_maintenance_writer_lease(db, "reindex-failed-queue")?;
     let store = mempal::core::queue::PendingMessageStore::new(db.path())
         .context("failed to open pending message queue")?;
     let retried = store
@@ -7035,6 +7326,8 @@ fn recompute_effective_importance_command(db: &Database) -> Result<()> {
         "recomputing effective_importance (decay_rate={}, floor={}, boost_cap={})...",
         imp.decay_rate, imp.floor, imp.boost_cap
     );
+    let writer_lease = acquire_maintenance_writer_lease(db, "recompute-effective-importance")?;
+    writer_lease.ensure_active("recompute effective_importance")?;
     let updated = db
         .recompute_all_effective_importance(now_ms, imp.decay_rate, imp.floor, imp.boost_cap)
         .context("failed to recompute effective_importance")?;
@@ -7076,6 +7369,7 @@ fn normalize_added_at_command(db: &Database) -> Result<()> {
         return Ok(());
     }
     println!("normalising {to_update} rows (batches of 1000)...");
+    let _writer_lease = acquire_maintenance_writer_lease(db, "normalize-added-at")?;
     let updated = db
         .bulk_update_added_at(&updates)
         .context("failed to apply added_at normalisation")?;
@@ -7104,6 +7398,7 @@ async fn reindex_command_by_embedder(
         println!("dry-run: no vectors were written");
         return Ok(());
     }
+    let writer_lease = acquire_maintenance_writer_lease(db, "reindex-embedder")?;
     let embedder = build_specific_embedder(config, embedder_name).await?;
     let new_dim = embedder.dimensions();
     let current_dim = current_vector_dim(db).context("failed to read embedding dim")?;
@@ -7166,9 +7461,11 @@ async fn reindex_command_by_embedder(
             );
             resume_checkpoint = None;
         }
+        writer_lease.ensure_active("stash vectors before recreate")?;
         let stash = db
             .stash_vectors_before_recreate()
             .context("failed to stash existing vectors before recreate")?;
+        writer_lease.ensure_active("recreate vector table")?;
         println!("recreating drawer_vectors with {new_dim} dimensions...");
         db.recreate_vectors_table(new_dim)
             .context("failed to recreate vectors table")?;
@@ -7193,9 +7490,12 @@ async fn reindex_command_by_embedder(
             embedder.as_ref(),
             embedder_name,
             &target_fingerprint_for_reindex,
-            batch.batch_size,
             target,
-            policy,
+            StaleBatchExecution {
+                batch_size: batch.batch_size,
+                policy,
+                writer_lease: Some(&writer_lease),
+            },
         )
         .await;
     }
@@ -7241,11 +7541,14 @@ async fn reindex_command_by_embedder(
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("embedder returned no vector during reindex"))?;
+        writer_lease.ensure_active("write reindex vector")?;
         db.conn()
             .execute("DELETE FROM drawer_vectors WHERE id = ?1", [&row.id])
             .with_context(|| format!("failed to clear existing vector for {}", row.id))?;
+        writer_lease.ensure_active("insert reindex vector")?;
         db.insert_vector_with_project(&row.id, &vector, row.project_id.as_deref())
             .with_context(|| format!("failed to insert vector for {}", row.id))?;
+        writer_lease.ensure_active("record reindex metadata")?;
         record_reindex_metadata(
             db,
             &row.id,
@@ -7253,6 +7556,7 @@ async fn reindex_command_by_embedder(
             &target_fingerprint_for_reindex,
         )
         .with_context(|| format!("failed to record reindex metadata for {}", row.id))?;
+        writer_lease.ensure_active("persist reindex checkpoint")?;
         progress_store_for_reindex
             .upsert_running(&row.source_path, Some(row.chunk_index), embedder_name)
             .context("failed to persist reindex checkpoint")?;
@@ -7402,6 +7706,12 @@ struct StaleBatchTuning {
     max_batch_retries: usize,
 }
 
+struct StaleBatchExecution<'a> {
+    batch_size: usize,
+    policy: BatchRetryPolicy,
+    writer_lease: Option<&'a MaintenanceWriterLeaseGuard>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReindexEmbedderMode {
     resume: bool,
@@ -7450,10 +7760,14 @@ async fn reindex_stale_batches(
     embedder: &dyn Embedder,
     embedder_name: &str,
     target_fingerprint: &str,
-    batch_size: usize,
     target: ReindexVectorTarget,
-    policy: BatchRetryPolicy,
+    execution: StaleBatchExecution<'_>,
 ) -> Result<()> {
+    let StaleBatchExecution {
+        batch_size,
+        policy,
+        writer_lease,
+    } = execution;
     if batch_size == 0 {
         bail!("--batch-size must be greater than 0");
     }
@@ -7490,10 +7804,13 @@ async fn reindex_stale_batches(
     // of an in-memory list expanded into `NOT IN (?, ?, ...)` placeholders,
     // whose bind-variable count would overflow SQLITE_MAX_VARIABLE_NUMBER
     // (32766) on a pathological run and crash the skip-continue (issue #304).
+    ensure_maintenance_writer_lease_active(writer_lease, "create stale reindex skip table")?;
     ensure_reindex_skipped_table(db).context("failed to create reindex skip table")?;
+    ensure_maintenance_writer_lease_active(writer_lease, "reset stale reindex skip table")?;
     db.conn()
         .execute_batch(&format!("DELETE FROM {REINDEX_SKIPPED_TABLE};"))
         .context("failed to reset reindex skip table")?;
+    ensure_maintenance_writer_lease_active(writer_lease, "snapshot stale reindex work")?;
     build_reindex_stale_pending_rows(db, target_fingerprint, &target)
         .context("failed to snapshot stale reindex work list")?;
     let mut batch_index = 0usize;
@@ -7528,11 +7845,23 @@ async fn reindex_stale_batches(
                 skipped_failed_batches += 1;
                 skipped_failed_drawers += rows.len();
                 let failed_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+                ensure_maintenance_writer_lease_active(
+                    writer_lease,
+                    "record skipped stale reindex ids",
+                )?;
                 stage_reindex_skipped_ids(db, &failed_ids)
                     .context("failed to record skipped drawer ids")?;
+                ensure_maintenance_writer_lease_active(
+                    writer_lease,
+                    "delete skipped stale reindex work",
+                )?;
                 delete_reindex_pending_ids(db, &failed_ids)
                     .context("failed to delete skipped stale reindex work")?;
                 for (source_path, chunk_index) in reindex_source_checkpoints(&rows) {
+                    ensure_maintenance_writer_lease_active(
+                        writer_lease,
+                        "record failed stale reindex checkpoint",
+                    )?;
                     progress_store
                         .mark_failed(&source_path, Some(chunk_index), embedder_name)
                         .context("failed to record failed reindex checkpoint")?;
@@ -7541,9 +7870,14 @@ async fn reindex_stale_batches(
                 continue;
             }
         };
+        ensure_maintenance_writer_lease_active(writer_lease, "write stale reindex vector batch")?;
         let stats = write_reindex_vector_batch(db, &rows, &vectors, target_fingerprint)
             .context("failed to write stale reindex batch")?;
         let pulled_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        ensure_maintenance_writer_lease_active(
+            writer_lease,
+            "delete completed stale reindex work",
+        )?;
         delete_reindex_pending_ids(db, &pulled_ids)
             .context("failed to delete completed stale reindex work")?;
         processed += stats.reindexed;
@@ -7560,6 +7894,10 @@ async fn reindex_stale_batches(
             );
         }
         for (source_path, chunk_index) in reindex_source_checkpoints(&rows) {
+            ensure_maintenance_writer_lease_active(
+                writer_lease,
+                "persist stale reindex checkpoint",
+            )?;
             let checkpoint = if failed_sources.contains(source_path.as_str()) {
                 progress_store.mark_failed(&source_path, Some(chunk_index), embedder_name)
             } else {
@@ -7568,6 +7906,7 @@ async fn reindex_stale_batches(
             checkpoint.context("failed to persist reindex checkpoint")?;
         }
     }
+    ensure_maintenance_writer_lease_active(writer_lease, "finalize stale reindex checkpoints")?;
     progress_store
         .finalize_completed_running_rows(CURRENT_VECTOR_INDEX_VERSION, target_fingerprint)
         .context("failed to finalize completed reindex sources")?;
@@ -7608,6 +7947,7 @@ async fn reindex_command_sources(
             .await
             .context("failed to plan reindex")?
     } else {
+        let _writer_lease = acquire_maintenance_writer_lease(db, "reindex-sources")?;
         let embedder = build_embedder(config).await?;
         println!("embedder: {} ({}d)", embedder.name(), embedder.dimensions());
         reindex_sources(db, &*embedder, options)
@@ -7696,6 +8036,7 @@ async fn knowledge_command(
                         .into_iter()
                         .next()
                         .context("embedder returned no vector")?;
+                    let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-distill")?;
                     commit_distill(db, *prepared, &vector)?
                 }
             };
@@ -7715,6 +8056,7 @@ async fn knowledge_command(
             reason,
             reviewer,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-promote")?;
             let outcome = promote_knowledge(
                 db,
                 PromoteRequest {
@@ -7739,6 +8081,7 @@ async fn knowledge_command(
             reason,
             reason_type,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-demote")?;
             let outcome = demote_knowledge(
                 db,
                 DemoteRequest {
@@ -7798,6 +8141,7 @@ async fn knowledge_command(
             reason,
             reviewer,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-publish-anchor")?;
             let outcome = publish_anchor(
                 db,
                 PublishAnchorRequest {
@@ -7885,6 +8229,7 @@ async fn knowledge_card_command(
                 created_at: now.clone(),
                 updated_at: now,
             };
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-card-create")?;
             db.insert_knowledge_card(&card)
                 .context("failed to insert knowledge card")?;
             match format.as_str() {
@@ -7985,6 +8330,7 @@ async fn knowledge_card_command(
                 note,
                 created_at: current_timestamp(),
             };
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-card-link")?;
             db.insert_knowledge_evidence_link(&link)
                 .context("failed to insert knowledge evidence link")?;
             println!("link_id={id} created=true");
@@ -8036,6 +8382,7 @@ async fn knowledge_card_command(
                 metadata,
                 created_at,
             };
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-card-event")?;
             db.append_knowledge_event(&event)
                 .context("failed to append knowledge card event")?;
             println!("event_id={id} created=true");
@@ -8073,6 +8420,7 @@ async fn knowledge_card_command(
             enforce_gate,
             format,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-card-promote")?;
             let outcome = promote_card(
                 db,
                 PromoteCardRequest {
@@ -8096,6 +8444,7 @@ async fn knowledge_card_command(
             reason_type,
             format,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "knowledge-card-demote")?;
             let outcome = demote_card(
                 db,
                 DemoteCardRequest {
@@ -8149,6 +8498,14 @@ async fn knowledge_card_command(
                 anchor_kind: anchor_kind.as_deref().map(parse_anchor_kind).transpose()?,
                 anchor_id,
                 ..KnowledgeCardFilter::default()
+            };
+            let _writer_lease = if execute {
+                Some(acquire_cli_content_writer_lease(
+                    db,
+                    "knowledge-card-backfill-apply",
+                )?)
+            } else {
+                None
             };
             let result = apply_backfill(db, &filter, KnowledgeCardBackfillApplyOptions { execute })
                 .context("failed to apply knowledge card backfill")?;
@@ -8659,6 +9016,8 @@ async fn research_ingest_plan_command(
                 .await
                 .context("failed to embed research evidence drawers")?;
 
+            let _writer_lease =
+                acquire_cli_content_writer_lease(db, "phase3-research-ingest-plan")?;
             for ((index, drawer_id, content), vector) in pending.into_iter().zip(vectors) {
                 let source_file = report.evidence_drawers[index].source_file.clone();
                 let drawer = research_evidence_drawer(
@@ -8783,6 +9142,14 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
                 let signal = parse_runtime_adoption_signal(&record_input.signal)?;
                 let should_write =
                     should_write_checked_record(&report.record_quality, allow_warnings);
+                let _writer_lease = if should_write {
+                    Some(acquire_cli_content_writer_lease(
+                        db,
+                        "phase3-adoption-capture",
+                    )?)
+                } else {
+                    None
+                };
                 let event = if should_write {
                     let event = runtime_adoption_event_from_input(record_input, track, signal);
                     db.insert_runtime_adoption_event(&event)
@@ -8875,6 +9242,14 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
             };
             let quality = check_runtime_adoption_record(&input);
             let should_write = should_write_checked_record(&quality, allow_warnings);
+            let _writer_lease = if should_write {
+                Some(acquire_cli_content_writer_lease(
+                    db,
+                    "phase3-adoption-record-checked",
+                )?)
+            } else {
+                None
+            };
             let event = if should_write {
                 let event = runtime_adoption_event_from_input(input, track, signal);
                 db.insert_runtime_adoption_event(&event)
@@ -8971,6 +9346,7 @@ fn phase3_adoption_command(db: &Database, command: Phase3AdoptionCommands) -> Re
                 signal,
             );
             let id = event.id.clone();
+            let _writer_lease = acquire_cli_content_writer_lease(db, "phase3-adoption-record")?;
             db.insert_runtime_adoption_event(&event)
                 .context("failed to insert runtime adoption event")?;
             match format.as_str() {
@@ -9987,6 +10363,7 @@ fn print_promotion_policy(policy: &[PromotionPolicyEntry]) {
 }
 
 fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
+    let _writer_lease = acquire_cli_content_writer_lease(db, "delete")?;
     let drawer = db
         .get_drawer(drawer_id)
         .context("failed to look up drawer")?;
@@ -10012,6 +10389,7 @@ fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
 }
 
 fn pin_command(db: &Database, drawer_id: &str) -> Result<()> {
+    let _writer_lease = acquire_cli_content_writer_lease(db, "pin")?;
     if !db
         .pin_drawer(drawer_id, None)
         .context("failed to pin drawer")?
@@ -10025,6 +10403,7 @@ fn pin_command(db: &Database, drawer_id: &str) -> Result<()> {
 }
 
 fn unpin_command(db: &Database, drawer_id: &str) -> Result<()> {
+    let _writer_lease = acquire_cli_content_writer_lease(db, "unpin")?;
     if !db
         .unpin_drawer(drawer_id)
         .context("failed to unpin drawer")?
@@ -10045,6 +10424,7 @@ fn pinned_command(
     json: bool,
 ) -> Result<()> {
     if !reorder.is_empty() {
+        let _writer_lease = acquire_cli_content_writer_lease(db, "pinned-reorder")?;
         for drawer_id in reorder {
             if db
                 .get_drawer(drawer_id)
@@ -10140,6 +10520,7 @@ fn rollback_command(
             dry_run: true,
         }
     } else {
+        let _writer_lease = acquire_cli_content_writer_lease(db, "rollback")?;
         let drawer_ids = db
             .soft_delete_drawers_since(&since, options.wing, options.room, project_id.as_deref())
             .context("failed to rollback drawers")?;
@@ -10173,6 +10554,7 @@ fn rollback_command(
 }
 
 fn purge_command(db: &Database, before: Option<&str>) -> Result<()> {
+    let _writer_lease = acquire_cli_content_writer_lease(db, "purge")?;
     let deleted_count = db
         .deleted_drawer_count()
         .context("failed to count deleted drawers")?;
@@ -10219,6 +10601,7 @@ fn kg_command(db: &Database, command: KgCommands) -> Result<()> {
             object,
             source_drawer,
         } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "kg-add")?;
             let id = build_triple_id(&subject, &predicate, &object);
             let triple = Triple {
                 id: id.clone(),
@@ -10267,6 +10650,7 @@ fn kg_command(db: &Database, command: KgCommands) -> Result<()> {
             }
         }
         KgCommands::Invalidate { triple_id } => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "kg-invalidate")?;
             if !db
                 .triple_exists(&triple_id)
                 .context("failed to check triple existence")?
@@ -10336,6 +10720,7 @@ fn tunnels_command(db: &Database, command: Option<TunnelCommands>) -> Result<()>
     match command {
         None => tunnels_discover_command(db),
         Some(TunnelCommands::Add { left, right, label }) => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "tunnels-add")?;
             let tunnel = db
                 .create_tunnel(
                     &parse_tunnel_endpoint(&left)?,
@@ -10357,6 +10742,7 @@ fn tunnels_command(db: &Database, command: Option<TunnelCommands>) -> Result<()>
             tunnels_list_command(db, wing.as_deref(), &kind)
         }
         Some(TunnelCommands::Delete { tunnel_id }) => {
+            let _writer_lease = acquire_cli_content_writer_lease(db, "tunnels-delete")?;
             if tunnel_id.starts_with("passive_") {
                 bail!("cannot delete passive tunnel");
             }
@@ -10494,6 +10880,7 @@ fn taxonomy_list_command(db: &Database) -> Result<()> {
     Ok(())
 }
 fn taxonomy_edit_command(db: &Database, wing: &str, room: &str, keywords: &str) -> Result<()> {
+    let _writer_lease = acquire_cli_content_writer_lease(db, "taxonomy-edit")?;
     let entry = TaxonomyEntry {
         wing: wing.to_string(),
         room: room.to_string(),
@@ -14056,8 +14443,17 @@ fn cowork_session_close_command(
         } else {
             None
         };
+        let writer_lease = if let Some(db) = db_opt.as_ref() {
+            Some(acquire_cli_content_writer_lease(
+                db,
+                "cowork-session-close-capture",
+            )?)
+        } else {
+            None
+        };
         let capture_report = capture_handoff_to_memory(
             db_opt.as_ref(),
+            writer_lease.as_ref().map(|lease| lease.lease()),
             &home,
             &cwd,
             CoworkCaptureRequest {
@@ -14137,8 +14533,14 @@ fn cowork_capture_command(
     } else {
         None
     };
+    let writer_lease = if let Some(db) = db_opt.as_ref() {
+        Some(acquire_cli_content_writer_lease(db, "cowork-capture")?)
+    } else {
+        None
+    };
     let report = capture_handoff_to_memory(
         db_opt.as_ref(),
+        writer_lease.as_ref().map(|lease| lease.lease()),
         &home,
         &cwd,
         CoworkCaptureRequest {
@@ -14336,6 +14738,12 @@ async fn maintenance_rejudge_command_with_runtime(
 ) -> Result<()> {
     validate_historical_rejudge_options(options)?;
     validate_historical_rejudge_runtime_options(runtime)?;
+    let writer_lease = if options.execute {
+        Some(acquire_maintenance_writer_lease(db, "maintenance-rejudge")?)
+    } else {
+        None
+    };
+    let writer_lease = writer_lease.as_ref();
     let current_dir = env::current_dir().ok();
     let project_id = if options.project.is_some() {
         resolve_project_id(options.project, config, current_dir.as_deref())
@@ -14353,11 +14761,20 @@ async fn maintenance_rejudge_command_with_runtime(
             runtime,
             project_id,
             progress.as_mut(),
+            writer_lease,
         )
         .await;
     }
 
-    maintenance_rejudge_limited_command(db, config, options, project_id, progress.as_mut()).await
+    maintenance_rejudge_limited_command(
+        db,
+        config,
+        options,
+        project_id,
+        progress.as_mut(),
+        writer_lease,
+    )
+    .await
 }
 
 fn validate_historical_rejudge_options(options: HistoricalRejudgeOptions<'_>) -> Result<()> {
@@ -14423,6 +14840,7 @@ async fn maintenance_rejudge_limited_command(
     options: HistoricalRejudgeOptions<'_>,
     project_id: Option<String>,
     mut progress: Option<&mut HistoricalRejudgeProgressWriter>,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let rows = db
@@ -14556,41 +14974,48 @@ async fn maintenance_rejudge_limited_command(
     }
 
     let mutated_count = if options.execute {
-        with_historical_rejudge_transaction(db, || {
-            let mutated_count = if candidate_ids.is_empty() {
-                0
-            } else {
-                delete_rejudge_backup_items_by_version_inner(
-                    db,
-                    &candidate_backup_items,
-                    options.hard_delete,
-                )
-                .context("failed to delete historical rejudge candidates")?
-            };
-            let mutation = if options.hard_delete {
-                "hard_delete"
-            } else {
-                "soft_delete"
-            };
-            for (row, decision) in &decisions {
-                record_historical_rejudge_decision_audit(
-                    db,
-                    row,
-                    decision,
-                    judge_model.as_deref(),
-                    &config_version,
-                    mutation,
-                )?;
-            }
-            Ok(mutated_count)
-        })?
+        with_historical_rejudge_transaction_with_writer_lease(
+            db,
+            writer_lease,
+            "apply limited historical rejudge mutations",
+            || {
+                let mutated_count = if candidate_ids.is_empty() {
+                    0
+                } else {
+                    delete_rejudge_backup_items_by_version_inner(
+                        db,
+                        &candidate_backup_items,
+                        options.hard_delete,
+                    )
+                    .context("failed to delete historical rejudge candidates")?
+                };
+                let mutation = if options.hard_delete {
+                    "hard_delete"
+                } else {
+                    "soft_delete"
+                };
+                for (row, decision) in &decisions {
+                    record_historical_rejudge_decision_audit(
+                        db,
+                        row,
+                        decision,
+                        judge_model.as_deref(),
+                        &config_version,
+                        mutation,
+                    )?;
+                }
+                Ok(mutated_count)
+            },
+        )?
     } else {
         0
     };
 
     if options.execute {
-        append_audit_entry(
+        append_audit_entry_with_writer_lease(
             db,
+            writer_lease,
+            "append limited historical rejudge audit",
             "maintenance-rejudge",
             &serde_json::json!({
                 "hard_delete": options.hard_delete,
@@ -14691,6 +15116,17 @@ fn record_historical_rejudge_decision_audit(
     .context("failed to record historical rejudge audit")
 }
 
+fn append_audit_entry_with_writer_lease(
+    db: &Database,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
+    operation: &'static str,
+    command: &str,
+    details: &serde_json::Value,
+) -> Result<()> {
+    ensure_maintenance_writer_lease_active(writer_lease, operation)?;
+    append_audit_entry(db, command, details)
+}
+
 fn historical_rejudge_effective_backup_dir(
     options: HistoricalRejudgeOptions<'_>,
     backup_required: bool,
@@ -14720,6 +15156,7 @@ async fn maintenance_rejudge_all_command(
     runtime: HistoricalRejudgeRuntimeOptions,
     project_id: Option<String>,
     mut progress: Option<&mut HistoricalRejudgeProgressWriter>,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let config_version = historical_rejudge_config_version(config);
@@ -14754,6 +15191,7 @@ async fn maintenance_rejudge_all_command(
         return print_historical_rejudge_report(&report, options.format);
     }
 
+    ensure_maintenance_writer_lease_active(writer_lease, "prepare historical rejudge checkpoint")?;
     let mut checkpoint = prepare_historical_rejudge_checkpoint(
         db,
         options,
@@ -14765,6 +15203,7 @@ async fn maintenance_rejudge_all_command(
             .may_mutate()
             .then_some(backup_dir.as_deref())
             .flatten(),
+        writer_lease,
     )
     .context("failed to prepare historical rejudge checkpoint")?;
 
@@ -14773,6 +15212,7 @@ async fn maintenance_rejudge_all_command(
         options,
         &mut checkpoint,
         backup_dir.as_deref(),
+        writer_lease,
     )?;
 
     if let Some(writer) = progress.as_mut() {
@@ -14841,7 +15281,12 @@ async fn maintenance_rejudge_all_command(
 
     checkpoint.status = "running".to_string();
     checkpoint.updated_at = iso_timestamp();
-    save_historical_rejudge_checkpoint(db, &checkpoint)?;
+    save_historical_rejudge_checkpoint_with_writer_lease(
+        db,
+        &checkpoint,
+        writer_lease,
+        "mark historical rejudge checkpoint running",
+    )?;
 
     loop {
         let page = next_historical_rejudge_work_items_for_stage(
@@ -14854,6 +15299,10 @@ async fn maintenance_rejudge_all_command(
             break;
         }
 
+        let work_context = HistoricalRejudgeWorkContext {
+            llm_context: llm_context.as_ref(),
+            writer_lease,
+        };
         let page_result = if runtime.llm_concurrency == DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY {
             process_historical_rejudge_work_page(
                 db,
@@ -14861,7 +15310,7 @@ async fn maintenance_rejudge_all_command(
                 options,
                 &mut checkpoint,
                 &page,
-                llm_context.as_ref(),
+                work_context,
             )
             .await
         } else {
@@ -14871,7 +15320,7 @@ async fn maintenance_rejudge_all_command(
                 options,
                 &mut checkpoint,
                 &page,
-                llm_context.as_ref(),
+                work_context,
                 runtime.llm_concurrency,
             )
             .await
@@ -14892,11 +15341,17 @@ async fn maintenance_rejudge_all_command(
                     db,
                     &mut checkpoint,
                     "waiting_llm",
+                    writer_lease,
                 )?;
             } else {
                 checkpoint.status = "failed".to_string();
                 checkpoint.updated_at = iso_timestamp();
-                save_historical_rejudge_checkpoint(db, &checkpoint)?;
+                save_historical_rejudge_checkpoint_with_writer_lease(
+                    db,
+                    &checkpoint,
+                    writer_lease,
+                    "persist failed historical rejudge checkpoint",
+                )?;
             }
             if let Some(writer) = progress.as_mut() {
                 writer.write_event(build_historical_rejudge_progress_event(
@@ -14942,6 +15397,7 @@ async fn maintenance_rejudge_all_command(
                     db,
                     &mut checkpoint,
                     "running",
+                    writer_lease,
                 )?;
                 continue;
             }
@@ -14987,10 +15443,17 @@ async fn maintenance_rejudge_all_command(
         "proposal_pending".to_string()
     };
     checkpoint.updated_at = iso_timestamp();
-    save_historical_rejudge_checkpoint(db, &checkpoint)?;
-
-    append_audit_entry(
+    save_historical_rejudge_checkpoint_with_writer_lease(
         db,
+        &checkpoint,
+        writer_lease,
+        "persist final historical rejudge checkpoint",
+    )?;
+
+    append_audit_entry_with_writer_lease(
+        db,
+        writer_lease,
+        "append all historical rejudge audit",
         "maintenance-rejudge",
         &serde_json::json!({
             "all": true,
@@ -15257,13 +15720,18 @@ fn prepare_historical_rejudge_checkpoint(
     config_version: &str,
     judge_model: Option<String>,
     backup_dir: Option<&Path>,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<HistoricalRejudgeCheckpoint> {
+    ensure_maintenance_writer_lease_active(
+        writer_lease,
+        "prepare historical rejudge checkpoint storage",
+    )?;
     ensure_historical_rejudge_checkpoint_storage(db)?;
     let options_hash = historical_rejudge_options_hash(options, project_id, config_version)?;
 
     if options.resume {
         let Some(checkpoint) = load_historical_rejudge_checkpoint(db)? else {
-            return start_historical_rejudge_checkpoint(
+            return start_historical_rejudge_checkpoint(HistoricalRejudgeCheckpointStart {
                 db,
                 options,
                 project_id,
@@ -15271,7 +15739,8 @@ fn prepare_historical_rejudge_checkpoint(
                 judge_model,
                 backup_dir,
                 options_hash,
-            );
+                writer_lease,
+            });
         };
         if checkpoint.status == "done" {
             bail!(
@@ -15290,7 +15759,7 @@ fn prepare_historical_rejudge_checkpoint(
         return Ok(checkpoint);
     }
 
-    start_historical_rejudge_checkpoint(
+    start_historical_rejudge_checkpoint(HistoricalRejudgeCheckpointStart {
         db,
         options,
         project_id,
@@ -15298,7 +15767,8 @@ fn prepare_historical_rejudge_checkpoint(
         judge_model,
         backup_dir,
         options_hash,
-    )
+        writer_lease,
+    })
 }
 
 fn historical_rejudge_checkpoint_matches_resume(
@@ -15486,26 +15956,9 @@ fn historical_rejudge_stage_endpoint_model_parts<'a>(
 }
 
 fn start_historical_rejudge_checkpoint(
-    db: &Database,
-    options: HistoricalRejudgeOptions<'_>,
-    project_id: Option<&str>,
-    config_version: &str,
-    judge_model: Option<String>,
-    backup_dir: Option<&Path>,
-    options_hash: String,
+    input: HistoricalRejudgeCheckpointStart<'_>,
 ) -> Result<HistoricalRejudgeCheckpoint> {
-    start_historical_rejudge_checkpoint_with_observer(
-        HistoricalRejudgeCheckpointStart {
-            db,
-            options,
-            project_id,
-            config_version,
-            judge_model,
-            backup_dir,
-            options_hash,
-        },
-        |_| Ok(()),
-    )
+    start_historical_rejudge_checkpoint_with_observer(input, |_| Ok(()))
 }
 
 fn start_historical_rejudge_checkpoint_with_observer(
@@ -15520,6 +15973,7 @@ fn start_historical_rejudge_checkpoint_with_observer(
         judge_model,
         backup_dir,
         options_hash,
+        writer_lease,
     } = input;
 
     let started_at = iso_timestamp();
@@ -15536,49 +15990,54 @@ fn start_historical_rejudge_checkpoint_with_observer(
         })
         .transpose()?;
 
-    with_historical_rejudge_transaction(db, || {
-        let snapshot_max_rowid = db
-            .historical_rejudge_scope_max_rowid(options.wing, options.room, project_id)
-            .context("failed to snapshot historical rejudge max rowid")?
-            .unwrap_or(0);
-        after_snapshot_bound(snapshot_max_rowid)?;
-        reset_historical_rejudge_work_items(db, &run_id)?;
-        let snapshot_count = insert_historical_rejudge_work_items(
-            db,
-            &run_id,
-            options.wing,
-            options.room,
-            project_id,
-            snapshot_max_rowid,
-        )?;
-        let checkpoint = HistoricalRejudgeCheckpoint {
-            run_id,
-            status: "running".to_string(),
-            options_hash,
-            started_at: started_at.clone(),
-            updated_at: started_at,
-            snapshot_max_rowid,
-            snapshot_count,
-            last_processed_rowid: None,
-            scanned_count: 0,
-            candidate_count: 0,
-            kept_count: 0,
-            protected_count: 0,
-            mutated_count: 0,
-            estimated_bytes_reclaimed: 0,
-            mutation: if options.hard_delete {
-                "hard_delete".to_string()
-            } else {
-                "soft_delete".to_string()
-            },
-            page_size: options.page_size,
-            judge_model,
-            config_version: config_version.to_string(),
-            backup_path,
-        };
-        save_historical_rejudge_checkpoint(db, &checkpoint)?;
-        Ok(checkpoint)
-    })
+    with_historical_rejudge_transaction_with_writer_lease(
+        db,
+        writer_lease,
+        "start historical rejudge checkpoint",
+        || {
+            let snapshot_max_rowid = db
+                .historical_rejudge_scope_max_rowid(options.wing, options.room, project_id)
+                .context("failed to snapshot historical rejudge max rowid")?
+                .unwrap_or(0);
+            after_snapshot_bound(snapshot_max_rowid)?;
+            reset_historical_rejudge_work_items(db, &run_id)?;
+            let snapshot_count = insert_historical_rejudge_work_items(
+                db,
+                &run_id,
+                options.wing,
+                options.room,
+                project_id,
+                snapshot_max_rowid,
+            )?;
+            let checkpoint = HistoricalRejudgeCheckpoint {
+                run_id,
+                status: "running".to_string(),
+                options_hash,
+                started_at: started_at.clone(),
+                updated_at: started_at,
+                snapshot_max_rowid,
+                snapshot_count,
+                last_processed_rowid: None,
+                scanned_count: 0,
+                candidate_count: 0,
+                kept_count: 0,
+                protected_count: 0,
+                mutated_count: 0,
+                estimated_bytes_reclaimed: 0,
+                mutation: if options.hard_delete {
+                    "hard_delete".to_string()
+                } else {
+                    "soft_delete".to_string()
+                },
+                page_size: options.page_size,
+                judge_model,
+                config_version: config_version.to_string(),
+                backup_path,
+            };
+            save_historical_rejudge_checkpoint(db, &checkpoint)?;
+            Ok(checkpoint)
+        },
+    )
 }
 
 fn ensure_historical_rejudge_checkpoint_backup_for_mutation(
@@ -15586,6 +16045,7 @@ fn ensure_historical_rejudge_checkpoint_backup_for_mutation(
     options: HistoricalRejudgeOptions<'_>,
     checkpoint: &mut HistoricalRejudgeCheckpoint,
     backup_dir: Option<&Path>,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<()> {
     if !historical_rejudge_backup_required(options)
         || checkpoint.backup_path.is_some()
@@ -15607,7 +16067,12 @@ fn ensure_historical_rejudge_checkpoint_backup_for_mutation(
         .context("failed to create historical rejudge confirmation backup")?,
     );
     checkpoint.updated_at = iso_timestamp();
-    save_historical_rejudge_checkpoint(db, checkpoint)?;
+    save_historical_rejudge_checkpoint_with_writer_lease(
+        db,
+        checkpoint,
+        writer_lease,
+        "persist historical rejudge backup checkpoint",
+    )?;
     Ok(())
 }
 
@@ -15637,7 +16102,7 @@ async fn process_historical_rejudge_work_page(
     options: HistoricalRejudgeOptions<'_>,
     checkpoint: &mut HistoricalRejudgeCheckpoint,
     page: &[HistoricalRejudgeWorkItem],
-    llm_context: Option<&HistoricalRejudgeLlmContext>,
+    context: HistoricalRejudgeWorkContext<'_>,
 ) -> Result<()> {
     process_historical_rejudge_work_page_with_concurrency(
         db,
@@ -15645,7 +16110,7 @@ async fn process_historical_rejudge_work_page(
         options,
         checkpoint,
         page,
-        llm_context,
+        context,
         DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY,
     )
     .await
@@ -15657,31 +16122,37 @@ async fn process_historical_rejudge_work_page_with_concurrency(
     options: HistoricalRejudgeOptions<'_>,
     checkpoint: &mut HistoricalRejudgeCheckpoint,
     page: &[HistoricalRejudgeWorkItem],
-    llm_context: Option<&HistoricalRejudgeLlmContext>,
+    context: HistoricalRejudgeWorkContext<'_>,
     llm_concurrency: usize,
 ) -> Result<()> {
     let prepared = prepare_historical_rejudge_work_page(
         db,
         config,
         page,
-        llm_context,
+        context,
         llm_concurrency,
         options.stage_mode,
     )
     .await?;
-    process_prepared_historical_rejudge_work_items(db, options, checkpoint, &prepared)
+    process_prepared_historical_rejudge_work_items(
+        db,
+        options,
+        checkpoint,
+        &prepared,
+        context.writer_lease,
+    )
 }
 
 async fn prepare_historical_rejudge_work_page(
     db: &Database,
     config: &Config,
     page: &[HistoricalRejudgeWorkItem],
-    llm_context: Option<&HistoricalRejudgeLlmContext>,
+    context: HistoricalRejudgeWorkContext<'_>,
     llm_concurrency: usize,
     stage_mode: HistoricalRejudgeStageMode,
 ) -> Result<Vec<PreparedHistoricalRejudgeWorkItem>> {
     prepare_historical_rejudge_work_page_with(page, llm_concurrency, |work_item| {
-        prepare_historical_rejudge_work_item(db, config, work_item, llm_context, stage_mode)
+        prepare_historical_rejudge_work_item(db, config, work_item, context, stage_mode)
     })
     .await
 }
@@ -15726,7 +16197,7 @@ async fn prepare_historical_rejudge_work_item(
     db: &Database,
     config: &Config,
     work_item: &HistoricalRejudgeWorkItem,
-    llm_context: Option<&HistoricalRejudgeLlmContext>,
+    context: HistoricalRejudgeWorkContext<'_>,
     stage_mode: HistoricalRejudgeStageMode,
 ) -> Result<PreparedHistoricalRejudgeWorkItem> {
     let row = db
@@ -15757,7 +16228,7 @@ async fn prepare_historical_rejudge_work_item(
     }
 
     let decision =
-        evaluate_historical_work_item(db, work_item, &row, config, llm_context, stage_mode).await?;
+        evaluate_historical_work_item(db, work_item, &row, config, context, stage_mode).await?;
     Ok(PreparedHistoricalRejudgeWorkItem {
         work_item: work_item.clone(),
         row: Some(row),
@@ -15772,12 +16243,17 @@ async fn evaluate_historical_work_item(
     work_item: &HistoricalRejudgeWorkItem,
     row: &mempal::core::db::HistoricalRejudgeCandidate,
     config: &Config,
-    llm_context: Option<&HistoricalRejudgeLlmContext>,
+    context: HistoricalRejudgeWorkContext<'_>,
     stage_mode: HistoricalRejudgeStageMode,
 ) -> Result<HistoricalRejudgeDecision> {
     if let Some(decision) = evaluate_historical_pre_llm(row, config) {
         if decision.delete_candidate && stage_mode == HistoricalRejudgeStageMode::ProposalOnly {
-            return persist_historical_rejudge_proposal_pending_decision(db, work_item, decision);
+            return persist_historical_rejudge_proposal_pending_decision(
+                db,
+                work_item,
+                decision,
+                context.writer_lease,
+            );
         }
         let drain_pending_delete = decision.delete_candidate
             && stage_mode == HistoricalRejudgeStageMode::ConfirmPendingOnly
@@ -15789,16 +16265,28 @@ async fn evaluate_historical_work_item(
         // LLM call. Drain it through the configured confirmation stage.
     }
 
-    if let Some(context) = llm_context {
-        return context
-            .evaluate_work_item(db, work_item, &row.drawer, config, stage_mode)
+    if let Some(llm_context) = context.llm_context {
+        return llm_context
+            .evaluate_work_item(
+                db,
+                work_item,
+                &row.drawer,
+                config,
+                stage_mode,
+                context.writer_lease,
+            )
             .await
             .context("historical rejudge LLM gate failed");
     }
 
     let decision = deterministic_historical_decision(&row.drawer);
     if decision.delete_candidate && stage_mode == HistoricalRejudgeStageMode::ProposalOnly {
-        return persist_historical_rejudge_proposal_pending_decision(db, work_item, decision);
+        return persist_historical_rejudge_proposal_pending_decision(
+            db,
+            work_item,
+            decision,
+            context.writer_lease,
+        );
     }
     if decision.delete_candidate
         && stage_mode == HistoricalRejudgeStageMode::ConfirmPendingOnly
@@ -15814,13 +16302,15 @@ fn persist_historical_rejudge_proposal_pending_decision(
     db: &Database,
     work_item: &HistoricalRejudgeWorkItem,
     decision: HistoricalRejudgeDecision,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<HistoricalRejudgeDecision> {
     let proposal_score = decision.score.unwrap_or(0.0);
-    match mark_historical_rejudge_work_item_llm_confirm_pending_or_keep(
+    match mark_historical_rejudge_work_item_llm_confirm_pending_or_keep_with_writer_lease(
         db,
         &work_item.run_id,
         work_item.drawer_rowid,
         proposal_score,
+        writer_lease,
     )? {
         HistoricalRejudgeConfirmPendingPersistence::Persisted => {
             Ok(historical_rejudge_proposal_pending_decision(decision))
@@ -15875,6 +16365,7 @@ fn process_prepared_historical_rejudge_work_items(
     options: HistoricalRejudgeOptions<'_>,
     checkpoint: &mut HistoricalRejudgeCheckpoint,
     prepared: &[PreparedHistoricalRejudgeWorkItem],
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<()> {
     let finalized = finalize_prepared_historical_rejudge_work_items(db, options, prepared)?;
     let backup_items = finalized
@@ -15896,58 +16387,68 @@ fn process_prepared_historical_rejudge_work_items(
     }
 
     let mut next_checkpoint = checkpoint.clone();
-    with_historical_rejudge_transaction(db, || {
-        let mutated_count = if backup_items.is_empty() {
-            0
-        } else {
-            delete_rejudge_backup_items_by_version_inner(db, &backup_items, options.hard_delete)
-                .context("failed to delete historical rejudge candidates")?
-        };
-
-        for item in &finalized {
-            if let (Some(row), Some(decision)) = (item.row.as_ref(), item.decision.as_ref()) {
-                if decision.requires_confirmation {
-                    next_checkpoint.last_processed_rowid = Some(item.work_item.drawer_rowid);
-                    continue;
-                }
-                record_historical_rejudge_decision_audit(
-                    db,
-                    row,
-                    decision,
-                    next_checkpoint.judge_model.as_deref(),
-                    &next_checkpoint.config_version,
-                    &next_checkpoint.mutation,
-                )?;
-                update_historical_rejudge_checkpoint_stats(&mut next_checkpoint, row, decision, 0);
-                mark_historical_rejudge_work_item_processed(
-                    db,
-                    &next_checkpoint.run_id,
-                    item.work_item.drawer_rowid,
-                    if decision.delete_candidate {
-                        "skip"
-                    } else {
-                        "keep"
-                    },
-                    &next_checkpoint.mutation,
-                )?;
+    with_historical_rejudge_transaction_with_writer_lease(
+        db,
+        writer_lease,
+        "apply historical rejudge page mutations",
+        || {
+            let mutated_count = if backup_items.is_empty() {
+                0
             } else {
-                next_checkpoint.scanned_count += 1;
-                let decision = item.terminal_decision.unwrap_or("missing");
-                mark_historical_rejudge_work_item_processed(
-                    db,
-                    &next_checkpoint.run_id,
-                    item.work_item.drawer_rowid,
-                    decision,
-                    "none",
-                )?;
+                delete_rejudge_backup_items_by_version_inner(db, &backup_items, options.hard_delete)
+                    .context("failed to delete historical rejudge candidates")?
+            };
+
+            for item in &finalized {
+                if let (Some(row), Some(decision)) = (item.row.as_ref(), item.decision.as_ref()) {
+                    if decision.requires_confirmation {
+                        next_checkpoint.last_processed_rowid = Some(item.work_item.drawer_rowid);
+                        continue;
+                    }
+                    record_historical_rejudge_decision_audit(
+                        db,
+                        row,
+                        decision,
+                        next_checkpoint.judge_model.as_deref(),
+                        &next_checkpoint.config_version,
+                        &next_checkpoint.mutation,
+                    )?;
+                    update_historical_rejudge_checkpoint_stats(
+                        &mut next_checkpoint,
+                        row,
+                        decision,
+                        0,
+                    );
+                    mark_historical_rejudge_work_item_processed(
+                        db,
+                        &next_checkpoint.run_id,
+                        item.work_item.drawer_rowid,
+                        if decision.delete_candidate {
+                            "skip"
+                        } else {
+                            "keep"
+                        },
+                        &next_checkpoint.mutation,
+                    )?;
+                } else {
+                    next_checkpoint.scanned_count += 1;
+                    let decision = item.terminal_decision.unwrap_or("missing");
+                    mark_historical_rejudge_work_item_processed(
+                        db,
+                        &next_checkpoint.run_id,
+                        item.work_item.drawer_rowid,
+                        decision,
+                        "none",
+                    )?;
+                }
+                next_checkpoint.last_processed_rowid = Some(item.work_item.drawer_rowid);
             }
-            next_checkpoint.last_processed_rowid = Some(item.work_item.drawer_rowid);
-        }
-        next_checkpoint.mutated_count += mutated_count;
-        next_checkpoint.updated_at = iso_timestamp();
-        save_historical_rejudge_checkpoint(db, &next_checkpoint)?;
-        Ok(())
-    })?;
+            next_checkpoint.mutated_count += mutated_count;
+            next_checkpoint.updated_at = iso_timestamp();
+            save_historical_rejudge_checkpoint(db, &next_checkpoint)?;
+            Ok(())
+        },
+    )?;
     *checkpoint = next_checkpoint;
     Ok(())
 }
@@ -16315,6 +16816,25 @@ fn mark_historical_rejudge_work_item_llm_confirm_pending_or_keep(
     historical_rejudge_confirm_pending_persistence_outcome(result, proposal_score)
 }
 
+fn mark_historical_rejudge_work_item_llm_confirm_pending_or_keep_with_writer_lease(
+    db: &Database,
+    run_id: &str,
+    drawer_rowid: i64,
+    proposal_score: f64,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
+) -> Result<HistoricalRejudgeConfirmPendingPersistence> {
+    ensure_maintenance_writer_lease_active(
+        writer_lease,
+        "persist historical rejudge proposal confirmation backlog",
+    )?;
+    mark_historical_rejudge_work_item_llm_confirm_pending_or_keep(
+        db,
+        run_id,
+        drawer_rowid,
+        proposal_score,
+    )
+}
+
 fn historical_rejudge_confirm_pending_persistence_outcome(
     result: Result<()>,
     proposal_score: f64,
@@ -16451,6 +16971,16 @@ fn save_historical_rejudge_checkpoint(
     Ok(())
 }
 
+fn save_historical_rejudge_checkpoint_with_writer_lease(
+    db: &Database,
+    checkpoint: &HistoricalRejudgeCheckpoint,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
+    operation: &'static str,
+) -> Result<()> {
+    ensure_maintenance_writer_lease_active(writer_lease, operation)?;
+    save_historical_rejudge_checkpoint(db, checkpoint)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoricalRejudgeCheckpointPersistence {
     Persisted,
@@ -16461,9 +16991,14 @@ fn persist_historical_rejudge_llm_retry_status_checkpoint(
     db: &Database,
     checkpoint: &mut HistoricalRejudgeCheckpoint,
     status: &'static str,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<HistoricalRejudgeCheckpointPersistence> {
     checkpoint.status = status.to_string();
     checkpoint.updated_at = iso_timestamp();
+    ensure_maintenance_writer_lease_active(
+        writer_lease,
+        "persist historical rejudge LLM retry checkpoint",
+    )?;
     historical_rejudge_checkpoint_persistence_outcome(
         save_historical_rejudge_checkpoint(db, checkpoint),
         status,
@@ -16930,6 +17465,16 @@ fn with_historical_rejudge_transaction<T>(
             Err(error)
         }
     }
+}
+
+fn with_historical_rejudge_transaction_with_writer_lease<T>(
+    db: &Database,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
+    operation_name: &'static str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    ensure_maintenance_writer_lease_active(writer_lease, operation_name)?;
+    with_historical_rejudge_transaction(db, operation)
 }
 
 fn append_historical_rejudge_backup_items_durable(
@@ -17559,10 +18104,25 @@ fn maintenance_rejudge_restore_command(
         conflict_count: 0,
         audit_count: 0,
     };
+    let writer_lease = if execute {
+        Some(acquire_maintenance_writer_lease(
+            db,
+            "maintenance-rejudge-restore",
+        )?)
+    } else {
+        None
+    };
+    let writer_lease = writer_lease.as_ref();
 
     for item in &backup.items {
         let outcome = if execute {
-            restore_rejudge_backup_item_transaction(db, item, &backup, conflict_policy)?
+            restore_rejudge_backup_item_transaction(
+                db,
+                item,
+                &backup,
+                conflict_policy,
+                writer_lease,
+            )?
         } else {
             dry_run_rejudge_restore_item(db, item, conflict_policy)?
         };
@@ -17584,8 +18144,10 @@ fn maintenance_rejudge_restore_command(
     }
 
     if execute {
-        append_audit_entry(
+        append_audit_entry_with_writer_lease(
             db,
+            writer_lease,
+            "append historical rejudge restore audit",
             "maintenance-rejudge-restore",
             &serde_json::json!({
                 "backup": backup_path,
@@ -17795,7 +18357,9 @@ fn restore_rejudge_backup_item_transaction(
     item: &HistoricalRejudgeBackupItem,
     backup: &HistoricalRejudgeBackup,
     conflict_policy: RejudgeRestoreConflictPolicy,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
 ) -> Result<HistoricalRejudgeRestoreItemOutcome> {
+    ensure_maintenance_writer_lease_active(writer_lease, "restore historical rejudge backup item")?;
     db.conn()
         .execute_batch("BEGIN IMMEDIATE;")
         .context("failed to begin historical rejudge restore transaction")?;
@@ -18622,6 +19186,7 @@ impl HistoricalRejudgeLlmContext {
         drawer: &Drawer,
         config: &Config,
         stage_mode: HistoricalRejudgeStageMode,
+        writer_lease: Option<&MaintenanceWriterLeaseGuard>,
     ) -> Result<HistoricalRejudgeDecision> {
         match self {
             Self::Single { .. } => self.evaluate(drawer, config).await,
@@ -18658,11 +19223,12 @@ impl HistoricalRejudgeLlmContext {
                             requires_confirmation: false,
                         });
                     }
-                    match mark_historical_rejudge_work_item_llm_confirm_pending_or_keep(
+                    match mark_historical_rejudge_work_item_llm_confirm_pending_or_keep_with_writer_lease(
                         db,
                         &work_item.run_id,
                         work_item.drawer_rowid,
                         proposal_score,
+                        writer_lease,
                     )? {
                         HistoricalRejudgeConfirmPendingPersistence::Persisted => {}
                         HistoricalRejudgeConfirmPendingPersistence::Keep(decision) => {
@@ -19659,6 +20225,14 @@ fn phase3_adoption_wrap_command(db: &Database, opts: WrapCommandOpts) -> Result<
         let track = parse_runtime_adoption_track(&record_input.track)?;
         let signal = parse_runtime_adoption_signal(&record_input.signal)?;
         let should_write = should_write_checked_record(&capture.record_quality, allow_warnings);
+        let _writer_lease = if should_write {
+            Some(acquire_cli_content_writer_lease(
+                db,
+                "phase3-adoption-wrap",
+            )?)
+        } else {
+            None
+        };
         let event = if should_write {
             let ev = runtime_adoption_event_from_input(record_input, track, signal);
             db.insert_runtime_adoption_event(&ev)
@@ -19836,6 +20410,11 @@ api_model = "text-embedding-3-large"
         calls: AtomicUsize,
     }
 
+    struct LeaseDroppingEmbedder {
+        db_path: PathBuf,
+        lease: RuntimeWriterLease,
+    }
+
     #[async_trait::async_trait]
     impl Embedder for FailFirstBatchEmbedder {
         async fn embed(
@@ -19860,8 +20439,135 @@ api_model = "text-embedding-3-large"
         }
     }
 
+    #[async_trait::async_trait]
+    impl Embedder for LeaseDroppingEmbedder {
+        async fn embed(
+            &self,
+            texts: &[&str],
+        ) -> std::result::Result<Vec<Vec<f32>>, mempal::embed::EmbedError> {
+            let db = Database::open(&self.db_path).map_err(|error| {
+                mempal::embed::EmbedError::Runtime(format!("open db in test embedder: {error}"))
+            })?;
+            db.runtime_writer_lease_release(
+                &self.lease.name,
+                &self.lease.owner,
+                &self.lease.session_id,
+            )
+            .map_err(|error| {
+                mempal::embed::EmbedError::Runtime(format!(
+                    "release writer lease in test embedder: {error}"
+                ))
+            })?;
+            Ok(texts.iter().map(|text| test_vector(text)).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        fn name(&self) -> &str {
+            "lease-dropping-test"
+        }
+    }
+
     fn test_vector(text: &str) -> Vec<f32> {
         vec![text.len() as f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    }
+
+    fn new_temp_db() -> (tempfile::TempDir, Database) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        (tmp, db)
+    }
+
+    fn hold_daemon_writer_lease(db: &Database) -> RuntimeWriterLease {
+        db.runtime_writer_lease_acquire(
+            SQLITE_WRITER_LEASE_NAME,
+            "test-daemon-writer",
+            "daemon",
+            MAINTENANCE_WRITER_LEASE_TTL_SECS,
+            None,
+        )
+        .expect("acquire daemon writer lease")
+        .expect("daemon writer lease")
+    }
+
+    fn assert_writer_lease_conflict(error: &anyhow::Error) {
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("SQLite writer lease `sqlite-writer` is already held"),
+            "{rendered}"
+        );
+    }
+
+    fn insert_checkpoint_drawer(db: &Database, id: &str, added_at: &str) {
+        let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: id.to_string(),
+            content: "checkpoint content".to_string(),
+            wing: "session-checkpoint".to_string(),
+            room: Some("claude".to_string()),
+            source_file: Some("session-checkpoint".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: added_at.to_string(),
+            chunk_index: Some(0),
+            importance: 4,
+        });
+        db.insert_drawer(&drawer).expect("insert checkpoint drawer");
+    }
+
+    fn insert_cli_test_drawer(db: &Database, id: &str) {
+        let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+            id: id.to_string(),
+            content: "CLI writer lease regression drawer".to_string(),
+            wing: "lease-test".to_string(),
+            room: Some("cli".to_string()),
+            source_file: Some("tests://cli-writer-lease".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            chunk_index: Some(0),
+            importance: 3,
+        });
+        db.insert_drawer(&drawer).expect("insert CLI test drawer");
+    }
+
+    fn checkpoint_count(db: &Database) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM drawers WHERE wing = 'session-checkpoint'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count checkpoint drawers")
+    }
+
+    fn drawer_deleted_at(db: &Database, id: &str) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT deleted_at FROM drawers WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .expect("load drawer deleted_at")
+    }
+
+    fn drawer_project_id(db: &Database, id: &str) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT project_id FROM drawers WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .expect("load drawer project_id")
+    }
+
+    fn drawer_effective_importance(db: &Database, id: &str) -> f64 {
+        db.conn()
+            .query_row(
+                "SELECT effective_importance FROM drawers WHERE id = ?1",
+                [id],
+                |row| row.get::<_, f64>(0),
+            )
+            .expect("load drawer effective_importance")
     }
 
     fn empty_reindex_target(limit: Option<usize>) -> ReindexVectorTarget {
@@ -19979,6 +20685,178 @@ api_model = "text-embedding-3-large"
     }
 
     #[tokio::test]
+    async fn cli_checkpoint_writes_reject_existing_writer_lease() {
+        let (_tmp, db) = new_temp_db();
+        let config = Config::default();
+        insert_checkpoint_drawer(&db, "checkpoint-old", "2000-01-01T00:00:00Z");
+        let _daemon_lease = hold_daemon_writer_lease(&db);
+
+        let save_error = checkpoint_command(
+            &db,
+            &config,
+            CheckpointCommands::Save {
+                content: Some("new checkpoint content".to_string()),
+                project: Some("lease-project".to_string()),
+            },
+        )
+        .await
+        .expect_err("checkpoint save must reject under daemon writer lease");
+        assert_writer_lease_conflict(&save_error);
+
+        let cleanup_error = checkpoint_command(
+            &db,
+            &config,
+            CheckpointCommands::Cleanup {
+                max_age: "1h".to_string(),
+                dry_run: false,
+            },
+        )
+        .await
+        .expect_err("checkpoint cleanup must reject under daemon writer lease");
+        assert_writer_lease_conflict(&cleanup_error);
+
+        assert_eq!(
+            checkpoint_count(&db),
+            1,
+            "conflicting save must not insert a checkpoint drawer"
+        );
+        assert_eq!(
+            drawer_deleted_at(&db, "checkpoint-old"),
+            None,
+            "conflicting cleanup must not soft-delete checkpoint drawers"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_checkpoint_cleanup_succeeds_without_writer_conflict() {
+        let (_tmp, db) = new_temp_db();
+        let config = Config::default();
+        insert_checkpoint_drawer(&db, "checkpoint-cleanup", "2000-01-01T00:00:00Z");
+
+        checkpoint_command(
+            &db,
+            &config,
+            CheckpointCommands::Cleanup {
+                max_age: "1h".to_string(),
+                dry_run: false,
+            },
+        )
+        .await
+        .expect("checkpoint cleanup without writer conflict");
+
+        assert!(
+            drawer_deleted_at(&db, "checkpoint-cleanup").is_some(),
+            "checkpoint cleanup should soft-delete old checkpoint"
+        );
+    }
+
+    #[test]
+    fn cli_project_migrate_rejects_existing_writer_lease() {
+        let (_tmp, db) = new_temp_db();
+        insert_cli_test_drawer(&db, "project-migrate-conflict");
+        let _daemon_lease = hold_daemon_writer_lease(&db);
+
+        let error = project_command(
+            &db,
+            ProjectCommands::Migrate {
+                project: "lease-project".to_string(),
+                wing: None,
+            },
+        )
+        .expect_err("project migrate must reject under daemon writer lease");
+
+        assert_writer_lease_conflict(&error);
+        assert_eq!(
+            drawer_project_id(&db, "project-migrate-conflict"),
+            None,
+            "conflicting project migration must not update drawer project_id"
+        );
+    }
+
+    #[test]
+    fn cli_project_migrate_succeeds_without_writer_conflict() {
+        let (_tmp, db) = new_temp_db();
+        db.recreate_vectors_table(8).expect("create vector table");
+        insert_cli_test_drawer(&db, "project-migrate-success");
+
+        project_command(
+            &db,
+            ProjectCommands::Migrate {
+                project: "lease-project".to_string(),
+                wing: None,
+            },
+        )
+        .expect("project migrate without writer conflict");
+
+        assert_eq!(
+            drawer_project_id(&db, "project-migrate-success").as_deref(),
+            Some("lease-project")
+        );
+    }
+
+    #[test]
+    fn cli_effective_importance_recompute_rejects_existing_writer_lease() {
+        let (_tmp, db) = new_temp_db();
+        insert_cli_test_drawer(&db, "importance-conflict");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0 WHERE id = ?1",
+                ["importance-conflict"],
+            )
+            .expect("reset effective importance");
+        let _daemon_lease = hold_daemon_writer_lease(&db);
+
+        let error = recompute_effective_importance_command(&db)
+            .expect_err("effective importance recompute must reject under daemon writer lease");
+
+        assert_writer_lease_conflict(&error);
+        assert_eq!(
+            drawer_effective_importance(&db, "importance-conflict"),
+            0.0,
+            "conflicting recompute must not update effective_importance"
+        );
+    }
+
+    #[test]
+    fn cli_effective_importance_recompute_succeeds_without_writer_conflict() {
+        let (_tmp, db) = new_temp_db();
+        insert_cli_test_drawer(&db, "importance-success");
+        db.conn()
+            .execute(
+                "UPDATE drawers SET effective_importance = 0.0 WHERE id = ?1",
+                ["importance-success"],
+            )
+            .expect("reset effective importance");
+
+        recompute_effective_importance_command(&db)
+            .expect("effective importance recompute without writer conflict");
+
+        assert!(
+            drawer_effective_importance(&db, "importance-success") > 0.0,
+            "successful recompute should update effective_importance"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_crystallize_dry_run_does_not_require_writer_lease() {
+        let (_tmp, db) = new_temp_db();
+        let config = Config::default();
+        let _daemon_lease = hold_daemon_writer_lease(&db);
+
+        crystallize_command(
+            &db,
+            &config,
+            CrystallizeCliOptions {
+                dry_run: true,
+                project: None,
+                json: true,
+            },
+        )
+        .await
+        .expect("crystallize dry-run should not require writer lease");
+    }
+
+    #[tokio::test]
     async fn reindex_stale_batches_processes_snapshot_once_and_drains_pending() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
@@ -19999,11 +20877,14 @@ api_model = "text-embedding-3-large"
             &embedder,
             "recording-test",
             TEST_TARGET_FINGERPRINT,
-            2,
             empty_reindex_target(None),
-            BatchRetryPolicy {
-                interval: std::time::Duration::from_millis(0),
-                max_retries: 0,
+            StaleBatchExecution {
+                batch_size: 2,
+                policy: BatchRetryPolicy {
+                    interval: std::time::Duration::from_millis(0),
+                    max_retries: 0,
+                },
+                writer_lease: None,
             },
         )
         .await
@@ -20054,11 +20935,14 @@ api_model = "text-embedding-3-large"
             &embedder,
             "fail-first-test",
             TEST_TARGET_FINGERPRINT,
-            2,
             empty_reindex_target(None),
-            BatchRetryPolicy {
-                interval: std::time::Duration::from_millis(0),
-                max_retries: 0,
+            StaleBatchExecution {
+                batch_size: 2,
+                policy: BatchRetryPolicy {
+                    interval: std::time::Duration::from_millis(0),
+                    max_retries: 0,
+                },
+                writer_lease: None,
             },
         )
         .await
@@ -20087,6 +20971,62 @@ api_model = "text-embedding-3-large"
             reindex_vector_ids(&db).expect("vector ids"),
             vec!["d-2".to_string(), "d-3".to_string()],
             "later batches still complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_stale_batches_stops_before_write_after_writer_lease_loss() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        db.recreate_vectors_table(8).expect("create vector table");
+        for i in 0i64..2 {
+            insert_reindex_test_drawer(
+                &db,
+                &format!("d-{i}"),
+                &format!("content {i}"),
+                "fixtures/source.txt",
+                i,
+            );
+        }
+        let writer_lease =
+            acquire_maintenance_writer_lease(&db, "test-stale-lease-loss").expect("writer lease");
+        let embedder = LeaseDroppingEmbedder {
+            db_path: db.path().to_path_buf(),
+            lease: writer_lease.lease().clone(),
+        };
+
+        let error = reindex_stale_batches(
+            &db,
+            &embedder,
+            "lease-dropping-test",
+            TEST_TARGET_FINGERPRINT,
+            empty_reindex_target(None),
+            StaleBatchExecution {
+                batch_size: 2,
+                policy: BatchRetryPolicy {
+                    interval: std::time::Duration::from_millis(0),
+                    max_retries: 0,
+                },
+                writer_lease: Some(&writer_lease),
+            },
+        )
+        .await
+        .expect_err("lost writer lease must stop stale reindex");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("lost before write stale reindex vector batch"),
+            "{rendered}"
+        );
+        assert_eq!(
+            db.vector_row_count().expect("vector count"),
+            0,
+            "lease loss must stop before writing vectors"
+        );
+        assert_eq!(
+            reindex_pending_count(&db).expect("pending count"),
+            2,
+            "lease loss must not delete pending work"
         );
     }
 
@@ -20236,11 +21176,14 @@ api_model = "text-embedding-3-large"
             &embedder,
             "recording-test",
             TEST_TARGET_FINGERPRINT,
-            2,
             empty_reindex_target(Some(3)),
-            BatchRetryPolicy {
-                interval: std::time::Duration::from_millis(0),
-                max_retries: 0,
+            StaleBatchExecution {
+                batch_size: 2,
+                policy: BatchRetryPolicy {
+                    interval: std::time::Duration::from_millis(0),
+                    max_retries: 0,
+                },
+                writer_lease: None,
             },
         )
         .await
@@ -20918,6 +21861,23 @@ threshold = 0.7
         tmp.path().join("rejudge-backups")
     }
 
+    fn release_writer_lease_for_test(db: &Database, lease: &MaintenanceWriterLeaseGuard) {
+        db.runtime_writer_lease_release(
+            &lease.lease().name,
+            &lease.lease().owner,
+            &lease.lease().session_id,
+        )
+        .expect("release writer lease");
+    }
+
+    fn assert_writer_lease_lost_before(error: &anyhow::Error, operation: &str) {
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&format!("lost before {operation}")),
+            "{rendered}"
+        );
+    }
+
     fn backup_files(dir: &Path) -> Vec<PathBuf> {
         if !dir.exists() {
             return Vec::new();
@@ -21410,6 +22370,7 @@ threshold = 0.7
             full_rejudge_options(true, None, 3),
             &mut checkpoint,
             &prepared,
+            None,
         )
         .expect("finalize prepared items");
 
@@ -21457,15 +22418,16 @@ threshold = 0.7
         ));
         let options_hash = historical_rejudge_options_hash(start_options, None, old_config_version)
             .expect("old options hash");
-        let checkpoint = start_historical_rejudge_checkpoint(
-            &db,
-            start_options,
-            None,
-            old_config_version,
-            judge_model.clone(),
-            Some(&backups),
+        let checkpoint = start_historical_rejudge_checkpoint(HistoricalRejudgeCheckpointStart {
+            db: &db,
+            options: start_options,
+            project_id: None,
+            config_version: old_config_version,
+            judge_model: judge_model.clone(),
+            backup_dir: Some(&backups),
             options_hash,
-        )
+            writer_lease: None,
+        })
         .expect("start checkpoint");
 
         let resumed = prepare_historical_rejudge_checkpoint(
@@ -21478,6 +22440,7 @@ threshold = 0.7
             new_config_version,
             judge_model,
             Some(&backups),
+            None,
         )
         .expect("resume should tolerate unrelated config-version drift");
 
@@ -21495,6 +22458,7 @@ threshold = 0.7
             old_config_version,
             Some("proposal:qwen=other-model, confirm:spark=spark-model".to_string()),
             Some(&backups),
+            None,
         )
         .expect_err("resume must reject changed judge model even without config-version drift");
         assert!(
@@ -21523,6 +22487,7 @@ threshold = 0.7
                 historical_rejudge_endpoint_summary(&confirm_endpoint)
             )),
             Some(&backups),
+            None,
         )
         .expect_err("resume must reject changed endpoint identity despite same id/model");
         assert!(
@@ -21546,6 +22511,7 @@ threshold = 0.7
                 historical_rejudge_endpoint_summary(&confirm_endpoint)
             )),
             Some(&backups),
+            None,
         )
         .expect_err("resume must reject changed judge policy despite config-version drift");
         assert!(
@@ -21565,6 +22531,7 @@ threshold = 0.7
             new_config_version,
             Some("proposal:qwen=other-model, confirm:spark=spark-model".to_string()),
             Some(&backups),
+            None,
         )
         .expect_err("resume must reject changed judge model despite config-version drift");
         assert!(
@@ -21595,15 +22562,16 @@ threshold = 0.7
         let legacy_options_hash =
             historical_rejudge_options_hash(legacy_options, None, old_config_version)
                 .expect("legacy old options hash");
-        start_historical_rejudge_checkpoint(
-            &legacy_db,
-            legacy_options,
-            None,
-            old_config_version,
-            legacy_judge_model,
-            Some(&legacy_backups),
-            legacy_options_hash,
-        )
+        start_historical_rejudge_checkpoint(HistoricalRejudgeCheckpointStart {
+            db: &legacy_db,
+            options: legacy_options,
+            project_id: None,
+            config_version: old_config_version,
+            judge_model: legacy_judge_model,
+            backup_dir: Some(&legacy_backups),
+            options_hash: legacy_options_hash,
+            writer_lease: None,
+        })
         .expect("start legacy checkpoint");
 
         let unsafe_required = prepare_historical_rejudge_checkpoint(
@@ -21616,6 +22584,7 @@ threshold = 0.7
             new_config_version,
             fingerprinted_judge_model.clone(),
             Some(&legacy_backups),
+            None,
         )
         .expect_err("legacy checkpoint without policy fingerprint must fail closed across config-version drift");
         assert!(
@@ -21636,6 +22605,7 @@ threshold = 0.7
             new_config_version,
             fingerprinted_judge_model,
             Some(&legacy_backups),
+            None,
         )
         .expect("explicit unsafe override should allow compatible legacy checkpoint");
         assert_eq!(unsafe_resumed.config_version, old_config_version);
@@ -21663,16 +22633,18 @@ threshold = 0.7
         );
         let options_hash = historical_rejudge_options_hash(options, None, old_config_version)
             .expect("old options hash");
-        let mut checkpoint = start_historical_rejudge_checkpoint(
-            &db,
-            options,
-            None,
-            old_config_version,
-            checkpoint_judge_model,
-            Some(&backups),
-            options_hash,
-        )
-        .expect("start checkpoint");
+        let mut checkpoint =
+            start_historical_rejudge_checkpoint(HistoricalRejudgeCheckpointStart {
+                db: &db,
+                options,
+                project_id: None,
+                config_version: old_config_version,
+                judge_model: checkpoint_judge_model,
+                backup_dir: Some(&backups),
+                options_hash,
+                writer_lease: None,
+            })
+            .expect("start checkpoint");
         checkpoint.status = "waiting_llm".to_string();
         checkpoint.last_processed_rowid = Some(drawer_rowid(&db, "live-resume-drift"));
         save_historical_rejudge_checkpoint(&db, &checkpoint).expect("save live checkpoint");
@@ -21687,6 +22659,7 @@ threshold = 0.7
             new_config_version,
             current_judge_model.clone(),
             Some(&backups),
+            None,
         )
         .expect("resume should accept live two-stage endpoint=model summary drift");
         assert_eq!(resumed.run_id, checkpoint.run_id);
@@ -21707,6 +22680,7 @@ threshold = 0.7
                     .to_string(),
             ),
             Some(&backups),
+            None,
         )
         .expect_err("resume must reject changed two-stage judge model");
         assert!(
@@ -21727,6 +22701,7 @@ threshold = 0.7
             new_config_version,
             current_judge_model.clone(),
             Some(&backups),
+            None,
         )
         .expect_err("resume must reject changed filters");
         assert!(
@@ -21748,6 +22723,7 @@ threshold = 0.7
             new_config_version,
             current_judge_model.clone(),
             Some(&backups),
+            None,
         )
         .expect_err("resume must reject changed destructive scope");
         assert!(
@@ -21768,6 +22744,7 @@ threshold = 0.7
             new_config_version,
             current_judge_model,
             Some(&backups),
+            None,
         )
         .expect_err("resume must reject changed stored page size");
         assert!(
@@ -21792,15 +22769,16 @@ threshold = 0.7
         let new_policy = Some("deterministic@policy:new-policy".to_string());
         let options_hash = historical_rejudge_options_hash(options, None, old_config_version)
             .expect("old options hash");
-        start_historical_rejudge_checkpoint(
-            &db,
+        start_historical_rejudge_checkpoint(HistoricalRejudgeCheckpointStart {
+            db: &db,
             options,
-            None,
-            old_config_version,
-            Some(old_policy),
-            Some(&backups),
+            project_id: None,
+            config_version: old_config_version,
+            judge_model: Some(old_policy),
+            backup_dir: Some(&backups),
             options_hash,
-        )
+            writer_lease: None,
+        })
         .expect("start deterministic checkpoint");
 
         let changed_policy = prepare_historical_rejudge_checkpoint(
@@ -21813,6 +22791,7 @@ threshold = 0.7
             new_config_version,
             new_policy,
             Some(&backups),
+            None,
         )
         .expect_err("resume must reject deterministic judge policy drift");
         assert!(
@@ -21839,15 +22818,16 @@ threshold = 0.7
         let legacy_options_hash =
             historical_rejudge_options_hash(legacy_options, None, old_config_version)
                 .expect("legacy old options hash");
-        start_historical_rejudge_checkpoint(
-            &legacy_db,
-            legacy_options,
-            None,
-            old_config_version,
-            Some("deterministic".to_string()),
-            Some(&legacy_backups),
-            legacy_options_hash,
-        )
+        start_historical_rejudge_checkpoint(HistoricalRejudgeCheckpointStart {
+            db: &legacy_db,
+            options: legacy_options,
+            project_id: None,
+            config_version: old_config_version,
+            judge_model: Some("deterministic".to_string()),
+            backup_dir: Some(&legacy_backups),
+            options_hash: legacy_options_hash,
+            writer_lease: None,
+        })
         .expect("start legacy deterministic checkpoint");
 
         let legacy_bare_deterministic = prepare_historical_rejudge_checkpoint(
@@ -21860,6 +22840,7 @@ threshold = 0.7
             new_config_version,
             Some("deterministic".to_string()),
             Some(&legacy_backups),
+            None,
         )
         .expect_err("bare deterministic summary must fail closed across config-version drift");
         assert!(
@@ -21879,6 +22860,7 @@ threshold = 0.7
             new_config_version,
             Some("deterministic@policy:new-policy".to_string()),
             Some(&legacy_backups),
+            None,
         )
         .expect_err("legacy deterministic checkpoint without policy fingerprint must fail closed");
         assert!(
@@ -21899,6 +22881,7 @@ threshold = 0.7
             new_config_version,
             Some("deterministic@policy:new-policy".to_string()),
             Some(&legacy_backups),
+            None,
         )
         .expect("explicit unsafe override should allow legacy deterministic checkpoint");
         assert_eq!(legacy_unsafe_resumed.config_version, old_config_version);
@@ -21916,15 +22899,16 @@ threshold = 0.7
         let options = full_rejudge_options(true, Some(&backups), 1);
         let options_hash = historical_rejudge_options_hash(options, None, old_config_version)
             .expect("old options hash");
-        start_historical_rejudge_checkpoint(
-            &db,
+        start_historical_rejudge_checkpoint(HistoricalRejudgeCheckpointStart {
+            db: &db,
             options,
-            None,
-            old_config_version,
-            Some("legacy-model".to_string()),
-            Some(&backups),
+            project_id: None,
+            config_version: old_config_version,
+            judge_model: Some("legacy-model".to_string()),
+            backup_dir: Some(&backups),
             options_hash,
-        )
+            writer_lease: None,
+        })
         .expect("start legacy single-endpoint checkpoint");
 
         let endpoint =
@@ -21944,6 +22928,7 @@ threshold = 0.7
             new_config_version,
             current_judge_model.clone(),
             Some(&backups),
+            None,
         )
         .expect_err("legacy single-endpoint label must fail closed without unsafe override");
         assert!(
@@ -21964,6 +22949,7 @@ threshold = 0.7
             new_config_version,
             current_judge_model,
             Some(&backups),
+            None,
         )
         .expect("unsafe override should accept legacy single-endpoint model label");
         assert_eq!(resumed.config_version, old_config_version);
@@ -22186,6 +23172,124 @@ threshold = 0.7
             fts_matches.is_empty(),
             "soft-deleted forget candidates must not remain BM25-searchable: {fts_matches:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_limited_stops_before_mutation_after_writer_lease_loss() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "limited-lease-loss", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+        let writer_lease = acquire_maintenance_writer_lease(&db, "test-rejudge-limited-lease-loss")
+            .expect("writer lease");
+        release_writer_lease_for_test(&db, &writer_lease);
+
+        let error = maintenance_rejudge_limited_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                all: false,
+                resume: false,
+                unsafe_allow_config_version_drift: false,
+                page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+            None,
+            None,
+            Some(&writer_lease),
+        )
+        .await
+        .expect_err("lost writer lease must stop limited rejudge before mutation");
+
+        assert_writer_lease_lost_before(&error, "apply limited historical rejudge mutations");
+        assert!(
+            db.get_drawer("limited-lease-loss")
+                .expect("load active drawer")
+                .is_some(),
+            "limited rejudge must not soft-delete after lease loss"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_eq!(
+            audit_count(&db),
+            0,
+            "limited rejudge must not write decision audit after lease loss"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_all_page_stops_before_mutation_after_writer_lease_loss() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "all-lease-loss", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+        let config = test_config();
+        let config_version = historical_rejudge_config_version(&config);
+        let options = full_rejudge_options(true, Some(&backups), 1);
+        let writer_lease = acquire_maintenance_writer_lease(&db, "test-rejudge-all-lease-loss")
+            .expect("writer lease");
+        let mut checkpoint = prepare_historical_rejudge_checkpoint(
+            &db,
+            options,
+            None,
+            &config_version,
+            Some("deterministic".to_string()),
+            Some(&backups),
+            Some(&writer_lease),
+        )
+        .expect("prepare checkpoint");
+        let page = next_historical_rejudge_work_items(&db, &checkpoint.run_id, 1)
+            .expect("load first work page");
+        let prepared = prepare_historical_rejudge_work_item(
+            &db,
+            &config,
+            &page[0],
+            HistoricalRejudgeWorkContext {
+                llm_context: None,
+                writer_lease: Some(&writer_lease),
+            },
+            HistoricalRejudgeStageMode::Paired,
+        )
+        .await
+        .expect("prepare deletion candidate");
+        release_writer_lease_for_test(&db, &writer_lease);
+
+        let error = process_prepared_historical_rejudge_work_items(
+            &db,
+            options,
+            &mut checkpoint,
+            &[prepared],
+            Some(&writer_lease),
+        )
+        .expect_err("lost writer lease must stop all-mode page mutation");
+
+        assert_writer_lease_lost_before(&error, "apply historical rejudge page mutations");
+        assert!(
+            db.get_drawer("all-lease-loss")
+                .expect("load active drawer")
+                .is_some(),
+            "all-mode page must not soft-delete after lease loss"
+        );
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_eq!(audit_count(&db), 0);
+        assert_eq!(checkpoint.scanned_count, 0);
+        let persisted = load_historical_rejudge_checkpoint(&db)
+            .expect("load persisted checkpoint")
+            .expect("checkpoint");
+        assert_eq!(persisted.scanned_count, 0);
+        assert_eq!(persisted.mutated_count, 0);
+        assert_eq!(persisted.last_processed_rowid, None);
     }
 
     #[tokio::test]
@@ -22450,6 +23554,7 @@ threshold = 0.7
             &config_version,
             Some("deterministic".to_string()),
             Some(&backups),
+            None,
         )
         .expect("prepare full rejudge checkpoint");
         let page = next_historical_rejudge_work_items(&db, &checkpoint.run_id, 1)
@@ -22459,7 +23564,10 @@ threshold = 0.7
             &db,
             &config,
             &page[0],
-            None,
+            HistoricalRejudgeWorkContext {
+                llm_context: None,
+                writer_lease: None,
+            },
             HistoricalRejudgeStageMode::Paired,
         )
         .await
@@ -22474,8 +23582,14 @@ threshold = 0.7
 
         protect_rejudge_candidate_metadata(&db, "low");
 
-        process_prepared_historical_rejudge_work_items(&db, options, &mut checkpoint, &[prepared])
-            .expect("process rejudge page");
+        process_prepared_historical_rejudge_work_items(
+            &db,
+            options,
+            &mut checkpoint,
+            &[prepared],
+            None,
+        )
+        .expect("process rejudge page");
 
         assert_eq!(
             historical_rejudge_work_item_decision(&db, &checkpoint.run_id, page[0].drawer_rowid),
@@ -23193,6 +24307,73 @@ threshold = 0.7
             )
             .expect("count restore audits");
         assert_eq!(restore_audits, 0);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_restore_item_stops_before_transaction_after_writer_lease_loss() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_drawer(&db, "restore-lease-loss", "ok", "notes", None);
+        let backups = backup_dir(&tmp);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                execute: true,
+                hard_delete: false,
+                backup_dir: Some(&backups),
+                unsafe_no_backup: false,
+                limit: 100,
+                all: false,
+                resume: false,
+                unsafe_allow_config_version_drift: false,
+                page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+                progress_file: None,
+                stage_mode: HistoricalRejudgeStageMode::Paired,
+                proposal_llm_endpoint: None,
+                confirm_llm_endpoint: None,
+                wing: None,
+                room: None,
+                project: None,
+                format: "json",
+            },
+        )
+        .await
+        .expect("create restore backup");
+        let backup = read_historical_rejudge_backup(&only_backup_file(&backups))
+            .expect("read rejudge backup");
+        let audit_count_before_restore = audit_count(&db);
+        let deleted_count_before_restore = db.deleted_drawer_count().expect("deleted count");
+        let writer_lease = acquire_maintenance_writer_lease(&db, "test-rejudge-restore-lease-loss")
+            .expect("writer lease");
+        release_writer_lease_for_test(&db, &writer_lease);
+
+        let error = restore_rejudge_backup_item_transaction(
+            &db,
+            &backup.items[0],
+            &backup,
+            RejudgeRestoreConflictPolicy::Skip,
+            Some(&writer_lease),
+        )
+        .expect_err("lost writer lease must stop restore item transaction");
+
+        assert_writer_lease_lost_before(&error, "restore historical rejudge backup item");
+        assert!(
+            db.get_drawer("restore-lease-loss")
+                .expect("load deleted drawer")
+                .is_none(),
+            "restore must not reactivate drawer after lease loss"
+        );
+        assert_eq!(
+            db.deleted_drawer_count().expect("deleted count"),
+            deleted_count_before_restore
+        );
+        assert_eq!(
+            audit_count(&db),
+            audit_count_before_restore,
+            "restore must not write per-drawer audit after lease loss"
+        );
     }
 
     #[tokio::test]
@@ -24503,6 +25684,7 @@ threshold = 0.7
             &config_version,
             Some("deterministic".to_string()),
             Some(&backups),
+            None,
         )
         .expect("prepare checkpoint");
         let backup_path = checkpoint.backup_path.clone().expect("backup path");
@@ -24523,7 +25705,10 @@ threshold = 0.7
             full_rejudge_options(true, Some(&backups), 1),
             &mut checkpoint,
             std::slice::from_ref(&first),
-            None,
+            HistoricalRejudgeWorkContext {
+                llm_context: None,
+                writer_lease: None,
+            },
         )
         .await
         .expect("process first item");
@@ -24599,6 +25784,7 @@ threshold = 0.7
             &config_version,
             Some("deterministic".to_string()),
             Some(&backups),
+            None,
         )
         .expect("prepare checkpoint");
         let backup_path = checkpoint.backup_path.clone().expect("backup path");
@@ -24624,7 +25810,10 @@ threshold = 0.7
             full_rejudge_options(true, Some(&backups), 1),
             &mut checkpoint,
             std::slice::from_ref(&work_item),
-            None,
+            HistoricalRejudgeWorkContext {
+                llm_context: None,
+                writer_lease: None,
+            },
         )
         .await
         .expect_err("injected work item failure must roll back");
@@ -24715,6 +25904,7 @@ threshold = 0.7
             &config_version,
             Some("deterministic".to_string()),
             Some(&backups),
+            None,
         )
         .expect("prepare checkpoint");
         let backup_path = checkpoint.backup_path.clone().expect("backup path");
@@ -24733,7 +25923,10 @@ threshold = 0.7
             full_rejudge_options(true, Some(&backups), 1),
             &mut checkpoint,
             std::slice::from_ref(&work_item),
-            None,
+            HistoricalRejudgeWorkContext {
+                llm_context: None,
+                writer_lease: None,
+            },
         )
         .await
         .expect_err("backup write failure must block deletion");
@@ -24789,6 +25982,7 @@ threshold = 0.7
             &config_version,
             Some("deterministic".to_string()),
             Some(&backups),
+            None,
         )
         .expect("prepare checkpoint");
 
@@ -24935,6 +26129,7 @@ threshold = 0.7
             &db,
             &mut checkpoint,
             "waiting_llm",
+            None,
         )
         .expect("waiting checkpoint lock must be deferred");
         assert_eq!(
@@ -24955,9 +26150,13 @@ threshold = 0.7
         blocker
             .execute_batch("COMMIT;")
             .expect("release write lock");
-        let outcome =
-            persist_historical_rejudge_llm_retry_status_checkpoint(&db, &mut checkpoint, "running")
-                .expect("running checkpoint save after lock release");
+        let outcome = persist_historical_rejudge_llm_retry_status_checkpoint(
+            &db,
+            &mut checkpoint,
+            "running",
+            None,
+        )
+        .expect("running checkpoint save after lock release");
         assert_eq!(outcome, HistoricalRejudgeCheckpointPersistence::Persisted);
         let persisted = load_historical_rejudge_checkpoint(&db)
             .expect("load running checkpoint")
@@ -25219,6 +26418,7 @@ threshold = 0.7
                 judge_model: Some("deterministic".to_string()),
                 backup_dir: Some(&backups),
                 options_hash,
+                writer_lease: None,
             },
             |snapshot_max_rowid| {
                 assert_eq!(snapshot_max_rowid, old_max_rowid);

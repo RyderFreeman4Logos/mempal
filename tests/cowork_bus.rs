@@ -155,6 +155,14 @@ fn palace_db_path(home: &TempDir) -> PathBuf {
     home.path().join(".mempal/palace.db")
 }
 
+fn hold_daemon_writer_lease(home: &TempDir) -> mempal::core::types::RuntimeWriterLease {
+    fs::create_dir_all(home.path().join(".mempal")).expect("create .mempal");
+    let db = mempal::core::db::Database::open(&palace_db_path(home)).expect("open db");
+    db.runtime_writer_lease_acquire("sqlite-writer", "daemon-owner", "daemon", 300, None)
+        .expect("acquire daemon writer lease")
+        .expect("daemon writer lease")
+}
+
 fn event_lines(home: &TempDir, repo: &Path) -> Vec<String> {
     fs::read_to_string(bus_events_path(home, repo))
         .expect("events file")
@@ -2013,6 +2021,41 @@ fn test_cli_cowork_capture_execute_writes_evidence() {
         .expect("drawer exists");
     assert_eq!(drawer.wing, "cowork-capture");
     assert!(drawer.content.contains("Cowork Handoff Capture"));
+}
+
+#[test]
+
+fn test_cli_cowork_capture_execute_respects_existing_writer_lease() {
+    let home = TempDir::new().expect("home");
+    let repo = setup_repo(&home, "capture-lease-conflict");
+    register(&home, &repo, "claude-main", "claude");
+    let _lease = hold_daemon_writer_lease(&home);
+
+    let capture = run_mempal(
+        &home,
+        &[
+            "cowork-capture",
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--summary-source",
+            "handoff",
+            "--execute",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert!(
+        !capture.status.success(),
+        "cowork-capture must fail under writer lease"
+    );
+    let err = stderr(&capture);
+    assert!(
+        err.contains("SQLite writer lease `sqlite-writer` is already held"),
+        "{err}"
+    );
+    let db = mempal::core::db::Database::open(&palace_db_path(&home)).expect("open db");
+    assert_eq!(db.drawer_count().expect("drawer count"), 0);
 }
 
 #[test]

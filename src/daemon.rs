@@ -18,7 +18,7 @@ use crate::core::{
     project::resolve_project_id,
     queue::{AsyncPendingMessageStore, ClaimedMessage, QueueFailureDisposition},
     strata::{is_raw_turn, raw_turn_importance, should_store_raw_turns},
-    types::{BootstrapEvidenceArgs, Drawer, SourceType},
+    types::{BootstrapEvidenceArgs, Drawer, RuntimeWriterLease, SourceType},
     utils::{current_timestamp, route_room_from_taxonomy, synthetic_source_file},
 };
 use crate::embed::{
@@ -53,6 +53,9 @@ const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 pub const DAEMON_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 const DAEMON_HOOK_WORKER_LIMIT: usize = 4;
 const ENDPOINT_RECOVERY_REQUEUE_INTERVAL: Duration = Duration::from_secs(30);
+const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
+const DAEMON_WRITER_LEASE_TTL_SECS: u64 = 120;
+const DAEMON_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
     run_command_with_bootstrap_events(config_path, foreground, None)
@@ -67,11 +70,11 @@ pub fn run_command_with_bootstrap_events(
     let context =
         match DaemonContext::bootstrap_with_events(config_path, foreground, bootstrap_events) {
             Ok(context) => context,
-            // A concurrent daemon already holds the singleton lock (#257): this is
-            // a clean no-op, not a failure. Exit success without daemonizing.
+            // A concurrent daemon already holds the singleton lock (#496):
+            // fail before daemonizing or starting any workers, with owner
+            // metadata in the error for operators and scripts.
             Err(error) if error.is::<crate::daemon_singleton::DaemonAlreadyRunning>() => {
-                eprintln!("daemon already running; exiting");
-                return Ok(());
+                return Err(error);
             }
             Err(error) => return Err(error),
         };
@@ -84,6 +87,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         db.path().to_path_buf()
     };
     global_embed_status().set_audit_db_path(Some(db_path.clone()));
+    let writer_lease = acquire_daemon_writer_lease(context, &db_path).await?;
     {
         let db = context.db.lock().await;
         db.prune_expired_audit_logs()
@@ -205,7 +209,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         .await
         .context("failed to reclaim stale daemon claims")?;
     tracing::info!("daemon startup reclaim_stale reclaimed={reclaimed}");
-    let ingest_drain_worker = spawn_daemon_ingest_drain_worker(context, &db_path)
+    let ingest_drain_worker = spawn_daemon_ingest_drain_worker(context, &db_path, &writer_lease)
         .context("failed to start daemon async ingest worker")?;
     let stall_watchdog_handle = spawn_stall_watchdog(
         context.write_observer.clone(),
@@ -268,6 +272,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
         config: Arc::clone(&context.config),
         mempal_home: context.mempal_home.clone(),
         write_observer: context.write_observer.clone(),
+        runtime_writer_lease: Some(writer_lease.lease().clone()),
         #[cfg(test)]
         idle_observer: None,
     };
@@ -350,9 +355,175 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
     Ok(())
 }
 
+struct RuntimeWriterLeaseHandle {
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+    heartbeat: tokio::task::JoinHandle<()>,
+}
+
+impl RuntimeWriterLeaseHandle {
+    fn new(db_path: PathBuf, lease: RuntimeWriterLease) -> Self {
+        let heartbeat = spawn_runtime_writer_lease_heartbeat(db_path.clone(), lease.clone());
+        Self {
+            db_path,
+            lease,
+            heartbeat,
+        }
+    }
+
+    fn lease(&self) -> &RuntimeWriterLease {
+        &self.lease
+    }
+}
+
+impl Drop for RuntimeWriterLeaseHandle {
+    fn drop(&mut self) {
+        self.heartbeat.abort();
+        if let Ok(db) = Database::open(&self.db_path) {
+            let _ = db.runtime_writer_lease_release(
+                &self.lease.name,
+                &self.lease.owner,
+                &self.lease.session_id,
+            );
+        }
+    }
+}
+
+async fn acquire_daemon_writer_lease(
+    context: &DaemonContext,
+    db_path: &Path,
+) -> Result<RuntimeWriterLeaseHandle> {
+    let owner = format!("mempal-daemon-{}", std::process::id());
+    let metadata = json!({
+        "command": "daemon",
+        "db_path": db_path.to_string_lossy(),
+    })
+    .to_string();
+    let lease = {
+        let db = context.db.lock().await;
+        db.runtime_writer_lease_acquire(
+            SQLITE_WRITER_LEASE_NAME,
+            &owner,
+            "daemon",
+            DAEMON_WRITER_LEASE_TTL_SECS,
+            Some(&metadata),
+        )
+        .context("failed to acquire daemon writer lease")?
+    };
+    match lease {
+        Some(lease) => Ok(RuntimeWriterLeaseHandle::new(db_path.to_path_buf(), lease)),
+        None => {
+            let active = {
+                let db = context.db.lock().await;
+                db.runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+                    .unwrap_or_default()
+            };
+            Err(anyhow::anyhow!(
+                "SQLite writer lease `{}` is already held: {}",
+                SQLITE_WRITER_LEASE_NAME,
+                format_runtime_writer_leases(&active)
+            ))
+        }
+    }
+}
+
+fn spawn_runtime_writer_lease_heartbeat(
+    db_path: PathBuf,
+    lease: RuntimeWriterLease,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DAEMON_WRITER_LEASE_RENEW_INTERVAL);
+        loop {
+            interval.tick().await;
+            let db_path = db_path.clone();
+            let lease_for_renew = lease.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let db =
+                    Database::open(&db_path).context("failed to open DB for writer lease renew")?;
+                db.runtime_writer_lease_renew(
+                    &lease_for_renew.name,
+                    &lease_for_renew.owner,
+                    &lease_for_renew.session_id,
+                    DAEMON_WRITER_LEASE_TTL_SECS,
+                )
+                .context("failed to renew daemon writer lease")
+            })
+            .await;
+            match result {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    tracing::error!(
+                        lease = %lease.name,
+                        owner = %lease.owner,
+                        "daemon writer lease was lost; requesting shutdown"
+                    );
+                    #[cfg(unix)]
+                    request_shutdown_and_notify();
+                    break;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "failed to renew daemon writer lease");
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "writer lease heartbeat task failed");
+                }
+            }
+        }
+    })
+}
+
+fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
+    if leases.is_empty() {
+        return "none visible".to_string();
+    }
+    leases
+        .iter()
+        .map(|lease| {
+            format!(
+                "name={} owner={} pid={} mode={} expires_at={} heartbeat_at={}",
+                lease.name,
+                lease.owner,
+                lease.pid,
+                lease.mode,
+                lease.expires_at,
+                lease.heartbeat_at
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn ensure_daemon_runtime_writer_lease_active(
+    db: &Database,
+    lease: Option<&RuntimeWriterLease>,
+    operation: &'static str,
+) -> Result<()> {
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+    let active = db
+        .runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
+        .with_context(|| {
+            format!(
+                "failed to verify daemon writer lease `{}` before {operation}",
+                lease.name
+            )
+        })?;
+    if active {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "SQLite writer lease `{}` for {} was lost before {operation}",
+            lease.name,
+            lease.owner
+        )
+    }
+}
+
 fn spawn_daemon_ingest_drain_worker(
     context: &DaemonContext,
     db_path: &Path,
+    writer_lease: &RuntimeWriterLeaseHandle,
 ) -> Result<crate::mcp::IngestDrainWorkerHandle> {
     let config = context.config.as_ref().clone();
     let server = crate::mcp::MempalMcpServer::new_with_factory_and_config(
@@ -361,7 +532,8 @@ fn spawn_daemon_ingest_drain_worker(
         Arc::new(crate::embed::ConfiguredEmbedderFactory::new_for_daemon(
             config,
         )),
-    )?;
+    )?
+    .with_external_ingest_writer_lease(writer_lease.lease().clone());
     let handle = server.spawn_scoped_ingest_drain_worker();
     tracing::info!("daemon async ingest worker started");
     Ok(handle)
@@ -378,6 +550,7 @@ struct HookWorkerState {
     config: Arc<crate::core::config::Config>,
     mempal_home: PathBuf,
     write_observer: crate::daemon_bootstrap::DaemonWriteObserver,
+    runtime_writer_lease: Option<RuntimeWriterLease>,
     #[cfg(test)]
     idle_observer: Option<Arc<Notify>>,
 }
@@ -551,6 +724,7 @@ async fn process_hook_worker_message(
             llm_gate: state.llm_gate.as_ref(),
             config: state.config.as_ref(),
             mempal_home: &state.mempal_home,
+            runtime_writer_lease: state.runtime_writer_lease.as_ref(),
         },
     )
     .await;
@@ -1031,6 +1205,7 @@ pub struct DaemonIngestContext<'a> {
     pub llm_gate: Option<&'a HookLlmGateRuntime>,
     pub config: &'a crate::core::config::Config,
     pub mempal_home: &'a Path,
+    pub runtime_writer_lease: Option<&'a RuntimeWriterLease>,
 }
 
 struct DrawerIngestContext<'a, E: Embedder + ?Sized> {
@@ -1077,8 +1252,16 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         let envelope = envelope.clone();
         let config = (*context.config).clone();
         let mempal_home = context.mempal_home.to_path_buf();
-        db.run_write_anyhow(move |db| build_drawer_records(db, &envelope, &config, &mempal_home))
-            .await?
+        let runtime_writer_lease = context.runtime_writer_lease.cloned();
+        db.run_write_anyhow(move |db| {
+            ensure_daemon_runtime_writer_lease_active(
+                db,
+                runtime_writer_lease.as_ref(),
+                "build daemon hook drawer records",
+            )?;
+            build_drawer_records(db, &envelope, &config, &mempal_home)
+        })
+        .await?
     };
     let drawer_context = DrawerIngestContext {
         db,
@@ -1310,8 +1493,14 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
         }));
     }
 
+    let runtime_writer_lease = context.runtime_writer_lease.cloned();
     let insert_stats = db
         .run_write_anyhow(move |db| {
+            ensure_daemon_runtime_writer_lease_active(
+                db,
+                runtime_writer_lease.as_ref(),
+                "insert Hermes turns",
+            )?;
             crate::xurl::store::insert_turns(db.conn(), &kept_turns)
                 .context("failed to insert gated Hermes turns")
         })
@@ -1327,6 +1516,7 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
         &turn_ids,
         &vector_fingerprint,
         context.config,
+        context.runtime_writer_lease,
         Some(&embed_heartbeat),
     )
     .await
@@ -1347,6 +1537,7 @@ async fn embed_and_write_hermes_turn_vectors<E: Embedder + ?Sized>(
     turn_ids: &[String],
     fingerprint: &str,
     config: &crate::core::config::Config,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
     heartbeat: Option<&HeartbeatCallback>,
 ) -> Result<usize> {
     let mut embedded = 0usize;
@@ -1406,8 +1597,14 @@ async fn embed_and_write_hermes_turn_vectors<E: Embedder + ?Sized>(
 
         let fingerprint = fingerprint.to_string();
         let dim = i64::try_from(embedder.dimensions()).unwrap_or(i64::MAX);
+        let runtime_writer_lease = runtime_writer_lease.cloned();
         let rows_written = db
             .run_write_anyhow(move |db| {
+                ensure_daemon_runtime_writer_lease_active(
+                    db,
+                    runtime_writer_lease.as_ref(),
+                    "insert Hermes turn vectors",
+                )?;
                 let conn = db.conn();
                 conn.execute_batch("BEGIN IMMEDIATE")?;
                 let write = (|| -> rusqlite::Result<usize> {
@@ -1491,6 +1688,7 @@ async fn gate_automatic_hermes_turn<E: Embedder + ?Sized>(
     {
         record_gating_audit_async(
             db,
+            context.runtime_writer_lease,
             input.candidate_hash,
             decision,
             input.project_id.map(ToOwned::to_owned),
@@ -1521,6 +1719,7 @@ async fn gate_automatic_hermes_turn<E: Embedder + ?Sized>(
         {
             record_gating_audit_async(
                 db,
+                context.runtime_writer_lease,
                 input.candidate_hash,
                 &decision,
                 input.project_id.map(ToOwned::to_owned),
@@ -1548,13 +1747,20 @@ async fn gate_automatic_hermes_turn<E: Embedder + ?Sized>(
             .unwrap_or_else(|| llm_decision.clone());
         record_gating_audit_async(
             db,
+            context.runtime_writer_lease,
             input.candidate_hash,
             &audit_decision,
             input.project_id.map(ToOwned::to_owned),
             (!audit_decision.is_rejected()).then_some(candidate.content.as_str()),
         )
         .await?;
-        record_llm_verdict_async(db, input.candidate_hash, &llm_decision).await?;
+        record_llm_verdict_async(
+            db,
+            context.runtime_writer_lease,
+            input.candidate_hash,
+            &llm_decision,
+        )
+        .await?;
         return Ok(!llm_decision.is_rejected());
     }
 
@@ -1564,6 +1770,7 @@ async fn gate_automatic_hermes_turn<E: Embedder + ?Sized>(
     let keep = !decision.is_rejected();
     record_gating_audit_async(
         db,
+        context.runtime_writer_lease,
         input.candidate_hash,
         &decision,
         input.project_id.map(ToOwned::to_owned),
@@ -1999,6 +2206,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     {
         record_gating_audit_async(
             context.db,
+            context.daemon.runtime_writer_lease,
             &drawer_id,
             decision,
             record.project_id.clone(),
@@ -2070,6 +2278,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         {
             record_gating_audit_async(
                 context.db,
+                context.daemon.runtime_writer_lease,
                 &drawer_id,
                 &decision,
                 record.project_id.clone(),
@@ -2096,13 +2305,20 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             .unwrap_or_else(|| llm_decision.clone());
         record_gating_audit_async(
             context.db,
+            context.daemon.runtime_writer_lease,
             &drawer_id,
             &audit_decision,
             record.project_id.clone(),
             (!audit_decision.is_rejected()).then_some(candidate.content.as_str()),
         )
         .await?;
-        record_llm_verdict_async(context.db, &drawer_id, &llm_decision).await?;
+        record_llm_verdict_async(
+            context.db,
+            context.daemon.runtime_writer_lease,
+            &drawer_id,
+            &llm_decision,
+        )
+        .await?;
         gating_audit_recorded = true;
         if llm_decision.is_rejected() {
             return Ok(drawer_id);
@@ -2112,6 +2328,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
     if !gating_audit_recorded && let Some(decision) = gating_decision.as_ref() {
         record_gating_audit_async(
             context.db,
+            context.daemon.runtime_writer_lease,
             &drawer_id,
             decision,
             record.project_id.clone(),
@@ -2132,12 +2349,19 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         }
     };
     if record.bypass_novelty {
-        insert_drawer_with_vector_async(context.db, &drawer_id, record.clone(), vector.clone())
-            .await?;
+        insert_drawer_with_vector_async(
+            context.db,
+            context.daemon.runtime_writer_lease,
+            &drawer_id,
+            record.clone(),
+            vector.clone(),
+        )
+        .await?;
         persist_deferred_raw_payload(&record)?;
         enqueue_llm_gating_after_durable_insert(
             context.db,
             context.store,
+            context.daemon.runtime_writer_lease,
             context.daemon.config,
             &gating_decision,
             &drawer_id,
@@ -2165,21 +2389,31 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             if novelty.should_audit {
                 record_novelty_audit_async(
                     context.db,
-                    &drawer_id,
-                    NoveltyAction::Insert,
-                    novelty.near_drawer_id.clone(),
-                    novelty.cosine,
-                    novelty.audit_decision.map(ToOwned::to_owned),
-                    record.project_id.clone(),
+                    context.daemon.runtime_writer_lease,
+                    DaemonNoveltyAudit {
+                        drawer_id: &drawer_id,
+                        action: NoveltyAction::Insert,
+                        near_drawer_id: novelty.near_drawer_id.as_deref(),
+                        cosine: novelty.cosine,
+                        audit_decision: novelty.audit_decision,
+                        project_id: record.project_id.as_deref(),
+                    },
                 )
                 .await?;
             }
-            insert_drawer_with_vector_async(context.db, &drawer_id, record.clone(), vector.clone())
-                .await?;
+            insert_drawer_with_vector_async(
+                context.db,
+                context.daemon.runtime_writer_lease,
+                &drawer_id,
+                record.clone(),
+                vector.clone(),
+            )
+            .await?;
             persist_deferred_raw_payload(&record)?;
             enqueue_llm_gating_after_durable_insert(
                 context.db,
                 context.store,
+                context.daemon.runtime_writer_lease,
                 context.daemon.config,
                 &gating_decision,
                 &drawer_id,
@@ -2192,12 +2426,15 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             if novelty.should_audit {
                 record_novelty_audit_async(
                     context.db,
-                    &drawer_id,
-                    NoveltyAction::Drop,
-                    novelty.near_drawer_id.clone(),
-                    novelty.cosine,
-                    novelty.audit_decision.map(ToOwned::to_owned),
-                    record.project_id.clone(),
+                    context.daemon.runtime_writer_lease,
+                    DaemonNoveltyAudit {
+                        drawer_id: &drawer_id,
+                        action: NoveltyAction::Drop,
+                        near_drawer_id: novelty.near_drawer_id.as_deref(),
+                        cosine: novelty.cosine,
+                        audit_decision: novelty.audit_decision,
+                        project_id: record.project_id.as_deref(),
+                    },
                 )
                 .await?;
             }
@@ -2255,16 +2492,20 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
             if capped {
                 record_novelty_audit_async(
                     context.db,
-                    &drawer_id,
-                    NoveltyAction::Insert,
-                    Some(target_id),
-                    novelty.cosine,
-                    Some("insert_due_to_merge_cap".to_string()),
-                    record.project_id.clone(),
+                    context.daemon.runtime_writer_lease,
+                    DaemonNoveltyAudit {
+                        drawer_id: &drawer_id,
+                        action: NoveltyAction::Insert,
+                        near_drawer_id: Some(target_id.as_str()),
+                        cosine: novelty.cosine,
+                        audit_decision: Some("insert_due_to_merge_cap"),
+                        project_id: record.project_id.as_deref(),
+                    },
                 )
                 .await?;
                 insert_drawer_with_vector_async(
                     context.db,
+                    context.daemon.runtime_writer_lease,
                     &drawer_id,
                     record.clone(),
                     vector.clone(),
@@ -2274,6 +2515,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 enqueue_llm_gating_after_durable_insert(
                     context.db,
                     context.store,
+                    context.daemon.runtime_writer_lease,
                     context.daemon.config,
                     &gating_decision,
                     &drawer_id,
@@ -2299,16 +2541,20 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         );
                         record_novelty_audit_async(
                             context.db,
-                            &drawer_id,
-                            NoveltyAction::Insert,
-                            Some(target_id),
-                            novelty.cosine,
-                            Some("insert_due_to_embed_error".to_string()),
-                            record.project_id.clone(),
+                            context.daemon.runtime_writer_lease,
+                            DaemonNoveltyAudit {
+                                drawer_id: &drawer_id,
+                                action: NoveltyAction::Insert,
+                                near_drawer_id: Some(target_id.as_str()),
+                                cosine: novelty.cosine,
+                                audit_decision: Some("insert_due_to_embed_error"),
+                                project_id: record.project_id.as_deref(),
+                            },
                         )
                         .await?;
                         insert_drawer_with_vector_async(
                             context.db,
+                            context.daemon.runtime_writer_lease,
                             &drawer_id,
                             record.clone(),
                             vector.clone(),
@@ -2318,6 +2564,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                         enqueue_llm_gating_after_durable_insert(
                             context.db,
                             context.store,
+                            context.daemon.runtime_writer_lease,
                             context.daemon.config,
                             &gating_decision,
                             &drawer_id,
@@ -2331,9 +2578,15 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
                 let target_id_for_merge = target_id.clone();
                 let audit_decision = novelty.audit_decision.map(ToOwned::to_owned);
                 let project_id = record.project_id.clone();
+                let runtime_writer_lease = context.daemon.runtime_writer_lease.cloned();
                 context
                     .db
                     .run_write_anyhow(move |db| {
+                        ensure_daemon_runtime_writer_lease_active(
+                            db,
+                            runtime_writer_lease.as_ref(),
+                            "merge daemon hook drawer",
+                        )?;
                         db.update_drawer_after_merge_and_record_novelty_audit(
                             &target_id_for_merge,
                             &merged_content,
@@ -2467,6 +2720,7 @@ fn audit_decision_with_llm_outcome(
 
 async fn record_llm_verdict_async(
     db: &AsyncDb,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
     drawer_id: &str,
     decision: &GatingDecision,
 ) -> Result<()> {
@@ -2478,7 +2732,13 @@ async fn record_llm_verdict_async(
     }
     .to_string();
     let score = decision.score.map(f64::from);
+    let runtime_writer_lease = runtime_writer_lease.cloned();
     db.run_write_anyhow(move |db| {
+        ensure_daemon_runtime_writer_lease_active(
+            db,
+            runtime_writer_lease.as_ref(),
+            "record daemon LLM verdict",
+        )?;
         db.upsert_llm_verdict_by_candidate_hash(&drawer_id, &verdict, score)
             .with_context(|| format!("failed to record LLM verdict {}", drawer_id))?;
         Ok(())
@@ -2487,8 +2747,9 @@ async fn record_llm_verdict_async(
 }
 
 async fn enqueue_llm_gating_after_durable_insert(
-    _db: &AsyncDb,
+    db: &AsyncDb,
     store: &AsyncPendingMessageStore,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
     config: &crate::core::config::Config,
     gating_decision: &Option<GatingDecision>,
     drawer_id: &str,
@@ -2497,6 +2758,15 @@ async fn enqueue_llm_gating_after_durable_insert(
     if !should_enqueue_llm_gating(config, gating_decision) {
         return Ok(());
     }
+    let runtime_writer_lease = runtime_writer_lease.cloned();
+    db.run_write_anyhow(move |db| {
+        ensure_daemon_runtime_writer_lease_active(
+            db,
+            runtime_writer_lease.as_ref(),
+            "enqueue daemon LLM gating task",
+        )
+    })
+    .await?;
 
     let system_prompt = config
         .ingest_gating
@@ -2526,6 +2796,7 @@ async fn enqueue_llm_gating_after_durable_insert(
 
 async fn record_gating_audit_async(
     db: &AsyncDb,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
     drawer_id: &str,
     decision: &GatingDecision,
     project_id: Option<String>,
@@ -2534,7 +2805,13 @@ async fn record_gating_audit_async(
     let drawer_id = drawer_id.to_string();
     let decision = decision.clone();
     let content = content.map(str::to_string);
+    let runtime_writer_lease = runtime_writer_lease.cloned();
     db.run_write_anyhow(move |db| {
+        ensure_daemon_runtime_writer_lease_active(
+            db,
+            runtime_writer_lease.as_ref(),
+            "record daemon gating audit",
+        )?;
         db.record_gating_audit(
             &drawer_id,
             &decision,
@@ -2547,17 +2824,33 @@ async fn record_gating_audit_async(
     .await
 }
 
+struct DaemonNoveltyAudit<'a> {
+    drawer_id: &'a str,
+    action: NoveltyAction,
+    near_drawer_id: Option<&'a str>,
+    cosine: Option<f32>,
+    audit_decision: Option<&'a str>,
+    project_id: Option<&'a str>,
+}
+
 async fn record_novelty_audit_async(
     db: &AsyncDb,
-    drawer_id: &str,
-    action: NoveltyAction,
-    near_drawer_id: Option<String>,
-    cosine: Option<f32>,
-    audit_decision: Option<String>,
-    project_id: Option<String>,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
+    audit: DaemonNoveltyAudit<'_>,
 ) -> Result<()> {
-    let drawer_id = drawer_id.to_string();
+    let drawer_id = audit.drawer_id.to_string();
+    let near_drawer_id = audit.near_drawer_id.map(str::to_string);
+    let audit_decision = audit.audit_decision.map(str::to_string);
+    let project_id = audit.project_id.map(str::to_string);
+    let action = audit.action;
+    let cosine = audit.cosine;
+    let runtime_writer_lease = runtime_writer_lease.cloned();
     db.run_write_anyhow(move |db| {
+        ensure_daemon_runtime_writer_lease_active(
+            db,
+            runtime_writer_lease.as_ref(),
+            "record daemon novelty audit",
+        )?;
         db.record_novelty_audit(
             &drawer_id,
             action,
@@ -2574,13 +2867,22 @@ async fn record_novelty_audit_async(
 
 async fn insert_drawer_with_vector_async(
     db: &AsyncDb,
+    runtime_writer_lease: Option<&RuntimeWriterLease>,
     drawer_id: &str,
     record: DrawerRecord,
     vector: Vec<f32>,
 ) -> Result<()> {
     let drawer_id = drawer_id.to_string();
-    db.run_write_anyhow(move |db| insert_drawer_with_vector(db, &drawer_id, &record, &vector))
-        .await
+    let runtime_writer_lease = runtime_writer_lease.cloned();
+    db.run_write_anyhow(move |db| {
+        ensure_daemon_runtime_writer_lease_active(
+            db,
+            runtime_writer_lease.as_ref(),
+            "insert daemon hook drawer",
+        )?;
+        insert_drawer_with_vector(db, &drawer_id, &record, &vector)
+    })
+    .await
 }
 
 fn insert_drawer_with_vector(
@@ -3851,6 +4153,7 @@ mod tests {
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                runtime_writer_lease: None,
                 idle_observer: Some(Arc::clone(&idle_observer)),
             },
             60,
@@ -3936,6 +4239,131 @@ mod tests {
         fn name(&self) -> &str {
             "static-test"
         }
+    }
+
+    #[tokio::test]
+    async fn test_hook_worker_stops_before_drawer_write_after_writer_lease_loss() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(&mempal_home).expect("create mempal home");
+        let db = Database::open(&db_path).expect("open db");
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db");
+        let store = PendingMessageStore::new(&db_path).expect("store");
+        let async_store = AsyncPendingMessageStore::from_store(store.clone());
+        let lease = db
+            .runtime_writer_lease_acquire(
+                super::SQLITE_WRITER_LEASE_NAME,
+                "daemon-lease-loss-test",
+                "daemon",
+                300,
+                None,
+            )
+            .expect("acquire daemon writer lease")
+            .expect("lease acquired");
+
+        let hook_payload = serde_json::json!({
+            "tool_name": "Bash",
+            "input": "printf lease-lost",
+            "output": "this hook must not become durable",
+            "exit_code": 0
+        })
+        .to_string();
+        let envelope = CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: tmp.path().to_string_lossy().to_string(),
+            payload: Some(hook_payload.clone()),
+            payload_path: None,
+            payload_preview: None,
+            original_size_bytes: hook_payload.len(),
+            truncated: false,
+        };
+        let payload = serde_json::to_string(&envelope).expect("serialize envelope");
+        store
+            .enqueue(HookEvent::PostToolUse.queue_kind(), &payload)
+            .expect("enqueue hook envelope");
+        let message = async_store
+            .claim_next("lease-loss-worker".to_string(), 60)
+            .await
+            .expect("claim hook")
+            .expect("queued hook claimed");
+
+        assert!(
+            db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)
+                .expect("release daemon writer lease"),
+            "test must force the daemon writer lease to be lost"
+        );
+
+        super::process_hook_worker_message(
+            HookWorkerState {
+                async_db,
+                store: async_store,
+                worker_id: "lease-loss-worker".to_string(),
+                embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
+                    StaticEmbedder,
+                ))),
+                prototype_classifier: Arc::new(ArcSwap::from_pointee(None)),
+                llm_gate: None,
+                config: Arc::new(Config::default()),
+                mempal_home,
+                write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                runtime_writer_lease: Some(lease),
+                idle_observer: None,
+            },
+            message.clone(),
+            60,
+        )
+        .await;
+
+        let drawer_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
+            .expect("count drawers");
+        let vector_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'drawer_vectors'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check drawer_vectors table");
+        let vector_count = if vector_count == 0 {
+            0
+        } else {
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM drawer_vectors", [], |row| row.get(0))
+                .expect("count drawer vectors")
+        };
+        let gating_audit_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM gating_audit", [], |row| row.get(0))
+            .expect("count gating audit");
+        assert_eq!(drawer_count, 0, "lost lease must stop drawer writes");
+        assert_eq!(vector_count, 0, "lost lease must stop vector writes");
+        assert_eq!(
+            gating_audit_count, 0,
+            "lost lease must stop audit writes before drawer ingest"
+        );
+
+        let (status, retry_count, last_error): (String, i64, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT status, retry_count, last_error FROM pending_messages WHERE id = ?1",
+                [message.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query queue row");
+        assert_eq!(status, "pending");
+        assert_eq!(retry_count, 1);
+        assert!(
+            last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("lost before build daemon hook drawer records")),
+            "queue failure must record lease loss: {last_error:?}"
+        );
     }
 
     struct HeartbeatProbeEmbedder {
@@ -4088,6 +4516,7 @@ mod tests {
                 config: std::sync::Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                runtime_writer_lease: None,
                 idle_observer: None,
             },
             message,
@@ -4180,6 +4609,7 @@ mod tests {
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                runtime_writer_lease: None,
                 idle_observer: None,
             },
             message,
@@ -4318,6 +4748,7 @@ mod tests {
                 config: Arc::new(config),
                 mempal_home,
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                runtime_writer_lease: None,
                 idle_observer: None,
             },
             message,
@@ -4424,6 +4855,7 @@ mod tests {
                 llm_gate: None,
                 config: &config,
                 mempal_home: tmp.path(),
+                runtime_writer_lease: None,
             },
         )
         .await
@@ -4496,6 +4928,7 @@ mod tests {
                 llm_gate: None,
                 config: &config,
                 mempal_home: tmp.path(),
+                runtime_writer_lease: None,
             },
         )
         .await
@@ -4608,6 +5041,7 @@ mod tests {
                 llm_gate: Some(&llm_gate),
                 config: &config,
                 mempal_home: tmp.path(),
+                runtime_writer_lease: None,
             },
         )
         .await
@@ -4743,6 +5177,7 @@ mod tests {
                 llm_gate: Some(&llm_gate),
                 config: &config,
                 mempal_home: tmp.path(),
+                runtime_writer_lease: None,
             },
         )
         .await
@@ -4850,6 +5285,7 @@ mod tests {
                 config: std::sync::Arc::new(config),
                 mempal_home: tmp.path().to_path_buf(),
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                runtime_writer_lease: None,
                 idle_observer: None,
             },
             message.clone(),
@@ -4968,6 +5404,7 @@ mod tests {
                 llm_gate: Some(&llm_gate),
                 config: &config,
                 mempal_home: tmp.path(),
+                runtime_writer_lease: None,
             },
         )
         .await
@@ -5091,6 +5528,7 @@ mod tests {
                 config: Arc::new(config),
                 mempal_home: tmp.path().to_path_buf(),
                 write_observer: crate::daemon_bootstrap::DaemonWriteObserver::for_test(),
+                runtime_writer_lease: None,
                 idle_observer: None,
             },
             message,
@@ -5198,6 +5636,7 @@ mod tests {
                 llm_gate: Some(&llm_gate),
                 config: &config,
                 mempal_home: tmp.path(),
+                runtime_writer_lease: None,
             },
         )
         .await
@@ -5308,6 +5747,7 @@ mod tests {
                 llm_gate: Some(&llm_gate),
                 config: &config,
                 mempal_home: tmp.path(),
+                runtime_writer_lease: None,
             },
         )
         .await

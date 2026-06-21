@@ -32,6 +32,14 @@ fn run_ingest(home: &Path, target: &str, wing: &str) -> Output {
         .expect("run mempal ingest")
 }
 
+fn run_delete(home: &Path, drawer_id: &str) -> Output {
+    Command::new(mempal_bin())
+        .args(["delete", drawer_id])
+        .env("HOME", home)
+        .output()
+        .expect("run mempal delete")
+}
+
 fn run_ingest_dry(home: &Path, target: &str, wing: &str) -> Output {
     Command::new(mempal_bin())
         .args(["ingest", target, "--wing", wing, "--dry-run"])
@@ -73,6 +81,33 @@ fn run_ingest_stdin_bytes(home: &Path, payload: &[u8], args: &[&str]) -> Output 
     child
         .wait_with_output()
         .expect("wait mempal ingest --stdin")
+}
+
+fn hold_daemon_writer_lease(home: &Path) -> mempal::core::types::RuntimeWriterLease {
+    let db =
+        mempal::core::db::Database::open(&home.join(".mempal").join("palace.db")).expect("open db");
+    db.runtime_writer_lease_acquire("sqlite-writer", "daemon-owner", "daemon", 300, None)
+        .expect("acquire daemon writer lease")
+        .expect("daemon writer lease")
+}
+
+fn insert_drawer(home: &Path, drawer_id: &str) {
+    let db =
+        mempal::core::db::Database::open(&home.join(".mempal").join("palace.db")).expect("open db");
+    let drawer = mempal::core::types::Drawer::new_bootstrap_evidence(
+        mempal::core::types::BootstrapEvidenceArgs {
+            id: drawer_id.to_string(),
+            content: "cli delete lease fixture".to_string(),
+            wing: "lease-wing".to_string(),
+            room: Some("lease-room".to_string()),
+            source_file: Some("/tmp/cli-delete.md".to_string()),
+            source_type: mempal::core::types::SourceType::AgentInference,
+            added_at: "1713000000".to_string(),
+            chunk_index: Some(0),
+            importance: 2,
+        },
+    );
+    db.insert_drawer(&drawer).expect("insert drawer");
 }
 
 fn write_embed_config(home: &Path, base_url: &str) {
@@ -707,6 +742,109 @@ fn test_ingest_stdin_rejects_format() {
     );
 
     assert_stdin_error(output, "--format is only supported for directory ingest");
+}
+
+#[test]
+fn test_directory_ingest_respects_existing_writer_lease() {
+    let tmp = setup_home();
+    let _lease = hold_daemon_writer_lease(tmp.path());
+    let input_dir = tmp.path().join("input");
+    fs::create_dir_all(&input_dir).expect("create input dir");
+    fs::write(
+        input_dir.join("memory.md"),
+        "directory lease conflict memory",
+    )
+    .expect("write input");
+
+    let output = run_ingest(
+        tmp.path(),
+        input_dir.to_str().expect("input path utf8"),
+        "lease-wing",
+    );
+
+    assert!(
+        !output.status.success(),
+        "directory ingest must fail under writer lease"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
+        "{stderr}"
+    );
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    assert_eq!(db.drawer_count().expect("drawer count"), 0);
+}
+
+#[test]
+fn test_stdin_non_wait_ingest_respects_existing_writer_lease() {
+    let tmp = setup_home();
+    let _lease = hold_daemon_writer_lease(tmp.path());
+    let payload = r#"{
+        "content": "stdin direct lease conflict memory",
+        "wing": "lease-wing",
+        "room": "lease-room"
+    }"#;
+
+    let output = run_ingest_stdin_json(tmp.path(), payload, &["--no-gate", "--json"]);
+
+    assert!(
+        !output.status.success(),
+        "stdin ingest must fail under writer lease"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
+        "{stderr}"
+    );
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    assert_eq!(db.drawer_count().expect("drawer count"), 0);
+}
+
+#[test]
+fn test_cli_delete_respects_existing_writer_lease() {
+    let tmp = setup_home();
+    insert_drawer(tmp.path(), "cli-delete-lease-target");
+    let _lease = hold_daemon_writer_lease(tmp.path());
+
+    let output = run_delete(tmp.path(), "cli-delete-lease-target");
+
+    assert!(
+        !output.status.success(),
+        "delete must fail under writer lease"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
+        "{stderr}"
+    );
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    assert!(
+        db.drawer_exists("cli-delete-lease-target")
+            .expect("drawer exists")
+    );
+}
+
+#[test]
+fn test_cli_delete_succeeds_without_writer_lease_conflict() {
+    let tmp = setup_home();
+    insert_drawer(tmp.path(), "cli-delete-success-target");
+
+    let output = run_delete(tmp.path(), "cli-delete-success-target");
+
+    assert!(
+        output.status.success(),
+        "delete should succeed without writer lease conflict: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
+        .expect("open db");
+    assert!(
+        !db.drawer_exists("cli-delete-success-target")
+            .expect("drawer exists")
+    );
 }
 
 #[test]
