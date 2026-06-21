@@ -11,6 +11,60 @@ use zip::ZipArchive;
 
 use super::detect::{Format, detect_format};
 
+/// Resource limits for deterministic in-process parsers.
+///
+/// These defaults keep plugin parsing bounded while still allowing ordinary
+/// notes, source files, PDFs, and Office documents to ingest without config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParserResourceLimits {
+    pub max_deterministic_input_bytes: usize,
+    pub max_pdf_input_bytes: usize,
+    pub max_ooxml_archive_entries: usize,
+    pub max_ooxml_xml_member_bytes: usize,
+    pub max_extracted_text_bytes: usize,
+    pub max_extracted_text_fragments: usize,
+    pub max_xml_nodes: usize,
+}
+
+impl Default for ParserResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_deterministic_input_bytes: 64 * 1024 * 1024,
+            max_pdf_input_bytes: 8 * 1024 * 1024,
+            max_ooxml_archive_entries: 1024,
+            max_ooxml_xml_member_bytes: 2 * 1024 * 1024,
+            max_extracted_text_bytes: 1024 * 1024,
+            max_extracted_text_fragments: 16_384,
+            max_xml_nodes: 131_072,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserResourceLimit {
+    DeterministicInputBytes,
+    PdfInputBytes,
+    OoxmlArchiveEntries,
+    OoxmlXmlMemberBytes,
+    ExtractedTextBytes,
+    ExtractedTextFragments,
+    XmlNodeCount,
+}
+
+impl fmt::Display for ParserResourceLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DeterministicInputBytes => "deterministic_input_bytes",
+            Self::PdfInputBytes => "pdf_input_bytes",
+            Self::OoxmlArchiveEntries => "ooxml_archive_entries",
+            Self::OoxmlXmlMemberBytes => "ooxml_xml_member_bytes",
+            Self::ExtractedTextBytes => "extracted_text_bytes",
+            Self::ExtractedTextFragments => "extracted_text_fragments",
+            Self::XmlNodeCount => "xml_node_count",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ParserMode {
     #[default]
@@ -87,6 +141,13 @@ pub enum ParserError {
     LlmParserUnavailable { parser: ParserMode, path: PathBuf },
     #[error("unsupported parser `{parser}` for {path}")]
     UnsupportedParser { parser: ParserMode, path: PathBuf },
+    #[error("parser resource limit `{limit}` exceeded for {path}: actual={actual}, max={max}")]
+    ResourceLimitExceeded {
+        path: PathBuf,
+        limit: ParserResourceLimit,
+        actual: u64,
+        max: u64,
+    },
     #[error("failed to extract text from PDF {path}")]
     PdfText {
         path: PathBuf,
@@ -239,6 +300,12 @@ impl DocumentParser for TextParser {
     }
 
     fn parse(&self, input: ParserInput<'_>) -> Result<ParsedDocument, ParserError> {
+        ensure_input_within_limit(
+            input.path,
+            input.bytes.len(),
+            ParserResourceLimit::DeterministicInputBytes,
+            ParserResourceLimits::default().max_deterministic_input_bytes,
+        )?;
         let content = String::from_utf8_lossy(input.bytes).to_string();
         Ok(ParsedDocument {
             format: detect_format(&content),
@@ -262,6 +329,12 @@ impl DocumentParser for MarkdownParser {
     }
 
     fn parse(&self, input: ParserInput<'_>) -> Result<ParsedDocument, ParserError> {
+        ensure_input_within_limit(
+            input.path,
+            input.bytes.len(),
+            ParserResourceLimit::DeterministicInputBytes,
+            ParserResourceLimits::default().max_deterministic_input_bytes,
+        )?;
         let content = String::from_utf8_lossy(input.bytes).to_string();
         Ok(ParsedDocument {
             content,
@@ -292,6 +365,12 @@ impl DocumentParser for CodeParser {
     }
 
     fn parse(&self, input: ParserInput<'_>) -> Result<ParsedDocument, ParserError> {
+        ensure_input_within_limit(
+            input.path,
+            input.bytes.len(),
+            ParserResourceLimit::DeterministicInputBytes,
+            ParserResourceLimits::default().max_deterministic_input_bytes,
+        )?;
         let content = String::from_utf8_lossy(input.bytes).to_string();
         let format = detect_format(&content);
         Ok(ParsedDocument {
@@ -316,6 +395,12 @@ impl DocumentParser for JsonlParser {
     }
 
     fn parse(&self, input: ParserInput<'_>) -> Result<ParsedDocument, ParserError> {
+        ensure_input_within_limit(
+            input.path,
+            input.bytes.len(),
+            ParserResourceLimit::DeterministicInputBytes,
+            ParserResourceLimits::default().max_deterministic_input_bytes,
+        )?;
         let content = String::from_utf8_lossy(input.bytes).to_string();
         Ok(ParsedDocument {
             format: detect_format(&content),
@@ -339,6 +424,12 @@ impl DocumentParser for PdfParser {
     }
 
     fn parse(&self, input: ParserInput<'_>) -> Result<ParsedDocument, ParserError> {
+        ensure_input_within_limit(
+            input.path,
+            input.bytes.len(),
+            ParserResourceLimit::PdfInputBytes,
+            ParserResourceLimits::default().max_pdf_input_bytes,
+        )?;
         let content = pdf_extract::extract_text_from_mem(input.bytes).map_err(|source| {
             ParserError::PdfText {
                 path: input.path.to_path_buf(),
@@ -367,6 +458,12 @@ impl DocumentParser for OfficeParser {
     }
 
     fn parse(&self, input: ParserInput<'_>) -> Result<ParsedDocument, ParserError> {
+        ensure_input_within_limit(
+            input.path,
+            input.bytes.len(),
+            ParserResourceLimit::DeterministicInputBytes,
+            ParserResourceLimits::default().max_deterministic_input_bytes,
+        )?;
         let content = extract_office_text(input.path, input.bytes)?;
         Ok(ParsedDocument {
             content,
@@ -377,12 +474,19 @@ impl DocumentParser for OfficeParser {
 }
 
 fn extract_office_text(path: &Path, bytes: &[u8]) -> Result<String, ParserError> {
+    let limits = ParserResourceLimits::default();
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor).map_err(|source| ParserError::OfficeZip {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut parts = Vec::new();
+    ensure_input_within_limit(
+        path,
+        archive.len(),
+        ParserResourceLimit::OoxmlArchiveEntries,
+        limits.max_ooxml_archive_entries,
+    )?;
+    let mut content = BoundedText::default();
 
     for index in 0..archive.len() {
         let mut file = archive
@@ -396,19 +500,12 @@ fn extract_office_text(path: &Path, bytes: &[u8]) -> Result<String, ParserError>
             continue;
         }
 
-        let mut xml = String::new();
-        file.read_to_string(&mut xml)
-            .map_err(|source| ParserError::OfficeIo {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        let text = extract_xml_text(path, &xml)?;
-        if !text.trim().is_empty() {
-            parts.push(text);
-        }
+        let uncompressed_size = file.size();
+        let xml = read_ooxml_member(path, &mut file, uncompressed_size, &limits)?;
+        extract_xml_text(path, &xml, &limits, &mut content)?;
     }
 
-    let content = parts.join("\n\n");
+    let content = content.into_string();
     if content.trim().is_empty() {
         return Err(ParserError::EmptyOfficeText {
             path: path.to_path_buf(),
@@ -417,12 +514,59 @@ fn extract_office_text(path: &Path, bytes: &[u8]) -> Result<String, ParserError>
     Ok(content)
 }
 
-fn extract_xml_text(path: &Path, xml: &str) -> Result<String, ParserError> {
+fn read_ooxml_member<R: Read>(
+    path: &Path,
+    reader: &mut R,
+    uncompressed_size: u64,
+    limits: &ParserResourceLimits,
+) -> Result<String, ParserError> {
+    ensure_resource_limit(
+        path,
+        uncompressed_size,
+        ParserResourceLimit::OoxmlXmlMemberBytes,
+        limits.max_ooxml_xml_member_bytes as u64,
+    )?;
+
+    let mut buffer = Vec::new();
+    reader
+        .take((limits.max_ooxml_xml_member_bytes as u64).saturating_add(1))
+        .read_to_end(&mut buffer)
+        .map_err(|source| ParserError::OfficeIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    ensure_input_within_limit(
+        path,
+        buffer.len(),
+        ParserResourceLimit::OoxmlXmlMemberBytes,
+        limits.max_ooxml_xml_member_bytes,
+    )?;
+
+    String::from_utf8(buffer).map_err(|source| ParserError::OfficeIo {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+    })
+}
+
+fn extract_xml_text(
+    path: &Path,
+    xml: &str,
+    limits: &ParserResourceLimits,
+    output: &mut BoundedText,
+) -> Result<(), ParserError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-    let mut parts = Vec::new();
+    let mut xml_nodes = 0usize;
+    let mut member_has_text = false;
 
     loop {
+        xml_nodes = xml_nodes.saturating_add(1);
+        ensure_input_within_limit(
+            path,
+            xml_nodes,
+            ParserResourceLimit::XmlNodeCount,
+            limits.max_xml_nodes,
+        )?;
         match reader.read_event() {
             Ok(Event::Text(text)) => {
                 let decoded = text
@@ -438,7 +582,7 @@ fn extract_xml_text(path: &Path, xml: &str) -> Result<String, ParserError> {
                     })?;
                 let value = unescaped.trim();
                 if !value.is_empty() {
-                    parts.push(value.to_string());
+                    output.push_fragment(path, value, &mut member_has_text, limits)?;
                 }
             }
             Ok(Event::CData(text)) => {
@@ -450,12 +594,12 @@ fn extract_xml_text(path: &Path, xml: &str) -> Result<String, ParserError> {
                     })?;
                 let value = decoded.trim();
                 if !value.is_empty() {
-                    parts.push(value.to_string());
+                    output.push_fragment(path, value, &mut member_has_text, limits)?;
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
                 if let Some(value) = resolve_general_ref(path, &reference)? {
-                    parts.push(value);
+                    output.push_fragment(path, &value, &mut member_has_text, limits)?;
                 }
             }
             Ok(Event::Eof) => break,
@@ -469,7 +613,84 @@ fn extract_xml_text(path: &Path, xml: &str) -> Result<String, ParserError> {
         }
     }
 
-    Ok(parts.join(" "))
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct BoundedText {
+    content: String,
+    fragments: usize,
+}
+
+impl BoundedText {
+    fn push_fragment(
+        &mut self,
+        path: &Path,
+        value: &str,
+        member_has_text: &mut bool,
+        limits: &ParserResourceLimits,
+    ) -> Result<(), ParserError> {
+        let separator = if self.content.is_empty() {
+            ""
+        } else if *member_has_text {
+            " "
+        } else {
+            "\n\n"
+        };
+        ensure_input_within_limit(
+            path,
+            self.fragments.saturating_add(1),
+            ParserResourceLimit::ExtractedTextFragments,
+            limits.max_extracted_text_fragments,
+        )?;
+        let next_bytes = self
+            .content
+            .len()
+            .saturating_add(separator.len())
+            .saturating_add(value.len());
+        ensure_input_within_limit(
+            path,
+            next_bytes,
+            ParserResourceLimit::ExtractedTextBytes,
+            limits.max_extracted_text_bytes,
+        )?;
+
+        self.content.push_str(separator);
+        self.content.push_str(value);
+        self.fragments = self.fragments.saturating_add(1);
+        *member_has_text = true;
+        Ok(())
+    }
+
+    fn into_string(self) -> String {
+        self.content
+    }
+}
+
+fn ensure_input_within_limit(
+    path: &Path,
+    actual: usize,
+    limit: ParserResourceLimit,
+    max: usize,
+) -> Result<(), ParserError> {
+    ensure_resource_limit(path, actual as u64, limit, max as u64)
+}
+
+fn ensure_resource_limit(
+    path: &Path,
+    actual: u64,
+    limit: ParserResourceLimit,
+    max: u64,
+) -> Result<(), ParserError> {
+    if actual <= max {
+        return Ok(());
+    }
+    Err(ParserError::ResourceLimitExceeded {
+        path: path.to_path_buf(),
+        limit,
+        actual,
+        max,
+    })
 }
 
 fn resolve_general_ref(

@@ -6,7 +6,10 @@ use std::process::Command;
 use async_trait::async_trait;
 use mempal::core::db::Database;
 use mempal::embed::{Embedder, Result as EmbedResult};
-use mempal::ingest::parsers::{ParseContext, ParserError, ParserMode, parse_document};
+use mempal::ingest::parsers::{
+    ParseContext, ParserError, ParserMode, ParserResourceLimit, ParserResourceLimits,
+    parse_document,
+};
 use mempal::ingest::{IngestOptions, ingest_file_with_options};
 use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
@@ -41,15 +44,21 @@ fn setup_home() -> TempDir {
 }
 
 fn write_docx(path: &Path, xml: &str) {
+    write_docx_with_method(
+        path,
+        &[("word/document.xml".to_string(), xml)],
+        zip::CompressionMethod::Stored,
+    );
+}
+
+fn write_docx_with_method(path: &Path, entries: &[(String, &str)], method: zip::CompressionMethod) {
     let file = File::create(path).expect("create docx");
     let mut writer = zip::ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    writer
-        .start_file("word/document.xml", options)
-        .expect("start document xml");
-    writer
-        .write_all(xml.as_bytes())
-        .expect("write document xml");
+    for (name, xml) in entries {
+        let options = SimpleFileOptions::default().compression_method(method);
+        writer.start_file(name, options).expect("start office xml");
+        writer.write_all(xml.as_bytes()).expect("write office xml");
+    }
     writer.finish().expect("finish docx");
 }
 
@@ -122,6 +131,126 @@ fn auto_parser_dispatches_pdf_to_text_extractor() {
     .expect_err("invalid PDF should still dispatch to PDF extractor");
 
     assert!(matches!(error, ParserError::PdfText { .. }));
+}
+
+#[test]
+fn pdf_parser_rejects_raw_input_over_limit_before_pdf_extract() {
+    let limits = ParserResourceLimits::default();
+    let oversized_pdf = vec![b'%'; limits.max_pdf_input_bytes + 1];
+    let error = parse_document(
+        Path::new("paper.pdf"),
+        &oversized_pdf,
+        ParseContext {
+            mode: ParserMode::Auto,
+            allow_llm: false,
+        },
+    )
+    .expect_err("oversized PDF should fail before pdf_extract");
+
+    assert!(matches!(
+        error,
+        ParserError::ResourceLimitExceeded {
+            limit: ParserResourceLimit::PdfInputBytes,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn office_parser_rejects_large_compressed_xml_member() {
+    let tmp = TempDir::new().expect("tempdir");
+    let source = tmp.path().join("large.docx");
+    let limits = ParserResourceLimits::default();
+    let xml = format!(
+        "<w:document><w:body><w:t>{}</w:t></w:body></w:document>",
+        "a".repeat(limits.max_ooxml_xml_member_bytes + 1)
+    );
+    write_docx_with_method(
+        &source,
+        &[("word/document.xml".to_string(), &xml)],
+        zip::CompressionMethod::Deflated,
+    );
+    let bytes = fs::read(&source).expect("read docx");
+
+    let error = parse_document(
+        &source,
+        &bytes,
+        ParseContext {
+            mode: ParserMode::Auto,
+            allow_llm: false,
+        },
+    )
+    .expect_err("large XML member should hit the OOXML member limit");
+
+    assert!(matches!(
+        error,
+        ParserError::ResourceLimitExceeded {
+            limit: ParserResourceLimit::OoxmlXmlMemberBytes,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn office_parser_rejects_too_many_relevant_entries() {
+    let tmp = TempDir::new().expect("tempdir");
+    let source = tmp.path().join("many-slides.pptx");
+    let limits = ParserResourceLimits::default();
+    let xml = "<p:sld><a:t>slide</a:t></p:sld>";
+    let entries: Vec<_> = (0..=limits.max_ooxml_archive_entries)
+        .map(|index| (format!("ppt/slides/slide{index}.xml"), xml))
+        .collect();
+    write_docx_with_method(&source, &entries, zip::CompressionMethod::Stored);
+    let bytes = fs::read(&source).expect("read pptx");
+
+    let error = parse_document(
+        &source,
+        &bytes,
+        ParseContext {
+            mode: ParserMode::Auto,
+            allow_llm: false,
+        },
+    )
+    .expect_err("too many OOXML entries should fail safely");
+
+    assert!(matches!(
+        error,
+        ParserError::ResourceLimitExceeded {
+            limit: ParserResourceLimit::OoxmlArchiveEntries,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn office_parser_rejects_extracted_text_over_limit() {
+    let tmp = TempDir::new().expect("tempdir");
+    let source = tmp.path().join("too-much-text.docx");
+    let limits = ParserResourceLimits::default();
+    let xml = format!(
+        "<w:document><w:body><w:t>{}</w:t></w:body></w:document>",
+        "a".repeat(limits.max_extracted_text_bytes + 1)
+    );
+    write_docx(&source, &xml);
+    let bytes = fs::read(&source).expect("read docx");
+
+    let error = parse_document(
+        &source,
+        &bytes,
+        ParseContext {
+            mode: ParserMode::Auto,
+            allow_llm: false,
+        },
+    )
+    .expect_err("extracted text cap should fail safely");
+
+    assert!(matches!(
+        error,
+        ParserError::ResourceLimitExceeded {
+            limit: ParserResourceLimit::ExtractedTextBytes,
+            ..
+        }
+    ));
 }
 
 #[test]
