@@ -197,6 +197,15 @@ pub struct MempalMcpServer {
     content_writer_lease_renew_interval: Duration,
     #[cfg(any(test, feature = "db-test-seam"))]
     stale_penalty_delay: Option<Duration>,
+    #[cfg(test)]
+    mcp_ingest_side_effect_hook: Option<Arc<dyn Fn(McpIngestSideEffectStage) + Send + Sync>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum McpIngestSideEffectStage {
+    Repair,
+    Pattern,
 }
 
 struct McpIngestWriterLeaseGuard {
@@ -424,6 +433,8 @@ impl MempalMcpServer {
             content_writer_lease_renew_interval: MCP_CONTENT_WRITER_LEASE_RENEW_INTERVAL,
             #[cfg(any(test, feature = "db-test-seam"))]
             stale_penalty_delay: None,
+            #[cfg(test)]
+            mcp_ingest_side_effect_hook: None,
         })
     }
 
@@ -478,6 +489,15 @@ impl MempalMcpServer {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_mcp_ingest_side_effect_hook_for_test(
+        mut self,
+        hook: Arc<dyn Fn(McpIngestSideEffectStage) + Send + Sync>,
+    ) -> Self {
+        self.mcp_ingest_side_effect_hook = Some(hook);
+        self
+    }
+
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_mcp_deadline_for_test(mut self, deadline: Duration) -> Self {
         self.search_route_deadline = deadline;
@@ -486,6 +506,13 @@ impl MempalMcpServer {
         self.ingest_admission_deadline = deadline;
         self.operation_status_deadline = deadline;
         self
+    }
+
+    #[cfg(test)]
+    fn run_mcp_ingest_side_effect_hook_for_test(&self, stage: McpIngestSideEffectStage) {
+        if let Some(hook) = &self.mcp_ingest_side_effect_hook {
+            hook(stage);
+        }
     }
 
     pub async fn serve_stdio(
@@ -5814,6 +5841,13 @@ impl MempalMcpServer {
 
         // Failure detection (P14) — fire-and-forget for each inserted drawer.
         if config.repair.enabled && !inserted_drawer_ids.is_empty() {
+            #[cfg(test)]
+            self.run_mcp_ingest_side_effect_hook_for_test(McpIngestSideEffectStage::Repair);
+            ensure_mcp_runtime_writer_lease_active(
+                &db,
+                runtime_writer_lease,
+                "record MCP ingest repair signal",
+            )?;
             for (drawer_id_r, chunk_r) in inserted_drawer_ids.iter().zip(chunks.iter()) {
                 crate::repair::spawn_failure_detection(
                     db.path().to_path_buf(),
@@ -5829,6 +5863,13 @@ impl MempalMcpServer {
 
         // Pattern detection (P13) — fire-and-forget for each inserted drawer.
         if config.patterns.enabled && !inserted_drawer_ids.is_empty() {
+            #[cfg(test)]
+            self.run_mcp_ingest_side_effect_hook_for_test(McpIngestSideEffectStage::Pattern);
+            ensure_mcp_runtime_writer_lease_active(
+                &db,
+                runtime_writer_lease,
+                "record MCP ingest pattern signal",
+            )?;
             let session_id = request
                 .source
                 .as_deref()
@@ -9437,7 +9478,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -9985,6 +10026,127 @@ quality_policy = "llm_required_for_keep"
             message.contains("SQLite writer lease `sqlite-writer` is already held"),
             "{message}"
         );
+    }
+
+    fn assert_writer_lease_lost(error: &ErrorData, operation: &str) {
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("was lost before {operation}")),
+            "{message}"
+        );
+    }
+
+    fn mcp_ingest_side_effect_config(
+        db_path: &Path,
+        repair_enabled: bool,
+        patterns_enabled: bool,
+    ) -> String {
+        format!(
+            r#"
+db_path = "{}"
+
+[embed]
+backend = "model2vec"
+
+[privacy]
+enabled = false
+
+[config_hot_reload]
+enabled = false
+
+[ingest_gating]
+enabled = false
+
+[repair]
+enabled = {}
+failure_keywords = []
+window_days = 7
+min_failures = 3
+alert_threshold = 3
+
+[patterns]
+enabled = {}
+similarity_threshold = 0.0
+min_sessions = 1
+min_exemplars = 1
+promote_threshold = 3
+retire_after_days = 90
+surfacing_threshold = 0.75
+pattern_boost = 0.2
+"#,
+            db_path.display(),
+            repair_enabled,
+            patterns_enabled
+        )
+    }
+
+    fn acquire_test_ingest_writer_lease(db_path: &Path, owner: &str) -> RuntimeWriterLease {
+        let db = Database::open(db_path).expect("open db");
+        db.runtime_writer_lease_acquire(
+            SQLITE_WRITER_LEASE_NAME,
+            owner,
+            "mcp-ingest-worker-test",
+            300,
+            None,
+        )
+        .expect("acquire test ingest writer lease")
+        .expect("test ingest writer lease")
+    }
+
+    fn release_test_ingest_writer_lease(db_path: &Path, lease: &RuntimeWriterLease) {
+        let db = Database::open(db_path).expect("open db");
+        assert!(
+            db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)
+                .expect("release test ingest writer lease"),
+            "test ingest writer lease should be active before release"
+        );
+    }
+
+    fn failure_event_count(db_path: &Path) -> i64 {
+        Database::open(db_path)
+            .expect("open db")
+            .conn()
+            .query_row("SELECT COUNT(*) FROM failure_events", [], |row| row.get(0))
+            .expect("count failure events")
+    }
+
+    fn pattern_count(db_path: &Path) -> i64 {
+        Database::open(db_path)
+            .expect("open db")
+            .conn()
+            .query_row("SELECT COUNT(*) FROM patterns", [], |row| row.get(0))
+            .expect("count patterns")
+    }
+
+    async fn wait_for_failure_event_count(db_path: &Path, expected: i64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if failure_event_count(db_path) >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failure detection should write event");
+    }
+
+    fn mcp_side_effect_ingest_request(content: &str, source: &str) -> IngestRequest {
+        IngestRequest {
+            content: content.to_string(),
+            wing: "mcp".to_string(),
+            room: Some("lease".to_string()),
+            source: Some(source.to_string()),
+            dry_run: Some(false),
+            ..IngestRequest::default()
+        }
+    }
+
+    fn side_effect_controls() -> IngestControls {
+        IngestControls {
+            no_gate: true,
+            bypass_novelty: true,
+        }
     }
 
     fn spawn_runtime_ticker() -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
@@ -13713,6 +13875,173 @@ quality_policy = "llm_required_for_keep"
 
         assert!(response.timed_out, "{response:?}");
         assert_eq!(db.drawer_count().expect("drawer count"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_repair_signal_rechecks_writer_lease() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let _config_guard =
+            ConfigOverrideGuard::install(&mcp_ingest_side_effect_config(&db_path, true, false))
+                .await;
+        let lease = acquire_test_ingest_writer_lease(&db_path, "repair-side-effect-test");
+        let released = Arc::new(AtomicBool::new(false));
+        let hook = {
+            let db_path = db_path.clone();
+            let lease = lease.clone();
+            let released = Arc::clone(&released);
+            Arc::new(move |stage| {
+                if stage == McpIngestSideEffectStage::Repair
+                    && !released.swap(true, Ordering::SeqCst)
+                {
+                    release_test_ingest_writer_lease(&db_path, &lease);
+                }
+            })
+        };
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_external_ingest_writer_lease(lease.clone())
+        .with_mcp_ingest_side_effect_hook_for_test(hook);
+
+        let error = match server
+            .mempal_ingest_sync(
+                mcp_side_effect_ingest_request(
+                    "repair side effect failed with error",
+                    "repair-session.md",
+                ),
+                side_effect_controls(),
+                Some(&lease),
+            )
+            .await
+        {
+            Ok(_) => panic!("repair signal must reject after writer lease loss"),
+            Err(error) => error,
+        };
+
+        assert_writer_lease_lost(&error, "record MCP ingest repair signal");
+        assert!(released.load(Ordering::SeqCst));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(failure_event_count(&db_path), 0);
+        assert_eq!(
+            Database::open(&db_path)
+                .expect("open db")
+                .drawer_count()
+                .expect("drawer count"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_pattern_signal_rechecks_writer_lease() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        insert_drawer(
+            &db_path,
+            "pattern-lease-seed",
+            "existing recurring pattern evidence",
+            "mcp",
+            Some("lease"),
+            "pattern-session-a.md",
+            2,
+        );
+        let _config_guard =
+            ConfigOverrideGuard::install(&mcp_ingest_side_effect_config(&db_path, true, true))
+                .await;
+        let lease = acquire_test_ingest_writer_lease(&db_path, "pattern-side-effect-test");
+        let released = Arc::new(AtomicBool::new(false));
+        let hook = {
+            let db_path = db_path.clone();
+            let lease = lease.clone();
+            let released = Arc::clone(&released);
+            Arc::new(move |stage| {
+                if stage == McpIngestSideEffectStage::Pattern
+                    && !released.swap(true, Ordering::SeqCst)
+                {
+                    release_test_ingest_writer_lease(&db_path, &lease);
+                }
+            })
+        };
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_external_ingest_writer_lease(lease.clone())
+        .with_mcp_ingest_side_effect_hook_for_test(hook);
+
+        let error = match server
+            .mempal_ingest_sync(
+                mcp_side_effect_ingest_request(
+                    "new recurring pattern evidence",
+                    "pattern-session-b.md",
+                ),
+                side_effect_controls(),
+                Some(&lease),
+            )
+            .await
+        {
+            Ok(_) => panic!("pattern signal must reject after writer lease loss"),
+            Err(error) => error,
+        };
+
+        assert_writer_lease_lost(&error, "record MCP ingest pattern signal");
+        assert!(released.load(Ordering::SeqCst));
+        assert_eq!(pattern_count(&db_path), 0);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_side_effect_signals_succeed_with_active_writer_lease() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        insert_drawer(
+            &db_path,
+            "pattern-success-seed",
+            "existing successful pattern evidence",
+            "mcp",
+            Some("lease"),
+            "pattern-success-a.md",
+            2,
+        );
+        let _config_guard =
+            ConfigOverrideGuard::install(&mcp_ingest_side_effect_config(&db_path, true, true))
+                .await;
+        let lease = acquire_test_ingest_writer_lease(&db_path, "side-effect-success-test");
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_external_ingest_writer_lease(lease.clone());
+
+        let response = server
+            .mempal_ingest_sync(
+                mcp_side_effect_ingest_request(
+                    "new successful pattern failed with error",
+                    "pattern-success-b.md",
+                ),
+                side_effect_controls(),
+                Some(&lease),
+            )
+            .await
+            .expect("ingest succeeds with active writer lease")
+            .0;
+
+        assert!(!response.drawer_ids.is_empty());
+        wait_for_failure_event_count(&db_path, 1).await;
+        assert_eq!(pattern_count(&db_path), 1);
+        release_test_ingest_writer_lease(&db_path, &lease);
     }
 
     #[tokio::test]
