@@ -76,43 +76,128 @@ Pass criteria:
 
 ## Read-only CLI smoke matrix
 
-Run these commands directly. Capture exit code, latency, stdout byte count, stderr byte count, and JSON shape/field names where applicable. Do not print raw drawer bodies.
+Do not paste raw stdout or stderr from `mempal` commands into chat, issues, or logs unless the command is explicitly listed as safe-direct below. For every other command, capture stdout/stderr to temporary files and report only:
 
-| Group | Command | Pass criteria |
-|---|---|---|
-| Identity | `mempal --version` | exits 0, expected version string |
-| Daemon | `mempal daemon status` | exits 0, running, singleton/current binary |
-| Doctor | `mempal doctor` | exits 0; warnings summarized |
-| REST doctor | `mempal doctor rest --format json` | exits 0, JSON parses, routes reported; degraded is allowed only with warning recorded |
-| Dashboard | `mempal status` | exits 0 |
-| Stats | `mempal stats` | exits 0 |
-| Config | `mempal config intelligence` | exits 0 |
-| Cost | `mempal cost status` | exits 0 |
-| Gating | `mempal gating stats` | exits 0 |
-| Timeline | `mempal timeline --since 1h --format json` | exits 0, empty output or valid JSON accepted |
-| Tail | `mempal tail --limit 3` | exits 0 |
-| Pinned | `mempal pinned --json` | exits 0, JSON parses |
-| KG | `mempal kg stats` | exits 0 |
-| Cards | `mempal knowledge-card list --format json` and `mempal cards --pending --format json` | exits 0, JSON parses |
-| Reflection | `mempal reflect --json --limit 3` | exits 0, JSON parses |
-| Prime | `mempal prime --format json --token-budget 512 --no-stats` | exits 0, JSON parses |
-| Wake-up | `mempal wake-up --format protocol` | exits 0 |
-| Taxonomy | `mempal field-taxonomy --format json` | exits 0, JSON parses |
-| Integrations | `mempal integrations status` | exits 0 |
-| Checkpoint | `mempal checkpoint status` | exits 0 |
-| Patterns/skills/repair | `mempal patterns list`, `mempal skills list`, `mempal repair list` | exits 0 |
-| Cowork | `mempal cowork-status --cwd "$PWD"` | exits 0 |
-| Maintenance | `mempal maintenance guided-run --format json` | exits 0, JSON parses |
-| Release | `mempal release-readiness --format json` | exits 0, JSON parses |
-| xurl | `mempal xurl stats` | exits 0 |
-| Benchmark | `mempal bench matrix --mode no-llm --top-k 3 --format json` | exits 0, JSON parses |
-| Recall help | `mempal recall hermes --help` | exits 0 |
+- exit code;
+- latency;
+- stdout/stderr byte counts;
+- JSON/NDJSON parse success/failure;
+- top-level JSON type, field names, line counts, and item counts;
+- health/status/warning strings only after redaction and only when they do not include drawer/card/prompt content.
+
+Treat these commands as content-bearing by default and never print their raw stdout in chat: `mempal status`, `mempal status --full`, `mempal timeline`, `mempal tail`, `mempal pinned`, `mempal knowledge-card list`, `mempal cards --pending`, `mempal reflect`, `mempal prime`, `mempal wake-up`, `mempal context`, `mempal search`, `mempal recall hermes search`, and any command that returns drawers, cards, recall snippets, evidence, timeline entries, prompts, model responses, or previews.
+
+Simple non-content identity commands may be displayed directly only when their output is known not to include memory content, for example `mempal --version`. For `doctor`, `doctor rest`, `daemon status`, stats, cost, and gating commands, still prefer summarized fields and redacted warning categories over raw output.
+
+Use a capture harness for all content-bearing or uncertain commands:
+
+```bash
+run_mempal_probe() {
+  name="$1"
+  expect_json="$2"
+  shift 2
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/mempal-smoke.XXXXXX")"
+  stdout_file="$tmpdir/stdout"
+  stderr_file="$tmpdir/stderr"
+  start_ms="$(date +%s%3N)"
+  "$@" >"$stdout_file" 2>"$stderr_file"
+  status=$?
+  end_ms="$(date +%s%3N)"
+  python3 - "$name" "$expect_json" "$status" "$start_ms" "$end_ms" "$stdout_file" "$stderr_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+name, expect_json, status, start_ms, end_ms, stdout_path, stderr_path = sys.argv[1:]
+stdout = Path(stdout_path).read_bytes()
+stderr = Path(stderr_path).read_bytes()
+summary = {
+    "name": name,
+    "exit_code": int(status),
+    "latency_ms": max(0, int(end_ms) - int(start_ms)),
+    "stdout_bytes": len(stdout),
+    "stderr_bytes": len(stderr),
+}
+
+if expect_json == "json":
+    try:
+        parsed = json.loads(stdout.decode("utf-8") or "null")
+    except Exception as exc:
+        lines = [line for line in stdout.decode("utf-8", errors="replace").splitlines() if line.strip()]
+        try:
+            parsed_lines = [json.loads(line) for line in lines]
+        except Exception:
+            summary["json"] = {"ok": False, "error_type": type(exc).__name__}
+        else:
+            field_names = sorted({
+                key
+                for item in parsed_lines
+                if isinstance(item, dict)
+                for key in item.keys()
+            })
+            summary["json"] = {
+                "ok": True,
+                "type": "ndjson",
+                "line_count": len(parsed_lines),
+                "fields": field_names,
+            }
+    else:
+        if isinstance(parsed, dict):
+            summary["json"] = {
+                "ok": True,
+                "type": "object",
+                "fields": sorted(parsed.keys()),
+                "field_count": len(parsed),
+            }
+        elif isinstance(parsed, list):
+            summary["json"] = {"ok": True, "type": "array", "count": len(parsed)}
+        else:
+            summary["json"] = {"ok": True, "type": type(parsed).__name__}
+
+print(json.dumps(summary, sort_keys=True))
+PY
+  rm -rf "$tmpdir"
+  return "$status"
+}
+```
+
+The harness prints structure only. It must not print command stdout/stderr, JSON values, drawer IDs from content-bearing output, search snippets, previews, prompts, or model responses.
+
+| Group | Command | Output handling | Pass criteria |
+|---|---|---|---|
+| Identity | `mempal --version` | safe-direct | exits 0, expected version string |
+| Daemon | `mempal daemon status` | summarize/redact | exits 0, running, singleton/current binary |
+| Doctor | `mempal doctor` | summarize/redact | exits 0; warning categories summarized |
+| REST doctor | `mempal doctor rest --format json` | harness JSON/NDJSON | exits 0, JSON parses, routes reported; degraded is allowed only with warning recorded |
+| Dashboard | `mempal status` | content-bearing harness | exits 0 |
+| Stats | `mempal stats` | summarize/redact | exits 0 |
+| Config | `mempal config intelligence` | summarize/redact | exits 0 |
+| Cost | `mempal cost status` | summarize/redact | exits 0 |
+| Gating | `mempal gating stats` | summarize/redact | exits 0 |
+| Timeline | `mempal timeline --since 1h --format json` | content-bearing harness JSON/NDJSON | exits 0, empty output or valid JSON/NDJSON accepted |
+| Tail | `mempal tail --limit 3` | content-bearing harness | exits 0 |
+| Pinned | `mempal pinned --json` | content-bearing harness JSON/NDJSON | exits 0, JSON parses |
+| KG | `mempal kg stats` | summarize/redact | exits 0 |
+| Cards | `mempal knowledge-card list --format json` and `mempal cards --pending --format json` | content-bearing harness JSON/NDJSON | exits 0, JSON parses |
+| Reflection | `mempal reflect --json --limit 3` | content-bearing harness JSON/NDJSON | exits 0, JSON parses |
+| Prime | `mempal prime --format json --token-budget 512 --no-stats` | content-bearing harness JSON/NDJSON | exits 0, JSON parses |
+| Wake-up | `mempal wake-up --format protocol` | content-bearing harness | exits 0 |
+| Taxonomy | `mempal field-taxonomy --format json` | harness JSON/NDJSON | exits 0, JSON parses |
+| Integrations | `mempal integrations status` | summarize/redact | exits 0 |
+| Checkpoint | `mempal checkpoint status` | summarize/redact | exits 0 |
+| Patterns/skills/repair | `mempal patterns list`, `mempal skills list`, `mempal repair list` | summarize/redact | exits 0 |
+| Cowork | `mempal cowork-status --cwd "$PWD"` | summarize/redact | exits 0 |
+| Maintenance | `mempal maintenance guided-run --format json` | harness JSON/NDJSON | exits 0, JSON parses |
+| Release | `mempal release-readiness --format json` | harness JSON/NDJSON | exits 0, JSON parses |
+| xurl | `mempal xurl stats` | summarize/redact | exits 0 |
+| Benchmark | `mempal bench matrix --mode no-llm --top-k 3 --format json` | harness JSON/NDJSON | exits 0, JSON parses |
+| Recall help | `mempal recall hermes --help` | safe-direct | exits 0 |
 
 For expensive semantic queries, run them only when needed and bound time explicitly:
 
 ```bash
-timeout 180s mempal search '<known safe query>' --top-k 3 --json
-timeout 120s mempal context '<known safe query>' --format json --max-items 3 --no-distill-suggestions
+run_mempal_probe search json timeout 180s mempal search '<known safe query>' --top-k 3 --json
+run_mempal_probe context json timeout 120s mempal context '<known safe query>' --format json --max-items 3 --no-distill-suggestions
 ```
 
 If these are slow, report latency and memory growth; do not treat slowness as pass unless the task only asked for availability.
@@ -160,7 +245,7 @@ PY
 
    Do not print the ingest response or smoke IDs unless cleanup fails.
 
-3. Optionally search for the marker as a verification probe only. Keep output in a temporary file, print aggregate counts only, and never use search result IDs for deletion:
+3. Optionally search for the marker as a verification probe only. Keep output in a temporary file, print aggregate counts only, never print search result bodies/snippets, and never use search result IDs for deletion:
 
    ```bash
    verify_json="$(mktemp)"
@@ -232,6 +317,7 @@ If read-only commands push RSS into multi-GB territory, file or update an issue 
 - Preflight state recorded without leaking content.
 - Daemon restart, if performed, leaves one current-binary daemon.
 - Read-only matrix exits 0 or failures are classified by command/stderr class.
+- Raw stdout/stderr from content-bearing `mempal` commands was captured, structurally summarized, and not pasted into chat or log summaries.
 - Optional write smoke cleans up its own drawers.
 - REST/MCP checks do not leave extra processes.
 - Memory before/after is recorded.
