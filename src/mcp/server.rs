@@ -922,6 +922,7 @@ impl MempalMcpServer {
                 if matches!(state, IngestOperationState::Rejected) {
                     response.drawer_id.clear();
                     response.drawer_ids.clear();
+                    response.created_drawer_ids.clear();
                 }
                 let mut finalized = finalize_ingest_response(
                     claim.id.clone(),
@@ -4744,6 +4745,7 @@ impl MempalMcpServer {
                 timed_out: false,
                 drawer_id: String::new(),
                 drawer_ids: Vec::new(),
+                created_drawer_ids: Vec::new(),
                 chunk_count: 0,
                 dropped: false,
                 gating_decision: None,
@@ -4836,6 +4838,7 @@ impl MempalMcpServer {
             timed_out: false,
             drawer_id: String::new(),
             drawer_ids: Vec::new(),
+            created_drawer_ids: Vec::new(),
             chunk_count: 0,
             dropped: false,
             gating_decision: None,
@@ -5142,6 +5145,7 @@ impl MempalMcpServer {
                 timed_out: false,
                 drawer_id: String::new(),
                 drawer_ids: Vec::new(),
+                created_drawer_ids: Vec::new(),
                 chunk_count: 0,
                 dropped: false,
                 gating_decision: None,
@@ -6032,6 +6036,7 @@ impl MempalMcpServer {
         Ok(Json(IngestResponse {
             drawer_id: response_drawer_id,
             drawer_ids: inserted_drawer_ids,
+            created_drawer_ids: newly_created_drawer_ids,
             chunk_count: chunks.len(),
             dropped: false,
             gating_decision,
@@ -9462,6 +9467,7 @@ fn finalize_failed_ingest_response(
             timed_out: false,
             drawer_id: String::new(),
             drawer_ids: Vec::new(),
+            created_drawer_ids: Vec::new(),
             chunk_count: 0,
             dropped: false,
             gating_decision: None,
@@ -9504,6 +9510,7 @@ fn operation_record_to_response(
         if !matches!(state, IngestOperationState::Completed) {
             response.drawer_id.clear();
             response.drawer_ids.clear();
+            response.created_drawer_ids.clear();
         }
         response.rejected_reason = record.rejected_reason.or(response.rejected_reason);
         response.failure_detail = record.failure_detail.or(response.failure_detail);
@@ -9522,6 +9529,7 @@ fn operation_record_to_response(
             String::new()
         },
         drawer_ids: Vec::new(),
+        created_drawer_ids: Vec::new(),
         chunk_count: 0,
         dropped: matches!(state, IngestOperationState::Rejected),
         gating_decision: None,
@@ -13750,8 +13758,13 @@ pattern_boost = 0.2
         let first = ingest_manual(&server, "idempotent exact fact", None, None, None).await;
         let second = ingest_manual(&server, "idempotent exact fact", None, None, None).await;
 
+        assert_eq!(first.created_drawer_ids, vec![first.drawer_id.clone()]);
         assert_eq!(second.drawer_id, first.drawer_id);
         assert_eq!(second.drawer_ids, vec![first.drawer_id.clone()]);
+        assert!(
+            second.created_drawer_ids.is_empty(),
+            "deduplicated queued completion must not expose cleanup-safe IDs for existing drawer"
+        );
         let db = Database::open(&db_path).expect("open db");
         assert_eq!(db.drawer_count().expect("drawer count"), 1);
     }
