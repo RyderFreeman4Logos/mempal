@@ -143,6 +143,8 @@ const MCP_SEARCH_DB_DEADLINE: Duration = Duration::from_secs(30);
 const MCP_SEARCH_STALE_INDEX_DEADLINE: Duration = Duration::from_secs(2);
 const MCP_INGEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
+const MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(5);
+const MCP_INGEST_QUEUE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const MCP_INGEST_WRITER_LEASE_TTL_SECS: u64 = 120;
 const MCP_CONTENT_WRITER_LEASE_TTL_SECS: u64 = 120;
@@ -2331,12 +2333,24 @@ fn status_database_diagnostic(
     error: &(dyn std::error::Error + 'static),
 ) -> DatabaseDiagnosticDto {
     let failure_kind = status_db_failure_kind(error);
+    let mut hint = status_db_failure_hint(failure_kind).to_string();
+    if failure_kind == "locked_or_busy" {
+        let holder_report = crate::process_diagnostics::inspect_db_holders(db_path);
+        if !holder_report.holders.is_empty() || holder_report.error.is_some() {
+            hint = format!(
+                "{} Holder summary: {}. Safe next step: {}.",
+                hint,
+                crate::process_diagnostics::format_db_holder_role_summary(&holder_report),
+                crate::process_diagnostics::sqlite_lock_safe_next_step(&holder_report)
+            );
+        }
+    }
     DatabaseDiagnosticDto {
         path: db_path.display().to_string(),
         source: source.to_string(),
         failure_kind: failure_kind.to_string(),
         summary: status_error_summary(error),
-        hint: status_db_failure_hint(failure_kind).to_string(),
+        hint,
     }
 }
 
@@ -2345,10 +2359,15 @@ fn record_status_database_diagnostic(
     database_diagnostic: &mut Option<DatabaseDiagnosticDto>,
     diagnostic: DatabaseDiagnosticDto,
 ) {
+    let headline = if diagnostic.failure_kind == "locked_or_busy" {
+        "database lock diagnostic"
+    } else {
+        "database diagnostic degraded"
+    };
     system_warnings.push(SystemWarning {
         level: "warn".to_string(),
         message: format!(
-            "database diagnostic degraded at {}: {} ({})",
+            "{headline} at {}: {} ({})",
             diagnostic.source, diagnostic.summary, diagnostic.failure_kind
         ),
         source: "database".to_string(),
@@ -4874,10 +4893,40 @@ impl MempalMcpServer {
             return Ok(operation_id);
         }
 
-        self.async_queue
-            .enqueue_idempotent_with_key(INGEST_ASYNC_KIND.to_string(), payload, idempotency_key)
+        self.enqueue_ingest_operation_locally_with_retry(payload, idempotency_key)
             .await
-            .map_err(Into::into)
+    }
+
+    async fn enqueue_ingest_operation_locally_with_retry(
+        &self,
+        payload: String,
+        idempotency_key: String,
+    ) -> anyhow::Result<String> {
+        let deadline = Instant::now() + MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE;
+        let last_lock_error = loop {
+            match self
+                .async_queue
+                .enqueue_idempotent_with_key_fail_fast(
+                    INGEST_ASYNC_KIND.to_string(),
+                    payload.clone(),
+                    idempotency_key.clone(),
+                )
+                .await
+            {
+                Ok(operation_id) => return Ok(operation_id),
+                Err(error) if error.is_sqlite_lock() => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break error;
+                    }
+                    tokio::time::sleep(MCP_INGEST_QUEUE_LOCK_RETRY_DELAY.min(remaining)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        Err(anyhow::Error::new(last_lock_error)
+            .context("SQLite queue admission lock retry exhausted"))
     }
 
     async fn try_enqueue_ingest_operation_via_daemon(
@@ -8993,10 +9042,15 @@ fn database_warning_snapshot(
     error: &(dyn std::error::Error + 'static),
 ) -> Vec<SystemWarning> {
     let diagnostic = status_database_diagnostic(db_path, stage, error);
+    let headline = if diagnostic.failure_kind == "locked_or_busy" {
+        "database lock diagnostic"
+    } else {
+        "database diagnostic degraded"
+    };
     warnings.push(SystemWarning {
         level: "warn".to_string(),
         message: format!(
-            "database diagnostic degraded at {}: {} ({})",
+            "{headline} at {}: {} ({})",
             diagnostic.source, diagnostic.summary, diagnostic.failure_kind
         ),
         source: "database".to_string(),
@@ -9005,24 +9059,59 @@ fn database_warning_snapshot(
 }
 
 fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDto) -> ErrorData {
+    let warning_headline = if diagnostic.failure_kind == "locked_or_busy" {
+        "database lock diagnostic"
+    } else {
+        "database diagnostic degraded"
+    };
     let warning = SystemWarning {
         level: "warn".to_string(),
         message: format!(
-            "database diagnostic degraded at {}: {} ({})",
+            "{warning_headline} at {}: {} ({})",
             diagnostic.source, diagnostic.summary, diagnostic.failure_kind
         ),
         source: "database".to_string(),
     };
-    let message = format!(
-        "mempal database degraded; writes are refused to preserve memory integrity. {}: {} ({}). {}",
-        diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
-    );
+    let holder_report = if diagnostic.failure_kind == "locked_or_busy" {
+        Some(crate::process_diagnostics::inspect_db_holders(Path::new(
+            &diagnostic.path,
+        )))
+    } else {
+        None
+    };
+    let holder_summary = holder_report
+        .as_ref()
+        .map(crate::process_diagnostics::format_db_holder_role_summary);
+    let safe_next_step = holder_report
+        .as_ref()
+        .map(crate::process_diagnostics::sqlite_lock_safe_next_step);
+    let (reason, action, message) = if diagnostic.failure_kind == "locked_or_busy" {
+        (
+            "database_locked",
+            "retry_after_transient_lock",
+            format!(
+                "mempal database is busy; write admission was not confirmed. {}: {} ({}). {}",
+                diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
+            ),
+        )
+    } else {
+        (
+            "database_degraded",
+            "write_refused",
+            format!(
+                "mempal database degraded; writes are refused to preserve memory integrity. {}: {} ({}). {}",
+                diagnostic.source, diagnostic.summary, diagnostic.failure_kind, diagnostic.hint
+            ),
+        )
+    };
     ErrorData::internal_error(
         message,
         Some(serde_json::json!({
-            "reason": "database_degraded",
-            "action": "write_refused",
+            "reason": reason,
+            "action": action,
             "database_diagnostic": diagnostic,
+            "db_holder_summary": holder_summary,
+            "safe_next_step": safe_next_step,
             "system_warnings": [warning],
         })),
     )
@@ -9521,6 +9610,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -9548,12 +9639,14 @@ mod tests {
         vector: Vec<f32>,
         call_count: Arc<AtomicUsize>,
         gate: Arc<Notify>,
+        released: Arc<AtomicBool>,
     }
 
     struct BlockingEmbedder {
         vector: Vec<f32>,
         call_count: Arc<AtomicUsize>,
         gate: Arc<Notify>,
+        released: Arc<AtomicBool>,
     }
 
     struct EmbedStatusResetGuard;
@@ -9610,6 +9703,7 @@ mod tests {
                 vector: self.vector.clone(),
                 call_count: Arc::clone(&self.call_count),
                 gate: Arc::clone(&self.gate),
+                released: Arc::clone(&self.released),
             }))
         }
     }
@@ -9618,7 +9712,12 @@ mod tests {
     impl Embedder for BlockingEmbedder {
         async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
-            self.gate.notified().await;
+            if !self.released.load(Ordering::SeqCst) {
+                self.gate.notified().await;
+                if !self.released.swap(true, Ordering::SeqCst) {
+                    self.gate.notify_waiters();
+                }
+            }
             Ok(texts.iter().map(|_| self.vector.clone()).collect())
         }
 
@@ -9644,6 +9743,23 @@ mod tests {
         .expect("create MCP server")
         .with_async_db_for_test(async_db);
         (tempdir, db_path, server)
+    }
+
+    fn hold_sqlite_write_lock(db_path: PathBuf, hold_for: Duration) -> thread::JoinHandle<()> {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let conn = rusqlite::Connection::open(db_path).expect("open sqlite lock connection");
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .expect("hold SQLite write lock");
+            ready_tx.send(()).expect("signal SQLite lock ready");
+            thread::sleep(hold_for);
+            conn.execute_batch("ROLLBACK;")
+                .expect("release SQLite lock");
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("SQLite write lock ready");
+        handle
     }
 
     fn assert_json_string_values_do_not_contain(value: &Value, needle: &str, rendered: &str) {
@@ -9895,6 +10011,44 @@ quality_policy = "llm_required_for_keep"
         assert!(
             local_record.is_none(),
             "MCP admission should not write the local queue when daemon IPC accepts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_enqueue_waits_for_transient_sqlite_lock() {
+        let (_tempdir, db_path, server) = setup_server();
+        assert!(
+            MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE >= Duration::from_secs(5),
+            "MCP ingest queue admission must preserve the previous SQLite busy-timeout budget"
+        );
+        let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_millis(2_500));
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "transient SQLite lock should not refuse MCP ingest".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("busy".to_string()),
+                wait: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("ingest admission should retry through transient SQLite busy")
+            .0;
+
+        lock.join().expect("lock thread");
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(operation_id)
+            .expect("query queued operation")
+            .expect("queued operation");
+        assert!(
+            matches!(
+                record.op_state.as_str(),
+                "queued" | "claimed" | "running" | "completed"
+            ),
+            "unexpected operation state after transient lock retry: {}",
+            record.op_state
         );
     }
 
@@ -10905,16 +11059,16 @@ pattern_boost = 0.2
 
         let error = database_write_refused_error(Path::new("/tmp/palace.db"), "async_db", &busy);
 
-        assert!(error.message.contains("writes are refused"));
+        assert!(error.message.contains("write admission was not confirmed"));
         assert!(error.message.contains("locked_or_busy"));
         let data = error.data.expect("structured error data");
         assert_eq!(
             data.get("reason").and_then(Value::as_str),
-            Some("database_degraded")
+            Some("database_locked")
         );
         assert_eq!(
             data.get("action").and_then(Value::as_str),
-            Some("write_refused")
+            Some("retry_after_transient_lock")
         );
         let diagnostic = data
             .get("database_diagnostic")
@@ -10938,11 +11092,20 @@ pattern_boost = 0.2
                 .is_some_and(|summary| summary.contains("database is locked")),
             "diagnostic summary should include the SQLite lock message: {diagnostic}"
         );
-        assert_eq!(
-            diagnostic.get("hint").and_then(Value::as_str),
-            Some(
-                "Check for stale daemon/MCP processes holding palace.db, wait for the writer to finish, then retry status."
-            )
+        assert!(
+            diagnostic
+                .get("hint")
+                .and_then(Value::as_str)
+                .is_some_and(|hint| hint.contains("wait for the writer to finish")),
+            "diagnostic hint should guide retry: {diagnostic}"
+        );
+        assert!(
+            data.get("db_holder_summary").is_some(),
+            "structured lock error should include holder summary: {data}"
+        );
+        assert!(
+            data.get("safe_next_step").is_some(),
+            "structured lock error should include safe next step: {data}"
         );
         assert!(
             data.get("system_warnings")
@@ -14440,6 +14603,7 @@ pattern_boost = 0.2
                 vector: vec![0.1, 0.2, 0.3],
                 call_count: Arc::clone(&call_count),
                 gate: Arc::clone(&gate),
+                released: Arc::new(AtomicBool::new(false)),
             }),
         )
         .expect("create MCP server");
@@ -14504,6 +14668,7 @@ pattern_boost = 0.2
                 vector: vec![0.1, 0.2, 0.3],
                 call_count: Arc::clone(&call_count),
                 gate: Arc::clone(&gate),
+                released: Arc::new(AtomicBool::new(false)),
             }),
         )
         .expect("create MCP server");
@@ -14622,6 +14787,7 @@ pattern_boost = 0.2
                 vector: vec![0.1, 0.2, 0.3],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 gate: Arc::clone(&gate),
+                released: Arc::new(AtomicBool::new(false)),
             }),
         )
         .expect("create MCP server");
@@ -14987,6 +15153,7 @@ enabled = false
                 vector: vec![0.1, 0.2, 0.3],
                 call_count: Arc::clone(&call_count),
                 gate: Arc::clone(&gate),
+                released: Arc::new(AtomicBool::new(false)),
             }),
         )
         .expect("create MCP server");

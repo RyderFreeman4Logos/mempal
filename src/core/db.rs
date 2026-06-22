@@ -11,7 +11,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, functions::FunctionFlags, params,
@@ -432,11 +432,24 @@ impl Database {
         Self::open_with_mode(path, OpenMode::ReadWrite)
     }
 
+    /// Open a read-write database connection with a caller-selected SQLite busy timeout.
+    pub fn open_with_busy_timeout(path: &Path, busy_timeout: Duration) -> Result<Self, DbError> {
+        Self::open_with_mode_and_busy_timeout(path, OpenMode::ReadWrite, busy_timeout)
+    }
+
     pub fn open_read_only(path: &Path) -> Result<Self, DbError> {
         Self::open_with_mode(path, OpenMode::ReadOnly)
     }
 
     fn open_with_mode(path: &Path, mode: OpenMode) -> Result<Self, DbError> {
+        Self::open_with_mode_and_busy_timeout(path, mode, Duration::from_secs(5))
+    }
+
+    fn open_with_mode_and_busy_timeout(
+        path: &Path,
+        mode: OpenMode,
+        busy_timeout: Duration,
+    ) -> Result<Self, DbError> {
         if mode.allows_write() {
             if let Some(parent) = path
                 .parent()
@@ -457,7 +470,7 @@ impl Database {
             }
             OpenMode::ReadWrite => Connection::open(path)?,
         };
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_256_MIB)?;
         register_math_functions(&conn)?;
         if mode.allows_write() {

@@ -32,6 +32,23 @@ pub enum QueueError {
     UnsupportedModelTaskKind(String),
 }
 
+impl QueueError {
+    pub fn is_sqlite_lock(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(sqlite, _))
+                if matches!(
+                    sqlite.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+                    || matches!(
+                        sqlite.extended_code & 0xff,
+                        rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED
+                    )
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, QueueError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
