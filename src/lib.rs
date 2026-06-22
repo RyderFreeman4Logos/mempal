@@ -5,6 +5,7 @@ pub mod adoption_analytics;
 pub mod algo;
 #[cfg(feature = "rest")]
 pub mod api;
+pub mod bench_matrix;
 pub mod bootstrap_events;
 pub mod brief;
 pub mod context;
