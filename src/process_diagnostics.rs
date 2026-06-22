@@ -294,6 +294,12 @@ pub struct ProcessMemoryReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swap_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_read_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_write_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_cancelled_write_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exe_path: Option<String>,
     pub exe_deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -594,6 +600,11 @@ fn inspect_process_memory_in_proc(pid: i32, proc_root: &Path) -> ProcessMemoryRe
         report.anonymous_bytes = parse_proc_kb_metric(&smaps, "Anonymous:");
         report.swap_bytes = parse_proc_kb_metric(&smaps, "Swap:");
     }
+    if let Ok(io) = fs::read_to_string(pid_dir.join("io")) {
+        report.io_read_bytes = parse_proc_byte_metric(&io, "read_bytes:");
+        report.io_write_bytes = parse_proc_byte_metric(&io, "write_bytes:");
+        report.io_cancelled_write_bytes = parse_proc_byte_metric(&io, "cancelled_write_bytes:");
+    }
     report
 }
 
@@ -603,6 +614,14 @@ fn parse_proc_kb_metric(contents: &str, label: &str) -> Option<u64> {
         let value = line.strip_prefix(label)?.trim();
         let kb = value.split_ascii_whitespace().next()?.parse::<u64>().ok()?;
         kb.checked_mul(1024)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_byte_metric(contents: &str, label: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let value = line.strip_prefix(label)?.trim();
+        value.split_ascii_whitespace().next()?.parse::<u64>().ok()
     })
 }
 
@@ -1335,6 +1354,11 @@ mod tests {
                 "Rss: 2048 kB\nPss: 1536 kB\nPrivate_Dirty: 1024 kB\nAnonymous: 768 kB\nSwap: 256 kB\n",
             )
             .expect("write smaps");
+            fs::write(
+                pid_dir.join("io"),
+                "rchar: 100\nwchar: 200\nread_bytes: 4096\nwrite_bytes: 8192\ncancelled_write_bytes: 1024\n",
+            )
+            .expect("write io");
             symlink("/usr/local/bin/mempal (deleted)", pid_dir.join("exe")).expect("symlink exe");
 
             let report = inspect_process_memory_in_proc(321, proc_root);
@@ -1345,6 +1369,9 @@ mod tests {
             assert_eq!(report.private_dirty_bytes, Some(1_048_576));
             assert_eq!(report.anonymous_bytes, Some(786_432));
             assert_eq!(report.swap_bytes, Some(262_144));
+            assert_eq!(report.io_read_bytes, Some(4_096));
+            assert_eq!(report.io_write_bytes, Some(8_192));
+            assert_eq!(report.io_cancelled_write_bytes, Some(1_024));
             assert!(report.exe_deleted);
             assert_eq!(
                 report.exe_path.as_deref(),

@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::core::config::{Config, ConfigHandle};
@@ -20,6 +21,44 @@ const FOLLOW_DEBOUNCE_MS: u64 = 250;
 const FOLLOW_SILENCE_TIMEOUT_MS: u64 = 3_000;
 const PREVIEW_CHARS: usize = 120;
 const GATING_STATUS_RECENT_WINDOW_SECS: u64 = 86_400;
+
+static ACCESS_WRITEBACK_SCHEDULED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static ACCESS_WRITEBACK_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static ACCESS_WRITEBACK_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ResourceCounterSnapshot {
+    pub access_writeback_scheduled_total: u64,
+    pub access_writeback_skipped_total: u64,
+    pub access_writeback_failed_total: u64,
+}
+
+pub fn record_access_writeback_scheduled() {
+    ACCESS_WRITEBACK_SCHEDULED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_access_writeback_skipped() {
+    ACCESS_WRITEBACK_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_access_writeback_failed() {
+    ACCESS_WRITEBACK_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn resource_counters() -> ResourceCounterSnapshot {
+    ResourceCounterSnapshot {
+        access_writeback_scheduled_total: ACCESS_WRITEBACK_SCHEDULED_TOTAL.load(Ordering::Relaxed),
+        access_writeback_skipped_total: ACCESS_WRITEBACK_SKIPPED_TOTAL.load(Ordering::Relaxed),
+        access_writeback_failed_total: ACCESS_WRITEBACK_FAILED_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+pub fn reset_resource_counters_for_tests() {
+    ACCESS_WRITEBACK_SCHEDULED_TOTAL.store(0, Ordering::Relaxed);
+    ACCESS_WRITEBACK_SKIPPED_TOTAL.store(0, Ordering::Relaxed);
+    ACCESS_WRITEBACK_FAILED_TOTAL.store(0, Ordering::Relaxed);
+}
 
 pub struct TailOptions<'a> {
     pub limit: usize,

@@ -37,6 +37,7 @@ const DEFAULT_SEARCH_PREVIEW_CHARS: usize = 120;
 const DEFAULT_SEARCH_TUNNEL_FANOUT_CAP: usize = 5;
 const DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP: usize = 8;
 const DEFAULT_SEARCH_TUNNEL_PENALTY: f32 = 0.7;
+const DEFAULT_SEARCH_RECORD_ACCESS: bool = false;
 const DEFAULT_SEARCH_DECAY_HALF_LIFE_DAYS: u64 = 90;
 const DEFAULT_SEARCH_DECAY_STEP_FULL_DAYS: u64 = 30;
 const DEFAULT_SEARCH_DECAY_STEP_REDUCED_WEIGHT: f64 = 0.5;
@@ -2302,6 +2303,12 @@ pub struct SearchConfig {
     pub bm25_fallback: bool,
     pub progressive_disclosure: bool,
     pub exclude_raw_turns: bool,
+    /// Persist search-hit access metadata (`last_accessed_at`/`access_count`).
+    ///
+    /// Disabled by default so read-only MCP/search/smoke probes do not produce
+    /// background SQLite writes or SSD churn (#526). Enable explicitly when
+    /// access-based salience feedback is worth the extra write IO.
+    pub record_access: bool,
     pub preview_chars: usize,
     pub tunnel_fanout_cap: usize,
     /// Maximum wing names shown per result in `tunnel_hints`. Excess entries are
@@ -2323,6 +2330,7 @@ impl Default for SearchConfig {
             bm25_fallback: DEFAULT_SEARCH_BM25_FALLBACK,
             progressive_disclosure: true,
             exclude_raw_turns: true,
+            record_access: DEFAULT_SEARCH_RECORD_ACCESS,
             preview_chars: DEFAULT_SEARCH_PREVIEW_CHARS,
             tunnel_fanout_cap: DEFAULT_SEARCH_TUNNEL_FANOUT_CAP,
             tunnel_hints_display_cap: DEFAULT_SEARCH_TUNNEL_HINTS_DISPLAY_CAP,
@@ -3171,9 +3179,23 @@ mod tests {
         assert_eq!(config.search.decay.half_life_days, 90);
         assert_eq!(config.search.decay.step_full_days, 30);
         assert_eq!(config.search.decay.step_reduced_weight, 0.5);
+        assert!(!config.search.record_access);
         assert!(!config.search.reranker.enabled);
         assert!(config.search.reranker.endpoint.is_none());
         assert!(config.search.reranker.model.is_none());
+    }
+
+    #[test]
+    fn search_record_access_is_explicit_opt_in() {
+        let config = Config::parse(
+            r#"
+            [search]
+            record_access = true
+            "#,
+        )
+        .expect("search record_access config should parse");
+
+        assert!(config.search.record_access);
     }
 
     #[test]

@@ -43,6 +43,13 @@ use crate::ingest::novelty::NoveltyAction;
 pub const CURRENT_SCHEMA_VERSION: u32 = 20;
 pub const CURRENT_VECTOR_INDEX_VERSION: &str = "v2";
 pub const VECTOR_DISTANCE_METRIC: &str = "cosine";
+/// Default SQLite page cache budget for normal CLI/daemon/MCP connections.
+///
+/// Negative `PRAGMA cache_size` values are KiB. Keep the default small because
+/// read-only status/search probes can leave page-cache memory resident in
+/// long-lived daemon and MCP processes (#525). High-throughput maintenance
+/// paths that need a larger cache must opt in explicitly.
+pub(crate) const SQLITE_CACHE_SIZE_KIB_DEFAULT: i64 = -16_384;
 /// SQLite page cache budget for issue #311's large-DB stale reindex path.
 ///
 /// Negative `PRAGMA cache_size` values are KiB, so `-262144` is 256 MiB.
@@ -471,7 +478,7 @@ impl Database {
             OpenMode::ReadWrite => Connection::open(path)?,
         };
         conn.busy_timeout(busy_timeout)?;
-        conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_256_MIB)?;
+        conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_DEFAULT)?;
         register_math_functions(&conn)?;
         if mode.allows_write() {
             conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -7311,7 +7318,7 @@ mod tests {
     }
 
     #[test]
-    fn database_connection_uses_256mib_cache_without_mmap() {
+    fn database_connection_uses_low_rss_cache_without_mmap() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
 
@@ -7324,7 +7331,7 @@ mod tests {
             .query_row("PRAGMA mmap_size", [], |row| row.get::<_, i64>(0))
             .expect("query mmap_size");
 
-        assert_eq!(cache_size, SQLITE_CACHE_SIZE_KIB_256_MIB);
+        assert_eq!(cache_size, SQLITE_CACHE_SIZE_KIB_DEFAULT);
         assert_eq!(mmap_size, 0, "issue #311 must not add multi-GiB mmap");
     }
 
