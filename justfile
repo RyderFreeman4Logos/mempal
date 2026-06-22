@@ -53,7 +53,7 @@ clippy:
 # are behind the `integration` feature.
 # CARGO_BUILD_JOBS=2 limits parallel LLVM codegen to avoid OOM on this host.
 test:
-    CARGO_BUILD_JOBS=2 {{cargo}} test
+    CARGO_BUILD_JOBS=2 bash scripts/gates/cargo-test-with-timeout.sh {{cargo}} test
 
 # REST feature test tier, batched to control disk and memory pressure.
 test-rest:

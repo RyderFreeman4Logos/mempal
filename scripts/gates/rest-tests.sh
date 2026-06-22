@@ -10,6 +10,8 @@ else
     cargo_cmd=(cargo)
 fi
 
+test_timeout_wrapper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/gates/cargo-test-with-timeout.sh"
+
 if ! [[ "${REST_TEST_TARGETS_PER_BATCH}" =~ ^[1-9][0-9]*$ ]]; then
     echo "REST_TEST_TARGETS_PER_BATCH must be a positive integer" >&2
     exit 2
@@ -29,6 +31,10 @@ clean_mempal_artifacts() {
     run_cmd "${cargo_cmd[@]}" clean -p mempal
 }
 
+run_cargo_test() {
+    run_cmd bash "${test_timeout_wrapper}" "${cargo_cmd[@]}" test "$@"
+}
+
 run_integration_batch() {
     local batch_index="$1"
     shift
@@ -40,14 +46,14 @@ run_integration_batch() {
     done
 
     printf 'rest integration batch %s: %s target(s)\n' "${batch_index}" "$#"
-    run_cmd "${cargo_cmd[@]}" test --workspace --features rest "${target_args[@]}"
+    run_cargo_test --workspace --features rest "${target_args[@]}"
     clean_mempal_artifacts
 }
 
 echo "rest target batch size: ${REST_TEST_TARGETS_PER_BATCH}"
 
-run_cmd "${cargo_cmd[@]}" test --workspace --features rest --lib --bins
-run_cmd "${cargo_cmd[@]}" test --workspace --features rest --doc
+run_cargo_test --workspace --features rest --lib --bins
+run_cargo_test --workspace --features rest --doc
 clean_mempal_artifacts
 
 mapfile -t integration_tests < <(
