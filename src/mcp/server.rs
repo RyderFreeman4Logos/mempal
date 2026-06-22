@@ -144,6 +144,7 @@ const MCP_SEARCH_STALE_INDEX_DEADLINE: Duration = Duration::from_secs(2);
 const MCP_INGEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
 const MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(5);
+const MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 const MCP_INGEST_QUEUE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const MCP_INGEST_WRITER_LEASE_TTL_SECS: u64 = 120;
@@ -4902,8 +4903,48 @@ impl MempalMcpServer {
         payload: String,
         idempotency_key: String,
     ) -> anyhow::Result<String> {
-        let deadline = Instant::now() + MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE;
-        let last_lock_error = loop {
+        let last_lock_error = match self
+            .retry_enqueue_ingest_operation_locally_until(
+                payload.clone(),
+                idempotency_key.clone(),
+                Instant::now() + MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE,
+            )
+            .await
+        {
+            Ok(operation_id) => return Ok(operation_id),
+            Err(error) if error.is_sqlite_lock() => error,
+            Err(error) => return Err(error.into()),
+        };
+
+        if should_extend_ingest_admission_for_self_holder(&self.db_path) {
+            match self
+                .retry_enqueue_ingest_operation_locally_until(
+                    payload,
+                    idempotency_key,
+                    Instant::now() + MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE,
+                )
+                .await
+            {
+                Ok(operation_id) => return Ok(operation_id),
+                Err(error) if error.is_sqlite_lock() => {
+                    return Err(anyhow::Error::new(error)
+                        .context("SQLite queue admission self-holder retry exhausted"));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(anyhow::Error::new(last_lock_error)
+            .context("SQLite queue admission lock retry exhausted"))
+    }
+
+    async fn retry_enqueue_ingest_operation_locally_until(
+        &self,
+        payload: String,
+        idempotency_key: String,
+        deadline: Instant,
+    ) -> std::result::Result<String, crate::core::queue::QueueError> {
+        loop {
             match self
                 .async_queue
                 .enqueue_idempotent_with_key_fail_fast(
@@ -4917,16 +4958,13 @@ impl MempalMcpServer {
                 Err(error) if error.is_sqlite_lock() => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        break error;
+                        return Err(error);
                     }
                     tokio::time::sleep(MCP_INGEST_QUEUE_LOCK_RETRY_DELAY.min(remaining)).await;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
-        };
-
-        Err(anyhow::Error::new(last_lock_error)
-            .context("SQLite queue admission lock retry exhausted"))
+        }
     }
 
     async fn try_enqueue_ingest_operation_via_daemon(
@@ -9058,6 +9096,29 @@ fn database_warning_snapshot(
     warnings
 }
 
+fn should_extend_ingest_admission_for_self_holder(db_path: &Path) -> bool {
+    let report = crate::process_diagnostics::inspect_db_holders(db_path);
+    ingest_admission_report_is_self_holder_only(&report)
+}
+
+fn ingest_admission_report_is_self_holder_only(
+    report: &crate::process_diagnostics::DbHolderReport,
+) -> bool {
+    if report.error.is_some()
+        || report.extra_holder_count > 0
+        || report.stale_mcp_server_count > 0
+        || report.orphan_daemon_count > 0
+    {
+        return false;
+    }
+
+    report.holders.iter().any(|holder| {
+        holder.current_mcp_server
+            || holder.classification == "current_mcp_server"
+            || holder.current_process
+    })
+}
+
 fn database_write_refused_error_from_diagnostic(diagnostic: DatabaseDiagnosticDto) -> ErrorData {
     let warning_headline = if diagnostic.failure_kind == "locked_or_busy" {
         "database lock diagnostic"
@@ -9762,6 +9823,54 @@ mod tests {
         handle
     }
 
+    fn db_holder_for_ingest_retry(
+        classification: &str,
+    ) -> crate::process_diagnostics::DbHolderProcess {
+        crate::process_diagnostics::DbHolderProcess {
+            pid: 55,
+            role: if classification == "current_mcp_server" {
+                "mempal_mcp_server".to_string()
+            } else {
+                "other".to_string()
+            },
+            classification: classification.to_string(),
+            command: if classification == "current_mcp_server" {
+                "mempal serve".to_string()
+            } else {
+                "other".to_string()
+            },
+            opened_files: vec!["db".to_string(), "shm".to_string(), "wal".to_string()],
+            started_at_unix_secs: Some(100),
+            age_secs: Some(10),
+            current_process: classification == "current_process",
+            current_daemon: classification == "current_daemon",
+            current_mcp_server: classification == "current_mcp_server",
+        }
+    }
+
+    fn db_holder_report_for_ingest_retry(
+        holders: Vec<crate::process_diagnostics::DbHolderProcess>,
+    ) -> crate::process_diagnostics::DbHolderReport {
+        crate::process_diagnostics::DbHolderReport {
+            db_path: "/tmp/palace.db".to_string(),
+            holder_count: holders.len(),
+            extra_holder_count: holders
+                .iter()
+                .filter(|holder| holder.classification == "extra_holder")
+                .count(),
+            stale_mcp_server_count: holders
+                .iter()
+                .filter(|holder| holder.classification == "stale_mcp_server")
+                .count(),
+            orphan_daemon_count: holders
+                .iter()
+                .filter(|holder| holder.classification == "orphan_daemon")
+                .count(),
+            error: None,
+            holders,
+        }
+    }
+
     fn assert_json_string_values_do_not_contain(value: &Value, needle: &str, rendered: &str) {
         match value {
             Value::String(text) => assert!(!text.contains(needle), "{rendered}"),
@@ -9777,6 +9886,32 @@ mod tests {
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
+    }
+
+    #[test]
+    fn test_mcp_ingest_admission_self_holder_retry_classifier_rejects_external_holders() {
+        let current_mcp = db_holder_report_for_ingest_retry(vec![db_holder_for_ingest_retry(
+            "current_mcp_server",
+        )]);
+        assert!(ingest_admission_report_is_self_holder_only(&current_mcp));
+
+        let current_process =
+            db_holder_report_for_ingest_retry(vec![db_holder_for_ingest_retry("current_process")]);
+        assert!(ingest_admission_report_is_self_holder_only(
+            &current_process
+        ));
+
+        let extra_with_current = db_holder_report_for_ingest_retry(vec![
+            db_holder_for_ingest_retry("current_mcp_server"),
+            db_holder_for_ingest_retry("extra_holder"),
+        ]);
+        assert!(!ingest_admission_report_is_self_holder_only(
+            &extra_with_current
+        ));
+
+        let stale_mcp =
+            db_holder_report_for_ingest_retry(vec![db_holder_for_ingest_retry("stale_mcp_server")]);
+        assert!(!ingest_admission_report_is_self_holder_only(&stale_mcp));
     }
 
     #[tokio::test]
@@ -10048,6 +10183,40 @@ quality_policy = "llm_required_for_keep"
                 "queued" | "claimed" | "running" | "completed"
             ),
             "unexpected operation state after transient lock retry: {}",
+            record.op_state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_enqueue_extends_retry_for_self_held_sqlite_lock() {
+        let (_tempdir, db_path, server) = setup_server();
+        let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_millis(5_500));
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "self-held SQLite lock should still admit MCP ingest".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("busy".to_string()),
+                wait: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("self-held ingest admission should extend retry")
+            .0;
+
+        lock.join().expect("lock thread");
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(operation_id)
+            .expect("query queued operation")
+            .expect("queued operation");
+        assert!(
+            matches!(
+                record.op_state.as_str(),
+                "queued" | "claimed" | "running" | "completed"
+            ),
+            "unexpected operation state after self-held lock retry: {}",
             record.op_state
         );
     }
