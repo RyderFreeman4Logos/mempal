@@ -13,6 +13,10 @@ use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::adoption_analytics::build_runtime_adoption_analytics;
 #[cfg(feature = "rest")]
 use mempal::api::{ApiState, DEFAULT_REST_ADDR, serve as serve_rest_api};
+use mempal::bench_matrix::{
+    BenchmarkMatrixArgs, BenchmarkMatrixDataset, BenchmarkMatrixFormat, BenchmarkMatrixModeArg,
+    default_matrix_top_k, run_benchmark_matrix_command,
+};
 use mempal::brief::{BriefRequest, assemble_brief};
 use mempal::context::{ContextPack, ContextRequest, assemble_context};
 use mempal::core::{
@@ -2453,6 +2457,20 @@ enum ProjectCommands {
 
 #[derive(Subcommand)]
 enum BenchCommands {
+    /// Run the deterministic recall/citation benchmark matrix.
+    #[command(name = "matrix")]
+    Matrix {
+        #[arg(long, value_enum, default_value_t = BenchmarkMatrixDataset::Builtin)]
+        dataset: BenchmarkMatrixDataset,
+        #[arg(long, value_enum, default_value_t = BenchmarkMatrixModeArg::NoLlm)]
+        mode: BenchmarkMatrixModeArg,
+        #[arg(long, default_value_t = default_matrix_top_k())]
+        top_k: usize,
+        #[arg(long, value_enum, default_value_t = BenchmarkMatrixFormat::Plain)]
+        format: BenchmarkMatrixFormat,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Run the LongMemEval benchmark.
     #[command(name = "longmemeval")]
     LongMemEval {
@@ -4497,6 +4515,22 @@ fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
 
 async fn bench_command(config: &Config, command: BenchCommands) -> Result<()> {
     match command {
+        BenchCommands::Matrix {
+            dataset,
+            mode,
+            top_k,
+            format,
+            out,
+        } => run_benchmark_matrix_command(
+            config,
+            BenchmarkMatrixArgs {
+                dataset,
+                mode,
+                top_k,
+                format,
+                out,
+            },
+        ),
         BenchCommands::LongMemEval {
             data_file,
             mode,
