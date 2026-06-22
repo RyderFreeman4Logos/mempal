@@ -11,7 +11,7 @@ Default to direct installed-CLI probes. Do not start extra daemons or long-lived
 
 ## Safety rules
 
-1. Keep diagnostics aggregate-only. Do not print raw drawer content, prompts, model responses, Authorization headers, bearer tokens, API keys, passwords, `drawer_content`, or secret-bearing URLs.
+1. Keep diagnostics aggregate-only. Do not print raw drawer content, prompts, model responses, raw process command lines, environment variables, connection strings, URLs, Authorization headers, bearer tokens, API keys, passwords, `drawer_content`, or prompt-like arguments.
 2. Use the installed binary (`command -v mempal`, `mempal --version`) and the live user daemon. Do not run `cargo run` for smoke unless debugging source changes.
 3. Maintain singleton ownership:
    - Prefer `systemctl --user restart mempal-daemon.service` for restart.
@@ -20,7 +20,7 @@ Default to direct installed-CLI probes. Do not start extra daemons or long-lived
    - Do not spawn extra `mempal serve --mcp` processes from the shell. MCP reconnect is a client action.
 4. Before declaring a lock failure, inspect DB holders with `mempal daemon status` and summarize only roles/counts/PIDs/commands.
 5. Prefer read-only CLI smoke first. Use reversible write/delete only when the requested task requires proving write paths or when read-only probes expose a write-path risk.
-6. If using a synthetic write, use a unique marker, a `smoke/manual` wing-room, `--no-gate`, `--wait`, then immediately find the created drawer ID(s), pin/unpin if needed, and `mempal delete` them. Report IDs only if needed; do not print content.
+6. If using a synthetic write, use a unique marker, a `smoke/manual` wing-room, `--no-gate`, and `--wait`, then clean up only the exact drawer ID(s) returned by the ingest response. Never delete IDs discovered from generic search results. Report IDs only when cleanup fails; do not print content.
 7. If there is already context that should become durable memory, it is acceptable to ingest a concise real note instead of synthetic content, but only when the note is genuinely useful and non-secret.
 
 ## Preflight
@@ -33,8 +33,8 @@ command -v mempal
 mempal --version
 systemctl --user is-active mempal-daemon.service || true
 systemctl --user show mempal-daemon.service -p MainPID -p ActiveState -p SubState --value || true
-ps -eo pid,ppid,stat,etime,%cpu,%mem,rss,vsz,args --sort=-rss | awk '/[m]empal/ {print}'
-mempal daemon status | sed -E 's/(authorization|bearer|token|password|secret|api[_-]?key|drawer_content)[^[:space:]]*/\1=[REDACTED]/Ig' | sed -n '1,180p'
+ps -C mempal -o pid,ppid,stat,etime,%cpu,%mem,rss,vsz,comm --sort=-rss || true
+mempal daemon status | awk '/^(status:|pid:|uptime_secs:|memory\.|live_daemons:|extra_holders:|stale_mcp_servers:|orphan_daemons:|search\.active:|rest\.health:|rest\.embedder_cache\.|embedder\.)/ {print}'
 ```
 
 Record:
@@ -49,6 +49,8 @@ Record:
 - `search.active`;
 - REST health summary.
 
+Do not record raw command lines, process arguments, environment variables, URLs, connection strings, bearer tokens, prompt-like arguments, or daemon status sections that contain drawer bodies.
+
 ## Restart procedure
 
 When restart is allowed or needed:
@@ -58,9 +60,10 @@ systemctl --user restart mempal-daemon.service
 sleep 3
 main_pid=$(systemctl --user show mempal-daemon.service -p MainPID --value)
 systemctl --user is-active mempal-daemon.service
-ps -p "$main_pid" -o pid,ppid,stat,etime,%cpu,%mem,rss,vsz,args
+ps -p "$main_pid" -o pid,ppid,stat,etime,%cpu,%mem,rss,vsz,comm
 readlink "/proc/$main_pid/exe"
-pgrep -af '^/usr/local/bin/mempal (daemon --foreground|serve --mcp)$' || true
+printf 'daemon_processes=%s\n' "$(pgrep -fc '^/usr/local/bin/mempal daemon --foreground$' || true)"
+printf 'mcp_server_processes=%s\n' "$(pgrep -fc '^/usr/local/bin/mempal serve --mcp$' || true)"
 ```
 
 Pass criteria:
@@ -124,46 +127,78 @@ Use only when write-path validation is required.
    marker="mempal-smoke-$(date +%s)-$RANDOM"
    ```
 
-2. Ingest via stdin with a smoke scope:
+2. Ingest via stdin with a smoke scope, capture the response, and extract only top-level ID fields returned by ingest:
 
    ```bash
+   ingest_json="$(mktemp)"
+   smoke_ids="$(mktemp)"
    printf '{"content":"%s reversible smoke drawer; safe to delete","wing":"smoke","room":"manual"}\n' "$marker" \
-     | mempal ingest --stdin --format json --wing smoke --room manual --no-gate --wait --wait-timeout-secs 60 --json
-   ```
-
-3. Search only for the marker and parse IDs from JSON without printing content:
-
-   ```bash
-   mempal search "$marker" --top-k 5 --json > /tmp/mempal-smoke-search.json
-   python3 - <<'PY'
+     | mempal ingest --stdin --format json --wing smoke --room manual --no-gate --wait --wait-timeout-secs 60 --json \
+     > "$ingest_json"
+   python3 - "$ingest_json" > "$smoke_ids" <<'PY'
 import json
+import sys
 from pathlib import Path
-obj=json.loads(Path('/tmp/mempal-smoke-search.json').read_text() or '[]')
-ids=[]
-def walk(x):
-    if isinstance(x, dict):
-        for k,v in x.items():
-            if k in ('id','drawer_id','drawerId') and isinstance(v,(str,int)):
-                ids.append(str(v))
-            else:
-                walk(v)
-    elif isinstance(x, list):
-        for y in x:
-            walk(y)
-walk(obj)
-print('\n'.join(dict.fromkeys(ids)))
+
+obj = json.loads(Path(sys.argv[1]).read_text() or "{}")
+ids = []
+drawer_id = obj.get("drawer_id")
+if isinstance(drawer_id, str) and drawer_id:
+    ids.append(drawer_id)
+drawer_ids = obj.get("drawer_ids")
+if isinstance(drawer_ids, list):
+    ids.extend(item for item in drawer_ids if isinstance(item, str) and item)
+for item in dict.fromkeys(ids):
+    print(item)
 PY
+   if [ ! -s "$smoke_ids" ]; then
+     echo "cleanup requires manual operator action: ingest response did not expose exact drawer ID(s)" >&2
+     rm -f "$ingest_json" "$smoke_ids"
+     exit 1
+   fi
    ```
 
-4. For each smoke ID, optionally test pin/unpin, then delete:
+   Do not print the ingest response or smoke IDs unless cleanup fails.
+
+3. Optionally search for the marker as a verification probe only. Keep output in a temporary file, print aggregate counts only, and never use search result IDs for deletion:
 
    ```bash
-   mempal pin "$id" || true
-   mempal unpin "$id" || true
-   mempal delete "$id"
+   verify_json="$(mktemp)"
+   mempal search "$marker" --top-k 5 --json > "$verify_json"
+   python3 - "$verify_json" "$marker" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results = json.loads(Path(sys.argv[1]).read_text() or "[]")
+marker = sys.argv[2]
+matches = [
+    item for item in results
+    if isinstance(item, dict)
+    and item.get("wing") == "smoke"
+    and item.get("room") == "manual"
+    and marker in str(item.get("content", ""))
+]
+print(f"active_smoke_marker_matches={len(matches)}")
+PY
+   rm -f "$verify_json"
    ```
 
-5. Re-run marker search and confirm no active smoke drawer remains, or record soft-delete behavior if tombstones remain visible only with explicit include-deleted flags.
+4. For each exact smoke ID from the ingest response, optionally test pin/unpin, then delete. Suppress command output so `mempal delete` cannot print drawer summaries:
+
+   ```bash
+   while IFS= read -r smoke_id; do
+     mempal pin "$smoke_id" >/dev/null || true
+     mempal unpin "$smoke_id" >/dev/null || true
+     if ! mempal delete "$smoke_id" >/dev/null; then
+       echo "cleanup failed for smoke drawer id: $smoke_id" >&2
+       exit 1
+     fi
+   done < "$smoke_ids"
+   rm -f "$ingest_json" "$smoke_ids"
+   ```
+
+5. Re-run the aggregate marker verification from step 3 and confirm no active `smoke/manual` marker match remains, or record soft-delete behavior if tombstones remain visible only with explicit include-deleted flags.
 
 ## REST checks
 
@@ -186,7 +221,7 @@ Capture daemon memory before and after smoke:
 
 ```bash
 main_pid=$(systemctl --user show mempal-daemon.service -p MainPID --value)
-ps -p "$main_pid" -o pid,ppid,stat,etime,%cpu,%mem,rss,vsz,args
+ps -p "$main_pid" -o pid,ppid,stat,etime,%cpu,%mem,rss,vsz,comm
 mempal daemon status | awk '/^(memory\.|live_daemons:|extra_holders:|search\.active:|rest\.embedder_cache\.|embedder\.)/ {print}'
 ```
 
