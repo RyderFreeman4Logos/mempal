@@ -32,6 +32,7 @@ use crate::knowledge_lifecycle::{DemoteOutcome, PromoteOutcome};
 use crate::process_diagnostics::DbHolderReport;
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// schemars 1.x emits boolean `true` for `serde_json::Value`, which MCP clients
 /// (e.g. Claude Code) reject when validating `tools/list`. Use this helper via
@@ -40,7 +41,33 @@ use serde::{Deserialize, Serialize};
 fn json_object_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({ "type": "object" })
 }
-use std::collections::BTreeMap;
+
+pub const INGEST_SOURCE_TYPE_VALUES: [&str; 4] = [
+    "user_explicit",
+    "agent_observation",
+    "agent_inference",
+    "system_generated",
+];
+pub const INGEST_SOURCE_TYPE_VALUES_DESCRIPTION: &str =
+    "user_explicit, agent_observation, agent_inference, system_generated";
+pub const INGEST_SOURCE_TYPE_SCHEMA_DESCRIPTION: &str = concat!(
+    "Optional source_type provenance: user_explicit, agent_observation, ",
+    "agent_inference, system_generated."
+);
+
+fn ingest_source_type_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "enum": [
+            "user_explicit",
+            "agent_observation",
+            "agent_inference",
+            "system_generated",
+            null
+        ],
+        "description": INGEST_SOURCE_TYPE_SCHEMA_DESCRIPTION
+    })
+}
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct StatusRequest {
@@ -1622,6 +1649,8 @@ pub struct IngestRequest {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
+    /// Optional source_type provenance: user_explicit, agent_observation, agent_inference, system_generated.
+    #[schemars(schema_with = "ingest_source_type_schema")]
     pub source_type: Option<String>,
     pub confidence: Option<f64>,
     pub project_id: Option<String>,
