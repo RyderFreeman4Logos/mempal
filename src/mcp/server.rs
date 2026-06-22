@@ -108,25 +108,26 @@ use super::tools::{
     DesignInsightStatusDto, DoctorMcpDto, DoctorRequest, DoctorResponse, DoctorToolDto,
     DuplicateWarning, EmbedEndpointStatusDto, EmbedStatusDto, EmbedderCircuitDto,
     EndpointHealthDto, FactCheckRequest, FactCheckResponse, FieldTaxonomyEntryDto,
-    FieldTaxonomyResponse, GatingRuntimeStatusDto, IngestControls, IngestOperationState,
-    IngestRequest, IngestResponse, IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto,
-    KnowledgeCardDto, KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse,
-    KnowledgeDemoteRequest, KnowledgeDemoteResponse, KnowledgeDistillRequest,
-    KnowledgeDistillResponse, KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse,
-    KnowledgePromoteRequest, KnowledgePromoteResponse, KnowledgePublishAnchorRequest,
-    KnowledgePublishAnchorResponse, LeaseInfoDto, LeaseRequest, LeaseResponse,
-    LlmEndpointStatusDto, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS,
-    OperationStatusRequest, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto,
-    Phase3Request, Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest,
-    PinnedFactsResponse, ProcessResourceUsageDto, QueueStatsDto, ReadDrawerRequest,
-    ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto,
-    ResearchIngestPlanDto, ResourceCounterDto, ResourceUsageDto, RetrievalScopeRequest,
-    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto,
-    RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
-    SearchResultDto, SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount,
-    SqliteResourceUsageDto, StatusDetail, StatusRequest, StatusResponse, StatusScope,
-    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
-    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    FieldTaxonomyResponse, GatingRuntimeStatusDto, INGEST_SOURCE_TYPE_VALUES,
+    INGEST_SOURCE_TYPE_VALUES_DESCRIPTION, IngestControls, IngestOperationState, IngestRequest,
+    IngestResponse, IntelligenceStatusDto, KgRequest, KgResponse, KgStatsDto, KnowledgeCardDto,
+    KnowledgeCardEventDto, KnowledgeCardsRequest, KnowledgeCardsResponse, KnowledgeDemoteRequest,
+    KnowledgeDemoteResponse, KnowledgeDistillRequest, KnowledgeDistillResponse,
+    KnowledgeGateRequest, KnowledgeGateResponse, KnowledgePolicyResponse, KnowledgePromoteRequest,
+    KnowledgePromoteResponse, KnowledgePublishAnchorRequest, KnowledgePublishAnchorResponse,
+    LeaseInfoDto, LeaseRequest, LeaseResponse, LlmEndpointStatusDto, LlmStatusDto,
+    MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest,
+    PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
+    Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
+    ProcessResourceUsageDto, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
+    ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto,
+    ResourceCounterDto, ResourceUsageDto, RetrievalScopeRequest, RetrievedKnowledgeCardDto,
+    RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto,
+    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, SkillDto,
+    SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, SqliteResourceUsageDto,
+    StatusDetail, StatusRequest, StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto,
+    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
+    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
@@ -2395,14 +2396,22 @@ fn validate_temporal_param(name: &str, value: Option<&str>) -> std::result::Resu
 
 fn parse_source_type_param(value: Option<&str>) -> std::result::Result<SourceType, ErrorData> {
     match value {
-        Some(raw) => raw.parse::<SourceType>().map_err(|_| {
+        Some(raw) => parse_ingest_source_type(raw).ok_or_else(|| {
             ErrorData::invalid_params(
-                "source_type must be one of: user_explicit, agent_observation, agent_inference, system_generated",
+                format!("source_type must be one of: {INGEST_SOURCE_TYPE_VALUES_DESCRIPTION}"),
                 None,
             )
         }),
         None => Ok(SourceType::AgentInference),
     }
+}
+
+fn parse_ingest_source_type(raw: &str) -> Option<SourceType> {
+    if !INGEST_SOURCE_TYPE_VALUES.contains(&raw) {
+        return None;
+    }
+
+    raw.parse::<SourceType>().ok()
 }
 
 fn should_apply_async_llm_gating(source_type: SourceType) -> bool {
@@ -9711,6 +9720,7 @@ mod tests {
     use crate::core::types::BootstrapEvidenceArgs;
     use crate::core::types::{KnowledgeCard, KnowledgeEvidenceLink, KnowledgeEvidenceRole};
     use crate::embed::Embedder;
+    use crate::mcp::tools::INGEST_SOURCE_TYPE_SCHEMA_DESCRIPTION;
 
     #[derive(Clone)]
     struct StubEmbedderFactory {
@@ -10054,6 +10064,37 @@ api_key = "sk-secret-should-not-print"
             !message.contains(raw),
             "invalid source_type errors must not echo caller-supplied raw values"
         );
+    }
+
+    #[test]
+    fn test_mcp_source_type_parser_accepts_only_advertised_values() {
+        assert_eq!(
+            parse_source_type_param(None).expect("default source_type"),
+            SourceType::AgentInference
+        );
+
+        for value in INGEST_SOURCE_TYPE_VALUES {
+            assert_eq!(
+                parse_source_type_param(Some(value)).expect("advertised source_type should parse"),
+                value
+                    .parse::<SourceType>()
+                    .expect("advertised source_type should map to core enum")
+            );
+        }
+
+        for value in [
+            "runtime",
+            "research",
+            "human",
+            "manual",
+            "project",
+            "conversation",
+        ] {
+            assert!(
+                parse_source_type_param(Some(value)).is_err(),
+                "MCP ingest should reject unadvertised source_type {value}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -12339,6 +12380,42 @@ pattern_boost = 0.2
             assert!(
                 props.get(field).is_some(),
                 "mempal_ingest must expose {field} in tools/list"
+            );
+        }
+        let source_type_schema = props
+            .get("source_type")
+            .expect("mempal_ingest must expose source_type in tools/list");
+        let advertised_source_types = source_type_schema
+            .get("enum")
+            .and_then(|value| value.as_array())
+            .expect("source_type schema must expose enum values")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            advertised_source_types, INGEST_SOURCE_TYPE_VALUES,
+            "source_type schema enum must match MCP validation"
+        );
+        let source_type_description = source_type_schema
+            .get("description")
+            .and_then(|value| value.as_str())
+            .expect("source_type schema must describe accepted values");
+        assert_eq!(
+            source_type_description, INGEST_SOURCE_TYPE_SCHEMA_DESCRIPTION,
+            "source_type schema description must use the shared MCP description"
+        );
+        assert!(
+            source_type_description.contains(INGEST_SOURCE_TYPE_VALUES_DESCRIPTION),
+            "source_type description must name the accepted enum: {source_type_description}"
+        );
+        for unaccepted in ["runtime", "research", "human"] {
+            assert!(
+                !advertised_source_types.contains(&unaccepted),
+                "source_type schema must not advertise unsupported value {unaccepted}"
+            );
+            assert!(
+                !source_type_description.contains(unaccepted),
+                "source_type description must not advertise unsupported value {unaccepted}"
             );
         }
         for field in ["no_gate", "bypass_novelty"] {
