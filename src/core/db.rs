@@ -1773,14 +1773,37 @@ impl Database {
     }
 
     pub fn pin_drawer(&self, drawer_id: &str, pin_order: Option<i64>) -> Result<bool, DbError> {
-        let resolved_order = match pin_order {
-            Some(order) => Some(order),
-            None => self.conn.query_row(
+        if let Some(order) = pin_order {
+            return self.pin_drawer_with_order(drawer_id, Some(order));
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<bool, DbError> {
+            let resolved_order = self.conn.query_row(
                 "SELECT COALESCE(MAX(pin_order), -1) + 1 FROM drawers WHERE is_pinned = 1",
                 [],
                 |row| row.get::<_, Option<i64>>(0),
-            )?,
-        };
+            )?;
+            self.pin_drawer_with_order(drawer_id, resolved_order)
+        })();
+
+        match result {
+            Ok(affected) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(affected)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
+    fn pin_drawer_with_order(
+        &self,
+        drawer_id: &str,
+        resolved_order: Option<i64>,
+    ) -> Result<bool, DbError> {
         let affected = self.conn.execute(
             "UPDATE drawers SET is_pinned = 1, pin_order = COALESCE(?2, pin_order) WHERE id = ?1 AND deleted_at IS NULL",
             params![drawer_id, resolved_order],
@@ -7291,6 +7314,71 @@ mod tests {
     fn insert_test_drawer(db: &Database, id: &str, content: &str, project_id: Option<&str>) {
         db.insert_drawer_with_project(&test_drawer(id, content), project_id)
             .expect("insert drawer");
+    }
+
+    #[test]
+    fn concurrent_default_pin_order_allocation_is_atomic_across_connections() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::open(&db_path).expect("open db");
+        insert_test_drawer(&db, "already-pinned", "already pinned", None);
+        insert_test_drawer(&db, "pin-a", "pin a", None);
+        insert_test_drawer(&db, "pin-b", "pin b", None);
+        assert!(
+            db.pin_drawer("already-pinned", None)
+                .expect("pin initial drawer")
+        );
+        let _daemon_lease = db
+            .runtime_writer_lease_acquire("sqlite-writer", "daemon-owner", "daemon", 300, None)
+            .expect("acquire daemon writer lease")
+            .expect("daemon writer lease");
+
+        let worker_a = Database::open(&db_path).expect("open worker a");
+        let worker_b = Database::open(&db_path).expect("open worker b");
+        let lock_holder = Connection::open(&db_path).expect("open lock holder");
+        lock_holder
+            .busy_timeout(Duration::from_secs(5))
+            .expect("set lock holder busy timeout");
+        lock_holder
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let barrier_a = std::sync::Arc::clone(&barrier);
+        let handle_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            worker_a.pin_drawer("pin-a", None).expect("pin a")
+        });
+        let barrier_b = std::sync::Arc::clone(&barrier);
+        let handle_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            worker_b.pin_drawer("pin-b", None).expect("pin b")
+        });
+
+        barrier.wait();
+        std::thread::sleep(Duration::from_millis(150));
+        lock_holder
+            .execute_batch("COMMIT;")
+            .expect("release write lock");
+
+        assert!(handle_a.join().expect("join pin a"));
+        assert!(handle_b.join().expect("join pin b"));
+
+        let order_a = db
+            .get_drawer("pin-a")
+            .expect("load pin a")
+            .expect("pin a exists")
+            .pin_order
+            .expect("pin a order");
+        let order_b = db
+            .get_drawer("pin-b")
+            .expect("load pin b")
+            .expect("pin b exists")
+            .pin_order
+            .expect("pin b order");
+        let mut orders = vec![order_a, order_b];
+        orders.sort_unstable();
+        assert_eq!(orders, vec![1, 2]);
     }
 
     #[test]

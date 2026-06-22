@@ -291,6 +291,13 @@ fn delete_cleanup_ids(home: &Path, drawer_ids: &[String]) {
     }
 }
 
+fn hold_daemon_writer_lease(home: &Path) -> mempal::core::types::RuntimeWriterLease {
+    let db = Database::open(&home.join(".mempal/palace.db")).expect("open db");
+    db.runtime_writer_lease_acquire("sqlite-writer", "daemon-owner", "daemon", 300, None)
+        .expect("acquire daemon writer lease")
+        .expect("daemon writer lease")
+}
+
 fn insert_existing_drawer(home: &Path, drawer_id: &str) {
     let db = Database::open(&home.join(".mempal/palace.db")).expect("open db");
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
@@ -706,6 +713,74 @@ async fn test_ingest_wait_json_cleanup_ids_delete_exact_drawers() {
             "reported cleanup id must be deletable by mempal delete"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_wait_json_cleanup_id_writes_under_daemon_lease() {
+    let home = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    let _config = write_config(home.path(), &format!("http://{addr}/v1"));
+    let wait_timeout = u64::MAX.to_string();
+    let payload = br#"{"content":"cleanup authority smoke safe to delete unique body"}"#;
+
+    let output = run_cli_with_stdin(
+        home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "smoke",
+            "--room",
+            "manual",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            wait_timeout.as_str(),
+            "--json",
+        ],
+        payload,
+    );
+    handle.shutdown().await;
+
+    assert!(output.status.success(), "stdin wait ingest must succeed");
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("parse wait JSON");
+    let cleanup_ids = cleanup_ids_from_ingest_json(&stdout);
+    assert_eq!(
+        cleanup_ids.len(),
+        1,
+        "stdin wait JSON must expose exactly one cleanup-safe drawer id"
+    );
+    assert_eq!(
+        stdout["cleanup_drawer_ids"], stdout["created_drawer_ids"],
+        "cleanup authority must come from created_drawer_ids"
+    );
+
+    let cleanup_id = cleanup_ids.first().expect("cleanup id");
+    let _daemon_lease = hold_daemon_writer_lease(home.path());
+
+    let pin = run_cli(home.path(), &["pin", cleanup_id]);
+    assert!(pin.status.success(), "pin by cleanup id must succeed");
+
+    let unpin = run_cli(home.path(), &["unpin", cleanup_id]);
+    assert!(unpin.status.success(), "unpin by cleanup id must succeed");
+
+    let delete = run_cli(home.path(), &["delete", cleanup_id]);
+    assert!(delete.status.success(), "delete by cleanup id must succeed");
+    let delete_stdout = String::from_utf8_lossy(&delete.stdout);
+    assert!(
+        !delete_stdout.contains("cleanup authority smoke safe to delete unique body"),
+        "delete stdout must not expose raw drawer content"
+    );
+
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    assert!(
+        db.get_drawer(cleanup_id)
+            .expect("get deleted cleanup drawer")
+            .is_none(),
+        "created cleanup id must be soft-deleted"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
