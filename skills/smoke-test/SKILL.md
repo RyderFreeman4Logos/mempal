@@ -216,10 +216,13 @@ Use only when write-path validation is required.
 
    ```bash
    ingest_json="$(mktemp)"
+   operation_json=""
    smoke_ids="$(mktemp)"
-   printf '{"content":"%s reversible smoke drawer; safe to delete","wing":"smoke","room":"manual"}\n' "$marker" \
+   if printf '{"content":"%s reversible smoke drawer; safe to delete","wing":"smoke","room":"manual"}\n' "$marker" \
      | mempal ingest --stdin --wing smoke --room manual --no-gate --wait --wait-timeout-secs 60 --json \
-     > "$ingest_json"
+     > "$ingest_json"; then
+     :
+   fi
    python3 - "$ingest_json" > "$smoke_ids" <<'PY'
 import json
 import sys
@@ -234,13 +237,53 @@ for item in dict.fromkeys(ids):
     print(item)
 PY
    if [ ! -s "$smoke_ids" ]; then
-     echo "cleanup requires manual operator action: ingest response did not expose created_drawer_ids; do not delete drawer_id, drawer_ids, or cleanup_drawer_ids" >&2
-     rm -f "$ingest_json" "$smoke_ids"
+     operation_id="$(python3 - "$ingest_json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+obj = json.loads(Path(sys.argv[1]).read_text() or "{}")
+operation_id = obj.get("operation_id")
+state = obj.get("state")
+if isinstance(operation_id, str) and operation_id and state not in {"completed", "rejected", "failed"}:
+    print(operation_id)
+PY
+)"
+     if [ -n "$operation_id" ]; then
+       operation_json="$(mktemp)"
+       if mempal operation wait "$operation_id" --timeout-secs 300 --json > "$operation_json"; then
+         wait_status=0
+       else
+         wait_status=$?
+       fi
+       if [ "$wait_status" -ne 0 ]; then
+         mempal operation status "$operation_id" --json > "$operation_json" || true
+       fi
+       python3 - "$operation_json" > "$smoke_ids" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+obj = json.loads(Path(sys.argv[1]).read_text() or "{}")
+if obj.get("state") != "completed":
+    raise SystemExit(0)
+ids = []
+drawer_ids = obj.get("created_drawer_ids")
+if isinstance(drawer_ids, list):
+    ids.extend(item for item in drawer_ids if isinstance(item, str) and item)
+for item in dict.fromkeys(ids):
+    print(item)
+PY
+     fi
+   fi
+   if [ ! -s "$smoke_ids" ]; then
+     echo "cleanup requires manual operator action: terminal response did not expose created_drawer_ids; do not delete drawer_id, drawer_ids, or cleanup_drawer_ids" >&2
+     rm -f "$ingest_json" "$operation_json" "$smoke_ids"
      exit 1
    fi
    ```
 
-   Do not print the ingest response or smoke IDs unless cleanup fails. `created_drawer_ids` is the cleanup authority; `cleanup_drawer_ids` is only a human-readable alias when it mirrors the created list. `drawer_id` and `drawer_ids` are informational because they may name pre-existing, deduplicated, dropped, or merge-target drawers. If the ingest response timed out and returned only an `operation_id`, inspect it with `mempal operation wait <operation_id> --timeout-secs <seconds>` or `mempal operation status <operation_id>`, then delete only IDs from `created_drawer_ids`; if that list is empty, fail closed.
+   Do not print the ingest response, operation response, or smoke IDs unless cleanup fails. `created_drawer_ids` from the terminal ingest JSON, or from terminal `mempal operation wait/status --json`, is the cleanup authority. `cleanup_drawer_ids` is only a human-readable alias when it mirrors the created list. `drawer_id` and `drawer_ids` are informational because they may name pre-existing, deduplicated, dropped, or merge-target drawers. If `created_drawer_ids` is empty after the terminal wait/status step, fail closed.
 
 3. Optionally search for the marker as a verification probe only. Keep output in a temporary file, print aggregate counts only, never print search result bodies/snippets, and never use search result IDs for deletion:
 
@@ -277,7 +320,7 @@ PY
        exit 1
      fi
    done < "$smoke_ids"
-   rm -f "$ingest_json" "$smoke_ids"
+   rm -f "$ingest_json" "$operation_json" "$smoke_ids"
    ```
 
 5. Re-run the aggregate marker verification from step 3 and confirm no active `smoke/manual` marker match remains, or record soft-delete behavior if tombstones remain visible only with explicit include-deleted flags.

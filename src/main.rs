@@ -1176,12 +1176,18 @@ enum Commands {
 #[derive(Subcommand)]
 enum OperationCommands {
     /// Print the current status of a receipt-backed ingest operation.
-    Status { operation_id: String },
+    Status {
+        operation_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Block until a receipt-backed ingest operation reaches a terminal state.
     Wait {
         operation_id: String,
         #[arg(long = "timeout-secs", default_value_t = 30)]
         timeout_secs: u64,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -5713,6 +5719,18 @@ fn print_operation_response(response: &IngestResponse) -> Result<()> {
     Ok(())
 }
 
+fn print_operation_response_format(json: bool, response: &IngestResponse) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(response)
+                .context("failed to serialize operation response JSON")?
+        );
+        return Ok(());
+    }
+    print_operation_response(response)
+}
+
 fn ingest_stdin_wait_stats_from_response(response: &IngestResponse) -> IngestStats {
     let mut stats = IngestStats {
         files: 1,
@@ -5730,8 +5748,12 @@ fn ingest_stdin_wait_stats_from_response(response: &IngestResponse) -> IngestSta
     stats
 }
 
-fn finish_operation_wait_response(response: IngestResponse, operation_id: &str) -> Result<()> {
-    print_operation_response(&response)?;
+fn finish_operation_wait_response(
+    response: IngestResponse,
+    operation_id: &str,
+    json: bool,
+) -> Result<()> {
+    print_operation_response_format(json, &response)?;
     match response.state {
         Some(IngestOperationState::Completed) => Ok(()),
         Some(IngestOperationState::Rejected) => bail!("operation {operation_id} was rejected"),
@@ -5747,7 +5769,7 @@ async fn operation_command(
 ) -> Result<()> {
     let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone())?;
     match command {
-        OperationCommands::Status { operation_id } => {
+        OperationCommands::Status { operation_id, json } => {
             let response = server
                 .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
                     OperationStatusRequest { operation_id },
@@ -5755,12 +5777,13 @@ async fn operation_command(
                 .await
                 .context("failed to load operation status")?
                 .0;
-            print_operation_response(&response)?;
+            print_operation_response_format(json, &response)?;
             Ok(())
         }
         OperationCommands::Wait {
             operation_id,
             timeout_secs,
+            json,
         } => {
             eprintln!(
                 "waiting for operation_id={} timeout_secs={timeout_secs}",
@@ -5788,7 +5811,7 @@ async fn operation_command(
                 .map(IngestOperationState::is_terminal)
                 .unwrap_or(false)
             {
-                return finish_operation_wait_response(initial_status, &operation_id);
+                return finish_operation_wait_response(initial_status, &operation_id, json);
             }
             let wait_result = server
                 .wait_for_operation_status_with_scoped_worker(
@@ -5799,7 +5822,7 @@ async fn operation_command(
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             match wait_result {
-                Some(response) => finish_operation_wait_response(response, &operation_id),
+                Some(response) => finish_operation_wait_response(response, &operation_id, json),
                 None => {
                     let mut response = server
                         .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
@@ -5815,10 +5838,10 @@ async fn operation_command(
                         .map(IngestOperationState::is_terminal)
                         .unwrap_or(false)
                     {
-                        return finish_operation_wait_response(response, &operation_id);
+                        return finish_operation_wait_response(response, &operation_id, json);
                     }
                     response.timed_out = true;
-                    print_operation_response(&response)?;
+                    print_operation_response_format(json, &response)?;
                     bail!("timed out waiting for operation {operation_id}")
                 }
             }
