@@ -119,6 +119,83 @@ async fn mcp_stdio_initialize_does_not_wait_for_busy_db_or_noop_llm() -> Result<
     Ok(())
 }
 
+#[tokio::test]
+async fn mcp_stdio_ingest_busy_after_status_keeps_transport_alive() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let mempal_home = tmp.path().join(".mempal");
+    fs::create_dir_all(&mempal_home)?;
+    let db_path = mempal_home.join("palace.db");
+    Database::open(&db_path)?;
+
+    let lock_conn = rusqlite::Connection::open(&db_path)?;
+    lock_conn.execute_batch("BEGIN EXCLUSIVE;")?;
+
+    let mut client = McpStdio::start(&db_path, HashMap::new()).await?;
+    let server_info = tokio::time::timeout(Duration::from_secs(5), client.initialize()).await??;
+    assert!(!server_info.server_info.name.trim().is_empty());
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(15),
+        client.call(
+            "tools/call",
+            serde_json::json!({
+                "name": "mempal_status",
+                "arguments": {},
+            }),
+        ),
+    )
+    .await??;
+    let status_body = &status["structuredContent"];
+    assert_eq!(
+        status_body["database_diagnostic"]["failure_kind"].as_str(),
+        Some("locked_or_busy")
+    );
+
+    let ingest = tokio::time::timeout(
+        Duration::from_secs(12),
+        client.call_raw(
+            "tools/call",
+            serde_json::json!({
+                "name": "mempal_ingest",
+                "arguments": {
+                    "content": "issue 534 locked transport regression payload",
+                    "wing": "mcp",
+                    "room": "busy",
+                    "source_type": "agent_inference",
+                    "wait": false
+                },
+            }),
+        ),
+    )
+    .await??;
+    let error = ingest
+        .get("error")
+        .expect("busy ingest should return a JSON-RPC error");
+    let error_text = error.to_string();
+    assert!(
+        error_text.contains("database_locked")
+            || error_text.contains("locked_or_busy")
+            || error_text.contains("retry_after_transient_lock"),
+        "busy ingest error must be structured and retryable: {error}"
+    );
+
+    lock_conn.execute_batch("ROLLBACK;")?;
+    let recovered_status = tokio::time::timeout(
+        Duration::from_secs(15),
+        client.call(
+            "tools/call",
+            serde_json::json!({
+                "name": "mempal_status",
+                "arguments": {},
+            }),
+        ),
+    )
+    .await??;
+    assert!(recovered_status["structuredContent"].is_object());
+    client.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn harness_integration_smoke() -> Result<()> {
     let tmp = TempDir::new()?;
