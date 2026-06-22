@@ -3450,6 +3450,8 @@ fn run() -> Result<()> {
 
     let db = match if dashboard_mode {
         open_dashboard_database(&db_path).context("failed to open dashboard database")
+    } else if command_retries_stdin_ingest_startup_open(&cli.command) {
+        open_stdin_ingest_database_with_retry(&db_path)
     } else if command_retries_historical_rejudge_startup_open(&cli.command) {
         open_historical_rejudge_startup_database_with_retry(|| {
             Database::open(&db_path).context("failed to open database")
@@ -4164,6 +4166,52 @@ fn command_retries_historical_rejudge_startup_open(command: &Commands) -> bool {
         Commands::Maintenance {
             command: MaintenanceCommands::Rejudge(args),
         } if args.command.is_none() && args.resume
+    )
+}
+
+fn command_retries_stdin_ingest_startup_open(command: &Commands) -> bool {
+    matches!(command, Commands::Ingest { stdin: true, .. })
+}
+
+const STDIN_INGEST_SQLITE_LOCK_MAX_RETRIES: usize = 40;
+const STDIN_INGEST_STARTUP_BUSY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(100);
+const STDIN_INGEST_SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn open_stdin_ingest_database_with_retry(path: &Path) -> Result<Database> {
+    for attempt in 0..=STDIN_INGEST_SQLITE_LOCK_MAX_RETRIES {
+        match Database::open_with_busy_timeout(path, STDIN_INGEST_STARTUP_BUSY_TIMEOUT)
+            .context("failed to open database")
+        {
+            Ok(db) => {
+                db.conn()
+                    .busy_timeout(STDIN_INGEST_SQLITE_BUSY_TIMEOUT)
+                    .context("failed to set stdin ingest SQLite busy timeout")?;
+                return Ok(db);
+            }
+            Err(error)
+                if is_transient_sqlite_lock_error(&error)
+                    && attempt < STDIN_INGEST_SQLITE_LOCK_MAX_RETRIES =>
+            {
+                std::thread::sleep(historical_rejudge_sqlite_lock_retry_delay(attempt));
+            }
+            Err(error) if is_transient_sqlite_lock_error(&error) => {
+                bail!("{}", stdin_ingest_sqlite_lock_diagnostic(path, &error));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("stdin ingest startup database retry loop returns on terminal attempt")
+}
+
+fn stdin_ingest_sqlite_lock_diagnostic(path: &Path, error: &anyhow::Error) -> String {
+    let holders = mempal::process_diagnostics::inspect_db_holders(path);
+    format!(
+        "failed to open database for ingest --stdin after waiting for transient SQLite locks: {error}\n\
+         holder summary: {}\n\
+         safe next step: {}",
+        mempal::process_diagnostics::format_db_holder_role_summary(&holders),
+        mempal::process_diagnostics::sqlite_lock_safe_next_step(&holders)
     )
 }
 
@@ -21498,6 +21546,21 @@ mod ingest_wait_timeout_error_tests {
         let error = anyhow::anyhow!("other error");
 
         assert!(!is_ingest_wait_timed_out(&error));
+    }
+
+    #[test]
+    fn stdin_ingest_lock_diagnostic_is_actionable_without_payload() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let _db = Database::open(&db_path).expect("open db");
+        let error = anyhow::anyhow!("failed to open database: database is locked");
+
+        let diagnostic = stdin_ingest_sqlite_lock_diagnostic(&db_path, &error);
+
+        assert!(diagnostic.contains("failed to open database for ingest --stdin"));
+        assert!(diagnostic.contains("holder summary:"));
+        assert!(diagnostic.contains("safe next step:"));
+        assert!(!diagnostic.contains("stdin transient sqlite lock fixture"));
     }
 }
 

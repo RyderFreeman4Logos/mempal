@@ -202,6 +202,56 @@ pub fn format_db_lock_remediation_hint(
     lines.join("\n")
 }
 
+/// Summarize live SQLite holders without exposing argv or payload content.
+pub fn format_db_holder_role_summary(report: &DbHolderReport) -> String {
+    if let Some(error) = report.error.as_deref() {
+        return format!("holder inspection failed: {error}");
+    }
+    if report.holders.is_empty() {
+        return "no live DB holders visible".to_string();
+    }
+
+    report
+        .holders
+        .iter()
+        .map(|holder| {
+            format!(
+                "pid={} role={} classification={} files={}",
+                holder.pid,
+                holder.role,
+                holder.classification,
+                holder.opened_files.join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Return the safe next operator step for a busy SQLite diagnostic.
+pub fn sqlite_lock_safe_next_step(report: &DbHolderReport) -> &'static str {
+    if report.stale_mcp_server_count > 0 || report.orphan_daemon_count > 0 {
+        return "run `mempal doctor` or `mempal daemon status` to inspect stale mempal-owned holders before retrying";
+    }
+    if report.extra_holder_count > 0 {
+        return "stop or wait for the extra process holding palace.db, then retry";
+    }
+    if report
+        .holders
+        .iter()
+        .any(|holder| holder.current_mcp_server || holder.classification == "current_mcp_server")
+    {
+        return "the current MCP server is the visible holder; wait for the active write to finish and retry without killing the server";
+    }
+    if report
+        .holders
+        .iter()
+        .any(|holder| holder.current_daemon || holder.classification == "current_daemon")
+    {
+        return "the current daemon is the visible holder; wait for the active queued write to finish and retry";
+    }
+    "wait for the transient SQLite writer to finish, then retry"
+}
+
 fn format_pid_list(pids: &[i32]) -> String {
     pids.iter()
         .map(i32::to_string)
@@ -839,6 +889,37 @@ mod tests {
         assert!(message.contains("pid=44 role=mempal_daemon classification=current_daemon"));
         assert!(message.contains("mempal only auto-terminates stale_mcp_server and orphan_daemon"));
         assert!(message.contains("mempal daemon status"));
+    }
+
+    #[test]
+    fn test_db_holder_role_summary_uses_sanitized_fields() {
+        let report = build_report(
+            Path::new("/tmp/palace.db"),
+            vec![holder(55, "mempal_mcp_server", "current_mcp_server")],
+            None,
+        );
+
+        let summary = format_db_holder_role_summary(&report);
+
+        assert!(summary.contains("pid=55"));
+        assert!(summary.contains("role=mempal_mcp_server"));
+        assert!(summary.contains("classification=current_mcp_server"));
+        assert!(!summary.contains("content"));
+        assert!(!summary.contains("token"));
+    }
+
+    #[test]
+    fn test_sqlite_lock_safe_next_step_distinguishes_current_mcp() {
+        let report = build_report(
+            Path::new("/tmp/palace.db"),
+            vec![holder(55, "mempal_mcp_server", "current_mcp_server")],
+            None,
+        );
+
+        let step = sqlite_lock_safe_next_step(&report);
+
+        assert!(step.contains("current MCP server"));
+        assert!(step.contains("without killing the server"));
     }
 
     #[cfg(target_os = "linux")]
