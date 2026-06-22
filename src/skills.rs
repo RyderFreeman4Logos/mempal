@@ -91,11 +91,7 @@ pub enum SkillsCommands {
     },
 }
 
-pub fn run_command(config: &Config, command: SkillsCommands) -> Result<()> {
-    let db_path = mempal::core::utils::expand_home(&config.db_path);
-    let db = Database::open(std::path::Path::new(&db_path))
-        .with_context(|| format!("failed to open database at {}", db_path.display()))?;
-
+pub fn run_command(db: &Database, config: &Config, command: SkillsCommands) -> Result<()> {
     if !skills_table_exists(db.conn()) {
         bail!("skills table not yet created — run `mempal init` to apply migrations");
     }
@@ -105,21 +101,14 @@ pub fn run_command(config: &Config, command: SkillsCommands) -> Result<()> {
             status,
             project,
             json,
-        } => cmd_list(&db, status.as_deref(), project.as_deref(), json),
-        SkillsCommands::Show { skill_id, json } => cmd_show(&db, &skill_id, json),
+        } => cmd_list(db, status.as_deref(), project.as_deref(), json),
+        SkillsCommands::Show { skill_id, json } => cmd_show(db, &skill_id, json),
         SkillsCommands::Promote {
             pattern_id,
             name,
             trigger,
             project,
-        } => cmd_promote(
-            &db,
-            config,
-            &pattern_id,
-            &name,
-            &trigger,
-            project.as_deref(),
-        ),
+        } => cmd_promote(db, config, &pattern_id, &name, &trigger, project.as_deref()),
         SkillsCommands::Propose {
             from_cases,
             min_support,
@@ -129,7 +118,7 @@ pub fn run_command(config: &Config, command: SkillsCommands) -> Result<()> {
             json,
             dry_run,
         } => cmd_propose_from_cases(
-            &db,
+            db,
             config,
             ProposeFromCasesCliArgs {
                 from_cases,
@@ -141,9 +130,9 @@ pub fn run_command(config: &Config, command: SkillsCommands) -> Result<()> {
                 dry_run,
             },
         ),
-        SkillsCommands::Adopt { skill_id } => cmd_adopt(&db, config, &skill_id),
-        SkillsCommands::Reject { skill_id } => cmd_reject(&db, config, &skill_id),
-        SkillsCommands::Retire { skill_id } => cmd_retire(&db, &skill_id),
+        SkillsCommands::Adopt { skill_id } => cmd_adopt(db, config, &skill_id),
+        SkillsCommands::Reject { skill_id } => cmd_reject(db, config, &skill_id),
+        SkillsCommands::Retire { skill_id } => cmd_retire(db, &skill_id),
     }
 }
 

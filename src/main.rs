@@ -3456,18 +3456,35 @@ fn run() -> Result<()> {
     if let Commands::Serve { mcp } = &cli.command {
         return block_on_result(serve_command(config.as_ref(), *mcp));
     }
+    if let Commands::FieldTaxonomy { format } = &cli.command {
+        return field_taxonomy_command(format);
+    }
+    if matches!(
+        &cli.command,
+        Commands::Bench {
+            command: BenchCommands::Matrix { .. }
+        }
+    ) {
+        let Commands::Bench { command } = cli.command else {
+            unreachable!("bench command preflight matched")
+        };
+        return block_on_result(bench_command(config.as_ref(), command));
+    }
 
     let db_path = expand_home(&config.db_path);
-    let dashboard_mode = is_dashboard_command(&cli.command);
-    if dashboard_mode && !db_path.exists() {
+    let read_only_database = command_uses_read_only_database(&cli.command);
+    if read_only_database {
+        validate_read_only_command_args(&cli.command)?;
+    }
+    if read_only_database && !db_path.exists() {
         bail!(
             "no palace.db found at {}; run `mempal init` first",
             display_path_for_user(&db_path)
         );
     }
 
-    let db = match if dashboard_mode {
-        open_dashboard_database(&db_path).context("failed to open dashboard database")
+    let db = match if read_only_database {
+        open_read_only_database(&db_path).context("failed to open read-only database")
     } else if command_retries_stdin_ingest_startup_open(&cli.command) {
         open_stdin_ingest_database_with_retry(&db_path)
     } else if command_retries_historical_rejudge_startup_open(&cli.command) {
@@ -4130,13 +4147,13 @@ fn run() -> Result<()> {
         Commands::Checkpoint { command } => {
             block_on_result(checkpoint_command(&db, config.as_ref(), command))
         }
-        Commands::Patterns { command } => patterns::run_command(config.as_ref(), command),
+        Commands::Patterns { command } => patterns::run_command(&db, command),
         Commands::Case { command } => case_skill::run_command(config.as_ref(), command),
         Commands::Foresight { command } => {
             foresight_cli::run_command(&db, config.as_ref(), command)
         }
-        Commands::Skills { command } => skills::run_command(config.as_ref(), command),
-        Commands::Repair { command } => repair_cli::run_command(config.as_ref(), command),
+        Commands::Skills { command } => skills::run_command(&db, config.as_ref(), command),
+        Commands::Repair { command } => repair_cli::run_command(&db, config.as_ref(), command),
         Commands::Xurl { command } => {
             block_on_result(xurl_ingest_command(&db, config.as_ref(), command))
         }
@@ -4251,16 +4268,79 @@ fn open_historical_rejudge_startup_database_with_retry(
     unreachable!("historical rejudge startup database retry loop returns on terminal attempt")
 }
 
-fn is_dashboard_command(command: &Commands) -> bool {
+fn command_uses_read_only_database(command: &Commands) -> bool {
     match command {
         Commands::Status { .. }
+        | Commands::Search { .. }
+        | Commands::Context { .. }
+        | Commands::WakeUp { .. }
         | Commands::Tail { .. }
         | Commands::Timeline { .. }
         | Commands::Stats { .. }
         | Commands::View { .. }
         | Commands::Reflect { .. }
         | Commands::Export { .. }
-        | Commands::Wiki { .. } => true,
+        | Commands::Wiki { .. }
+        | Commands::FactCheck { .. } => true,
+        Commands::Pinned { reorder, .. } => reorder.is_empty(),
+        Commands::Kg { command } => matches!(
+            command,
+            KgCommands::Query { .. }
+                | KgCommands::Timeline { .. }
+                | KgCommands::Stats
+                | KgCommands::List
+        ),
+        Commands::Knowledge { command } => {
+            matches!(
+                command,
+                KnowledgeCommands::Gate { .. } | KnowledgeCommands::Policy { .. }
+            )
+        }
+        Commands::KnowledgeCard { command } => matches!(
+            command,
+            KnowledgeCardCommands::Get { .. }
+                | KnowledgeCardCommands::List { .. }
+                | KnowledgeCardCommands::Retrieve { .. }
+                | KnowledgeCardCommands::Events { .. }
+                | KnowledgeCardCommands::Gate { .. }
+                | KnowledgeCardCommands::BackfillPlan { .. }
+                | KnowledgeCardCommands::BackfillApply { execute: false, .. }
+        ),
+        Commands::Cards {
+            pending,
+            approve,
+            reject,
+            ..
+        } => *pending && approve.is_none() && reject.is_none(),
+        Commands::Tunnels { command } => matches!(
+            command,
+            None | Some(TunnelCommands::List { .. }) | Some(TunnelCommands::Follow { .. })
+        ),
+        Commands::Taxonomy { command } => matches!(command, TaxonomyCommands::List),
+        Commands::Gating { command } => matches!(command, GatingCommands::Stats { .. }),
+        Commands::Checkpoint { command } => matches!(
+            command,
+            CheckpointCommands::Latest { .. }
+                | CheckpointCommands::Extract { .. }
+                | CheckpointCommands::Status
+                | CheckpointCommands::Cleanup { dry_run: true, .. }
+        ),
+        Commands::Patterns { command } => matches!(
+            command,
+            patterns::PatternsCommands::List { .. } | patterns::PatternsCommands::Show { .. }
+        ),
+        Commands::Skills { command } => matches!(
+            command,
+            skills::SkillsCommands::List { .. } | skills::SkillsCommands::Show { .. }
+        ),
+        Commands::Repair { .. } => true,
+        Commands::Xurl { command } => matches!(
+            command,
+            XurlCommands::Search { .. }
+                | XurlCommands::Timeline { .. }
+                | XurlCommands::Stats { .. }
+                | XurlCommands::Reindex { dry_run: true, .. }
+        ),
         Commands::Audit { command, .. } => {
             !matches!(command, Some(AuditCommands::Cleanup { dry_run: false, .. }))
         }
@@ -4268,11 +4348,28 @@ fn is_dashboard_command(command: &Commands) -> bool {
     }
 }
 
-fn open_dashboard_database(path: &Path) -> Result<Database> {
+fn validate_read_only_command_args(command: &Commands) -> Result<()> {
+    if let Commands::Xurl { command } = command {
+        match command {
+            XurlCommands::Search { since, .. }
+            | XurlCommands::Timeline { since, .. }
+            | XurlCommands::Stats { since, .. } => {
+                if let Some(since) = since {
+                    parse_since_to_epoch(since)?;
+                }
+            }
+            XurlCommands::Reindex { .. } => {}
+            XurlCommands::Ingest { .. } | XurlCommands::Backfill { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn open_read_only_database(path: &Path) -> Result<Database> {
     let db = Database::open_read_only(path)?;
     db.conn()
         .execute_batch("PRAGMA query_only = ON;")
-        .context("failed to enable query_only for dashboard connection")?;
+        .context("failed to enable query_only for read-only connection")?;
     Ok(db)
 }
 
@@ -4565,7 +4662,7 @@ fn prime_command(config_path: &Path, args: PrimeArgs) -> Result<()> {
         eprintln!("mempal: palace.db not found; skipping priming");
         return Ok(());
     }
-    let db = open_dashboard_database(&db_path).context("failed to open priming database")?;
+    let db = open_read_only_database(&db_path).context("failed to open priming database")?;
     let current_dir = env::current_dir().ok();
     let project_id =
         resolve_project_id(args.project_id.as_deref(), &config, current_dir.as_deref())

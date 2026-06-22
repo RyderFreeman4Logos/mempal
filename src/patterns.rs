@@ -4,7 +4,6 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 
 use mempal::core::{
-    config::Config,
     db::Database,
     patterns::{
         get_pattern, list_patterns, patterns_table_exists, promote_pattern, retire_pattern,
@@ -45,11 +44,7 @@ pub enum PatternsCommands {
     },
 }
 
-pub fn run_command(config: &Config, command: PatternsCommands) -> Result<()> {
-    let db_path = mempal::core::utils::expand_home(&config.db_path);
-    let db = Database::open(std::path::Path::new(&db_path))
-        .with_context(|| format!("failed to open database at {}", db_path.display()))?;
-
+pub fn run_command(db: &Database, command: PatternsCommands) -> Result<()> {
     if !patterns_table_exists(db.conn()) {
         bail!("patterns table not yet created — run `mempal init` to apply migrations");
     }
@@ -59,10 +54,10 @@ pub fn run_command(config: &Config, command: PatternsCommands) -> Result<()> {
             status,
             project,
             json,
-        } => cmd_list(&db, status.as_deref(), project.as_deref(), json),
-        PatternsCommands::Show { pattern_id, json } => cmd_show(&db, &pattern_id, json),
-        PatternsCommands::Retire { pattern_id } => cmd_retire(&db, &pattern_id),
-        PatternsCommands::Promote { pattern_id } => cmd_promote(&db, &pattern_id),
+        } => cmd_list(db, status.as_deref(), project.as_deref(), json),
+        PatternsCommands::Show { pattern_id, json } => cmd_show(db, &pattern_id, json),
+        PatternsCommands::Retire { pattern_id } => cmd_retire(db, &pattern_id),
+        PatternsCommands::Promote { pattern_id } => cmd_promote(db, &pattern_id),
     }
 }
 
