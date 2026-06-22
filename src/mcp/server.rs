@@ -6054,7 +6054,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_operation_status",
-        description = "Return the current status of an asynchronous ingest operation, including the queue state, stored drawer_id, rejection reason, failure detail, and persisted per-stage timings. Use this to confirm a receipt-based write landed."
+        description = "Return the current status of an asynchronous ingest operation, including the queue state, informational drawer_id/drawer_ids, cleanup-safe created_drawer_ids, rejection reason, failure detail, and persisted per-stage timings. Use created_drawer_ids, not drawer_id/drawer_ids, as delete authority for receipt-backed cleanup."
     )]
     pub async fn mempal_operation_status(
         &self,
@@ -12322,7 +12322,7 @@ pattern_boost = 0.2
                 .description
                 .as_deref()
                 .unwrap_or_default()
-                .contains("receipt-based write landed")
+                .contains("cleanup-safe created_drawer_ids")
         );
 
         let ingest_tool = tools
@@ -13770,6 +13770,57 @@ pattern_boost = 0.2
     }
 
     #[tokio::test]
+    async fn test_mcp_queued_duplicate_completion_does_not_create_cleanup_ids() {
+        let (_tempdir, db_path, server) = setup_server();
+
+        let first = ingest_manual(&server, "queued duplicate cleanup fact", None, None, None).await;
+        let duplicate = server
+            .mempal_ingest_with_controls_scoped_worker(
+                IngestRequest {
+                    content: "queued duplicate cleanup fact".to_string(),
+                    wing: "mempal".to_string(),
+                    room: Some("replace".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(30),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
+            )
+            .await
+            .expect("queued duplicate ingest")
+            .0;
+
+        assert_eq!(duplicate.state, Some(IngestOperationState::Completed));
+        assert_eq!(duplicate.drawer_id, first.drawer_id);
+        assert_eq!(duplicate.drawer_ids, vec![first.drawer_id.clone()]);
+        assert!(
+            duplicate.created_drawer_ids.is_empty(),
+            "queued duplicate completion must not grant cleanup authority for an existing drawer"
+        );
+
+        let operation_id = duplicate
+            .operation_id
+            .as_deref()
+            .expect("queued duplicate operation id");
+        let status = server
+            .operation_status_json_for_test(operation_id)
+            .await
+            .expect("queued duplicate status");
+        assert_eq!(status.state, Some(IngestOperationState::Completed));
+        assert_eq!(status.drawer_ids, vec![first.drawer_id]);
+        assert!(
+            status.created_drawer_ids.is_empty(),
+            "persisted duplicate status must not grant cleanup authority"
+        );
+
+        let db = Database::open(&db_path).expect("open db");
+        assert_eq!(db.drawer_count().expect("drawer count"), 1);
+    }
+
+    #[tokio::test]
     async fn test_mcp_delete_rejects_existing_content_writer_lease() {
         let (_tempdir, db_path, server) = setup_server();
         insert_drawer(
@@ -15202,6 +15253,11 @@ enabled = true
             .expect("completed status");
         assert_eq!(completed.state, Some(IngestOperationState::Completed));
         assert!(!completed.drawer_id.is_empty());
+        assert_eq!(
+            completed.created_drawer_ids,
+            vec![completed.drawer_id.clone()]
+        );
+        assert_eq!(completed.drawer_ids, completed.created_drawer_ids);
 
         let completed_record =
             crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path)
@@ -15220,6 +15276,10 @@ enabled = true
             .expect("final status");
         assert_eq!(final_status.state, Some(IngestOperationState::Completed));
         assert_eq!(final_status.drawer_id, completed.drawer_id);
+        assert_eq!(
+            final_status.created_drawer_ids,
+            completed.created_drawer_ids
+        );
     }
 
     #[tokio::test]

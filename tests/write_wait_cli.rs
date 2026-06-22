@@ -802,9 +802,15 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
     handle.resume();
     let recovery = run_cli(
         home.path(),
-        &["operation", "wait", &operation_id, "--timeout-secs", "10"],
+        &[
+            "operation",
+            "wait",
+            &operation_id,
+            "--timeout-secs",
+            "10",
+            "--json",
+        ],
     );
-    handle.shutdown().await;
 
     assert!(
         recovery.status.success(),
@@ -813,28 +819,58 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
         String::from_utf8_lossy(&recovery.stderr)
     );
     let (recovery_stdout, recovery_stderr) = print_lines(&recovery);
+    let recovery_json: Value =
+        serde_json::from_str(&recovery_stdout).expect("parse operation wait recovery JSON");
+    assert_eq!(recovery_json["operation_id"], operation_id);
+    assert_eq!(recovery_json["state"], "completed");
+    assert!(!recovery_json["timed_out"].as_bool().unwrap_or(false));
     assert!(
-        recovery_stdout.contains("state=completed"),
-        "{recovery_stdout}"
-    );
-    assert!(
-        recovery_stdout.contains("timed_out=false"),
-        "{recovery_stdout}"
+        !recovery_stdout.contains("cli wait json timeout content"),
+        "operation wait JSON must not expose raw content: {recovery_stdout}"
     );
     assert!(
         recovery_stderr.contains("waiting for operation_id="),
         "{recovery_stderr}"
     );
-    let recovery_ids = cleanup_ids_from_operation_stdout(&recovery_stdout);
-    assert!(
-        !recovery_ids.is_empty(),
+    let recovery_ids = cleanup_ids_from_ingest_json(&recovery_json);
+    assert_eq!(
+        recovery_ids.len(),
+        1,
         "operation wait recovery must expose exact cleanup ids: {recovery_stdout}"
+    );
+    assert_eq!(
+        recovery_json["created_drawer_ids"], recovery_json["drawer_ids"],
+        "new operation completion should report the same affected and cleanup-safe IDs"
     );
     let completed = PendingMessageStore::new_without_reclaim(&db_path)
         .operation_status(&operation_id)
         .expect("load completed status")
         .expect("operation record exists");
     assert_eq!(completed.op_state, "completed");
+    let status = run_cli(
+        home.path(),
+        &["operation", "status", &operation_id, "--json"],
+    );
+    handle.shutdown().await;
+
+    assert!(
+        status.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_json: Value =
+        serde_json::from_slice(&status.stdout).expect("parse operation status JSON");
+    assert_eq!(status_json["state"], "completed");
+    assert_eq!(
+        cleanup_ids_from_ingest_json(&status_json),
+        recovery_ids,
+        "operation status JSON must preserve cleanup-safe IDs after wait"
+    );
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains("cli wait json timeout content"),
+        "operation status JSON must not expose raw content"
+    );
     let db = Database::open(&db_path).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
     drop(db);
