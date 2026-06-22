@@ -172,6 +172,14 @@ log_path = "{}"
     }
 
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        let message = self.call_raw(method, params).await?;
+        if let Some(error) = message.get("error") {
+            bail!("JSON-RPC error: {error}");
+        }
+        Ok(message["result"].clone())
+    }
+
+    pub async fn call_raw(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         self.send(json!({
@@ -181,7 +189,7 @@ log_path = "{}"
             "params": params,
         }))
         .await?;
-        self.read_response(id).await
+        self.read_response_message(id).await
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
@@ -215,7 +223,7 @@ log_path = "{}"
         Ok(())
     }
 
-    async fn read_response(&mut self, expected_id: u64) -> Result<Value> {
+    async fn read_response_message(&mut self, expected_id: u64) -> Result<Value> {
         loop {
             let mut line = String::new();
             let bytes = self
@@ -259,10 +267,7 @@ log_path = "{}"
             if message["id"].as_u64() != Some(expected_id) {
                 bail!("unexpected JSON-RPC id: {message}");
             }
-            if let Some(error) = message.get("error") {
-                bail!("JSON-RPC error: {error}");
-            }
-            return Ok(message["result"].clone());
+            return Ok(message);
         }
     }
 }
