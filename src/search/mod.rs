@@ -1,5 +1,7 @@
 #![warn(clippy::all)]
 
+use std::time::Duration;
+
 use crate::algo::ranking::{RankedMemoryItem, ReciprocalRankFusion};
 use crate::core::decay::{search_decay_factor_at, validity_window_contains_at};
 use crate::core::{
@@ -219,6 +221,8 @@ async fn apply_optional_reranker_to_outcome(
 pub enum SearchError {
     #[error("failed to embed search query")]
     EmbedQuery(#[source] EmbedError),
+    #[error("embedding deadline exceeded after {deadline_secs}s")]
+    EmbedQueryTimeout { deadline_secs: u64 },
     #[error("embedder returned no query vector")]
     MissingQueryVector,
     #[error("failed to count candidate drawers")]
@@ -374,9 +378,14 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
         return Ok(apply_optional_reranker_to_outcome(query, outcome).await);
     }
 
-    let embeddings = match embedder.embed(&[query]).await {
-        Ok(embeddings) => embeddings,
-        Err(error) if vector_search_circuit.bm25_fallback_enabled => {
+    let embeddings = match tokio::time::timeout(
+        Duration::from_secs(vector_search_circuit.search_deadline_secs),
+        embedder.embed(&[query]),
+    )
+    .await
+    {
+        Ok(Ok(embeddings)) => embeddings,
+        Ok(Err(error)) if vector_search_circuit.bm25_fallback_enabled => {
             let outcome = bm25_fallback_outcome(
                 db,
                 query,
@@ -390,7 +399,24 @@ pub async fn search_with_route_options_outcome<E: Embedder + ?Sized>(
             )?;
             return Ok(apply_optional_reranker_to_outcome(query, outcome).await);
         }
-        Err(error) => return Err(SearchError::EmbedQuery(error)),
+        Ok(Err(error)) => return Err(SearchError::EmbedQuery(error)),
+        Err(_) if vector_search_circuit.bm25_fallback_enabled => {
+            let outcome = bm25_fallback_outcome(
+                db,
+                query,
+                route,
+                scope,
+                options,
+                top_k,
+                bm25_fallback_warning_timeout(vector_search_circuit.search_deadline_secs),
+            )?;
+            return Ok(apply_optional_reranker_to_outcome(query, outcome).await);
+        }
+        Err(_) => {
+            return Err(SearchError::EmbedQueryTimeout {
+                deadline_secs: vector_search_circuit.search_deadline_secs,
+            });
+        }
     };
     let Some(query_vector) = embeddings.into_iter().next() else {
         if vector_search_circuit.bm25_fallback_enabled {
@@ -2059,6 +2085,71 @@ mod tests {
         ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
         ConfigHandle::harness_reload_from_path(&config_path);
         crate::observability::reset_resource_counters_for_tests();
+    }
+
+    struct SlowSearchEmbedder;
+
+    #[async_trait::async_trait]
+    impl crate::embed::Embedder for SlowSearchEmbedder {
+        async fn embed(&self, texts: &[&str]) -> crate::embed::Result<Vec<Vec<f32>>> {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Ok(texts.iter().map(|_| vec![0.25; 4]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        fn name(&self) -> &str {
+            "slow-search-test-embedder"
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn search_query_embedding_deadline_falls_back_to_bm25() {
+        let lock = crate::core::config::global_config_test_lock();
+        let _guard = lock.lock().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let config_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            db_path: db_path.to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        config.search.bm25_fallback = true;
+        config.embed.retry.search_deadline_secs = 5;
+        config.save_to(&config_path).expect("save config");
+        ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
+        ConfigHandle::harness_reload_from_path(&config_path);
+        crate::embed::global_embed_status().reset_for_tests();
+
+        let db = Database::open(&db_path).expect("db");
+        let mut drawer = make_drawer("bm25-timeout-hit", "alpha", "decision");
+        drawer.content = "fallback keyword memory".to_string();
+        db.insert_drawer_with_project(&drawer, Some("proj-a"))
+            .expect("insert drawer");
+
+        let outcome = search_with_route_options_outcome(
+            &db,
+            &SlowSearchEmbedder,
+            "fallback keyword",
+            route(),
+            &ProjectSearchScope::all_projects(),
+            SearchOptions::default(),
+            3,
+        )
+        .await
+        .expect("search should fall back to BM25");
+
+        assert_eq!(outcome.search_mode, SearchMode::Bm25Only);
+        assert_eq!(outcome.results[0].drawer_id, "bm25-timeout-hit");
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("deadline exceeded after 5s")),
+            "{outcome:#?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
