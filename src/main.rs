@@ -117,7 +117,15 @@ use mempal::reflect::{
     ReflectionEvidenceRef, ReflectionMode, ReflectionOptions, ReflectionReport, current_unix_secs,
     run_reflection,
 };
-use mempal::search::{SearchFilters, SearchOptions, search_with_all_options_outcome};
+use mempal::search::{SearchError, resolve_route};
+use mempal::search::{
+    SearchFilters, SearchMode, SearchOptions, SearchOutcome, VectorSearchCircuit,
+    bm25_fallback_warning_degraded, bm25_fallback_warning_dimension_mismatch,
+    bm25_fallback_warning_embed_error, bm25_fallback_warning_missing_query_vector,
+    bm25_fallback_warning_timeout, current_vector_dim as search_current_vector_dim,
+    maybe_rerank_search_results, search_bm25_only_with_options,
+    search_with_vector_and_scope_options,
+};
 use mempal::sleep::{
     NremSummary, RemSummary, SalienceSummary, SleepCycleSummary, SleepPhaseSelection,
     SleepRunOptions, run_sleep_cycle,
@@ -6503,6 +6511,362 @@ fn print_context_plain(pack: &ContextPack) {
     }
 }
 
+fn cli_search_db_deadline(config: &Config) -> std::time::Duration {
+    std::time::Duration::from_secs(config.api.search_db_deadline_secs)
+}
+
+fn cli_search_rerank_deadline(config: &Config) -> std::time::Duration {
+    let deadline_secs = config
+        .search
+        .reranker
+        .timeout_secs
+        .min(config.api.search_db_deadline_secs)
+        .max(1);
+    std::time::Duration::from_secs(deadline_secs)
+}
+
+fn cli_search_timeout_warning(stage: &str, deadline: std::time::Duration) -> String {
+    format!(
+        "{stage} deadline exceeded after {}s; returning partial/fallback search results",
+        deadline.as_secs()
+    )
+}
+
+fn cli_search_rerank_timeout_warning(deadline: std::time::Duration) -> String {
+    format!(
+        "reranker deadline exceeded after {}s; using original search ranking",
+        deadline.as_secs()
+    )
+}
+
+fn fallback_cli_search_route(
+    wing: Option<&str>,
+    room: Option<&str>,
+    reason: &'static str,
+) -> mempal::core::types::RouteDecision {
+    mempal::core::types::RouteDecision {
+        wing: wing.map(str::to_string),
+        room: room.map(str::to_string),
+        confidence: if wing.is_some() || room.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+        reason: reason.to_string(),
+    }
+}
+
+fn run_cli_search_read_bounded<R, F>(
+    stage: &'static str,
+    deadline: std::time::Duration,
+    f: F,
+) -> Result<Option<R>>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    if deadline.is_zero() {
+        return Ok(None);
+    }
+
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name(format!("mempal-cli-search-{stage}"))
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .with_context(|| format!("failed to spawn bounded CLI search {stage} worker"))?;
+
+    match rx.recv_timeout(deadline) {
+        Ok(result) => Ok(Some(result)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("bounded CLI search {stage} worker exited without a result")
+        }
+    }
+}
+
+fn run_cli_route_bounded(
+    db_path: PathBuf,
+    query: String,
+    wing: Option<String>,
+    room: Option<String>,
+    deadline: std::time::Duration,
+) -> Result<Option<Result<mempal::core::types::RouteDecision>>> {
+    run_cli_search_read_bounded("route", deadline, move || {
+        let db = open_read_only_database(&db_path)?;
+        resolve_route(&db, &query, wing.as_deref(), room.as_deref())
+            .context("failed to resolve search route")
+    })
+}
+
+#[derive(Clone)]
+struct CliSearchDbRequest {
+    db_path: PathBuf,
+    query: String,
+    route: mempal::core::types::RouteDecision,
+    scope: ProjectSearchScope,
+    options: SearchOptions,
+    top_k: usize,
+    deadline: std::time::Duration,
+}
+
+struct CliHybridSearchRequest {
+    db: CliSearchDbRequest,
+    query_vector: Vec<f32>,
+}
+
+fn run_cli_hybrid_search_bounded(
+    request: CliHybridSearchRequest,
+) -> Result<Option<Result<Vec<mempal::core::types::SearchResult>>>> {
+    run_cli_search_read_bounded("hybrid", request.db.deadline, move || {
+        let db = open_read_only_database(&request.db.db_path)?;
+        if let Some(current_dim) =
+            search_current_vector_dim(&db).map_err(SearchError::KeywordSearch)?
+            && current_dim != request.query_vector.len()
+        {
+            return Err(SearchError::VectorDimensionMismatch {
+                current_dim,
+                new_dim: request.query_vector.len(),
+            }
+            .into());
+        }
+        search_with_vector_and_scope_options(
+            &db,
+            &request.db.query,
+            &request.query_vector,
+            request.db.route,
+            &request.db.scope,
+            request.db.options,
+            request.db.top_k,
+        )
+        .context("failed to run hybrid search")
+    })
+}
+
+fn run_cli_bm25_search_bounded(
+    request: CliSearchDbRequest,
+) -> Result<Option<Result<Vec<mempal::core::types::SearchResult>>>> {
+    run_cli_search_read_bounded("bm25", request.deadline, move || {
+        let db = open_read_only_database(&request.db_path)?;
+        search_bm25_only_with_options(
+            &db,
+            &request.query,
+            request.route,
+            &request.scope,
+            request.options,
+            request.top_k,
+        )
+        .context("failed to run BM25 search")
+    })
+}
+
+fn vector_dimension_mismatch(error: &anyhow::Error) -> Option<(usize, usize)> {
+    error
+        .downcast_ref::<SearchError>()
+        .and_then(|error| match error {
+            SearchError::VectorDimensionMismatch {
+                current_dim,
+                new_dim,
+            } => Some((*current_dim, *new_dim)),
+            _ => None,
+        })
+}
+
+async fn apply_cli_reranker_bounded(
+    query: &str,
+    mut outcome: SearchOutcome,
+    deadline: std::time::Duration,
+) -> SearchOutcome {
+    if outcome.results.len() <= 1 {
+        return outcome;
+    }
+
+    let results = std::mem::take(&mut outcome.results);
+    let original_results = results.clone();
+    match tokio::time::timeout(deadline, maybe_rerank_search_results(query, results)).await {
+        Ok(rerank_outcome) => {
+            outcome.results = rerank_outcome.results;
+            outcome.warnings.extend(rerank_outcome.warnings);
+        }
+        Err(_) => {
+            outcome.results = original_results;
+            outcome
+                .warnings
+                .push(cli_search_rerank_timeout_warning(deadline));
+        }
+    }
+    outcome
+}
+
+fn cli_bm25_fallback_outcome(
+    request: CliSearchDbRequest,
+    mut warnings: Vec<String>,
+) -> Result<SearchOutcome> {
+    let deadline = request.deadline;
+    match run_cli_bm25_search_bounded(request)? {
+        Some(Ok(results)) => Ok(SearchOutcome {
+            results,
+            search_mode: SearchMode::Bm25Only,
+            warnings,
+        }),
+        Some(Err(error)) => Err(error),
+        None => {
+            warnings.push(cli_search_timeout_warning("BM25 search", deadline));
+            Ok(SearchOutcome {
+                results: Vec::new(),
+                search_mode: SearchMode::Bm25Only,
+                warnings,
+            })
+        }
+    }
+}
+
+struct CliSearchExecutionRequest<'a> {
+    query: &'a str,
+    wing: Option<&'a str>,
+    room: Option<&'a str>,
+    scope: ProjectSearchScope,
+    options: SearchOptions,
+    top_k: usize,
+}
+
+async fn cli_search_with_bounded_reads<E: Embedder + ?Sized>(
+    db: &Database,
+    config: &Config,
+    embedder: &E,
+    request: CliSearchExecutionRequest<'_>,
+) -> Result<SearchOutcome> {
+    let CliSearchExecutionRequest {
+        query,
+        wing,
+        room,
+        scope,
+        options,
+        top_k,
+    } = request;
+    if top_k == 0 {
+        return Ok(SearchOutcome {
+            results: Vec::new(),
+            search_mode: SearchMode::Hybrid,
+            warnings: Vec::new(),
+        });
+    }
+
+    let db_path = db.path().to_path_buf();
+    let db_deadline = cli_search_db_deadline(config);
+    let mut warnings = Vec::new();
+    let route = match run_cli_route_bounded(
+        db_path.clone(),
+        query.to_string(),
+        wing.map(str::to_string),
+        room.map(str::to_string),
+        db_deadline,
+    )? {
+        Some(Ok(route)) => route,
+        Some(Err(error)) => return Err(error),
+        None => {
+            warnings.push(cli_search_timeout_warning("route resolution", db_deadline));
+            fallback_cli_search_route(
+                wing,
+                room,
+                "bounded CLI fallback: route resolution timed out",
+            )
+        }
+    };
+
+    let embed_snapshot = global_embed_status().snapshot();
+    let vector_search_circuit =
+        VectorSearchCircuit::from_config_and_snapshot(config, &embed_snapshot);
+    let query_vector = if vector_search_circuit.bm25_fallback_enabled && vector_search_circuit.open
+    {
+        warnings.push(bm25_fallback_warning_degraded(
+            vector_search_circuit.failure_count,
+        ));
+        None
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(vector_search_circuit.search_deadline_secs),
+            embedder.embed(&[query]),
+        )
+        .await
+        {
+            Ok(Ok(vectors)) => match vectors.into_iter().next() {
+                Some(vector) => Some(vector),
+                None if vector_search_circuit.bm25_fallback_enabled => {
+                    warnings.push(bm25_fallback_warning_missing_query_vector());
+                    None
+                }
+                None => return Err(SearchError::MissingQueryVector.into()),
+            },
+            Ok(Err(_error)) if vector_search_circuit.bm25_fallback_enabled => {
+                warnings.push(bm25_fallback_warning_embed_error("query embedding failed"));
+                None
+            }
+            Ok(Err(error)) => return Err(SearchError::EmbedQuery(error).into()),
+            Err(_) if vector_search_circuit.bm25_fallback_enabled => {
+                warnings.push(bm25_fallback_warning_timeout(
+                    vector_search_circuit.search_deadline_secs,
+                ));
+                None
+            }
+            Err(_) => {
+                return Err(SearchError::EmbedQueryTimeout {
+                    deadline_secs: vector_search_circuit.search_deadline_secs,
+                }
+                .into());
+            }
+        }
+    };
+
+    let db_request = CliSearchDbRequest {
+        db_path,
+        query: query.to_string(),
+        route,
+        scope,
+        options,
+        top_k,
+        deadline: db_deadline,
+    };
+
+    let outcome = if let Some(query_vector) = query_vector {
+        match run_cli_hybrid_search_bounded(CliHybridSearchRequest {
+            db: db_request.clone(),
+            query_vector,
+        })? {
+            Some(Ok(results)) => SearchOutcome {
+                results,
+                search_mode: SearchMode::Hybrid,
+                warnings,
+            },
+            Some(Err(error)) if vector_search_circuit.bm25_fallback_enabled => {
+                if let Some((current_dim, new_dim)) = vector_dimension_mismatch(&error) {
+                    warnings.push(bm25_fallback_warning_dimension_mismatch(
+                        new_dim,
+                        current_dim,
+                    ));
+                    cli_bm25_fallback_outcome(db_request, warnings)?
+                } else {
+                    return Err(error);
+                }
+            }
+            Some(Err(error)) => return Err(error),
+            None if vector_search_circuit.bm25_fallback_enabled => {
+                warnings.push(cli_search_timeout_warning("hybrid search", db_deadline));
+                cli_bm25_fallback_outcome(db_request, warnings)?
+            }
+            None => bail!(
+                "{}",
+                cli_search_timeout_warning("hybrid search", db_deadline)
+            ),
+        }
+    } else {
+        cli_bm25_fallback_outcome(db_request, warnings)?
+    };
+
+    Ok(apply_cli_reranker_bounded(query, outcome, cli_search_rerank_deadline(config)).await)
+}
+
 async fn search_command(
     db: &Database,
     config: &Config,
@@ -6519,20 +6883,23 @@ async fn search_command(
     );
     let room = resolve_room_session_scope(options.room, options.session)?;
     let embedder = build_embedder(config).await?;
-    let outcome = search_with_all_options_outcome(
+    let outcome = cli_search_with_bounded_reads(
         db,
+        config,
         &*embedder,
-        options.query,
-        options.wing,
-        room.as_deref(),
-        &scope,
-        SearchOptions {
-            filters: options.filters,
-            with_neighbors: options.with_neighbors,
-            include_raw_turns: options.include_raw_turns,
-            include_expired: options.include_expired,
+        CliSearchExecutionRequest {
+            query: options.query,
+            wing: options.wing,
+            room: room.as_deref(),
+            scope,
+            options: SearchOptions {
+                filters: options.filters,
+                with_neighbors: options.with_neighbors,
+                include_raw_turns: options.include_raw_turns,
+                include_expired: options.include_expired,
+            },
+            top_k: options.top_k,
         },
-        options.top_k,
     )
     .await?;
     for warning in &outcome.warnings {
@@ -20934,6 +21301,57 @@ api_model = "text-embedding-3-large"
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
         (tmp, db)
+    }
+
+    #[test]
+    fn cli_search_read_bounded_zero_deadline_does_not_run_stage() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_stage = Arc::clone(&calls);
+
+        let outcome = run_cli_search_read_bounded("test", std::time::Duration::ZERO, move || {
+            calls_for_stage.fetch_add(1, Ordering::SeqCst);
+            42
+        })
+        .expect("bounded read");
+
+        assert!(outcome.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cli_search_db_deadline_returns_empty_bm25_json_safe_outcome() {
+        let (_tmp, db) = new_temp_db();
+        let mut config = Config::default();
+        config.api.search_db_deadline_secs = 0;
+        config.search.bm25_fallback = true;
+        let embedder = RecordingEmbedder::default();
+
+        let outcome = cli_search_with_bounded_reads(
+            &db,
+            &config,
+            &embedder,
+            CliSearchExecutionRequest {
+                query: "synthetic availability query",
+                wing: None,
+                room: None,
+                scope: ProjectSearchScope::all_projects(),
+                options: SearchOptions::default(),
+                top_k: 3,
+            },
+        )
+        .await
+        .expect("bounded CLI search");
+
+        assert_eq!(outcome.search_mode, SearchMode::Bm25Only);
+        assert!(outcome.results.is_empty());
+        assert_eq!(
+            embedder.seen_texts(),
+            vec!["synthetic availability query".to_string()]
+        );
+        let warnings = outcome.warnings.join("\n");
+        assert!(warnings.contains("route resolution deadline exceeded"));
+        assert!(warnings.contains("hybrid search deadline exceeded"));
+        assert!(warnings.contains("BM25 search deadline exceeded"));
     }
 
     fn hold_daemon_writer_lease(db: &Database) -> RuntimeWriterLease {

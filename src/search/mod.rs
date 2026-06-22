@@ -1307,7 +1307,9 @@ fn rrf_merge(
 // KNN helpers (fork)
 // ---------------------------------------------------------------------------
 
-fn current_vector_dim(
+/// Return the current vector index dimension if `drawer_vectors` exists and is
+/// non-empty.
+pub fn current_vector_dim(
     db: &Database,
 ) -> std::result::Result<Option<usize>, crate::core::db::DbError> {
     let exists: bool = db.conn().query_row(
