@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::bootstrap_events::BootstrapEvent;
 use crate::core::{
     AsyncDb,
+    async_db::RESOURCE_BOUNDED_READERS,
     config::{Config, ConfigHandle},
     db::Database,
     queue::AsyncPendingMessageStore,
@@ -301,7 +302,8 @@ fn open_daemon_storage_once(
     db_path: &Path,
 ) -> Result<(Database, AsyncDb, AsyncPendingMessageStore)> {
     let db = Database::open(db_path).context("failed to open daemon database")?;
-    let async_db = AsyncDb::open(db_path, 4).context("failed to open daemon async database")?;
+    let async_db = AsyncDb::open(db_path, RESOURCE_BOUNDED_READERS)
+        .context("failed to open daemon async database")?;
     let store = AsyncPendingMessageStore::new(db.path()).context("failed to open pending queue")?;
     Ok((db, async_db, store))
 }

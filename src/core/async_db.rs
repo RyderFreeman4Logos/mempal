@@ -31,8 +31,10 @@
 //!   open `Transaction` is ever handed across calls.
 //! * A task holds at most one pooled connection at a time, so the pool can never
 //!   self-deadlock waiting on its own checkout.
-//! * `(n_read + 1) × 256 MiB` page cache stays under a 1.5 GiB cap (issue #311);
-//!   `mmap_size` stays `0`.
+//! * `(n_read + 1) × 16 MiB` page cache stays under a 256 MiB cap for
+//!   long-lived read paths (#525); high-throughput maintenance jobs opt into a
+//!   larger cache outside this pool.
+//! * `mmap_size` stays `0`.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -40,14 +42,29 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
-use super::db::{Database, DbError, SQLITE_CACHE_SIZE_KIB_256_MIB};
+use super::db::{Database, DbError, SQLITE_CACHE_SIZE_KIB_DEFAULT};
 
 /// Hard cap on the aggregate SQLite page cache across all pooled connections.
 ///
-/// Each connection carries a 256 MiB cache ([`SQLITE_CACHE_SIZE_KIB_256_MIB`]);
-/// the default `n_read = 4` plus the writer is `5 × 256 MiB = 1.28 GiB`, well
-/// under this 1.5 GiB cap and far below issue #311's 4 GiB peak-memory budget.
-const PAGE_CACHE_BUDGET_MIB: i64 = 1536;
+/// Each long-lived connection carries a 16 MiB cache
+/// ([`SQLITE_CACHE_SIZE_KIB_DEFAULT`]). The default daemon/MCP/API pools use two
+/// readers plus one writer, so their configured resident page-cache ceiling is
+/// 48 MiB before SQLite and allocator overhead.
+const PAGE_CACHE_BUDGET_MIB: i64 = 256;
+
+/// Conservative production reader count for daemon/MCP/REST read pools.
+pub const RESOURCE_BOUNDED_READERS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsyncDbResourceSnapshot {
+    pub reader_connections: usize,
+    pub writer_connections: usize,
+    pub total_connections: usize,
+    pub per_connection_cache_kib: i64,
+    pub per_connection_cache_bytes: u64,
+    pub configured_page_cache_bytes: u64,
+    pub page_cache_budget_bytes: u64,
+}
 
 /// Bounded connection pool: a tokio [`Semaphore`] whose permit count equals the
 /// connection count, paired with the idle connections themselves. Acquiring a
@@ -58,6 +75,7 @@ struct ConnPool {
     idle: Mutex<Vec<Database>>,
     path: PathBuf,
     query_only: bool,
+    count: usize,
 }
 
 impl ConnPool {
@@ -73,6 +91,7 @@ impl ConnPool {
             idle: Mutex::new(idle),
             path: path.to_path_buf(),
             query_only,
+            count,
         })
     }
 
@@ -129,7 +148,7 @@ impl AsyncDb {
     /// least 1 so the read pool always has a connection to hand out.
     pub fn open(path: &Path, n_read: usize) -> Result<Self, DbError> {
         let n_read = n_read.max(1);
-        let per_conn_mib = (-SQLITE_CACHE_SIZE_KIB_256_MIB) / 1024;
+        let per_conn_mib = (-SQLITE_CACHE_SIZE_KIB_DEFAULT) / 1024;
         let conns = (n_read as i64) + 1;
         let requested_mib = conns * per_conn_mib;
         if requested_mib > PAGE_CACHE_BUDGET_MIB {
@@ -150,6 +169,23 @@ impl AsyncDb {
             #[cfg(any(test, feature = "db-test-seam"))]
             write_delay: None,
         })
+    }
+
+    pub fn resource_snapshot(&self) -> AsyncDbResourceSnapshot {
+        let reader_connections = self.readers.count;
+        let writer_connections = self.writer.count;
+        let total_connections = reader_connections + writer_connections;
+        let per_connection_cache_bytes = sqlite_cache_size_bytes(SQLITE_CACHE_SIZE_KIB_DEFAULT);
+        AsyncDbResourceSnapshot {
+            reader_connections,
+            writer_connections,
+            total_connections,
+            per_connection_cache_kib: SQLITE_CACHE_SIZE_KIB_DEFAULT,
+            per_connection_cache_bytes,
+            configured_page_cache_bytes: per_connection_cache_bytes
+                .saturating_mul(total_connections as u64),
+            page_cache_budget_bytes: (PAGE_CACHE_BUDGET_MIB as u64) * 1024 * 1024,
+        }
     }
 
     /// Inject a synthetic cold-read delay into every `run_read` (tests only).
@@ -232,6 +268,10 @@ impl AsyncDb {
         let delay: Option<Duration> = None;
         exec_anyhow(Arc::clone(&self.writer), delay, f).await
     }
+}
+
+fn sqlite_cache_size_bytes(cache_size_kib: i64) -> u64 {
+    cache_size_kib.unsigned_abs().saturating_mul(1024)
 }
 
 /// Execute `f` on a blocking thread over a connection borrowed from `pool`.
@@ -374,27 +414,34 @@ mod tests {
         );
     }
 
-    /// Every reader connection must enforce `query_only` and carry no `mmap`
-    /// (issue #311 RSS budget).
+    /// Every reader connection must enforce `query_only`, carry the low-RSS
+    /// cache profile, and carry no `mmap`.
     #[tokio::test]
-    async fn readers_are_query_only_without_mmap() {
+    async fn readers_are_query_only_low_cache_without_mmap() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let adb = AsyncDb::open(&tmp.path().join("palace.db"), 4).expect("open async db");
 
-        let (query_only, mmap_size): (i64, i64) = adb
+        let (query_only, cache_size, mmap_size): (i64, i64, i64) = adb
             .run_read(|db| {
                 let query_only = db
                     .conn()
                     .query_row("PRAGMA query_only", [], |row| row.get(0))?;
+                let cache_size = db
+                    .conn()
+                    .query_row("PRAGMA cache_size", [], |row| row.get(0))?;
                 let mmap_size = db
                     .conn()
                     .query_row("PRAGMA mmap_size", [], |row| row.get(0))?;
-                Ok((query_only, mmap_size))
+                Ok((query_only, cache_size, mmap_size))
             })
             .await
             .expect("read pragmas");
 
         assert_eq!(query_only, 1, "readers must be query_only");
+        assert_eq!(
+            cache_size, SQLITE_CACHE_SIZE_KIB_DEFAULT,
+            "long-lived read pools must use the low-RSS cache profile"
+        );
         assert_eq!(mmap_size, 0, "issue #311: pooled readers must not add mmap");
     }
 
@@ -417,21 +464,43 @@ mod tests {
     }
 
     /// Startup must reject a read pool whose aggregate page cache would blow the
-    /// issue #311 budget; the default-sized pool must be accepted.
+    /// long-lived process budget; the default-sized pool must be accepted.
     #[test]
     fn open_rejects_oversized_read_pool() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path = tmp.path().join("palace.db");
 
-        // (n_read + 1) × 256 MiB: n_read = 5 ⇒ 6 conns ⇒ 1536 MiB == budget (ok).
-        AsyncDb::open(&path, 5).expect("at-budget pool opens");
+        // (n_read + 1) × 16 MiB: n_read = 15 ⇒ 16 conns ⇒ 256 MiB == budget.
+        AsyncDb::open(&path, 15).expect("at-budget pool opens");
 
-        // n_read = 6 ⇒ 7 conns ⇒ 1792 MiB > 1536 MiB budget (rejected before any
-        // connection is opened).
-        let result = AsyncDb::open(&path, 6);
+        // n_read = 16 ⇒ 17 conns ⇒ 272 MiB > 256 MiB budget.
+        let result = AsyncDb::open(&path, 16);
         assert!(
             matches!(result, Err(DbError::PoolCacheBudgetExceeded { .. })),
             "oversized pool must be rejected with PoolCacheBudgetExceeded"
+        );
+    }
+
+    #[test]
+    fn resource_snapshot_reports_configured_page_cache_budget() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let adb = AsyncDb::open(&tmp.path().join("palace.db"), RESOURCE_BOUNDED_READERS)
+            .expect("open async db");
+
+        let snapshot = adb.resource_snapshot();
+
+        assert_eq!(snapshot.reader_connections, RESOURCE_BOUNDED_READERS);
+        assert_eq!(snapshot.writer_connections, 1);
+        assert_eq!(snapshot.total_connections, RESOURCE_BOUNDED_READERS + 1);
+        assert_eq!(
+            snapshot.per_connection_cache_kib,
+            SQLITE_CACHE_SIZE_KIB_DEFAULT
+        );
+        assert_eq!(snapshot.per_connection_cache_bytes, 16 * 1024 * 1024);
+        assert_eq!(
+            snapshot.configured_page_cache_bytes,
+            48 * 1024 * 1024,
+            "daemon/MCP/API default async DB pool must stay well below old GiB-scale cache"
         );
     }
 

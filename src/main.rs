@@ -13748,6 +13748,7 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
         && let Ok(Some(status)) = block_on_result(fetch_daemon_status(&config.api.addr))
     {
         print_daemon_rest_embedder_cache(&status);
+        print_daemon_rest_resource_usage(&status);
         if let Some(telemetry) = status.get("search_telemetry") {
             print_daemon_search_telemetry(telemetry);
         }
@@ -13820,6 +13821,18 @@ fn print_daemon_process_report(pid: i32, prefix: &str) {
         "{prefix}memory.swap_bytes: {}",
         display_opt_u64(report.swap_bytes)
     );
+    println!(
+        "{prefix}io.read_bytes: {}",
+        display_opt_u64(report.io_read_bytes)
+    );
+    println!(
+        "{prefix}io.write_bytes: {}",
+        display_opt_u64(report.io_write_bytes)
+    );
+    println!(
+        "{prefix}io.cancelled_write_bytes: {}",
+        display_opt_u64(report.io_cancelled_write_bytes)
+    );
     if report.exe_deleted {
         println!(
             "{prefix}warning: daemon binary has been deleted or replaced; run `mempal daemon restart` after upgrade"
@@ -13888,6 +13901,55 @@ fn print_daemon_rest_embedder_cache(status: &Value) {
     );
 }
 
+#[cfg(feature = "rest")]
+fn print_daemon_rest_resource_usage(status: &Value) {
+    let Some(resource) = status.get("resource_usage") else {
+        return;
+    };
+    let process = resource.get("process").unwrap_or(&Value::Null);
+    println!(
+        "rest.resource.process.io_read_bytes: {}",
+        json_opt_u64(process, "io_read_bytes")
+    );
+    println!(
+        "rest.resource.process.io_write_bytes: {}",
+        json_opt_u64(process, "io_write_bytes")
+    );
+    let sqlite = resource.get("sqlite").unwrap_or(&Value::Null);
+    println!(
+        "rest.resource.sqlite.async_pool_loaded: {}",
+        sqlite
+            .get("async_pool_loaded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    println!(
+        "rest.resource.sqlite.async_total_connections: {}",
+        json_u64(sqlite, "async_total_connections")
+    );
+    println!(
+        "rest.resource.sqlite.configured_page_cache_bytes: {}",
+        json_u64(sqlite, "configured_page_cache_bytes")
+    );
+    println!(
+        "rest.resource.sqlite.page_cache_budget_bytes: {}",
+        json_u64(sqlite, "page_cache_budget_bytes")
+    );
+    let counters = resource.get("counters").unwrap_or(&Value::Null);
+    println!(
+        "rest.resource.access_writeback_scheduled_total: {}",
+        json_u64(counters, "access_writeback_scheduled_total")
+    );
+    println!(
+        "rest.resource.access_writeback_skipped_total: {}",
+        json_u64(counters, "access_writeback_skipped_total")
+    );
+    println!(
+        "rest.resource.access_writeback_failed_total: {}",
+        json_u64(counters, "access_writeback_failed_total")
+    );
+}
+
 fn display_opt_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
@@ -13896,6 +13958,15 @@ fn display_opt_u64(value: Option<u64>) -> String {
 
 fn display_opt_usize(value: Option<usize>) -> String {
     value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+#[cfg(feature = "rest")]
+fn json_opt_u64(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
         .map(|value| value.to_string())
         .unwrap_or_else(|| "none".to_string())
 }

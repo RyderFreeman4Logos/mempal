@@ -4,12 +4,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::core::{AsyncDb, config::ConfigHandle, db::DbError};
+use crate::core::{
+    AsyncDb,
+    async_db::{AsyncDbResourceSnapshot, RESOURCE_BOUNDED_READERS},
+    config::ConfigHandle,
+    db::DbError,
+};
 use crate::embed::EmbedderFactory;
 use serde::Serialize;
 use tokio::sync::OnceCell;
 
-const API_ASYNC_DB_READERS: usize = 4;
+const API_ASYNC_DB_READERS: usize = RESOURCE_BOUNDED_READERS;
 const MAX_SLOW_SEARCHES: usize = 10;
 const SLOW_SEARCH_THRESHOLD: Duration = Duration::from_secs(1);
 
@@ -64,6 +69,10 @@ impl ApiState {
             .get_or_try_init(|| async move { AsyncDb::open(&db_path, API_ASYNC_DB_READERS) })
             .await
             .cloned()
+    }
+
+    pub(crate) fn async_db_resource_snapshot(&self) -> Option<AsyncDbResourceSnapshot> {
+        self.async_db.get().map(AsyncDb::resource_snapshot)
     }
 
     pub(crate) async fn run_read_anyhow_bounded<F, R>(

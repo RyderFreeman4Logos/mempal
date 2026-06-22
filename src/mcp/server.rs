@@ -10,6 +10,7 @@ use crate::context::assemble_context_with_vector;
 use crate::core::{
     AsyncDb,
     anchor::{self, DerivedAnchor},
+    async_db::RESOURCE_BOUNDED_READERS,
     config::{Config, ConfigHandle},
     db::{
         CURRENT_VECTOR_INDEX_VERSION, Database, NoveltyAuditInsert, VECTOR_DISTANCE_METRIC,
@@ -117,14 +118,15 @@ use super::tools::{
     LlmEndpointStatusDto, LlmStatusDto, MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS,
     OperationStatusRequest, PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto,
     Phase3Request, Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest,
-    PinnedFactsResponse, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse, ReadDrawersRequest,
-    ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto, RetrievalScopeRequest,
+    PinnedFactsResponse, ProcessResourceUsageDto, QueueStatsDto, ReadDrawerRequest,
+    ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto,
+    ResearchIngestPlanDto, ResourceCounterDto, ResourceUsageDto, RetrievalScopeRequest,
     RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto,
     RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
     SearchResultDto, SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount,
-    StatusDetail, StatusRequest, StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto,
-    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
-    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    SqliteResourceUsageDto, StatusDetail, StatusRequest, StatusResponse, StatusScope,
+    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
+    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
@@ -1200,7 +1202,7 @@ impl MempalMcpServer {
             .get_or_try_init(|| async move {
                 let display_path = db_path.display().to_string();
                 tokio::task::spawn_blocking(move || {
-                    AsyncDb::open(&db_path, 4).with_context(|| {
+                    AsyncDb::open(&db_path, RESOURCE_BOUNDED_READERS).with_context(|| {
                         format!("failed to open MCP async database pool for {display_path}")
                     })
                 })
@@ -3372,6 +3374,21 @@ impl MempalMcpServer {
         let llm_endpoint_label = |base_url: &str| {
             endpoint_policy_diagnostic_label(remote_call_policy, RemoteCallService::Llm, base_url)
         };
+        let process_report =
+            crate::process_diagnostics::inspect_process_memory(std::process::id() as i32);
+        let sqlite_resource = self
+            .async_db
+            .get()
+            .map(|db| SqliteResourceUsageDto::from(db.resource_snapshot()))
+            .unwrap_or_else(|| SqliteResourceUsageDto {
+                async_pool_loaded: false,
+                ..SqliteResourceUsageDto::default()
+            });
+        let resource_usage = ResourceUsageDto {
+            process: ProcessResourceUsageDto::from(process_report),
+            sqlite: sqlite_resource,
+            counters: ResourceCounterDto::from(crate::observability::resource_counters()),
+        };
 
         Ok(Json(StatusResponse {
             schema_version: db_snapshot.schema_version,
@@ -3509,6 +3526,7 @@ impl MempalMcpServer {
                 eta_secs: queue_stats.eta_secs,
             },
             db_holders,
+            resource_usage,
             scrub_stats: ScrubStatsDto::from(ConfigHandle::scrub_stats()),
             chunker_stats: ChunkerStatsDto::from(
                 crate::ingest::chunk::global_chunker_stats().snapshot(),
@@ -11109,6 +11127,17 @@ pattern_boost = 0.2
         assert_eq!(status.embed_status.failed_count, 1);
         assert!(json.get("endpoint_health").is_some());
         assert!(json.get("intelligence_status").is_some());
+        assert!(json.get("resource_usage").is_some());
+        assert!(status.resource_usage.sqlite.async_pool_loaded);
+        assert_eq!(
+            status.resource_usage.sqlite.per_connection_cache_bytes,
+            16 * 1024 * 1024
+        );
+        assert!(
+            status.resource_usage.sqlite.configured_page_cache_bytes
+                <= status.resource_usage.sqlite.page_cache_budget_bytes,
+            "compact status path must keep daemon/MCP SQLite cache within its configured budget"
+        );
         assert!(
             status
                 .system_warnings

@@ -1970,6 +1970,10 @@ pub struct StatusResponse {
     /// `palace.db-shm` open, classified as current daemon/MCP server versus
     /// stale or extra holders.
     pub db_holders: DbHolderReport,
+    /// Aggregate, content-safe resource usage. Contains only process-level
+    /// counters and configured SQLite cache ceilings; never drawer content,
+    /// prompts, tokens, argv, or secret-bearing URLs.
+    pub resource_usage: ResourceUsageDto,
     pub scrub_stats: ScrubStatsDto,
     pub chunker_stats: ChunkerStatsDto,
     pub llm_status: LlmStatusDto,
@@ -1982,6 +1986,94 @@ pub struct StatusResponse {
     pub database_diagnostic: Option<DatabaseDiagnosticDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_warnings: Vec<SystemWarning>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ResourceUsageDto {
+    pub process: ProcessResourceUsageDto,
+    pub sqlite: SqliteResourceUsageDto,
+    pub counters: ResourceCounterDto,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProcessResourceUsageDto {
+    pub pid: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pss_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_dirty_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anonymous_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_read_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_write_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_cancelled_write_bytes: Option<u64>,
+}
+
+impl From<crate::process_diagnostics::ProcessMemoryReport> for ProcessResourceUsageDto {
+    fn from(value: crate::process_diagnostics::ProcessMemoryReport) -> Self {
+        Self {
+            pid: value.pid,
+            rss_bytes: value.rss_bytes,
+            pss_bytes: value.pss_bytes,
+            private_dirty_bytes: value.private_dirty_bytes,
+            anonymous_bytes: value.anonymous_bytes,
+            swap_bytes: value.swap_bytes,
+            io_read_bytes: value.io_read_bytes,
+            io_write_bytes: value.io_write_bytes,
+            io_cancelled_write_bytes: value.io_cancelled_write_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SqliteResourceUsageDto {
+    pub async_pool_loaded: bool,
+    pub async_reader_connections: usize,
+    pub async_writer_connections: usize,
+    pub async_total_connections: usize,
+    pub per_connection_cache_kib: i64,
+    pub per_connection_cache_bytes: u64,
+    pub configured_page_cache_bytes: u64,
+    pub page_cache_budget_bytes: u64,
+}
+
+impl From<crate::core::async_db::AsyncDbResourceSnapshot> for SqliteResourceUsageDto {
+    fn from(value: crate::core::async_db::AsyncDbResourceSnapshot) -> Self {
+        Self {
+            async_pool_loaded: true,
+            async_reader_connections: value.reader_connections,
+            async_writer_connections: value.writer_connections,
+            async_total_connections: value.total_connections,
+            per_connection_cache_kib: value.per_connection_cache_kib,
+            per_connection_cache_bytes: value.per_connection_cache_bytes,
+            configured_page_cache_bytes: value.configured_page_cache_bytes,
+            page_cache_budget_bytes: value.page_cache_budget_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ResourceCounterDto {
+    pub access_writeback_scheduled_total: u64,
+    pub access_writeback_skipped_total: u64,
+    pub access_writeback_failed_total: u64,
+}
+
+impl From<crate::observability::ResourceCounterSnapshot> for ResourceCounterDto {
+    fn from(value: crate::observability::ResourceCounterSnapshot) -> Self {
+        Self {
+            access_writeback_scheduled_total: value.access_writeback_scheduled_total,
+            access_writeback_skipped_total: value.access_writeback_skipped_total,
+            access_writeback_failed_total: value.access_writeback_failed_total,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]

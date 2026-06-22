@@ -854,24 +854,31 @@ pub fn dispatch_access_update(db_path: std::path::PathBuf, drawer_ids: Vec<Strin
     if drawer_ids.is_empty() {
         return;
     }
+    let config = crate::core::config::ConfigHandle::current();
+    if !config.search.record_access {
+        crate::observability::record_access_writeback_skipped();
+        return;
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let config = crate::core::config::ConfigHandle::current();
     let decay_rate = config.importance.decay_rate;
     let floor = config.importance.floor;
     let boost_cap = config.importance.boost_cap;
+    crate::observability::record_access_writeback_scheduled();
     tokio::task::spawn_blocking(move || match crate::core::db::Database::open(&db_path) {
         Ok(db) => {
             if let Err(err) =
                 db.update_access_fields_batch(&drawer_ids, now_ms, decay_rate, floor, boost_cap)
             {
+                crate::observability::record_access_writeback_failed();
                 tracing::warn!(error = %err, "access field update failed");
             }
         }
         Err(err) => {
+            crate::observability::record_access_writeback_failed();
             tracing::warn!(error = %err, "failed to open db for access update");
         }
     });
@@ -1943,6 +1950,7 @@ fn build_fts_match_query(query: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::{Config, ConfigHandle, SearchConfig};
     use crate::core::project::{ProjectSearchScope, SearchResultSource};
     use crate::core::types::{Drawer, RouteDecision, SearchResult, SourceType};
     use tempfile::TempDir;
@@ -2020,6 +2028,87 @@ mod tests {
 
     fn scoped_to_proj_a() -> ProjectSearchScope {
         ProjectSearchScope::from_request(Some("proj-a".to_string()), false, false, false)
+    }
+
+    fn access_count(db_path: &std::path::Path, drawer_id: &str) -> i64 {
+        let db = Database::open(db_path).expect("open db");
+        db.conn()
+            .query_row(
+                "SELECT COALESCE(access_count, 0) FROM drawers WHERE id = ?1",
+                [drawer_id],
+                |row| row.get(0),
+            )
+            .expect("read access count")
+    }
+
+    async fn configure_record_access(
+        dir: &std::path::Path,
+        db_path: &std::path::Path,
+        enabled: bool,
+    ) {
+        let config_path = dir.join("config.toml");
+        let config = Config {
+            db_path: db_path.to_string_lossy().into_owned(),
+            search: SearchConfig {
+                record_access: enabled,
+                ..SearchConfig::default()
+            },
+            ..Config::default()
+        };
+        config.save_to(&config_path).expect("save config");
+        ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
+        ConfigHandle::harness_reload_from_path(&config_path);
+        crate::observability::reset_resource_counters_for_tests();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_access_update_skips_db_write_by_default() {
+        let lock = crate::core::config::global_config_test_lock();
+        let _guard = lock.lock().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let db = Database::open(&db_path).expect("db");
+        let drawer = make_drawer("access-default", "alpha", "decision");
+        db.insert_drawer(&drawer).expect("insert drawer");
+        configure_record_access(tmp.path(), &db_path, false).await;
+
+        dispatch_access_update(db_path.clone(), vec![drawer.id.clone()]);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(access_count(&db_path, &drawer.id), 0);
+        let counters = crate::observability::resource_counters();
+        assert_eq!(counters.access_writeback_skipped_total, 1);
+        assert_eq!(counters.access_writeback_scheduled_total, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_access_update_writes_only_when_opted_in() {
+        let lock = crate::core::config::global_config_test_lock();
+        let _guard = lock.lock().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let db = Database::open(&db_path).expect("db");
+        let drawer = make_drawer("access-opt-in", "alpha", "decision");
+        db.insert_drawer(&drawer).expect("insert drawer");
+        configure_record_access(tmp.path(), &db_path, true).await;
+
+        dispatch_access_update(db_path.clone(), vec![drawer.id.clone()]);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if access_count(&db_path, &drawer.id) == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "access writeback did not complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let counters = crate::observability::resource_counters();
+        assert_eq!(counters.access_writeback_scheduled_total, 1);
+        assert_eq!(counters.access_writeback_skipped_total, 0);
+        assert_eq!(counters.access_writeback_failed_total, 0);
     }
 
     #[test]
