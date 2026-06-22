@@ -1,8 +1,9 @@
-//! Model2Vec embedding backend — static distilled models, zero native deps.
+//! Model2Vec embedding backend — explicit opt-in static distilled models.
 //!
-//! Default model: `minishlab/potion-multilingual-128M` (BGE-M3 distilled, 1024-dim).
-//! Falls back to `minishlab/potion-base-8M` (256-dim) if the multilingual model
-//! is not available.
+//! When the `model2vec` feature and `backend = "model2vec"` are both selected,
+//! omitting `embed.model` uses `minishlab/potion-multilingual-128M`
+//! (BGE-M3 distilled, 1024-dim). Default REST and correctness gates do not enable
+//! this backend.
 
 use super::{EmbedError, Embedder, Result};
 

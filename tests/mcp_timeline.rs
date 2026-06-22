@@ -90,7 +90,7 @@ fn timeline_config(
 db_path = "{}"
 {}
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [embed.degradation]
 degrade_after_n_failures = {}

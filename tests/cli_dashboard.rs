@@ -125,7 +125,7 @@ fn write_dashboard_config(
 db_path = "{}"
 {}
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [search]
 strict_project_isolation = {}
@@ -855,12 +855,8 @@ fn test_view_prints_full_drawer() {
     let db = Database::open(&env.db_path).expect("open db");
     db.insert_vector("view-full", &[0.1, 0.2, 0.3, 0.4])
         .expect("insert view vector");
-    db.record_vector_metadata(
-        "view-full",
-        CURRENT_VECTOR_INDEX_VERSION,
-        "model2vec:model2vec/potion-multilingual-128M::4",
-    )
-    .expect("record view vector metadata");
+    db.record_vector_metadata("view-full", CURRENT_VECTOR_INDEX_VERSION, "stub:::4")
+        .expect("record view vector metadata");
 
     let output = run_mempal(&env.home, env.cwd(), &["view", "view-full"]);
     assert!(
@@ -879,11 +875,8 @@ fn test_view_prints_full_drawer() {
         stdout.contains("vector_distance_metric: cosine"),
         "{stdout}"
     );
-    assert!(stdout.contains("vector_embedder: model2vec"), "{stdout}");
-    assert!(
-        stdout.contains("vector_model: model2vec/potion-multilingual-128M"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("vector_embedder: stub"), "{stdout}");
+    assert!(stdout.contains("vector_model: unknown"), "{stdout}");
     assert!(stdout.contains("vector_index_version: v2"), "{stdout}");
     assert!(stdout.contains("vector_stale: false"), "{stdout}");
     assert!(stdout.contains("content_truncated: false"), "{stdout}");
@@ -953,7 +946,7 @@ fn test_view_project_allows_cross_project_vector_diagnostics() {
     db.record_vector_metadata(
         "view-cross-project",
         CURRENT_VECTOR_INDEX_VERSION,
-        "model2vec:model2vec/potion-multilingual-128M::4",
+        "stub:::4",
     )
     .expect("record view vector metadata");
 

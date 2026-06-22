@@ -145,7 +145,7 @@ fn config_text(db_path: &Path, patterns_enabled: bool, promote_threshold: usize)
 db_path = "{}"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [config_hot_reload]
 enabled = false
@@ -491,8 +491,8 @@ fn test_pattern_promotes_to_active_at_threshold() {
 // Test: active pattern boosts exemplar results in search
 // ---------------------------------------------------------------------------
 
-// model_id that apply_pattern_boost derives for config backend = "model2vec"
-const MODEL2VEC_MODEL_ID: &str = "model2vec/potion-multilingual-128M";
+// model_id that apply_pattern_boost derives for config backend = "stub".
+const STUB_MODEL_ID: &str = "";
 
 #[tokio::test]
 async fn test_active_pattern_boosts_exemplar_results() {
@@ -548,7 +548,7 @@ async fn test_active_pattern_boosts_exemplar_results() {
                     "sess-c.md".to_string(),
                 ],
                 topic_tags: vec!["recurring".to_string(), "memory".to_string()],
-                model_id: Some(MODEL2VEC_MODEL_ID.to_string()),
+                model_id: Some(STUB_MODEL_ID.to_string()),
                 project_id: None,
             },
         )

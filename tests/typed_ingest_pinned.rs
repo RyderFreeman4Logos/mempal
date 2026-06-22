@@ -82,7 +82,7 @@ db_path = "{}"
 enabled = false
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 "#,
                 db_path.display()
             ),

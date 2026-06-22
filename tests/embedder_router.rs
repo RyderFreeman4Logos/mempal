@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+#[cfg(not(feature = "model2vec"))]
+use mempal::core::config::DaemonEmbedderMode;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::embed::{
     ConfiguredEmbedderFactory, EmbedError, EmbedderFactory, router::EmbeddingRouter,
@@ -437,7 +439,7 @@ dim = 3
 }
 
 #[tokio::test]
-async fn test_daemon_embedder_factory_remote_mode_avoids_local_model2vec() {
+async fn test_daemon_embedder_factory_remote_mode_uses_configured_remote_provider() {
     let _cache_guard = shared_embedder_cache_test_lock().lock().await;
     let (base_url, request_count, server) =
         spawn_counting_embedding_server(Duration::from_millis(1)).await;
@@ -448,7 +450,7 @@ async fn test_daemon_embedder_factory_remote_mode_avoids_local_model2vec() {
 db_path = "{}"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [embed.openai_compat]
 base_url = "{base_url}"
@@ -475,4 +477,28 @@ embedder_mode = "remote"
     assert_eq!(snapshot.backend.as_deref(), Some("openai_compat"));
     assert_eq!(snapshot.model.as_deref(), Some("Qwen/Qwen3-Embedding-8B"));
     assert_eq!(snapshot.dimensions, Some(3));
+}
+
+#[tokio::test]
+#[cfg(not(feature = "model2vec"))]
+async fn test_daemon_embedder_factory_rejects_small_local_without_model2vec_feature() {
+    let _guard = shared_embedder_cache_test_lock().lock().await;
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut config = Config {
+        db_path: tmp.path().join("palace.db").display().to_string(),
+        ..Config::default()
+    };
+    config.daemon.embedder_mode = DaemonEmbedderMode::SmallLocal;
+
+    let factory = ConfiguredEmbedderFactory::new_for_daemon(config);
+    let error = match factory.build().await {
+        Ok(_) => panic!("small_local must fail before building an embedder without model2vec"),
+        Err(error) => error,
+    };
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("requires building mempal with the `model2vec` Cargo feature"),
+        "{rendered}"
+    );
 }

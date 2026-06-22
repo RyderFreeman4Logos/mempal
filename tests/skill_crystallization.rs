@@ -604,7 +604,7 @@ fn test_skills_promote_cli() {
 db_path = "{}"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [config_hot_reload]
 enabled = false

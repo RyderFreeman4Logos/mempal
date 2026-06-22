@@ -10088,7 +10088,7 @@ quality_policy = "llm_required_for_keep"
 db_path = "{}"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [privacy]
 enabled = false

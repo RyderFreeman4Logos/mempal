@@ -31,7 +31,7 @@ impl TestEnv {
 db_path = "{}"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 "#,
                 db_path.display()
             ),

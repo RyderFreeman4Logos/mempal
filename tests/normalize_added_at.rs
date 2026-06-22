@@ -27,7 +27,7 @@ fn setup() -> (TempDir, std::path::PathBuf) {
             r#"
 db_path = "{}"
 [embed]
-backend = "model2vec"
+backend = "stub"
 "#,
             db_path.display()
         ),

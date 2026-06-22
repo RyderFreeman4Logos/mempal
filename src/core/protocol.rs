@@ -82,13 +82,13 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    field strings remain valid when the recommended fields are too coarse.
 
 3a. TRANSLATE QUERIES TO ENGLISH
-   The default embedding model is a multilingual distillation (model2vec) but
-   still performs best with English queries. Non-English queries may miss
-   relevant results. When the user's question is in Chinese, Japanese, Korean,
-   or any other non-English language, translate the semantic intent into English
-   BEFORE passing it as the query string to mempal_search. Do NOT transliterate
-   — capture the meaning. Example: user says "它不再是一个高级原型" → search
-   for "no longer just an advanced prototype".
+   The default embedding path follows the configured provider; model2vec is an
+   explicit opt-in fallback for local static models. Retrieval can still perform
+   better when queries are normalized to English. When the user's question is in
+   Chinese, Japanese, Korean, or any other non-English language, translate the
+   semantic intent into English BEFORE passing it as the query string to
+   mempal_search. Do NOT transliterate - capture the meaning. Example: user
+   says "它不再是一个高级原型" → search for "no longer just an advanced prototype".
 
 3b. USE TIMELINE FOR PROJECT OVERVIEW
    When you want project state overview without a specific question in mind,

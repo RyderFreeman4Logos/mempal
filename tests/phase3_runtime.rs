@@ -2523,7 +2523,7 @@ fn test_cli_phase3_research_ingest_plan_execute_writes_research_evidence() {
 
     fs::write(
         home.path().join(".mempal/config.toml"),
-        "[embed]\nbackend = \"model2vec\"\n",
+        "[embed]\nbackend = \"stub\"\n",
     )
     .expect("write embed config");
 

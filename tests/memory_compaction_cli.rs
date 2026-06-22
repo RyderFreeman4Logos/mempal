@@ -31,7 +31,7 @@ impl CompactionEnv {
 db_path = "{}"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [project]
 id = "project-a"

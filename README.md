@@ -1,6 +1,6 @@
 # mempal
 
-Project memory for coding agents. Single binary, `cargo install mempal`, find past decisions with citations in seconds. Local-first by default: SQLite + model2vec, with no cloud LLM, embedding, or rerank calls unless you opt in.
+Project memory for coding agents. Single binary, `cargo install mempal`, find past decisions with citations in seconds. Local-first storage by default: SQLite with no hidden model2vec download and no cloud LLM, embedding, or rerank calls unless you configure them.
 
 ## What It Does
 
@@ -13,7 +13,7 @@ Next session (any agent) → mempal search → finds the decision with source ci
 - **Knowledge graph**: subject-predicate-object triples with temporal validity (valid_from/valid_to)
 - **Cross-project tunnels**: automatic discovery when the same room appears in multiple wings
 - **Self-describing protocol**: MEMORY_PROTOCOL embedded in MCP ServerInfo teaches any agent how to use mempal — no system prompt configuration required
-- **Multilingual**: model2vec-rs (BGE-M3 distilled) as default embedder, zero native dependencies
+- **Configurable embeddings**: prefer an explicit OpenAI-compatible local/LAN provider for production; model2vec is an opt-in feature/backend
 - **Single file**: everything lives in `~/.mempal/palace.db` (SQLite + sqlite-vec)
 - **No cloud by default**: remote embeddings, LLM gating, and rerankers are disabled until configured explicitly
 
@@ -55,26 +55,25 @@ cargo install --path . --locked --features rest
 
 ## Configuration
 
-Config at `~/.mempal/config.toml` (optional, defaults work without it):
+Config at `~/.mempal/config.toml`:
 
-With no config file, mempal uses the local SQLite database at `~/.mempal/palace.db`, the local model2vec embedder, and no reranker or LLM calls. OpenAI-compatible embedding, LLM gating, and reranking examples below are opt-in.
+With no config file, mempal uses the local SQLite database at `~/.mempal/palace.db` and does not silently download or load model2vec. Configure an embedding endpoint for ingest/search, or explicitly enable `backend = "model2vec"` with the `model2vec` Cargo feature for local static models.
 
 ```toml
 db_path = "~/.mempal/palace.db"
 
 [embed]
-backend = "model2vec"                          # default, zero native deps
-# model = "minishlab/potion-multilingual-128M" # default multilingual model (1024d)
+backend = "openai_compat"                      # default provider family
 
-# Optional: keep long-lived daemon RSS lower than the in-process default model.
+# Optional: keep long-lived daemon RSS lower than in-process local models.
 # Requires [embed.openai_compat] or [[embed.endpoints]] below.
 [daemon]
 embedder_mode = "remote"                       # configured | remote | small_local
 
 [embed.openai_compat]
-# base_url = "http://127.0.0.1:18002/v1"       # local/LAN embedding endpoint
-# model = "Qwen/Qwen3-Embedding-8B"
-# dim = 4096
+base_url = "http://127.0.0.1:18002/v1"         # local/LAN embedding endpoint
+model = "Qwen/Qwen3-Embedding-8B"
+dim = 4096
 
 [search.reranker]
 enabled = false                                # default: no reranker call
@@ -176,7 +175,7 @@ Daemon low-memory mode:
 
 - `[daemon].embedder_mode = "configured"` uses the normal `[embed]` backend.
 - `"remote"` forces daemon workers and daemon REST embedding to use the configured OpenAI-compatible/API endpoint and disables daemon fallback to local model2vec.
-- `"small_local"` forces the daemon to use `minishlab/potion-base-8M` instead of the larger default in-process model.
+- `"small_local"` forces the daemon to use `minishlab/potion-base-8M` instead of a larger explicitly configured in-process model; it requires installing with `--features model2vec`.
 - After changing backend/model/dimensions, run `mempal reindex`, then `mempal daemon restart`.
 - `mempal daemon status` and `mempal doctor` report daemon RSS/PSS, whether the daemon executable is deleted/replaced, and whether the daemon embedder cache is loaded.
 
@@ -387,7 +386,7 @@ mempal currently builds as one Cargo package named `mempal`, with the binary at 
 | Path | Responsibility |
 |------|---------------|
 | `src/core/` | Types, SQLite schema, taxonomy, triples, config, queue |
-| `src/embed/` | Embedder implementations (model2vec default, ONNX and OpenAI-compatible optional paths) |
+| `src/embed/` | Embedder implementations (OpenAI-compatible routing, explicit model2vec and ONNX paths) |
 | `src/ingest/` | Format detection, normalization, chunking, gating, novelty |
 | `src/search/` | Hybrid search (BM25 + vector + RRF), routing, tunnels |
 | `src/aaak/` | AAAK encode/decode with BNF grammar + roundtrip tests |
@@ -396,7 +395,7 @@ mempal currently builds as one Cargo package named `mempal`, with the binary at 
 | `src/main.rs`, `src/cli/` | CLI entrypoint and command helpers |
 
 Key design choices:
-- **model2vec-rs** default embedder — zero native deps, multilingual (BGE-M3 distilled)
+- **OpenAI-compatible embeddings** as the default provider family; model2vec stays explicit opt-in
 - **ort (ONNX)** available behind `onnx` feature flag for max quality
 - **FTS5** for BM25 keyword search — synced via SQLite triggers
 - **Soft-delete** with audit trail — `mempal delete` + `mempal purge`

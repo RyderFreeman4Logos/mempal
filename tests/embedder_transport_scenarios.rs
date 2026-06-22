@@ -462,7 +462,7 @@ async fn test_server_info_injects_rule_11_when_degraded() {
 db_path = "/tmp/mempal-server-info.db"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [embed.degradation]
 degrade_after_n_failures = 1
@@ -483,7 +483,7 @@ block_writes_when_degraded = true
 db_path = "/tmp/mempal-server-info.db"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 
 [embed.degradation]
 degrade_after_n_failures = 1
@@ -623,7 +623,7 @@ fn test_base_url_rejects_userinfo_and_query_secret() {
 }
 
 #[test]
-fn test_legacy_config_missing_embed_keeps_model2vec() {
+fn test_legacy_config_missing_embed_keeps_configured_provider_default() {
     let config = Config::parse(
         r#"
 db_path = "/tmp/mempal-legacy.db"
@@ -633,7 +633,7 @@ strict_project_isolation = false
 "#,
     )
     .expect("parse legacy config");
-    assert_eq!(config.embed.backend, "model2vec");
+    assert_eq!(config.embed.backend, "openai_compat");
 }
 
 #[derive(Clone)]

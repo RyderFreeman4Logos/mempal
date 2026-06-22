@@ -1506,15 +1506,10 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
         })
         .await?;
     let turn_ids = insert_stats.turn_ids.clone();
-    let vector_fingerprint = context
-        .config
-        .embed
-        .current_vector_embedder_fingerprint(embedder.dimensions());
     let vectors_created = embed_and_write_hermes_turn_vectors(
         db,
         embedder,
         &turn_ids,
-        &vector_fingerprint,
         context.config,
         context.runtime_writer_lease,
         Some(&embed_heartbeat),
@@ -1535,7 +1530,6 @@ async fn embed_and_write_hermes_turn_vectors<E: Embedder + ?Sized>(
     db: &AsyncDb,
     embedder: &E,
     turn_ids: &[String],
-    fingerprint: &str,
     config: &crate::core::config::Config,
     runtime_writer_lease: Option<&RuntimeWriterLease>,
     heartbeat: Option<&HeartbeatCallback>,
@@ -1574,7 +1568,7 @@ async fn embed_and_write_hermes_turn_vectors<E: Embedder + ?Sized>(
             continue;
         }
 
-        let mut vector_rows = Vec::<(String, i64, Vec<u8>)>::new();
+        let mut vector_rows = Vec::<(String, i64, Vec<u8>, String, i64)>::new();
         for (turn_id, content) in candidates {
             let chunks = crate::ingest::chunk::chunk_text_token_aware(
                 &content,
@@ -1584,10 +1578,16 @@ async fn embed_and_write_hermes_turn_vectors<E: Embedder + ?Sized>(
             );
             for (chunk_index, chunk) in chunks.iter().enumerate() {
                 let vector = embed_text_with_heartbeat(embedder, chunk, heartbeat).await?;
+                let dim = i64::try_from(vector.len()).unwrap_or(i64::MAX);
+                let fingerprint = config
+                    .embed
+                    .current_vector_embedder_fingerprint(vector.len());
                 vector_rows.push((
                     turn_id.clone(),
                     chunk_index as i64,
                     serialize_f32_vector(&vector),
+                    fingerprint,
+                    dim,
                 ));
             }
         }
@@ -1595,8 +1595,6 @@ async fn embed_and_write_hermes_turn_vectors<E: Embedder + ?Sized>(
             continue;
         }
 
-        let fingerprint = fingerprint.to_string();
-        let dim = i64::try_from(embedder.dimensions()).unwrap_or(i64::MAX);
         let runtime_writer_lease = runtime_writer_lease.cloned();
         let rows_written = db
             .run_write_anyhow(move |db| {
@@ -1609,7 +1607,7 @@ async fn embed_and_write_hermes_turn_vectors<E: Embedder + ?Sized>(
                 conn.execute_batch("BEGIN IMMEDIATE")?;
                 let write = (|| -> rusqlite::Result<usize> {
                     let mut rows_written = 0usize;
-                    for (turn_id, chunk_index, blob) in &vector_rows {
+                    for (turn_id, chunk_index, blob, fingerprint, dim) in &vector_rows {
                         rows_written += conn.execute(
                             "INSERT INTO conversation_turn_vectors \
                              (turn_id, chunk_index, vector, embedder_fingerprint, dim, index_version) \
@@ -1619,7 +1617,7 @@ async fn embed_and_write_hermes_turn_vectors<E: Embedder + ?Sized>(
                                 turn_id,
                                 chunk_index,
                                 blob,
-                                &fingerprint,
+                                fingerprint,
                                 dim,
                                 crate::core::db::CURRENT_VECTOR_INDEX_VERSION,
                             ],
@@ -3031,7 +3029,9 @@ pub(crate) fn llm_worker_claim_enabled(config: &crate::core::config::Config) -> 
 
 struct DaemonEmbedder {
     name: String,
-    runtime: Mutex<DaemonEmbedderRuntime>,
+    config: crate::core::config::Config,
+    runtime_init_lock: tokio::sync::Mutex<()>,
+    runtime: Mutex<Option<DaemonEmbedderRuntime>>,
     status_path: Option<PathBuf>,
 }
 
@@ -3267,16 +3267,23 @@ impl DaemonEmbedder {
         config: &crate::core::config::Config,
         mempal_home: &Path,
     ) -> crate::embed::Result<Self> {
-        let generation = crate::core::config::ConfigHandle::current_embed_generation();
-        let runtime = DaemonEmbedderRuntime::from_config(config, generation).await?;
-        let name = runtime.primary.name().to_string();
+        config
+            .validate_daemon_embedder_mode()
+            .map_err(|error| crate::embed::EmbedError::InvalidConfiguration(error.to_string()))?;
+        let daemon_config = config.daemon_embedder_config();
+        let name = daemon_config
+            .embed
+            .effective_model_summary()
+            .unwrap_or_else(|| daemon_config.embed.backend.clone());
         let status_path = Some(crate::daemon_status::embedder_status_path(mempal_home));
         let embedder = Self {
             name,
-            runtime: Mutex::new(runtime),
+            config: config.clone(),
+            runtime_init_lock: tokio::sync::Mutex::new(()),
+            runtime: Mutex::new(None),
             status_path,
         };
-        embedder.write_loaded_status(config, "daemon-hook-worker");
+        embedder.write_unloaded_status(config, "daemon-hook-worker");
         Ok(embedder)
     }
 
@@ -3286,19 +3293,30 @@ impl DaemonEmbedder {
             return Ok(snapshot);
         }
 
-        let config = crate::core::config::ConfigHandle::current();
+        let _init_guard = self.runtime_init_lock.lock().await;
+        if let Some(snapshot) = self.snapshot_if_generation(generation) {
+            return Ok(snapshot);
+        }
+
+        let config = self.active_config();
         let replacement = DaemonEmbedderRuntime::from_config(config.as_ref(), generation).await?;
         let mut guard = self
             .runtime
             .lock()
             .expect("daemon embedder runtime mutex poisoned");
-        let status = if guard.generation != generation {
-            *guard = replacement;
+        let status = if guard
+            .as_ref()
+            .is_none_or(|runtime| runtime.generation != generation)
+        {
+            *guard = Some(replacement);
+            let runtime = guard
+                .as_ref()
+                .expect("daemon embedder runtime was just loaded");
             Some(
                 crate::daemon_status::DaemonEmbedderRuntimeStatus::loaded_from_config(
                     config.as_ref(),
-                    guard.primary.dimensions(),
-                    guard
+                    runtime.primary.dimensions(),
+                    runtime
                         .fallback
                         .as_ref()
                         .map(|fallback| fallback.name().to_string()),
@@ -3308,7 +3326,10 @@ impl DaemonEmbedder {
         } else {
             None
         };
-        let snapshot = guard.snapshot();
+        let snapshot = guard
+            .as_ref()
+            .expect("daemon embedder runtime must be loaded")
+            .snapshot();
         drop(guard);
         if let (Some(status_path), Some(status)) = (&self.status_path, status) {
             write_daemon_embedder_status_path(status_path, &status);
@@ -3321,7 +3342,10 @@ impl DaemonEmbedder {
             .runtime
             .lock()
             .expect("daemon embedder runtime mutex poisoned");
-        (guard.generation == generation).then(|| guard.snapshot())
+        guard
+            .as_ref()
+            .filter(|runtime| runtime.generation == generation)
+            .map(DaemonEmbedderRuntime::snapshot)
     }
 
     #[cfg(test)]
@@ -3334,28 +3358,30 @@ impl DaemonEmbedder {
         };
         Self {
             name,
-            runtime: Mutex::new(runtime),
+            config: crate::core::config::Config::default(),
+            runtime_init_lock: tokio::sync::Mutex::new(()),
+            runtime: Mutex::new(Some(runtime)),
             status_path: None,
         }
     }
 
-    fn write_loaded_status(&self, config: &crate::core::config::Config, source: &str) {
+    fn active_config(&self) -> std::sync::Arc<crate::core::config::Config> {
+        let current = crate::core::config::ConfigHandle::current();
+        if current.db_path == self.config.db_path
+            && !daemon_config_is_default_snapshot(current.as_ref())
+        {
+            current
+        } else {
+            std::sync::Arc::new(self.config.clone())
+        }
+    }
+
+    fn write_unloaded_status(&self, config: &crate::core::config::Config, source: &str) {
         let Some(status_path) = &self.status_path else {
             return;
         };
-        let guard = self
-            .runtime
-            .lock()
-            .expect("daemon embedder runtime mutex poisoned");
-        let status = crate::daemon_status::DaemonEmbedderRuntimeStatus::loaded_from_config(
-            config,
-            guard.primary.dimensions(),
-            guard
-                .fallback
-                .as_ref()
-                .map(|fallback| fallback.name().to_string()),
-            source,
-        );
+        let status =
+            crate::daemon_status::DaemonEmbedderRuntimeStatus::unloaded_from_config(config, source);
         write_daemon_embedder_status_path(status_path, &status);
     }
 }
@@ -3389,11 +3415,18 @@ impl Embedder for DaemonEmbedder {
     }
 
     fn dimensions(&self) -> usize {
-        self.runtime
+        if let Some(runtime) = self
+            .runtime
             .lock()
             .expect("daemon embedder runtime mutex poisoned")
-            .primary
-            .dimensions()
+            .as_ref()
+        {
+            return runtime.primary.dimensions();
+        }
+        self.active_config()
+            .daemon_embedder_config()
+            .embed
+            .resolved_openai_dim()
     }
 
     fn name(&self) -> &str {
@@ -3426,6 +3459,16 @@ impl DaemonEmbedderRuntime {
             primary: Arc::clone(&self.primary),
             fallback: self.fallback.as_ref().map(Arc::clone),
         }
+    }
+}
+
+fn daemon_config_is_default_snapshot(config: &crate::core::config::Config) -> bool {
+    match (
+        config.effective_hash(),
+        crate::core::config::Config::default().effective_hash(),
+    ) {
+        (Ok(current), Ok(default)) => current == default,
+        _ => false,
     }
 }
 
@@ -3474,6 +3517,9 @@ mod tests {
     use std::pin::Pin;
     use tokio::sync::Notify;
 
+    #[cfg(not(feature = "model2vec"))]
+    use crate::core::config::DaemonEmbedderMode;
+
     use super::{
         ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext,
         EndpointRecoveryConfigProvider, EndpointRecoveryRequeuePlan, EndpointRecoveryRequeueState,
@@ -3482,6 +3528,88 @@ mod tests {
         request_shutdown, reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick,
         wing_from_cwd,
     };
+
+    #[tokio::test]
+    async fn daemon_embedder_from_config_defers_explicit_model2vec_construction() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = Config {
+            db_path: tmp.path().join("palace.db").display().to_string(),
+            ..Config::default()
+        };
+        config.embed.backend = "model2vec".to_string();
+        config.embed.model = Some("explicit-model2vec-not-loaded-at-startup".to_string());
+
+        let _embedder = DaemonEmbedder::from_config(&config, tmp.path())
+            .await
+            .expect("daemon startup must not construct explicit model2vec");
+
+        let status = crate::daemon_status::read_embedder_status(tmp.path())
+            .expect("read daemon embedder status")
+            .expect("daemon embedder status should be written");
+        assert_eq!(status.backend, "model2vec");
+        assert!(
+            !status.cache_loaded,
+            "daemon startup/status path must not load the configured embedder"
+        );
+        assert_eq!(status.dimensions, None);
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "model2vec"))]
+    async fn daemon_embedder_from_config_rejects_small_local_without_model2vec_feature() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = Config {
+            db_path: tmp.path().join("palace.db").display().to_string(),
+            ..Config::default()
+        };
+        config.daemon.embedder_mode = DaemonEmbedderMode::SmallLocal;
+
+        let error = match DaemonEmbedder::from_config(&config, tmp.path()).await {
+            Ok(_) => {
+                panic!("small_local must fail before daemon embedder startup without model2vec")
+            }
+            Err(error) => error,
+        };
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("requires building mempal with the `model2vec` Cargo feature"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_embedder_marks_cache_loaded_only_after_first_embed() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = Config {
+            db_path: tmp.path().join("palace.db").display().to_string(),
+            ..Config::default()
+        };
+        config.embed.backend = "stub".to_string();
+        config.embed.openai_compat.dim = Some(7);
+
+        let embedder = DaemonEmbedder::from_config(&config, tmp.path())
+            .await
+            .expect("daemon startup should defer stub construction too");
+        let initial_status = crate::daemon_status::read_embedder_status(tmp.path())
+            .expect("read initial daemon embedder status")
+            .expect("initial daemon embedder status should be written");
+        assert!(!initial_status.cache_loaded);
+
+        let vectors = embedder
+            .embed(&["lazy daemon embedder"])
+            .await
+            .expect("embed");
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].len(), 7);
+
+        let loaded_status = crate::daemon_status::read_embedder_status(tmp.path())
+            .expect("read loaded daemon embedder status")
+            .expect("loaded daemon embedder status should be written");
+        assert!(loaded_status.cache_loaded);
+        assert_eq!(loaded_status.backend, "stub");
+        assert_eq!(loaded_status.dimensions, Some(7));
+    }
 
     struct ShutdownResetGuard;
 

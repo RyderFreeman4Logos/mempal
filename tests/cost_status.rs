@@ -29,7 +29,7 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn cost_status_missing_config_reports_default_local() {
+fn cost_status_missing_config_reports_missing_embedding_endpoint() {
     let home = TempDir::new().expect("temp home");
 
     let output = run_mempal(&home, &["cost", "status"]);
@@ -42,7 +42,8 @@ fn cost_status_missing_config_reports_default_local() {
     );
     let stdout = stdout(&output);
     assert!(stdout.contains("embedding:"));
-    assert!(stdout.contains("status: default_local"));
+    assert!(stdout.contains("status: misconfigured"));
+    assert!(stdout.contains("openai_compat endpoint is missing"));
     assert!(stdout.contains("llm:"));
     assert!(stdout.contains("rerank:"));
     assert!(stdout.contains("status: disabled"));

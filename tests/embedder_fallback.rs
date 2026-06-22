@@ -1,4 +1,4 @@
-#![cfg(feature = "integration")]
+#![cfg(all(feature = "integration", feature = "model2vec"))]
 
 use std::fs;
 use std::sync::{Arc, OnceLock};

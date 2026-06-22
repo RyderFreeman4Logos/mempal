@@ -91,7 +91,7 @@ fn config(db_path: &Path, project_id: Option<&str>) -> String {
 db_path = "{}"
 
 [embed]
-backend = "model2vec"
+backend = "stub"
 {}
 "#,
         db_path.display(),
