@@ -11,7 +11,7 @@ use common::harness::embed_mock::start as start_embed_mock;
 use mempal::core::config::{Config, ConfigHandle};
 use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
-use mempal::core::types::Triple;
+use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType, Triple};
 use mempal::core::utils::build_triple_id;
 use mempal::mcp::{IngestOperationState, IngestRequest, MempalMcpServer};
 use rmcp::handler::server::wrapper::Parameters;
@@ -235,6 +235,100 @@ fn print_lines(output: &Output) -> (String, String) {
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+fn cleanup_ids_from_ingest_json(json: &Value) -> Vec<String> {
+    let cleanup_key = if json.get("cleanup_drawer_ids").is_some() {
+        "cleanup_drawer_ids"
+    } else {
+        "created_drawer_ids"
+    };
+    let ids = json[cleanup_key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned);
+    ids.into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn cleanup_ids_from_operation_stdout(stdout: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for line in stdout.lines() {
+        if let Some(raw_ids) = line
+            .strip_prefix("cleanup_drawer_ids=")
+            .or_else(|| line.strip_prefix("created_drawer_ids="))
+        {
+            ids.extend(
+                raw_ids
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned),
+            );
+        }
+    }
+    ids.into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn delete_cleanup_ids(home: &Path, drawer_ids: &[String]) {
+    assert!(!drawer_ids.is_empty(), "cleanup ids must not be empty");
+    for drawer_id in drawer_ids {
+        let delete_output = run_cli(home, &["delete", drawer_id]);
+        assert!(
+            delete_output.status.success(),
+            "delete {drawer_id} must succeed, stdout={}, stderr={}",
+            String::from_utf8_lossy(&delete_output.stdout),
+            String::from_utf8_lossy(&delete_output.stderr)
+        );
+    }
+}
+
+fn insert_existing_drawer(home: &Path, drawer_id: &str) {
+    let db = Database::open(&home.join(".mempal/palace.db")).expect("open db");
+    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: drawer_id.to_string(),
+        content: "existing novelty target".to_string(),
+        wing: "smoke".to_string(),
+        room: Some("manual".to_string()),
+        source_file: Some("test://existing-novelty-target".to_string()),
+        source_type: SourceType::AgentInference,
+        added_at: "1713000000".to_string(),
+        chunk_index: Some(0),
+        importance: 0,
+    });
+    db.insert_drawer(&drawer).expect("insert existing drawer");
+}
+
+#[test]
+fn test_operation_stdout_cleanup_ids_ignore_informational_drawer_id_without_created_list() {
+    let home = setup_home();
+    let existing_id = "existing-novelty-target";
+    insert_existing_drawer(home.path(), existing_id);
+    let stdout = format!(
+        "operation_id=op\nstate=completed\ntimed_out=false\ndrawer_id={existing_id}\ndrawer_ids={existing_id}\nchunk_count=1\ndropped=false\ntimings={{}}\n"
+    );
+
+    let cleanup_ids = cleanup_ids_from_operation_stdout(&stdout);
+    assert!(
+        cleanup_ids.is_empty(),
+        "lone operation drawer_id must not be treated as cleanup-safe: {stdout}"
+    );
+
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    assert!(
+        db.get_drawer(existing_id)
+            .expect("get existing novelty target")
+            .is_some(),
+        "existing novelty target must remain present when no cleanup ids are exposed"
+    );
 }
 
 fn novelty_audit_count(home: &Path) -> i64 {
@@ -523,6 +617,95 @@ async fn test_ingest_wait_json_matches_non_wait_json_output() {
         drawer_ids.iter().all(|value| value.as_str().is_some()),
         "drawer_ids must contain strings"
     );
+    assert_eq!(
+        wait_json["cleanup_drawer_ids"], wait_json["created_drawer_ids"],
+        "cleanup_drawer_ids must mirror newly-created cleanup authority"
+    );
+    assert_eq!(
+        wait_json["drawer_id"], drawer_ids[0],
+        "top-level drawer_id must identify the same fresh drawer reported in created_drawer_ids"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ingest_wait_json_cleanup_ids_delete_exact_drawers() {
+    let home = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    let _config = write_config(home.path(), &format!("http://{addr}/v1"));
+    let wait_timeout = u64::MAX.to_string();
+    let payload = br#"{"content":"cli wait cleanup-safe drawer id content"}"#;
+
+    let output = run_cli_with_stdin(
+        home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--wing",
+            "smoke",
+            "--room",
+            "manual",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            wait_timeout.as_str(),
+            "--json",
+        ],
+        payload,
+    );
+    handle.shutdown().await;
+
+    assert!(
+        output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("parse wait JSON");
+    assert_eq!(stdout["stats"]["chunks"], 1);
+    assert_eq!(
+        stdout["cleanup_drawer_ids"], stdout["created_drawer_ids"],
+        "cleanup_drawer_ids must match newly-created drawer ids"
+    );
+    let cleanup_ids = cleanup_ids_from_ingest_json(&stdout);
+    assert_eq!(
+        cleanup_ids.len(),
+        1,
+        "stdin wait JSON must expose exactly one cleanup-safe drawer id: {stdout}"
+    );
+    assert_eq!(
+        stdout["drawer_id"].as_str(),
+        cleanup_ids.first().map(String::as_str)
+    );
+    assert_eq!(
+        stdout["drawer_ids"][0].as_str(),
+        cleanup_ids.first().map(String::as_str)
+    );
+
+    let db_path = home.path().join(".mempal/palace.db");
+    let db = Database::open(&db_path).expect("open db");
+    for drawer_id in &cleanup_ids {
+        assert!(
+            db.get_drawer(drawer_id)
+                .expect("get cleanup drawer")
+                .is_some(),
+            "reported cleanup id must identify an active drawer"
+        );
+    }
+    drop(db);
+
+    delete_cleanup_ids(home.path(), &cleanup_ids);
+
+    let db = Database::open(&db_path).expect("reopen db");
+    for drawer_id in &cleanup_ids {
+        assert!(
+            db.get_drawer(drawer_id)
+                .expect("get deleted cleanup drawer")
+                .is_none(),
+            "reported cleanup id must be deletable by mempal delete"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -606,6 +789,10 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
             .contains_key("drawer_ids"),
         "timed-out receipt must not report drawer ids: {stdout}"
     );
+    assert!(
+        cleanup_ids_from_ingest_json(&stdout).is_empty(),
+        "timed-out receipt must not expose cleanup ids: {stdout}"
+    );
     let queued = PendingMessageStore::new_without_reclaim(&db_path)
         .operation_status(&operation_id)
         .expect("load queued status")
@@ -638,6 +825,11 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
         recovery_stderr.contains("waiting for operation_id="),
         "{recovery_stderr}"
     );
+    let recovery_ids = cleanup_ids_from_operation_stdout(&recovery_stdout);
+    assert!(
+        !recovery_ids.is_empty(),
+        "operation wait recovery must expose exact cleanup ids: {recovery_stdout}"
+    );
     let completed = PendingMessageStore::new_without_reclaim(&db_path)
         .operation_status(&operation_id)
         .expect("load completed status")
@@ -645,6 +837,18 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
     assert_eq!(completed.op_state, "completed");
     let db = Database::open(&db_path).expect("open db");
     assert_eq!(db.drawer_count().expect("drawer count"), 1);
+    drop(db);
+
+    delete_cleanup_ids(home.path(), &recovery_ids);
+    let db = Database::open(&db_path).expect("reopen db");
+    for drawer_id in &recovery_ids {
+        assert!(
+            db.get_drawer(drawer_id)
+                .expect("get deleted recovery drawer")
+                .is_none(),
+            "operation wait cleanup id must be deletable"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -961,6 +1165,21 @@ async fn test_ingest_wait_exact_duplicate_matches_non_wait_plain_and_json_output
                     .len(),
                 1
             );
+            assert!(
+                direct_json["cleanup_drawer_ids"]
+                    .as_array()
+                    .expect("cleanup drawer ids")
+                    .is_empty(),
+                "exact duplicates must not expose cleanup ids for pre-existing drawers"
+            );
+            assert!(
+                direct_json["created_drawer_ids"]
+                    .as_array()
+                    .expect("created drawer ids")
+                    .is_empty(),
+                "exact duplicates must not expose created ids for pre-existing drawers"
+            );
+            assert_eq!(direct_json["drawer_id"], "");
         } else {
             assert_eq!(
                 String::from_utf8_lossy(&wait_output.stdout),

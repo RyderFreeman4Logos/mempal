@@ -5009,6 +5009,9 @@ impl ResolvedStdinIngest {
 
 #[derive(Serialize)]
 struct StdinIngestJsonOutput<'a> {
+    drawer_id: &'a str,
+    created_drawer_ids: &'a [String],
+    cleanup_drawer_ids: &'a [String],
     drawer_ids: &'a [String],
     stats: StdinIngestStatsJson,
 }
@@ -5369,7 +5372,12 @@ async fn ingest_stdin_command(
             Some(IngestOperationState::Completed) => {
                 append_ingest_stdin_audit_log(db, &resolved.wing, false, &record, &wait_stats)
                     .context("failed to append ingest audit log")?;
-                print_stdin_ingest_output(options.json, false, &wait_stats)?;
+                print_stdin_ingest_output_with_created_ids(
+                    options.json,
+                    false,
+                    &wait_stats,
+                    &response.created_drawer_ids,
+                )?;
                 return Ok(());
             }
             Some(IngestOperationState::Rejected) => {
@@ -5564,10 +5572,16 @@ async fn ingest_stdin_command(
     }
 
     stats.chunks = 1;
+    let created_drawer_ids = vec![drawer_id.clone()];
     stats.drawer_ids.push(drawer_id);
     append_ingest_stdin_audit_log(db, &resolved.wing, options.dry_run, &record, &stats)
         .context("failed to append ingest audit log")?;
-    print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
+    print_stdin_ingest_output_with_created_ids(
+        options.json,
+        options.dry_run,
+        &stats,
+        &created_drawer_ids,
+    )?;
     Ok(())
 }
 
@@ -5591,9 +5605,23 @@ fn normalize_stdin_content(content: &str, no_strip_noise: bool) -> Result<String
 }
 
 fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> Result<()> {
+    print_stdin_ingest_output_with_created_ids(json, dry_run, stats, &[])
+}
+
+fn print_stdin_ingest_output_with_created_ids(
+    json: bool,
+    dry_run: bool,
+    stats: &IngestStats,
+    created_drawer_ids: &[String],
+) -> Result<()> {
     print_fact_check_warnings(&stats.fact_check_warnings);
     if json {
+        let cleanup_drawer_ids =
+            cleanup_drawer_ids_for_stdin_output_from_created(dry_run, stats, created_drawer_ids);
         let output = StdinIngestJsonOutput {
+            drawer_id: cleanup_drawer_ids.first().map(String::as_str).unwrap_or(""),
+            created_drawer_ids: cleanup_drawer_ids,
+            cleanup_drawer_ids,
             drawer_ids: &stats.drawer_ids,
             stats: StdinIngestStatsJson {
                 dry_run,
@@ -5625,6 +5653,18 @@ fn print_stdin_ingest_output(json: bool, dry_run: bool, stats: &IngestStats) -> 
     Ok(())
 }
 
+fn cleanup_drawer_ids_for_stdin_output_from_created<'a>(
+    dry_run: bool,
+    stats: &IngestStats,
+    created_drawer_ids: &'a [String],
+) -> &'a [String] {
+    if dry_run || stats.chunks == 0 || stats.skipped > 0 || stats.dropped_by_gate > 0 {
+        &[]
+    } else {
+        created_drawer_ids
+    }
+}
+
 fn print_fact_check_warnings(warnings: &[String]) {
     for warning in warnings {
         eprintln!("{warning}");
@@ -5644,6 +5684,16 @@ fn print_operation_response(response: &IngestResponse) -> Result<()> {
     println!("drawer_id={}", response.drawer_id);
     if !response.drawer_ids.is_empty() {
         println!("drawer_ids={}", response.drawer_ids.join(","));
+    }
+    if !response.created_drawer_ids.is_empty() {
+        println!(
+            "created_drawer_ids={}",
+            response.created_drawer_ids.join(",")
+        );
+        println!(
+            "cleanup_drawer_ids={}",
+            response.created_drawer_ids.join(",")
+        );
     }
     println!("chunk_count={}", response.chunk_count);
     println!("dropped={}", response.dropped);
@@ -5674,11 +5724,7 @@ fn ingest_stdin_wait_stats_from_response(response: &IngestResponse) -> IngestSta
         dropped_by_gate: if response.dropped { 1 } else { 0 },
         ..IngestStats::default()
     };
-    stats.drawer_ids = if response.drawer_ids.is_empty() && !response.drawer_id.is_empty() {
-        vec![response.drawer_id.clone()]
-    } else {
-        response.drawer_ids.clone()
-    };
+    stats.drawer_ids = response.drawer_ids.clone();
     stats.fact_check_warnings = response.fact_check_warnings.clone();
     stats.superseded_drawer_id = response.superseded_drawer_id.clone();
     stats

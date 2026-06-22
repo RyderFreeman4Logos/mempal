@@ -1857,15 +1857,19 @@ pub struct IngestResponse {
     /// `mempal_operation_status`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub timed_out: bool,
-    /// ID of the first (or only) drawer created once the ingest completes.
-    /// Empty while queued/running and for rejection/failure outcomes without
-    /// stored drawers.
+    /// Primary outcome drawer for status display. This can identify an existing
+    /// dedup, novelty drop, or merge target, so callers must not use it as a
+    /// deletion or cleanup authority.
     pub drawer_id: String,
-    /// All drawer IDs created by this ingest (one per chunk). When content
-    /// fits in a single chunk, this contains exactly one element matching
-    /// `drawer_id`. Empty while queued/running and when `dropped` is true.
+    /// Operation-scoped drawer IDs reported by the ingest result (one per
+    /// inserted, deduplicated, dropped, or merged target chunk). These are
+    /// informational affected/result IDs and are not deletion authority.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drawer_ids: Vec<String>,
+    /// Drawer IDs newly created by this operation. This is the only response
+    /// list safe for cleanup/delete automation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_drawer_ids: Vec<String>,
     /// Number of chunks the content was split into. Always >= 1 for
     /// successful ingests; 0 while queued/running, during dry-run previews,
     /// and when `dropped` is true.

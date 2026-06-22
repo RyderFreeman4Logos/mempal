@@ -591,6 +591,11 @@ async fn test_high_similarity_candidate_dropped() {
 
     assert_eq!(drawer_count(&env.db_path), 2);
     assert_eq!(response.drawer_id, "existing-proj-a");
+    assert_eq!(response.drawer_ids, Vec::<String>::new());
+    assert!(
+        response.created_drawer_ids.is_empty(),
+        "novelty drop must not expose cleanup-safe IDs for existing target"
+    );
     assert_eq!(
         response.novelty_action,
         Some(mempal::ingest::novelty::NoveltyAction::Drop)
@@ -634,6 +639,10 @@ async fn test_low_similarity_candidate_inserted() {
         response.novelty_action,
         Some(mempal::ingest::novelty::NoveltyAction::Insert)
     );
+    assert_eq!(
+        response.created_drawer_ids,
+        vec![response.drawer_id.clone()]
+    );
     assert_eq!(response.near_drawer_id, None);
     let audits = novelty_rows(&env.db_path);
     assert_eq!(audits.len(), 1);
@@ -663,6 +672,11 @@ async fn test_medium_similarity_candidate_merged() {
 
     assert_eq!(drawer_count(&env.db_path), 1);
     assert_eq!(response.drawer_id, "existing");
+    assert_eq!(response.drawer_ids, Vec::<String>::new());
+    assert!(
+        response.created_drawer_ids.is_empty(),
+        "novelty merge must not expose cleanup-safe IDs for existing target"
+    );
     assert_eq!(
         response.novelty_action,
         Some(mempal::ingest::novelty::NoveltyAction::Merge)

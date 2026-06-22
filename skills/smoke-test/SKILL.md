@@ -212,13 +212,13 @@ Use only when write-path validation is required.
    marker="mempal-smoke-$(date +%s)-$RANDOM"
    ```
 
-2. Ingest via stdin with a smoke scope, capture the response, and extract only top-level ID fields returned by ingest:
+2. Ingest via stdin with a smoke scope, capture the response, and extract only cleanup-safe IDs explicitly returned by ingest:
 
    ```bash
    ingest_json="$(mktemp)"
    smoke_ids="$(mktemp)"
    printf '{"content":"%s reversible smoke drawer; safe to delete","wing":"smoke","room":"manual"}\n' "$marker" \
-     | mempal ingest --stdin --format json --wing smoke --room manual --no-gate --wait --wait-timeout-secs 60 --json \
+     | mempal ingest --stdin --wing smoke --room manual --no-gate --wait --wait-timeout-secs 60 --json \
      > "$ingest_json"
    python3 - "$ingest_json" > "$smoke_ids" <<'PY'
 import json
@@ -227,23 +227,20 @@ from pathlib import Path
 
 obj = json.loads(Path(sys.argv[1]).read_text() or "{}")
 ids = []
-drawer_id = obj.get("drawer_id")
-if isinstance(drawer_id, str) and drawer_id:
-    ids.append(drawer_id)
-drawer_ids = obj.get("drawer_ids")
+drawer_ids = obj.get("created_drawer_ids")
 if isinstance(drawer_ids, list):
     ids.extend(item for item in drawer_ids if isinstance(item, str) and item)
 for item in dict.fromkeys(ids):
     print(item)
 PY
    if [ ! -s "$smoke_ids" ]; then
-     echo "cleanup requires manual operator action: ingest response did not expose exact drawer ID(s)" >&2
+     echo "cleanup requires manual operator action: ingest response did not expose created_drawer_ids; do not delete drawer_id, drawer_ids, or cleanup_drawer_ids" >&2
      rm -f "$ingest_json" "$smoke_ids"
      exit 1
    fi
    ```
 
-   Do not print the ingest response or smoke IDs unless cleanup fails.
+   Do not print the ingest response or smoke IDs unless cleanup fails. `created_drawer_ids` is the cleanup authority; `cleanup_drawer_ids` is only a human-readable alias when it mirrors the created list. `drawer_id` and `drawer_ids` are informational because they may name pre-existing, deduplicated, dropped, or merge-target drawers. If the ingest response timed out and returned only an `operation_id`, inspect it with `mempal operation wait <operation_id> --timeout-secs <seconds>` or `mempal operation status <operation_id>`, then delete only IDs from `created_drawer_ids`; if that list is empty, fail closed.
 
 3. Optionally search for the marker as a verification probe only. Keep output in a temporary file, print aggregate counts only, never print search result bodies/snippets, and never use search result IDs for deletion:
 
