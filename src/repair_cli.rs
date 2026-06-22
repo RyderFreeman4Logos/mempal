@@ -30,11 +30,7 @@ pub enum RepairCommands {
     },
 }
 
-pub fn run_command(config: &Config, command: RepairCommands) -> Result<()> {
-    let db_path = mempal::core::utils::expand_home(&config.db_path);
-    let db = Database::open(std::path::Path::new(&db_path))
-        .with_context(|| format!("failed to open database at {}", db_path.display()))?;
-
+pub fn run_command(db: &Database, config: &Config, command: RepairCommands) -> Result<()> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -42,9 +38,9 @@ pub fn run_command(config: &Config, command: RepairCommands) -> Result<()> {
 
     match command {
         RepairCommands::List { wing, since, json } => {
-            cmd_list(&db, config, wing.as_deref(), since, json, now_ms)
+            cmd_list(db, config, wing.as_deref(), since, json, now_ms)
         }
-        RepairCommands::Show { topic_sig, json } => cmd_show(&db, config, &topic_sig, json, now_ms),
+        RepairCommands::Show { topic_sig, json } => cmd_show(db, config, &topic_sig, json, now_ms),
     }
 }
 
