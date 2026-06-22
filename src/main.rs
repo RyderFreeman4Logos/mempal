@@ -3493,6 +3493,8 @@ fn run() -> Result<()> {
         open_read_only_database(&db_path).context("failed to open read-only database")
     } else if command_retries_stdin_ingest_startup_open(&cli.command) {
         open_stdin_ingest_database_with_retry(&db_path)
+    } else if let Some(operation) = cli_content_write_operation(&cli.command) {
+        open_cli_content_write_database_with_retry(&db_path, operation)
     } else if command_retries_historical_rejudge_startup_open(&cli.command) {
         open_historical_rejudge_startup_database_with_retry(|| {
             Database::open(&db_path).context("failed to open database")
@@ -4214,6 +4216,15 @@ fn command_retries_stdin_ingest_startup_open(command: &Commands) -> bool {
     matches!(command, Commands::Ingest { stdin: true, .. })
 }
 
+fn cli_content_write_operation(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Delete { .. } => Some("delete"),
+        Commands::Pin { .. } => Some("pin"),
+        Commands::Unpin { .. } => Some("unpin"),
+        _ => None,
+    }
+}
+
 const STDIN_INGEST_SQLITE_LOCK_MAX_RETRIES: usize = 40;
 const STDIN_INGEST_STARTUP_BUSY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(100);
@@ -4245,6 +4256,40 @@ fn open_stdin_ingest_database_with_retry(path: &Path) -> Result<Database> {
     unreachable!("stdin ingest startup database retry loop returns on terminal attempt")
 }
 
+fn open_cli_content_write_database_with_retry(
+    path: &Path,
+    operation: &'static str,
+) -> Result<Database> {
+    for attempt in 0..=STDIN_INGEST_SQLITE_LOCK_MAX_RETRIES {
+        match Database::open_with_busy_timeout(path, STDIN_INGEST_STARTUP_BUSY_TIMEOUT)
+            .context("failed to open database")
+        {
+            Ok(db) => {
+                db.conn()
+                    .busy_timeout(STDIN_INGEST_SQLITE_BUSY_TIMEOUT)
+                    .with_context(|| {
+                        format!("failed to set SQLite busy timeout for {operation}")
+                    })?;
+                return Ok(db);
+            }
+            Err(error)
+                if is_transient_sqlite_lock_error(&error)
+                    && attempt < STDIN_INGEST_SQLITE_LOCK_MAX_RETRIES =>
+            {
+                std::thread::sleep(historical_rejudge_sqlite_lock_retry_delay(attempt));
+            }
+            Err(error) if is_transient_sqlite_lock_error(&error) => {
+                bail!(
+                    "{}",
+                    cli_content_write_sqlite_lock_diagnostic(path, operation)
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("CLI content write startup database retry loop returns on terminal attempt")
+}
+
 fn stdin_ingest_sqlite_lock_diagnostic(path: &Path, error: &anyhow::Error) -> String {
     let holders = mempal::process_diagnostics::inspect_db_holders(path);
     format!(
@@ -4254,6 +4299,34 @@ fn stdin_ingest_sqlite_lock_diagnostic(path: &Path, error: &anyhow::Error) -> St
         mempal::process_diagnostics::format_db_holder_role_summary(&holders),
         mempal::process_diagnostics::sqlite_lock_safe_next_step(&holders)
     )
+}
+
+fn cli_content_write_sqlite_lock_diagnostic(path: &Path, operation: &str) -> String {
+    let holders = mempal::process_diagnostics::inspect_db_holders(path);
+    format!(
+        "write_blocked=true reason=sqlite_locked operation={operation}\n\
+         holder_summary={}\n\
+         safe_next_step={}",
+        mempal::process_diagnostics::format_db_holder_role_summary(&holders),
+        mempal::process_diagnostics::sqlite_lock_safe_next_step(&holders)
+    )
+}
+
+fn classify_cli_content_write_result<T>(
+    db: &Database,
+    operation: &'static str,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if is_transient_sqlite_lock_error(&error) => {
+            bail!(
+                "{}",
+                cli_content_write_sqlite_lock_diagnostic(db.path(), operation)
+            )
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn open_historical_rejudge_startup_database_with_retry(
@@ -10669,14 +10742,20 @@ fn print_promotion_policy(policy: &[PromotionPolicyEntry]) {
 }
 
 fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
-    let _writer_lease = acquire_cli_content_writer_lease(db, "delete")?;
     let drawer = db
         .get_drawer(drawer_id)
         .context("failed to look up drawer")?;
     match drawer {
         Some(drawer) => {
-            db.soft_delete_drawer(drawer_id)
-                .context("failed to soft-delete drawer")?;
+            let deleted = classify_cli_content_write_result(
+                db,
+                "delete",
+                db.soft_delete_drawer(drawer_id)
+                    .context("failed to soft-delete drawer"),
+            )?;
+            if !deleted {
+                bail!("drawer not found: {drawer_id}");
+            }
             append_audit_entry(db, "delete", &serde_json::json!({ "drawer_id": drawer_id }))
                 .context("failed to append audit log")?;
             println!("soft-deleted {}", drawer_id);
@@ -10686,7 +10765,6 @@ fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
                 drawer.room.as_deref().unwrap_or("default"),
                 drawer.source_file.as_deref().unwrap_or("(none)")
             );
-            println!("  content: {}", truncate_for_summary(&drawer.content, 100));
             println!("  (use `mempal purge` to permanently remove)");
         }
         None => bail!("drawer not found: {drawer_id}"),
@@ -10695,11 +10773,12 @@ fn delete_command(db: &Database, drawer_id: &str) -> Result<()> {
 }
 
 fn pin_command(db: &Database, drawer_id: &str) -> Result<()> {
-    let _writer_lease = acquire_cli_content_writer_lease(db, "pin")?;
-    if !db
-        .pin_drawer(drawer_id, None)
-        .context("failed to pin drawer")?
-    {
+    if !classify_cli_content_write_result(
+        db,
+        "pin",
+        db.pin_drawer(drawer_id, None)
+            .context("failed to pin drawer"),
+    )? {
         bail!("drawer not found: {drawer_id}");
     }
     append_audit_entry(db, "pin", &serde_json::json!({ "drawer_id": drawer_id }))
@@ -10709,11 +10788,11 @@ fn pin_command(db: &Database, drawer_id: &str) -> Result<()> {
 }
 
 fn unpin_command(db: &Database, drawer_id: &str) -> Result<()> {
-    let _writer_lease = acquire_cli_content_writer_lease(db, "unpin")?;
-    if !db
-        .unpin_drawer(drawer_id)
-        .context("failed to unpin drawer")?
-    {
+    if !classify_cli_content_write_result(
+        db,
+        "unpin",
+        db.unpin_drawer(drawer_id).context("failed to unpin drawer"),
+    )? {
         bail!("drawer not found: {drawer_id}");
     }
     append_audit_entry(db, "unpin", &serde_json::json!({ "drawer_id": drawer_id }))
@@ -21832,6 +21911,22 @@ mod ingest_wait_timeout_error_tests {
         assert!(diagnostic.contains("holder summary:"));
         assert!(diagnostic.contains("safe next step:"));
         assert!(!diagnostic.contains("stdin transient sqlite lock fixture"));
+    }
+
+    #[test]
+    fn cli_content_write_lock_diagnostic_is_structured_without_payload() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let _db = Database::open(&db_path).expect("open db");
+
+        let diagnostic = cli_content_write_sqlite_lock_diagnostic(&db_path, "delete");
+
+        assert!(diagnostic.contains("write_blocked=true"));
+        assert!(diagnostic.contains("reason=sqlite_locked"));
+        assert!(diagnostic.contains("operation=delete"));
+        assert!(diagnostic.contains("holder_summary="));
+        assert!(diagnostic.contains("safe_next_step="));
+        assert!(!diagnostic.contains("cleanup authority smoke safe to delete unique body"));
     }
 }
 

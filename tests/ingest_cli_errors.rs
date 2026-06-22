@@ -803,7 +803,7 @@ fn test_stdin_non_wait_ingest_respects_existing_writer_lease() {
 }
 
 #[test]
-fn test_cli_delete_respects_existing_writer_lease() {
+fn test_cli_delete_succeeds_under_existing_writer_lease() {
     let tmp = setup_home();
     insert_drawer(tmp.path(), "cli-delete-lease-target");
     let _lease = hold_daemon_writer_lease(tmp.path());
@@ -811,18 +811,19 @@ fn test_cli_delete_respects_existing_writer_lease() {
     let output = run_delete(tmp.path(), "cli-delete-lease-target");
 
     assert!(
-        !output.status.success(),
-        "delete must fail under writer lease"
+        output.status.success(),
+        "delete should succeed under daemon writer lease: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
-        "{stderr}"
+        !stdout.contains("cli delete lease fixture"),
+        "delete stdout must not expose raw drawer content"
     );
     let db = mempal::core::db::Database::open(&tmp.path().join(".mempal").join("palace.db"))
         .expect("open db");
     assert!(
-        db.drawer_exists("cli-delete-lease-target")
+        !db.drawer_exists("cli-delete-lease-target")
             .expect("drawer exists")
     );
 }
