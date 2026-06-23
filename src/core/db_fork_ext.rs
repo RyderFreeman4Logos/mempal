@@ -1057,9 +1057,14 @@ fn apply_fork_ext_migrations_with_hook_and_target(
     hook: Option<&dyn MigrationHook>,
     target_version: Option<u32>,
 ) -> rusqlite::Result<()> {
+    let current_version = read_fork_ext_version(conn)?;
+    let effective_target = target_version.unwrap_or(CURRENT_FORK_EXT_VERSION);
+    if current_version >= effective_target {
+        return Ok(());
+    }
+
     conn.execute_batch(FORK_EXT_META_DDL)?;
 
-    let current_version = read_fork_ext_version(conn)?;
     for migration in fork_ext_migrations().iter().filter(|migration| {
         migration.version > current_version
             && target_version.is_none_or(|target| migration.version <= target)
@@ -1090,4 +1095,37 @@ fn apply_fork_ext_migrations_with_hook_and_target(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn up_to_date_migration_check_does_not_take_schema_write_lock() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("fork-ext.db");
+        let setup = Connection::open(&db_path).expect("open setup db");
+        setup
+            .execute_batch(FORK_EXT_META_DDL)
+            .expect("create fork ext meta");
+        set_fork_ext_version(&setup, CURRENT_FORK_EXT_VERSION).expect("set current version");
+        drop(setup);
+
+        let reader = Connection::open(&db_path).expect("open reader");
+        reader
+            .execute_batch(
+                "BEGIN; SELECT value FROM fork_ext_meta WHERE key = 'fork_ext_version';",
+            )
+            .expect("hold read transaction");
+
+        let writer = Connection::open(&db_path).expect("open writer");
+        writer
+            .busy_timeout(Duration::ZERO)
+            .expect("set zero busy timeout");
+        apply_fork_ext_migrations(&writer).expect("up-to-date check must be read-only");
+
+        reader.execute_batch("ROLLBACK").expect("release reader");
+    }
 }

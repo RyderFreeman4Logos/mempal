@@ -96,6 +96,58 @@ fn runtime_boot_id() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "linux")]
+fn runtime_writer_process_is_live_holder(pid: u32, boot_id: Option<&str>) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Some(expected_boot_id) = boot_id else {
+        return false;
+    };
+    if runtime_boot_id().as_deref() != Some(expected_boot_id) {
+        return false;
+    }
+
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    if !proc_dir.exists() {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+
+    let exe_matches = fs::read_link(proc_dir.join("exe"))
+        .ok()
+        .as_deref()
+        .is_some_and(runtime_writer_path_is_mempal_holder);
+    if exe_matches {
+        return true;
+    }
+
+    fs::read(proc_dir.join("cmdline"))
+        .ok()
+        .and_then(|cmdline| {
+            cmdline
+                .split(|byte| *byte == 0)
+                .find(|part| !part.is_empty())
+                .map(|part| PathBuf::from(String::from_utf8_lossy(part).into_owned()))
+        })
+        .as_deref()
+        .is_some_and(runtime_writer_path_is_mempal_holder)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runtime_writer_process_is_live_holder(_pid: u32, _boot_id: Option<&str>) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_writer_path_is_mempal_holder(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "mempal")
+}
+
 fn truncate_preview(content: &str, max_chars: usize) -> String {
     let mut chars = content.chars();
     let mut preview = chars.by_ref().take(max_chars).collect::<String>();
@@ -5088,6 +5140,43 @@ impl Database {
         ttl_secs: u64,
         metadata_json: Option<&str>,
     ) -> Result<Option<RuntimeWriterLease>, DbError> {
+        self.runtime_writer_lease_acquire_with_cleanup_policy(
+            name,
+            owner,
+            mode,
+            ttl_secs,
+            metadata_json,
+            false,
+        )
+    }
+
+    pub fn runtime_writer_lease_acquire_preserving_live_holders(
+        &self,
+        name: &str,
+        owner: &str,
+        mode: &str,
+        ttl_secs: u64,
+        metadata_json: Option<&str>,
+    ) -> Result<Option<RuntimeWriterLease>, DbError> {
+        self.runtime_writer_lease_acquire_with_cleanup_policy(
+            name,
+            owner,
+            mode,
+            ttl_secs,
+            metadata_json,
+            true,
+        )
+    }
+
+    fn runtime_writer_lease_acquire_with_cleanup_policy(
+        &self,
+        name: &str,
+        owner: &str,
+        mode: &str,
+        ttl_secs: u64,
+        metadata_json: Option<&str>,
+        preserve_live_holders: bool,
+    ) -> Result<Option<RuntimeWriterLease>, DbError> {
         let mut session_id = String::new();
         let mut acquired = false;
         let mut acquired_at = String::new();
@@ -5095,7 +5184,7 @@ impl Database {
         let pid = std::process::id();
         let boot_id = runtime_boot_id();
         self.with_immediate_tx(|| {
-            self.runtime_writer_lease_cleanup_expired_tx()?;
+            self.runtime_writer_lease_cleanup_expired_tx(preserve_live_holders)?;
             session_id = runtime_writer_session_id(name, owner);
             let now_time = SystemTime::now();
             acquired_at = crate::cowork::peek::format_rfc3339(now_time);
@@ -5150,7 +5239,7 @@ impl Database {
     ) -> Result<bool, DbError> {
         let mut renewed = false;
         self.with_immediate_tx(|| {
-            self.runtime_writer_lease_cleanup_expired_tx()?;
+            self.runtime_writer_lease_cleanup_expired_tx(true)?;
             let now = crate::cowork::peek::format_rfc3339(SystemTime::now());
             let expires_at = crate::cowork::peek::format_rfc3339(
                 SystemTime::now() + std::time::Duration::from_secs(ttl_secs),
@@ -5173,7 +5262,7 @@ impl Database {
         owner: &str,
         session_id: &str,
     ) -> Result<bool, DbError> {
-        self.runtime_writer_lease_cleanup_expired()?;
+        self.with_immediate_tx(|| self.runtime_writer_lease_cleanup_expired_tx(true))?;
         let active = self.conn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM runtime_writer_leases
@@ -5205,7 +5294,7 @@ impl Database {
         &self,
         name: Option<&str>,
     ) -> Result<Vec<RuntimeWriterLease>, DbError> {
-        self.runtime_writer_lease_cleanup_expired()?;
+        self.with_immediate_tx(|| self.runtime_writer_lease_cleanup_expired_tx(true))?;
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
@@ -5252,16 +5341,47 @@ impl Database {
     }
 
     pub fn runtime_writer_lease_cleanup_expired(&self) -> Result<usize, DbError> {
-        self.with_immediate_tx(|| self.runtime_writer_lease_cleanup_expired_tx())
+        self.with_immediate_tx(|| self.runtime_writer_lease_cleanup_expired_tx(false))
     }
 
-    fn runtime_writer_lease_cleanup_expired_tx(&self) -> Result<usize, DbError> {
-        let rows = self.conn.execute(
-            "DELETE FROM runtime_writer_leases \
-             WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-            [],
-        )?;
-        Ok(rows)
+    fn runtime_writer_lease_cleanup_expired_tx(
+        &self,
+        preserve_live_holders: bool,
+    ) -> Result<usize, DbError> {
+        let expired = {
+            let mut stmt = self.conn.prepare(
+                "SELECT name, owner, pid, boot_id, session_id \
+                 FROM runtime_writer_leases \
+                 WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut removed = 0;
+        for (name, owner, pid, boot_id, session_id) in expired {
+            let preserve_live_holder = preserve_live_holders
+                && u32::try_from(pid).ok().is_some_and(|pid| {
+                    runtime_writer_process_is_live_holder(pid, boot_id.as_deref())
+                });
+            if preserve_live_holder {
+                continue;
+            }
+            removed += self.conn.execute(
+                "DELETE FROM runtime_writer_leases \
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
+                params![name, owner, session_id],
+            )?;
+        }
+        Ok(removed)
     }
 }
 
@@ -7353,6 +7473,93 @@ mod tests {
     fn insert_test_drawer(db: &Database, id: &str, content: &str, project_id: Option<&str>) {
         db.insert_drawer_with_project(&test_drawer(id, content), project_id)
             .expect("insert drawer");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_writer_status_preserves_and_renews_expired_live_current_process_lease() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::open(&db_path).expect("open db");
+        let lease = db
+            .runtime_writer_lease_acquire("sqlite-writer", "live-daemon", "daemon", 1, None)
+            .expect("acquire runtime writer lease")
+            .expect("runtime writer lease");
+
+        db.conn()
+            .execute(
+                "UPDATE runtime_writer_leases \
+                 SET expires_at = '1970-01-01T00:00:00Z', heartbeat_at = '1970-01-01T00:00:00Z' \
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
+                params![&lease.name, &lease.owner, &lease.session_id],
+            )
+            .expect("force lease expiry");
+
+        assert!(
+            db.runtime_writer_lease_is_active(&lease.name, &lease.owner, &lease.session_id)
+                .expect("check runtime writer lease active"),
+            "current live process must retain its runtime writer lease after delayed heartbeat"
+        );
+        let expired_status = db
+            .runtime_writer_lease_status(Some(&lease.name))
+            .expect("load runtime writer lease status");
+        assert_eq!(expired_status.len(), 1);
+        assert_eq!(expired_status[0].remaining_secs, 0);
+        assert!(
+            db.runtime_writer_lease_renew(&lease.name, &lease.owner, &lease.session_id, 300)
+                .expect("renew delayed live runtime writer lease"),
+            "delayed live runtime writer lease must be renewable after expiry"
+        );
+        let renewed_status = db
+            .runtime_writer_lease_status(Some(&lease.name))
+            .expect("load renewed runtime writer lease status");
+        assert_eq!(renewed_status.len(), 1);
+        assert!(renewed_status[0].remaining_secs > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_writer_cooperative_acquire_preserves_expired_live_current_process_lease() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::open(&db_path).expect("open db");
+        let lease = db
+            .runtime_writer_lease_acquire("sqlite-writer", "live-daemon", "daemon", 1, None)
+            .expect("acquire runtime writer lease")
+            .expect("runtime writer lease");
+
+        db.conn()
+            .execute(
+                "UPDATE runtime_writer_leases \
+                 SET expires_at = '1970-01-01T00:00:00Z', heartbeat_at = '1970-01-01T00:00:00Z' \
+                 WHERE name = ?1 AND owner = ?2 AND session_id = ?3",
+                params![&lease.name, &lease.owner, &lease.session_id],
+            )
+            .expect("force lease expiry");
+
+        assert!(
+            db.runtime_writer_lease_acquire_preserving_live_holders(
+                "sqlite-writer",
+                "cooperative-mcp-worker",
+                "mcp-ingest-worker",
+                300,
+                None,
+            )
+            .expect("cooperative acquire")
+            .is_none(),
+            "cooperative writer must not steal an expired lease from a live holder"
+        );
+        let preserved = db
+            .runtime_writer_lease_status(Some("sqlite-writer"))
+            .expect("load preserved runtime writer lease status");
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].owner, "live-daemon");
+
+        let maintenance = db
+            .runtime_writer_lease_acquire("sqlite-writer", "maintenance", "maintenance", 300, None)
+            .expect("maintenance acquire")
+            .expect("maintenance can reclaim expired lease");
+        assert_eq!(maintenance.owner, "maintenance");
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::ingest::gating::{
     evaluate_tier1, tier2_enabled,
 };
 use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
+use crate::llm::LlmError;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use serde_json::{Value, json};
@@ -53,6 +54,7 @@ const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 pub const DAEMON_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 const DAEMON_HOOK_WORKER_LIMIT: usize = 4;
 const ENDPOINT_RECOVERY_REQUEUE_INTERVAL: Duration = Duration::from_secs(30);
+const AUTOMATIC_HOOK_LLM_GATE_MAX_SECS: u64 = 30;
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const DAEMON_WRITER_LEASE_TTL_SECS: u64 = 120;
 const DAEMON_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
@@ -1808,11 +1810,37 @@ fn queue_failure_disposition(error: &anyhow::Error) -> QueueFailureDisposition {
                 QueueFailureDisposition::Terminal
             };
         }
+        if cause
+            .downcast_ref::<AutomaticHookLlmGateTerminalFailure>()
+            .is_some()
+        {
+            return QueueFailureDisposition::Terminal;
+        }
+        if let Some(llm_error) = cause.downcast_ref::<LlmError>() {
+            if !llm_error.is_retryable() {
+                return QueueFailureDisposition::Terminal;
+            }
+            return llm_error
+                .retry_after()
+                .map(queue_retry_delay_from_duration)
+                .unwrap_or(QueueFailureDisposition::Retryable);
+        }
         if cause.downcast_ref::<serde_json::Error>().is_some() {
             return QueueFailureDisposition::Terminal;
         }
     }
     QueueFailureDisposition::Retryable
+}
+
+fn queue_retry_delay_from_duration(duration: Duration) -> QueueFailureDisposition {
+    let delay_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+    QueueFailureDisposition::RetryableAfter { delay_ms }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("automatic hook LLM gate terminal failure: {reason}")]
+struct AutomaticHookLlmGateTerminalFailure {
+    reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2680,7 +2708,17 @@ async fn judge_automatic_content_llm_gate(
             .as_ref()
             .and_then(|judge| judge.system_prompt.clone()),
     };
-    let outcome = match gate.judge(config, &task, heartbeat).await {
+    let deadline = automatic_hook_llm_gate_deadline(config);
+    let outcome = match tokio::time::timeout(deadline, gate.judge(config, &task, heartbeat)).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            return Err(anyhow::Error::new(AutomaticHookLlmGateTerminalFailure {
+                reason: format!("timed out after {}s", deadline.as_secs()),
+            })
+            .context("automatic hook LLM gate failed before durable insert"));
+        }
+    };
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             let error_chain = format!("{error:#}");
@@ -2690,6 +2728,15 @@ async fn judge_automatic_content_llm_gate(
         }
     };
     Ok(gating_decision_from_llm_outcome(outcome))
+}
+
+fn automatic_hook_llm_gate_deadline(config: &crate::core::config::Config) -> Duration {
+    Duration::from_secs(
+        config
+            .llm
+            .request_timeout_secs
+            .clamp(1, AUTOMATIC_HOOK_LLM_GATE_MAX_SECS),
+    )
 }
 
 fn gating_decision_from_llm_outcome(
@@ -3513,6 +3560,7 @@ mod tests {
     use crate::embed::{EmbedError, Embedder};
     use crate::endpoint_health::{EndpointHealthSnapshot, ProbeStatus};
     use crate::hook::{CapturedHookEnvelope, HookEvent};
+    use crate::llm::LlmError;
     use arc_swap::ArcSwap;
     use std::pin::Pin;
     use tokio::sync::Notify;
@@ -3521,13 +3569,58 @@ mod tests {
     use crate::core::config::DaemonEmbedderMode;
 
     use super::{
-        ClaimNextSource, ClaimPollResult, DaemonEmbedder, DaemonIngestContext,
-        EndpointRecoveryConfigProvider, EndpointRecoveryRequeuePlan, EndpointRecoveryRequeueState,
-        HookWorkerState, build_drawer_records, compile_classifier_from_embedder,
-        llm_worker_claim_enabled, poll_claim_next, process_claimed_message_with_embedder,
+        AutomaticHookLlmGateTerminalFailure, ClaimNextSource, ClaimPollResult, DaemonEmbedder,
+        DaemonIngestContext, EndpointRecoveryConfigProvider, EndpointRecoveryRequeuePlan,
+        EndpointRecoveryRequeueState, HookWorkerState, automatic_hook_llm_gate_deadline,
+        build_drawer_records, compile_classifier_from_embedder, llm_worker_claim_enabled,
+        poll_claim_next, process_claimed_message_with_embedder, queue_failure_disposition,
         request_shutdown, reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick,
         wing_from_cwd,
     };
+
+    #[test]
+    fn queue_failure_disposition_dead_letters_non_retryable_llm_errors() {
+        let decode_error = anyhow::Error::new(LlmError::DecodeResponse(
+            "error decoding response body".to_string(),
+        ))
+        .context("LLM gating request failed")
+        .context("automatic hook LLM gate failed before durable insert");
+
+        assert_eq!(
+            queue_failure_disposition(&decode_error),
+            QueueFailureDisposition::Terminal
+        );
+    }
+
+    #[test]
+    fn queue_failure_disposition_dead_letters_automatic_hook_llm_gate_deadline() {
+        let timeout_error = anyhow::Error::new(AutomaticHookLlmGateTerminalFailure {
+            reason: "timed out after 30s".to_string(),
+        })
+        .context("automatic hook LLM gate failed before durable insert");
+
+        assert_eq!(
+            queue_failure_disposition(&timeout_error),
+            QueueFailureDisposition::Terminal
+        );
+    }
+
+    #[test]
+    fn automatic_hook_llm_gate_deadline_caps_global_llm_timeout() {
+        let mut config = Config::default();
+
+        config.llm.request_timeout_secs = 3_000;
+        assert_eq!(
+            automatic_hook_llm_gate_deadline(&config),
+            Duration::from_secs(30)
+        );
+
+        config.llm.request_timeout_secs = 2;
+        assert_eq!(
+            automatic_hook_llm_gate_deadline(&config),
+            Duration::from_secs(2)
+        );
+    }
 
     #[tokio::test]
     async fn daemon_embedder_from_config_defers_explicit_model2vec_construction() {

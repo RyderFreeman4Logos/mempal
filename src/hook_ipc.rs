@@ -127,6 +127,14 @@ pub(crate) fn enqueue_with_default_timeout(
     mempal_home: &Path,
     request: HookIpcEnqueueRequest,
 ) -> HookIpcClientOutcome {
+    enqueue_with_timeout(mempal_home, request, HOOK_IPC_TIMEOUT)
+}
+
+pub(crate) fn enqueue_with_timeout(
+    mempal_home: &Path,
+    request: HookIpcEnqueueRequest,
+    timeout: Duration,
+) -> HookIpcClientOutcome {
     let path = socket_path(mempal_home);
     if !path.exists() {
         return HookIpcClientOutcome::Fallback(HookIpcFallbackReason::SocketUnavailable);
@@ -146,7 +154,7 @@ pub(crate) fn enqueue_with_default_timeout(
     };
 
     runtime.block_on(async move {
-        match tokio::time::timeout(HOOK_IPC_TIMEOUT, enqueue_once(&path, request)).await {
+        match tokio::time::timeout(timeout, enqueue_once(&path, request)).await {
             Ok(outcome) => outcome,
             Err(_) => HookIpcClientOutcome::Fallback(HookIpcFallbackReason::Timeout),
         }

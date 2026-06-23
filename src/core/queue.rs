@@ -14,7 +14,7 @@ use super::db::ensure_wal_journal_mode;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STARTUP_RECLAIM_STALE_SECS: i64 = 60;
 const COMPLETION_METRICS_WINDOW_MINS: u64 = 10;
-const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const LAST_ERROR_MAX_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error)]
@@ -1725,5 +1725,13 @@ mod tests {
 
         assert_eq!(status.op_state, "queued");
         assert_eq!(stats.pending, 1);
+    }
+
+    #[test]
+    fn queue_busy_timeout_covers_smoke_read_write_contention() {
+        assert!(
+            DEFAULT_BUSY_TIMEOUT >= Duration::from_secs(30),
+            "async ingest queue writes must outwait transient full-smoke read/write contention"
+        );
     }
 }

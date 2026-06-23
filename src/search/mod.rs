@@ -28,6 +28,7 @@ pub mod route;
 pub mod tiered;
 
 const EXACT_VECTOR_CANDIDATE_LIMIT: i64 = 4_096;
+const ACCESS_WRITEBACK_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub type Result<T> = std::result::Result<T, SearchError>;
 
@@ -894,18 +895,23 @@ pub fn dispatch_access_update(db_path: std::path::PathBuf, drawer_ids: Vec<Strin
     let floor = config.importance.floor;
     let boost_cap = config.importance.boost_cap;
     crate::observability::record_access_writeback_scheduled();
-    tokio::task::spawn_blocking(move || match crate::core::db::Database::open(&db_path) {
-        Ok(db) => {
-            if let Err(err) =
-                db.update_access_fields_batch(&drawer_ids, now_ms, decay_rate, floor, boost_cap)
-            {
-                crate::observability::record_access_writeback_failed();
-                tracing::warn!(error = %err, "access field update failed");
+    tokio::task::spawn_blocking(move || {
+        match crate::core::db::Database::open_with_busy_timeout(
+            &db_path,
+            ACCESS_WRITEBACK_BUSY_TIMEOUT,
+        ) {
+            Ok(db) => {
+                if let Err(err) =
+                    db.update_access_fields_batch(&drawer_ids, now_ms, decay_rate, floor, boost_cap)
+                {
+                    crate::observability::record_access_writeback_failed();
+                    tracing::warn!(error = %err, "access field update failed");
+                }
             }
-        }
-        Err(err) => {
-            crate::observability::record_access_writeback_failed();
-            tracing::warn!(error = %err, "failed to open db for access update");
+            Err(err) => {
+                crate::observability::record_access_writeback_failed();
+                tracing::warn!(error = %err, "failed to open db for access update");
+            }
         }
     });
 }
@@ -2202,6 +2208,39 @@ mod tests {
         assert_eq!(counters.access_writeback_scheduled_total, 1);
         assert_eq!(counters.access_writeback_skipped_total, 0);
         assert_eq!(counters.access_writeback_failed_total, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_access_update_skips_when_sqlite_writer_is_busy() {
+        let lock = crate::core::config::global_config_test_lock();
+        let _guard = lock.lock().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let db = Database::open(&db_path).expect("db");
+        let drawer = make_drawer("access-busy", "alpha", "decision");
+        db.insert_drawer(&drawer).expect("insert drawer");
+        configure_record_access(tmp.path(), &db_path, true).await;
+
+        let lock_holder = rusqlite::Connection::open(&db_path).expect("open lock holder");
+        lock_holder
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("set fail-fast lock holder timeout");
+        lock_holder
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold writer lock");
+
+        dispatch_access_update(db_path.clone(), vec![drawer.id.clone()]);
+        tokio::time::sleep(ACCESS_WRITEBACK_BUSY_TIMEOUT + std::time::Duration::from_millis(150))
+            .await;
+        lock_holder
+            .execute_batch("COMMIT;")
+            .expect("release writer lock");
+
+        assert_eq!(
+            access_count(&db_path, &drawer.id),
+            0,
+            "access writeback is best-effort and must not wait behind ingest-critical writes"
+        );
     }
 
     #[test]
