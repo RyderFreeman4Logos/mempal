@@ -2281,6 +2281,18 @@ enum IngestWaitWorkerMode {
     Scoped,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngestQueueProcessor {
+    Daemon,
+    Local,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IngestQueueAdmission {
+    operation_id: String,
+    processor: IngestQueueProcessor,
+}
+
 #[doc(hidden)]
 pub struct IngestDrainWorkerHandle {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -4876,9 +4888,6 @@ impl MempalMcpServer {
             .await?;
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
-        if matches!(worker_mode, IngestWaitWorkerMode::Background) {
-            self.spawn_ingest_drain_worker();
-        }
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
             return Ok(Json(IngestResponse {
@@ -4957,8 +4966,8 @@ impl MempalMcpServer {
         let payload = serde_json::to_string(&prepared).map_err(|error| {
             ErrorData::internal_error(format!("failed to serialize ingest request: {error}"), None)
         })?;
-        let operation_id = match self.enqueue_ingest_operation(payload).await {
-            Ok(operation_id) => operation_id,
+        let queue_admission = match self.enqueue_ingest_operation(payload).await {
+            Ok(admission) => admission,
             Err(error) => {
                 if let Some(error) = maybe_database_write_refused_error(
                     &self.db_path,
@@ -4973,9 +4982,14 @@ impl MempalMcpServer {
                 ));
             }
         };
+        if matches!(worker_mode, IngestWaitWorkerMode::Background)
+            && matches!(queue_admission.processor, IngestQueueProcessor::Local)
+        {
+            self.spawn_ingest_drain_worker();
+        }
 
         let queued_response = IngestResponse {
-            operation_id: Some(operation_id),
+            operation_id: Some(queue_admission.operation_id.clone()),
             accepted_at: Some(crate::core::utils::iso_timestamp()),
             state: Some(IngestOperationState::Queued),
             timed_out: false,
@@ -5002,7 +5016,9 @@ impl MempalMcpServer {
                 .operation_id
                 .as_deref()
                 .expect("queued receipt must include operation id");
-            let wait_result = if wait_timeout_secs > 0 {
+            let wait_result = if wait_timeout_secs > 0
+                && matches!(queue_admission.processor, IngestQueueProcessor::Local)
+            {
                 self.wait_for_operation_status_with_scoped_worker(
                     operation_id,
                     Duration::from_secs(wait_timeout_secs),
@@ -5048,17 +5064,28 @@ impl MempalMcpServer {
         Ok(Json(queued_response))
     }
 
-    async fn enqueue_ingest_operation(&self, payload: String) -> anyhow::Result<String> {
+    async fn enqueue_ingest_operation(
+        &self,
+        payload: String,
+    ) -> anyhow::Result<IngestQueueAdmission> {
         let idempotency_key = mcp_ingest_idempotency_key(&payload);
         if let Some(operation_id) = self
             .try_enqueue_ingest_operation_via_daemon(payload.clone(), idempotency_key.clone())
             .await?
         {
-            return Ok(operation_id);
+            return Ok(IngestQueueAdmission {
+                operation_id,
+                processor: IngestQueueProcessor::Daemon,
+            });
         }
 
-        self.enqueue_ingest_operation_locally_with_retry(payload, idempotency_key)
-            .await
+        let operation_id = self
+            .enqueue_ingest_operation_locally_with_retry(payload, idempotency_key)
+            .await?;
+        Ok(IngestQueueAdmission {
+            operation_id,
+            processor: IngestQueueProcessor::Local,
+        })
     }
 
     async fn enqueue_ingest_operation_locally_with_retry(
@@ -10433,6 +10460,63 @@ quality_policy = "llm_required_for_keep"
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_mcp_ingest_wait_polls_daemon_admitted_operation() {
+        let (tempdir, db_path, server) = setup_server();
+        let daemon_lease = hold_daemon_writer_lease(&db_path);
+        let (listener, _socket_guard) =
+            crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
+        let daemon_db_path = db_path.clone();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
+            let request = crate::hook_ipc::read_enqueue_request(&mut stream)
+                .await
+                .expect("read daemon IPC request");
+            let operation_id = PendingMessageStore::new_without_reclaim(&daemon_db_path)
+                .enqueue_idempotent_with_key(
+                    &request.kind,
+                    &request.payload,
+                    &request.idempotency_key,
+                )
+                .expect("persist daemon-admitted operation");
+            crate::hook_ipc::write_enqueue_response(
+                &mut stream,
+                &crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
+            )
+            .await
+            .expect("write daemon IPC response");
+            (request, operation_id)
+        });
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "daemon-admitted MCP wait must not self-claim".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("busy".to_string()),
+                wait: Some(true),
+                wait_timeout_secs: Some(1),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("daemon-admitted wait should poll without local claim")
+            .0;
+
+        let (request, operation_id) = daemon.await.expect("daemon IPC task");
+        let response_operation_id = response.operation_id.as_deref().expect("operation id");
+        assert_eq!(request.kind, INGEST_ASYNC_KIND);
+        assert_eq!(response_operation_id, operation_id);
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.timed_out);
+        assert!(response.created_drawer_ids.is_empty());
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(response_operation_id)
+            .expect("query queued operation")
+            .expect("queued operation");
+        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+        release_test_ingest_writer_lease(&db_path, &daemon_lease);
+    }
+
     #[tokio::test]
     async fn test_mcp_ingest_enqueue_waits_for_transient_sqlite_lock() {
         let (_tempdir, db_path, server) = setup_server();
@@ -10503,6 +10587,43 @@ quality_policy = "llm_required_for_keep"
             "unexpected operation state after self-held lock retry: {}",
             record.op_state
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_enqueue_skips_wal_reset_under_existing_reader() {
+        let (_tempdir, db_path, server) = setup_server();
+        let reader = rusqlite::Connection::open(&db_path).expect("open existing MCP holder");
+        reader
+            .busy_timeout(Duration::from_millis(25))
+            .expect("set reader busy timeout");
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM sqlite_master;")
+            .expect("hold read transaction");
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "existing MCP holder must not block queue admission".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("busy".to_string()),
+                wait: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("ingest admission should not reset WAL under an existing reader")
+            .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(operation_id)
+            .expect("query queued operation")
+            .expect("queued operation");
+        assert!(
+            matches!(record.op_state.as_str(), "queued" | "running" | "completed"),
+            "unexpected operation state after reader-held admission: {}",
+            record.op_state
+        );
+        reader.execute_batch("COMMIT;").expect("release reader");
     }
 
     #[tokio::test]

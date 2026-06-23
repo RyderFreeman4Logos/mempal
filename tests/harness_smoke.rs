@@ -196,6 +196,82 @@ async fn mcp_stdio_ingest_busy_after_status_keeps_transport_alive() -> Result<()
     Ok(())
 }
 
+#[tokio::test]
+async fn mcp_stdio_ingest_succeeds_with_existing_status_holder() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let mempal_home = tmp.path().join(".mempal");
+    fs::create_dir_all(&mempal_home)?;
+    let db_path = mempal_home.join("palace.db");
+    Database::open(&db_path)?;
+
+    let mut holder = McpStdio::start(&db_path, HashMap::new()).await?;
+    holder.initialize().await?;
+    let status = tokio::time::timeout(
+        Duration::from_secs(15),
+        holder.call(
+            "tools/call",
+            serde_json::json!({
+                "name": "mempal_status",
+                "arguments": {},
+            }),
+        ),
+    )
+    .await??;
+    assert!(status["structuredContent"].is_object());
+
+    let mut client = McpStdio::start(&db_path, HashMap::new()).await?;
+    client.initialize().await?;
+    let ingest = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.call(
+            "tools/call",
+            serde_json::json!({
+                "name": "mempal_ingest",
+                "arguments": {
+                    "content": "issue 544 MCP smoke create cleanup-id regression payload",
+                    "wing": "smoke",
+                    "room": "mcp",
+                    "source_type": "agent_inference",
+                    "memory_kind": "evidence",
+                    "domain": "project",
+                    "field": "smoke",
+                    "smoke": true,
+                    "wait": true,
+                    "wait_timeout_secs": 10
+                },
+            }),
+        ),
+    )
+    .await??;
+    let created = ingest["structuredContent"]["created_drawer_ids"]
+        .as_array()
+        .expect("created_drawer_ids array");
+    assert!(
+        !created.is_empty(),
+        "MCP create must return cleanup-safe created_drawer_ids"
+    );
+
+    for drawer_id in created.iter().filter_map(serde_json::Value::as_str) {
+        let deleted = client
+            .call(
+                "tools/call",
+                serde_json::json!({
+                    "name": "mempal_delete",
+                    "arguments": {"drawer_id": drawer_id},
+                }),
+            )
+            .await?;
+        assert_eq!(
+            deleted["structuredContent"]["deleted"].as_bool(),
+            Some(true)
+        );
+    }
+
+    client.shutdown().await?;
+    holder.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn harness_integration_smoke() -> Result<()> {
     let tmp = TempDir::new()?;

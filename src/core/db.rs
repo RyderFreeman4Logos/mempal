@@ -200,6 +200,14 @@ CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object);
 
 static SQLITE_VEC_AUTO_EXTENSION: OnceLock<Result<(), String>> = OnceLock::new();
 
+pub(crate) fn ensure_wal_journal_mode(conn: &Connection) -> rusqlite::Result<()> {
+    let mode = conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum DbError {
     #[error("failed to create database directory for {path}")]
@@ -494,7 +502,7 @@ impl Database {
             conn.pragma_update(None, "query_only", "ON")?;
         }
         if mode.allows_write() {
-            conn.pragma_update(None, "journal_mode", "WAL")?;
+            ensure_wal_journal_mode(&conn)?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             apply_migrations(&conn)?;

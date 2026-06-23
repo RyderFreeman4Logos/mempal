@@ -36,6 +36,7 @@ SUMMARY: dict[str, Any] = {
         ],
     },
 }
+OWNED_MCP_CHILDREN: dict[int, subprocess.Popen[Any]] = {}
 
 PROC_IO_KEYS = ('read_bytes', 'write_bytes', 'cancelled_write_bytes', 'rchar', 'wchar')
 
@@ -464,6 +465,7 @@ class McpClient:
             text=True,
             bufsize=1,
         )
+        OWNED_MCP_CHILDREN[self.proc.pid] = self.proc
         self.proc_io_before = read_proc_io(self.proc.pid)
         self.next_id = 1
 
@@ -556,6 +558,32 @@ class McpClient:
             self.stderr_file.close()
         except Exception:
             pass
+        if self.proc.returncode is not None:
+            OWNED_MCP_CHILDREN.pop(self.proc.pid, None)
+
+
+def wait_owned_mcp_children_reaped(timeout: float = 5.0) -> dict[str, Any]:
+    initial_pids = sorted(OWNED_MCP_CHILDREN)
+    deadline = time.monotonic() + timeout
+    while OWNED_MCP_CHILDREN and time.monotonic() < deadline:
+        for pid, proc in list(OWNED_MCP_CHILDREN.items()):
+            try:
+                proc.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception:
+                OWNED_MCP_CHILDREN.pop(pid, None)
+                continue
+            if proc.returncode is not None:
+                OWNED_MCP_CHILDREN.pop(pid, None)
+        if OWNED_MCP_CHILDREN:
+            time.sleep(0.05)
+    remaining_pids = sorted(OWNED_MCP_CHILDREN)
+    return {
+        'initial_count': len(initial_pids),
+        'remaining_count': len(remaining_pids),
+        'reaped_count': len(initial_pids) - len(remaining_pids),
+    }
 
 
 def mcp_start_initialized() -> McpClient:
@@ -832,6 +860,7 @@ def main() -> int:
     cli_ids = cli_crud()
     mcp_ids = mcp_crud()
 
+    SUMMARY['mcp_owned_children_after_wait'] = wait_owned_mcp_children_reaped()
     SUMMARY['holders_after'] = holder_summary()
     daemon_pid_after = daemon_main_pid()
     daemon_io_after = read_proc_io(daemon_pid_after)

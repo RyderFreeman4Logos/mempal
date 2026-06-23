@@ -9,6 +9,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use super::config::scrub_sensitive_text;
+use super::db::ensure_wal_journal_mode;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STARTUP_RECLAIM_STALE_SECS: i64 = 60;
@@ -1039,7 +1040,7 @@ impl PendingMessageStore {
     ) -> Result<Connection> {
         let conn = Connection::open(&self.db_path)?;
         conn.busy_timeout(busy_timeout.unwrap_or(DEFAULT_BUSY_TIMEOUT))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        ensure_wal_journal_mode(&conn)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(conn)
     }
