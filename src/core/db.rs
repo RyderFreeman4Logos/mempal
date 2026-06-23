@@ -367,6 +367,7 @@ pub struct HistoricalRejudgeCandidate {
 #[derive(Clone, Copy)]
 enum OpenMode {
     ReadOnly,
+    QueryOnly,
     ReadWrite,
 }
 
@@ -448,6 +449,12 @@ impl Database {
         Self::open_with_mode(path, OpenMode::ReadOnly)
     }
 
+    /// Open a non-mutating connection for read paths that must not run startup
+    /// writes such as WAL mode changes or migrations.
+    pub fn open_query_only(path: &Path) -> Result<Self, DbError> {
+        Self::open_with_mode(path, OpenMode::QueryOnly)
+    }
+
     fn open_with_mode(path: &Path, mode: OpenMode) -> Result<Self, DbError> {
         Self::open_with_mode_and_busy_timeout(path, mode, Duration::from_secs(5))
     }
@@ -475,11 +482,17 @@ impl Database {
             OpenMode::ReadOnly => {
                 Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
             }
+            OpenMode::QueryOnly => {
+                Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?
+            }
             OpenMode::ReadWrite => Connection::open(path)?,
         };
         conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB_DEFAULT)?;
         register_math_functions(&conn)?;
+        if matches!(mode, OpenMode::QueryOnly) {
+            conn.pragma_update(None, "query_only", "ON")?;
+        }
         if mode.allows_write() {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -7439,6 +7452,41 @@ mod tests {
 
         assert_eq!(cache_size, SQLITE_CACHE_SIZE_KIB_DEFAULT);
         assert_eq!(mmap_size, 0, "issue #311 must not add multi-GiB mmap");
+    }
+
+    #[test]
+    fn query_only_connection_opens_while_writer_lock_is_held() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("initialize db");
+
+        let lock_holder = Connection::open(&db_path).expect("open lock holder");
+        lock_holder
+            .busy_timeout(Duration::from_millis(25))
+            .expect("set lock holder busy timeout");
+        lock_holder
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+
+        let reader = Database::open_with_mode_and_busy_timeout(
+            &db_path,
+            OpenMode::QueryOnly,
+            Duration::from_millis(25),
+        )
+        .expect("query-only reader opens without startup writes");
+        let query_only: i64 = reader
+            .conn()
+            .query_row("PRAGMA query_only", [], |row| row.get(0))
+            .expect("read query_only pragma");
+
+        assert_eq!(query_only, 1);
+        reader
+            .drawer_count()
+            .expect("query-only reader can read while writer lock is held");
+        reader
+            .conn()
+            .execute("CREATE TABLE query_only_must_not_write(id INTEGER)", [])
+            .expect_err("query-only connection must reject mutations");
     }
 
     fn insert_test_source_drawer_with_vector(

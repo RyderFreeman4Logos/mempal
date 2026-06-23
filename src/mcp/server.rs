@@ -142,7 +142,7 @@ fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool
 }
 
 const MCP_SEARCH_ROUTE_DEADLINE: Duration = Duration::from_secs(5);
-const MCP_SEARCH_DB_DEADLINE: Duration = Duration::from_secs(30);
+pub(super) const MCP_SEARCH_DB_DEADLINE: Duration = Duration::from_secs(30);
 const MCP_SEARCH_STALE_INDEX_DEADLINE: Duration = Duration::from_secs(2);
 const MCP_INGEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
@@ -1204,6 +1204,37 @@ impl MempalMcpServer {
         Database::open(&self.db_path).map_err(|error| {
             ErrorData::internal_error(format!("failed to open database: {error}"), None)
         })
+    }
+
+    pub(super) async fn run_query_only_read_bounded<F, R>(
+        &self,
+        stage: &'static str,
+        deadline: Duration,
+        f: F,
+    ) -> std::result::Result<R, ErrorData>
+    where
+        F: FnOnce(&Database) -> std::result::Result<R, ErrorData> + Send + 'static,
+        R: Send + 'static,
+    {
+        let db_path = self.db_path.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let db = Database::open_query_only(&db_path).map_err(|error| {
+                ErrorData::internal_error(format!("{stage} failed to open database: {error}"), None)
+            })?;
+            f(&db)
+        });
+        match tokio::time::timeout(deadline, read).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(ErrorData::internal_error(
+                format!("{stage} database task failed: {error}"),
+                None,
+            )),
+            Err(_) => Err(mcp_stage_timeout_error(
+                stage,
+                "query-only database read",
+                deadline,
+            )),
+        }
     }
 
     async fn async_db(&self) -> anyhow::Result<AsyncDb> {
@@ -3681,10 +3712,17 @@ impl MempalMcpServer {
             .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
             .await?;
         let budget_chars = request.budget_chars.unwrap_or(4_000);
-        let db = self.open_db()?;
-        let drawers = db
-            .get_pinned_facts(project_id.as_deref(), budget_chars)
-            .map_err(db_error)?;
+        let facts_project_id = project_id.clone();
+        let drawers = self
+            .run_query_only_read_bounded(
+                "mempal_pinned_facts",
+                self.search_db_deadline,
+                move |db| {
+                    db.get_pinned_facts(facts_project_id.as_deref(), budget_chars)
+                        .map_err(db_error)
+                },
+            )
+            .await?;
         let used_chars = drawers
             .iter()
             .map(|drawer| drawer.content.chars().count())
@@ -4160,19 +4198,22 @@ impl MempalMcpServer {
             request.all_projects.unwrap_or(false),
             config.search.strict_project_isolation,
         );
-        let db = self.open_db()?;
-        let details = db
-            .get_drawer_details(&request.drawer_id)
-            .map_err(db_error)?
-            .ok_or_else(|| {
-                ErrorData::resource_not_found(
-                    "drawer not found",
-                    Some(serde_json::json!({
-                        "error": "not_found",
-                        "drawer_id": request.drawer_id,
-                    })),
-                )
-            })?;
+        let drawer_id = request.drawer_id.clone();
+        let details = self
+            .run_query_only_read_bounded("mempal_read_drawer", self.search_db_deadline, move |db| {
+                db.get_drawer_details(&drawer_id)
+                    .map_err(db_error)?
+                    .ok_or_else(|| {
+                        ErrorData::resource_not_found(
+                            "drawer not found",
+                            Some(serde_json::json!({
+                                "error": "not_found",
+                                "drawer_id": drawer_id,
+                            })),
+                        )
+                    })
+            })
+            .await?;
         if !scope.allows_row(details.project_id.as_deref()) {
             return Err(ErrorData::invalid_params(
                 format!(
@@ -4248,10 +4289,14 @@ impl MempalMcpServer {
         } else {
             deduped_ids
         };
-        let db = self.open_db()?;
-        let details = db
-            .get_drawer_details_batch(&requested_ids)
-            .map_err(db_error)?;
+        let details_ids = requested_ids.clone();
+        let details = self
+            .run_query_only_read_bounded(
+                "mempal_read_drawers",
+                self.search_db_deadline,
+                move |db| db.get_drawer_details_batch(&details_ids).map_err(db_error),
+            )
+            .await?;
         let mut drawers = Vec::with_capacity(details.len());
         let mut found_ids = std::collections::HashSet::new();
         for detail in details {
@@ -4344,28 +4389,28 @@ impl MempalMcpServer {
             .next()
             .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
 
-        let db = self.open_db()?;
-        let pack = assemble_context_with_vector(
-            &db,
-            crate::context::ContextRequest {
-                query: request.query,
-                domain,
-                field: request_scope
-                    .field
-                    .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
-                cwd,
-                include_evidence: request.include_evidence.unwrap_or(false),
-                include_cards,
-                max_items,
-                dao_tian_limit,
-                project_id,
-                trigger,
-                context_cfg_override: None,
-                include_distill_suggestions: request.include_distill_suggestions.unwrap_or(true),
-            },
-            &query_vector,
-        )
-        .map_err(context_error)?;
+        let context_request = crate::context::ContextRequest {
+            query: request.query,
+            domain,
+            field: request_scope
+                .field
+                .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
+            cwd,
+            include_evidence: request.include_evidence.unwrap_or(false),
+            include_cards,
+            max_items,
+            dao_tian_limit,
+            project_id,
+            trigger,
+            context_cfg_override: None,
+            include_distill_suggestions: request.include_distill_suggestions.unwrap_or(true),
+        };
+        let pack = self
+            .run_query_only_read_bounded("mempal_context", self.search_db_deadline, move |db| {
+                assemble_context_with_vector(db, context_request, &query_vector)
+                    .map_err(context_error)
+            })
+            .await?;
 
         Ok(Json(ContextResponse::from(pack)))
     }
@@ -6401,12 +6446,15 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<TaxonomyRequest>,
     ) -> std::result::Result<Json<TaxonomyResponse>, ErrorData> {
-        let db = self.open_db()?;
         match request.action.as_str() {
             "list" => {
-                let entries = db
-                    .taxonomy_entries()
-                    .map_err(db_error)?
+                let entries = self
+                    .run_query_only_read_bounded(
+                        "mempal_taxonomy list",
+                        self.search_db_deadline,
+                        |db| db.taxonomy_entries().map_err(db_error),
+                    )
+                    .await?
                     .into_iter()
                     .map(TaxonomyEntryDto::from)
                     .collect();
@@ -6417,6 +6465,7 @@ impl MempalMcpServer {
                 }))
             }
             "edit" => {
+                let db = self.open_db()?;
                 let _writer_lease =
                     self.acquire_content_writer_lease(&db, "mempal_taxonomy edit")?;
                 let wing = request
@@ -6471,13 +6520,12 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<KgRequest>,
     ) -> std::result::Result<Json<KgResponse>, ErrorData> {
-        let block_writes = global_embed_status().should_block_writes();
-        let db = self.open_db()?;
         match request.action.as_str() {
             "add" => {
-                if block_writes {
+                if global_embed_status().should_block_writes() {
                     return Err(degraded_write_error());
                 }
+                let db = self.open_db()?;
                 let _writer_lease = self.acquire_content_writer_lease(&db, "mempal_kg add")?;
                 let subject = request
                     .subject
@@ -6509,14 +6557,24 @@ impl MempalMcpServer {
             }
             "query" => {
                 let active_only = request.active_only.unwrap_or(true);
-                let triples = db
-                    .query_triples(
-                        request.subject.as_deref(),
-                        request.predicate.as_deref(),
-                        request.object.as_deref(),
-                        active_only,
+                let subject = request.subject;
+                let predicate = request.predicate;
+                let object = request.object;
+                let triples = self
+                    .run_query_only_read_bounded(
+                        "mempal_kg query",
+                        self.search_db_deadline,
+                        move |db| {
+                            db.query_triples(
+                                subject.as_deref(),
+                                predicate.as_deref(),
+                                object.as_deref(),
+                                active_only,
+                            )
+                            .map_err(db_error)
+                        },
                     )
-                    .map_err(db_error)?;
+                    .await?;
                 Ok(Json(KgResponse {
                     action: "query".to_string(),
                     triples: triples.iter().map(triple_to_dto).collect(),
@@ -6525,9 +6583,10 @@ impl MempalMcpServer {
                 }))
             }
             "invalidate" => {
-                if block_writes {
+                if global_embed_status().should_block_writes() {
                     return Err(degraded_write_error());
                 }
+                let db = self.open_db()?;
                 let _writer_lease =
                     self.acquire_content_writer_lease(&db, "mempal_kg invalidate")?;
                 let triple_id = request
@@ -6550,16 +6609,27 @@ impl MempalMcpServer {
                 let entity = request.subject.ok_or_else(|| {
                     ErrorData::invalid_params("missing subject for timeline", None)
                 })?;
-                let triples = db.timeline_for_entity(&entity).map_err(db_error)?;
+                let action = format!("timeline for {entity}");
+                let triples = self
+                    .run_query_only_read_bounded(
+                        "mempal_kg timeline",
+                        self.search_db_deadline,
+                        move |db| db.timeline_for_entity(&entity).map_err(db_error),
+                    )
+                    .await?;
                 Ok(Json(KgResponse {
-                    action: format!("timeline for {entity}"),
+                    action,
                     triples: triples.iter().map(triple_to_dto).collect(),
                     stats: None,
                     system_warnings: current_system_warnings(),
                 }))
             }
             "stats" => {
-                let stats = db.triple_stats().map_err(db_error)?;
+                let stats = self
+                    .run_query_only_read_bounded("mempal_kg stats", self.search_db_deadline, |db| {
+                        db.triple_stats().map_err(db_error)
+                    })
+                    .await?;
                 Ok(Json(KgResponse {
                     action: "stats".to_string(),
                     triples: vec![],
@@ -6900,28 +6970,29 @@ impl MempalMcpServer {
             .into_iter()
             .next()
             .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
-        let db = self.open_db()?;
-        let context = assemble_context_with_vector(
-            &db,
-            crate::context::ContextRequest {
-                query: request.query,
-                domain,
-                field: request
-                    .field
-                    .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
-                cwd,
-                include_evidence: true,
-                include_cards: true,
-                max_items,
-                dao_tian_limit: request.dao_tian_limit.unwrap_or(1),
-                project_id: None,
-                trigger: None,
-                context_cfg_override: None,
-                include_distill_suggestions: false,
-            },
-            &query_vector,
-        )
-        .map_err(|error| ErrorData::internal_error(format!("brief failed: {error}"), None))?;
+        let context_request = crate::context::ContextRequest {
+            query: request.query,
+            domain,
+            field: request
+                .field
+                .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
+            cwd,
+            include_evidence: true,
+            include_cards: true,
+            max_items,
+            dao_tian_limit: request.dao_tian_limit.unwrap_or(1),
+            project_id: None,
+            trigger: None,
+            context_cfg_override: None,
+            include_distill_suggestions: false,
+        };
+        let context = self
+            .run_query_only_read_bounded("mempal_brief", self.search_db_deadline, move |db| {
+                assemble_context_with_vector(db, context_request, &query_vector).map_err(|error| {
+                    ErrorData::internal_error(format!("brief failed: {error}"), None)
+                })
+            })
+            .await?;
         let brief = brief_from_context(context);
         Ok(Json(BriefMcpResponse::from(brief)))
     }
@@ -7559,29 +7630,32 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<SkillRequest>,
     ) -> std::result::Result<Json<SkillResponse>, ErrorData> {
-        let db = self.open_db()?;
         let config = ConfigHandle::current();
         let project_id = self
             .resolve_mcp_project_id(request.project_id.as_deref(), &config)
             .await?;
 
-        if !crate::core::skills::skills_table_exists(db.conn()) {
-            return Err(ErrorData::internal_error(
-                "skills table not yet created — run `mempal init` to apply migrations",
-                None,
-            ));
-        }
-
         match request.action.as_str() {
             "list" => {
-                let skills = tokio::task::block_in_place(|| {
-                    crate::core::skills::list_skills(
-                        db.conn(),
-                        request.status.as_deref(),
-                        project_id.as_deref(),
+                let status = request.status;
+                let list_project_id = project_id.clone();
+                let skills = self
+                    .run_query_only_read_bounded(
+                        "mempal_skill list",
+                        self.search_db_deadline,
+                        move |db| {
+                            ensure_mcp_skills_table(db)?;
+                            crate::core::skills::list_skills(
+                                db.conn(),
+                                status.as_deref(),
+                                list_project_id.as_deref(),
+                            )
+                            .map_err(|e| {
+                                ErrorData::internal_error(format!("list_skills failed: {e}"), None)
+                            })
+                        },
                     )
-                })
-                .map_err(|e| ErrorData::internal_error(format!("list_skills failed: {e}"), None))?;
+                    .await?;
 
                 let dtos: Vec<SkillSummaryDto> = skills
                     .iter()
@@ -7606,16 +7680,31 @@ impl MempalMcpServer {
             }
 
             "show" => {
-                let skill_id = request.skill_id.as_deref().ok_or_else(|| {
+                let skill_id = request.skill_id.ok_or_else(|| {
                     ErrorData::invalid_params("skill_id is required for show", None)
                 })?;
-                let skill = tokio::task::block_in_place(|| {
-                    crate::core::skills::get_skill(db.conn(), skill_id)
-                })
-                .map_err(|e| ErrorData::internal_error(format!("get_skill failed: {e}"), None))?
-                .ok_or_else(|| {
-                    ErrorData::invalid_params(format!("skill not found: {skill_id}"), None)
-                })?;
+                let skill = self
+                    .run_query_only_read_bounded(
+                        "mempal_skill show",
+                        self.search_db_deadline,
+                        move |db| {
+                            ensure_mcp_skills_table(db)?;
+                            crate::core::skills::get_skill(db.conn(), &skill_id)
+                                .map_err(|e| {
+                                    ErrorData::internal_error(
+                                        format!("get_skill failed: {e}"),
+                                        None,
+                                    )
+                                })?
+                                .ok_or_else(|| {
+                                    ErrorData::invalid_params(
+                                        format!("skill not found: {skill_id}"),
+                                        None,
+                                    )
+                                })
+                        },
+                    )
+                    .await?;
 
                 Ok(Json(SkillResponse {
                     action: "show".to_string(),
@@ -7627,6 +7716,8 @@ impl MempalMcpServer {
             }
 
             "promote" => {
+                let db = self.open_db()?;
+                ensure_mcp_skills_table(&db)?;
                 let pattern_id = request.pattern_id.as_deref().ok_or_else(|| {
                     ErrorData::invalid_params("pattern_id is required for promote", None)
                 })?;
@@ -7680,6 +7771,8 @@ impl MempalMcpServer {
             }
 
             "adopt" => {
+                let db = self.open_db()?;
+                ensure_mcp_skills_table(&db)?;
                 let skill_id = request.skill_id.as_deref().ok_or_else(|| {
                     ErrorData::invalid_params("skill_id is required for adopt", None)
                 })?;
@@ -7706,6 +7799,8 @@ impl MempalMcpServer {
             }
 
             "reject" => {
+                let db = self.open_db()?;
+                ensure_mcp_skills_table(&db)?;
                 let skill_id = request.skill_id.as_deref().ok_or_else(|| {
                     ErrorData::invalid_params("skill_id is required for reject", None)
                 })?;
@@ -7733,6 +7828,8 @@ impl MempalMcpServer {
             }
 
             "retire" => {
+                let db = self.open_db()?;
+                ensure_mcp_skills_table(&db)?;
                 let skill_id = request.skill_id.as_deref().ok_or_else(|| {
                     ErrorData::invalid_params("skill_id is required for retire", None)
                 })?;
@@ -8598,6 +8695,16 @@ fn skill_to_dto(skill: &crate::core::skills::Skill) -> SkillDto {
         updated_at_unix_ms: skill.updated_at,
         project_id: skill.project_id.clone(),
     }
+}
+
+fn ensure_mcp_skills_table(db: &Database) -> std::result::Result<(), ErrorData> {
+    if crate::core::skills::skills_table_exists(db.conn()) {
+        return Ok(());
+    }
+    Err(ErrorData::internal_error(
+        "skills table not yet created — run `mempal init` to apply migrations",
+        None,
+    ))
 }
 
 fn required_bus_field(
