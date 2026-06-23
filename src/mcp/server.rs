@@ -1489,15 +1489,40 @@ impl MempalMcpServer {
         timeout: Duration,
         poll_interval: Duration,
     ) -> std::result::Result<Option<IngestResponse>, ErrorData> {
+        self.wait_for_operation_status_with_lookup_policy(
+            operation_id,
+            timeout,
+            poll_interval,
+            false,
+        )
+        .await
+    }
+
+    async fn wait_for_operation_status_with_lookup_policy(
+        &self,
+        operation_id: &str,
+        timeout: Duration,
+        poll_interval: Duration,
+        allow_pending_admission_lookup: bool,
+    ) -> std::result::Result<Option<IngestResponse>, ErrorData> {
         let deadline = Instant::now() + clamp_wait_timeout(timeout);
         loop {
-            let response = self.operation_status_json_for_test(operation_id).await?;
-            if response
-                .state
-                .map(IngestOperationState::is_terminal)
-                .unwrap_or(false)
-            {
-                return Ok(Some(response));
+            match self.operation_status_json_for_test(operation_id).await {
+                Ok(response) => {
+                    if response
+                        .state
+                        .map(IngestOperationState::is_terminal)
+                        .unwrap_or(false)
+                    {
+                        return Ok(Some(response));
+                    }
+                }
+                Err(error)
+                    if mcp_operation_wait_error_is_ignorable_during_wait(
+                        &error,
+                        allow_pending_admission_lookup,
+                    ) => {}
+                Err(error) => return Err(error),
             }
             if timeout.is_zero() || Instant::now() >= deadline {
                 return Ok(None);
@@ -1529,13 +1554,18 @@ impl MempalMcpServer {
         let queue = self.async_queue.clone();
 
         loop {
-            let response = self.operation_status_json_for_test(operation_id).await?;
-            if response
-                .state
-                .map(IngestOperationState::is_terminal)
-                .unwrap_or(false)
-            {
-                return Ok(Some(response));
+            match self.operation_status_json_for_test(operation_id).await {
+                Ok(response) => {
+                    if response
+                        .state
+                        .map(IngestOperationState::is_terminal)
+                        .unwrap_or(false)
+                    {
+                        return Ok(Some(response));
+                    }
+                }
+                Err(error) if mcp_operation_wait_error_is_transient_lookup(&error) => {}
+                Err(error) => return Err(error),
             }
             if timeout.is_zero() || Instant::now() >= deadline {
                 return Ok(None);
@@ -2091,6 +2121,9 @@ fn anyhow_chain_contains_sqlite_lock(error: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<rusqlite::Error>()
             .is_some_and(rusqlite_error_is_lock)
+            || cause
+                .downcast_ref::<QueueError>()
+                .is_some_and(QueueError::is_sqlite_lock)
             || cause
                 .downcast_ref::<crate::core::db::DbError>()
                 .is_some_and(|db_error| {
@@ -5146,10 +5179,11 @@ impl MempalMcpServer {
                 )
                 .await
             } else {
-                self.wait_for_operation_status(
+                self.wait_for_operation_status_with_lookup_policy(
                     operation_id,
                     Duration::from_secs(wait_timeout_secs),
                     Duration::from_millis(150),
+                    queue_admission.daemon_enqueue_may_have_reached,
                 )
                 .await
             };
@@ -5158,22 +5192,35 @@ impl MempalMcpServer {
             }
 
             let mut timed_out_response = if matches!(worker_mode, IngestWaitWorkerMode::Scoped) {
-                let refreshed = self
+                match self
                     .operation_status_json_for_test(
                         queued_response
                             .operation_id
                             .as_deref()
                             .expect("queued receipt must include operation id"),
                     )
-                    .await?;
-                if refreshed
-                    .state
-                    .map(IngestOperationState::is_terminal)
-                    .unwrap_or(false)
+                    .await
                 {
-                    return Ok(Json(refreshed));
+                    Ok(refreshed) => {
+                        if refreshed
+                            .state
+                            .map(IngestOperationState::is_terminal)
+                            .unwrap_or(false)
+                        {
+                            return Ok(Json(refreshed));
+                        }
+                        refreshed
+                    }
+                    Err(error)
+                        if mcp_operation_wait_error_is_ignorable_during_wait(
+                            &error,
+                            queue_admission.daemon_enqueue_may_have_reached,
+                        ) =>
+                    {
+                        queued_response
+                    }
+                    Err(error) => return Err(error),
                 }
-                refreshed
             } else {
                 queued_response
             };
@@ -5203,9 +5250,27 @@ impl MempalMcpServer {
         }
 
         let daemon_enqueue_may_have_reached = daemon_enqueue.may_have_reached_daemon();
-        let operation_id = self
-            .enqueue_ingest_operation_locally_with_retry(payload, idempotency_key)
-            .await?;
+        let operation_id = match self
+            .enqueue_ingest_operation_locally_with_retry(payload, idempotency_key.clone())
+            .await
+        {
+            Ok(operation_id) => operation_id,
+            Err(error) => {
+                if let Some(admission) = queue_admission_for_uncertain_daemon_enqueue(
+                    &idempotency_key,
+                    daemon_enqueue_may_have_reached,
+                    &error,
+                ) {
+                    tracing::warn!(
+                        operation_id = %admission.operation_id,
+                        error = %error,
+                        "local ingest queue admission failed after daemon enqueue may have reached daemon; preserving operation receipt"
+                    );
+                    return Ok(admission);
+                }
+                return Err(error);
+            }
+        };
         Ok(IngestQueueAdmission {
             operation_id,
             processor: IngestQueueProcessor::Local,
@@ -9684,6 +9749,57 @@ fn mcp_stage_timeout_error(operation: &str, stage: &str, deadline: Duration) -> 
     )
 }
 
+fn mcp_operation_wait_error_is_transient_lookup(error: &ErrorData) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    let operation_lookup = message.contains("queue lookup")
+        || message.contains("mempal_operation_status")
+        || message.contains("operation status");
+    let transient = message.contains("database is locked")
+        || message.contains("database locked")
+        || message.contains("database is busy")
+        || message.contains("database busy")
+        || message.contains("sqlite_busy")
+        || message.contains("sqlite_locked")
+        || message.contains("locked_or_busy")
+        || (message.contains("exceeded") && message.contains("queue lookup"));
+    operation_lookup && transient
+}
+
+fn mcp_operation_wait_error_is_ignorable_during_wait(
+    error: &ErrorData,
+    allow_pending_admission_lookup: bool,
+) -> bool {
+    mcp_operation_wait_error_is_transient_lookup(error)
+        || (allow_pending_admission_lookup
+            && mcp_operation_wait_error_is_missing_pending_admission(error))
+}
+
+fn mcp_operation_wait_error_is_missing_pending_admission(error: &ErrorData) -> bool {
+    error
+        .message
+        .to_ascii_lowercase()
+        .contains("operation not found:")
+}
+
+fn queue_admission_for_uncertain_daemon_enqueue(
+    idempotency_key: &str,
+    daemon_enqueue_may_have_reached: bool,
+    error: &anyhow::Error,
+) -> Option<IngestQueueAdmission> {
+    if !daemon_enqueue_may_have_reached || !anyhow_chain_contains_sqlite_lock(error) {
+        return None;
+    }
+
+    Some(IngestQueueAdmission {
+        operation_id: PendingMessageStore::idempotent_message_id(
+            INGEST_ASYNC_KIND,
+            idempotency_key,
+        ),
+        processor: IngestQueueProcessor::Local,
+        daemon_enqueue_may_have_reached: true,
+    })
+}
+
 fn push_mcp_timeout_warning(
     response_warnings: &mut Vec<String>,
     system_warnings: &mut Vec<SystemWarning>,
@@ -10427,6 +10543,86 @@ mod tests {
     fn test_operation_wait_uses_daemon_worker_when_daemon_ipc_is_live() {
         assert!(should_claim_scoped_ingest_worker(false));
         assert!(!should_claim_scoped_ingest_worker(true));
+    }
+
+    #[test]
+    fn test_operation_wait_classifies_transient_status_lookup_errors() {
+        let locked = ErrorData::internal_error(
+            "mempal_operation_status queue lookup failed: database is locked",
+            None,
+        );
+        assert!(mcp_operation_wait_error_is_transient_lookup(&locked));
+
+        let timeout = mcp_stage_timeout_error(
+            "mempal_operation_status",
+            "queue lookup",
+            Duration::from_secs(2),
+        );
+        assert!(mcp_operation_wait_error_is_transient_lookup(&timeout));
+
+        let enqueue_lock =
+            ErrorData::internal_error("enqueue_ingest_operation failed: database is locked", None);
+        assert!(!mcp_operation_wait_error_is_transient_lookup(&enqueue_lock));
+
+        let missing_operation = ErrorData::internal_error(
+            "mempal_operation_status queue lookup failed: operation row was not found",
+            None,
+        );
+        assert!(!mcp_operation_wait_error_is_transient_lookup(
+            &missing_operation
+        ));
+
+        let pending_admission =
+            ErrorData::invalid_params("operation not found: msg-dedup-pending-admission", None);
+        assert!(!mcp_operation_wait_error_is_ignorable_during_wait(
+            &pending_admission,
+            false
+        ));
+        assert!(mcp_operation_wait_error_is_ignorable_during_wait(
+            &pending_admission,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_uncertain_daemon_enqueue_admission_preserves_operation_id_after_local_lock() {
+        let lock_error = anyhow::Error::new(QueueError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy,
+                extended_code: rusqlite::ffi::SQLITE_BUSY,
+            },
+            Some("database is locked".to_string()),
+        )))
+        .context("SQLite queue admission known-runtime-holder retry exhausted");
+
+        let admission =
+            queue_admission_for_uncertain_daemon_enqueue("uncertain-daemon-key", true, &lock_error)
+                .expect("lock after may-have-reached daemon enqueue should preserve receipt");
+
+        assert_eq!(
+            admission.operation_id,
+            PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, "uncertain-daemon-key")
+        );
+        assert_eq!(admission.processor, IngestQueueProcessor::Local);
+        assert!(admission.daemon_enqueue_may_have_reached);
+        assert!(
+            queue_admission_for_uncertain_daemon_enqueue(
+                "uncertain-daemon-key",
+                false,
+                &lock_error,
+            )
+            .is_none()
+        );
+
+        let non_lock_error = anyhow::anyhow!("local admission rejected malformed payload");
+        assert!(
+            queue_admission_for_uncertain_daemon_enqueue(
+                "uncertain-daemon-key",
+                true,
+                &non_lock_error,
+            )
+            .is_none()
+        );
     }
 
     #[test]
