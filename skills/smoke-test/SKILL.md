@@ -1,13 +1,13 @@
 ---
 name: smoke-test
-description: "Project-local mempal manual smoke test skill. Use after installing, restarting, merging, or changing mempal to verify daemon health, CLI/REST/MCP/read-only surfaces, optional reversible write/delete paths, memory growth, and database-holder safety without starting duplicate daemons or leaking drawer content."
+description: "Project-local mempal exhaustive smoke test skill. Use after installing, restarting, merging, or changing mempal to verify daemon health, CLI/REST/MCP read surfaces, reversible CLI and MCP memory CRUD, memory growth, and database-holder safety without starting duplicate daemons or leaking drawer content."
 ---
 
 # mempal Manual Smoke Test
 
-Use this project-local skill when a main agent must manually verify that the installed `mempal` binary and live daemon still work after a merge, install, restart, MCP reconnect, or production-like debugging session.
+Use this project-local skill when a main agent must manually verify that the installed `mempal` binary, live daemon, command-line surfaces, REST availability, and MCP tools still work after a merge, install, restart, MCP reconnect, or production-like debugging session.
 
-Default to direct installed-CLI probes. Do not start extra daemons or long-lived REST/MCP servers unless the test explicitly requires them and the owner process is tracked for cleanup.
+Default to the installed CLI plus the MCP tools already exposed to the active client. Do not start extra daemons or long-lived REST/MCP servers unless the test explicitly requires them and the owner process is tracked for cleanup.
 
 ## Safety rules
 
@@ -17,11 +17,46 @@ Default to direct installed-CLI probes. Do not start extra daemons or long-lived
    - Prefer `systemctl --user restart mempal-daemon.service` for restart.
    - Verify exactly one `/usr/local/bin/mempal daemon --foreground` after restart.
    - Do not run `mempal serve` as a long-lived REST server for smoke unless a route test requires it; if started, track and kill it.
-   - Do not spawn extra `mempal serve --mcp` processes from the shell. MCP reconnect is a client action.
+   - Do not spawn unmanaged `mempal serve --mcp` processes from the shell. The checked-in `scripts/full_smoke.py` runner may start short-lived MCP stdio servers because it owns their PID lifecycle, sends shutdown/exit, and kills leftovers.
 4. Before declaring a lock failure, inspect DB holders with `mempal daemon status` and summarize only roles/counts/PIDs/commands.
-5. Prefer read-only CLI smoke first. Use reversible write/delete only when the requested task requires proving write paths or when read-only probes expose a write-path risk.
-6. If using a synthetic write, use a unique marker, a `smoke/manual` wing-room, `--no-gate`, and `--wait`, then clean up only the exact drawer ID(s) returned by the ingest response. Never delete IDs discovered from generic search results. Report IDs only when cleanup fails; do not print content.
-7. If there is already context that should become durable memory, it is acceptable to ingest a concise real note instead of synthetic content, but only when the note is genuinely useful and non-secret.
+5. Full smoke means read-only probes plus reversible memory CRUD through both CLI and MCP when the active client exposes MCP tools. If MCP tools are unavailable, record `mcp_crud=skipped_unavailable` and do not spawn an unmanaged MCP holder just to satisfy the matrix.
+6. If using a synthetic write, use a unique marker, a `smoke/cli` or `smoke/mcp` wing-room, explicit typed metadata, and bounded wait/poll behavior, then clean up only exact drawer ID(s) returned by the create/update operation's `created_drawer_ids`. Never delete IDs discovered from generic search/read results. Report IDs only when cleanup fails; do not print content.
+7. Update smoke must use replacement semantics (`--supersedes` / `supersedes`) against an exact drawer ID created earlier in the same smoke run. If the initial create did not expose a cleanup-safe created ID, skip update/delete and fail closed.
+8. If there is already context that should become durable memory, it is acceptable to ingest a concise real note instead of synthetic content, but only when the note is genuinely useful and non-secret.
+
+## Preferred automated full smoke
+
+Use the checked-in runner first when the goal is broad coverage rather than one-off diagnosis:
+
+```bash
+python3 skills/smoke-test/scripts/full_smoke.py | tee /tmp/mempal-skill-full-smoke.log
+```
+
+The runner is intentionally part of this repo-local skill (`skills/smoke-test/scripts/full_smoke.py`) rather than `/tmp` so the exact CLI/MCP protocol, safety rules, and cleanup behavior stay versioned with the skill. It prints one aggregate JSON object and avoids raw memory content.
+
+Runner behavior:
+
+- CLI CRUD: JSON stdin `mempal ingest --stdin --json`, `search`, `view`, `context`, `pin`, `unpin`, `ingest --supersedes`, exact-ID `delete`, post-delete search verification.
+- MCP read-only probes: short-lived isolated MCP stdio servers per optional probe to avoid one tool's SQLite read lock poisoning the rest of the matrix.
+- MCP CRUD: `mempal_ingest`, `mempal_operation_status`, `mempal_search`, `mempal_read_drawer`, `mempal_read_drawers`, `mempal_context`, `mempal_brief`, `mempal_ingest` with `supersedes`, `mempal_delete`, post-delete search verification.
+- Timed-out MCP ingest receipts: close the MCP server before following the returned `operation_id` with `mempal operation wait --json`; this avoids MCP self-holder SQLite lock false failures.
+- Cleanup: if a later step fails after create exposed cleanup-safe IDs, delete those exact IDs before exiting.
+- I/O telemetry: sample daemon `/proc/<pid>/io` before/after when the daemon PID stays stable, sample `/proc/<pid>/io` for CLI child commands and short-lived MCP stdio servers, and keep `resource.getrusage(RUSAGE_CHILDREN)` block counters as an aggregate fallback. The runner also appends content-free telemetry to `target/smoke-io-history.jsonl`.
+
+If the runner exits nonzero, parse only the final JSON summary:
+
+```bash
+python3 - <<'PY'
+import json, pathlib
+line = [line for line in pathlib.Path('/tmp/mempal-skill-full-smoke.log').read_text(errors='replace').splitlines() if line.strip()][-1]
+data = json.loads(line)
+print({'overall_ok': data.get('overall_ok'), 'failures': data.get('failures'), 'cleanup': data.get('cleanup'), 'created_counts': data.get('created_counts'), 'io': data.get('io')})
+for name in data.get('failures', []):
+    print(name, data.get('groups', {}).get(name))
+PY
+```
+
+Do not paste raw command output from the log into chat; the JSON summary is already redacted/aggregate-only.
 
 ## Preflight
 
@@ -73,6 +108,22 @@ Pass criteria:
 - daemon exe resolves to `/usr/local/bin/mempal` and is not deleted;
 - no untracked extra `mempal serve --mcp` processes were created by the smoke;
 - RSS is reasonable immediately after restart (normally hundreds of MB, not multi-GB).
+
+## Coverage target
+
+Run the broadest safe matrix the current environment supports. A full report should classify each group as `pass`, `fail`, or `skipped_<reason>`.
+
+| Group | Surface | Required coverage |
+|---|---|---|
+| Runtime | CLI/systemd/process | installed binary, daemon singleton, current executable, DB holders, RSS/resource summary |
+| Read-only memory | CLI | status, stats, search, context, timeline/tail shape, pinned shape, knowledge/card/repair/pattern/skill surfaces where supported |
+| Reversible CRUD | CLI | create via `mempal ingest`, read via `search` + `view`, update via `ingest --supersedes`, pin/unpin, delete via exact created IDs, post-delete verification |
+| REST | CLI doctor or tracked REST server | route/health shape and degraded warning categories |
+| Read-only MCP | MCP tools | `mempal_status`, `mempal_search`, `mempal_context`, `mempal_pinned_facts`, `mempal_timeline`, `mempal_doctor`, plus optional knowledge/brief/taxonomy/skill tools exposed by the client |
+| Reversible CRUD | MCP tools | create via `mempal_ingest`, read via `mempal_search` + `mempal_read_drawer`, update via `mempal_ingest` with `supersedes`, delete via `mempal_delete`, post-delete search verification |
+| Cleanup | CLI/process | no extra daemon/MCP/REST holders, all exact-created smoke IDs soft-deleted or explicitly reported |
+
+Never downgrade a failed CRUD path to pass because another surface worked. Report CLI CRUD and MCP CRUD separately.
 
 ## Read-only CLI smoke matrix
 
@@ -202,9 +253,9 @@ run_mempal_probe context json timeout 120s mempal context '<known safe query>' -
 
 If these are slow, report latency and memory growth; do not treat slowness as pass unless the task only asked for availability.
 
-## Optional reversible write smoke
+## Reversible CLI memory CRUD smoke
 
-Use only when write-path validation is required.
+Run this by default for full smoke unless the operator explicitly requests read-only mode. The flow must exercise create, read, update, pin/unpin, search, context, and delete through the command line.
 
 1. Generate a unique marker:
 
@@ -218,9 +269,21 @@ Use only when write-path validation is required.
    ingest_json="$(mktemp)"
    operation_json=""
    smoke_ids="$(mktemp)"
-   if printf '{"content":"%s reversible smoke drawer; safe to delete","wing":"smoke","room":"manual"}\n' "$marker" \
-     | mempal ingest --stdin --wing smoke --room manual --no-gate --wait --wait-timeout-secs 60 --json \
+   if python3 - "$marker" <<'PY' \
+     | mempal ingest --stdin --wing smoke --room cli --source-type agent_inference --memory-kind evidence --domain project --field smoke --no-gate --wait --wait-timeout-secs 90 --json \
      > "$ingest_json"; then
+import json, sys
+marker = sys.argv[1]
+print(json.dumps({
+    "content": f"{marker} reversible CLI smoke drawer; safe to delete",
+    "wing": "smoke",
+    "room": "cli",
+    "source_type": "agent_inference",
+    "memory_kind": "evidence",
+    "domain": "project",
+    "field": "smoke",
+}))
+PY
      :
    fi
    python3 - "$ingest_json" > "$smoke_ids" <<'PY'
@@ -285,7 +348,82 @@ PY
 
    Do not print the ingest response, operation response, or smoke IDs unless cleanup fails. `created_drawer_ids` from the terminal ingest JSON, or from terminal `mempal operation wait/status --json`, is the cleanup authority. `cleanup_drawer_ids` is only a human-readable alias when it mirrors the created list. `drawer_id` and `drawer_ids` are informational because they may name pre-existing, deduplicated, dropped, or merge-target drawers. If `created_drawer_ids` is empty after the terminal wait/status step, fail closed.
 
-3. Optionally search for the marker as a verification probe only. Keep output in a temporary file, print aggregate counts only, never print search result bodies/snippets, and never use search result IDs for deletion:
+3. Read and query the created memory without printing content:
+
+   ```bash
+   created_id="$(head -n 1 "$smoke_ids")"
+   view_out="$(mktemp)"
+   search_json="$(mktemp)"
+   context_json="$(mktemp)"
+   pinned_json="$(mktemp)"
+
+   mempal view "$created_id" --all-projects > "$view_out"
+   mempal search "$marker" --top-k 5 --json > "$search_json"
+   mempal context "$marker" --format json --max-items 3 --no-distill-suggestions > "$context_json"
+   mempal pinned --json > "$pinned_json"
+
+   python3 - "$view_out" "$search_json" "$context_json" "$pinned_json" <<'PY'
+import json, sys
+from pathlib import Path
+view_out, search_path, context_path, pinned_path = [Path(p) for p in sys.argv[1:]]
+results = json.loads(search_path.read_text() or "[]")
+context = json.loads(context_path.read_text() or "{}")
+pinned = json.loads(pinned_path.read_text() or "[]")
+summary = {
+    "view_stdout_bytes": view_out.stat().st_size,
+    "search_count": len(results) if isinstance(results, list) else None,
+    "context_fields": sorted(context.keys()) if isinstance(context, dict) else [],
+    "pinned_type": type(pinned).__name__,
+}
+print(json.dumps(summary, sort_keys=True))
+PY
+   rm -f "$view_out" "$search_json" "$context_json" "$pinned_json"
+   ```
+
+   The summary is aggregate-only. Do not print `view`, search result content, context sections, pinned text, snippets, or previews. Search result IDs are not cleanup authority.
+
+4. Update by replacement semantics, then verify the replacement ID:
+
+   ```bash
+   created_id="$(head -n 1 "$smoke_ids")"
+   update_json="$(mktemp)"
+   update_ids="$(mktemp)"
+   if python3 - "$marker" <<'PY' \
+     | mempal ingest --stdin --wing smoke --room cli --source-type agent_inference --memory-kind evidence --domain project --field smoke --no-gate --supersedes "$created_id" --wait --wait-timeout-secs 90 --json \
+     > "$update_json"; then
+import json, sys
+marker = sys.argv[1]
+print(json.dumps({
+    "content": f"{marker} reversible CLI smoke drawer updated; safe to delete",
+    "wing": "smoke",
+    "room": "cli",
+    "source_type": "agent_inference",
+    "memory_kind": "evidence",
+    "domain": "project",
+    "field": "smoke",
+}))
+PY
+     :
+   fi
+   python3 - "$update_json" > "$update_ids" <<'PY'
+import json, sys
+from pathlib import Path
+obj = json.loads(Path(sys.argv[1]).read_text() or "{}")
+for item in dict.fromkeys(x for x in obj.get("created_drawer_ids", []) if isinstance(x, str) and x):
+    print(item)
+PY
+   if [ ! -s "$update_ids" ]; then
+     echo "update smoke did not expose cleanup-safe created_drawer_ids; fail closed" >&2
+     exit 1
+   fi
+   cat "$update_ids" >> "$smoke_ids"
+   updated_id="$(head -n 1 "$update_ids")"
+   updated_view="$(mktemp)"
+   mempal view "$updated_id" --all-projects > "$updated_view"
+   rm -f "$updated_view" "$update_json" "$update_ids"
+   ```
+
+5. Verify marker visibility again, then pin/unpin and delete exact smoke IDs from create/update responses. Suppress command output so `mempal delete` cannot print drawer summaries:
 
    ```bash
    verify_json="$(mktemp)"
@@ -301,17 +439,14 @@ matches = [
     item for item in results
     if isinstance(item, dict)
     and item.get("wing") == "smoke"
-    and item.get("room") == "manual"
+    and item.get("room") == "cli"
     and marker in str(item.get("content", ""))
 ]
-print(f"active_smoke_marker_matches={len(matches)}")
+print(f"active_cli_smoke_marker_matches={len(matches)}")
 PY
    rm -f "$verify_json"
-   ```
 
-4. For each exact smoke ID from the ingest response, optionally test pin/unpin, then delete. Suppress command output so `mempal delete` cannot print drawer summaries:
-
-   ```bash
+   sort -u "$smoke_ids" -o "$smoke_ids"
    while IFS= read -r smoke_id; do
      mempal pin "$smoke_id" >/dev/null || true
      mempal unpin "$smoke_id" >/dev/null || true
@@ -323,7 +458,54 @@ PY
    rm -f "$ingest_json" "$operation_json" "$smoke_ids"
    ```
 
-5. Re-run the aggregate marker verification from step 3 and confirm no active `smoke/manual` marker match remains, or record soft-delete behavior if tombstones remain visible only with explicit include-deleted flags.
+6. Re-run aggregate marker verification and confirm no active `smoke/cli` marker match remains, or record soft-delete behavior if tombstones remain visible only with explicit include-deleted flags.
+
+## Reversible MCP memory CRUD smoke
+
+Run this by default for full smoke. Prefer MCP tools already exposed to the active client. If the active client has no mempal MCP tools, it is acceptable to start a short-lived tracked stdio child with `mempal serve --mcp`, call the tools, then shut it down and verify no extra holder remains.
+
+Required MCP tool coverage when available:
+
+| Step | MCP method/tool | Required assertion |
+|---|---|---|
+| initialize | JSON-RPC `initialize` then `notifications/initialized` | server name present |
+| discover | `tools/list` | includes `mempal_ingest`, `mempal_operation_status`, `mempal_search`, `mempal_read_drawer`, `mempal_delete` |
+| status | `mempal_status` | structured object, db holder fields summarized only |
+| create | `mempal_ingest` with `wing="smoke"`, `room="mcp"`, `smoke=true`, `wait=true`, typed metadata | completed or terminal success; `created_drawer_ids` non-empty |
+| read/search | `mempal_search`, `mempal_read_drawer`, optionally `mempal_read_drawers` | structured responses parse; do not print content |
+| context/read-only | `mempal_context`, `mempal_pinned_facts`, `mempal_timeline`, `mempal_doctor`, optionally `mempal_taxonomy`, `mempal_field_taxonomy`, `mempal_kg`, `mempal_skill`, `mempal_brief` | shape-only success or classified skip/failure |
+| update | `mempal_ingest` with `supersedes=<created_id>`, same smoke scope, `smoke=true`, `wait=true` | replacement `created_drawer_ids` non-empty |
+| delete | `mempal_delete` for every exact create/update ID | `deleted=true` or explicit already-deleted for duplicate cleanup attempt |
+| post-delete | `mempal_search` marker query | no active `smoke/mcp` marker matches, or soft-delete visibility classified |
+| shutdown | `shutdown` then `notifications/exit`; kill only if needed | child exits; no extra MCP/DB holder remains |
+
+MCP stdio uses newline-delimited JSON-RPC messages in this project. A minimal client pattern is:
+
+```python
+send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mempal-smoke","version":"0"}}})
+send({"jsonrpc":"2.0","method":"notifications/initialized"})
+send({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+send({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mempal_ingest","arguments":{"content":"<marker> reversible MCP smoke drawer; safe to delete","wing":"smoke","room":"mcp","source_type":"agent_inference","memory_kind":"evidence","domain":"project","field":"smoke","smoke":True,"wait":True,"wait_timeout_secs":90}}})
+```
+
+Capture MCP responses to temp files and report only: method/tool name, JSON-RPC error class if any, latency, structuredContent top-level fields, result counts, and cleanup-created ID counts. Never print `content`, snippets, previews, prompts, drawer text, or raw response bodies.
+
+Cleanup authority is the same as CLI: only `created_drawer_ids` from `mempal_ingest` or `mempal_operation_status` may be deleted automatically. Do not delete `drawer_id`, search hits, read results, or marker matches.
+
+Public MCP `mempal_ingest` exposes a constrained smoke path through `smoke=true`. The server accepts it only for small writes under `wing="smoke"` and `room="mcp"`, rejects diary rollup, and internally bypasses gating/novelty so automated smoke can receive cleanup-authoritative `created_drawer_ids`. If a terminal MCP smoke write still has no `created_drawer_ids`, classify it as `inconclusive_no_cleanup_id`, do not attempt update/delete, and do not use search result IDs for cleanup.
+
+## Dangerous or non-default surfaces
+
+Default smoke must skip these unless the task explicitly asks for them and an exact cleanup plan exists:
+
+- `mempal_rollback`: dry-run only; never execute real rollback in smoke.
+- Purge/delete-all style commands: forbidden for smoke.
+- `mempal_peek_partner`: may read live session text; skip.
+- `mempal_cowork_push` and `mempal_cowork_bus send/broadcast/drain/capture`: skip because they mutate or expose cowork traffic.
+- Taxonomy/tunnel/knowledge graph mutations such as taxonomy edit, tunnel add/delete, and `mempal_kg add/invalidate`: skip unless exact synthetic IDs and cleanup are proven.
+- Knowledge/profile promotion workflows (`promote`, `adopt`, `reject`, `retire`, `publish`, card promote/demote): read/list/gate summaries only by default.
+
+For content-bearing read-only tools (`mempal_context`, `mempal_brief`, `mempal_pinned_facts`, `mempal_timeline`, search/read tools), summarize counts/fields/bytes only and redact or omit values named `content`, `text`, `preview`, `statement`, `narrative`, `messages`, `facts.content`, snippets, prompts, and model output.
 
 ## REST checks
 
@@ -335,10 +517,6 @@ Prefer `mempal doctor rest --format json` for route availability. If an actual R
 4. Kill the temporary server and verify no extra `mempal serve` process remains.
 
 Do not confuse daemon service health with REST server availability; they are separate surfaces.
-
-## MCP checks
-
-Do not spawn MCP servers manually for smoke. If MCP tool validation is required, ask the interactive client to reconnect MCP (for example `/mcp`) and then call available read-only MCP tools. Pass criteria are shape/status only; do not print raw memory content.
 
 ## Memory growth guard
 
@@ -358,7 +536,8 @@ If read-only commands push RSS into multi-GB territory, file or update an issue 
 - Daemon restart, if performed, leaves one current-binary daemon.
 - Read-only matrix exits 0 or failures are classified by command/stderr class.
 - Raw stdout/stderr from content-bearing `mempal` commands was captured, structurally summarized, and not pasted into chat or log summaries.
-- Optional write smoke cleans up its own drawers.
-- REST/MCP checks do not leave extra processes.
+- CLI CRUD smoke creates, reads/searches/contexts, updates, pin/unpins, deletes, and verifies cleanup using only exact `created_drawer_ids`.
+- MCP CRUD smoke creates, reads/searches/contexts, updates, deletes, and verifies cleanup through MCP tools using the constrained `smoke=true` write path. If a terminal MCP smoke write lacks cleanup-safe `created_drawer_ids`, classify it as `inconclusive_no_cleanup_id` and keep the MCP CRUD group non-pass. Use `skipped_unavailable` only when no MCP client/tooling is available.
+- REST/MCP checks do not leave extra processes or DB holders.
 - Memory before/after is recorded.
 - Worktree remains clean except intentional skill/code changes.

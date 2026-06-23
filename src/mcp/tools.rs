@@ -1683,6 +1683,12 @@ pub struct IngestRequest {
     /// UTC day. Requires wing="agent-diary" and an explicit room.
     pub diary_rollup: Option<bool>,
 
+    /// If true, enable the constrained MCP smoke-test write path. This is only
+    /// accepted for small synthetic writes under wing="smoke", room="mcp";
+    /// accepted smoke writes bypass gating/novelty so cleanup can rely on
+    /// operation-scoped created_drawer_ids.
+    pub smoke: Option<bool>,
+
     /// Importance ranking (0-5). Higher values appear first in wake-up context.
     /// Default 0. Use 3-5 for key decisions, architecture choices, and lessons learned.
     pub importance: Option<i32>,

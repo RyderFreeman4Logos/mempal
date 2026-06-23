@@ -1943,9 +1943,55 @@ impl ValidatedIngestMetadata {
 }
 
 const MAX_WAIT_TIMEOUT_SECS: u64 = 86_400;
+const MCP_SMOKE_CONTENT_MAX_BYTES: usize = 4 * 1024;
 
 fn clamp_wait_timeout(timeout: Duration) -> Duration {
     timeout.min(Duration::from_secs(MAX_WAIT_TIMEOUT_SECS))
+}
+
+fn resolve_mcp_ingest_controls(
+    request: &IngestRequest,
+    controls: IngestControls,
+) -> std::result::Result<IngestControls, ErrorData> {
+    if !request.smoke.unwrap_or(false) {
+        return Ok(controls);
+    }
+
+    validate_mcp_smoke_ingest_request(request)?;
+    Ok(IngestControls {
+        no_gate: true,
+        bypass_novelty: true,
+    })
+}
+
+fn validate_mcp_smoke_ingest_request(
+    request: &IngestRequest,
+) -> std::result::Result<(), ErrorData> {
+    if request.wing != "smoke" {
+        return Err(ErrorData::invalid_params(
+            "smoke ingest requires wing=\"smoke\"",
+            None,
+        ));
+    }
+    if request.room.as_deref() != Some("mcp") {
+        return Err(ErrorData::invalid_params(
+            "smoke ingest requires room=\"mcp\"",
+            None,
+        ));
+    }
+    if request.content.len() > MCP_SMOKE_CONTENT_MAX_BYTES {
+        return Err(ErrorData::invalid_params(
+            format!("smoke ingest content must be <= {MCP_SMOKE_CONTENT_MAX_BYTES} bytes"),
+            None,
+        ));
+    }
+    if request.diary_rollup.unwrap_or(false) {
+        return Err(ErrorData::invalid_params(
+            "smoke ingest cannot use diary_rollup",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -4687,7 +4733,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_ingest",
-        description = "Persist a decision, bug fix, design insight, profile fact, or typed knowledge/evidence drawer to project memory. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, `statement`, `tier`, `status`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, dry_run preview, and receipt-based waiting via `wait`/`wait_timeout_secs` (wait=true blocks to a terminal state or returns a timed_out receipt you can poll with `mempal_operation_status`)."
+        description = "Persist a decision, bug fix, design insight, profile fact, or typed knowledge/evidence drawer to project memory. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, `statement`, `tier`, `status`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, dry_run preview, and receipt-based waiting via `wait`/`wait_timeout_secs` (wait=true blocks to a terminal state or returns a timed_out receipt you can poll with `mempal_operation_status`). Constrained smoke writes may set `smoke=true` only for small synthetic `wing=\"smoke\"`, `room=\"mcp\"` payloads."
     )]
     pub async fn mempal_ingest(
         &self,
@@ -4728,6 +4774,7 @@ impl MempalMcpServer {
         worker_mode: IngestWaitWorkerMode,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let dry_run = request.dry_run.unwrap_or(false);
+        let controls = resolve_mcp_ingest_controls(&request, controls)?;
         if !dry_run && global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
         }
@@ -5035,6 +5082,7 @@ impl MempalMcpServer {
         compiled_privacy: &crate::core::config::CompiledPrivacyConfig,
         project_id: Option<String>,
     ) -> std::result::Result<PreparedIngestOperation, ErrorData> {
+        let controls = resolve_mcp_ingest_controls(request, controls)?;
         let scrubbed_content =
             config.scrub_content_with_compiled(&request.content, compiled_privacy);
         let scrubbed_source = request
@@ -5125,6 +5173,7 @@ impl MempalMcpServer {
         runtime_writer_lease: Option<&RuntimeWriterLease>,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
         let dry_run = request.dry_run.unwrap_or(false);
+        let controls = resolve_mcp_ingest_controls(&request, controls)?;
         if !dry_run && global_embed_status().should_block_writes() {
             return Err(degraded_write_error());
         }
@@ -12376,7 +12425,7 @@ pattern_boost = 0.2
             .and_then(|value| value.as_object())
             .expect("mempal_ingest must have a properties object");
 
-        for field in ["wait", "wait_timeout_secs"] {
+        for field in ["wait", "wait_timeout_secs", "smoke"] {
             assert!(
                 props.get(field).is_some(),
                 "mempal_ingest must expose {field} in tools/list"
@@ -15432,6 +15481,7 @@ reject_on_contradiction = true
                     importance: None,
                     dry_run: None,
                     diary_rollup: None,
+                    smoke: None,
                     supersedes: None,
                     replace_text: None,
                     valid_from: None,
@@ -15550,6 +15600,157 @@ enabled = false
             .await
             .expect("cleanup ingest completion");
         assert_eq!(completed.state, Some(IngestOperationState::Completed));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_smoke_mode_rejects_non_smoke_scope() {
+        let (_tempdir, _db_path, server) = setup_server();
+
+        let error = match server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "smoke validation must not include request content in errors".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("mcp".to_string()),
+                smoke: Some(true),
+                ..IngestRequest::default()
+            }))
+            .await
+        {
+            Ok(_) => panic!("smoke mode must reject non-smoke wing"),
+            Err(error) => error,
+        };
+
+        let error_text = error.to_string();
+        assert!(error_text.contains("wing=\"smoke\""), "error={error_text}");
+        assert!(
+            !error_text.contains("request content"),
+            "smoke validation errors must not echo content: {error_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_smoke_mode_sets_internal_controls() {
+        let _tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = _tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let _config_guard = ConfigOverrideGuard::install(&format!(
+            r#"
+db_path = "{}"
+
+[privacy]
+enabled = false
+
+[ingest_gating]
+enabled = false
+"#,
+            db_path.display()
+        ))
+        .await;
+        let gate = Arc::new(Notify::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let server = MempalMcpServer::new_with_factory(
+            db_path.clone(),
+            Arc::new(BlockingEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+                call_count: Arc::clone(&call_count),
+                gate: Arc::clone(&gate),
+                released: Arc::new(AtomicBool::new(false)),
+            }),
+        )
+        .expect("create MCP server");
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "bounded MCP smoke write should bypass gates for cleanup authority"
+                    .to_string(),
+                wing: "smoke".to_string(),
+                room: Some("mcp".to_string()),
+                source_type: Some("agent_inference".to_string()),
+                memory_kind: Some("evidence".to_string()),
+                domain: Some("project".to_string()),
+                field: Some("smoke".to_string()),
+                smoke: Some(true),
+                wait: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("smoke ingest should queue")
+            .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while call_count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should reach embed");
+        let db = Database::open(&db_path).expect("open db");
+        let payload: String = db
+            .conn()
+            .query_row(
+                "SELECT payload FROM pending_messages WHERE id = ?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .expect("read queued ingest payload");
+        let decoded: PreparedIngestOperation =
+            serde_json::from_str(&payload).expect("decode queued ingest payload");
+
+        assert_eq!(decoded.request.smoke, Some(true));
+        assert!(decoded.controls.no_gate);
+        assert!(decoded.controls.bypass_novelty);
+
+        gate.notify_one();
+
+        let completed = server
+            .wait_for_operation_completion(operation_id)
+            .await
+            .expect("cleanup ingest completion");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_smoke_ingest_wait_and_status_return_created_ids() {
+        let (_tempdir, _db_path, server) = setup_server();
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "cleanup-authoritative MCP smoke write one".to_string(),
+                wing: "smoke".to_string(),
+                room: Some("mcp".to_string()),
+                source_type: Some("agent_inference".to_string()),
+                memory_kind: Some("evidence".to_string()),
+                domain: Some("project".to_string()),
+                field: Some("smoke".to_string()),
+                smoke: Some(true),
+                wait: Some(true),
+                wait_timeout_secs: Some(5),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("smoke ingest should complete")
+            .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(
+            !response.created_drawer_ids.is_empty(),
+            "smoke wait response must expose cleanup authority"
+        );
+        assert_eq!(response.drawer_ids, response.created_drawer_ids);
+
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        let status = server
+            .operation_status_json_for_test(operation_id)
+            .await
+            .expect("operation status should load");
+
+        assert_eq!(status.state, Some(IngestOperationState::Completed));
+        assert_eq!(status.created_drawer_ids, response.created_drawer_ids);
+        assert_eq!(status.drawer_ids, status.created_drawer_ids);
+        assert!(!status.dropped);
+        assert!(status.rejected_reason.is_none());
     }
 
     // =========================================================================
