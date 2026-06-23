@@ -13,8 +13,7 @@ use mempal::core::db::Database;
 use mempal::core::queue::PendingMessageStore;
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType, Triple};
 use mempal::core::utils::build_triple_id;
-use mempal::mcp::{IngestOperationState, IngestRequest, MempalMcpServer};
-use rmcp::handler::server::wrapper::Parameters;
+use mempal::mcp::{IngestDrainWorkerHandle, IngestOperationState, MempalMcpServer};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use serde_json::json;
@@ -446,17 +445,8 @@ fn assert_queued_status(output: &Output) {
     assert!(stdout.contains("timings={"), "{stdout}");
 }
 
-fn start_worker(server: MempalMcpServer) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let request = IngestRequest {
-            content: "worker warmup".to_string(),
-            wing: "mcp".to_string(),
-            room: Some("warmup".to_string()),
-            dry_run: Some(true),
-            ..IngestRequest::default()
-        };
-        let _ = server.mempal_ingest(Parameters(request)).await;
-    })
+fn start_worker(server: &MempalMcpServer) -> IngestDrainWorkerHandle {
+    server.spawn_scoped_ingest_drain_worker()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1452,12 +1442,10 @@ async fn test_operation_status_reports_queued_then_completed() {
     let queued_output = run_cli(home.path(), &["operation", "status", &operation_id]);
     assert_queued_status(&queued_output);
 
-    let warmup = start_worker(server.clone());
-    let completed = server
-        .wait_for_operation_completion(&operation_id)
-        .await
-        .expect("wait for completion");
-    warmup.await.expect("warmup join");
+    let warmup = start_worker(&server);
+    let completed = server.wait_for_operation_completion(&operation_id).await;
+    warmup.shutdown_and_drain().await;
+    let completed = completed.expect("wait for completion");
 
     assert_eq!(completed.state, Some(IngestOperationState::Completed));
     assert!(

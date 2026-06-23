@@ -647,7 +647,33 @@ fn classify_role(argv: &[String], binary_name: &str) -> &'static str {
     if is_mcp_server_argv(argv) {
         return "mempal_mcp_server";
     }
+    if is_read_only_cli_argv(argv) {
+        return "mempal_readonly_cli";
+    }
     "mempal_cli"
+}
+
+#[cfg(target_os = "linux")]
+fn is_read_only_cli_argv(argv: &[String]) -> bool {
+    let Some((_, subcommand)) = crate::daemon_singleton::first_cli_subcommand(argv) else {
+        return false;
+    };
+    // Diagnostic-only classification for short-lived CLI readers that can overlap
+    // MCP write admission. Keep this conservative: write-capable subcommands must
+    // remain `mempal_cli` so busy diagnostics still fail fast on external writers.
+    matches!(
+        subcommand,
+        "status"
+            | "search"
+            | "context"
+            | "wake-up"
+            | "tail"
+            | "timeline"
+            | "stats"
+            | "view"
+            | "reflect"
+            | "field-taxonomy"
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -700,6 +726,7 @@ fn command_display(role: &str) -> String {
     match role {
         "mempal_daemon" => "mempal daemon".to_string(),
         "mempal_mcp_server" => "mempal serve".to_string(),
+        "mempal_readonly_cli" => "mempal read-only cli".to_string(),
         "mempal_cli" => "mempal cli".to_string(),
         "other" => "other process".to_string(),
         _ => "<unknown>".to_string(),
@@ -840,6 +867,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![33, 44, 55]
         );
+    }
+
+    #[test]
+    fn test_classify_role_distinguishes_read_only_cli_from_write_cli() {
+        let status_argv = vec!["mempal".to_string(), "status".to_string()];
+        assert_eq!(classify_role(&status_argv, "mempal"), "mempal_readonly_cli");
+
+        let ingest_argv = vec!["mempal".to_string(), "ingest".to_string()];
+        assert_eq!(classify_role(&ingest_argv, "mempal"), "mempal_cli");
     }
 
     #[test]

@@ -36,6 +36,7 @@ SUMMARY: dict[str, Any] = {
         ],
     },
 }
+OWNED_MCP_CHILDREN: dict[int, subprocess.Popen[Any]] = {}
 
 PROC_IO_KEYS = ('read_bytes', 'write_bytes', 'cancelled_write_bytes', 'rchar', 'wchar')
 
@@ -333,7 +334,7 @@ def count_marker_matches(value: Any, room: str) -> int:
     return count
 
 
-def delete_exact_ids_cli(drawer_ids: list[str], label: str) -> dict[str, Any]:
+def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = None) -> dict[str, Any]:
     unique_ids = list(dict.fromkeys(drawer_ids))
     deleted = 0
     failed = 0
@@ -351,6 +352,16 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str) -> dict[str, Any]:
             deleted += 1
         else:
             failed += 1
+    active_matches_after_failed_deletes: int | None = None
+    if failed > 0 and deleted == 0 and room is not None:
+        rc, _out, _err, parsed, _shape = run_cli(
+            label + '_post_cleanup_search',
+            ['mempal', 'search', MARKER, '--top-k', '5', '--json'],
+            expect_json=True,
+            timeout=180,
+        )
+        if rc == 0:
+            active_matches_after_failed_deletes = count_marker_matches(parsed, room)
     result = {
         'attempted_count': len(unique_ids),
         'deleted_count': deleted,
@@ -358,7 +369,16 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str) -> dict[str, Any]:
         'stdout_bytes': stdout_bytes,
         'stderr_bytes': stderr_bytes,
     }
-    note(label, failed == 0 or deleted > 0 or not unique_ids, **result)
+    if active_matches_after_failed_deletes is not None:
+        result['active_matches_after_failed_deletes'] = active_matches_after_failed_deletes
+    note(
+        label,
+        failed == 0
+        or deleted > 0
+        or not unique_ids
+        or active_matches_after_failed_deletes == 0,
+        **result,
+    )
     return result
 
 
@@ -413,7 +433,7 @@ def cli_crud() -> list[str]:
         upd_parsed2 = wait_operation(upd_parsed['operation_id'], 'cli_update_wait')
         upd_ids = created_ids_from(upd_parsed2)
     if not upd_ids:
-        delete_exact_ids_cli(cleanup_ids, 'cli_cleanup_after_update_failure')
+        delete_exact_ids_cli(cleanup_ids, 'cli_cleanup_after_update_failure', room='cli')
         note('cli_crud', False, reason='update_missing_created_drawer_ids', cleanup_id_count=len(cleanup_ids))
         return cleanup_ids
     cleanup_ids.extend(upd_ids)
@@ -445,6 +465,7 @@ class McpClient:
             text=True,
             bufsize=1,
         )
+        OWNED_MCP_CHILDREN[self.proc.pid] = self.proc
         self.proc_io_before = read_proc_io(self.proc.pid)
         self.next_id = 1
 
@@ -537,6 +558,32 @@ class McpClient:
             self.stderr_file.close()
         except Exception:
             pass
+        if self.proc.returncode is not None:
+            OWNED_MCP_CHILDREN.pop(self.proc.pid, None)
+
+
+def wait_owned_mcp_children_reaped(timeout: float = 5.0) -> dict[str, Any]:
+    initial_pids = sorted(OWNED_MCP_CHILDREN)
+    deadline = time.monotonic() + timeout
+    while OWNED_MCP_CHILDREN and time.monotonic() < deadline:
+        for pid, proc in list(OWNED_MCP_CHILDREN.items()):
+            try:
+                proc.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception:
+                OWNED_MCP_CHILDREN.pop(pid, None)
+                continue
+            if proc.returncode is not None:
+                OWNED_MCP_CHILDREN.pop(pid, None)
+        if OWNED_MCP_CHILDREN:
+            time.sleep(0.05)
+    remaining_pids = sorted(OWNED_MCP_CHILDREN)
+    return {
+        'initial_count': len(initial_pids),
+        'remaining_count': len(remaining_pids),
+        'reaped_count': len(initial_pids) - len(remaining_pids),
+    }
 
 
 def mcp_start_initialized() -> McpClient:
@@ -656,7 +703,7 @@ def mcp_crud() -> list[str]:
                 upd_ids = created_ids_from(waited)
         note('mcp_update', bool(uinfo.get('ok')) and bool(upd_ids), created_id_count=len(upd_ids), **without_ok(uinfo))
         if not upd_ids:
-            delete_exact_ids_cli(cleanup_ids, 'mcp_cleanup_after_update_failure')
+            delete_exact_ids_cli(cleanup_ids, 'mcp_cleanup_after_update_failure', room='mcp')
             note(
                 'mcp_inconclusive_no_cleanup_id',
                 False,
@@ -813,6 +860,7 @@ def main() -> int:
     cli_ids = cli_crud()
     mcp_ids = mcp_crud()
 
+    SUMMARY['mcp_owned_children_after_wait'] = wait_owned_mcp_children_reaped()
     SUMMARY['holders_after'] = holder_summary()
     daemon_pid_after = daemon_main_pid()
     daemon_io_after = read_proc_io(daemon_pid_after)

@@ -463,6 +463,32 @@ async fn test_timeline_top_k_upper_bound() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_timeline_invalid_since_maps_to_invalid_params() {
+    let _guard = config_guard().await;
+    let env = TimelineEnv::new(Some("foo"), 10);
+
+    let error = match env
+        .server()
+        .mempal_timeline(Parameters(TimelineRequest {
+            project_id: Some("foo".to_string()),
+            since: Some("not-a-time".to_string()),
+            until: None,
+            top_k: None,
+            min_importance: None,
+            wing: None,
+            room: None,
+        }))
+        .await
+    {
+        Ok(_) => panic!("invalid since must be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    assert!(error.message.contains("invalid since"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_timeline_rejects_all_projects() {
     let tmp = TempDir::new().expect("tempdir");
     let mempal_home = tmp.path().join(".mempal");

@@ -90,23 +90,29 @@ pub(super) async fn handle(
         .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
         .await?;
     let scope = ProjectSearchScope::from_request(project_id.clone(), false, false, true);
-    let db = server.open_db()?;
-    let report = build_timeline_report(
-        &db,
-        TimelineQuery {
-            project_id,
-            scope,
-            since: request
-                .since
-                .unwrap_or_else(|| DEFAULT_TIMELINE_SINCE.to_string()),
-            until: request.until,
-            top_k,
-            min_importance,
-            wing: request.wing,
-            room: request.room,
-        },
-    )
-    .map_err(timeline_error)?;
+    let report = server
+        .run_query_only_read_bounded("mempal_timeline", super::server::MCP_SEARCH_DB_DEADLINE, {
+            let project_id = project_id.clone();
+            move |db| {
+                build_timeline_report(
+                    db,
+                    TimelineQuery {
+                        project_id,
+                        scope,
+                        since: request
+                            .since
+                            .unwrap_or_else(|| DEFAULT_TIMELINE_SINCE.to_string()),
+                        until: request.until,
+                        top_k,
+                        min_importance,
+                        wing: request.wing,
+                        room: request.room,
+                    },
+                )
+                .map_err(timeline_error)
+            }
+        })
+        .await?;
 
     Ok(Json(TimelineResponse::from_report(
         report,

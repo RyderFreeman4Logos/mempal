@@ -96,11 +96,11 @@ impl ConnPool {
     }
 
     fn open_one(path: &Path, query_only: bool) -> Result<Database, DbError> {
-        let db = Database::open(path)?;
         if query_only {
-            db.conn().pragma_update(None, "query_only", "ON")?;
+            Database::open_query_only(path)
+        } else {
+            Database::open(path)
         }
-        Ok(db)
     }
 
     /// Pop an idle connection; reopen a fresh one if the pool was transiently
@@ -159,8 +159,8 @@ impl AsyncDb {
             });
         }
 
-        let readers = ConnPool::open(path, n_read, true)?;
         let writer = ConnPool::open(path, 1, false)?;
+        let readers = ConnPool::open(path, n_read, true)?;
         Ok(Self {
             readers: Arc::new(readers),
             writer: Arc::new(writer),

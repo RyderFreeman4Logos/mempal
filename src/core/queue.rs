@@ -9,11 +9,12 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use super::config::scrub_sensitive_text;
+use super::db::ensure_wal_journal_mode;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STARTUP_RECLAIM_STALE_SECS: i64 = 60;
 const COMPLETION_METRICS_WINDOW_MINS: u64 = 10;
-const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const LAST_ERROR_MAX_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error)]
@@ -772,7 +773,7 @@ impl PendingMessageStore {
     }
 
     pub fn operation_status(&self, id: &str) -> Result<Option<PendingOperationRecord>> {
-        let conn = self.open_connection()?;
+        let conn = self.open_query_connection()?;
         if let Some(record) = operation_status_from_pending(&conn, id)? {
             return Ok(Some(record));
         }
@@ -1025,7 +1026,7 @@ impl PendingMessageStore {
     }
 
     pub fn stats(&self) -> Result<QueueStats> {
-        let conn = self.open_connection()?;
+        let conn = self.open_query_connection()?;
         compute_queue_stats(&conn)
     }
 
@@ -1039,8 +1040,15 @@ impl PendingMessageStore {
     ) -> Result<Connection> {
         let conn = Connection::open(&self.db_path)?;
         conn.busy_timeout(busy_timeout.unwrap_or(DEFAULT_BUSY_TIMEOUT))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        ensure_wal_journal_mode(&conn)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(conn)
+    }
+
+    fn open_query_connection(&self) -> Result<Connection> {
+        let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+        conn.pragma_update(None, "query_only", "ON")?;
         Ok(conn)
     }
 
@@ -1689,5 +1697,41 @@ mod tests {
             .expect("async ingest row remains visible");
         assert_eq!(ingest_status.op_state, "queued");
         assert!(ingest_status.claimed_at.is_none());
+    }
+
+    #[test]
+    fn status_and_stats_read_through_writer_lock() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(&db_path).expect("open queue");
+        let ingest_id = store
+            .enqueue("ingest_async", r#"{"request":{}}"#)
+            .expect("enqueue async ingest");
+
+        let lock_holder = Connection::open(&db_path).expect("open lock holder");
+        lock_holder
+            .busy_timeout(Duration::from_millis(25))
+            .expect("set lock holder busy timeout");
+        lock_holder
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+
+        let status = store
+            .operation_status(&ingest_id)
+            .expect("operation status should not need startup writes")
+            .expect("operation remains visible");
+        let stats = store.stats().expect("stats should not need startup writes");
+
+        assert_eq!(status.op_state, "queued");
+        assert_eq!(stats.pending, 1);
+    }
+
+    #[test]
+    fn queue_busy_timeout_covers_smoke_read_write_contention() {
+        assert!(
+            DEFAULT_BUSY_TIMEOUT >= Duration::from_secs(30),
+            "async ingest queue writes must outwait transient full-smoke read/write contention"
+        );
     }
 }
