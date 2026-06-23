@@ -1225,8 +1225,8 @@ impl MempalMcpServer {
         });
         match tokio::time::timeout(deadline, read).await {
             Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(ErrorData::internal_error(
-                format!("{stage} database task failed: {error}"),
+            Ok(Err(join_error)) => Err(ErrorData::internal_error(
+                format!("{stage} database task failed: {join_error}"),
                 None,
             )),
             Err(_) => Err(mcp_stage_timeout_error(
@@ -9908,6 +9908,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use rmcp::model::ErrorCode;
     use rusqlite::params;
     use tempfile::TempDir;
     use tokio::sync::Notify;
@@ -10037,6 +10038,25 @@ mod tests {
         .expect("create MCP server")
         .with_async_db_for_test(async_db);
         (tempdir, db_path, server)
+    }
+
+    #[tokio::test]
+    async fn test_query_only_read_preserves_mcp_error_data() {
+        let (_tempdir, _db_path, server) = setup_server();
+
+        let error = server
+            .run_query_only_read_bounded(
+                "test_query_only_read",
+                Duration::from_secs(1),
+                |_db| -> std::result::Result<(), ErrorData> {
+                    Err(ErrorData::invalid_params("preserve caller error", None))
+                },
+            )
+            .await
+            .expect_err("closure ErrorData must be returned unchanged");
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(error.message, "preserve caller error");
     }
 
     fn hold_sqlite_write_lock(db_path: PathBuf, hold_for: Duration) -> thread::JoinHandle<()> {
