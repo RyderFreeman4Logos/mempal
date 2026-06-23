@@ -5071,6 +5071,7 @@ impl ResolvedStdinIngest {
             wait: Some(true),
             wait_timeout_secs: Some(wait_timeout_secs),
             diary_rollup: Some(false),
+            smoke: None,
             importance: Some(self.drawer_importance),
             memory_kind: Some(memory_kind_slug(&self.memory_kind).to_string()),
             domain: Some(domain_slug(&self.domain).to_string()),
