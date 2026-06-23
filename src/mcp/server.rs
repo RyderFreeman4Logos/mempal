@@ -795,13 +795,9 @@ impl MempalMcpServer {
         let writer_lease = if external_writer_lease.is_some() {
             None
         } else {
-            match self
-                .acquire_ingest_writer_lease(worker_id)
-                .await
-                .context("failed to acquire MCP ingest writer lease")?
-            {
-                Some(lease) => Some(lease),
-                None => {
+            match self.acquire_ingest_writer_lease(worker_id).await {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
                     queue
                         .release_claim(claim)
@@ -809,6 +805,17 @@ impl MempalMcpServer {
                         .context("failed to release ingest claim after writer lease conflict")?;
                     tokio::time::sleep(INGEST_POLL_INTERVAL).await;
                     return Ok(());
+                }
+                Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
+                    Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+                    queue.release_claim(claim).await.context(
+                        "failed to release ingest claim after transient writer lease lock",
+                    )?;
+                    tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(error).context("failed to acquire MCP ingest writer lease");
                 }
             }
         };
@@ -861,19 +868,26 @@ impl MempalMcpServer {
         let writer_lease = if external_writer_lease.is_some() {
             None
         } else {
-            match self
-                .acquire_ingest_writer_lease(worker_id)
-                .await
-                .context("failed to acquire scoped MCP ingest writer lease")?
-            {
-                Some(lease) => Some(lease),
-                None => {
+            match self.acquire_ingest_writer_lease(worker_id).await {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
                     queue.release_claim(claim).await.context(
                         "failed to release scoped ingest claim after writer lease conflict",
                     )?;
                     tokio::time::sleep(INGEST_POLL_INTERVAL).await;
                     return Ok(());
+                }
+                Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
+                    Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+                    queue.release_claim(claim).await.context(
+                        "failed to release scoped ingest claim after transient writer lease lock",
+                    )?;
+                    tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(error).context("failed to acquire scoped MCP ingest writer lease");
                 }
             }
         };
@@ -1947,6 +1961,34 @@ const MCP_SMOKE_CONTENT_MAX_BYTES: usize = 4 * 1024;
 
 fn clamp_wait_timeout(timeout: Duration) -> Duration {
     timeout.min(Duration::from_secs(MAX_WAIT_TIMEOUT_SECS))
+}
+
+fn rusqlite_error_is_lock(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite, _)
+            if matches!(
+                sqlite.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+                || matches!(
+                    sqlite.extended_code & 0xff,
+                    rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED
+                )
+    )
+}
+
+fn anyhow_chain_contains_sqlite_lock(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(rusqlite_error_is_lock)
+            || cause
+                .downcast_ref::<crate::core::db::DbError>()
+                .is_some_and(|db_error| {
+                    matches!(db_error, crate::core::db::DbError::Sqlite(error) if rusqlite_error_is_lock(error))
+                })
+    })
 }
 
 fn resolve_mcp_ingest_controls(
@@ -4915,22 +4957,21 @@ impl MempalMcpServer {
                 .operation_id
                 .as_deref()
                 .expect("queued receipt must include operation id");
-            let wait_result =
-                if matches!(worker_mode, IngestWaitWorkerMode::Scoped) && wait_timeout_secs > 0 {
-                    self.wait_for_operation_status_with_scoped_worker(
-                        operation_id,
-                        Duration::from_secs(wait_timeout_secs),
-                        Duration::from_millis(150),
-                    )
-                    .await
-                } else {
-                    self.wait_for_operation_status(
-                        operation_id,
-                        Duration::from_secs(wait_timeout_secs),
-                        Duration::from_millis(150),
-                    )
-                    .await
-                };
+            let wait_result = if wait_timeout_secs > 0 {
+                self.wait_for_operation_status_with_scoped_worker(
+                    operation_id,
+                    Duration::from_secs(wait_timeout_secs),
+                    Duration::from_millis(150),
+                )
+                .await
+            } else {
+                self.wait_for_operation_status(
+                    operation_id,
+                    Duration::from_secs(wait_timeout_secs),
+                    Duration::from_millis(150),
+                )
+                .await
+            };
             if let Some(final_response) = wait_result? {
                 return Ok(Json(final_response));
             }
@@ -13944,6 +13985,57 @@ pattern_boost = 0.2
 
         let db = Database::open(&db_path).expect("open db");
         assert_eq!(db.drawer_count().expect("drawer count"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_wait_supersedes_returns_cleanup_ids_without_background_worker() {
+        let (_tempdir, db_path, server) = setup_server();
+        let old = ingest_manual(&server, "wait scoped supersedes old fact", None, None, None).await;
+
+        server.ingest_worker_started.store(true, Ordering::SeqCst);
+        let update = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "wait scoped supersedes new fact".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("replace".to_string()),
+                supersedes: Some(old.drawer_id.clone()),
+                wait: Some(true),
+                wait_timeout_secs: Some(30),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("wait supersedes ingest")
+            .0;
+
+        assert_eq!(update.state, Some(IngestOperationState::Completed));
+        assert_eq!(
+            update.superseded_drawer_id.as_deref(),
+            Some(old.drawer_id.as_str())
+        );
+        assert_eq!(
+            update.created_drawer_ids.len(),
+            1,
+            "supersedes wait response must expose cleanup-safe new drawer id"
+        );
+        assert_eq!(update.drawer_ids, update.created_drawer_ids);
+        assert_ne!(update.created_drawer_ids[0], old.drawer_id);
+
+        let operation_id = update.operation_id.as_deref().expect("operation id");
+        let status = server
+            .operation_status_json_for_test(operation_id)
+            .await
+            .expect("wait supersedes status");
+        assert_eq!(status.state, Some(IngestOperationState::Completed));
+        assert_eq!(status.created_drawer_ids, update.created_drawer_ids);
+        assert_eq!(status.drawer_ids, status.created_drawer_ids);
+
+        let db = Database::open(&db_path).expect("open db");
+        assert!(db.get_drawer(&old.drawer_id).expect("old lookup").is_none());
+        assert!(
+            db.get_drawer(&update.created_drawer_ids[0])
+                .expect("new lookup")
+                .is_some()
+        );
     }
 
     #[tokio::test]

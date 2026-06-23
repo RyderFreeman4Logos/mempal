@@ -333,7 +333,7 @@ def count_marker_matches(value: Any, room: str) -> int:
     return count
 
 
-def delete_exact_ids_cli(drawer_ids: list[str], label: str) -> dict[str, Any]:
+def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = None) -> dict[str, Any]:
     unique_ids = list(dict.fromkeys(drawer_ids))
     deleted = 0
     failed = 0
@@ -351,6 +351,16 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str) -> dict[str, Any]:
             deleted += 1
         else:
             failed += 1
+    active_matches_after_failed_deletes: int | None = None
+    if failed > 0 and deleted == 0 and room is not None:
+        rc, _out, _err, parsed, _shape = run_cli(
+            label + '_post_cleanup_search',
+            ['mempal', 'search', MARKER, '--top-k', '5', '--json'],
+            expect_json=True,
+            timeout=180,
+        )
+        if rc == 0:
+            active_matches_after_failed_deletes = count_marker_matches(parsed, room)
     result = {
         'attempted_count': len(unique_ids),
         'deleted_count': deleted,
@@ -358,7 +368,16 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str) -> dict[str, Any]:
         'stdout_bytes': stdout_bytes,
         'stderr_bytes': stderr_bytes,
     }
-    note(label, failed == 0 or deleted > 0 or not unique_ids, **result)
+    if active_matches_after_failed_deletes is not None:
+        result['active_matches_after_failed_deletes'] = active_matches_after_failed_deletes
+    note(
+        label,
+        failed == 0
+        or deleted > 0
+        or not unique_ids
+        or active_matches_after_failed_deletes == 0,
+        **result,
+    )
     return result
 
 
@@ -413,7 +432,7 @@ def cli_crud() -> list[str]:
         upd_parsed2 = wait_operation(upd_parsed['operation_id'], 'cli_update_wait')
         upd_ids = created_ids_from(upd_parsed2)
     if not upd_ids:
-        delete_exact_ids_cli(cleanup_ids, 'cli_cleanup_after_update_failure')
+        delete_exact_ids_cli(cleanup_ids, 'cli_cleanup_after_update_failure', room='cli')
         note('cli_crud', False, reason='update_missing_created_drawer_ids', cleanup_id_count=len(cleanup_ids))
         return cleanup_ids
     cleanup_ids.extend(upd_ids)
@@ -656,7 +675,7 @@ def mcp_crud() -> list[str]:
                 upd_ids = created_ids_from(waited)
         note('mcp_update', bool(uinfo.get('ok')) and bool(upd_ids), created_id_count=len(upd_ids), **without_ok(uinfo))
         if not upd_ids:
-            delete_exact_ids_cli(cleanup_ids, 'mcp_cleanup_after_update_failure')
+            delete_exact_ids_cli(cleanup_ids, 'mcp_cleanup_after_update_failure', room='mcp')
             note(
                 'mcp_inconclusive_no_cleanup_id',
                 False,

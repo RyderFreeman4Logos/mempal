@@ -5069,12 +5069,18 @@ impl Database {
     ) -> Result<Option<RuntimeWriterLease>, DbError> {
         let mut session_id = String::new();
         let mut acquired = false;
+        let mut acquired_at = String::new();
+        let mut expires_at = String::new();
+        let pid = std::process::id();
+        let boot_id = runtime_boot_id();
         self.with_immediate_tx(|| {
             self.runtime_writer_lease_cleanup_expired_tx()?;
             session_id = runtime_writer_session_id(name, owner);
-            let now = crate::cowork::peek::format_rfc3339(SystemTime::now());
-            let expires_at =
-                crate::cowork::peek::format_rfc3339(SystemTime::now() + std::time::Duration::from_secs(ttl_secs));
+            let now_time = SystemTime::now();
+            acquired_at = crate::cowork::peek::format_rfc3339(now_time);
+            expires_at = crate::cowork::peek::format_rfc3339(
+                now_time + std::time::Duration::from_secs(ttl_secs),
+            );
             let rows = self.conn.execute(
                 "INSERT OR IGNORE INTO runtime_writer_leases \
                  (name, owner, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json) \
@@ -5082,10 +5088,10 @@ impl Database {
                 params![
                     name,
                     owner,
-                    std::process::id() as i64,
-                    runtime_boot_id(),
+                    pid as i64,
+                    &boot_id,
                     &session_id,
-                    &now,
+                    &acquired_at,
                     &expires_at,
                     mode,
                     metadata_json
@@ -5095,8 +5101,20 @@ impl Database {
             Ok(())
         })?;
         if acquired {
-            self.runtime_writer_lease_status(Some(name))
-                .map(|mut leases| leases.pop())
+            let remaining_secs = i64::try_from(ttl_secs).unwrap_or(i64::MAX);
+            Ok(Some(RuntimeWriterLease {
+                name: name.to_string(),
+                owner: owner.to_string(),
+                pid,
+                boot_id,
+                session_id,
+                acquired_at: acquired_at.clone(),
+                expires_at,
+                heartbeat_at: acquired_at,
+                mode: mode.to_string(),
+                metadata_json: metadata_json.map(ToOwned::to_owned),
+                remaining_secs,
+            }))
         } else {
             Ok(None)
         }
