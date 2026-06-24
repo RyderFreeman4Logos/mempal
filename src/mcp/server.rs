@@ -5073,6 +5073,7 @@ impl MempalMcpServer {
         controls: IngestControls,
         worker_mode: IngestWaitWorkerMode,
     ) -> std::result::Result<Json<IngestResponse>, ErrorData> {
+        let request_started_at = Instant::now();
         let dry_run = request.dry_run.unwrap_or(false);
         let controls = resolve_mcp_ingest_controls(&request, controls)?;
         if !dry_run && global_embed_status().should_block_writes() {
@@ -5225,17 +5226,31 @@ impl MempalMcpServer {
                 .operation_id
                 .as_deref()
                 .expect("queued receipt must include operation id");
-            let wait_result = if wait_timeout_secs > 0 && use_local_ingest_worker {
+            let wait_timeout = Duration::from_secs(wait_timeout_secs);
+            let wait_remaining = wait_timeout
+                .checked_sub(request_started_at.elapsed())
+                .unwrap_or_default();
+            let wait_result = if wait_timeout_secs == 0 {
+                self.wait_for_operation_status_with_lookup_policy(
+                    operation_id,
+                    Duration::ZERO,
+                    Duration::from_millis(150),
+                    queue_admission.daemon_enqueue_may_have_reached,
+                )
+                .await
+            } else if wait_remaining.is_zero() {
+                Ok(None)
+            } else if use_local_ingest_worker {
                 self.wait_for_operation_status_with_scoped_worker(
                     operation_id,
-                    Duration::from_secs(wait_timeout_secs),
+                    wait_remaining,
                     Duration::from_millis(150),
                 )
                 .await
             } else {
                 self.wait_for_operation_status_with_lookup_policy(
                     operation_id,
-                    Duration::from_secs(wait_timeout_secs),
+                    wait_remaining,
                     Duration::from_millis(150),
                     queue_admission.daemon_enqueue_may_have_reached,
                 )
@@ -11807,6 +11822,36 @@ pattern_boost = 0.2
             .expect("operation must be durable when receipt is returned");
         assert_eq!(record.id, operation_id);
         assert_eq!(record.kind, INGEST_ASYNC_KIND);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_wait_budget_includes_queue_admission() {
+        let (_tempdir, db_path, server) = setup_server();
+        let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_blocking_delay(Duration::from_millis(1200));
+        let server = server.with_async_queue_for_test(async_queue);
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(1700),
+            server.mempal_ingest(Parameters(IngestRequest {
+                content: "slow queue admission should not extend MCP wait budget".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("receipt".to_string()),
+                dry_run: Some(false),
+                wait: Some(true),
+                wait_timeout_secs: Some(1),
+                ..IngestRequest::default()
+            })),
+        )
+        .await
+        .expect("MCP ingest should return the queued receipt without a second slow status lookup")
+        .expect("slow queue admission should still return a receipt")
+        .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.timed_out);
+        assert!(response.operation_id.is_some());
+        assert!(response.created_drawer_ids.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

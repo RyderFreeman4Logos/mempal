@@ -45,6 +45,7 @@ def note(name: str, ok: bool, **fields: Any) -> None:
     safe = {'ok': ok}
     safe.update(fields)
     SUMMARY['groups'][name] = safe
+    SUMMARY['failures'] = [failure for failure in SUMMARY['failures'] if failure != name]
     if not ok:
         SUMMARY['failures'].append(name)
 
@@ -403,6 +404,8 @@ def cli_crud() -> list[str]:
     if not ids and isinstance(parsed, dict) and parsed.get('operation_id'):
         parsed2 = wait_operation(parsed['operation_id'], 'cli_create_wait')
         ids = created_ids_from(parsed2)
+        if ids:
+            note('cli_create', True, recovered_via='cli_create_wait', created_id_count=len(ids))
     if not ids:
         note('cli_crud', False, reason='create_missing_created_drawer_ids')
         return cleanup_ids
@@ -432,6 +435,8 @@ def cli_crud() -> list[str]:
     if not upd_ids and isinstance(upd_parsed, dict) and upd_parsed.get('operation_id'):
         upd_parsed2 = wait_operation(upd_parsed['operation_id'], 'cli_update_wait')
         upd_ids = created_ids_from(upd_parsed2)
+        if upd_ids:
+            note('cli_update', True, recovered_via='cli_update_wait', created_id_count=len(upd_ids))
     if not upd_ids:
         delete_exact_ids_cli(cleanup_ids, 'cli_cleanup_after_update_failure', room='cli')
         note('cli_crud', False, reason='update_missing_created_drawer_ids', cleanup_id_count=len(cleanup_ids))
