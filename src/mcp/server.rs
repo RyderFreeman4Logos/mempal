@@ -2451,22 +2451,10 @@ enum IngestQueueProcessor {
     Local,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum DaemonIngestEnqueue {
-    Accepted,
+    Accepted { operation_id: String },
     Fallback { may_have_reached_daemon: bool },
-}
-
-impl DaemonIngestEnqueue {
-    fn may_have_reached_daemon(self) -> bool {
-        matches!(
-            self,
-            Self::Accepted
-                | Self::Fallback {
-                    may_have_reached_daemon: true
-                }
-        )
-    }
 }
 
 fn should_defer_local_ingest_to_daemon(
@@ -5308,17 +5296,18 @@ impl MempalMcpServer {
         let daemon_enqueue = self
             .try_enqueue_ingest_operation_via_daemon(payload.clone(), idempotency_key.clone())
             .await?;
-        if matches!(daemon_enqueue, DaemonIngestEnqueue::Accepted) {
-            let operation_id =
-                PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &idempotency_key);
-            return Ok(IngestQueueAdmission {
-                operation_id,
-                processor: IngestQueueProcessor::Daemon,
-                daemon_enqueue_may_have_reached: true,
-            });
-        }
-
-        let daemon_enqueue_may_have_reached = daemon_enqueue.may_have_reached_daemon();
+        let daemon_enqueue_may_have_reached = match daemon_enqueue {
+            DaemonIngestEnqueue::Accepted { operation_id } => {
+                return Ok(IngestQueueAdmission {
+                    operation_id,
+                    processor: IngestQueueProcessor::Daemon,
+                    daemon_enqueue_may_have_reached: true,
+                });
+            }
+            DaemonIngestEnqueue::Fallback {
+                may_have_reached_daemon,
+            } => may_have_reached_daemon,
+        };
         let operation_id = match self
             .enqueue_ingest_operation_locally_with_retry(payload, idempotency_key.clone())
             .await
@@ -5330,10 +5319,18 @@ impl MempalMcpServer {
                     daemon_enqueue_may_have_reached,
                     &error,
                 ) {
+                    if !self
+                        .daemon_admitted_operation_is_visible(&admission.operation_id)
+                        .await?
+                    {
+                        return Err(error.context(
+                            "daemon enqueue may have reached daemon but no queryable operation row was visible",
+                        ));
+                    }
                     tracing::warn!(
                         operation_id = %admission.operation_id,
                         error = %error,
-                        "local ingest queue admission failed after daemon enqueue may have reached daemon; preserving operation receipt"
+                        "local ingest queue admission failed after daemon enqueue may have reached daemon; returning verified operation receipt"
                     );
                     return Ok(admission);
                 }
@@ -5429,7 +5426,7 @@ impl MempalMcpServer {
         let request = crate::hook_ipc::HookIpcEnqueueRequest {
             kind: INGEST_ASYNC_KIND.to_string(),
             payload,
-            idempotency_key,
+            idempotency_key: idempotency_key.clone(),
         };
         let outcome = tokio::task::spawn_blocking(move || {
             crate::hook_ipc::enqueue_with_timeout(
@@ -5442,7 +5439,24 @@ impl MempalMcpServer {
         .context("blocking daemon ingest enqueue IPC failed")?;
 
         match outcome {
-            crate::hook_ipc::HookIpcClientOutcome::Accepted => Ok(DaemonIngestEnqueue::Accepted),
+            crate::hook_ipc::HookIpcClientOutcome::Accepted => {
+                let operation_id =
+                    PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &idempotency_key);
+                if self
+                    .daemon_admitted_operation_is_visible(&operation_id)
+                    .await?
+                {
+                    Ok(DaemonIngestEnqueue::Accepted { operation_id })
+                } else {
+                    tracing::warn!(
+                        operation_id,
+                        "daemon ingest enqueue ACK did not expose a queryable operation row; falling back to local idempotent admission"
+                    );
+                    Ok(DaemonIngestEnqueue::Fallback {
+                        may_have_reached_daemon: true,
+                    })
+                }
+            }
             crate::hook_ipc::HookIpcClientOutcome::Fallback(reason) => {
                 let may_have_reached_daemon = reason.may_have_reached_daemon();
                 tracing::debug!(
@@ -5453,6 +5467,35 @@ impl MempalMcpServer {
                 Ok(DaemonIngestEnqueue::Fallback {
                     may_have_reached_daemon,
                 })
+            }
+        }
+    }
+
+    async fn daemon_admitted_operation_is_visible(
+        &self,
+        operation_id: &str,
+    ) -> anyhow::Result<bool> {
+        let deadline = Instant::now() + MCP_OPERATION_STATUS_DEADLINE;
+        loop {
+            match self
+                .async_queue
+                .operation_status(operation_id.to_string())
+                .await
+            {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) => return Ok(false),
+                Err(error) if error.is_sqlite_lock() && Instant::now() < deadline => {
+                    tokio::time::sleep(
+                        MCP_INGEST_QUEUE_LOCK_RETRY_DELAY
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
+                }
+                Err(error) if error.is_sqlite_lock() => return Ok(false),
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context("failed to verify daemon-admitted ingest operation"));
+                }
             }
         }
     }
@@ -10968,6 +11011,62 @@ quality_policy = "llm_required_for_keep"
         let (tempdir, db_path, server) = setup_server();
         let (listener, _socket_guard) =
             crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
+        let daemon_db_path = db_path.clone();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
+            let request = crate::hook_ipc::read_enqueue_request(&mut stream)
+                .await
+                .expect("read daemon IPC request");
+            let operation_id = PendingMessageStore::new_without_reclaim(&daemon_db_path)
+                .enqueue_idempotent_with_key(
+                    &request.kind,
+                    &request.payload,
+                    &request.idempotency_key,
+                )
+                .expect("persist daemon-admitted operation");
+            crate::hook_ipc::write_enqueue_response(
+                &mut stream,
+                &crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
+            )
+            .await
+            .expect("write daemon IPC response");
+            (request, operation_id)
+        });
+
+        let response = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "daemon-owned MCP queue admission".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("busy".to_string()),
+                wait: Some(false),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("ingest admission should succeed")
+            .0;
+
+        let (request, persisted_operation_id) = daemon.await.expect("daemon IPC task");
+        assert_eq!(request.kind, INGEST_ASYNC_KIND);
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        assert_eq!(operation_id, persisted_operation_id);
+        assert_eq!(
+            operation_id,
+            PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key)
+        );
+        let local_record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(operation_id)
+            .expect("query queue")
+            .expect("daemon-accepted operation must be status-queryable");
+        assert_eq!(local_record.id, operation_id);
+        assert_eq!(local_record.op_state, IngestOperationState::Queued.as_str());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_mcp_ingest_falls_back_when_daemon_ack_lacks_queryable_operation() {
+        let (tempdir, db_path, server) = setup_server();
+        let (listener, _socket_guard) =
+            crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
         let daemon = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
             let request = crate::hook_ipc::read_enqueue_request(&mut stream)
@@ -10984,30 +11083,32 @@ quality_policy = "llm_required_for_keep"
 
         let response = server
             .mempal_ingest(Parameters(IngestRequest {
-                content: "daemon-owned MCP queue admission".to_string(),
+                content: "daemon ACK without durable operation must use local admission"
+                    .to_string(),
                 wing: "mcp".to_string(),
-                room: Some("busy".to_string()),
-                wait: Some(false),
+                room: Some("receipt".to_string()),
+                wait: Some(true),
+                wait_timeout_secs: Some(0),
                 ..IngestRequest::default()
             }))
             .await
-            .expect("ingest admission should succeed")
+            .expect("ingest admission should recover with local idempotent enqueue")
             .0;
 
         let request = daemon.await.expect("daemon IPC task");
-        assert_eq!(request.kind, INGEST_ASYNC_KIND);
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.timed_out);
         let operation_id = response.operation_id.as_deref().expect("operation id");
         assert_eq!(
             operation_id,
             PendingMessageStore::idempotent_message_id(INGEST_ASYNC_KIND, &request.idempotency_key)
         );
-        let local_record = PendingMessageStore::new_without_reclaim(&db_path)
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
             .operation_status(operation_id)
-            .expect("query local queue");
-        assert!(
-            local_record.is_none(),
-            "MCP admission should not write the local queue when daemon IPC accepts"
-        );
+            .expect("query operation")
+            .expect("returned operation id must be queryable");
+        assert_eq!(record.id, operation_id);
+        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
     }
 
     #[cfg(unix)]
