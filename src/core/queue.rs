@@ -9,12 +9,15 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use super::config::scrub_sensitive_text;
-use super::db::ensure_wal_journal_mode;
+use super::db::{ensure_wal_journal_mode, rusqlite_error_is_lock};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STARTUP_RECLAIM_STALE_SECS: i64 = 60;
 const COMPLETION_METRICS_WINDOW_MINS: u64 = 10;
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const CLAIM_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+const CLAIM_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(2);
+const CLAIM_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub const LAST_ERROR_MAX_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error)]
@@ -35,18 +38,7 @@ pub enum QueueError {
 
 impl QueueError {
     pub fn is_sqlite_lock(&self) -> bool {
-        matches!(
-            self,
-            Self::Sqlite(rusqlite::Error::SqliteFailure(sqlite, _))
-                if matches!(
-                    sqlite.code,
-                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                )
-                    || matches!(
-                        sqlite.extended_code & 0xff,
-                        rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED
-                    )
-        )
+        matches!(self, Self::Sqlite(error) if rusqlite_error_is_lock(error))
     }
 }
 
@@ -514,7 +506,15 @@ impl PendingMessageStore {
         worker_id: &str,
         claim_ttl_secs: i64,
     ) -> Result<Option<ClaimedMessage>> {
-        let mut conn = self.open_connection()?;
+        self.with_claim_lock_retry(|| self.claim_next_once(worker_id, claim_ttl_secs))
+    }
+
+    fn claim_next_once(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+    ) -> Result<Option<ClaimedMessage>> {
+        let mut conn = self.open_claim_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
@@ -586,7 +586,18 @@ impl PendingMessageStore {
         claim_ttl_secs: i64,
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
-        let mut conn = self.open_connection()?;
+        self.with_claim_lock_retry(|| {
+            self.claim_next_by_kind_once(worker_id, claim_ttl_secs, kind_filter)
+        })
+    }
+
+    fn claim_next_by_kind_once(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+        kind_filter: &str,
+    ) -> Result<Option<ClaimedMessage>> {
+        let mut conn = self.open_claim_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
@@ -658,7 +669,19 @@ impl PendingMessageStore {
         id_filter: &str,
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
-        let mut conn = self.open_connection()?;
+        self.with_claim_lock_retry(|| {
+            self.claim_by_id_and_kind_once(worker_id, claim_ttl_secs, id_filter, kind_filter)
+        })
+    }
+
+    fn claim_by_id_and_kind_once(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+        id_filter: &str,
+        kind_filter: &str,
+    ) -> Result<Option<ClaimedMessage>> {
+        let mut conn = self.open_claim_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
@@ -1032,6 +1055,25 @@ impl PendingMessageStore {
 
     fn open_connection(&self) -> Result<Connection> {
         self.open_connection_with_busy_timeout(None)
+    }
+
+    fn open_claim_connection(&self) -> Result<Connection> {
+        self.open_connection_with_busy_timeout(Some(CLAIM_BUSY_TIMEOUT))
+    }
+
+    fn with_claim_lock_retry<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+        let started = std::time::Instant::now();
+        loop {
+            match op() {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if error.is_sqlite_lock() && started.elapsed() < CLAIM_LOCK_RETRY_DEADLINE =>
+                {
+                    std::thread::sleep(CLAIM_LOCK_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn open_connection_with_busy_timeout(
@@ -1732,6 +1774,41 @@ mod tests {
         assert!(
             DEFAULT_BUSY_TIMEOUT >= Duration::from_secs(30),
             "async ingest queue writes must outwait transient full-smoke read/write contention"
+        );
+    }
+
+    #[test]
+    fn claim_next_uses_bounded_sqlite_lock_budget() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(&db_path).expect("open queue");
+        store
+            .enqueue("hook", r#"{"request":{}}"#)
+            .expect("enqueue async ingest");
+
+        let lock_holder = Connection::open(&db_path).expect("open lock holder");
+        lock_holder
+            .busy_timeout(Duration::ZERO)
+            .expect("set fail-fast lock holder timeout");
+        lock_holder
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+
+        let started = std::time::Instant::now();
+        let error = store
+            .claim_next("worker-a", 60)
+            .expect_err("claim should exhaust the bounded lock budget");
+        let elapsed = started.elapsed();
+
+        lock_holder
+            .execute_batch("ROLLBACK;")
+            .expect("release write lock");
+
+        assert!(error.is_sqlite_lock());
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "claim lock budget must not monopolize queue blocking workers for the 30s default busy timeout"
         );
     }
 }

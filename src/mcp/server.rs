@@ -181,6 +181,9 @@ const MCP_INGEST_WRITER_LEASE_TTL_SECS: u64 = 120;
 const MCP_CONTENT_WRITER_LEASE_TTL_SECS: u64 = 120;
 const MCP_INGEST_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 const MCP_CONTENT_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+const MCP_WRITER_LEASE_RENEW_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+const MCP_WRITER_LEASE_RENEW_RETRY_DEADLINE: Duration = Duration::from_secs(5);
+const MCP_WRITER_LEASE_RENEW_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 fn mcp_ingest_idempotency_key(payload: &str) -> String {
     let now_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -1202,13 +1205,7 @@ impl MempalMcpServer {
                         let db_path = db_path.clone();
                         let lease_for_renew = lease.clone();
                         let renew_result = tokio::task::spawn_blocking(move || {
-                            let db = Database::open(&db_path)?;
-                            db.runtime_writer_lease_renew(
-                                &lease_for_renew.name,
-                                &lease_for_renew.owner,
-                                &lease_for_renew.session_id,
-                                ttl_secs,
-                            )
+                            renew_mcp_writer_lease_with_retry(&db_path, &lease_for_renew, ttl_secs)
                         })
                         .await;
                         match renew_result {
@@ -2130,6 +2127,35 @@ fn anyhow_chain_contains_sqlite_lock(error: &anyhow::Error) -> bool {
                     matches!(db_error, crate::core::db::DbError::Sqlite(error) if rusqlite_error_is_lock(error))
                 })
     })
+}
+
+fn renew_mcp_writer_lease_with_retry(
+    db_path: &Path,
+    lease: &RuntimeWriterLease,
+    ttl_secs: u64,
+) -> anyhow::Result<bool> {
+    let started = Instant::now();
+    loop {
+        match renew_mcp_writer_lease_once(db_path, lease, ttl_secs) {
+            Ok(renewed) => return Ok(renewed),
+            Err(error)
+                if anyhow_chain_contains_sqlite_lock(&error)
+                    && started.elapsed() < MCP_WRITER_LEASE_RENEW_RETRY_DEADLINE =>
+            {
+                std::thread::sleep(MCP_WRITER_LEASE_RENEW_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn renew_mcp_writer_lease_once(
+    db_path: &Path,
+    lease: &RuntimeWriterLease,
+    ttl_secs: u64,
+) -> anyhow::Result<bool> {
+    let db = Database::open_with_busy_timeout(db_path, MCP_WRITER_LEASE_RENEW_BUSY_TIMEOUT)?;
+    Ok(db.runtime_writer_lease_renew(&lease.name, &lease.owner, &lease.session_id, ttl_secs)?)
 }
 
 fn resolve_mcp_ingest_controls(

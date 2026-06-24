@@ -260,6 +260,25 @@ pub(crate) fn ensure_wal_journal_mode(conn: &Connection) -> rusqlite::Result<()>
     Ok(())
 }
 
+pub fn rusqlite_error_is_lock(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite, _)
+            if matches!(
+                sqlite.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+                || matches!(
+                    sqlite.extended_code & 0xff,
+                    rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED
+                )
+    )
+}
+
+pub fn db_error_is_sqlite_lock(error: &DbError) -> bool {
+    matches!(error, DbError::Sqlite(sqlite) if rusqlite_error_is_lock(sqlite))
+}
+
 #[derive(Debug, Error)]
 pub enum DbError {
     #[error("failed to create database directory for {path}")]
