@@ -1508,6 +1508,24 @@ impl MempalMcpServer {
         .map(|response| response.0)
     }
 
+    async fn operation_status_json_within(
+        &self,
+        operation_id: &str,
+        timeout: Duration,
+    ) -> std::result::Result<Option<IngestResponse>, ErrorData> {
+        let timeout = clamp_wait_timeout(timeout);
+        if timeout.is_zero() {
+            return Ok(None);
+        }
+
+        match tokio::time::timeout(timeout, self.operation_status_json_for_test(operation_id)).await
+        {
+            Ok(Ok(response)) => Ok(Some(response)),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(None),
+        }
+    }
+
     pub async fn wait_for_operation_status(
         &self,
         operation_id: &str,
@@ -1530,10 +1548,19 @@ impl MempalMcpServer {
         poll_interval: Duration,
         allow_pending_admission_lookup: bool,
     ) -> std::result::Result<Option<IngestResponse>, ErrorData> {
-        let deadline = Instant::now() + clamp_wait_timeout(timeout);
+        let timeout = clamp_wait_timeout(timeout);
+        let deadline = Instant::now() + timeout;
         loop {
-            match self.operation_status_json_for_test(operation_id).await {
-                Ok(response) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+
+            match self
+                .operation_status_json_within(operation_id, remaining)
+                .await
+            {
+                Ok(Some(response)) => {
                     if response
                         .state
                         .map(IngestOperationState::is_terminal)
@@ -1542,6 +1569,7 @@ impl MempalMcpServer {
                         return Ok(Some(response));
                     }
                 }
+                Ok(None) => return Ok(None),
                 Err(error)
                     if mcp_operation_wait_error_is_ignorable_during_wait(
                         &error,
@@ -1549,10 +1577,12 @@ impl MempalMcpServer {
                     ) => {}
                 Err(error) => return Err(error),
             }
-            if timeout.is_zero() || Instant::now() >= deadline {
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Ok(None);
             }
-            tokio::time::sleep(poll_interval).await;
+            tokio::time::sleep(poll_interval.min(remaining)).await;
         }
     }
 
@@ -1579,8 +1609,16 @@ impl MempalMcpServer {
         let queue = self.async_queue.clone();
 
         loop {
-            match self.operation_status_json_for_test(operation_id).await {
-                Ok(response) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+
+            match self
+                .operation_status_json_within(operation_id, remaining)
+                .await
+            {
+                Ok(Some(response)) => {
                     if response
                         .state
                         .map(IngestOperationState::is_terminal)
@@ -1589,23 +1627,29 @@ impl MempalMcpServer {
                         return Ok(Some(response));
                     }
                 }
+                Ok(None) => return Ok(None),
                 Err(error) if mcp_operation_wait_error_is_transient_lookup(&error) => {}
                 Err(error) => return Err(error),
             }
-            if timeout.is_zero() || Instant::now() >= deadline {
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Ok(None);
             }
 
-            match queue
-                .claim_by_id_and_kind(
+            match tokio::time::timeout(
+                remaining,
+                queue.claim_by_id_and_kind(
                     worker_id.clone(),
                     INGEST_CLAIM_TTL_SECS,
                     operation_id.to_string(),
                     INGEST_ASYNC_KIND.to_string(),
-                )
-                .await
+                ),
+            )
+            .await
             {
-                Ok(Some(claim)) => {
+                Err(_) => return Ok(None),
+                Ok(Ok(Some(claim))) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         Self::release_scoped_claim_after_timeout(&queue, claim).await?;
@@ -1630,14 +1674,14 @@ impl MempalMcpServer {
                         }
                     }
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Ok(None);
                     }
                     tokio::time::sleep(poll_interval.min(remaining)).await;
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     return Err(ErrorData::internal_error(
                         format!("scoped async ingest worker claim failed: {error}"),
                         None,
@@ -11142,6 +11186,36 @@ quality_policy = "llm_required_for_keep"
         assert!(
             started.elapsed() < Duration::from_millis(200),
             "visibility check exceeded its MCP status deadline budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_operation_wait_bounds_status_probe_by_wait_timeout() {
+        let (_tempdir, db_path, server) = setup_server();
+        let operation_id = PendingMessageStore::new_without_reclaim(&db_path)
+            .enqueue(INGEST_ASYNC_KIND, "{}")
+            .expect("enqueue operation");
+        let delayed_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_blocking_delay(Duration::from_millis(500));
+        let server = server.with_async_queue_for_test(delayed_queue);
+
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            server.wait_for_operation_status(
+                &operation_id,
+                Duration::from_millis(25),
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("operation wait must stay within the caller budget")
+        .expect("operation wait should return a bounded timeout receipt state");
+
+        assert!(response.is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "operation wait inherited the slower status lookup budget"
         );
     }
 
