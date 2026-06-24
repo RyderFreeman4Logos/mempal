@@ -1651,19 +1651,30 @@ impl MempalMcpServer {
                 return Ok(None);
             }
 
-            match tokio::time::timeout(
-                remaining,
-                queue.claim_by_id_and_kind(
-                    worker_id.clone(),
-                    INGEST_CLAIM_TTL_SECS,
-                    operation_id.to_string(),
-                    INGEST_ASYNC_KIND.to_string(),
-                ),
-            )
-            .await
-            {
-                Err(_) => return Ok(None),
-                Ok(Ok(Some(claim))) => {
+            let mut claim_task = tokio::spawn({
+                let queue = queue.clone();
+                let worker_id = worker_id.clone();
+                let operation_id = operation_id.to_string();
+                async move {
+                    queue
+                        .claim_by_id_and_kind(
+                            worker_id,
+                            INGEST_CLAIM_TTL_SECS,
+                            operation_id,
+                            INGEST_ASYNC_KIND.to_string(),
+                        )
+                        .await
+                }
+            });
+            tokio::select! {
+                result = &mut claim_task => match result {
+                    Err(error) => {
+                        return Err(ErrorData::internal_error(
+                            format!("scoped async ingest worker claim task failed: {error}"),
+                            None,
+                        ));
+                    }
+                    Ok(Ok(Some(claim))) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         Self::release_scoped_claim_after_timeout(&queue, claim).await?;
@@ -1688,21 +1699,56 @@ impl MempalMcpServer {
                         }
                     }
                 }
-                Ok(Ok(None)) => {
+                    Ok(Ok(None)) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Ok(None);
                     }
                     tokio::time::sleep(poll_interval.min(remaining)).await;
                 }
-                Ok(Err(error)) => {
+                    Ok(Err(error)) => {
                     return Err(ErrorData::internal_error(
                         format!("scoped async ingest worker claim failed: {error}"),
                         None,
                     ));
                 }
+                },
+                _ = tokio::time::sleep(remaining) => {
+                    Self::release_late_scoped_claim_after_timeout(queue.clone(), claim_task);
+                    return Ok(None);
+                }
             }
         }
+    }
+
+    fn release_late_scoped_claim_after_timeout(
+        queue: AsyncPendingMessageStore,
+        claim_task: tokio::task::JoinHandle<crate::core::queue::Result<Option<ClaimedMessage>>>,
+    ) {
+        let _release_task = tokio::spawn(async move {
+            match claim_task.await {
+                Ok(Ok(Some(claim))) => {
+                    if let Err(error) =
+                        Self::release_scoped_claim_after_timeout(&queue, claim).await
+                    {
+                        tracing::warn!(?error, "failed to release late scoped ingest claim");
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        ?error,
+                        "late scoped ingest claim failed after caller timeout"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "late scoped ingest claim task failed after caller timeout"
+                    );
+                }
+            }
+        });
     }
 
     async fn release_scoped_claim_after_timeout(
@@ -12110,6 +12156,60 @@ pattern_boost = 0.2
             started.elapsed() < Duration::from_millis(250),
             "scoped ingest performed an unbudgeted status refresh after wait budget exhaustion"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_scoped_late_claim_is_released_after_timeout() {
+        let (_tempdir, db_path, server) = setup_server();
+        let async_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_claim_blocking_delay(Duration::from_millis(1500));
+        let server = server.with_async_queue_for_test(async_queue);
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(1300),
+            server.mempal_ingest_with_controls_scoped_worker(
+                IngestRequest {
+                    content: "scoped wait must release a late queue claim after timeout"
+                        .to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("receipt".to_string()),
+                    dry_run: Some(false),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(1),
+                    ..IngestRequest::default()
+                },
+                IngestControls::default(),
+            ),
+        )
+        .await
+        .expect("scoped ingest must respect the caller wait timeout while claim is slow")
+        .expect("scoped ingest should return a timeout receipt")
+        .0;
+        let operation_id = response
+            .operation_id
+            .as_deref()
+            .expect("timeout receipt must include operation id")
+            .to_string();
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.timed_out);
+        assert!(response.created_drawer_ids.is_empty());
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let record = PendingMessageStore::new_without_reclaim(&db_path)
+                    .operation_status(&operation_id)
+                    .expect("load operation status")
+                    .expect("operation must stay queryable");
+                if record.claimed_at.is_none()
+                    && record.op_state == IngestOperationState::Queued.as_str()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("late scoped claim should be released instead of waiting for claim TTL");
     }
 
     #[tokio::test(flavor = "current_thread")]

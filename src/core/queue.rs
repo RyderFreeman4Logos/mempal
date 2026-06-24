@@ -135,6 +135,8 @@ pub struct AsyncPendingMessageStore {
     permits: Arc<Semaphore>,
     #[cfg(any(test, feature = "db-test-seam"))]
     blocking_delay: Option<Duration>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    claim_blocking_delay: Option<Duration>,
 }
 
 impl AsyncPendingMessageStore {
@@ -154,12 +156,20 @@ impl AsyncPendingMessageStore {
             permits: Arc::new(Semaphore::new(Self::DEFAULT_BLOCKING_PERMITS)),
             #[cfg(any(test, feature = "db-test-seam"))]
             blocking_delay: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            claim_blocking_delay: None,
         }
     }
 
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_blocking_delay(mut self, delay: Duration) -> Self {
         self.blocking_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_claim_blocking_delay(mut self, delay: Duration) -> Self {
+        self.claim_blocking_delay = Some(delay);
         self
     }
 
@@ -251,9 +261,14 @@ impl AsyncPendingMessageStore {
         id: String,
         kind_filter: String,
     ) -> Result<Option<ClaimedMessage>> {
-        self.run(move |store| {
-            store.claim_by_id_and_kind(&worker_id, claim_ttl_secs, &id, &kind_filter)
-        })
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.claim_blocking_delay.or(self.blocking_delay);
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay = None;
+        self.run_with_delay(
+            move |store| store.claim_by_id_and_kind(&worker_id, claim_ttl_secs, &id, &kind_filter),
+            delay,
+        )
         .await
     }
 
@@ -329,15 +344,23 @@ impl AsyncPendingMessageStore {
         F: FnOnce(PendingMessageStore) -> Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.blocking_delay;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay = None;
+        self.run_with_delay(f, delay).await
+    }
+
+    async fn run_with_delay<F, R>(&self, f: F, delay: Option<Duration>) -> Result<R>
+    where
+        F: FnOnce(PendingMessageStore) -> Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
         let permit =
             self.permits.clone().acquire_owned().await.map_err(|_| {
                 QueueError::BlockingTaskFailed("queue semaphore closed".to_string())
             })?;
         let store = self.inner.clone();
-        #[cfg(any(test, feature = "db-test-seam"))]
-        let delay = self.blocking_delay;
-        #[cfg(not(any(test, feature = "db-test-seam")))]
-        let delay: Option<Duration> = None;
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let join = tokio::task::spawn_blocking(move || {
             let permit = permit;
