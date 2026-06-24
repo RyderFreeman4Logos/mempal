@@ -5475,27 +5475,36 @@ impl MempalMcpServer {
         &self,
         operation_id: &str,
     ) -> anyhow::Result<bool> {
-        let deadline = Instant::now() + MCP_OPERATION_STATUS_DEADLINE;
+        let deadline = Instant::now() + self.operation_status_deadline;
         loop {
-            match self
-                .async_queue
-                .operation_status(operation_id.to_string())
-                .await
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+
+            match tokio::time::timeout(
+                remaining,
+                self.async_queue.operation_status(operation_id.to_string()),
+            )
+            .await
             {
-                Ok(Some(_)) => return Ok(true),
-                Ok(None) => return Ok(false),
-                Err(error) if error.is_sqlite_lock() && Instant::now() < deadline => {
-                    tokio::time::sleep(
-                        MCP_INGEST_QUEUE_LOCK_RETRY_DELAY
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    )
-                    .await;
-                }
-                Err(error) if error.is_sqlite_lock() => return Ok(false),
-                Err(error) => {
-                    return Err(anyhow::Error::new(error)
-                        .context("failed to verify daemon-admitted ingest operation"));
-                }
+                Err(_) => return Ok(false),
+                Ok(result) => match result {
+                    Ok(Some(_)) => return Ok(true),
+                    Ok(None) => return Ok(false),
+                    Err(error) if error.is_sqlite_lock() && Instant::now() < deadline => {
+                        tokio::time::sleep(
+                            MCP_INGEST_QUEUE_LOCK_RETRY_DELAY
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        )
+                        .await;
+                    }
+                    Err(error) if error.is_sqlite_lock() => return Ok(false),
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error)
+                            .context("failed to verify daemon-admitted ingest operation"));
+                    }
+                },
             }
         }
     }
@@ -11109,6 +11118,31 @@ quality_policy = "llm_required_for_keep"
             .expect("returned operation id must be queryable");
         assert_eq!(record.id, operation_id);
         assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+    }
+
+    #[tokio::test]
+    async fn test_daemon_admitted_operation_visibility_uses_status_deadline() {
+        let (_tempdir, db_path, server) = setup_server();
+        let delayed_queue = AsyncPendingMessageStore::new_without_reclaim(&db_path)
+            .with_blocking_delay(Duration::from_millis(500));
+        let server = server
+            .with_async_queue_for_test(delayed_queue)
+            .with_mcp_deadline_for_test(Duration::from_millis(25));
+
+        let started = tokio::time::Instant::now();
+        let visible = tokio::time::timeout(
+            Duration::from_millis(200),
+            server.daemon_admitted_operation_is_visible("missing-operation"),
+        )
+        .await
+        .expect("visibility check must not inherit the queue busy/blocking budget")
+        .expect("visibility check should return a bounded fallback result");
+
+        assert!(!visible);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "visibility check exceeded its MCP status deadline budget"
+        );
     }
 
     #[cfg(unix)]
