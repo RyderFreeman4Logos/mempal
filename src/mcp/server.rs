@@ -230,6 +230,8 @@ pub struct MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     ingest_processing_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    operation_status_probe_delay: Option<Duration>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_error: Option<String>,
     #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_lock_failures: Arc<AtomicUsize>,
@@ -470,6 +472,8 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             ingest_processing_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            operation_status_probe_delay: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_error: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_lock_failures: Arc::new(AtomicUsize::new(0)),
@@ -515,6 +519,12 @@ impl MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_ingest_processing_delay_for_test(mut self, delay: Duration) -> Self {
         self.ingest_processing_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_operation_status_probe_delay_for_test(mut self, delay: Duration) -> Self {
+        self.operation_status_probe_delay = Some(delay);
         self
     }
 
@@ -1501,6 +1511,10 @@ impl MempalMcpServer {
         &self,
         operation_id: &str,
     ) -> std::result::Result<IngestResponse, ErrorData> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if let Some(delay) = self.operation_status_probe_delay {
+            tokio::time::sleep(delay).await;
+        }
         self.mempal_operation_status(Parameters(OperationStatusRequest {
             operation_id: operation_id.to_string(),
         }))
@@ -5293,16 +5307,14 @@ impl MempalMcpServer {
             }
 
             let mut timed_out_response = if matches!(worker_mode, IngestWaitWorkerMode::Scoped) {
+                let refresh_remaining = wait_timeout
+                    .checked_sub(request_started_at.elapsed())
+                    .unwrap_or_default();
                 match self
-                    .operation_status_json_for_test(
-                        queued_response
-                            .operation_id
-                            .as_deref()
-                            .expect("queued receipt must include operation id"),
-                    )
+                    .operation_status_json_within(operation_id, refresh_remaining)
                     .await
                 {
-                    Ok(refreshed) => {
+                    Ok(Some(refreshed)) => {
                         if refreshed
                             .state
                             .map(IngestOperationState::is_terminal)
@@ -5312,6 +5324,7 @@ impl MempalMcpServer {
                         }
                         refreshed
                     }
+                    Ok(None) => queued_response,
                     Err(error)
                         if mcp_operation_wait_error_is_ignorable_during_wait(
                             &error,
@@ -12061,6 +12074,42 @@ pattern_boost = 0.2
         assert!(response.timed_out);
         assert!(response.operation_id.is_some());
         assert!(response.created_drawer_ids.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_scoped_zero_wait_skips_status_refresh_after_budget() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server.with_operation_status_probe_delay_for_test(Duration::from_millis(500));
+
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            server.mempal_ingest_with_controls_scoped_worker(
+                IngestRequest {
+                    content: "scoped zero wait must not refresh status after budget".to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("receipt".to_string()),
+                    dry_run: Some(false),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(0),
+                    ..IngestRequest::default()
+                },
+                IngestControls::default(),
+            ),
+        )
+        .await
+        .expect("scoped ingest must not run a status refresh after wait budget is exhausted")
+        .expect("scoped zero-wait ingest should return a receipt")
+        .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(response.timed_out);
+        assert!(response.operation_id.is_some());
+        assert!(response.created_drawer_ids.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "scoped ingest performed an unbudgeted status refresh after wait budget exhaustion"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
