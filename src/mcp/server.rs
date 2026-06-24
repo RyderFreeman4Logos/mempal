@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "db-test-seam"))]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -229,6 +231,8 @@ pub struct MempalMcpServer {
     ingest_processing_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_error: Option<String>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    async_db_open_lock_failures: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
     content_writer_lease_ttl_secs: u64,
     #[cfg(any(test, feature = "db-test-seam"))]
@@ -468,6 +472,8 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_error: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            async_db_open_lock_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "db-test-seam"))]
             content_writer_lease_ttl_secs: MCP_CONTENT_WRITER_LEASE_TTL_SECS,
             #[cfg(any(test, feature = "db-test-seam"))]
             content_writer_lease_renew_interval: MCP_CONTENT_WRITER_LEASE_RENEW_INTERVAL,
@@ -515,6 +521,13 @@ impl MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_async_db_open_error_for_test(mut self, error: impl Into<String>) -> Self {
         self.async_db_open_error = Some(error.into());
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_async_db_open_lock_failures_for_test(self, failures: usize) -> Self {
+        self.async_db_open_lock_failures
+            .store(failures, Ordering::SeqCst);
         self
     }
 
@@ -1310,7 +1323,22 @@ impl MempalMcpServer {
         if let Some(error) = self.async_db_open_error.as_deref() {
             anyhow::bail!("{error}");
         }
-
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .async_db_open_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseBusy,
+                    extended_code: rusqlite::ffi::SQLITE_BUSY,
+                },
+                Some("database is locked".to_string()),
+            )));
+        }
         let db_path = self.db_path.clone();
         let async_db = self
             .async_db
@@ -5485,25 +5513,60 @@ impl MempalMcpServer {
             return Ok(None);
         }
 
-        let async_db = self.async_db().await.map_err(|error| {
-            database_write_refused_error(
-                &self.db_path,
-                "resolve replacement target",
-                error.as_ref(),
-            )
-        })?;
-        async_db
-            .run_read(move |db| {
-                db.resolve_replacement_target(
-                    supersedes.as_deref(),
-                    replace_text.as_deref(),
-                    &wing,
-                    room.as_deref(),
-                    project_id.as_deref(),
-                )
-            })
-            .await
-            .map_err(replacement_db_error)
+        let deadline = Instant::now() + self.ingest_admission_deadline;
+        loop {
+            let async_db = match self.async_db().await {
+                Ok(async_db) => async_db,
+                Err(error)
+                    if anyhow_chain_contains_sqlite_lock(&error) && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(
+                        MCP_INGEST_QUEUE_LOCK_RETRY_DELAY
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(database_write_refused_error(
+                        &self.db_path,
+                        "resolve replacement target",
+                        error.as_ref(),
+                    ));
+                }
+            };
+
+            let supersedes = supersedes.clone();
+            let replace_text = replace_text.clone();
+            let wing = wing.clone();
+            let room = room.clone();
+            let project_id = project_id.clone();
+            match async_db
+                .run_read(move |db| {
+                    db.resolve_replacement_target(
+                        supersedes.as_deref(),
+                        replace_text.as_deref(),
+                        &wing,
+                        room.as_deref(),
+                        project_id.as_deref(),
+                    )
+                })
+                .await
+            {
+                Ok(target) => return Ok(target),
+                Err(error)
+                    if crate::core::db::db_error_is_sqlite_lock(&error)
+                        && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(
+                        MCP_INGEST_QUEUE_LOCK_RETRY_DELAY
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
+                }
+                Err(error) => return Err(replacement_db_error(error)),
+            }
+        }
     }
 
     #[cfg(test)]
@@ -11659,6 +11722,53 @@ pattern_boost = 0.2
         );
 
         tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_ingest_replacement_target_retries_transient_sqlite_lock() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        insert_drawer(
+            &db_path,
+            "replacement-transient-lock-target",
+            "replacement target before transient lock",
+            "mcp",
+            Some("deadline"),
+            "/tmp/replacement-transient-lock.md",
+            2,
+        );
+        let server = MempalMcpServer::new_with_factory(
+            db_path,
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_async_db_open_lock_failures_for_test(1);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.mempal_ingest(Parameters(IngestRequest {
+                content: "replacement target transient lock should still enqueue".to_string(),
+                wing: "mcp".to_string(),
+                room: Some("deadline".to_string()),
+                supersedes: Some("replacement-transient-lock-target".to_string()),
+                dry_run: Some(false),
+                wait: Some(false),
+                ..IngestRequest::default()
+            })),
+        )
+        .await
+        .expect("MCP ingest should return before client timeout")
+        .expect("transient replacement target lock should be retried")
+        .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(
+            response.operation_id.is_some(),
+            "durable receipt must be preserved after transient replacement lookup lock"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
