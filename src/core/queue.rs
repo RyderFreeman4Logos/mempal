@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(test, feature = "db-test-seam"))]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -9,12 +11,15 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use super::config::scrub_sensitive_text;
-use super::db::ensure_wal_journal_mode;
+use super::db::{ensure_wal_journal_mode, rusqlite_error_is_lock};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STARTUP_RECLAIM_STALE_SECS: i64 = 60;
 const COMPLETION_METRICS_WINDOW_MINS: u64 = 10;
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const CLAIM_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const CLAIM_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(2);
+const CLAIM_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub const LAST_ERROR_MAX_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error)]
@@ -35,19 +40,19 @@ pub enum QueueError {
 
 impl QueueError {
     pub fn is_sqlite_lock(&self) -> bool {
-        matches!(
-            self,
-            Self::Sqlite(rusqlite::Error::SqliteFailure(sqlite, _))
-                if matches!(
-                    sqlite.code,
-                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                )
-                    || matches!(
-                        sqlite.extended_code & 0xff,
-                        rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED
-                    )
-        )
+        matches!(self, Self::Sqlite(error) if rusqlite_error_is_lock(error))
     }
+}
+
+#[cfg(any(test, feature = "db-test-seam"))]
+fn sqlite_busy_queue_error() -> QueueError {
+    QueueError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::DatabaseBusy,
+            extended_code: rusqlite::ffi::SQLITE_BUSY,
+        },
+        Some("database is locked".to_string()),
+    ))
 }
 
 pub type Result<T> = std::result::Result<T, QueueError>;
@@ -143,6 +148,14 @@ pub struct AsyncPendingMessageStore {
     permits: Arc<Semaphore>,
     #[cfg(any(test, feature = "db-test-seam"))]
     blocking_delay: Option<Duration>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    enqueue_lock_failures: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    claim_lock_failures: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    claim_blocking_delay: Option<Duration>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    release_lock_failures: Arc<AtomicUsize>,
 }
 
 impl AsyncPendingMessageStore {
@@ -162,12 +175,44 @@ impl AsyncPendingMessageStore {
             permits: Arc::new(Semaphore::new(Self::DEFAULT_BLOCKING_PERMITS)),
             #[cfg(any(test, feature = "db-test-seam"))]
             blocking_delay: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            enqueue_lock_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            claim_lock_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            claim_blocking_delay: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            release_lock_failures: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_blocking_delay(mut self, delay: Duration) -> Self {
         self.blocking_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_enqueue_lock_failures_for_test(self, failures: usize) -> Self {
+        self.enqueue_lock_failures.store(failures, Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_claim_lock_failures_for_test(self, failures: usize) -> Self {
+        self.claim_lock_failures.store(failures, Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_claim_blocking_delay(mut self, delay: Duration) -> Self {
+        self.claim_blocking_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_release_lock_failures_for_test(self, failures: usize) -> Self {
+        self.release_lock_failures.store(failures, Ordering::SeqCst);
         self
     }
 
@@ -227,6 +272,16 @@ impl AsyncPendingMessageStore {
         payload: String,
         idempotency_key: String,
     ) -> Result<String> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .enqueue_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(sqlite_busy_queue_error());
+        }
         self.run(move |store| {
             store.enqueue_idempotent_with_key_fail_fast(&kind, &payload, &idempotency_key)
         })
@@ -259,9 +314,51 @@ impl AsyncPendingMessageStore {
         id: String,
         kind_filter: String,
     ) -> Result<Option<ClaimedMessage>> {
-        self.run(move |store| {
-            store.claim_by_id_and_kind(&worker_id, claim_ttl_secs, &id, &kind_filter)
-        })
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.claim_blocking_delay.or(self.blocking_delay);
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay = None;
+        self.run_with_delay(
+            move |store| store.claim_by_id_and_kind(&worker_id, claim_ttl_secs, &id, &kind_filter),
+            delay,
+        )
+        .await
+    }
+
+    pub async fn claim_by_id_and_kind_with_lock_retry_deadline(
+        &self,
+        worker_id: String,
+        claim_ttl_secs: i64,
+        id: String,
+        kind_filter: String,
+        retry_deadline: Duration,
+    ) -> Result<Option<ClaimedMessage>> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .claim_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(sqlite_busy_queue_error());
+        }
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.claim_blocking_delay.or(self.blocking_delay);
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay = None;
+        self.run_with_delay(
+            move |store| {
+                store.claim_by_id_and_kind_with_lock_retry_deadline(
+                    &worker_id,
+                    claim_ttl_secs,
+                    &id,
+                    &kind_filter,
+                    retry_deadline,
+                )
+            },
+            delay,
+        )
         .await
     }
 
@@ -316,7 +413,36 @@ impl AsyncPendingMessageStore {
     }
 
     pub async fn release_claim(&self, claim: ClaimedMessage) -> Result<()> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .release_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(sqlite_busy_queue_error());
+        }
         self.run(move |store| store.release_claim(&claim)).await
+    }
+
+    pub async fn release_claim_with_busy_timeout(
+        &self,
+        claim: ClaimedMessage,
+        busy_timeout: Duration,
+    ) -> Result<()> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .release_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(sqlite_busy_queue_error());
+        }
+        self.run(move |store| store.release_claim_with_busy_timeout(&claim, Some(busy_timeout)))
+            .await
     }
 
     pub async fn refresh_heartbeat(&self, id: String, worker_id: String) -> Result<()> {
@@ -337,15 +463,23 @@ impl AsyncPendingMessageStore {
         F: FnOnce(PendingMessageStore) -> Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.blocking_delay;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay = None;
+        self.run_with_delay(f, delay).await
+    }
+
+    async fn run_with_delay<F, R>(&self, f: F, delay: Option<Duration>) -> Result<R>
+    where
+        F: FnOnce(PendingMessageStore) -> Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
         let permit =
             self.permits.clone().acquire_owned().await.map_err(|_| {
                 QueueError::BlockingTaskFailed("queue semaphore closed".to_string())
             })?;
         let store = self.inner.clone();
-        #[cfg(any(test, feature = "db-test-seam"))]
-        let delay = self.blocking_delay;
-        #[cfg(not(any(test, feature = "db-test-seam")))]
-        let delay: Option<Duration> = None;
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let join = tokio::task::spawn_blocking(move || {
             let permit = permit;
@@ -514,7 +648,15 @@ impl PendingMessageStore {
         worker_id: &str,
         claim_ttl_secs: i64,
     ) -> Result<Option<ClaimedMessage>> {
-        let mut conn = self.open_connection()?;
+        self.with_claim_lock_retry(|| self.claim_next_once(worker_id, claim_ttl_secs))
+    }
+
+    fn claim_next_once(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+    ) -> Result<Option<ClaimedMessage>> {
+        let mut conn = self.open_claim_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
@@ -586,7 +728,18 @@ impl PendingMessageStore {
         claim_ttl_secs: i64,
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
-        let mut conn = self.open_connection()?;
+        self.with_claim_lock_retry(|| {
+            self.claim_next_by_kind_once(worker_id, claim_ttl_secs, kind_filter)
+        })
+    }
+
+    fn claim_next_by_kind_once(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+        kind_filter: &str,
+    ) -> Result<Option<ClaimedMessage>> {
+        let mut conn = self.open_claim_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
@@ -658,7 +811,32 @@ impl PendingMessageStore {
         id_filter: &str,
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
-        let mut conn = self.open_connection()?;
+        self.with_claim_lock_retry(|| {
+            self.claim_by_id_and_kind_once(worker_id, claim_ttl_secs, id_filter, kind_filter)
+        })
+    }
+
+    pub fn claim_by_id_and_kind_with_lock_retry_deadline(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+        id_filter: &str,
+        kind_filter: &str,
+        retry_deadline: Duration,
+    ) -> Result<Option<ClaimedMessage>> {
+        self.with_claim_lock_retry_deadline(retry_deadline, || {
+            self.claim_by_id_and_kind_once(worker_id, claim_ttl_secs, id_filter, kind_filter)
+        })
+    }
+
+    fn claim_by_id_and_kind_once(
+        &self,
+        worker_id: &str,
+        claim_ttl_secs: i64,
+        id_filter: &str,
+        kind_filter: &str,
+    ) -> Result<Option<ClaimedMessage>> {
+        let mut conn = self.open_claim_connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
@@ -962,7 +1140,15 @@ impl PendingMessageStore {
     /// Used by LLM workers cancelled due to a config hot-reload so the task is
     /// retried with the new configuration rather than charged a retry.
     pub fn release_claim(&self, claim: &ClaimedMessage) -> Result<()> {
-        let mut conn = self.open_connection()?;
+        self.release_claim_with_busy_timeout(claim, None)
+    }
+
+    fn release_claim_with_busy_timeout(
+        &self,
+        claim: &ClaimedMessage,
+        busy_timeout: Option<Duration>,
+    ) -> Result<()> {
+        let mut conn = self.open_connection_with_busy_timeout(busy_timeout)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = tx.execute(
             r#"
@@ -1032,6 +1218,32 @@ impl PendingMessageStore {
 
     fn open_connection(&self) -> Result<Connection> {
         self.open_connection_with_busy_timeout(None)
+    }
+
+    fn open_claim_connection(&self) -> Result<Connection> {
+        self.open_connection_with_busy_timeout(Some(CLAIM_BUSY_TIMEOUT))
+    }
+
+    fn with_claim_lock_retry<T>(&self, op: impl FnMut() -> Result<T>) -> Result<T> {
+        self.with_claim_lock_retry_deadline(CLAIM_LOCK_RETRY_DEADLINE, op)
+    }
+
+    fn with_claim_lock_retry_deadline<T>(
+        &self,
+        retry_deadline: Duration,
+        mut op: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        let started = Instant::now();
+        loop {
+            match op() {
+                Ok(value) => return Ok(value),
+                Err(error) if error.is_sqlite_lock() && started.elapsed() < retry_deadline => {
+                    let remaining = retry_deadline.saturating_sub(started.elapsed());
+                    std::thread::sleep(CLAIM_LOCK_RETRY_DELAY.min(remaining));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn open_connection_with_busy_timeout(
@@ -1732,6 +1944,41 @@ mod tests {
         assert!(
             DEFAULT_BUSY_TIMEOUT >= Duration::from_secs(30),
             "async ingest queue writes must outwait transient full-smoke read/write contention"
+        );
+    }
+
+    #[test]
+    fn claim_next_uses_bounded_sqlite_lock_budget() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(&db_path).expect("open queue");
+        store
+            .enqueue("hook", r#"{"request":{}}"#)
+            .expect("enqueue async ingest");
+
+        let lock_holder = Connection::open(&db_path).expect("open lock holder");
+        lock_holder
+            .busy_timeout(Duration::ZERO)
+            .expect("set fail-fast lock holder timeout");
+        lock_holder
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+
+        let started = std::time::Instant::now();
+        let error = store
+            .claim_next("worker-a", 60)
+            .expect_err("claim should exhaust the bounded lock budget");
+        let elapsed = started.elapsed();
+
+        lock_holder
+            .execute_batch("ROLLBACK;")
+            .expect("release write lock");
+
+        assert!(error.is_sqlite_lock());
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "claim lock budget must not monopolize queue blocking workers for the 30s default busy timeout"
         );
     }
 }

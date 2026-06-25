@@ -457,7 +457,7 @@ async fn test_ingest_wait_matches_non_wait_plain_output() {
     handle.set_embedding_fill(1.0).await;
     let _wait_config = write_config(wait_home.path(), &format!("http://{addr}/v1"));
     let _direct_config = write_config(direct_home.path(), &format!("http://{addr}/v1"));
-    let wait_timeout = u64::MAX.to_string();
+    let wait_timeout = "30".to_string();
     let payload = br#"{"content":"cli wait content"}"#;
 
     let direct_output = run_cli_with_stdin(
@@ -534,7 +534,7 @@ async fn test_ingest_wait_json_matches_non_wait_json_output() {
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     let _wait_config = write_config(wait_home.path(), &format!("http://{addr}/v1"));
     let _direct_config = write_config(direct_home.path(), &format!("http://{addr}/v1"));
-    let wait_timeout = u64::MAX.to_string();
+    let wait_timeout = "30".to_string();
     let payload = br#"{"content":"cli wait json content"}"#;
 
     let direct_output = run_cli_with_stdin(
@@ -629,7 +629,7 @@ async fn test_ingest_wait_json_cleanup_ids_delete_exact_drawers() {
     let home = setup_home();
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     let _config = write_config(home.path(), &format!("http://{addr}/v1"));
-    let wait_timeout = u64::MAX.to_string();
+    let wait_timeout = "30".to_string();
     let payload = br#"{"content":"cli wait cleanup-safe drawer id content"}"#;
 
     let output = run_cli_with_stdin(
@@ -774,10 +774,10 @@ async fn test_ingest_wait_json_cleanup_id_writes_under_daemon_lease() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
+async fn test_ingest_wait_json_timeout_returns_receipt_and_leaves_claim_queued() {
     let home = setup_home();
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
-    let _config = write_config(home.path(), &format!("http://{addr}/v1"));
+    let _config_path = write_config(home.path(), &format!("http://{addr}/v1"));
     let db_path = home.path().join(".mempal/palace.db");
     handle.pause();
 
@@ -798,7 +798,7 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
             "--no-gate",
             "--wait",
             "--wait-timeout-secs",
-            "1",
+            "6",
             "--json",
         ])
         .env("HOME", home.path())
@@ -818,24 +818,30 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let operation_id = loop {
-        if let Some((operation_id, state)) = first_ingest_async_operation(&db_path)
-            && state == "running"
-        {
+        if let Some((operation_id, state)) = first_ingest_async_operation(&db_path) {
+            assert!(
+                matches!(state.as_str(), "queued" | "running"),
+                "finite wait may claim local work while the caller timeout is still open, got {state}"
+            );
             break operation_id;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "ingest wait worker did not claim operation"
+            "ingest wait worker did not enqueue operation"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    let running = PendingMessageStore::new_without_reclaim(&db_path)
+    let initial = PendingMessageStore::new_without_reclaim(&db_path)
         .operation_status(&operation_id)
-        .expect("load running status")
+        .expect("load initial status")
         .expect("operation record exists");
-    assert_eq!(running.op_state, "running");
+    assert!(
+        matches!(initial.op_state.as_str(), "queued" | "running"),
+        "finite wait may claim local work while the caller timeout is still open, got {}",
+        initial.op_state
+    );
 
-    let output = wait_child_output_timeout(child, Duration::from_secs(4));
+    let output = wait_child_output_timeout(child, Duration::from_secs(9));
     assert!(
         !output.status.success(),
         "stdout={}, stderr={}",
@@ -863,8 +869,10 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
         .expect("load queued status")
         .expect("operation record exists");
     assert_eq!(queued.op_state, "queued");
+    assert!(queued.claimed_at.is_none());
 
     handle.resume();
+    let unbounded_timeout = u64::MAX.to_string();
     let recovery = run_cli(
         home.path(),
         &[
@@ -872,7 +880,7 @@ async fn test_ingest_wait_json_timeout_returns_receipt_and_requeues_claim() {
             "wait",
             &operation_id,
             "--timeout-secs",
-            "10",
+            unbounded_timeout.as_str(),
             "--json",
         ],
     );
@@ -1096,6 +1104,7 @@ async fn test_ingest_wait_preserves_stdin_semantics_and_audit() {
     })
     .to_string();
 
+    let wait_timeout = u64::MAX.to_string();
     let output = run_cli_with_stdin(
         home.path(),
         &[
@@ -1108,7 +1117,7 @@ async fn test_ingest_wait_preserves_stdin_semantics_and_audit() {
             "--no-gate",
             "--wait",
             "--wait-timeout-secs",
-            "30",
+            wait_timeout.as_str(),
         ],
         payload.as_bytes(),
     );
@@ -1358,6 +1367,7 @@ async fn test_ingest_wait_rejected_matches_non_wait_output_and_audit() {
     })
     .to_string();
 
+    let wait_timeout = u64::MAX.to_string();
     let direct_output = run_cli_with_stdin(
         direct_home.path(),
         &["ingest", "--stdin", "--json"],
@@ -1370,7 +1380,7 @@ async fn test_ingest_wait_rejected_matches_non_wait_output_and_audit() {
             "--stdin",
             "--wait",
             "--wait-timeout-secs",
-            "30",
+            wait_timeout.as_str(),
             "--json",
         ],
         payload.as_bytes(),
@@ -1474,7 +1484,7 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
 
     let operation_id =
         enqueue_prepared_operation(&db_path, "wait cli content", "mcp", Some("wait"));
-    let wait_timeout = u64::MAX.to_string();
+    let wait_timeout = "30".to_string();
 
     handle.pause();
     let child = spawn_cli(
@@ -1517,7 +1527,7 @@ async fn test_operation_wait_exits_zero_and_prints_progress() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_operation_wait_timeout_returns_receipt_and_requeues_claim() {
+async fn test_operation_wait_timeout_returns_receipt_and_leaves_finite_budget_queued() {
     let home = setup_home();
     let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
     let config_path = write_config(home.path(), &format!("http://{addr}/v1"));
@@ -1534,27 +1544,10 @@ async fn test_operation_wait_timeout_returns_receipt_and_requeues_claim() {
     handle.pause();
     let child = spawn_cli(
         home.path(),
-        &["operation", "wait", &operation_id, "--timeout-secs", "1"],
+        &["operation", "wait", &operation_id, "--timeout-secs", "6"],
     );
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        let record = PendingMessageStore::new_without_reclaim(&db_path)
-            .operation_status(&operation_id)
-            .expect("load operation status")
-            .expect("operation record exists");
-        if record.op_state == "running" {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let running = PendingMessageStore::new_without_reclaim(&db_path)
-        .operation_status(&operation_id)
-        .expect("load running status")
-        .expect("operation record exists");
-    assert_eq!(running.op_state, "running");
-
-    let output = wait_child_output_timeout(child, Duration::from_secs(4));
+    let output = wait_child_output_timeout(child, Duration::from_secs(9));
     assert!(
         !output.status.success(),
         "stdout={}, stderr={}",
@@ -1572,11 +1565,19 @@ async fn test_operation_wait_timeout_returns_receipt_and_requeues_claim() {
         .expect("load queued status")
         .expect("operation record exists");
     assert_eq!(queued.op_state, "queued");
+    assert!(queued.claimed_at.is_none());
 
     handle.resume();
+    let unbounded_timeout = u64::MAX.to_string();
     let recovery = run_cli(
         home.path(),
-        &["operation", "wait", &operation_id, "--timeout-secs", "10"],
+        &[
+            "operation",
+            "wait",
+            &operation_id,
+            "--timeout-secs",
+            unbounded_timeout.as_str(),
+        ],
     );
     handle.shutdown().await;
 

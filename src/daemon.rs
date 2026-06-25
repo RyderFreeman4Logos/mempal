@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin};
 
 use crate::bootstrap_events::BootstrapEvent;
@@ -58,6 +58,9 @@ const AUTOMATIC_HOOK_LLM_GATE_MAX_SECS: u64 = 30;
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const DAEMON_WRITER_LEASE_TTL_SECS: u64 = 120;
 const DAEMON_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+const DAEMON_WRITER_LEASE_RENEW_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+const DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE: Duration = Duration::from_secs(5);
+const DAEMON_WRITER_LEASE_RENEW_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub fn run_command(config_path: PathBuf, foreground: bool) -> Result<()> {
     run_command_with_bootstrap_events(config_path, foreground, None)
@@ -440,15 +443,7 @@ fn spawn_runtime_writer_lease_heartbeat(
             let db_path = db_path.clone();
             let lease_for_renew = lease.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<bool> {
-                let db =
-                    Database::open(&db_path).context("failed to open DB for writer lease renew")?;
-                db.runtime_writer_lease_renew(
-                    &lease_for_renew.name,
-                    &lease_for_renew.owner,
-                    &lease_for_renew.session_id,
-                    DAEMON_WRITER_LEASE_TTL_SECS,
-                )
-                .context("failed to renew daemon writer lease")
+                renew_daemon_writer_lease_with_retry(&db_path, &lease_for_renew)
             })
             .await;
             match result {
@@ -471,6 +466,48 @@ fn spawn_runtime_writer_lease_heartbeat(
                 }
             }
         }
+    })
+}
+
+fn renew_daemon_writer_lease_with_retry(
+    db_path: &Path,
+    lease: &RuntimeWriterLease,
+) -> Result<bool> {
+    let started = Instant::now();
+    loop {
+        match renew_daemon_writer_lease_once(db_path, lease) {
+            Ok(renewed) => return Ok(renewed),
+            Err(error)
+                if anyhow_error_is_sqlite_lock(&error)
+                    && started.elapsed() < DAEMON_WRITER_LEASE_RENEW_RETRY_DEADLINE =>
+            {
+                std::thread::sleep(DAEMON_WRITER_LEASE_RENEW_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn renew_daemon_writer_lease_once(db_path: &Path, lease: &RuntimeWriterLease) -> Result<bool> {
+    let db = Database::open_with_busy_timeout(db_path, DAEMON_WRITER_LEASE_RENEW_BUSY_TIMEOUT)
+        .context("failed to open DB for writer lease renew")?;
+    db.runtime_writer_lease_renew(
+        &lease.name,
+        &lease.owner,
+        &lease.session_id,
+        DAEMON_WRITER_LEASE_TTL_SECS,
+    )
+    .context("failed to renew daemon writer lease")
+}
+
+fn anyhow_error_is_sqlite_lock(error: &anyhow::Error) -> bool {
+    error.chain().any(|error| {
+        error
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(crate::core::db::rusqlite_error_is_lock)
+            || error
+                .downcast_ref::<DbError>()
+                .is_some_and(crate::core::db::db_error_is_sqlite_lock)
     })
 }
 

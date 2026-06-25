@@ -3486,6 +3486,18 @@ fn run() -> Result<()> {
     }
 
     let db_path = expand_home(&config.db_path);
+    if matches!(&cli.command, Commands::Operation { .. }) {
+        let Commands::Operation { command } = cli.command else {
+            unreachable!("operation command preflight matched")
+        };
+        if !db_path.exists() {
+            bail!(
+                "no palace.db found at {}; run `mempal init` first",
+                display_path_for_user(&db_path)
+            );
+        }
+        return block_on_result(operation_command(&db_path, config.as_ref(), command));
+    }
     let read_only_database = command_uses_read_only_database(&cli.command);
     if read_only_database {
         validate_read_only_command_args(&cli.command)?;
@@ -3597,7 +3609,7 @@ fn run() -> Result<()> {
             },
         )),
         Commands::Operation { command } => {
-            block_on_result(operation_command(&db, config.as_ref(), command))
+            block_on_result(operation_command(db.path(), config.as_ref(), command))
         }
         Commands::Export { command } => export_command(&db, config.as_ref(), command),
         Commands::Wiki { command } => wiki_command(&db, config.as_ref(), command),
@@ -5844,12 +5856,81 @@ fn finish_operation_wait_response(
     }
 }
 
+fn operation_wait_status_error_is_recoverable(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    let operation_lookup = message.contains("queue lookup")
+        || message.contains("mempal_operation_status")
+        || message.contains("operation status");
+    let transient = message.contains("database is locked")
+        || message.contains("database locked")
+        || message.contains("database is busy")
+        || message.contains("database busy")
+        || message.contains("sqlite_busy")
+        || message.contains("sqlite_locked")
+        || message.contains("locked_or_busy")
+        || (message.contains("exceeded") && message.contains("queue lookup"));
+    operation_lookup && transient
+}
+
+const OPERATION_WAIT_STATUS_PROBE_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn operation_wait_status_probe_deadline_from_elapsed(
+    wait_timeout: std::time::Duration,
+    elapsed: std::time::Duration,
+) -> std::time::Duration {
+    wait_timeout
+        .saturating_sub(elapsed)
+        .min(OPERATION_WAIT_STATUS_PROBE_MAX)
+}
+
+fn operation_wait_status_probe_deadline(
+    wait_timeout: std::time::Duration,
+    started_at: std::time::Instant,
+) -> std::time::Duration {
+    operation_wait_status_probe_deadline_from_elapsed(wait_timeout, started_at.elapsed())
+}
+
+fn operation_wait_timeout_response_from_refresh(
+    initial_status: IngestResponse,
+    refresh_result: std::result::Result<Option<IngestResponse>, String>,
+) -> Result<IngestResponse> {
+    match refresh_result {
+        Ok(Some(response)) => Ok(response),
+        Ok(None) => Ok(initial_status),
+        Err(error) if operation_wait_status_error_is_recoverable(&error) => Ok(initial_status),
+        Err(error) => Err(anyhow::anyhow!(error)),
+    }
+}
+
+fn operation_wait_queued_status(operation_id: &str) -> IngestResponse {
+    IngestResponse {
+        operation_id: Some(operation_id.to_string()),
+        accepted_at: Some(iso_timestamp()),
+        state: Some(IngestOperationState::Queued),
+        ..IngestResponse::default()
+    }
+}
+
+fn operation_wait_initial_response_from_snapshot(
+    operation_id: &str,
+    snapshot_result: std::result::Result<Option<IngestResponse>, String>,
+) -> Result<IngestResponse> {
+    match snapshot_result {
+        Ok(Some(response)) => Ok(response),
+        Ok(None) => Ok(operation_wait_queued_status(operation_id)),
+        Err(error) if operation_wait_status_error_is_recoverable(&error) => {
+            Ok(operation_wait_queued_status(operation_id))
+        }
+        Err(error) => Err(anyhow::anyhow!(error)),
+    }
+}
+
 async fn operation_command(
-    db: &Database,
+    db_path: &Path,
     config: &Config,
     command: OperationCommands,
 ) -> Result<()> {
-    let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone())?;
+    let server = MempalMcpServer::new(db_path.to_path_buf(), config.clone())?;
     match command {
         OperationCommands::Status { operation_id, json } => {
             let response = server
@@ -5871,15 +5952,19 @@ async fn operation_command(
                 "waiting for operation_id={} timeout_secs={timeout_secs}",
                 operation_id
             );
-            let initial_status = server
-                .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
-                    OperationStatusRequest {
-                        operation_id: operation_id.clone(),
-                    },
-                ))
+            let wait_timeout = std::time::Duration::from_secs(timeout_secs);
+            let wait_started_at = std::time::Instant::now();
+            let initial_status_result = server
+                .operation_status_snapshot_lightweight(
+                    &operation_id,
+                    operation_wait_status_probe_deadline(wait_timeout, wait_started_at),
+                )
                 .await
-                .context("failed to load initial operation status")?
-                .0;
+                .map_err(|error| error.to_string());
+            let initial_status = operation_wait_initial_response_from_snapshot(
+                &operation_id,
+                initial_status_result,
+            )?;
             eprintln!(
                 "waiting operation_id={} state={}",
                 operation_id,
@@ -5895,26 +5980,39 @@ async fn operation_command(
             {
                 return finish_operation_wait_response(initial_status, &operation_id, json);
             }
-            let wait_result = server
-                .wait_for_operation_status_with_scoped_worker(
-                    &operation_id,
-                    std::time::Duration::from_secs(timeout_secs),
-                    std::time::Duration::from_millis(150),
-                )
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let wait_remaining = wait_timeout.saturating_sub(wait_started_at.elapsed());
+            let wait_result = if timeout_secs == u64::MAX {
+                server
+                    .wait_for_operation_status_with_scoped_worker_until_terminal(
+                        &operation_id,
+                        wait_remaining,
+                        std::time::Duration::from_millis(150),
+                    )
+                    .await
+            } else {
+                server
+                    .wait_for_operation_status_with_scoped_worker(
+                        &operation_id,
+                        wait_remaining,
+                        std::time::Duration::from_millis(150),
+                    )
+                    .await
+            }
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             match wait_result {
                 Some(response) => finish_operation_wait_response(response, &operation_id, json),
                 None => {
-                    let mut response = server
-                        .mempal_operation_status(rmcp::handler::server::wrapper::Parameters(
-                            OperationStatusRequest {
-                                operation_id: operation_id.clone(),
-                            },
-                        ))
+                    let refresh_result = server
+                        .operation_status_snapshot_lightweight(
+                            &operation_id,
+                            operation_wait_status_probe_deadline(wait_timeout, wait_started_at),
+                        )
                         .await
-                        .context("failed to load timed-out operation status")?
-                        .0;
+                        .map_err(|error| error.to_string());
+                    let mut response = operation_wait_timeout_response_from_refresh(
+                        initial_status,
+                        refresh_result,
+                    )?;
                     if response
                         .state
                         .map(IngestOperationState::is_terminal)
@@ -5924,7 +6022,7 @@ async fn operation_command(
                     }
                     response.timed_out = true;
                     print_operation_response_format(json, &response)?;
-                    bail!("timed out waiting for operation {operation_id}")
+                    Err(IngestWaitTimedOut::new(Some(&operation_id)).into())
                 }
             }
         }
@@ -21169,6 +21267,87 @@ api_model = "text-embedding-3-large"
         let rendered = embed_last_error_for_status(&config, &endpoints, last_error);
 
         assert_eq!(rendered.as_deref(), Some("connection refused"));
+    }
+
+    fn queued_operation_wait_response(operation_id: &str) -> IngestResponse {
+        IngestResponse {
+            operation_id: Some(operation_id.to_string()),
+            state: Some(IngestOperationState::Queued),
+            drawer_id: operation_id.to_string(),
+            ..IngestResponse::default()
+        }
+    }
+
+    #[test]
+    fn test_operation_wait_timeout_refresh_keeps_initial_receipt_on_transient_lookup_error() {
+        let initial = queued_operation_wait_response("op-timeout-transient");
+        let response = operation_wait_timeout_response_from_refresh(
+            initial.clone(),
+            Err("queue lookup exceeded timeout while database is locked".to_string()),
+        )
+        .expect("transient lookup error should keep initial receipt");
+
+        assert_eq!(response.operation_id, initial.operation_id);
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+    }
+
+    #[test]
+    fn test_operation_wait_timeout_refresh_rejects_unrelated_error() {
+        let initial = queued_operation_wait_response("op-timeout-fatal");
+        let error = operation_wait_timeout_response_from_refresh(
+            initial,
+            Err("operation status failed: malformed operation id".to_string()),
+        )
+        .expect_err("unrelated status errors remain fatal");
+
+        assert!(format!("{error:#}").contains("malformed operation id"));
+    }
+
+    #[test]
+    fn test_operation_wait_initial_probe_timeout_keeps_waiting_with_queued_receipt() {
+        let response =
+            operation_wait_initial_response_from_snapshot("op-initial-timeout", Ok(None))
+                .expect("initial probe timeout should degrade to queued receipt");
+
+        assert_eq!(response.operation_id.as_deref(), Some("op-initial-timeout"));
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(!response.timed_out);
+    }
+
+    #[test]
+    fn test_operation_wait_initial_probe_rejects_missing_operation_error() {
+        let error = operation_wait_initial_response_from_snapshot(
+            "op-missing",
+            Err("operation not found: op-missing".to_string()),
+        )
+        .expect_err("missing operation remains fatal");
+
+        assert!(format!("{error:#}").contains("operation not found"));
+    }
+
+    #[test]
+    fn test_operation_wait_status_probe_deadline_respects_remaining_timeout() {
+        assert_eq!(
+            operation_wait_status_probe_deadline_from_elapsed(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(250),
+            ),
+            std::time::Duration::from_millis(750)
+        );
+        assert_eq!(
+            operation_wait_status_probe_deadline_from_elapsed(
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_millis(250),
+            ),
+            OPERATION_WAIT_STATUS_PROBE_MAX
+        );
+        assert_eq!(
+            operation_wait_status_probe_deadline_from_elapsed(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+            ),
+            std::time::Duration::ZERO
+        );
     }
 
     #[test]
