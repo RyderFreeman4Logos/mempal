@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -69,6 +70,16 @@ class RecordingProvider(MempalMemoryProvider):
 
     def _drain_writes(self) -> None:
         self._write_queue.join()
+
+
+class FailingPostProvider(RecordingProvider):
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self.exc = exc
+
+    def _post(self, path: str, body: Dict[str, Any]) -> Any:
+        self.posts.append((path, dict(body)))
+        raise self.exc
 
 
 class MempalProviderScopeTests(unittest.TestCase):
@@ -352,6 +363,35 @@ class SearchResultTests(unittest.TestCase):
 
         result = json.loads(provider.handle_tool_call("mempal_conclude", {"conclusion": "test fact"}))
         self.assertIn("drawer_id", result)
+
+    def test_conclude_http_500_returns_redacted_actionable_error(self) -> None:
+        provider = FailingPostProvider(urllib.error.HTTPError(
+            "http://127.0.0.1:3080/api/ingest?debug=true",
+            500,
+            "Internal Server Error",
+            {},
+            None,
+        ))
+        provider.initialize("session-a", user_id="alice", profile="work")
+
+        result = json.loads(provider.handle_tool_call(
+            "mempal_conclude",
+            {"conclusion": "synthetic harmless durable fact"},
+        ))
+
+        self.assertEqual(result["error"], "Failed to store memory via mempal REST API.")
+        details = result["error_details"]
+        self.assertEqual(details["kind"], "rest_http_error")
+        self.assertEqual(details["http_status"], 500)
+        self.assertEqual(details["route"], "/api/ingest")
+        self.assertEqual(details["route_class"], "write")
+        self.assertTrue(details["retryable"])
+        self.assertIn("recovery_hint", details)
+        serialized = json.dumps(result)
+        self.assertNotIn("synthetic harmless durable fact", serialized)
+        self.assertNotIn("127.0.0.1", serialized)
+        self.assertNotIn("debug=true", serialized)
+        self.assertNotIn("HTTP Error 500", serialized)
 
     def test_profile_returns_drawer_id(self) -> None:
         provider = RecordingProvider()
