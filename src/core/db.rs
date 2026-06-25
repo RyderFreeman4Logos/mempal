@@ -1762,6 +1762,81 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn count_novelty_candidate_drawers(
+        &self,
+        wing: Option<&str>,
+        room: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let vectors_exist: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !vectors_exist {
+            return Ok(0);
+        }
+
+        self.conn
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM drawer_vectors v
+                JOIN drawers d ON d.id = v.id
+                WHERE d.deleted_at IS NULL
+                  AND (?1 IS NULL OR d.wing = ?1)
+                  AND (?2 IS NULL OR d.room = ?2)
+                  AND (?3 IS NULL OR d.project_id = ?3)
+                "#,
+                (wing, room, project_id),
+                |row| row.get(0),
+            )
+            .map_err(DbError::from)
+    }
+
+    pub fn novelty_candidates_exact(
+        &self,
+        query_vector: &[f32],
+        wing: Option<&str>,
+        room: Option<&str>,
+        project_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, f32)>, DbError> {
+        let vectors_exist: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !vectors_exist || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let query_json = serde_json::to_string(query_vector)?;
+        let limit =
+            i64::try_from(limit).map_err(|_| DbError::InvalidSourceType("limit".to_string()))?;
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT d.id,
+                   CAST(1.0 - vec_distance_cosine(v.embedding, vec_f32(?1)) AS REAL) AS similarity
+            FROM drawer_vectors v
+            JOIN drawers d ON d.id = v.id
+            WHERE d.deleted_at IS NULL
+              AND (?2 IS NULL OR d.wing = ?2)
+              AND (?3 IS NULL OR d.room = ?3)
+              AND (?4 IS NULL OR d.project_id = ?4)
+            ORDER BY similarity DESC
+            LIMIT ?5
+            "#,
+        )?;
+        statement
+            .query_map(
+                (query_json.as_str(), wing, room, project_id, limit),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::from)
+    }
+
     /// Ensure drawer_vectors table exists with the right dimension.
     /// Creates it on first call; errors on dimension mismatch.
     fn ensure_vectors_table(&self, dim: usize) -> Result<(), DbError> {

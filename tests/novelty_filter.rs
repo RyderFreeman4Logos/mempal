@@ -553,6 +553,55 @@ async fn test_fts_finds_merged_supplementary() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn test_no_project_novelty_uses_exact_same_wing_scope_not_global_knn_window() {
+    let _guard = test_guard().await;
+    let env = TestEnv::new(true);
+    for idx in 0..5 {
+        let id = format!("other-wing-{idx}");
+        insert_drawer(
+            &env.db_path,
+            DrawerSeed {
+                id: &id,
+                content: "closer item from another wing",
+                wing: "other-wing",
+                room: DEFAULT_ROOM,
+                project_id: None,
+            },
+            &[1.0, 0.0],
+        );
+    }
+    insert_drawer(
+        &env.db_path,
+        DrawerSeed {
+            id: "same-wing-existing",
+            content: "Decision: keep same-wing novelty exact",
+            wing: DEFAULT_WING,
+            room: DEFAULT_ROOM,
+            project_id: None,
+        },
+        &[0.9, 0.4358899],
+    );
+    let candidate = "Also: same-wing novelty must not use global KNN";
+    let server = env.server(&[(candidate, vec![1.0, 0.0])], &[]);
+
+    let response = ingest(&server, DEFAULT_WING, DEFAULT_ROOM, candidate, None).await;
+
+    assert_eq!(
+        response.novelty_action,
+        Some(mempal::ingest::novelty::NoveltyAction::Merge)
+    );
+    assert_eq!(
+        response.near_drawer_id.as_deref(),
+        Some("same-wing-existing")
+    );
+    assert_eq!(
+        drawer_count(&env.db_path),
+        6,
+        "bounded exact no-project novelty should merge instead of inserting"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_high_similarity_candidate_dropped() {
     let _guard = test_guard().await;
     let env = TestEnv::new(true);

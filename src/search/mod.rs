@@ -27,7 +27,7 @@ pub mod rerank;
 pub mod route;
 pub mod tiered;
 
-const EXACT_VECTOR_CANDIDATE_LIMIT: i64 = 4_096;
+pub const EXACT_VECTOR_CANDIDATE_LIMIT: i64 = 4_096;
 const ACCESS_WRITEBACK_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub type Result<T> = std::result::Result<T, SearchError>;
@@ -1389,43 +1389,7 @@ fn search_by_vector_with_filters(
     let applied_wing = route.wing.as_deref();
     let applied_room = route.room.as_deref();
 
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM drawers d {}",
-        build_retrieval_filter_clause(
-            "d",
-            RetrievalFilterParamIndexes {
-                wing: 1,
-                room: 2,
-                project_mode: 3,
-                project_id: 4,
-                memory_kind: 5,
-                domain: 6,
-                field: 7,
-                tier: 8,
-                status: 9,
-                anchor_kind: 10,
-            },
-        )
-    );
-    let candidate_count: i64 = db
-        .conn()
-        .query_row(
-            &count_sql,
-            (
-                applied_wing,
-                applied_room,
-                scope.mode_param(),
-                scope.project_id.as_deref(),
-                filters.memory_kind.as_deref(),
-                filters.domain.as_deref(),
-                filters.field.as_deref(),
-                filters.tier.as_deref(),
-                filters.status.as_deref(),
-                filters.anchor_kind.as_deref(),
-            ),
-            |row| row.get(0),
-        )
-        .map_err(SearchError::CountCandidateDrawers)?;
+    let candidate_count = count_vector_candidate_drawers(db, &route, scope, filters)?;
     if candidate_count == 0 {
         return Ok(Vec::new());
     }
@@ -1535,6 +1499,55 @@ fn search_by_vector_with_filters(
         .into_iter()
         .map(|result| hydrate_result_metadata(db, result))
         .collect())
+}
+
+pub fn count_vector_candidate_drawers(
+    db: &Database,
+    route: &RouteDecision,
+    scope: &ProjectSearchScope,
+    filters: &SearchFilters,
+) -> Result<i64> {
+    let applied_wing = route.wing.as_deref();
+    let applied_room = route.room.as_deref();
+
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM drawers d {}",
+        build_retrieval_filter_clause(
+            "d",
+            RetrievalFilterParamIndexes {
+                wing: 1,
+                room: 2,
+                project_mode: 3,
+                project_id: 4,
+                memory_kind: 5,
+                domain: 6,
+                field: 7,
+                tier: 8,
+                status: 9,
+                anchor_kind: 10,
+            },
+        )
+    );
+    let candidate_count: i64 = db
+        .conn()
+        .query_row(
+            &count_sql,
+            (
+                applied_wing,
+                applied_room,
+                scope.mode_param(),
+                scope.project_id.as_deref(),
+                filters.memory_kind.as_deref(),
+                filters.domain.as_deref(),
+                filters.field.as_deref(),
+                filters.tier.as_deref(),
+                filters.status.as_deref(),
+                filters.anchor_kind.as_deref(),
+            ),
+            |row| row.get(0),
+        )
+        .map_err(SearchError::CountCandidateDrawers)?;
+    Ok(candidate_count)
 }
 
 struct ExactVectorSearchRequest<'a> {

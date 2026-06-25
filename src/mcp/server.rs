@@ -65,7 +65,10 @@ use crate::ingest::{
         evaluate_tier2, should_route_to_llm_judge,
     },
     normalize::CURRENT_NORMALIZE_VERSION,
-    novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty},
+    novelty::{
+        NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty,
+        novelty_vector_search_has_pushed_project_scope,
+    },
 };
 use crate::knowledge_anchor::{PublishAnchorRequest as CorePublishAnchorRequest, publish_anchor};
 use crate::knowledge_card_lifecycle::{
@@ -6307,7 +6310,7 @@ impl MempalMcpServer {
         // consistent set from a single `sqlite_master` read. A mid-request embed transition
         // to degraded is not lost: the degraded-write guard above rejects before any
         // success response that would carry this snapshot is built.
-        let request_system_warnings = system_warnings_with_stale_index(&db);
+        let mut request_system_warnings = system_warnings_with_stale_index(&db);
         let no_gate = controls.no_gate;
         let bypass_novelty = controls.bypass_novelty;
         let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
@@ -6726,12 +6729,29 @@ impl MempalMcpServer {
 
         let first_vector_ref = &vectors[0];
         let novelty_started = Instant::now();
-        let duplicate_warning = check_semantic_duplicate(&db, first_vector_ref, first_chunk);
         let novelty_candidate = NoveltyCandidate {
             wing: request.wing.clone(),
             room: request.room.clone(),
             project_id: project_id.clone(),
         };
+        let duplicate_warning = check_semantic_duplicate(
+            &db,
+            first_vector_ref,
+            first_chunk,
+            SemanticDuplicateCheckContext {
+                wing: &request.wing,
+                room: request.room.as_deref(),
+                project_id: project_id.as_deref(),
+                strict_project_isolation: config.search.strict_project_isolation,
+                skip_for_ingest_policy: superseded_drawer_id.is_some() || bypass_novelty,
+                novelty_will_search: novelty_vector_search_will_run(
+                    &db,
+                    &novelty_candidate,
+                    &config.ingest_gating.novelty,
+                ),
+            },
+            &mut request_system_warnings,
+        );
         let novelty = if superseded_drawer_id.is_some() || bypass_novelty {
             crate::ingest::novelty::NoveltyDecision {
                 should_audit: false,
@@ -10897,21 +10917,103 @@ fn read_drawer_response(details: crate::core::types::DrawerDetails) -> ReadDrawe
 
 const DEDUP_THRESHOLD: f32 = 0.85;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticDuplicateCheckPlan {
+    Search,
+    Skip(SemanticDuplicateSkipReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticDuplicateSkipReason {
+    IngestPolicy,
+    NoveltyVectorSearch,
+    CandidateLimitExceeded,
+    CandidateCountUnavailable,
+    VectorSearchFailed,
+}
+
+struct SemanticDuplicateCheckContext<'a> {
+    wing: &'a str,
+    room: Option<&'a str>,
+    project_id: Option<&'a str>,
+    strict_project_isolation: bool,
+    skip_for_ingest_policy: bool,
+    novelty_will_search: bool,
+}
+
 fn check_semantic_duplicate(
     db: &Database,
     vector: &[f32],
     _content: &str,
+    context: SemanticDuplicateCheckContext<'_>,
+    system_warnings: &mut Vec<SystemWarning>,
 ) -> Option<DuplicateWarning> {
     use crate::core::types::RouteDecision;
 
+    if let Some(reason) = pre_count_semantic_duplicate_skip_reason(
+        context.skip_for_ingest_policy,
+        context.novelty_will_search,
+    ) {
+        system_warnings.push(semantic_duplicate_skip_warning(reason, None));
+        return None;
+    }
+
     let route = RouteDecision {
-        wing: None,
-        room: None,
+        wing: Some(context.wing.to_string()),
+        room: context.room.map(ToOwned::to_owned),
         confidence: 0.0,
         reason: "dedup check".to_string(),
     };
-    let scope = ProjectSearchScope::all_projects();
-    let results = crate::search::search_by_vector(db, vector, route, &scope, 1).ok()?;
+    let scope = ProjectSearchScope::from_request(
+        context.project_id.map(ToOwned::to_owned),
+        false,
+        false,
+        context.strict_project_isolation,
+    );
+    let filters = SearchFilters::default();
+    let candidate_count =
+        match crate::search::count_vector_candidate_drawers(db, &route, &scope, &filters) {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "semantic duplicate candidate count failed; fail-open without duplicate warning"
+                );
+                system_warnings.push(semantic_duplicate_skip_warning(
+                    SemanticDuplicateSkipReason::CandidateCountUnavailable,
+                    None,
+                ));
+                return None;
+            }
+        };
+    match plan_semantic_duplicate_check(
+        candidate_count,
+        crate::search::EXACT_VECTOR_CANDIDATE_LIMIT,
+    ) {
+        SemanticDuplicateCheckPlan::Search => {}
+        SemanticDuplicateCheckPlan::Skip(reason) => {
+            system_warnings.push(semantic_duplicate_skip_warning(
+                reason,
+                Some(candidate_count),
+            ));
+            return None;
+        }
+    }
+
+    let results = match crate::search::search_by_vector(db, vector, route, &scope, 1) {
+        Ok(results) => results,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "bounded semantic duplicate search failed; fail-open without duplicate warning"
+            );
+            system_warnings.push(semantic_duplicate_skip_warning(
+                SemanticDuplicateSkipReason::VectorSearchFailed,
+                Some(candidate_count),
+            ));
+            return None;
+        }
+    };
     let top = results.first()?;
     if top.similarity >= DEDUP_THRESHOLD {
         Some(DuplicateWarning {
@@ -10921,6 +11023,74 @@ fn check_semantic_duplicate(
         })
     } else {
         None
+    }
+}
+
+fn pre_count_semantic_duplicate_skip_reason(
+    skip_for_ingest_policy: bool,
+    novelty_will_search: bool,
+) -> Option<SemanticDuplicateSkipReason> {
+    if skip_for_ingest_policy {
+        return Some(SemanticDuplicateSkipReason::IngestPolicy);
+    }
+    if novelty_will_search {
+        return Some(SemanticDuplicateSkipReason::NoveltyVectorSearch);
+    }
+    None
+}
+
+fn plan_semantic_duplicate_check(candidate_count: i64, limit: i64) -> SemanticDuplicateCheckPlan {
+    if candidate_count > limit {
+        SemanticDuplicateCheckPlan::Skip(SemanticDuplicateSkipReason::CandidateLimitExceeded)
+    } else {
+        SemanticDuplicateCheckPlan::Search
+    }
+}
+
+fn novelty_vector_search_will_run(
+    db: &Database,
+    candidate: &NoveltyCandidate,
+    config: &crate::core::config::NoveltyConfig,
+) -> bool {
+    read_fork_ext_version(db.conn()).is_ok_and(|version| {
+        novelty_vector_search_has_pushed_project_scope(candidate, config, version)
+    })
+}
+
+fn semantic_duplicate_skip_warning(
+    reason: SemanticDuplicateSkipReason,
+    candidate_count: Option<i64>,
+) -> SystemWarning {
+    let limit = crate::search::EXACT_VECTOR_CANDIDATE_LIMIT;
+    let (level, message) = match reason {
+        SemanticDuplicateSkipReason::IngestPolicy => (
+            "info",
+            "semantic duplicate warning skipped: ingest controls disabled vector deduplication for this write".to_string(),
+        ),
+        SemanticDuplicateSkipReason::NoveltyVectorSearch => (
+            "info",
+            "semantic duplicate warning skipped: novelty policy already performs the scoped vector candidate search for this ingest".to_string(),
+        ),
+        SemanticDuplicateSkipReason::CandidateLimitExceeded => (
+            "warn",
+            format!(
+                "semantic duplicate warning skipped: scoped candidate_count={} exceeds limit={limit}",
+                candidate_count.unwrap_or_default()
+            ),
+        ),
+        SemanticDuplicateSkipReason::CandidateCountUnavailable => (
+            "warn",
+            "semantic duplicate warning skipped: scoped candidate count failed before vector search".to_string(),
+        ),
+        SemanticDuplicateSkipReason::VectorSearchFailed => (
+            "warn",
+            "semantic duplicate warning skipped: bounded vector search failed".to_string(),
+        ),
+    };
+    SystemWarning {
+        level: level.to_string(),
+        message,
+        source: "ingest_duplicate".to_string(),
     }
 }
 
@@ -11134,6 +11304,81 @@ mod tests {
         .expect("create MCP server")
         .with_async_db_for_test(async_db);
         (tempdir, db_path, server)
+    }
+
+    #[test]
+    fn test_semantic_duplicate_plan_skips_large_candidate_scope() {
+        assert_eq!(
+            plan_semantic_duplicate_check(
+                crate::search::EXACT_VECTOR_CANDIDATE_LIMIT + 1,
+                crate::search::EXACT_VECTOR_CANDIDATE_LIMIT,
+            ),
+            SemanticDuplicateCheckPlan::Skip(SemanticDuplicateSkipReason::CandidateLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn test_semantic_duplicate_plan_searches_bounded_candidate_scope() {
+        assert_eq!(
+            plan_semantic_duplicate_check(
+                crate::search::EXACT_VECTOR_CANDIDATE_LIMIT,
+                crate::search::EXACT_VECTOR_CANDIDATE_LIMIT,
+            ),
+            SemanticDuplicateCheckPlan::Search
+        );
+    }
+
+    #[test]
+    fn test_semantic_duplicate_pre_count_skip_avoids_redundant_vector_search() {
+        assert_eq!(
+            pre_count_semantic_duplicate_skip_reason(false, true),
+            Some(SemanticDuplicateSkipReason::NoveltyVectorSearch)
+        );
+        assert_eq!(
+            pre_count_semantic_duplicate_skip_reason(true, false),
+            Some(SemanticDuplicateSkipReason::IngestPolicy)
+        );
+    }
+
+    #[test]
+    fn test_novelty_vector_search_replacement_requires_project_pushdown() {
+        let (_tempdir, db_path, _server) = setup_server();
+        let db = Database::open(&db_path).expect("open db");
+        let config = crate::core::config::NoveltyConfig {
+            enabled: true,
+            top_k_candidates: 5,
+            ..Default::default()
+        };
+        let no_project = NoveltyCandidate {
+            wing: "mcp".to_string(),
+            room: Some("decision".to_string()),
+            project_id: None,
+        };
+        let scoped_project = NoveltyCandidate {
+            wing: "mcp".to_string(),
+            room: Some("decision".to_string()),
+            project_id: Some("proj-a".to_string()),
+        };
+
+        assert!(!novelty_vector_search_will_run(&db, &no_project, &config));
+        assert!(novelty_vector_search_will_run(
+            &db,
+            &scoped_project,
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_semantic_duplicate_skip_warning_is_content_free() {
+        let warning = semantic_duplicate_skip_warning(
+            SemanticDuplicateSkipReason::CandidateLimitExceeded,
+            Some(50_000),
+        );
+
+        assert_eq!(warning.source, "ingest_duplicate");
+        assert!(warning.message.contains("candidate_count=50000"));
+        assert!(!warning.message.contains("payload"));
+        assert!(!warning.message.contains("content"));
     }
 
     async fn enqueue_prepared_test_ingest_operation(
