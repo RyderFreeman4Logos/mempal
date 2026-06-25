@@ -151,6 +151,8 @@ pub struct AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     enqueue_lock_failures: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    claim_lock_failures: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     claim_blocking_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
     release_lock_failures: Arc<AtomicUsize>,
@@ -176,6 +178,8 @@ impl AsyncPendingMessageStore {
             #[cfg(any(test, feature = "db-test-seam"))]
             enqueue_lock_failures: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "db-test-seam"))]
+            claim_lock_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "db-test-seam"))]
             claim_blocking_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             release_lock_failures: Arc::new(AtomicUsize::new(0)),
@@ -191,6 +195,12 @@ impl AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_enqueue_lock_failures_for_test(self, failures: usize) -> Self {
         self.enqueue_lock_failures.store(failures, Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_claim_lock_failures_for_test(self, failures: usize) -> Self {
+        self.claim_lock_failures.store(failures, Ordering::SeqCst);
         self
     }
 
@@ -323,6 +333,16 @@ impl AsyncPendingMessageStore {
         kind_filter: String,
         retry_deadline: Duration,
     ) -> Result<Option<ClaimedMessage>> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .claim_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(sqlite_busy_queue_error());
+        }
         #[cfg(any(test, feature = "db-test-seam"))]
         let delay = self.claim_blocking_delay.or(self.blocking_delay);
         #[cfg(not(any(test, feature = "db-test-seam")))]

@@ -309,10 +309,12 @@ def run_cli(name: str, args: list[str], *, input_text: str | None = None, expect
 def created_ids_from(value: Any) -> list[str]:
     if not isinstance(value, dict):
         return []
-    ids = value.get('created_drawer_ids')
-    if isinstance(ids, list):
-        return list(dict.fromkeys(x for x in ids if isinstance(x, str) and x))
-    return []
+    ids: list[str] = []
+    for key in ('created_drawer_ids', 'cleanup_drawer_ids'):
+        values = value.get(key)
+        if isinstance(values, list):
+            ids.extend(x for x in values if isinstance(x, str) and x)
+    return list(dict.fromkeys(ids))
 
 
 def terminal_state(value: Any) -> bool:
@@ -524,22 +526,34 @@ class McpClient:
         killed = False
         exited = False
         try:
-            self.call('shutdown', {}, timeout=5)
-        except Exception:
-            pass
-        try:
             self.notify('notifications/exit')
         except Exception:
             pass
         try:
-            waited = wait_exited_without_reap(self.proc.pid, 5)
+            if self.proc.stdin is not None and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            waited = wait_exited_without_reap(self.proc.pid, 1)
             exited = waited is True
         except Exception:
             exited = False
         proc_io_after = read_proc_io(self.proc.pid)
         try:
-            self.proc.wait(timeout=5)
+            self.proc.wait(timeout=1)
         except Exception:
+            try:
+                killed = True
+                self.proc.terminate()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=1)
+                exited = True
+            except Exception:
+                pass
+        if self.proc.returncode is None:
             try:
                 killed = True
                 self.proc.kill()
@@ -601,6 +615,16 @@ def mcp_start_initialized() -> McpClient:
 
 def mcp_call_isolated(tool_names: list[str], name: str, args: dict[str, Any], timeout: int) -> tuple[Any | None, dict[str, Any]]:
     label = 'mcp_read_' + name.removeprefix('mempal_')
+    return mcp_call_isolated_labeled(tool_names, label, name, args, timeout)
+
+
+def mcp_call_isolated_labeled(
+    tool_names: list[str],
+    label: str,
+    name: str,
+    args: dict[str, Any],
+    timeout: int,
+) -> tuple[Any | None, dict[str, Any]]:
     if name not in tool_names:
         note(label, True, skipped='tool_not_advertised')
         return None, {'ok': True, 'skipped': True}
@@ -655,14 +679,14 @@ def mcp_crud() -> list[str]:
         create, info = client.tool('mempal_ingest', create_args, timeout=130)
         ids = created_ids_from(create)
         if not ids and isinstance(create, dict) and create.get('operation_id'):
-            status, sinfo = client.tool('mempal_operation_status', {'operation_id': create['operation_id']}, timeout=30)
-            note('mcp_create_status', bool(sinfo.get('ok')), **without_ok(sinfo))
-            ids = created_ids_from(status)
-            if not ids:
-                client.close()
-                client = None
-                waited = wait_operation(create['operation_id'], 'mcp_create_cli_wait')
-                ids = created_ids_from(waited)
+            # A non-terminal MCP ingest receipt means the daemon may still be
+            # processing the write. Close this stdio server before following the
+            # operation via CLI so the smoke runner never observes a result while
+            # its own MCP process is still an extra SQLite holder.
+            client.close()
+            client = None
+            waited = wait_operation(create['operation_id'], 'mcp_create_cli_wait')
+            ids = created_ids_from(waited)
         note('mcp_create', bool(info.get('ok')) and bool(ids), created_id_count=len(ids), **without_ok(info))
         if not ids:
             note(
@@ -675,8 +699,10 @@ def mcp_crud() -> list[str]:
         cleanup_ids.extend(ids)
         created_id = ids[0]
         SUMMARY['created_counts']['mcp'] = len(cleanup_ids)
-        if client is None:
-            client = mcp_start_initialized()
+
+        if client is not None:
+            client.close()
+            client = None
 
         for name, args, timeout in [
             ('mempal_search', {'query': MARKER, 'top_k': 5, 'all_projects': True}, 180),
@@ -685,27 +711,27 @@ def mcp_crud() -> list[str]:
             ('mempal_context', {'query': MARKER, 'all_projects': True, 'max_items': 3, 'include_distill_suggestions': False}, 150),
             ('mempal_brief', {'query': MARKER, 'domain': 'project', 'field': 'smoke', 'cwd': str(REPO), 'max_items': 3}, 150),
         ]:
-            if name in tool_names:
-                structured, info = client.tool(name, args, timeout=timeout)
-                note('mcp_' + name.removeprefix('mempal_'), bool(info.get('ok')), **without_ok(info))
-                if name == 'mempal_search':
-                    matches = count_marker_matches(structured, 'mcp')
-                    note('mcp_search_created_match', matches > 0, active_matches=matches)
-            else:
-                note('mcp_' + name.removeprefix('mempal_'), True, skipped='tool_not_advertised')
+            structured, info = mcp_call_isolated_labeled(
+                tool_names,
+                'mcp_' + name.removeprefix('mempal_'),
+                name,
+                args,
+                timeout,
+            )
+            if name == 'mempal_search' and bool(info.get('ok')):
+                matches = count_marker_matches(structured, 'mcp')
+                note('mcp_search_created_match', matches > 0, active_matches=matches)
+
+        client = mcp_start_initialized()
 
         update_args = {'content': f'{MARKER} reversible MCP smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens deltaorchid embervault frostcairn; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'supersedes': created_id, 'wait': True, 'wait_timeout_secs': 90}
         update, uinfo = client.tool('mempal_ingest', update_args, timeout=130)
         upd_ids = created_ids_from(update)
         if not upd_ids and isinstance(update, dict) and update.get('operation_id'):
-            status, sinfo = client.tool('mempal_operation_status', {'operation_id': update['operation_id']}, timeout=30)
-            note('mcp_update_status', bool(sinfo.get('ok')), **without_ok(sinfo))
-            upd_ids = created_ids_from(status)
-            if not upd_ids:
-                client.close()
-                client = None
-                waited = wait_operation(update['operation_id'], 'mcp_update_cli_wait')
-                upd_ids = created_ids_from(waited)
+            client.close()
+            client = None
+            waited = wait_operation(update['operation_id'], 'mcp_update_cli_wait')
+            upd_ids = created_ids_from(waited)
         note('mcp_update', bool(uinfo.get('ok')) and bool(upd_ids), created_id_count=len(upd_ids), **without_ok(uinfo))
         if not upd_ids:
             delete_exact_ids_cli(cleanup_ids, 'mcp_cleanup_after_update_failure', room='mcp')
