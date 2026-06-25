@@ -12238,7 +12238,10 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
             ),
         });
     }
-    let (daemon_pid, daemon_running) = detect_daemon_status(db.path())?;
+    let (daemon_pid, daemon_running, daemon_pidfile_warning) = detect_daemon_status(db.path())?;
+    if let Some(warning) = daemon_pidfile_warning {
+        runtime_warnings.push(warning);
+    }
     let last_heartbeat = db
         .conn()
         .query_row(
@@ -12916,35 +12919,117 @@ fn read_daemon_pid(db_path: &Path) -> Result<Option<i32>> {
     Ok(Some(pid))
 }
 
+struct DaemonPidfileProbe {
+    pid: Option<i32>,
+    warning: Option<mempal::core::config::RuntimeWarning>,
+}
+
+fn daemon_pidfile_status_warning(
+    pid_path: &Path,
+    reason: &str,
+) -> mempal::core::config::RuntimeWarning {
+    mempal::core::config::RuntimeWarning {
+        level: "warn",
+        source: "daemon",
+        message: format!(
+            "daemon pidfile {} is {reason}; ignoring pidfile for status. Daemon liveness is based on process scan and DB holder diagnostics.",
+            pid_path.display()
+        ),
+    }
+}
+
+fn read_daemon_pid_for_status(db_path: &Path) -> DaemonPidfileProbe {
+    let Some(mempal_home) = db_path.parent() else {
+        return DaemonPidfileProbe {
+            pid: None,
+            warning: None,
+        };
+    };
+    let pid_path = mempal_home.join("daemon.pid");
+    let content = match std::fs::read_to_string(&pid_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return DaemonPidfileProbe {
+                pid: None,
+                warning: None,
+            };
+        }
+        Err(error) => {
+            return DaemonPidfileProbe {
+                pid: None,
+                warning: Some(daemon_pidfile_status_warning(
+                    &pid_path,
+                    &format!("unreadable ({})", error.kind()),
+                )),
+            };
+        }
+    };
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return DaemonPidfileProbe {
+            pid: None,
+            warning: Some(daemon_pidfile_status_warning(&pid_path, "empty")),
+        };
+    }
+    match trimmed.parse::<i32>() {
+        Ok(pid) => DaemonPidfileProbe {
+            pid: Some(pid),
+            warning: None,
+        },
+        Err(_) => DaemonPidfileProbe {
+            pid: None,
+            warning: Some(daemon_pidfile_status_warning(
+                &pid_path,
+                "not a valid integer",
+            )),
+        },
+    }
+}
+
 #[cfg(unix)]
-fn detect_daemon_status(db_path: &Path) -> Result<(Option<i32>, bool)> {
-    let pidfile_pid = read_daemon_pid(db_path)?;
+fn detect_daemon_status(
+    db_path: &Path,
+) -> Result<(
+    Option<i32>,
+    bool,
+    Option<mempal::core::config::RuntimeWarning>,
+)> {
+    let pidfile = read_daemon_pid_for_status(db_path);
+    let pidfile_pid = pidfile.pid;
     if let Some(pid) = pidfile_pid
         && process_is_running(pid).context("failed to probe daemon pid liveness")?
     {
-        return Ok((Some(pid), true));
+        return Ok((Some(pid), true, pidfile.warning));
     }
 
-    let (candidates, live_pidfile_pid) = collect_daemon_candidates(db_path)?;
+    let (candidates, live_pidfile_pid) =
+        collect_daemon_candidates_with_pidfile(db_path, pidfile_pid)?;
     let plan = mempal::daemon_singleton::plan_daemon_reap(&candidates, live_pidfile_pid);
     if let Some(pid) = plan.keeper
         && process_is_running(pid).context("failed to probe daemon singleton liveness")?
     {
-        return Ok((Some(pid), true));
+        return Ok((Some(pid), true, pidfile.warning));
     }
 
-    Ok((pidfile_pid, false))
+    Ok((pidfile_pid, false, pidfile.warning))
 }
 
 #[cfg(not(unix))]
-fn detect_daemon_status(db_path: &Path) -> Result<(Option<i32>, bool)> {
-    let daemon_pid = read_daemon_pid(db_path)?;
+fn detect_daemon_status(
+    db_path: &Path,
+) -> Result<(
+    Option<i32>,
+    bool,
+    Option<mempal::core::config::RuntimeWarning>,
+)> {
+    let pidfile = read_daemon_pid_for_status(db_path);
+    let daemon_pid = pidfile.pid;
     let daemon_running = daemon_pid
         .map(process_is_running)
         .transpose()
         .context("failed to probe daemon pid liveness")?
         .unwrap_or(false);
-    Ok((daemon_pid, daemon_running))
+    Ok((daemon_pid, daemon_running, pidfile.warning))
 }
 
 #[cfg(unix)]
@@ -14324,19 +14409,46 @@ impl DaemonProcessOps for RealDaemonProcessOps {
 
 #[cfg(unix)]
 fn collect_daemon_candidates(db_path: &Path) -> Result<(Vec<i32>, Option<i32>)> {
-    collect_daemon_candidates_with_scan(db_path, mempal::daemon_singleton::enumerate_daemon_pids)
+    let pidfile_pid = read_daemon_pid(db_path)?;
+    collect_daemon_candidates_with_scan_and_pidfile(
+        db_path,
+        mempal::daemon_singleton::enumerate_daemon_pids,
+        pidfile_pid,
+    )
 }
 
 #[cfg(unix)]
+fn collect_daemon_candidates_with_pidfile(
+    db_path: &Path,
+    pidfile_pid: Option<i32>,
+) -> Result<(Vec<i32>, Option<i32>)> {
+    collect_daemon_candidates_with_scan_and_pidfile(
+        db_path,
+        mempal::daemon_singleton::enumerate_daemon_pids,
+        pidfile_pid,
+    )
+}
+
+#[cfg(all(unix, test))]
 fn collect_daemon_candidates_with_scan(
     db_path: &Path,
     enumerate_daemon_pids: impl Fn(&str, &Path) -> Vec<i32>,
+) -> Result<(Vec<i32>, Option<i32>)> {
+    let pidfile_pid = read_daemon_pid(db_path)?;
+    collect_daemon_candidates_with_scan_and_pidfile(db_path, enumerate_daemon_pids, pidfile_pid)
+}
+
+#[cfg(unix)]
+fn collect_daemon_candidates_with_scan_and_pidfile(
+    db_path: &Path,
+    enumerate_daemon_pids: impl Fn(&str, &Path) -> Vec<i32>,
+    pidfile_pid: Option<i32>,
 ) -> Result<(Vec<i32>, Option<i32>)> {
     let binary =
         mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
     let mut candidates = enumerate_daemon_pids(&binary, db_path);
 
-    let pidfile_pid = match read_daemon_pid(db_path)? {
+    let live_pidfile_pid = match pidfile_pid {
         Some(pid) if process_is_running(pid)? => {
             if !candidates.contains(&pid) {
                 candidates.push(pid);
@@ -14349,7 +14461,7 @@ fn collect_daemon_candidates_with_scan(
     candidates.sort_unstable();
     candidates.dedup();
 
-    Ok((candidates, pidfile_pid))
+    Ok((candidates, live_pidfile_pid))
 }
 
 #[cfg(unix)]
@@ -14710,8 +14822,12 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
         mempal::daemon_singleton::current_binary_name().unwrap_or_else(|| "mempal".to_string());
     let mempal_home = daemon_home_from_db_path(db_path);
     let siblings = mempal::daemon_singleton::enumerate_daemon_pids(&binary, db_path);
+    let pidfile = read_daemon_pid_for_status(db_path);
+    if let Some(warning) = pidfile.warning.as_ref() {
+        println!("warning: {}", warning.message);
+    }
 
-    match read_daemon_pid(db_path)? {
+    match pidfile.pid {
         None => {
             if siblings.is_empty() {
                 println!("status: stopped");
