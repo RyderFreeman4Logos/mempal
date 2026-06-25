@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(any(test, feature = "db-test-seam"))]
@@ -36,6 +37,8 @@ pub enum QueueError {
     BlockingTaskFailed(String),
     #[error("unsupported model task kind for auto-requeue: {0}")]
     UnsupportedModelTaskKind(String),
+    #[error("queue failed-row mutation requires at least one explicit kind/class/reason filter")]
+    UnsafeUnfilteredQueueMutation,
 }
 
 impl QueueError {
@@ -83,20 +86,93 @@ pub struct PendingOperationRecord {
     pub result_json: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueueStats {
     pub pending: u64,
     pub claimed: u64,
     pub failed: u64,
     pub failed_retryable: u64,
     pub failed_terminal: u64,
+    pub failed_archived: u64,
+    pub retrying: u64,
     pub failed_retryable_embed: u64,
     pub failed_retryable_llm: u64,
     pub last_auto_requeue_at_unix_ms: Option<u64>,
+    pub next_retry_at_unix_secs: Option<u64>,
     pub oldest_pending_age_secs: Option<u64>,
     pub rate_per_min: f64,
     pub avg_processing_ms: Option<u64>,
     pub eta_secs: Option<u64>,
+    pub failed_buckets: Vec<QueueFailureBucket>,
+    pub retrying_buckets: Vec<QueueFailureBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueFailureBucket {
+    pub kind: String,
+    pub retry_class: String,
+    pub reason_code: String,
+    pub sanitized_message: String,
+    pub count: u64,
+    pub min_retry_count: u32,
+    pub max_retry_count: u32,
+    pub next_attempt_at_unix_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueFailureFilter {
+    pub kind: Option<String>,
+    pub retry_class: Option<String>,
+    pub reason_code: Option<String>,
+}
+
+impl QueueFailureFilter {
+    pub fn is_explicit(&self) -> bool {
+        self.kind.is_some() || self.retry_class.is_some() || self.reason_code.is_some()
+    }
+
+    pub fn matches_bucket(&self, bucket: &QueueFailureBucket) -> bool {
+        self.kind
+            .as_deref()
+            .is_none_or(|value| value == bucket.kind.as_str())
+            && self
+                .retry_class
+                .as_deref()
+                .is_none_or(|value| value == bucket.retry_class.as_str())
+            && self
+                .reason_code
+                .as_deref()
+                .is_none_or(|value| value == bucket.reason_code.as_str())
+    }
+
+    fn matches_row(&self, row: &QueueFailureRow) -> bool {
+        self.kind
+            .as_deref()
+            .is_none_or(|value| value == row.kind.as_str())
+            && self
+                .retry_class
+                .as_deref()
+                .is_none_or(|value| value == row.retry_class.as_str())
+            && self
+                .reason_code
+                .as_deref()
+                .is_none_or(|value| value == row.reason_code.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueFailureActionPreview {
+    pub filter: QueueFailureFilter,
+    pub matched: u64,
+    pub buckets: Vec<QueueFailureBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueFailureActionOutcome {
+    pub filter: QueueFailureFilter,
+    pub matched: u64,
+    pub changed: u64,
+    pub buckets: Vec<QueueFailureBucket>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,6 +1204,7 @@ impl PendingMessageStore {
                     ELSE result_json
                 END
             WHERE status = 'failed'
+              AND failure_class = 'retryable_model'
               AND kind != 'llm_task'
             "#,
             [now],
@@ -1214,6 +1291,146 @@ impl PendingMessageStore {
     pub fn stats(&self) -> Result<QueueStats> {
         let conn = self.open_query_connection()?;
         compute_queue_stats(&conn)
+    }
+
+    pub fn preview_failed_action(
+        &self,
+        filter: QueueFailureFilter,
+    ) -> Result<QueueFailureActionPreview> {
+        ensure_explicit_filter(&filter)?;
+        let conn = self.open_query_connection()?;
+        let rows = matching_failed_rows(&conn, &filter)?;
+        Ok(QueueFailureActionPreview {
+            filter,
+            matched: rows.len() as u64,
+            buckets: buckets_from_rows(rows.iter()),
+        })
+    }
+
+    pub fn retry_failed_messages(
+        &self,
+        filter: QueueFailureFilter,
+    ) -> Result<QueueFailureActionOutcome> {
+        ensure_explicit_filter(&filter)?;
+        let mut conn = self.open_connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows = matching_failed_rows(&tx, &filter)?;
+        let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+
+        let now = now_secs();
+        let mut changed = 0u64;
+        for id in &ids {
+            let updated = tx.execute(
+                r#"
+                UPDATE pending_messages
+                SET status = 'pending',
+                    retry_count = 0,
+                    retry_backoff_ms = 0,
+                    next_attempt_at = MIN(created_at, ?2),
+                    claim_token = NULL,
+                    claimed_at = NULL,
+                    heartbeat_at = NULL,
+                    last_error = NULL,
+                    op_state = 'queued',
+                    failure_class = NULL,
+                    result_drawer_id = CASE
+                        WHEN kind = 'ingest_async' THEN NULL
+                        ELSE result_drawer_id
+                    END,
+                    rejected_reason = CASE
+                        WHEN kind = 'ingest_async' THEN NULL
+                        ELSE rejected_reason
+                    END,
+                    failure_detail = CASE
+                        WHEN kind = 'ingest_async' THEN NULL
+                        ELSE failure_detail
+                    END,
+                    result_json = CASE
+                        WHEN kind = 'ingest_async' THEN NULL
+                        ELSE result_json
+                    END
+                WHERE id = ?1 AND status = 'failed'
+                "#,
+                params![id, now],
+            )?;
+            changed = changed.saturating_add(updated as u64);
+        }
+        tx.commit()?;
+        Ok(QueueFailureActionOutcome {
+            filter,
+            matched: rows.len() as u64,
+            changed,
+            buckets: buckets_from_rows(rows.iter()),
+        })
+    }
+
+    pub fn archive_failed_messages(
+        &self,
+        filter: QueueFailureFilter,
+    ) -> Result<QueueFailureActionOutcome> {
+        ensure_explicit_filter(&filter)?;
+        let completed_at = now_millis();
+        let mut conn = self.open_connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows = matching_failed_rows(&tx, &filter)?;
+        let mut changed = 0u64;
+        for row in &rows {
+            let archive_reason = format!("queue_archive:{}", row.reason_code);
+            tx.execute(
+                r#"
+                INSERT INTO pending_message_completions (
+                    message_id,
+                    kind,
+                    created_at,
+                    claimed_at,
+                    completed_at,
+                    processing_ms,
+                    result_drawer_id,
+                    op_state,
+                    rejected_reason,
+                    failure_detail,
+                    result_json
+                )
+                SELECT id,
+                       kind,
+                       created_at * 1000,
+                       claimed_at,
+                       ?2,
+                       NULL,
+                       result_drawer_id,
+                       'failed',
+                       ?3,
+                       last_error,
+                       result_json
+                FROM pending_messages
+                WHERE id = ?1 AND status = 'failed'
+                ON CONFLICT(message_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    created_at = excluded.created_at,
+                    claimed_at = excluded.claimed_at,
+                    completed_at = excluded.completed_at,
+                    processing_ms = excluded.processing_ms,
+                    result_drawer_id = excluded.result_drawer_id,
+                    op_state = excluded.op_state,
+                    rejected_reason = excluded.rejected_reason,
+                    failure_detail = excluded.failure_detail,
+                    result_json = excluded.result_json
+                "#,
+                params![row.id.as_str(), completed_at, archive_reason.as_str()],
+            )?;
+            let deleted = tx.execute(
+                "DELETE FROM pending_messages WHERE id = ?1 AND status = 'failed'",
+                [row.id.as_str()],
+            )?;
+            changed = changed.saturating_add(deleted as u64);
+        }
+        tx.commit()?;
+        Ok(QueueFailureActionOutcome {
+            filter,
+            matched: rows.len() as u64,
+            changed,
+            buckets: buckets_from_rows(rows.iter()),
+        })
     }
 
     fn open_connection(&self) -> Result<Connection> {
@@ -1539,50 +1756,51 @@ fn compute_queue_stats(conn: &Connection) -> Result<QueueStats> {
         }
     }
 
-    let has_failure_class = column_exists(conn, "pending_messages", "failure_class")?;
-    let (failed_retryable, failed_terminal, failed_retryable_embed, failed_retryable_llm) =
-        if has_failure_class {
-            let failed_retryable = conn.query_row(
-                r#"
-                SELECT COUNT(*)
-                FROM pending_messages
-                WHERE status = 'failed'
-                  AND failure_class = 'retryable_model'
-                "#,
-                [],
-                |row| row.get::<_, i64>(0),
-            )?;
-            let failed_retryable_embed = conn.query_row(
-                r#"
-                SELECT COUNT(*)
-                FROM pending_messages
-                WHERE status = 'failed'
-                  AND failure_class = 'retryable_model'
-                  AND kind != 'llm_task'
-                "#,
-                [],
-                |row| row.get::<_, i64>(0),
-            )?;
-            let failed_retryable_llm = conn.query_row(
-                r#"
-                SELECT COUNT(*)
-                FROM pending_messages
-                WHERE status = 'failed'
-                  AND failure_class = 'retryable_model'
-                  AND kind = 'llm_task'
-                "#,
-                [],
-                |row| row.get::<_, i64>(0),
-            )?;
-            (
-                failed_retryable,
-                failed.saturating_sub(failed_retryable),
-                failed_retryable_embed,
-                failed_retryable_llm,
-            )
-        } else {
-            (0, failed, 0, 0)
-        };
+    let failure_rows = queue_failure_rows(conn)?;
+    let failed_buckets = buckets_from_rows(
+        failure_rows
+            .iter()
+            .filter(|row| row.status == QueueFailureRowStatus::Failed),
+    );
+    let retrying_buckets = buckets_from_rows(
+        failure_rows
+            .iter()
+            .filter(|row| row.status == QueueFailureRowStatus::Retrying),
+    );
+    let failed_retryable = failure_rows
+        .iter()
+        .filter(|row| {
+            row.status == QueueFailureRowStatus::Failed && row.retry_class == "retryable_model"
+        })
+        .count() as i64;
+    let failed_retryable_embed = failure_rows
+        .iter()
+        .filter(|row| {
+            row.status == QueueFailureRowStatus::Failed
+                && row.retry_class == "retryable_model"
+                && row.kind != "llm_task"
+        })
+        .count() as i64;
+    let failed_retryable_llm = failure_rows
+        .iter()
+        .filter(|row| {
+            row.status == QueueFailureRowStatus::Failed
+                && row.retry_class == "retryable_model"
+                && row.kind == "llm_task"
+        })
+        .count() as i64;
+    let retrying = failure_rows
+        .iter()
+        .filter(|row| row.status == QueueFailureRowStatus::Retrying)
+        .count() as i64;
+    let next_retry_at_unix_secs = failure_rows
+        .iter()
+        .filter(|row| row.status == QueueFailureRowStatus::Retrying)
+        .filter_map(|row| row.next_attempt_at)
+        .min()
+        .map(i64_to_u64);
+    let failed_terminal = failed.saturating_sub(failed_retryable);
+    let failed_archived = archived_failed_count(conn)?;
     let last_auto_requeue_at_unix_ms = if table_exists(conn, "fork_ext_meta")? {
         conn.query_row(
             r#"
@@ -1643,18 +1861,339 @@ fn compute_queue_stats(conn: &Connection) -> Result<QueueStats> {
         failed: i64_to_u64(failed),
         failed_retryable: i64_to_u64(failed_retryable),
         failed_terminal: i64_to_u64(failed_terminal),
+        failed_archived,
+        retrying: i64_to_u64(retrying),
         failed_retryable_embed: i64_to_u64(failed_retryable_embed),
         failed_retryable_llm: i64_to_u64(failed_retryable_llm),
         last_auto_requeue_at_unix_ms,
+        next_retry_at_unix_secs,
         oldest_pending_age_secs,
         rate_per_min,
         avg_processing_ms,
         eta_secs,
+        failed_buckets,
+        retrying_buckets,
     })
 }
 
 pub fn failure_headline_count(live_fail_count: u64, queue_stats: &QueueStats) -> u64 {
     live_fail_count.max(queue_stats.failed)
+}
+
+fn ensure_explicit_filter(filter: &QueueFailureFilter) -> Result<()> {
+    if filter.is_explicit() {
+        Ok(())
+    } else {
+        Err(QueueError::UnsafeUnfilteredQueueMutation)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueFailureRowStatus {
+    Failed,
+    Retrying,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueueFailureRow {
+    id: String,
+    status: QueueFailureRowStatus,
+    kind: String,
+    retry_class: String,
+    reason_code: String,
+    sanitized_message: String,
+    retry_count: u32,
+    next_attempt_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct QueueFailureBucketKey {
+    kind: String,
+    retry_class: String,
+    reason_code: String,
+}
+
+#[derive(Debug, Clone)]
+struct QueueFailureBucketAccumulator {
+    sanitized_message: String,
+    count: u64,
+    min_retry_count: u32,
+    max_retry_count: u32,
+    next_attempt_at: Option<i64>,
+}
+
+fn queue_failure_rows(conn: &Connection) -> Result<Vec<QueueFailureRow>> {
+    let has_failure_class = column_exists(conn, "pending_messages", "failure_class")?;
+    let has_last_error = column_exists(conn, "pending_messages", "last_error")?;
+    let has_retry_count = column_exists(conn, "pending_messages", "retry_count")?;
+    let has_next_attempt_at = column_exists(conn, "pending_messages", "next_attempt_at")?;
+
+    let failure_class_expr = if has_failure_class {
+        "failure_class"
+    } else {
+        "NULL"
+    };
+    let last_error_expr = if has_last_error { "last_error" } else { "NULL" };
+    let retry_count_expr = if has_retry_count { "retry_count" } else { "0" };
+    let next_attempt_expr = if has_next_attempt_at {
+        "next_attempt_at"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        r#"
+        SELECT id,
+               kind,
+               status,
+               {failure_class_expr},
+               {last_error_expr},
+               {retry_count_expr},
+               {next_attempt_expr}
+        FROM pending_messages
+        WHERE status = 'failed'
+           OR (status = 'pending' AND {retry_count_expr} > 0)
+        "#
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], |row| {
+        let id = row.get::<_, String>(0)?;
+        let kind = row.get::<_, String>(1)?;
+        let status = row.get::<_, String>(2)?;
+        let failure_class = row.get::<_, Option<String>>(3)?;
+        let last_error = row.get::<_, Option<String>>(4)?;
+        let retry_count_i64 = row.get::<_, i64>(5)?;
+        let next_attempt_at = row.get::<_, Option<i64>>(6)?;
+        Ok((
+            id,
+            kind,
+            status,
+            failure_class,
+            last_error,
+            retry_count_i64,
+            next_attempt_at,
+        ))
+    })?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        let (id, kind, status, failure_class, last_error, retry_count_i64, next_attempt_at) = row?;
+        let status = match status.as_str() {
+            "failed" => QueueFailureRowStatus::Failed,
+            "pending" => QueueFailureRowStatus::Retrying,
+            _ => continue,
+        };
+        let retry_count = u32::try_from(retry_count_i64)
+            .map_err(|_| QueueError::RetryCountOverflow { id: id.clone() })?;
+        let retry_class = retry_class_for(status, failure_class.as_deref());
+        let last_error = last_error.unwrap_or_default();
+        let reason_code = queue_failure_reason_code(&kind, &last_error);
+        result.push(QueueFailureRow {
+            id,
+            status,
+            kind,
+            retry_class,
+            sanitized_message: queue_failure_message_summary(&reason_code, &last_error),
+            reason_code,
+            retry_count,
+            next_attempt_at,
+        });
+    }
+    Ok(result)
+}
+
+fn matching_failed_rows(
+    conn: &Connection,
+    filter: &QueueFailureFilter,
+) -> Result<Vec<QueueFailureRow>> {
+    queue_failure_rows(conn).map(|rows| {
+        rows.into_iter()
+            .filter(|row| row.status == QueueFailureRowStatus::Failed)
+            .filter(|row| filter.matches_row(row))
+            .collect()
+    })
+}
+
+fn buckets_from_rows<'a>(
+    rows: impl Iterator<Item = &'a QueueFailureRow>,
+) -> Vec<QueueFailureBucket> {
+    let mut buckets = BTreeMap::<QueueFailureBucketKey, QueueFailureBucketAccumulator>::new();
+    for row in rows {
+        let key = QueueFailureBucketKey {
+            kind: row.kind.clone(),
+            retry_class: row.retry_class.clone(),
+            reason_code: row.reason_code.clone(),
+        };
+        buckets
+            .entry(key)
+            .and_modify(|bucket| {
+                bucket.count = bucket.count.saturating_add(1);
+                bucket.min_retry_count = bucket.min_retry_count.min(row.retry_count);
+                bucket.max_retry_count = bucket.max_retry_count.max(row.retry_count);
+                bucket.next_attempt_at =
+                    min_optional_i64(bucket.next_attempt_at, row.next_attempt_at);
+            })
+            .or_insert_with(|| QueueFailureBucketAccumulator {
+                sanitized_message: row.sanitized_message.clone(),
+                count: 1,
+                min_retry_count: row.retry_count,
+                max_retry_count: row.retry_count,
+                next_attempt_at: row.next_attempt_at,
+            });
+    }
+
+    let mut result = buckets
+        .into_iter()
+        .map(|(key, bucket)| QueueFailureBucket {
+            kind: key.kind,
+            retry_class: key.retry_class,
+            reason_code: key.reason_code,
+            sanitized_message: bucket.sanitized_message,
+            count: bucket.count,
+            min_retry_count: bucket.min_retry_count,
+            max_retry_count: bucket.max_retry_count,
+            next_attempt_at_unix_secs: bucket.next_attempt_at.map(i64_to_u64),
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.retry_class.cmp(&right.retry_class))
+            .then_with(|| left.reason_code.cmp(&right.reason_code))
+    });
+    result
+}
+
+fn retry_class_for(status: QueueFailureRowStatus, failure_class: Option<&str>) -> String {
+    match status {
+        QueueFailureRowStatus::Retrying => "retrying_backoff".to_string(),
+        QueueFailureRowStatus::Failed => match failure_class {
+            Some("retryable_model") => "retryable_model".to_string(),
+            Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+            _ => "terminal".to_string(),
+        },
+    }
+}
+
+fn queue_failure_reason_code(kind: &str, last_error: &str) -> String {
+    let lower = last_error.to_ascii_lowercase();
+    if lower.contains("failed to decode llm response")
+        || lower.contains("error decoding response body")
+    {
+        "llm_response_decode".to_string()
+    } else if lower.contains("automatic hook llm gate failed before durable insert") {
+        "automatic_hook_llm_gate".to_string()
+    } else if lower.contains("failed to decode queued hook envelope")
+        || (is_hook_queue_kind(kind) && lower.contains("decode"))
+    {
+        "invalid_hook_envelope".to_string()
+    } else if lower.contains("failed to reopen db for merge")
+        || lower.contains("failed to merge drawer")
+    {
+        "storage_merge_reopen".to_string()
+    } else if lower.contains("database is locked")
+        || lower.contains("database locked")
+        || lower.contains("database is busy")
+        || lower.contains("database busy")
+        || lower.contains("sqlite_busy")
+        || lower.contains("sqlite_locked")
+    {
+        "storage_locked_or_busy".to_string()
+    } else if lower.contains("too many requests")
+        || lower.contains("rate limit")
+        || lower.contains("429")
+    {
+        "model_rate_limited".to_string()
+    } else if lower.contains("timeout") || lower.contains("timed out") || lower.contains("408") {
+        "model_timeout".to_string()
+    } else if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("remote disconnected")
+    {
+        "model_connection".to_string()
+    } else if lower.contains("unknown llm task") || lower.contains("unsupported") {
+        "unsupported_queue_task".to_string()
+    } else if lower.contains("invalid")
+        || lower.contains("missing")
+        || lower.contains("configuration")
+        || lower.contains("config")
+        || lower.contains("dimension")
+        || lower.contains("no vectors")
+    {
+        "invalid_queue_payload".to_string()
+    } else if last_error.trim().is_empty() {
+        "unknown_no_error".to_string()
+    } else {
+        "unknown_failure".to_string()
+    }
+}
+
+fn queue_failure_message_summary(reason_code: &str, last_error: &str) -> String {
+    let canonical = match reason_code {
+        "llm_response_decode" => "failed to decode LLM response",
+        "automatic_hook_llm_gate" => "automatic hook LLM gate failed before durable insert",
+        "invalid_hook_envelope" => "invalid or legacy hook envelope",
+        "storage_merge_reopen" => "failed to reopen db for merge",
+        "storage_locked_or_busy" => "database locked or busy",
+        "model_rate_limited" => "model endpoint rate limited",
+        "model_timeout" => "model endpoint timeout",
+        "model_connection" => "model endpoint connection failure",
+        "unsupported_queue_task" => "unsupported queued task",
+        "invalid_queue_payload" => "invalid queued payload",
+        "unknown_no_error" => "no last error recorded",
+        _ => "",
+    };
+    if !canonical.is_empty() {
+        return canonical.to_string();
+    }
+    truncate_to_byte_limit(sanitize_last_error(last_error), 240)
+}
+
+fn is_hook_queue_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ingest_async"
+            | "hook_event"
+            | "hook_post_tool"
+            | "hook_user_prompt"
+            | "hook_session_start"
+            | "hook_session_end"
+            | "hook:post-tool-use"
+            | "hook:user-prompt-submit"
+            | "hook:session-start"
+            | "hook:session-end"
+    )
+}
+
+fn archived_failed_count(conn: &Connection) -> Result<u64> {
+    if !table_exists(conn, "pending_message_completions")?
+        || !column_exists(conn, "pending_message_completions", "op_state")?
+        || !column_exists(conn, "pending_message_completions", "rejected_reason")?
+    {
+        return Ok(0);
+    }
+    conn.query_row(
+        r#"
+        SELECT COUNT(*)
+        FROM pending_message_completions
+        WHERE op_state = 'failed'
+          AND rejected_reason LIKE 'queue_archive:%'
+        "#,
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(i64_to_u64)
+    .map_err(QueueError::from)
+}
+
+fn min_optional_i64(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
 }
 
 fn reclaim_stale_tx(conn: &rusqlite::Transaction<'_>, stale_cutoff: i64) -> rusqlite::Result<u64> {

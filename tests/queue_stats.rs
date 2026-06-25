@@ -10,7 +10,9 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::{Database, apply_fork_ext_migrations_to};
-use mempal::core::queue::{PendingMessageStore, QueueConfig, QueueFailureDisposition};
+use mempal::core::queue::{
+    PendingMessageStore, QueueConfig, QueueFailureDisposition, QueueFailureFilter,
+};
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -611,7 +613,7 @@ fn test_reindex_failed_requeues_only_failed_embed_queue_items() {
     Connection::open(&db_path)
         .expect("open sqlite")
         .execute(
-            "UPDATE pending_messages SET status = 'failed', retry_count = 4, last_error = 'boom' WHERE id IN (?1, ?2)",
+            "UPDATE pending_messages SET status = 'failed', failure_class = 'retryable_model', retry_count = 4, last_error = 'boom' WHERE id IN (?1, ?2)",
             params![failed_embed, failed_llm],
         )
         .expect("mark failed rows");
@@ -681,6 +683,495 @@ fn test_queue_stats_split_failed_retryable_and_terminal_model_work() {
     assert_eq!(stats.failed_terminal, 1);
     assert_eq!(stats.failed_retryable_embed, 1);
     assert_eq!(stats.failed_retryable_llm, 1);
+}
+
+#[test]
+fn test_queue_stats_classifies_failed_reasons_and_retrying_backoff() {
+    let (_tmp, db_path, store) = new_store(QueueConfig::default());
+    let malformed = store
+        .enqueue("ingest_async", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue malformed");
+    let gate = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue gate");
+    let llm_decode = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue llm decode");
+    let storage_terminal = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue storage terminal");
+    let storage_retrying = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue storage retrying");
+    let now = now_secs();
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    for (id, kind, status, failure_class, retry_count, next_attempt_at, last_error) in [
+        (
+            malformed.as_str(),
+            "ingest_async",
+            "failed",
+            Some("terminal"),
+            18_i64,
+            now,
+            "failed to decode queued hook envelope",
+        ),
+        (
+            gate.as_str(),
+            "hook_post_tool",
+            "failed",
+            Some("terminal"),
+            3_i64,
+            now,
+            "automatic hook LLM gate failed before durable insert",
+        ),
+        (
+            llm_decode.as_str(),
+            "hook_post_tool",
+            "failed",
+            Some("terminal"),
+            4_i64,
+            now,
+            "automatic hook LLM gate failed before durable insert: LLM gating request failed: failed to decode LLM response: error decoding response body",
+        ),
+        (
+            storage_terminal.as_str(),
+            "hook_post_tool",
+            "failed",
+            Some("terminal"),
+            46_i64,
+            now,
+            "failed to reopen db for merge drawer_hooks_raw_bash_69633781",
+        ),
+        (
+            storage_retrying.as_str(),
+            "hook_post_tool",
+            "pending",
+            None,
+            2_i64,
+            now + 60,
+            "failed to reopen db for merge drawer_hooks_raw_bash_69633781",
+        ),
+    ] {
+        conn.execute(
+            r#"
+            UPDATE pending_messages
+            SET kind = ?2,
+                status = ?3,
+                failure_class = ?4,
+                retry_count = ?5,
+                next_attempt_at = ?6,
+                last_error = ?7,
+                op_state = CASE WHEN ?3 = 'failed' THEN 'failed' ELSE 'queued' END
+            WHERE id = ?1
+            "#,
+            params![
+                id,
+                kind,
+                status,
+                failure_class,
+                retry_count,
+                next_attempt_at,
+                last_error
+            ],
+        )
+        .expect("update queue fixture");
+    }
+    drop(conn);
+
+    let stats = store.stats().expect("stats");
+    assert_eq!(stats.failed, 4);
+    assert_eq!(stats.failed_retryable, 0);
+    assert_eq!(stats.failed_terminal, 4);
+    assert_eq!(stats.retrying, 1);
+    assert_eq!(stats.next_retry_at_unix_secs, Some((now + 60) as u64));
+
+    let failed_reason_count = |reason: &str| -> u64 {
+        stats
+            .failed_buckets
+            .iter()
+            .find(|bucket| bucket.reason_code == reason)
+            .map_or(0, |bucket| bucket.count)
+    };
+    assert_eq!(failed_reason_count("invalid_hook_envelope"), 1);
+    assert_eq!(failed_reason_count("automatic_hook_llm_gate"), 1);
+    assert_eq!(failed_reason_count("llm_response_decode"), 1);
+    assert_eq!(failed_reason_count("storage_merge_reopen"), 1);
+    let retrying_storage = stats
+        .retrying_buckets
+        .iter()
+        .find(|bucket| bucket.reason_code == "storage_merge_reopen")
+        .expect("retrying storage bucket");
+    assert_eq!(retrying_storage.retry_class, "retrying_backoff");
+    assert_eq!(retrying_storage.count, 1);
+    for bucket in stats
+        .failed_buckets
+        .iter()
+        .chain(stats.retrying_buckets.iter())
+    {
+        assert!(
+            !bucket
+                .sanitized_message
+                .contains("RAW_PAYLOAD_SHOULD_NOT_APPEAR"),
+            "{bucket:?}"
+        );
+    }
+}
+
+#[test]
+fn test_queue_failed_preview_retry_and_archive_are_filtered() {
+    let (_tmp, db_path, store) = new_store(QueueConfig::default());
+    let malformed = store
+        .enqueue("ingest_async", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue malformed");
+    let storage = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue storage");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE pending_messages SET status = 'failed', failure_class = 'terminal', retry_count = 1, last_error = 'failed to decode queued hook envelope', op_state = 'failed' WHERE id = ?1",
+        [malformed.as_str()],
+    )
+    .expect("mark malformed failed");
+    conn.execute(
+        "UPDATE pending_messages SET status = 'failed', failure_class = 'terminal', retry_count = 2, last_error = 'failed to reopen db for merge drawer_hooks_raw_bash_69633781', op_state = 'failed' WHERE id = ?1",
+        [storage.as_str()],
+    )
+    .expect("mark storage failed");
+    drop(conn);
+
+    assert!(
+        store
+            .retry_failed_messages(QueueFailureFilter::default())
+            .is_err(),
+        "unfiltered retry must be rejected"
+    );
+    assert!(
+        store
+            .archive_failed_messages(QueueFailureFilter::default())
+            .is_err(),
+        "unfiltered archive must be rejected"
+    );
+
+    let malformed_filter = QueueFailureFilter {
+        kind: Some("ingest_async".to_string()),
+        retry_class: None,
+        reason_code: Some("invalid_hook_envelope".to_string()),
+    };
+    let preview = store
+        .preview_failed_action(malformed_filter.clone())
+        .expect("preview malformed archive");
+    assert_eq!(preview.matched, 1);
+    let failed_before = store.stats().expect("stats before archive").failed;
+    assert_eq!(failed_before, 2, "preview must not mutate failed rows");
+
+    let archived = store
+        .archive_failed_messages(malformed_filter)
+        .expect("archive malformed");
+    assert_eq!(archived.changed, 1);
+    let storage_filter = QueueFailureFilter {
+        kind: Some("hook_post_tool".to_string()),
+        retry_class: Some("terminal".to_string()),
+        reason_code: Some("storage_merge_reopen".to_string()),
+    };
+    let retried = store
+        .retry_failed_messages(storage_filter)
+        .expect("retry storage row");
+    assert_eq!(retried.changed, 1);
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let pending_failed = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_messages WHERE status = 'failed'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count failed rows");
+    let pending_ready = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_messages WHERE status = 'pending' AND last_error IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count pending rows");
+    let archived_failed = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_message_completions WHERE op_state = 'failed'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count archived rows");
+    assert_eq!(pending_failed, 0);
+    assert_eq!(pending_ready, 1);
+    assert_eq!(archived_failed, 1);
+    assert_eq!(
+        store.stats().expect("stats after actions").failed_archived,
+        1
+    );
+}
+
+#[test]
+fn test_queue_retry_and_archive_revalidate_filter_at_execute_time() {
+    let (_tmp, db_path, store) = new_store(QueueConfig::default());
+    let retry_target = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue retry target");
+    let archive_target = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue archive target");
+    let storage_filter = QueueFailureFilter {
+        kind: Some("hook_post_tool".to_string()),
+        retry_class: Some("terminal".to_string()),
+        reason_code: Some("storage_merge_reopen".to_string()),
+    };
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    for id in [&retry_target, &archive_target] {
+        conn.execute(
+            "UPDATE pending_messages SET status = 'failed', failure_class = 'terminal', retry_count = 2, last_error = 'failed to reopen db for merge drawer_hooks_raw_bash_69633781', op_state = 'failed' WHERE id = ?1",
+            [id.as_str()],
+        )
+        .expect("mark storage failed");
+    }
+    drop(conn);
+
+    let preview = store
+        .preview_failed_action(storage_filter.clone())
+        .expect("preview storage filter");
+    assert_eq!(preview.matched, 2);
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE pending_messages SET last_error = 'automatic hook LLM gate failed before durable insert' WHERE id = ?1",
+        [retry_target.as_str()],
+    )
+    .expect("change retry target reason");
+    conn.execute(
+        "UPDATE pending_messages SET failure_class = 'retryable_model' WHERE id = ?1",
+        [archive_target.as_str()],
+    )
+    .expect("change archive target class");
+    drop(conn);
+
+    let retried = store
+        .retry_failed_messages(storage_filter.clone())
+        .expect("retry with stale filter");
+    assert_eq!(retried.matched, 0);
+    assert_eq!(retried.changed, 0);
+    let archived = store
+        .archive_failed_messages(storage_filter)
+        .expect("archive with stale filter");
+    assert_eq!(archived.matched, 0);
+    assert_eq!(archived.changed, 0);
+
+    let still_failed = Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT COUNT(*) FROM pending_messages WHERE status = 'failed'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count failed rows");
+    assert_eq!(still_failed, 2);
+}
+
+#[test]
+fn test_failed_archived_counts_only_queue_archive_provenance() {
+    let (_tmp, db_path, store) = new_store(QueueConfig::default());
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute_batch(
+        r#"
+        INSERT INTO pending_message_completions (
+            message_id,
+            kind,
+            created_at,
+            claimed_at,
+            completed_at,
+            processing_ms,
+            op_state,
+            rejected_reason
+        )
+        VALUES (
+            'ordinary-failed-completion',
+            'ingest_async',
+            1700000000000,
+            1700000001000,
+            1700000002000,
+            1000,
+            'failed',
+            'normal_ingest_failure'
+        );
+        "#,
+    )
+    .expect("insert ordinary failed completion");
+    drop(conn);
+
+    assert_eq!(store.stats().expect("ordinary stats").failed_archived, 0);
+
+    let malformed = store
+        .enqueue("ingest_async", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue malformed");
+    Connection::open(&db_path)
+        .expect("open sqlite")
+        .execute(
+            "UPDATE pending_messages SET status = 'failed', failure_class = 'terminal', retry_count = 1, last_error = 'failed to decode queued hook envelope', op_state = 'failed' WHERE id = ?1",
+            [malformed.as_str()],
+        )
+        .expect("mark malformed failed");
+    store
+        .archive_failed_messages(QueueFailureFilter {
+            kind: Some("ingest_async".to_string()),
+            retry_class: None,
+            reason_code: Some("invalid_hook_envelope".to_string()),
+        })
+        .expect("archive malformed");
+    assert_eq!(store.stats().expect("archived stats").failed_archived, 1);
+}
+
+#[test]
+fn test_queue_cli_failed_summary_and_retry_dry_run_are_aggregate_only() {
+    let (home, db_path) = setup_home();
+    let store = PendingMessageStore::new(&db_path).expect("create store");
+    let malformed = store
+        .enqueue("ingest_async", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue malformed");
+    let storage = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue storage");
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE pending_messages SET status = 'failed', failure_class = 'terminal', retry_count = 1, last_error = 'failed to decode queued hook envelope', op_state = 'failed' WHERE id = ?1",
+        [malformed.as_str()],
+    )
+    .expect("mark malformed failed");
+    conn.execute(
+        "UPDATE pending_messages SET status = 'failed', failure_class = 'terminal', retry_count = 2, last_error = 'failed to reopen db for merge drawer_hooks_raw_bash_69633781', op_state = 'failed' WHERE id = ?1",
+        [storage.as_str()],
+    )
+    .expect("mark storage failed");
+    drop(conn);
+
+    let stats_output = Command::new(mempal_bin())
+        .arg("stats")
+        .env("HOME", home.path())
+        .output()
+        .expect("run mempal stats");
+    assert!(stats_output.status.success(), "{stats_output:?}");
+    let stats_stdout = String::from_utf8(stats_output.stdout).expect("stats stdout utf8");
+    assert!(stats_stdout.contains("failed: 2"), "{stats_stdout}");
+    assert!(
+        stats_stdout.contains("failed_terminal: 2"),
+        "{stats_stdout}"
+    );
+    assert!(
+        stats_stdout.contains("failed_retryable: 0"),
+        "{stats_stdout}"
+    );
+    assert!(
+        stats_stdout.contains("failed_by_kind_class_reason:"),
+        "{stats_stdout}"
+    );
+    assert!(
+        stats_stdout.contains("invalid_hook_envelope"),
+        "{stats_stdout}"
+    );
+    assert!(
+        stats_stdout.contains("storage_merge_reopen"),
+        "{stats_stdout}"
+    );
+    assert!(
+        !stats_stdout.contains("RAW_PAYLOAD_SHOULD_NOT_APPEAR"),
+        "{stats_stdout}"
+    );
+
+    let failed_output = Command::new(mempal_bin())
+        .args(["queue", "failed", "--reason", "storage_merge_reopen"])
+        .env("HOME", home.path())
+        .output()
+        .expect("run mempal queue failed");
+    assert!(failed_output.status.success(), "{failed_output:?}");
+    let failed_stdout = String::from_utf8(failed_output.stdout).expect("queue failed stdout utf8");
+    assert!(failed_stdout.contains("filter: reason=storage_merge_reopen"));
+    assert!(failed_stdout.contains("matched_failed: 1"));
+    assert!(failed_stdout.contains("storage_merge_reopen"));
+    assert!(!failed_stdout.contains("RAW_PAYLOAD_SHOULD_NOT_APPEAR"));
+
+    let retry_dry_run = Command::new(mempal_bin())
+        .args([
+            "queue",
+            "retry-failed",
+            "--kind",
+            "hook_post_tool",
+            "--reason",
+            "storage_merge_reopen",
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("run mempal queue retry dry-run");
+    assert!(retry_dry_run.status.success(), "{retry_dry_run:?}");
+    let retry_stdout = String::from_utf8(retry_dry_run.stdout).expect("retry stdout utf8");
+    assert!(retry_stdout.contains("dry_run: true"), "{retry_stdout}");
+    assert!(retry_stdout.contains("matched: 1"), "{retry_stdout}");
+    assert!(
+        !retry_stdout.contains("RAW_PAYLOAD_SHOULD_NOT_APPEAR"),
+        "{retry_stdout}"
+    );
+    let archive_dry_run = Command::new(mempal_bin())
+        .args([
+            "queue",
+            "archive-failed",
+            "--kind",
+            "ingest_async",
+            "--reason",
+            "invalid_hook_envelope",
+        ])
+        .env("HOME", home.path())
+        .output()
+        .expect("run mempal queue archive dry-run");
+    assert!(archive_dry_run.status.success(), "{archive_dry_run:?}");
+    let archive_stdout = String::from_utf8(archive_dry_run.stdout).expect("archive stdout utf8");
+    assert!(archive_stdout.contains("dry_run: true"), "{archive_stdout}");
+    assert!(archive_stdout.contains("matched: 1"), "{archive_stdout}");
+    assert!(
+        !archive_stdout.contains("RAW_PAYLOAD_SHOULD_NOT_APPEAR"),
+        "{archive_stdout}"
+    );
+    let failed_after_dry_run = Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT COUNT(*) FROM pending_messages WHERE status = 'failed'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count failed after dry-run");
+    assert_eq!(failed_after_dry_run, 2);
+
+    let unfiltered_execute = Command::new(mempal_bin())
+        .args(["queue", "retry-failed", "--execute"])
+        .env("HOME", home.path())
+        .output()
+        .expect("run unfiltered queue retry");
+    assert!(!unfiltered_execute.status.success());
+    let stderr = String::from_utf8(unfiltered_execute.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("requires at least one explicit --kind, --class, or --reason filter"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_queue_help_documents_failed_recovery_examples() {
+    let output = Command::new(mempal_bin())
+        .args(["queue", "--help"])
+        .output()
+        .expect("run mempal queue help");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("help stdout utf8");
+    assert!(stdout.contains("invalid_hook_envelope"), "{stdout}");
+    assert!(stdout.contains("automatic_hook_llm_gate"), "{stdout}");
+    assert!(stdout.contains("llm_response_decode"), "{stdout}");
+    assert!(stdout.contains("storage_merge_reopen"), "{stdout}");
+    assert!(stdout.contains("retry-failed"), "{stdout}");
+    assert!(stdout.contains("archive-failed"), "{stdout}");
 }
 
 #[test]

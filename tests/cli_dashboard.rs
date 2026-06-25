@@ -623,7 +623,12 @@ fn test_stats_shows_all_sections() {
     assert!(stdout.contains("schema_version:"), "{stdout}");
     assert!(stdout.contains("fork_ext_version:"), "{stdout}");
     assert!(stdout.contains("queue:"), "{stdout}");
-    assert!(stdout.contains("  heartbeat:"), "{stdout}");
+    assert!(stdout.contains("  failed_retryable:"), "{stdout}");
+    assert!(stdout.contains("  failed_terminal:"), "{stdout}");
+    assert!(
+        stdout.contains("  failed_by_kind_class_reason:"),
+        "{stdout}"
+    );
     assert!(stdout.contains("gating:"), "{stdout}");
     assert!(stdout.contains("novelty:"), "{stdout}");
     assert!(stdout.contains("privacy scrub:"), "{stdout}");

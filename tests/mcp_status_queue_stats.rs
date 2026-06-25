@@ -19,6 +19,7 @@ use mempal::core::db::Database;
 use mempal::core::queue::{PendingMessageStore, QueueConfig, QueueFailureDisposition};
 use mempal::core::types::{BootstrapEvidenceArgs, CompactionStrategy, Drawer, SourceType};
 use mempal::mcp::MempalMcpServer;
+use rusqlite::params;
 #[cfg(feature = "integration")]
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -344,6 +345,91 @@ async fn test_mcp_status_headline_reflects_failed_queue() {
             warning.source == "queue"
                 && warning.message.contains("retryable_model=1")
                 && warning.message.contains("terminal=1")
+        }),
+        "{:?}",
+        response.system_warnings
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_status_queue_stats_match_shared_summary_buckets() {
+    let (_tmp, db_path, config) = setup_env();
+    let store = PendingMessageStore::new(&db_path).expect("create store");
+    let storage_a = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue storage a");
+    let storage_b = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue storage b");
+    let llm_gate = store
+        .enqueue("hook_post_tool", "RAW_PAYLOAD_SHOULD_NOT_APPEAR")
+        .expect("enqueue llm gate");
+    let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    for id in [&storage_a, &storage_b] {
+        conn.execute(
+            "UPDATE pending_messages SET status = 'failed', failure_class = 'terminal', retry_count = 3, last_error = 'failed to reopen db for merge drawer_hooks_raw_bash_69633781', op_state = 'failed' WHERE id = ?1",
+            params![id],
+        )
+        .expect("mark storage failed");
+    }
+    conn.execute(
+        "UPDATE pending_messages SET status = 'failed', failure_class = 'terminal', retry_count = 1, last_error = 'automatic hook LLM gate failed before durable insert', op_state = 'failed' WHERE id = ?1",
+        params![llm_gate],
+    )
+    .expect("mark llm gate failed");
+    drop(conn);
+
+    let core_stats =
+        mempal::core::queue::queue_stats_readonly(&db_path).expect("shared queue stats");
+    let server = MempalMcpServer::new(db_path, config).expect("create MCP server");
+    let response = server.mempal_status().await.expect("status").0;
+
+    assert_eq!(response.queue_stats.pending, core_stats.pending);
+    assert_eq!(response.queue_stats.claimed, core_stats.claimed);
+    assert_eq!(response.queue_stats.failed, core_stats.failed);
+    assert_eq!(
+        response.queue_stats.failed_retryable,
+        core_stats.failed_retryable
+    );
+    assert_eq!(
+        response.queue_stats.failed_terminal,
+        core_stats.failed_terminal
+    );
+    assert_eq!(response.queue_stats.retrying, core_stats.retrying);
+    assert_eq!(
+        response.queue_stats.failed_buckets.len(),
+        core_stats.failed_buckets.len()
+    );
+    let storage_bucket = response
+        .queue_stats
+        .failed_buckets
+        .iter()
+        .find(|bucket| bucket.reason_code == "storage_merge_reopen")
+        .expect("storage bucket");
+    assert_eq!(storage_bucket.count, 2);
+    assert_eq!(storage_bucket.retry_class, "terminal");
+    let gate_bucket = response
+        .queue_stats
+        .failed_buckets
+        .iter()
+        .find(|bucket| bucket.reason_code == "automatic_hook_llm_gate")
+        .expect("llm gate bucket");
+    assert_eq!(gate_bucket.count, 1);
+    for bucket in &response.queue_stats.failed_buckets {
+        assert!(
+            !bucket
+                .sanitized_message
+                .contains("RAW_PAYLOAD_SHOULD_NOT_APPEAR"),
+            "{bucket:?}"
+        );
+    }
+    assert!(
+        response.system_warnings.iter().any(|warning| {
+            warning.source == "queue"
+                && warning
+                    .message
+                    .contains("top_failed_reason=storage_merge_reopen")
+                && warning.message.contains("count=2")
         }),
         "{:?}",
         response.system_warnings

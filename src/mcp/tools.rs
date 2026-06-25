@@ -2326,10 +2326,14 @@ pub struct QueueStatsDto {
     pub failed: u64,
     pub failed_retryable: u64,
     pub failed_terminal: u64,
+    pub failed_archived: u64,
+    pub retrying: u64,
     pub failed_retryable_embed: u64,
     pub failed_retryable_llm: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_auto_requeue_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_unix_secs: Option<u64>,
     pub rate_per_min: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_pending_age_secs: Option<u64>,
@@ -2337,6 +2341,23 @@ pub struct QueueStatsDto {
     pub avg_processing_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eta_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_buckets: Vec<QueueFailureBucketDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retrying_buckets: Vec<QueueFailureBucketDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct QueueFailureBucketDto {
+    pub kind: String,
+    pub retry_class: String,
+    pub reason_code: String,
+    pub sanitized_message: String,
+    pub count: u64,
+    pub min_retry_count: u32,
+    pub max_retry_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at_unix_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
