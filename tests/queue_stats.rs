@@ -55,6 +55,69 @@ db_path = "{}"
     (tmp, db_path)
 }
 
+fn run_status_in_home(home: &TempDir) -> String {
+    let output = Command::new(mempal_bin())
+        .arg("status")
+        .env("HOME", home.path())
+        .output()
+        .expect("run mempal status");
+
+    assert!(
+        output.status.success(),
+        "status failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("status stdout utf8")
+}
+
+fn run_status_with_daemon_pidfile(content: &str) -> String {
+    let (home, db_path) = setup_home();
+    let pid_path = db_path.parent().expect("mempal home").join("daemon.pid");
+    fs::write(pid_path, content).expect("write daemon pidfile");
+
+    run_status_in_home(&home)
+}
+
+#[test]
+fn test_status_command_reports_missing_daemon_pidfile_as_stopped() {
+    let (home, _db_path) = setup_home();
+    let stdout = run_status_in_home(&home);
+
+    assert!(stdout.contains("Daemon:"), "{stdout}");
+    assert!(stdout.contains("running: false"), "{stdout}");
+    assert!(stdout.contains("pid: none"), "{stdout}");
+    assert!(!stdout.contains("daemon pidfile"), "{stdout}");
+}
+
+#[test]
+fn test_status_command_warns_on_empty_daemon_pidfile() {
+    let stdout = run_status_with_daemon_pidfile("");
+
+    assert!(stdout.contains("Daemon:"), "{stdout}");
+    assert!(stdout.contains("running: false"), "{stdout}");
+    assert!(stdout.contains("pid: none"), "{stdout}");
+    assert!(stdout.contains("Warnings:"), "{stdout}");
+    assert!(stdout.contains("daemon pidfile"), "{stdout}");
+    assert!(stdout.contains("empty"), "{stdout}");
+}
+
+#[test]
+fn test_status_command_warns_on_corrupt_daemon_pidfile() {
+    let stdout = run_status_with_daemon_pidfile("not-a-pid\n");
+
+    assert!(stdout.contains("Daemon:"), "{stdout}");
+    assert!(stdout.contains("running: false"), "{stdout}");
+    assert!(stdout.contains("pid: none"), "{stdout}");
+    assert!(stdout.contains("Warnings:"), "{stdout}");
+    assert!(stdout.contains("daemon pidfile"), "{stdout}");
+    assert!(stdout.contains("not a valid integer"), "{stdout}");
+    assert!(
+        !stdout.contains("not-a-pid"),
+        "status must not echo corrupt pidfile payload: {stdout}"
+    );
+}
+
 fn insert_status_drawer(db_path: &Path, id: &str, source_type: SourceType) {
     let db = Database::open(db_path).expect("open db for status drawer");
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
