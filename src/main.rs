@@ -2864,6 +2864,7 @@ const DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY: usize = 1;
 const HISTORICAL_REJUDGE_CHECKPOINT_KEY: &str = "maintenance.rejudge.checkpoint";
 const HISTORICAL_REJUDGE_WORK_TABLE: &str = "historical_rejudge_work_items";
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
+const HISTORICAL_REJUDGE_WRITER_LEASE_NAME: &str = "maintenance-rejudge-writer";
 const MAINTENANCE_WRITER_LEASE_TTL_SECS: u64 = 120;
 const MAINTENANCE_WRITER_LEASE_RENEW_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(30);
@@ -4654,7 +4655,49 @@ fn acquire_maintenance_writer_lease(
     db: &Database,
     command: &str,
 ) -> Result<MaintenanceWriterLeaseGuard> {
-    acquire_runtime_writer_lease(db, command, "maintenance", "mempal-maintenance")
+    acquire_named_runtime_writer_lease(
+        db,
+        SQLITE_WRITER_LEASE_NAME,
+        command,
+        "maintenance",
+        "mempal-maintenance",
+        false,
+    )
+}
+
+fn acquire_historical_rejudge_writer_lease(db: &Database) -> Result<MaintenanceWriterLeaseGuard> {
+    let command = "maintenance-rejudge";
+    ensure_no_historical_rejudge_writer_lease(db, command)?;
+    if let Some(lease) = try_acquire_named_runtime_writer_lease(
+        db,
+        SQLITE_WRITER_LEASE_NAME,
+        command,
+        "maintenance",
+        "mempal-maintenance",
+        true,
+    )? {
+        return Ok(lease);
+    }
+
+    let active = db
+        .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+        .unwrap_or_default();
+    if !sqlite_writer_conflict_is_live_daemon(db, &active)? {
+        bail!(
+            "SQLite writer lease `{}` is already held; refusing to run {command}: {}",
+            SQLITE_WRITER_LEASE_NAME,
+            format_runtime_writer_leases(&active)
+        );
+    }
+
+    acquire_named_runtime_writer_lease(
+        db,
+        HISTORICAL_REJUDGE_WRITER_LEASE_NAME,
+        command,
+        "maintenance-rejudge",
+        "mempal-maintenance",
+        true,
+    )
 }
 
 fn acquire_cli_ingest_writer_lease(
@@ -4677,33 +4720,98 @@ fn acquire_runtime_writer_lease(
     mode: &str,
     owner_prefix: &str,
 ) -> Result<MaintenanceWriterLeaseGuard> {
+    acquire_named_runtime_writer_lease(
+        db,
+        SQLITE_WRITER_LEASE_NAME,
+        command,
+        mode,
+        owner_prefix,
+        false,
+    )
+}
+
+fn acquire_named_runtime_writer_lease(
+    db: &Database,
+    lease_name: &str,
+    command: &str,
+    mode: &str,
+    owner_prefix: &str,
+    preserve_live_holders: bool,
+) -> Result<MaintenanceWriterLeaseGuard> {
+    if lease_name == SQLITE_WRITER_LEASE_NAME {
+        ensure_no_historical_rejudge_writer_lease(db, command)?;
+    }
+    let lease = match try_acquire_named_runtime_writer_lease(
+        db,
+        lease_name,
+        command,
+        mode,
+        owner_prefix,
+        preserve_live_holders,
+    )? {
+        Some(lease) => lease,
+        None => {
+            let active = db
+                .runtime_writer_lease_status(Some(lease_name))
+                .unwrap_or_default();
+            bail!(
+                "SQLite writer lease `{}` is already held; refusing to run {command}: {}",
+                lease_name,
+                format_runtime_writer_leases(&active)
+            );
+        }
+    };
+    Ok(lease)
+}
+
+fn ensure_no_historical_rejudge_writer_lease(db: &Database, command: &str) -> Result<()> {
+    let active = db
+        .runtime_writer_lease_status(Some(HISTORICAL_REJUDGE_WRITER_LEASE_NAME))
+        .unwrap_or_default();
+    if active.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "SQLite writer lease `{}` is already held; refusing to run {command}: {}",
+        HISTORICAL_REJUDGE_WRITER_LEASE_NAME,
+        format_runtime_writer_leases(&active)
+    );
+}
+
+fn try_acquire_named_runtime_writer_lease(
+    db: &Database,
+    lease_name: &str,
+    command: &str,
+    mode: &str,
+    owner_prefix: &str,
+    preserve_live_holders: bool,
+) -> Result<Option<MaintenanceWriterLeaseGuard>> {
     let owner = format!("{owner_prefix}-{command}-{}", std::process::id());
     let metadata = serde_json::json!({
         "command": command,
         "db_path": db.path().to_string_lossy(),
     })
     .to_string();
-    let lease = db
-        .runtime_writer_lease_acquire(
-            SQLITE_WRITER_LEASE_NAME,
+    let lease = if preserve_live_holders {
+        db.runtime_writer_lease_acquire_preserving_live_holders(
+            lease_name,
             &owner,
             mode,
             MAINTENANCE_WRITER_LEASE_TTL_SECS,
             Some(&metadata),
         )
-        .with_context(|| format!("failed to acquire writer lease for {command}"))?;
-    let lease = match lease {
-        Some(lease) => lease,
-        None => {
-            let active = db
-                .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
-                .unwrap_or_default();
-            bail!(
-                "SQLite writer lease `{}` is already held; refusing to run {command}: {}",
-                SQLITE_WRITER_LEASE_NAME,
-                format_runtime_writer_leases(&active)
-            );
-        }
+    } else {
+        db.runtime_writer_lease_acquire(
+            lease_name,
+            &owner,
+            mode,
+            MAINTENANCE_WRITER_LEASE_TTL_SECS,
+            Some(&metadata),
+        )
+    }
+    .with_context(|| format!("failed to acquire writer lease for {command}"))?;
+    let Some(lease) = lease else {
+        return Ok(None);
     };
     let (stop_tx, stop_rx) = mpsc::channel();
     let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -4713,13 +4821,24 @@ fn acquire_runtime_writer_lease(
         Arc::clone(&active),
         stop_rx,
     );
-    Ok(MaintenanceWriterLeaseGuard {
+    Ok(Some(MaintenanceWriterLeaseGuard {
         db_path: db.path().to_path_buf(),
         lease,
         active,
         stop: Some(stop_tx),
         heartbeat: Some(heartbeat),
-    })
+    }))
+}
+
+fn sqlite_writer_conflict_is_live_daemon(
+    db: &Database,
+    active: &[RuntimeWriterLease],
+) -> Result<bool> {
+    if !matches!(active, [lease] if lease.mode == "daemon") {
+        return Ok(false);
+    }
+    db.runtime_writer_lease_has_live_daemon(SQLITE_WRITER_LEASE_NAME)
+        .context("failed to inspect daemon writer lease")
 }
 
 fn spawn_maintenance_writer_lease_heartbeat(
@@ -16091,7 +16210,7 @@ async fn maintenance_rejudge_command_with_runtime(
     validate_historical_rejudge_options(options)?;
     validate_historical_rejudge_runtime_options(runtime)?;
     let writer_lease = if options.execute {
-        Some(acquire_maintenance_writer_lease(db, "maintenance-rejudge")?)
+        Some(acquire_historical_rejudge_writer_lease(db)?)
     } else {
         None
     };
@@ -22257,6 +22376,42 @@ api_model = "text-embedding-3-large"
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_project_migrate_rejects_active_rejudge_scoped_writer_lease_after_daemon_exit() {
+        let (_tmp, db) = new_temp_db();
+        insert_cli_test_drawer(&db, "project-migrate-rejudge-conflict");
+        let daemon_lease = hold_daemon_writer_lease(&db);
+        let _rejudge_lease =
+            acquire_historical_rejudge_writer_lease(&db).expect("rejudge scoped writer lease");
+        db.runtime_writer_lease_release(
+            &daemon_lease.name,
+            &daemon_lease.owner,
+            &daemon_lease.session_id,
+        )
+        .expect("release daemon writer lease");
+
+        let error = project_command(
+            &db,
+            ProjectCommands::Migrate {
+                project: "lease-project".to_string(),
+                wing: None,
+            },
+        )
+        .expect_err("project migrate must reject under active rejudge scoped lease");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(HISTORICAL_REJUDGE_WRITER_LEASE_NAME),
+            "{rendered}"
+        );
+        assert_eq!(
+            drawer_project_id(&db, "project-migrate-rejudge-conflict"),
+            None,
+            "conflicting project migration must not update drawer project_id"
+        );
+    }
+
     #[test]
     fn cli_project_migrate_succeeds_without_writer_conflict() {
         let (_tmp, db) = new_temp_db();
@@ -22964,6 +23119,18 @@ mod historical_rejudge_tests {
 
     fn test_config() -> Config {
         Config::parse("[gating]\nenabled = true\n").expect("parse config")
+    }
+
+    fn hold_test_daemon_writer_lease(db: &Database) -> RuntimeWriterLease {
+        db.runtime_writer_lease_acquire(
+            SQLITE_WRITER_LEASE_NAME,
+            "test-daemon-writer",
+            "daemon",
+            MAINTENANCE_WRITER_LEASE_TTL_SECS,
+            None,
+        )
+        .expect("acquire daemon writer lease")
+        .expect("daemon writer lease")
     }
 
     fn database_locked_open_error() -> anyhow::Error {
@@ -24787,6 +24954,84 @@ threshold = 0.7
         assert!(
             fts_matches.is_empty(),
             "soft-deleted forget candidates must not remain BM25-searchable: {fts_matches:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn historical_rejudge_resume_all_execute_coexists_with_live_daemon_writer_lease() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let raw_content = "daemon coexist regression fixture";
+        insert_drawer(&db, "daemon-coexist-low", raw_content, "notes", None);
+        let backups = backup_dir(&tmp);
+        let progress_path = tmp.path().join("rejudge-progress.jsonl");
+        let daemon_lease = hold_test_daemon_writer_lease(&db);
+
+        maintenance_rejudge_command(
+            &db,
+            &test_config(),
+            HistoricalRejudgeOptions {
+                resume: true,
+                progress_file: Some(&progress_path),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("resume all execute rejudge should coexist with daemon writer lease");
+
+        assert_eq!(active_drawer_count(&db), 0);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+        assert!(
+            db.runtime_writer_lease_is_active(
+                &daemon_lease.name,
+                &daemon_lease.owner,
+                &daemon_lease.session_id
+            )
+            .expect("check daemon writer lease"),
+            "historical rejudge must not steal or release the daemon sqlite-writer lease"
+        );
+        assert!(
+            db.runtime_writer_lease_status(Some(HISTORICAL_REJUDGE_WRITER_LEASE_NAME))
+                .expect("load rejudge writer lease status")
+                .is_empty(),
+            "historical rejudge command-scoped lease must be released after completion"
+        );
+        let progress = std::fs::read_to_string(&progress_path).expect("read progress file");
+        assert!(progress.contains(r#""status":"started""#), "{progress}");
+        assert!(progress.contains(r#""status":"completed""#), "{progress}");
+        assert!(
+            !progress.contains(raw_content),
+            "progress output must stay aggregate-only"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn historical_rejudge_cooperative_lease_rejects_second_rejudge_under_daemon() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let daemon_lease = hold_test_daemon_writer_lease(&db);
+        let _first = acquire_historical_rejudge_writer_lease(&db).expect("first rejudge lease");
+
+        let error = match acquire_historical_rejudge_writer_lease(&db) {
+            Ok(_) => panic!("second rejudge must reject the command-scoped lease conflict"),
+            Err(error) => error,
+        };
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(HISTORICAL_REJUDGE_WRITER_LEASE_NAME),
+            "{rendered}"
+        );
+        assert!(
+            db.runtime_writer_lease_is_active(
+                &daemon_lease.name,
+                &daemon_lease.owner,
+                &daemon_lease.session_id
+            )
+            .expect("check daemon writer lease"),
+            "rejudge scoped lease conflict must not disturb the daemon sqlite-writer lease"
         );
     }
 
