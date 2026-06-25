@@ -2868,6 +2868,16 @@ const HISTORICAL_REJUDGE_WRITER_LEASE_NAME: &str = "maintenance-rejudge-writer";
 const MAINTENANCE_WRITER_LEASE_TTL_SECS: u64 = 120;
 const MAINTENANCE_WRITER_LEASE_RENEW_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(30);
+const MAINTENANCE_WRITER_LEASE_RENEW_BUSY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(250);
+const MAINTENANCE_WRITER_LEASE_RENEW_RETRY_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(20);
+const MAINTENANCE_WRITER_LEASE_RENEW_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(250);
+const HISTORICAL_REJUDGE_CHECKPOINT_LOCK_INITIAL_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(2);
+const HISTORICAL_REJUDGE_CHECKPOINT_LOCK_MAX_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(60);
 const HISTORICAL_REJUDGE_SQLITE_BACKUP_HASH_FORMAT: &str = "sqlite_stream_v1";
 static HISTORICAL_REJUDGE_RUN_ID_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -4593,33 +4603,50 @@ impl MaintenanceWriterLeaseGuard {
                 self.lease.owner
             );
         }
-        let db = Database::open(&self.db_path).with_context(|| {
+        let started = std::time::Instant::now();
+        loop {
+            match self.lease_is_active_once(operation) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    bail!(
+                        "SQLite writer lease `{}` for {} was lost before {operation}",
+                        self.lease.name,
+                        self.lease.owner
+                    );
+                }
+                Err(error)
+                    if is_transient_sqlite_lock_error(&error)
+                        && started.elapsed() < MAINTENANCE_WRITER_LEASE_RENEW_RETRY_DEADLINE =>
+                {
+                    std::thread::sleep(MAINTENANCE_WRITER_LEASE_RENEW_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn lease_is_active_once(&self, operation: &'static str) -> Result<bool> {
+        let db = Database::open_with_busy_timeout(
+            &self.db_path,
+            MAINTENANCE_WRITER_LEASE_RENEW_BUSY_TIMEOUT,
+        )
+        .with_context(|| {
             format!(
                 "failed to verify writer lease `{}` before {operation}",
                 self.lease.name
             )
         })?;
-        if db
-            .runtime_writer_lease_is_active(
-                &self.lease.name,
-                &self.lease.owner,
-                &self.lease.session_id,
+        db.runtime_writer_lease_is_active(
+            &self.lease.name,
+            &self.lease.owner,
+            &self.lease.session_id,
+        )
+        .with_context(|| {
+            format!(
+                "failed to verify writer lease `{}` before {operation}",
+                self.lease.name
             )
-            .with_context(|| {
-                format!(
-                    "failed to verify writer lease `{}` before {operation}",
-                    self.lease.name
-                )
-            })?
-        {
-            Ok(())
-        } else {
-            bail!(
-                "SQLite writer lease `{}` for {} was lost before {operation}",
-                self.lease.name,
-                self.lease.owner
-            )
-        }
+        })
     }
 }
 
@@ -4848,21 +4875,15 @@ fn spawn_maintenance_writer_lease_heartbeat(
     stop: mpsc::Receiver<()>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        let mut warning_state = MaintenanceWriterLeaseRenewWarningState::default();
         loop {
             match stop.recv_timeout(MAINTENANCE_WRITER_LEASE_RENEW_INTERVAL) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            let result = Database::open(&db_path).and_then(|db| {
-                db.runtime_writer_lease_renew(
-                    &lease.name,
-                    &lease.owner,
-                    &lease.session_id,
-                    MAINTENANCE_WRITER_LEASE_TTL_SECS,
-                )
-            });
+            let result = renew_maintenance_writer_lease_with_retry(&db_path, &lease);
             match result {
-                Ok(true) => {}
+                Ok(true) => warning_state.record_success(&lease),
                 Ok(false) => {
                     active.store(false, std::sync::atomic::Ordering::SeqCst);
                     eprintln!(
@@ -4872,14 +4893,83 @@ fn spawn_maintenance_writer_lease_heartbeat(
                     break;
                 }
                 Err(error) => {
-                    eprintln!(
-                        "warning: failed to renew writer lease `{}` for {}: {error}",
-                        lease.name, lease.owner
-                    );
+                    warning_state.record_failure(&lease, &error);
                 }
             }
         }
     })
+}
+
+fn renew_maintenance_writer_lease_with_retry(
+    db_path: &Path,
+    lease: &RuntimeWriterLease,
+) -> Result<bool> {
+    let started = std::time::Instant::now();
+    loop {
+        match renew_maintenance_writer_lease_once(db_path, lease) {
+            Ok(renewed) => return Ok(renewed),
+            Err(error)
+                if is_transient_sqlite_lock_error(&error)
+                    && started.elapsed() < MAINTENANCE_WRITER_LEASE_RENEW_RETRY_DEADLINE =>
+            {
+                std::thread::sleep(MAINTENANCE_WRITER_LEASE_RENEW_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn renew_maintenance_writer_lease_once(db_path: &Path, lease: &RuntimeWriterLease) -> Result<bool> {
+    let db = Database::open_with_busy_timeout(db_path, MAINTENANCE_WRITER_LEASE_RENEW_BUSY_TIMEOUT)
+        .with_context(|| {
+            format!(
+                "failed to open database to renew writer lease `{}`",
+                lease.name
+            )
+        })?;
+    db.runtime_writer_lease_renew(
+        &lease.name,
+        &lease.owner,
+        &lease.session_id,
+        MAINTENANCE_WRITER_LEASE_TTL_SECS,
+    )
+    .with_context(|| format!("failed to renew writer lease `{}`", lease.name))
+}
+
+#[derive(Debug, Default)]
+struct MaintenanceWriterLeaseRenewWarningState {
+    consecutive_failures: u64,
+    suppressed_failures: u64,
+}
+
+impl MaintenanceWriterLeaseRenewWarningState {
+    fn record_success(&mut self, lease: &RuntimeWriterLease) {
+        if self.consecutive_failures > 0 {
+            eprintln!(
+                "writer lease `{}` for {} renewed after {} transient lock failure(s); suppressed_warnings={}",
+                lease.name, lease.owner, self.consecutive_failures, self.suppressed_failures
+            );
+        }
+        self.consecutive_failures = 0;
+        self.suppressed_failures = 0;
+    }
+
+    fn record_failure(&mut self, lease: &RuntimeWriterLease, error: &anyhow::Error) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if retry_warning_should_log(self.consecutive_failures) {
+            eprintln!(
+                "warning: failed to renew writer lease `{}` for {} after bounded retry; consecutive_failures={} suppressed_warnings={} next_retry_secs={}: {error}",
+                lease.name,
+                lease.owner,
+                self.consecutive_failures,
+                self.suppressed_failures,
+                MAINTENANCE_WRITER_LEASE_RENEW_INTERVAL.as_secs()
+            );
+            self.suppressed_failures = 0;
+        } else {
+            self.suppressed_failures = self.suppressed_failures.saturating_add(1);
+        }
+    }
 }
 
 fn format_runtime_writer_leases(leases: &[RuntimeWriterLease]) -> String {
@@ -16759,6 +16849,7 @@ async fn maintenance_rejudge_all_command(
         "mark historical rejudge checkpoint running",
     )?;
 
+    let mut checkpoint_lock_retry = HistoricalRejudgeCheckpointLockRetryState::default();
     loop {
         let page = next_historical_rejudge_work_items_for_stage(
             db,
@@ -16807,6 +16898,14 @@ async fn maintenance_rejudge_all_command(
                 .map(|work_item| work_item.drawer_rowid)
                 .unwrap_or(page_start);
             let waiting_for_llm = is_retryable_historical_llm_error(&error);
+            let waiting_for_sqlite_lock =
+                !waiting_for_llm && is_transient_sqlite_lock_error(&error);
+            if waiting_for_sqlite_lock {
+                let retry_delay =
+                    checkpoint_lock_retry.record_deferred("sqlite_locked", page_start, page_end);
+                tokio::time::sleep(retry_delay).await;
+                continue;
+            }
             let checkpoint_persistence = if waiting_for_llm {
                 persist_historical_rejudge_llm_retry_status_checkpoint(
                     db,
@@ -16821,13 +16920,22 @@ async fn maintenance_rejudge_all_command(
                     writer_lease,
                 )?
             };
-            if !waiting_for_llm
-                && checkpoint_persistence
-                    == HistoricalRejudgeCheckpointPersistence::DeferredTransientLock
+            if checkpoint_persistence
+                == HistoricalRejudgeCheckpointPersistence::DeferredTransientLock
             {
-                tokio::time::sleep(historical_rejudge_sqlite_lock_retry_delay(0)).await;
+                let retry_delay = checkpoint_lock_retry.record_deferred(
+                    if waiting_for_llm {
+                        "waiting_llm"
+                    } else {
+                        "failed"
+                    },
+                    page_start,
+                    page_end,
+                );
+                tokio::time::sleep(retry_delay).await;
                 continue;
             }
+            checkpoint_lock_retry.record_persisted();
             if let Some(writer) = progress.as_mut() {
                 writer.write_event(build_historical_rejudge_progress_event(
                     HistoricalRejudgeProgressEventInput {
@@ -16868,12 +16976,21 @@ async fn maintenance_rejudge_all_command(
                     retry_delay.as_secs_f64()
                 );
                 tokio::time::sleep(retry_delay).await;
-                persist_historical_rejudge_llm_retry_status_checkpoint(
+                let running_persistence = persist_historical_rejudge_llm_retry_status_checkpoint(
                     db,
                     &mut checkpoint,
                     "running",
                     writer_lease,
                 )?;
+                if running_persistence
+                    == HistoricalRejudgeCheckpointPersistence::DeferredTransientLock
+                {
+                    let retry_delay =
+                        checkpoint_lock_retry.record_deferred("running", page_start, page_end);
+                    tokio::time::sleep(retry_delay).await;
+                } else {
+                    checkpoint_lock_retry.record_persisted();
+                }
                 continue;
             }
             return Err(error).with_context(|| {
@@ -16907,6 +17024,7 @@ async fn maintenance_rejudge_all_command(
                 },
             ))?;
         }
+        checkpoint_lock_retry.record_persisted();
     }
 
     let final_backlog = historical_rejudge_backlog_counts(db, &checkpoint.run_id)?;
@@ -18532,12 +18650,11 @@ fn persist_historical_rejudge_failed_status_checkpoint(
 
 fn historical_rejudge_checkpoint_lease_check_outcome(
     result: Result<()>,
-    status: &'static str,
+    _status: &'static str,
 ) -> Result<HistoricalRejudgeCheckpointLeaseCheck> {
     match result {
         Ok(()) => Ok(HistoricalRejudgeCheckpointLeaseCheck::Active),
         Err(error) if is_transient_sqlite_lock_error(&error) => {
-            log_deferred_historical_rejudge_checkpoint_persistence(status);
             Ok(HistoricalRejudgeCheckpointLeaseCheck::DeferredTransientLock)
         }
         Err(error) => Err(error),
@@ -18546,22 +18663,51 @@ fn historical_rejudge_checkpoint_lease_check_outcome(
 
 fn historical_rejudge_checkpoint_persistence_outcome(
     result: Result<()>,
-    status: &'static str,
+    _status: &'static str,
 ) -> Result<HistoricalRejudgeCheckpointPersistence> {
     match result {
         Ok(()) => Ok(HistoricalRejudgeCheckpointPersistence::Persisted),
         Err(error) if is_transient_sqlite_lock_error(&error) => {
-            log_deferred_historical_rejudge_checkpoint_persistence(status);
             Ok(HistoricalRejudgeCheckpointPersistence::DeferredTransientLock)
         }
         Err(error) => Err(error),
     }
 }
 
-fn log_deferred_historical_rejudge_checkpoint_persistence(status: &'static str) {
-    eprintln!(
-        "historical rejudge deferred `{status}` checkpoint persistence because the database is locked; retrying without advancing the page"
-    );
+#[derive(Debug, Default)]
+struct HistoricalRejudgeCheckpointLockRetryState {
+    consecutive_deferrals: u64,
+    suppressed_warnings: u64,
+}
+
+impl HistoricalRejudgeCheckpointLockRetryState {
+    fn record_deferred(
+        &mut self,
+        status: &'static str,
+        page_start: i64,
+        page_end: i64,
+    ) -> std::time::Duration {
+        self.consecutive_deferrals = self.consecutive_deferrals.saturating_add(1);
+        let retry_delay =
+            historical_rejudge_checkpoint_lock_retry_delay(self.consecutive_deferrals - 1);
+        if retry_warning_should_log(self.consecutive_deferrals) {
+            eprintln!(
+                "historical rejudge deferred `{status}` checkpoint persistence because the database is locked; rowids {page_start}..={page_end}; consecutive_deferrals={} suppressed_warnings={} retrying_in_secs={} without advancing the cursor",
+                self.consecutive_deferrals,
+                self.suppressed_warnings,
+                retry_delay.as_secs()
+            );
+            self.suppressed_warnings = 0;
+        } else {
+            self.suppressed_warnings = self.suppressed_warnings.saturating_add(1);
+        }
+        retry_delay
+    }
+
+    fn record_persisted(&mut self) {
+        self.consecutive_deferrals = 0;
+        self.suppressed_warnings = 0;
+    }
 }
 
 fn execute_historical_rejudge_sqlite_write_with_retry<T>(
@@ -18595,6 +18741,18 @@ fn historical_rejudge_sqlite_lock_retry_delay(attempt: usize) -> std::time::Dura
         .saturating_mul(multiplier)
         .min(HISTORICAL_REJUDGE_SQLITE_LOCK_MAX_DELAY_MS);
     std::time::Duration::from_millis(delay_ms)
+}
+
+fn historical_rejudge_checkpoint_lock_retry_delay(deferral_index: u64) -> std::time::Duration {
+    let shift = deferral_index.min(5);
+    let multiplier = 1_u32 << shift;
+    HISTORICAL_REJUDGE_CHECKPOINT_LOCK_INITIAL_DELAY
+        .saturating_mul(multiplier)
+        .min(HISTORICAL_REJUDGE_CHECKPOINT_LOCK_MAX_DELAY)
+}
+
+fn retry_warning_should_log(count: u64) -> bool {
+    count == 1 || count.is_power_of_two()
 }
 
 fn is_transient_sqlite_lock(error: &rusqlite::Error) -> bool {
@@ -28044,6 +28202,114 @@ threshold = 0.7
         assert_eq!(persisted.run_id, checkpoint.run_id);
         assert_eq!(persisted.last_processed_rowid, Some(2));
         assert_eq!(persisted.mutated_count, 1);
+    }
+
+    #[test]
+    fn maintenance_writer_lease_renew_retries_transient_sqlite_lock() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let _daemon_lease = hold_test_daemon_writer_lease(&db);
+        let writer_lease =
+            acquire_historical_rejudge_writer_lease(&db).expect("historical rejudge writer lease");
+        db.conn()
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make lease test connection fail fast");
+        let blocker = rusqlite::Connection::open(&db_path).expect("open blocking connection");
+        blocker
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make blocker fail fast");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            blocker
+                .execute_batch("COMMIT;")
+                .expect("release write lock");
+        });
+
+        let renewed = renew_maintenance_writer_lease_with_retry(&db_path, writer_lease.lease())
+            .expect("writer lease renewal must retry a transient SQLite lock");
+        release.join().expect("release thread");
+
+        assert!(renewed);
+        assert!(
+            db.runtime_writer_lease_is_active(
+                &writer_lease.lease().name,
+                &writer_lease.lease().owner,
+                &writer_lease.lease().session_id,
+            )
+            .expect("lease remains active after retry")
+        );
+    }
+
+    #[test]
+    fn maintenance_writer_lease_verify_retries_transient_sqlite_lock() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let _daemon_lease = hold_test_daemon_writer_lease(&db);
+        let writer_lease =
+            acquire_historical_rejudge_writer_lease(&db).expect("historical rejudge writer lease");
+        let blocker = rusqlite::Connection::open(&db_path).expect("open blocking connection");
+        blocker
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make blocker fail fast");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            blocker
+                .execute_batch("COMMIT;")
+                .expect("release write lock");
+        });
+
+        ensure_maintenance_writer_lease_active(Some(&writer_lease), "test lease verification")
+            .expect("writer lease verification must retry a transient SQLite lock");
+        release.join().expect("release thread");
+    }
+
+    #[test]
+    fn maintenance_writer_lease_renew_lost_lease_remains_fatal() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        let _daemon_lease = hold_test_daemon_writer_lease(&db);
+        let writer_lease =
+            acquire_historical_rejudge_writer_lease(&db).expect("historical rejudge writer lease");
+        release_writer_lease_for_test(&db, &writer_lease);
+
+        let renewed = renew_maintenance_writer_lease_with_retry(&db_path, writer_lease.lease())
+            .expect("lost lease check must complete without a lock error");
+
+        assert!(!renewed, "lost writer lease must remain fatal to callers");
+    }
+
+    #[test]
+    fn historical_rejudge_checkpoint_lock_retry_delay_caps_and_logs_sparsely() {
+        assert_eq!(
+            historical_rejudge_checkpoint_lock_retry_delay(0),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            historical_rejudge_checkpoint_lock_retry_delay(1),
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(
+            historical_rejudge_checkpoint_lock_retry_delay(5),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            historical_rejudge_checkpoint_lock_retry_delay(6),
+            std::time::Duration::from_secs(60)
+        );
+        assert!(retry_warning_should_log(1));
+        assert!(retry_warning_should_log(2));
+        assert!(!retry_warning_should_log(3));
+        assert!(retry_warning_should_log(4));
+        assert!(!retry_warning_should_log(5));
     }
 
     #[test]
