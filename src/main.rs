@@ -18458,6 +18458,12 @@ enum HistoricalRejudgeCheckpointPersistence {
     DeferredTransientLock,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoricalRejudgeRetryCheckpointLeaseCheck {
+    Active,
+    DeferredTransientLock,
+}
+
 fn persist_historical_rejudge_llm_retry_status_checkpoint(
     db: &Database,
     checkpoint: &mut HistoricalRejudgeCheckpoint,
@@ -18466,14 +18472,36 @@ fn persist_historical_rejudge_llm_retry_status_checkpoint(
 ) -> Result<HistoricalRejudgeCheckpointPersistence> {
     checkpoint.status = status.to_string();
     checkpoint.updated_at = iso_timestamp();
-    ensure_maintenance_writer_lease_active(
-        writer_lease,
-        "persist historical rejudge LLM retry checkpoint",
-    )?;
+    match historical_rejudge_retry_checkpoint_lease_check_outcome(
+        ensure_maintenance_writer_lease_active(
+            writer_lease,
+            "persist historical rejudge LLM retry checkpoint",
+        ),
+        status,
+    )? {
+        HistoricalRejudgeRetryCheckpointLeaseCheck::Active => {}
+        HistoricalRejudgeRetryCheckpointLeaseCheck::DeferredTransientLock => {
+            return Ok(HistoricalRejudgeCheckpointPersistence::DeferredTransientLock);
+        }
+    }
     historical_rejudge_checkpoint_persistence_outcome(
         save_historical_rejudge_checkpoint(db, checkpoint),
         status,
     )
+}
+
+fn historical_rejudge_retry_checkpoint_lease_check_outcome(
+    result: Result<()>,
+    status: &'static str,
+) -> Result<HistoricalRejudgeRetryCheckpointLeaseCheck> {
+    match result {
+        Ok(()) => Ok(HistoricalRejudgeRetryCheckpointLeaseCheck::Active),
+        Err(error) if is_transient_sqlite_lock_error(&error) => {
+            log_deferred_historical_rejudge_checkpoint_persistence(status);
+            Ok(HistoricalRejudgeRetryCheckpointLeaseCheck::DeferredTransientLock)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn historical_rejudge_checkpoint_persistence_outcome(
@@ -18483,13 +18511,17 @@ fn historical_rejudge_checkpoint_persistence_outcome(
     match result {
         Ok(()) => Ok(HistoricalRejudgeCheckpointPersistence::Persisted),
         Err(error) if is_transient_sqlite_lock_error(&error) => {
-            eprintln!(
-                "historical rejudge deferred `{status}` checkpoint persistence because the database is locked; retrying without advancing the page"
-            );
+            log_deferred_historical_rejudge_checkpoint_persistence(status);
             Ok(HistoricalRejudgeCheckpointPersistence::DeferredTransientLock)
         }
         Err(error) => Err(error),
     }
+}
+
+fn log_deferred_historical_rejudge_checkpoint_persistence(status: &'static str) {
+    eprintln!(
+        "historical rejudge deferred `{status}` checkpoint persistence because the database is locked; retrying without advancing the page"
+    );
 }
 
 fn execute_historical_rejudge_sqlite_write_with_retry<T>(
@@ -28021,6 +28053,75 @@ threshold = 0.7
         assert_eq!(outcome, HistoricalRejudgeCheckpointPersistence::Persisted);
         let persisted = load_historical_rejudge_checkpoint(&db)
             .expect("load running checkpoint")
+            .expect("checkpoint");
+        assert_eq!(persisted.status, "running");
+        assert_eq!(persisted.last_processed_rowid, Some(2));
+    }
+
+    #[test]
+    fn historical_rejudge_waiting_llm_checkpoint_lease_verification_lock_is_deferred() {
+        let outcome = historical_rejudge_retry_checkpoint_lease_check_outcome(
+            Err(database_locked_open_error().context(
+                "failed to verify writer lease `maintenance-rejudge-writer` before persist historical rejudge LLM retry checkpoint",
+            )),
+            "waiting_llm",
+        )
+        .expect("transient lease verification lock must defer retry checkpoint persistence");
+
+        assert_eq!(
+            outcome,
+            HistoricalRejudgeRetryCheckpointLeaseCheck::DeferredTransientLock
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_waiting_llm_checkpoint_lost_writer_lease_still_fails() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let _daemon_lease = hold_test_daemon_writer_lease(&db);
+        let writer_lease =
+            acquire_historical_rejudge_writer_lease(&db).expect("historical rejudge writer lease");
+        assert_eq!(
+            writer_lease.lease().name,
+            HISTORICAL_REJUDGE_WRITER_LEASE_NAME
+        );
+        let mut checkpoint = HistoricalRejudgeCheckpoint {
+            run_id: "lost-lease-waiting-llm-run".to_string(),
+            status: "running".to_string(),
+            options_hash: "hash".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:01Z".to_string(),
+            snapshot_max_rowid: 42,
+            snapshot_count: 3,
+            last_processed_rowid: Some(2),
+            scanned_count: 2,
+            candidate_count: 1,
+            kept_count: 1,
+            protected_count: 0,
+            mutated_count: 1,
+            estimated_bytes_reclaimed: 64,
+            mutation: "soft_delete".to_string(),
+            page_size: 500,
+            judge_model: Some("proposal:qwen, confirm:spark".to_string()),
+            config_version: "cfg".to_string(),
+            backup_path: Some(tmp.path().join("backup.sqlite")),
+        };
+        save_historical_rejudge_checkpoint(&db, &checkpoint).expect("save initial checkpoint");
+        release_writer_lease_for_test(&db, &writer_lease);
+
+        let error = persist_historical_rejudge_llm_retry_status_checkpoint(
+            &db,
+            &mut checkpoint,
+            "waiting_llm",
+            Some(&writer_lease),
+        )
+        .expect_err("lost writer lease must remain fatal");
+
+        assert_writer_lease_lost_before(&error, "persist historical rejudge LLM retry checkpoint");
+        let persisted = load_historical_rejudge_checkpoint(&db)
+            .expect("load unchanged checkpoint")
             .expect("checkpoint");
         assert_eq!(persisted.status, "running");
         assert_eq!(persisted.last_processed_rowid, Some(2));
