@@ -643,7 +643,8 @@ pub fn stats_command(db: &Database, config: &Config, options: StatsOptions) -> R
         importance_total as f64 / records.len() as f64
     };
 
-    let queue_stats = query_queue_stats(db).context("failed to query queue stats")?;
+    let queue_stats = crate::core::queue::queue_stats_readonly(db.path())
+        .context("failed to query queue stats")?;
     let gating = load_audit_records(db, "gating", &scope, None)?;
     let novelty = load_audit_records(db, "novelty", &scope, None)?;
     let embed_count = db
@@ -688,12 +689,25 @@ pub fn stats_command(db: &Database, config: &Config, options: StatsOptions) -> R
     println!("  pending: {}", queue_stats.pending);
     println!("  claimed: {}", queue_stats.claimed);
     println!("  failed: {}", queue_stats.failed);
-    println!("  heartbeat: {}", queue_stats.heartbeat_state);
+    println!("  failed_retryable: {}", queue_stats.failed_retryable);
+    println!("  failed_terminal: {}", queue_stats.failed_terminal);
+    println!("  failed_archived: {}", queue_stats.failed_archived);
+    println!("  retrying: {}", queue_stats.retrying);
     println!(
-        "  heartbeat_age_secs: {}",
+        "  next_retry_at_unix_secs: {}",
         queue_stats
-            .heartbeat_age_secs
+            .next_retry_at_unix_secs
             .map_or_else(|| "none".to_string(), |value| value.to_string())
+    );
+    print_queue_failure_buckets(
+        "  failed_by_kind_class_reason",
+        &queue_stats.failed_buckets,
+        options.raw,
+    );
+    print_queue_failure_buckets(
+        "  retrying_by_kind_class_reason",
+        &queue_stats.retrying_buckets,
+        options.raw,
     );
     println!("gating:");
     print_decision_counts(&gating);
@@ -1937,65 +1951,35 @@ struct TimelineJsonLine {
     preview: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DashboardQueueStats {
-    pending: i64,
-    claimed: i64,
-    failed: i64,
-    heartbeat_age_secs: Option<i64>,
-    heartbeat_state: &'static str,
-}
-
-fn query_queue_stats(db: &Database) -> Result<DashboardQueueStats> {
-    let has_pending_messages = db.conn().query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pending_messages'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if has_pending_messages == 0 {
-        return Ok(DashboardQueueStats {
-            pending: 0,
-            claimed: 0,
-            failed: 0,
-            heartbeat_age_secs: None,
-            heartbeat_state: "none",
-        });
+fn print_queue_failure_buckets(
+    label: &str,
+    buckets: &[crate::core::queue::QueueFailureBucket],
+    raw: bool,
+) {
+    println!("{label}:");
+    if buckets.is_empty() {
+        println!("    none");
+        return;
     }
-
-    let pending = db.conn().query_row(
-        "SELECT COUNT(*) FROM pending_messages WHERE status = 'pending'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
-    let claimed = db.conn().query_row(
-        "SELECT COUNT(*) FROM pending_messages WHERE status = 'claimed'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
-    let failed = db.conn().query_row(
-        "SELECT COUNT(*) FROM pending_messages WHERE status = 'failed'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
-    let last_heartbeat = db.conn().query_row(
-        "SELECT MAX(heartbeat_at) FROM pending_messages WHERE heartbeat_at IS NOT NULL",
-        [],
-        |row| row.get::<_, Option<i64>>(0),
-    )?;
-    let heartbeat_age_secs =
-        last_heartbeat.map(|heartbeat| now_unix_secs().saturating_sub(heartbeat));
-    let heartbeat_state = match heartbeat_age_secs {
-        Some(age) if age <= 120 => "healthy",
-        Some(_) => "stale",
-        None => "none",
-    };
-    Ok(DashboardQueueStats {
-        pending,
-        claimed,
-        failed,
-        heartbeat_age_secs,
-        heartbeat_state,
-    })
+    for bucket in buckets.iter().take(10) {
+        let next_attempt = bucket
+            .next_attempt_at_unix_secs
+            .map_or_else(|| "none".to_string(), |value| value.to_string());
+        println!(
+            "    kind={} class={} reason={} count={} retry_count={}..{} next_attempt_at={} last_error_summary={}",
+            maybe_escape(&bucket.kind, raw),
+            maybe_escape(&bucket.retry_class, raw),
+            maybe_escape(&bucket.reason_code, raw),
+            bucket.count,
+            bucket.min_retry_count,
+            bucket.max_retry_count,
+            next_attempt,
+            maybe_escape(&bucket.sanitized_message, raw)
+        );
+    }
+    if buckets.len() > 10 {
+        println!("    ... {} more bucket(s)", buckets.len() - 10);
+    }
 }
 
 fn maybe_escape(value: &str, raw: bool) -> String {

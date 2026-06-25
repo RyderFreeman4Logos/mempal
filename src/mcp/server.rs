@@ -127,15 +127,15 @@ use super::tools::{
     MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest,
     PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
     Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
-    ProcessResourceUsageDto, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
-    ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto,
-    ResourceCounterDto, ResourceUsageDto, RetrievalScopeRequest, RetrievedKnowledgeCardDto,
-    RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto,
-    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, SkillDto,
-    SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, SqliteResourceUsageDto,
-    StatusDetail, StatusRequest, StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto,
-    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
-    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    ProcessResourceUsageDto, QueueFailureBucketDto, QueueStatsDto, ReadDrawerRequest,
+    ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto,
+    ResearchIngestPlanDto, ResourceCounterDto, ResourceUsageDto, RetrievalScopeRequest,
+    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto,
+    RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
+    SearchResultDto, SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount,
+    SqliteResourceUsageDto, StatusDetail, StatusRequest, StatusResponse, StatusScope,
+    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
+    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
@@ -3159,13 +3159,33 @@ fn default_queue_stats() -> crate::core::queue::QueueStats {
         failed: 0,
         failed_retryable: 0,
         failed_terminal: 0,
+        failed_archived: 0,
+        retrying: 0,
         failed_retryable_embed: 0,
         failed_retryable_llm: 0,
         last_auto_requeue_at_unix_ms: None,
+        next_retry_at_unix_secs: None,
         oldest_pending_age_secs: None,
         rate_per_min: 0.0,
         avg_processing_ms: None,
         eta_secs: None,
+        failed_buckets: Vec::new(),
+        retrying_buckets: Vec::new(),
+    }
+}
+
+fn queue_failure_bucket_dto(
+    bucket: &crate::core::queue::QueueFailureBucket,
+) -> QueueFailureBucketDto {
+    QueueFailureBucketDto {
+        kind: bucket.kind.clone(),
+        retry_class: bucket.retry_class.clone(),
+        reason_code: bucket.reason_code.clone(),
+        sanitized_message: bucket.sanitized_message.clone(),
+        count: bucket.count,
+        min_retry_count: bucket.min_retry_count,
+        max_retry_count: bucket.max_retry_count,
+        next_attempt_at_unix_secs: bucket.next_attempt_at_unix_secs,
     }
 }
 
@@ -4451,13 +4471,26 @@ impl MempalMcpServer {
                 failed: queue_stats.failed,
                 failed_retryable: queue_stats.failed_retryable,
                 failed_terminal: queue_stats.failed_terminal,
+                failed_archived: queue_stats.failed_archived,
+                retrying: queue_stats.retrying,
                 failed_retryable_embed: queue_stats.failed_retryable_embed,
                 failed_retryable_llm: queue_stats.failed_retryable_llm,
                 last_auto_requeue_at_unix_ms: queue_stats.last_auto_requeue_at_unix_ms,
+                next_retry_at_unix_secs: queue_stats.next_retry_at_unix_secs,
                 rate_per_min: queue_stats.rate_per_min,
                 oldest_pending_age_secs: queue_stats.oldest_pending_age_secs,
                 avg_processing_ms: queue_stats.avg_processing_ms,
                 eta_secs: queue_stats.eta_secs,
+                failed_buckets: queue_stats
+                    .failed_buckets
+                    .iter()
+                    .map(queue_failure_bucket_dto)
+                    .collect(),
+                retrying_buckets: queue_stats
+                    .retrying_buckets
+                    .iter()
+                    .map(queue_failure_bucket_dto)
+                    .collect(),
             },
             db_holders,
             resource_usage,
@@ -10521,11 +10554,24 @@ fn push_model_backend_warnings(
         });
     }
     if queue_stats.failed > 0 {
+        let top_reason = queue_stats
+            .failed_buckets
+            .first()
+            .map(|bucket| {
+                format!(
+                    " top_failed_reason={} kind={} class={} count={}",
+                    bucket.reason_code, bucket.kind, bucket.retry_class, bucket.count
+                )
+            })
+            .unwrap_or_else(|| " run `mempal queue failed` for aggregate details.".to_string());
         system_warnings.push(SystemWarning {
             level: "warn".to_string(),
             message: format!(
-                "queue has failed work (retryable_model={}, terminal={}); retryable model tasks are auto-requeued when their endpoint recovers, terminal failures require manual action.",
-                queue_stats.failed_retryable, queue_stats.failed_terminal
+                "queue has failed work (retryable_model={}, terminal={}, archived={}); retryable model tasks are auto-requeued when their endpoint recovers, terminal failures require filtered queue action.{}",
+                queue_stats.failed_retryable,
+                queue_stats.failed_terminal,
+                queue_stats.failed_archived,
+                top_reason
             ),
             source: "queue".to_string(),
         });

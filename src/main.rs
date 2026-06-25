@@ -770,6 +770,11 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         full: bool,
     },
+    /// Inspect and safely recover failed queue work without exposing payloads.
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommands,
+    },
     /// List recent drawers from the CLI dashboard.
     Tail {
         #[arg(long, default_value_t = 20)]
@@ -2312,6 +2317,69 @@ enum Phase3AdoptionCommands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+}
+
+#[derive(Subcommand)]
+#[command(after_long_help = "\
+Examples:
+  mempal queue failed
+  mempal queue failed --reason invalid_hook_envelope
+  mempal queue failed --reason automatic_hook_llm_gate
+  mempal queue failed --reason llm_response_decode
+  mempal queue failed --reason storage_merge_reopen
+  mempal queue retry-failed --kind hook_post_tool --reason storage_merge_reopen
+  mempal queue retry-failed --kind hook_post_tool --reason storage_merge_reopen --execute
+  mempal queue archive-failed --kind ingest_async --reason invalid_hook_envelope
+  mempal queue archive-failed --kind ingest_async --reason invalid_hook_envelope --execute
+
+Failed queue output is aggregate-only. It never prints raw queued payloads.
+Malformed or legacy hook envelopes usually classify as invalid_hook_envelope and should be archived rather than retried.
+LLM gate failures classify as automatic_hook_llm_gate or llm_response_decode.
+Storage reopen failures classify as storage_merge_reopen; retry only with an explicit filter after checking the dry-run count.")]
+enum QueueCommands {
+    /// Summarize failed queue rows by kind/class/reason without payloads.
+    Failed(QueueFailedArgs),
+    /// Requeue matching failed rows. Dry-run unless --execute is present.
+    #[command(name = "retry-failed")]
+    RetryFailed(QueueMutationArgs),
+    /// Archive matching failed rows into completion history. Dry-run unless --execute is present.
+    #[command(name = "archive-failed")]
+    ArchiveFailed(QueueMutationArgs),
+}
+
+#[derive(Args, Clone)]
+struct QueueFailedArgs {
+    /// Match one queue kind, such as hook_post_tool, hook_user_prompt, ingest_async, or llm_task.
+    #[arg(long)]
+    kind: Option<String>,
+    /// Match retry class, such as terminal, retryable_model, or retrying_backoff.
+    #[arg(long = "class")]
+    retry_class: Option<String>,
+    /// Match stable reason code, such as invalid_hook_envelope, llm_response_decode, automatic_hook_llm_gate, or storage_merge_reopen.
+    #[arg(long)]
+    reason: Option<String>,
+    /// Do not escape terminal control characters in aggregate labels.
+    #[arg(long, default_value_t = false)]
+    raw: bool,
+}
+
+#[derive(Args, Clone)]
+struct QueueMutationArgs {
+    /// Match one queue kind, such as hook_post_tool, hook_user_prompt, ingest_async, or llm_task.
+    #[arg(long)]
+    kind: Option<String>,
+    /// Match retry class, such as terminal or retryable_model.
+    #[arg(long = "class")]
+    retry_class: Option<String>,
+    /// Match stable reason code, such as invalid_hook_envelope, llm_response_decode, automatic_hook_llm_gate, or storage_merge_reopen.
+    #[arg(long)]
+    reason: Option<String>,
+    /// Actually mutate matching rows. Omit for dry-run.
+    #[arg(long, default_value_t = false)]
+    execute: bool,
+    /// Do not escape terminal control characters in aggregate labels.
+    #[arg(long, default_value_t = false)]
+    raw: bool,
 }
 
 #[derive(Subcommand)]
@@ -4046,6 +4114,7 @@ fn run() -> Result<()> {
         Commands::FieldTaxonomy { format } => field_taxonomy_command(&format),
         Commands::Serve { mcp } => block_on_result(serve_command(config.as_ref(), mcp)),
         Commands::Status { full } => status_command(&db, config.as_ref(), full),
+        Commands::Queue { command } => queue_command(&db, command),
         Commands::Gating { command } => gating_command(&db, config.as_ref(), command),
         Commands::Tail {
             limit,
@@ -4417,6 +4486,12 @@ fn command_uses_read_only_database(command: &Commands) -> bool {
         ),
         Commands::Taxonomy { command } => matches!(command, TaxonomyCommands::List),
         Commands::Gating { command } => matches!(command, GatingCommands::Stats { .. }),
+        Commands::Queue { command } => matches!(
+            command,
+            QueueCommands::Failed(_)
+                | QueueCommands::RetryFailed(QueueMutationArgs { execute: false, .. })
+                | QueueCommands::ArchiveFailed(QueueMutationArgs { execute: false, .. })
+        ),
         Commands::Checkpoint { command } => matches!(
             command,
             CheckpointCommands::Latest { .. }
@@ -8126,6 +8201,177 @@ fn reindex_failed_queue_command(db: &Database) -> Result<()> {
         .context("failed to requeue failed embed messages")?;
     println!("requeued failed embed queue items: {retried}");
     Ok(())
+}
+
+fn queue_command(db: &Database, command: QueueCommands) -> Result<()> {
+    let store = mempal::core::queue::PendingMessageStore::new_without_reclaim(db.path());
+    match command {
+        QueueCommands::Failed(args) => queue_failed_command(&store, args),
+        QueueCommands::RetryFailed(args) => queue_retry_failed_command(db, &store, args),
+        QueueCommands::ArchiveFailed(args) => queue_archive_failed_command(db, &store, args),
+    }
+}
+
+fn queue_failed_command(
+    store: &mempal::core::queue::PendingMessageStore,
+    args: QueueFailedArgs,
+) -> Result<()> {
+    let filter = queue_filter(args.kind, args.retry_class, args.reason);
+    let stats = store.stats().context("failed to summarize failed queue")?;
+    let failed_buckets = filter_queue_buckets(&stats.failed_buckets, &filter);
+    let retrying_buckets = filter_queue_buckets(&stats.retrying_buckets, &filter);
+    let failed_matched = failed_buckets
+        .iter()
+        .map(|bucket| bucket.count)
+        .sum::<u64>();
+    let retrying_matched = retrying_buckets
+        .iter()
+        .map(|bucket| bucket.count)
+        .sum::<u64>();
+
+    println!("queue_failed_summary:");
+    println!("  filter: {}", queue_filter_display(&filter, args.raw));
+    println!("  pending: {}", stats.pending);
+    println!("  claimed: {}", stats.claimed);
+    println!("  failed: {}", stats.failed);
+    println!("  failed_retryable: {}", stats.failed_retryable);
+    println!("  failed_terminal: {}", stats.failed_terminal);
+    println!("  failed_archived: {}", stats.failed_archived);
+    println!("  retrying: {}", stats.retrying);
+    println!("  matched_failed: {failed_matched}");
+    println!("  matched_retrying: {retrying_matched}");
+    println!(
+        "  next_retry_at_unix_secs: {}",
+        stats
+            .next_retry_at_unix_secs
+            .map_or_else(|| "none".to_string(), |value| value.to_string())
+    );
+    print_queue_failure_buckets("  failed_by_kind_class_reason", &failed_buckets, args.raw);
+    print_queue_failure_buckets(
+        "  retrying_by_kind_class_reason",
+        &retrying_buckets,
+        args.raw,
+    );
+    Ok(())
+}
+
+fn queue_retry_failed_command(
+    db: &Database,
+    store: &mempal::core::queue::PendingMessageStore,
+    args: QueueMutationArgs,
+) -> Result<()> {
+    let filter = queue_filter(args.kind, args.retry_class, args.reason);
+    ensure_queue_mutation_filter(&filter)?;
+    let preview = store
+        .preview_failed_action(filter.clone())
+        .context("failed to preview queue retry")?;
+    print_queue_action_preview("retry_failed", args.execute, &preview, args.raw);
+    if !args.execute {
+        return Ok(());
+    }
+    let _writer_lease = acquire_maintenance_writer_lease(db, "queue-retry-failed")?;
+    let outcome = store
+        .retry_failed_messages(filter)
+        .context("failed to retry failed queue rows")?;
+    print_queue_action_outcome("retry_failed", &outcome, args.raw);
+    Ok(())
+}
+
+fn queue_archive_failed_command(
+    db: &Database,
+    store: &mempal::core::queue::PendingMessageStore,
+    args: QueueMutationArgs,
+) -> Result<()> {
+    let filter = queue_filter(args.kind, args.retry_class, args.reason);
+    ensure_queue_mutation_filter(&filter)?;
+    let preview = store
+        .preview_failed_action(filter.clone())
+        .context("failed to preview queue archive")?;
+    print_queue_action_preview("archive_failed", args.execute, &preview, args.raw);
+    if !args.execute {
+        return Ok(());
+    }
+    let _writer_lease = acquire_maintenance_writer_lease(db, "queue-archive-failed")?;
+    let outcome = store
+        .archive_failed_messages(filter)
+        .context("failed to archive failed queue rows")?;
+    print_queue_action_outcome("archive_failed", &outcome, args.raw);
+    Ok(())
+}
+
+fn queue_filter(
+    kind: Option<String>,
+    retry_class: Option<String>,
+    reason_code: Option<String>,
+) -> mempal::core::queue::QueueFailureFilter {
+    mempal::core::queue::QueueFailureFilter {
+        kind,
+        retry_class,
+        reason_code,
+    }
+}
+
+fn ensure_queue_mutation_filter(filter: &mempal::core::queue::QueueFailureFilter) -> Result<()> {
+    if filter.is_explicit() {
+        Ok(())
+    } else {
+        bail!(
+            "queue retry/archive requires at least one explicit --kind, --class, or --reason filter"
+        )
+    }
+}
+
+fn filter_queue_buckets(
+    buckets: &[mempal::core::queue::QueueFailureBucket],
+    filter: &mempal::core::queue::QueueFailureFilter,
+) -> Vec<mempal::core::queue::QueueFailureBucket> {
+    buckets
+        .iter()
+        .filter(|bucket| filter.matches_bucket(bucket))
+        .cloned()
+        .collect()
+}
+
+fn queue_filter_display(filter: &mempal::core::queue::QueueFailureFilter, raw: bool) -> String {
+    let parts = [
+        ("kind", filter.kind.as_deref()),
+        ("class", filter.retry_class.as_deref()),
+        ("reason", filter.reason_code.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| format!("{key}={}", queue_display(value, raw))))
+    .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn print_queue_action_preview(
+    action: &str,
+    execute: bool,
+    preview: &mempal::core::queue::QueueFailureActionPreview,
+    raw: bool,
+) {
+    println!("{action}:");
+    println!("  dry_run: {}", !execute);
+    println!("  execute: {execute}");
+    println!("  filter: {}", queue_filter_display(&preview.filter, raw));
+    println!("  matched: {}", preview.matched);
+    print_queue_failure_buckets("  matched_by_kind_class_reason", &preview.buckets, raw);
+}
+
+fn print_queue_action_outcome(
+    action: &str,
+    outcome: &mempal::core::queue::QueueFailureActionOutcome,
+    raw: bool,
+) {
+    println!("{action}_result:");
+    println!("  filter: {}", queue_filter_display(&outcome.filter, raw));
+    println!("  matched: {}", outcome.matched);
+    println!("  changed: {}", outcome.changed);
+    print_queue_failure_buckets("  changed_by_kind_class_reason", &outcome.buckets, raw);
 }
 
 fn audit_stale_command(db: &Database, threshold: f64) -> Result<()> {
@@ -12240,6 +12486,8 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     println!("  failed: {}", queue_stats.failed);
     println!("  failed_retryable: {}", queue_stats.failed_retryable);
     println!("  failed_terminal: {}", queue_stats.failed_terminal);
+    println!("  failed_archived: {}", queue_stats.failed_archived);
+    println!("  retrying: {}", queue_stats.retrying);
     println!(
         "  failed_retryable_model: embedding={} llm={}",
         queue_stats.failed_retryable_embed, queue_stats.failed_retryable_llm
@@ -12247,6 +12495,10 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
     match queue_stats.last_auto_requeue_at_unix_ms {
         Some(ts) => println!("  last_auto_requeue_at_unix_ms: {ts}"),
         None => println!("  last_auto_requeue_at_unix_ms: none"),
+    }
+    match queue_stats.next_retry_at_unix_secs {
+        Some(ts) => println!("  next_retry_at_unix_secs: {ts}"),
+        None => println!("  next_retry_at_unix_secs: none"),
     }
     println!("  rate_per_min: {:.1}", queue_stats.rate_per_min);
     match queue_stats.oldest_pending_age_secs {
@@ -12261,6 +12513,16 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         Some(eta) => println!("  eta_secs: {eta}"),
         None => println!("  eta_secs: n/a"),
     }
+    print_queue_failure_buckets(
+        "  failed_by_kind_class_reason",
+        &queue_stats.failed_buckets,
+        false,
+    );
+    print_queue_failure_buckets(
+        "  retrying_by_kind_class_reason",
+        &queue_stats.retrying_buckets,
+        false,
+    );
     println!("Historical Rejudge:");
     if let Some(checkpoint) = historical_rejudge_checkpoint.as_ref() {
         let backlog_counts = historical_rejudge_backlog_counts(db, &checkpoint.run_id)
@@ -12551,12 +12813,25 @@ fn push_model_backend_runtime_warnings(
         });
     }
     if queue_stats.failed > 0 {
+        let top_reason = queue_stats
+            .failed_buckets
+            .first()
+            .map(|bucket| {
+                format!(
+                    " top_failed_reason={} kind={} class={} count={}",
+                    bucket.reason_code, bucket.kind, bucket.retry_class, bucket.count
+                )
+            })
+            .unwrap_or_else(|| " run `mempal queue failed` for aggregate details.".to_string());
         warnings.push(mempal::core::config::RuntimeWarning {
             level: "warn",
             source: "queue",
             message: format!(
-                "queue has failed work (retryable_model={}, terminal={}); retryable model tasks are auto-requeued when their endpoint recovers, terminal failures require manual action.",
-                queue_stats.failed_retryable, queue_stats.failed_terminal
+                "queue has failed work (retryable_model={}, terminal={}, archived={}); retryable model tasks are auto-requeued when their endpoint recovers, terminal failures require filtered queue action.{}",
+                queue_stats.failed_retryable,
+                queue_stats.failed_terminal,
+                queue_stats.failed_archived,
+                top_reason
             ),
         });
     }
@@ -12567,6 +12842,45 @@ fn display_list_or_none(values: &[String]) -> String {
         "none".to_string()
     } else {
         values.join(", ")
+    }
+}
+
+fn print_queue_failure_buckets(
+    label: &str,
+    buckets: &[mempal::core::queue::QueueFailureBucket],
+    raw: bool,
+) {
+    println!("{label}:");
+    if buckets.is_empty() {
+        println!("    none");
+        return;
+    }
+    for bucket in buckets.iter().take(10) {
+        let next_attempt = bucket
+            .next_attempt_at_unix_secs
+            .map_or_else(|| "none".to_string(), |value| value.to_string());
+        println!(
+            "    kind={} class={} reason={} count={} retry_count={}..{} next_attempt_at={} last_error_summary={}",
+            queue_display(&bucket.kind, raw),
+            queue_display(&bucket.retry_class, raw),
+            queue_display(&bucket.reason_code, raw),
+            bucket.count,
+            bucket.min_retry_count,
+            bucket.max_retry_count,
+            next_attempt,
+            queue_display(&bucket.sanitized_message, raw)
+        );
+    }
+    if buckets.len() > 10 {
+        println!("    ... {} more bucket(s)", buckets.len() - 10);
+    }
+}
+
+fn queue_display(value: &str, raw: bool) -> String {
+    if raw {
+        value.to_string()
+    } else {
+        mempal::observability::escape_terminal_text(value)
     }
 }
 

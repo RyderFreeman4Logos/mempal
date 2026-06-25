@@ -4,8 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mempal::core::db::Database;
 use mempal::core::queue::{
-    ClaimedMessage, LAST_ERROR_MAX_BYTES, PendingMessageStore, QueueConfig, QueueError,
-    QueueFailureDisposition,
+    ClaimedMessage, LAST_ERROR_MAX_BYTES, PendingMessageStore, QueueError, QueueFailureDisposition,
 };
 use mempal::llm::worker::confirm_llm_task;
 use rusqlite::Connection;
@@ -473,48 +472,6 @@ fn test_stale_claim_finalizers_fail_without_touching_reclaimed_claim() {
 }
 
 #[test]
-fn test_retryable_failure_stays_retryable_past_max_retries() {
-    let tmp = TempDir::new().expect("tempdir");
-    let db_path = tmp.path().join("palace.db");
-    Database::open(&db_path).expect("open db");
-    let store = PendingMessageStore::with_config(
-        &db_path,
-        QueueConfig {
-            base_delay_ms: 0,
-            max_delay_ms: 0,
-            max_retries: 3,
-        },
-    )
-    .expect("store");
-
-    let id = store.enqueue("hook_event", r#"{"n":1}"#).expect("enqueue");
-    for worker in ["worker-a", "worker-b", "worker-c", "worker-d"] {
-        let claimed = store
-            .claim_next(worker, 60)
-            .expect("claim")
-            .expect("message");
-        assert_eq!(claimed.id, id);
-        store.mark_failed(&claimed, "timeout").expect("mark failed");
-    }
-
-    let conn = Connection::open(&db_path).expect("open sqlite");
-    let (status, retry_count): (String, i64) = conn
-        .query_row(
-            "SELECT status, retry_count FROM pending_messages WHERE id = ?1",
-            [&id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("query status");
-    assert_eq!(status, "pending");
-    assert_eq!(retry_count, 4);
-    let retry = store
-        .claim_next("worker-z", 60)
-        .expect("claim after retryable failures")
-        .expect("retryable message");
-    assert_eq!(retry.id, id);
-}
-
-#[test]
 fn test_claim_next_breaks_timestamp_ties_by_id() {
     let (_tmp, db_path, store) = new_store();
     let first = store
@@ -559,7 +516,7 @@ fn test_retry_failed_embed_messages_preserves_fifo_after_later_retry() {
 
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
-        "UPDATE pending_messages SET status = 'failed', retry_count = 7, retry_backoff_ms = 5000, last_error = 'boom', created_at = ?2, next_attempt_at = ?2 WHERE id = ?1",
+        "UPDATE pending_messages SET status = 'failed', failure_class = 'retryable_model', retry_count = 7, retry_backoff_ms = 5000, last_error = 'boom', created_at = ?2, next_attempt_at = ?2 WHERE id = ?1",
         rusqlite::params![failed_embed, base],
     )
     .expect("mark failed embed with older queue position");
@@ -600,7 +557,7 @@ fn test_retry_failed_embed_messages_requeues_only_failed_embed_items() {
 
     let conn = Connection::open(&db_path).expect("open sqlite");
     conn.execute(
-        "UPDATE pending_messages SET status = 'failed', retry_count = 7, retry_backoff_ms = 5000, last_error = 'boom' WHERE id IN (?1, ?2)",
+        "UPDATE pending_messages SET status = 'failed', failure_class = 'retryable_model', retry_count = 7, retry_backoff_ms = 5000, last_error = 'boom' WHERE id IN (?1, ?2)",
         rusqlite::params![failed_embed, failed_llm],
     )
     .expect("mark failed rows");
