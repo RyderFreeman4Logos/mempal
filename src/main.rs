@@ -16807,22 +16807,26 @@ async fn maintenance_rejudge_all_command(
                 .map(|work_item| work_item.drawer_rowid)
                 .unwrap_or(page_start);
             let waiting_for_llm = is_retryable_historical_llm_error(&error);
-            if waiting_for_llm {
+            let checkpoint_persistence = if waiting_for_llm {
                 persist_historical_rejudge_llm_retry_status_checkpoint(
                     db,
                     &mut checkpoint,
                     "waiting_llm",
                     writer_lease,
-                )?;
+                )?
             } else {
-                checkpoint.status = "failed".to_string();
-                checkpoint.updated_at = iso_timestamp();
-                save_historical_rejudge_checkpoint_with_writer_lease(
+                persist_historical_rejudge_failed_status_checkpoint(
                     db,
-                    &checkpoint,
+                    &mut checkpoint,
                     writer_lease,
-                    "persist failed historical rejudge checkpoint",
-                )?;
+                )?
+            };
+            if !waiting_for_llm
+                && checkpoint_persistence
+                    == HistoricalRejudgeCheckpointPersistence::DeferredTransientLock
+            {
+                tokio::time::sleep(historical_rejudge_sqlite_lock_retry_delay(0)).await;
+                continue;
             }
             if let Some(writer) = progress.as_mut() {
                 writer.write_event(build_historical_rejudge_progress_event(
@@ -18459,9 +18463,31 @@ enum HistoricalRejudgeCheckpointPersistence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HistoricalRejudgeRetryCheckpointLeaseCheck {
+enum HistoricalRejudgeCheckpointLeaseCheck {
     Active,
     DeferredTransientLock,
+}
+
+fn save_historical_rejudge_checkpoint_with_writer_lease_outcome(
+    db: &Database,
+    checkpoint: &HistoricalRejudgeCheckpoint,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
+    operation: &'static str,
+    status: &'static str,
+) -> Result<HistoricalRejudgeCheckpointPersistence> {
+    match historical_rejudge_checkpoint_lease_check_outcome(
+        ensure_maintenance_writer_lease_active(writer_lease, operation),
+        status,
+    )? {
+        HistoricalRejudgeCheckpointLeaseCheck::Active => {}
+        HistoricalRejudgeCheckpointLeaseCheck::DeferredTransientLock => {
+            return Ok(HistoricalRejudgeCheckpointPersistence::DeferredTransientLock);
+        }
+    }
+    historical_rejudge_checkpoint_persistence_outcome(
+        save_historical_rejudge_checkpoint(db, checkpoint),
+        status,
+    )
 }
 
 fn persist_historical_rejudge_llm_retry_status_checkpoint(
@@ -18472,33 +18498,47 @@ fn persist_historical_rejudge_llm_retry_status_checkpoint(
 ) -> Result<HistoricalRejudgeCheckpointPersistence> {
     checkpoint.status = status.to_string();
     checkpoint.updated_at = iso_timestamp();
-    match historical_rejudge_retry_checkpoint_lease_check_outcome(
-        ensure_maintenance_writer_lease_active(
-            writer_lease,
-            "persist historical rejudge LLM retry checkpoint",
-        ),
-        status,
-    )? {
-        HistoricalRejudgeRetryCheckpointLeaseCheck::Active => {}
-        HistoricalRejudgeRetryCheckpointLeaseCheck::DeferredTransientLock => {
-            return Ok(HistoricalRejudgeCheckpointPersistence::DeferredTransientLock);
-        }
-    }
-    historical_rejudge_checkpoint_persistence_outcome(
-        save_historical_rejudge_checkpoint(db, checkpoint),
+    save_historical_rejudge_checkpoint_with_writer_lease_outcome(
+        db,
+        checkpoint,
+        writer_lease,
+        "persist historical rejudge LLM retry checkpoint",
         status,
     )
 }
 
-fn historical_rejudge_retry_checkpoint_lease_check_outcome(
+fn persist_historical_rejudge_failed_status_checkpoint(
+    db: &Database,
+    checkpoint: &mut HistoricalRejudgeCheckpoint,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
+) -> Result<HistoricalRejudgeCheckpointPersistence> {
+    let previous_status = checkpoint.status.clone();
+    let previous_updated_at = checkpoint.updated_at.clone();
+    checkpoint.status = "failed".to_string();
+    checkpoint.updated_at = iso_timestamp();
+    let outcome = save_historical_rejudge_checkpoint_with_writer_lease_outcome(
+        db,
+        checkpoint,
+        writer_lease,
+        "persist failed historical rejudge checkpoint",
+        "failed",
+    )?;
+    if outcome == HistoricalRejudgeCheckpointPersistence::DeferredTransientLock {
+        checkpoint.status = previous_status;
+        checkpoint.updated_at = previous_updated_at;
+    }
+    Ok(outcome)
+}
+
+fn historical_rejudge_checkpoint_lease_check_outcome(
     result: Result<()>,
     status: &'static str,
-) -> Result<HistoricalRejudgeRetryCheckpointLeaseCheck> {
+) -> Result<HistoricalRejudgeCheckpointLeaseCheck> {
     match result {
-        Ok(()) => Ok(HistoricalRejudgeRetryCheckpointLeaseCheck::Active),
+        Ok(()) => Ok(HistoricalRejudgeCheckpointLeaseCheck::Active),
         Err(error) if is_transient_sqlite_lock_error(&error) => {
             log_deferred_historical_rejudge_checkpoint_persistence(status);
-            Ok(HistoricalRejudgeRetryCheckpointLeaseCheck::DeferredTransientLock)
+            Ok(HistoricalRejudgeCheckpointLeaseCheck::DeferredTransientLock)
         }
         Err(error) => Err(error),
     }
@@ -23676,6 +23716,33 @@ threshold = 0.7
         tmp.path().join("rejudge-backups")
     }
 
+    fn historical_rejudge_checkpoint_for_test(
+        tmp: &tempfile::TempDir,
+        run_id: &str,
+    ) -> HistoricalRejudgeCheckpoint {
+        HistoricalRejudgeCheckpoint {
+            run_id: run_id.to_string(),
+            status: "running".to_string(),
+            options_hash: "hash".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:01Z".to_string(),
+            snapshot_max_rowid: 42,
+            snapshot_count: 3,
+            last_processed_rowid: Some(2),
+            scanned_count: 2,
+            candidate_count: 1,
+            kept_count: 1,
+            protected_count: 0,
+            mutated_count: 1,
+            estimated_bytes_reclaimed: 64,
+            mutation: "soft_delete".to_string(),
+            page_size: 500,
+            judge_model: Some("proposal:qwen, confirm:spark".to_string()),
+            config_version: "cfg".to_string(),
+            backup_path: Some(tmp.path().join(format!("{run_id}.sqlite"))),
+        }
+    }
+
     fn release_writer_lease_for_test(db: &Database, lease: &MaintenanceWriterLeaseGuard) {
         db.runtime_writer_lease_release(
             &lease.lease().name,
@@ -28060,7 +28127,7 @@ threshold = 0.7
 
     #[test]
     fn historical_rejudge_waiting_llm_checkpoint_lease_verification_lock_is_deferred() {
-        let outcome = historical_rejudge_retry_checkpoint_lease_check_outcome(
+        let outcome = historical_rejudge_checkpoint_lease_check_outcome(
             Err(database_locked_open_error().context(
                 "failed to verify writer lease `maintenance-rejudge-writer` before persist historical rejudge LLM retry checkpoint",
             )),
@@ -28070,8 +28137,108 @@ threshold = 0.7
 
         assert_eq!(
             outcome,
-            HistoricalRejudgeRetryCheckpointLeaseCheck::DeferredTransientLock
+            HistoricalRejudgeCheckpointLeaseCheck::DeferredTransientLock
         );
+    }
+
+    #[test]
+    fn historical_rejudge_failed_checkpoint_lease_verification_lock_is_deferred() {
+        let outcome = historical_rejudge_checkpoint_lease_check_outcome(
+            Err(database_locked_open_error().context(
+                "failed to verify writer lease `maintenance-rejudge-writer` before persist failed historical rejudge checkpoint",
+            )),
+            "failed",
+        )
+        .expect("transient lease verification lock must defer failed checkpoint persistence");
+
+        assert_eq!(
+            outcome,
+            HistoricalRejudgeCheckpointLeaseCheck::DeferredTransientLock
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_failed_checkpoint_lock_is_deferred_without_cursor_advance() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let mut checkpoint =
+            historical_rejudge_checkpoint_for_test(&tmp, "failed-checkpoint-lock-run");
+        save_historical_rejudge_checkpoint(&db, &checkpoint).expect("save initial checkpoint");
+        db.conn()
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make failed checkpoint writer fail fast");
+        let blocker = rusqlite::Connection::open(&db_path).expect("open blocking connection");
+        blocker
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("make blocker fail fast");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold write lock");
+
+        let outcome =
+            persist_historical_rejudge_failed_status_checkpoint(&db, &mut checkpoint, None)
+                .expect("failed checkpoint lock must be deferred");
+        assert_eq!(
+            outcome,
+            HistoricalRejudgeCheckpointPersistence::DeferredTransientLock
+        );
+        assert_eq!(
+            checkpoint.status, "running",
+            "deferred failed checkpoint must restore in-memory status for same-page retry"
+        );
+        assert_eq!(checkpoint.last_processed_rowid, Some(2));
+        let persisted = load_historical_rejudge_checkpoint(&db)
+            .expect("load unchanged checkpoint")
+            .expect("checkpoint");
+        assert_eq!(
+            persisted.status, "running",
+            "transient failed checkpoint failure must not corrupt the durable checkpoint"
+        );
+        assert_eq!(persisted.last_processed_rowid, Some(2));
+
+        blocker
+            .execute_batch("COMMIT;")
+            .expect("release write lock");
+        let outcome =
+            persist_historical_rejudge_failed_status_checkpoint(&db, &mut checkpoint, None)
+                .expect("failed checkpoint save after lock release");
+        assert_eq!(outcome, HistoricalRejudgeCheckpointPersistence::Persisted);
+        let persisted = load_historical_rejudge_checkpoint(&db)
+            .expect("load failed checkpoint")
+            .expect("checkpoint");
+        assert_eq!(persisted.status, "failed");
+        assert_eq!(persisted.last_processed_rowid, Some(2));
+    }
+
+    #[test]
+    fn historical_rejudge_failed_checkpoint_lost_writer_lease_still_fails() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let _daemon_lease = hold_test_daemon_writer_lease(&db);
+        let writer_lease =
+            acquire_historical_rejudge_writer_lease(&db).expect("historical rejudge writer lease");
+        let mut checkpoint =
+            historical_rejudge_checkpoint_for_test(&tmp, "lost-lease-failed-checkpoint-run");
+        save_historical_rejudge_checkpoint(&db, &checkpoint).expect("save initial checkpoint");
+        release_writer_lease_for_test(&db, &writer_lease);
+
+        let error = persist_historical_rejudge_failed_status_checkpoint(
+            &db,
+            &mut checkpoint,
+            Some(&writer_lease),
+        )
+        .expect_err("lost writer lease must remain fatal");
+
+        assert_writer_lease_lost_before(&error, "persist failed historical rejudge checkpoint");
+        let persisted = load_historical_rejudge_checkpoint(&db)
+            .expect("load unchanged checkpoint")
+            .expect("checkpoint");
+        assert_eq!(persisted.status, "running");
+        assert_eq!(persisted.last_processed_rowid, Some(2));
     }
 
     #[test]
