@@ -184,6 +184,8 @@ const MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE: Duration = Duration::fro
 const MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT: Duration =
     MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE;
 const MCP_INGEST_QUEUE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
+const MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(30);
+const MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MCP_INGEST_CLAIM_RELEASE_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 const MCP_INGEST_CLAIM_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MCP_INGEST_CLAIM_RELEASE_BUSY_TIMEOUT: Duration = Duration::ZERO;
@@ -271,6 +273,8 @@ pub struct MempalMcpServer {
     daemon_writer_lease_check_error: Option<String>,
     #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_lock_failures: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    sync_db_open_lock_failures: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "db-test-seam"))]
     content_writer_lease_ttl_secs: u64,
     #[cfg(any(test, feature = "db-test-seam"))]
@@ -518,6 +522,8 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_lock_failures: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "db-test-seam"))]
+            sync_db_open_lock_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "db-test-seam"))]
             content_writer_lease_ttl_secs: MCP_CONTENT_WRITER_LEASE_TTL_SECS,
             #[cfg(any(test, feature = "db-test-seam"))]
             content_writer_lease_renew_interval: MCP_CONTENT_WRITER_LEASE_RENEW_INTERVAL,
@@ -592,6 +598,13 @@ impl MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_async_db_open_lock_failures_for_test(self, failures: usize) -> Self {
         self.async_db_open_lock_failures
+            .store(failures, Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_sync_db_open_lock_failures_for_test(self, failures: usize) -> Self {
+        self.sync_db_open_lock_failures
             .store(failures, Ordering::SeqCst);
         self
     }
@@ -1497,7 +1510,107 @@ impl MempalMcpServer {
         .context("blocking ingest worker task failed")?
     }
 
+    async fn soft_delete_drawer_for_mcp(
+        &self,
+        drawer_id: String,
+    ) -> std::result::Result<(bool, Vec<SystemWarning>), ErrorData> {
+        let system_warnings = current_system_warnings();
+        match self.async_db().await {
+            Ok(async_db) => {
+                let drawer_id_for_write = drawer_id.clone();
+                let deleted = async_db
+                    .run_write(move |db| db.soft_delete_drawer(&drawer_id_for_write))
+                    .await
+                    .map_err(|error| mcp_write_db_error(&self.db_path, "mempal_delete", error))?;
+                Ok((deleted, system_warnings))
+            }
+            Err(error) => {
+                let diagnostic = status_database_diagnostic(
+                    &self.db_path,
+                    "mempal_delete_async_db",
+                    error.as_ref(),
+                );
+                if database_lock_is_known_runtime_holder_only(&self.db_path, &diagnostic) {
+                    let system_warnings = database_warning_snapshot(
+                        system_warnings,
+                        &self.db_path,
+                        "mempal_delete_async_db",
+                        error.as_ref(),
+                    );
+                    let deleted = self
+                        .soft_delete_drawer_with_self_holder_retry(drawer_id)
+                        .await?;
+                    return Ok((deleted, system_warnings));
+                }
+                Err(database_write_refused_error_from_diagnostic(diagnostic))
+            }
+        }
+    }
+
+    async fn soft_delete_drawer_with_self_holder_retry(
+        &self,
+        drawer_id: String,
+    ) -> std::result::Result<bool, ErrorData> {
+        let started = Instant::now();
+        loop {
+            let db_path = self.db_path.clone();
+            let drawer_id_for_write = drawer_id.clone();
+            let write = tokio::task::spawn_blocking(move || {
+                let db = Database::open_with_busy_timeout(
+                    &db_path,
+                    MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY,
+                )?;
+                db.soft_delete_drawer(&drawer_id_for_write)
+            })
+            .await
+            .map_err(|error| {
+                ErrorData::internal_error(
+                    format!("mempal_delete database task failed: {error}"),
+                    None,
+                )
+            })?;
+
+            match write {
+                Ok(deleted) => return Ok(deleted),
+                Err(error)
+                    if crate::core::db::db_error_is_sqlite_lock(&error)
+                        && started.elapsed() < MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE
+                        && should_extend_ingest_admission_for_known_runtime_holder(
+                            &self.db_path,
+                        ) =>
+                {
+                    let remaining =
+                        MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE.saturating_sub(started.elapsed());
+                    tokio::time::sleep(MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY.min(remaining)).await;
+                }
+                Err(error) => {
+                    return Err(mcp_write_db_error(&self.db_path, "mempal_delete", error));
+                }
+            }
+        }
+    }
+
     pub(super) fn open_db(&self) -> std::result::Result<Database, ErrorData> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .sync_db_open_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(database_write_refused_error(
+                &self.db_path,
+                "open_db",
+                &rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::DatabaseBusy,
+                        extended_code: rusqlite::ffi::SQLITE_BUSY,
+                    },
+                    Some("database is locked".to_string()),
+                ),
+            ));
+        }
         Database::open(&self.db_path).map_err(|error| {
             ErrorData::internal_error(format!("failed to open database: {error}"), None)
         })
@@ -7331,25 +7444,23 @@ impl MempalMcpServer {
         &self,
         Parameters(request): Parameters<DeleteRequest>,
     ) -> std::result::Result<Json<DeleteResponse>, ErrorData> {
-        let db = self.open_db()?;
+        let drawer_id = request.drawer_id;
         // Match CLI `mempal delete`: exact cleanup deletes are short SQLite writes
         // that must still work while the daemon owns the long-lived runtime writer
         // lease. Taking an MCP content-writer lease here makes daemon-backed full
         // smoke cleanup impossible because the live daemon intentionally holds
         // `sqlite-writer` for queue ownership.
-        let deleted = db
-            .soft_delete_drawer(&request.drawer_id)
-            .map_err(db_error)?;
+        let (deleted, system_warnings) = self.soft_delete_drawer_for_mcp(drawer_id.clone()).await?;
         let message = if deleted {
-            format!("drawer {} soft-deleted", request.drawer_id)
+            format!("drawer {drawer_id} soft-deleted")
         } else {
-            format!("drawer {} not found or already deleted", request.drawer_id)
+            format!("drawer {drawer_id} not found or already deleted")
         };
         Ok(Json(DeleteResponse {
-            drawer_id: request.drawer_id,
+            drawer_id,
             deleted,
             message,
-            system_warnings: current_system_warnings(),
+            system_warnings,
         }))
     }
 
@@ -10117,6 +10228,18 @@ pub(super) fn db_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(format!("{error}"), None)
 }
 
+fn mcp_write_db_error(
+    db_path: &Path,
+    operation: &'static str,
+    error: crate::core::db::DbError,
+) -> ErrorData {
+    if crate::core::db::db_error_is_sqlite_lock(&error) {
+        database_write_refused_error(db_path, operation, &error)
+    } else {
+        db_error(error)
+    }
+}
+
 fn replacement_db_error(error: crate::core::db::DbError) -> ErrorData {
     match error {
         crate::core::db::DbError::ReplacementTargetConflict
@@ -10416,6 +10539,29 @@ fn database_warning_snapshot(
 fn should_extend_ingest_admission_for_known_runtime_holder(db_path: &Path) -> bool {
     let report = crate::process_diagnostics::inspect_db_holders(db_path);
     ingest_admission_report_is_known_runtime_holder_only(&report)
+}
+
+fn database_lock_is_known_runtime_holder_only(
+    db_path: &Path,
+    diagnostic: &DatabaseDiagnosticDto,
+) -> bool {
+    if diagnostic.failure_kind != "locked_or_busy" {
+        return false;
+    }
+    let report = crate::process_diagnostics::inspect_db_holders(db_path);
+    if ingest_admission_report_is_known_runtime_holder_only(&report) {
+        return true;
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    {
+        diagnostic.summary.contains("current_mcp_server")
+            || diagnostic.hint.contains("current_mcp_server")
+    }
+    #[cfg(not(any(test, feature = "db-test-seam")))]
+    {
+        false
+    }
 }
 
 fn ingest_admission_report_is_known_runtime_holder_only(
@@ -16722,6 +16868,47 @@ pattern_boost = 0.2
         let db = Database::open(&db_path).expect("open db");
         assert!(
             !db.drawer_exists("mcp-delete-lease-target")
+                .expect("drawer exists")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_uses_current_server_writer_after_status_pool_load() {
+        let (_tempdir, db_path, server) = setup_server();
+        insert_drawer(
+            &db_path,
+            "mcp-delete-self-holder-target",
+            "issue-547 synthetic delete marker",
+            "mcp",
+            Some("self-holder"),
+            "/tmp/mcp-delete-self-holder.md",
+            2,
+        );
+        let server = server.with_sync_db_open_lock_failures_for_test(1);
+        server
+            .async_db()
+            .await
+            .expect("status path loads the current MCP async database pool");
+
+        let delete = server
+            .mempal_delete(Parameters(DeleteRequest {
+                drawer_id: "mcp-delete-self-holder-target".to_string(),
+            }))
+            .await
+            .expect("current MCP writer must not be blocked by a self-holder sync open lock")
+            .0;
+
+        assert!(delete.deleted);
+        assert!(
+            !delete
+                .system_warnings
+                .iter()
+                .any(|warning| warning.message.contains("database_locked")),
+            "self-holder delete must not surface database_locked as the outcome"
+        );
+        let db = Database::open(&db_path).expect("open db after delete");
+        assert!(
+            !db.drawer_exists("mcp-delete-self-holder-target")
                 .expect("drawer exists")
         );
     }
