@@ -4297,7 +4297,7 @@ fn command_retries_historical_rejudge_startup_open(command: &Commands) -> bool {
         command,
         Commands::Maintenance {
             command: MaintenanceCommands::Rejudge(args),
-        } if args.command.is_none() && args.resume
+        } if args.command.is_none()
     )
 }
 
@@ -22976,6 +22976,107 @@ mod historical_rejudge_tests {
         );
         anyhow::Error::new(mempal::core::db::DbError::from(sqlite_error))
             .context("failed to open database")
+    }
+
+    fn top_level_rejudge_command(configure: impl FnOnce(&mut MaintenanceRejudgeArgs)) -> Commands {
+        let mut args = MaintenanceRejudgeArgs {
+            command: None,
+            help_verbose: false,
+            execute: false,
+            hard_delete: false,
+            backup_dir: None,
+            unsafe_no_backup: false,
+            limit: 1000,
+            all: false,
+            resume: false,
+            unsafe_allow_config_version_drift: false,
+            page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+            llm_concurrency: DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY,
+            progress_file: None,
+            proposal_only: false,
+            confirm_pending_only: false,
+            proposal_llm_endpoint: None,
+            confirm_llm_endpoint: None,
+            wing: None,
+            room: None,
+            project: None,
+            format: "plain".to_string(),
+        };
+        configure(&mut args);
+        Commands::Maintenance {
+            command: MaintenanceCommands::Rejudge(Box::new(args)),
+        }
+    }
+
+    fn assert_historical_rejudge_startup_retry(name: &str, command: Commands) {
+        assert!(
+            command_retries_historical_rejudge_startup_open(&command),
+            "expected startup retry for {name}"
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_startup_retry_covers_top_level_sweep_modes() {
+        assert_historical_rejudge_startup_retry(
+            "limited dry-run",
+            top_level_rejudge_command(|args| {
+                args.limit = 20;
+                args.format = "json".to_string();
+            }),
+        );
+        assert_historical_rejudge_startup_retry(
+            "all dry-run",
+            top_level_rejudge_command(|args| {
+                args.all = true;
+            }),
+        );
+        assert_historical_rejudge_startup_retry(
+            "execute",
+            top_level_rejudge_command(|args| {
+                args.execute = true;
+                args.backup_dir = Some(PathBuf::from("/tmp/mempal-rejudge-backup"));
+            }),
+        );
+        assert_historical_rejudge_startup_retry(
+            "proposal-only",
+            top_level_rejudge_command(|args| {
+                args.all = true;
+                args.proposal_only = true;
+            }),
+        );
+        assert_historical_rejudge_startup_retry(
+            "confirm-pending resume",
+            top_level_rejudge_command(|args| {
+                args.all = true;
+                args.resume = true;
+                args.execute = true;
+                args.confirm_pending_only = true;
+                args.backup_dir = Some(PathBuf::from("/tmp/mempal-rejudge-backup"));
+            }),
+        );
+        assert_historical_rejudge_startup_retry(
+            "resume",
+            top_level_rejudge_command(|args| {
+                args.all = true;
+                args.resume = true;
+                args.execute = true;
+                args.backup_dir = Some(PathBuf::from("/tmp/mempal-rejudge-backup"));
+            }),
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_restore_subcommand_does_not_use_sweep_startup_retry() {
+        let command = top_level_rejudge_command(|args| {
+            args.command = Some(MaintenanceRejudgeCommands::Restore {
+                backup: PathBuf::from("/tmp/mempal-rejudge-backup.json"),
+                execute: false,
+                conflict_policy: RejudgeRestoreConflictPolicy::Skip,
+                format: "plain".to_string(),
+            });
+        });
+
+        assert!(!command_retries_historical_rejudge_startup_open(&command));
     }
 
     #[test]
