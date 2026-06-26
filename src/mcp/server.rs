@@ -2825,11 +2825,15 @@ fn rusqlite_error_is_lock(error: &rusqlite::Error) -> bool {
         rusqlite::Error::SqliteFailure(sqlite, _)
             if matches!(
                 sqlite.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::FileLockingProtocolFailed
             )
                 || matches!(
                     sqlite.extended_code & 0xff,
-                    rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED
+                    rusqlite::ffi::SQLITE_BUSY
+                        | rusqlite::ffi::SQLITE_LOCKED
+                        | rusqlite::ffi::SQLITE_PROTOCOL
                 )
     )
 }
@@ -3355,19 +3359,33 @@ fn status_db_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static
 
 fn status_rusqlite_failure_kind(error: &rusqlite::Error) -> Option<&'static str> {
     match error {
-        rusqlite::Error::SqliteFailure(sqlite, _) => match sqlite.code {
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
+        rusqlite::Error::SqliteFailure(sqlite, _) => {
+            let primary_code = sqlite.extended_code & 0xff;
+            if matches!(
+                sqlite.code,
+                rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::FileLockingProtocolFailed
+            ) || matches!(
+                primary_code,
+                rusqlite::ffi::SQLITE_BUSY
+                    | rusqlite::ffi::SQLITE_LOCKED
+                    | rusqlite::ffi::SQLITE_PROTOCOL
+            ) {
                 Some("locked_or_busy")
+            } else {
+                match sqlite.code {
+                    rusqlite::ErrorCode::CannotOpen
+                    | rusqlite::ErrorCode::NotFound
+                    | rusqlite::ErrorCode::PermissionDenied
+                    | rusqlite::ErrorCode::ReadOnly => Some("path_or_permission"),
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+                        Some("corrupt_or_invalid")
+                    }
+                    _ => None,
+                }
             }
-            rusqlite::ErrorCode::CannotOpen
-            | rusqlite::ErrorCode::NotFound
-            | rusqlite::ErrorCode::PermissionDenied
-            | rusqlite::ErrorCode::ReadOnly => Some("path_or_permission"),
-            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
-                Some("corrupt_or_invalid")
-            }
-            _ => None,
-        },
+        }
         _ => None,
     }
 }
@@ -12832,6 +12850,36 @@ quality_policy = "llm_required_for_keep"
     }
 
     #[test]
+    fn test_mcp_sqlite_protocol_is_classified_as_transient_lock() {
+        let protocol_error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::FileLockingProtocolFailed,
+                extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
+            },
+            Some("Database lock protocol error".to_string()),
+        );
+
+        assert!(
+            rusqlite_error_is_lock(&protocol_error),
+            "MCP retry paths must treat SQLITE_PROTOCOL as transient SQLite lock contention"
+        );
+
+        let wrapped_error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::FileLockingProtocolFailed,
+                extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
+            },
+            Some("Database lock protocol error".to_string()),
+        ))
+        .context("wrapped MCP SQLite lock protocol failure");
+
+        assert!(
+            anyhow_chain_contains_sqlite_lock(&wrapped_error),
+            "wrapped MCP SQLITE_PROTOCOL failures must reach the same retry classifier"
+        );
+    }
+
+    #[test]
     fn test_mcp_context_database_deadline_exceeds_large_db_smoke_latency() {
         assert!(
             MCP_SEARCH_DB_DEADLINE >= Duration::from_secs(60),
@@ -14149,10 +14197,50 @@ pattern_boost = 0.2
             },
             Some("file is not a database".to_string()),
         );
+        let protocol = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::FileLockingProtocolFailed,
+                extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
+            },
+            Some("Database lock protocol error".to_string()),
+        );
 
         assert_eq!(status_db_failure_kind(&busy), "locked_or_busy");
+        assert_eq!(status_db_failure_kind(&protocol), "locked_or_busy");
         assert_eq!(status_db_failure_kind(&permission), "path_or_permission");
         assert_eq!(status_db_failure_kind(&invalid), "corrupt_or_invalid");
+    }
+
+    #[test]
+    fn test_mcp_ingest_database_write_refused_error_classifies_sqlite_protocol() {
+        let protocol = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::FileLockingProtocolFailed,
+                extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
+            },
+            Some("Database lock protocol error".to_string()),
+        );
+
+        let error =
+            database_write_refused_error(Path::new("/tmp/palace.db"), "async_db", &protocol);
+
+        assert!(error.message.contains("locked_or_busy"));
+        let data = error.data.expect("structured error data");
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("database_locked")
+        );
+        assert_eq!(
+            data.get("action").and_then(Value::as_str),
+            Some("retry_after_transient_lock")
+        );
+        let diagnostic = data
+            .get("database_diagnostic")
+            .expect("database diagnostic payload");
+        assert_eq!(
+            diagnostic.get("failure_kind").and_then(Value::as_str),
+            Some("locked_or_busy")
+        );
     }
 
     #[test]
