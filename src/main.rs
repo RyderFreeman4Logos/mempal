@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -4601,8 +4601,49 @@ struct MaintenanceWriterLeaseGuard {
     db_path: PathBuf,
     lease: RuntimeWriterLease,
     active: Arc<std::sync::atomic::AtomicBool>,
+    heartbeat: Mutex<MaintenanceWriterLeaseHeartbeat>,
+}
+
+struct MaintenanceWriterLeaseHeartbeat {
     stop: Option<mpsc::Sender<()>>,
-    heartbeat: Option<std::thread::JoinHandle<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MaintenanceWriterLeaseHeartbeat {
+    fn start_new(
+        db_path: PathBuf,
+        lease: RuntimeWriterLease,
+        active: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let mut heartbeat = Self {
+            stop: None,
+            handle: None,
+        };
+        heartbeat.start(db_path, lease, active);
+        heartbeat
+    }
+
+    fn start(
+        &mut self,
+        db_path: PathBuf,
+        lease: RuntimeWriterLease,
+        active: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        self.stop = Some(stop_tx);
+        self.handle = Some(spawn_maintenance_writer_lease_heartbeat(
+            db_path, lease, active, stop_rx,
+        ));
+    }
+
+    fn stop_and_join(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4651,6 +4692,21 @@ impl MaintenanceWriterLeaseGuard {
         )
     }
 
+    fn restore_active_after_lease_row_recovered(&self) -> Result<()> {
+        let mut heartbeat = self
+            .heartbeat
+            .lock()
+            .map_err(|_| anyhow::anyhow!("writer lease heartbeat state lock poisoned"))?;
+        heartbeat.stop_and_join();
+        self.active.store(true, std::sync::atomic::Ordering::SeqCst);
+        heartbeat.start(
+            self.db_path.clone(),
+            self.lease.clone(),
+            Arc::clone(&self.active),
+        );
+        Ok(())
+    }
+
     fn lease_is_active_once(&self, operation: &'static str) -> Result<bool> {
         let db = Database::open_with_busy_timeout(
             &self.db_path,
@@ -4688,11 +4744,8 @@ fn ensure_maintenance_writer_lease_active(
 
 impl Drop for MaintenanceWriterLeaseGuard {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(handle) = self.heartbeat.take() {
-            let _ = handle.join();
+        if let Ok(mut heartbeat) = self.heartbeat.lock() {
+            heartbeat.stop_and_join();
         }
         if let Ok(db) = Database::open(&self.db_path) {
             let _ = db.runtime_writer_lease_release(
@@ -4866,20 +4919,17 @@ fn try_acquire_named_runtime_writer_lease(
     let Some(lease) = lease else {
         return Ok(None);
     };
-    let (stop_tx, stop_rx) = mpsc::channel();
     let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let heartbeat = spawn_maintenance_writer_lease_heartbeat(
+    let heartbeat = MaintenanceWriterLeaseHeartbeat::start_new(
         db.path().to_path_buf(),
         lease.clone(),
         Arc::clone(&active),
-        stop_rx,
     );
     Ok(Some(MaintenanceWriterLeaseGuard {
         db_path: db.path().to_path_buf(),
         lease,
         active,
-        stop: Some(stop_tx),
-        heartbeat: Some(heartbeat),
+        heartbeat: Mutex::new(heartbeat),
     }))
 }
 
@@ -18792,7 +18842,7 @@ fn historical_rejudge_checkpoint_lease_check(
             Ok(HistoricalRejudgeCheckpointLeaseCheck::Active)
         }
         Ok(MaintenanceWriterLeaseCheck::Lost) => {
-            match historical_rejudge_lost_sqlite_writer_lease_can_defer(db, writer_lease, status) {
+            match historical_rejudge_lost_writer_lease_can_defer(db, writer_lease, status) {
                 Ok(true) => Ok(HistoricalRejudgeCheckpointLeaseCheck::DeferredTransientLock),
                 Ok(false) => writer_lease.bail_lost(operation),
                 Err(error) if is_transient_sqlite_lock_error(&error) => {
@@ -18805,22 +18855,31 @@ fn historical_rejudge_checkpoint_lease_check(
     }
 }
 
-fn historical_rejudge_lost_sqlite_writer_lease_can_defer(
+fn historical_rejudge_lost_writer_lease_can_defer(
     db: &Database,
     writer_lease: &MaintenanceWriterLeaseGuard,
     status: &'static str,
 ) -> Result<bool> {
     let lease = writer_lease.lease();
-    if !historical_rejudge_checkpoint_status_can_defer_lost_sqlite_writer(status)
-        || lease.name != SQLITE_WRITER_LEASE_NAME
-        || lease.mode != "maintenance"
-    {
+    if !historical_rejudge_checkpoint_status_can_defer_lost_sqlite_writer(status) {
         return Ok(false);
     }
-    let active = db
-        .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
-        .context("failed to inspect SQLite writer lease after historical rejudge lease loss")?;
-    sqlite_writer_conflict_is_live_daemon(db, &active)
+    if lease.name == SQLITE_WRITER_LEASE_NAME && lease.mode == "maintenance" {
+        let active = db
+            .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+            .context("failed to inspect SQLite writer lease after historical rejudge lease loss")?;
+        return sqlite_writer_conflict_is_live_daemon(db, &active);
+    }
+    if lease.name == HISTORICAL_REJUDGE_WRITER_LEASE_NAME && lease.mode == "maintenance-rejudge" {
+        let restored = db
+            .runtime_writer_lease_restore_if_unheld(lease, MAINTENANCE_WRITER_LEASE_TTL_SECS)
+            .context("failed to restore historical rejudge writer lease after transient loss")?;
+        if restored {
+            writer_lease.restore_active_after_lease_row_recovered()?;
+        }
+        return Ok(restored);
+    }
+    Ok(false)
 }
 
 fn historical_rejudge_checkpoint_status_can_defer_lost_sqlite_writer(status: &'static str) -> bool {
@@ -29030,7 +29089,55 @@ threshold = 0.7
     }
 
     #[test]
-    fn historical_rejudge_failed_checkpoint_lost_writer_lease_still_fails() {
+    fn historical_rejudge_failed_checkpoint_lost_rejudge_writer_reacquires_when_unheld() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let _daemon_lease = hold_test_daemon_writer_lease(&db);
+        let writer_lease =
+            acquire_historical_rejudge_writer_lease(&db).expect("historical rejudge writer lease");
+        assert_eq!(
+            writer_lease.lease().name,
+            HISTORICAL_REJUDGE_WRITER_LEASE_NAME
+        );
+        let mut checkpoint = historical_rejudge_checkpoint_for_test(
+            &tmp,
+            "lost-rejudge-writer-reacquire-failed-checkpoint-run",
+        );
+        save_historical_rejudge_checkpoint(&db, &checkpoint).expect("save initial checkpoint");
+        release_writer_lease_for_test(&db, &writer_lease);
+
+        let outcome = persist_historical_rejudge_failed_status_checkpoint(
+            &db,
+            &mut checkpoint,
+            Some(&writer_lease),
+        )
+        .expect("lost unheld rejudge writer lease must be recovered and deferred");
+
+        assert_eq!(
+            outcome,
+            HistoricalRejudgeCheckpointPersistence::DeferredTransientLock
+        );
+        assert_eq!(
+            writer_lease
+                .active_status("verify recovered rejudge writer lease")
+                .expect("check recovered writer lease"),
+            MaintenanceWriterLeaseCheck::Active
+        );
+        assert_eq!(
+            checkpoint.status, "running",
+            "deferred failed checkpoint must restore in-memory status for same-page retry"
+        );
+        let persisted = load_historical_rejudge_checkpoint(&db)
+            .expect("load unchanged checkpoint")
+            .expect("checkpoint");
+        assert_eq!(persisted.status, "running");
+        assert_eq!(persisted.last_processed_rowid, Some(2));
+    }
+
+    #[test]
+    fn historical_rejudge_failed_checkpoint_lost_writer_lease_with_competing_holder_still_fails() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -29042,13 +29149,23 @@ threshold = 0.7
             historical_rejudge_checkpoint_for_test(&tmp, "lost-lease-failed-checkpoint-run");
         save_historical_rejudge_checkpoint(&db, &checkpoint).expect("save initial checkpoint");
         release_writer_lease_for_test(&db, &writer_lease);
+        let _competing_lease = db
+            .runtime_writer_lease_acquire(
+                HISTORICAL_REJUDGE_WRITER_LEASE_NAME,
+                "competing-rejudge-writer",
+                "maintenance-rejudge",
+                MAINTENANCE_WRITER_LEASE_TTL_SECS,
+                None,
+            )
+            .expect("acquire competing rejudge writer lease")
+            .expect("competing rejudge writer lease");
 
         let error = persist_historical_rejudge_failed_status_checkpoint(
             &db,
             &mut checkpoint,
             Some(&writer_lease),
         )
-        .expect_err("lost writer lease must remain fatal");
+        .expect_err("lost writer lease with competing holder must remain fatal");
 
         assert_writer_lease_lost_before(&error, "persist failed historical rejudge checkpoint");
         let persisted = load_historical_rejudge_checkpoint(&db)
@@ -29059,7 +29176,8 @@ threshold = 0.7
     }
 
     #[test]
-    fn historical_rejudge_waiting_llm_checkpoint_lost_writer_lease_still_fails() {
+    fn historical_rejudge_waiting_llm_checkpoint_lost_writer_lease_with_competing_holder_still_fails()
+     {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("palace.db");
         let db = Database::open(&db_path).expect("open db");
@@ -29094,6 +29212,16 @@ threshold = 0.7
         };
         save_historical_rejudge_checkpoint(&db, &checkpoint).expect("save initial checkpoint");
         release_writer_lease_for_test(&db, &writer_lease);
+        let _competing_lease = db
+            .runtime_writer_lease_acquire(
+                HISTORICAL_REJUDGE_WRITER_LEASE_NAME,
+                "competing-rejudge-writer",
+                "maintenance-rejudge",
+                MAINTENANCE_WRITER_LEASE_TTL_SECS,
+                None,
+            )
+            .expect("acquire competing rejudge writer lease")
+            .expect("competing rejudge writer lease");
 
         let error = persist_historical_rejudge_llm_retry_status_checkpoint(
             &db,
@@ -29101,7 +29229,7 @@ threshold = 0.7
             "waiting_llm",
             Some(&writer_lease),
         )
-        .expect_err("lost writer lease must remain fatal");
+        .expect_err("lost writer lease with competing holder must remain fatal");
 
         assert_writer_lease_lost_before(&error, "persist historical rejudge LLM retry checkpoint");
         let persisted = load_historical_rejudge_checkpoint(&db)
