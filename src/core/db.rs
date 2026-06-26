@@ -5435,31 +5435,19 @@ impl Database {
     }
 
     pub fn runtime_writer_lease_has_live_daemon(&self, name: &str) -> Result<bool, DbError> {
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
         let mut stmt = self.conn.prepare(
-            "SELECT pid, boot_id, expires_at \
+            "SELECT pid, boot_id \
              FROM runtime_writer_leases \
              WHERE name = ?1 AND mode = 'daemon'",
         )?;
         let rows = stmt.query_map([name], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         for row in rows {
-            let (pid_i64, boot_id, expires_at) = row?;
-            let remaining_secs = crate::cowork::peek::parse_rfc3339(&expires_at)
-                .map(|expires| expires - now_secs)
-                .unwrap_or(0);
-            if remaining_secs > 0
-                && u32::try_from(pid_i64).ok().is_some_and(|pid| {
-                    runtime_writer_process_is_live_holder(pid, boot_id.as_deref())
-                })
+            let (pid_i64, boot_id) = row?;
+            if u32::try_from(pid_i64)
+                .ok()
+                .is_some_and(|pid| runtime_writer_process_is_live_holder(pid, boot_id.as_deref()))
             {
                 return Ok(true);
             }

@@ -23363,6 +23363,27 @@ mod historical_rejudge_tests {
         .expect("daemon writer lease")
     }
 
+    fn expire_writer_lease_for_test(db: &Database, lease: &RuntimeWriterLease) {
+        let expired_at = mempal::cowork::peek::format_rfc3339(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(300),
+        );
+        let heartbeat_at = mempal::cowork::peek::format_rfc3339(std::time::SystemTime::now());
+        db.conn()
+            .execute(
+                "UPDATE runtime_writer_leases \
+                 SET expires_at = ?1, heartbeat_at = ?2 \
+                 WHERE name = ?3 AND owner = ?4 AND session_id = ?5",
+                rusqlite::params![
+                    expired_at,
+                    heartbeat_at,
+                    lease.name,
+                    lease.owner,
+                    lease.session_id
+                ],
+            )
+            .expect("expire writer lease for test");
+    }
+
     fn database_locked_open_error() -> anyhow::Error {
         let sqlite_error = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error {
@@ -25224,6 +25245,7 @@ threshold = 0.7
         let backups = backup_dir(&tmp);
         let progress_path = tmp.path().join("rejudge-progress.jsonl");
         let daemon_lease = hold_test_daemon_writer_lease(&db);
+        expire_writer_lease_for_test(&db, &daemon_lease);
 
         maintenance_rejudge_command(
             &db,
@@ -25269,6 +25291,7 @@ threshold = 0.7
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
         let daemon_lease = hold_test_daemon_writer_lease(&db);
+        expire_writer_lease_for_test(&db, &daemon_lease);
         let _first = acquire_historical_rejudge_writer_lease(&db).expect("first rejudge lease");
 
         let error = match acquire_historical_rejudge_writer_lease(&db) {
