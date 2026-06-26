@@ -18689,13 +18689,20 @@ fn historical_rejudge_lost_sqlite_writer_lease_can_defer(
     status: &'static str,
 ) -> Result<bool> {
     let lease = writer_lease.lease();
-    if status != "failed" || lease.name != SQLITE_WRITER_LEASE_NAME || lease.mode != "maintenance" {
+    if !historical_rejudge_checkpoint_status_can_defer_lost_sqlite_writer(status)
+        || lease.name != SQLITE_WRITER_LEASE_NAME
+        || lease.mode != "maintenance"
+    {
         return Ok(false);
     }
     let active = db
         .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
         .context("failed to inspect SQLite writer lease after historical rejudge lease loss")?;
     sqlite_writer_conflict_is_live_daemon(db, &active)
+}
+
+fn historical_rejudge_checkpoint_status_can_defer_lost_sqlite_writer(status: &'static str) -> bool {
+    matches!(status, "failed" | "waiting_llm" | "running")
 }
 
 fn historical_rejudge_checkpoint_lease_check_outcome(
@@ -28581,6 +28588,51 @@ threshold = 0.7
             checkpoint.status, "running",
             "deferred failed checkpoint must restore in-memory status for same-page retry"
         );
+        assert_eq!(checkpoint.last_processed_rowid, Some(2));
+        let persisted = load_historical_rejudge_checkpoint(&db)
+            .expect("load unchanged checkpoint")
+            .expect("checkpoint");
+        assert_eq!(persisted.status, "running");
+        assert_eq!(persisted.last_processed_rowid, Some(2));
+        assert!(
+            db.runtime_writer_lease_is_active(
+                &daemon_lease.name,
+                &daemon_lease.owner,
+                &daemon_lease.session_id
+            )
+            .expect("check daemon writer lease"),
+            "deferred checkpoint must not disturb the live daemon sqlite-writer lease"
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_waiting_llm_checkpoint_lost_sqlite_writer_to_live_daemon_is_deferred() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let writer_lease =
+            acquire_historical_rejudge_writer_lease(&db).expect("historical rejudge writer lease");
+        assert_eq!(writer_lease.lease().name, SQLITE_WRITER_LEASE_NAME);
+        let mut checkpoint =
+            historical_rejudge_checkpoint_for_test(&tmp, "lost-sqlite-writer-waiting-llm-run");
+        save_historical_rejudge_checkpoint(&db, &checkpoint).expect("save initial checkpoint");
+        release_writer_lease_for_test(&db, &writer_lease);
+        let daemon_lease = hold_test_daemon_writer_lease(&db);
+
+        let outcome = persist_historical_rejudge_llm_retry_status_checkpoint(
+            &db,
+            &mut checkpoint,
+            "waiting_llm",
+            Some(&writer_lease),
+        )
+        .expect("lost sqlite-writer under live daemon must defer LLM retry checkpoint persistence");
+
+        assert_eq!(
+            outcome,
+            HistoricalRejudgeCheckpointPersistence::DeferredTransientLock
+        );
+        assert_eq!(checkpoint.status, "waiting_llm");
         assert_eq!(checkpoint.last_processed_rowid, Some(2));
         let persisted = load_historical_rejudge_checkpoint(&db)
             .expect("load unchanged checkpoint")
