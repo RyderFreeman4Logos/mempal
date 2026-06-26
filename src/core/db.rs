@@ -5384,6 +5384,70 @@ impl Database {
         })
     }
 
+    /// Restore a previously-owned runtime writer lease only when the recorded
+    /// holder is still alive and no holder currently owns the same lease name.
+    ///
+    /// This is a crash-recovery primitive for long maintenance commands whose
+    /// heartbeat lost the row to a transient cleanup race. It deliberately does
+    /// not steal from any visible holder, including expired-but-live holders.
+    pub fn runtime_writer_lease_restore_if_unheld(
+        &self,
+        lease: &RuntimeWriterLease,
+        ttl_secs: u64,
+    ) -> Result<bool, DbError> {
+        let mut restored = false;
+        self.with_immediate_tx(|| {
+            self.runtime_writer_lease_cleanup_expired_tx(true)?;
+            if !runtime_writer_process_is_live_holder(lease.pid, lease.boot_id.as_deref()) {
+                return Ok(());
+            }
+            let same_lease_exists = self.conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM runtime_writer_leases
+                     WHERE name = ?1 AND owner = ?2 AND session_id = ?3
+                 )",
+                params![&lease.name, &lease.owner, &lease.session_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if same_lease_exists != 0 {
+                restored = true;
+                return Ok(());
+            }
+            let holder_count = self.conn.query_row(
+                "SELECT COUNT(*) FROM runtime_writer_leases WHERE name = ?1",
+                params![&lease.name],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if holder_count != 0 {
+                return Ok(());
+            }
+            let now_time = SystemTime::now();
+            let now = crate::cowork::peek::format_rfc3339(now_time);
+            let expires_at = crate::cowork::peek::format_rfc3339(
+                now_time + Duration::from_secs(ttl_secs),
+            );
+            let rows = self.conn.execute(
+                "INSERT OR IGNORE INTO runtime_writer_leases \
+                 (name, owner, pid, boot_id, session_id, acquired_at, expires_at, heartbeat_at, mode, metadata_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6, ?8, ?9)",
+                params![
+                    &lease.name,
+                    &lease.owner,
+                    lease.pid as i64,
+                    &lease.boot_id,
+                    &lease.session_id,
+                    &now,
+                    &expires_at,
+                    &lease.mode,
+                    &lease.metadata_json,
+                ],
+            )?;
+            restored = rows > 0;
+            Ok(())
+        })?;
+        Ok(restored)
+    }
+
     pub fn runtime_writer_lease_status(
         &self,
         name: Option<&str>,

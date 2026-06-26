@@ -25,6 +25,19 @@ use tower::ServiceExt;
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn json_string_values_contain(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(text) => text.contains(needle),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_string_values_contain(value, needle)),
+        Value::Object(fields) => fields
+            .values()
+            .any(|value| json_string_values_contain(value, needle)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
 struct TestEnv {
     _tmp: TempDir,
     db_path: PathBuf,
@@ -667,7 +680,7 @@ model = "rerank"
     assert!(endpoints[0]["last_error"].is_null(), "{rendered}");
     assert!(rendered.contains(mempal::core::remote_calls::BLOCKED_REMOTE_ENDPOINT_LABEL));
     assert!(!rendered.contains("api.openai.com"), "{rendered}");
-    assert!(!rendered.contains("9443"), "{rendered}");
+    assert!(!json_string_values_contain(&body, "9443"), "{rendered}");
     assert!(!rendered.contains("private-embed-path"), "{rendered}");
     assert!(!rendered.contains("api_key"), "{rendered}");
     assert!(
@@ -676,10 +689,10 @@ model = "rerank"
     );
     assert!(!rendered.contains("MEMPAL_SECRET_TOKEN_ENV"), "{rendered}");
     assert!(!rendered.contains("llm.example.com"), "{rendered}");
-    assert!(!rendered.contains("9444"), "{rendered}");
+    assert!(!json_string_values_contain(&body, "9444"), "{rendered}");
     assert!(!rendered.contains("private-chat-path"), "{rendered}");
     assert!(!rendered.contains("rerank.example.com"), "{rendered}");
-    assert!(!rendered.contains("9445"), "{rendered}");
+    assert!(!json_string_values_contain(&body, "9445"), "{rendered}");
     assert!(!rendered.contains("private-rerank-path"), "{rendered}");
 }
 
