@@ -25,6 +25,10 @@ use crate::process_diagnostics::{
 
 const DAEMON_STALL_SECONDS: u64 = 5 * 60;
 const DAEMON_STALL_LOG_THROTTLE_SECONDS: u64 = 60;
+#[cfg(not(test))]
+const DAEMONIZE_READY_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(not(test))]
+const DAEMONIZE_READY_POLL: Duration = Duration::from_millis(50);
 #[cfg(target_os = "linux")]
 const DB_HOLDER_TERM_GRACE: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
@@ -623,9 +627,49 @@ fn perform_daemonize(foreground: bool, mempal_home: &Path, log_path: &Path) -> R
         .umask(0o027)
         .stdout(stdout)
         .stderr(stderr);
-    daemonize.start().context("failed to daemonize process")?;
+
+    match daemonize.execute() {
+        daemonize::Outcome::Child(Ok(_)) => {}
+        daemonize::Outcome::Child(Err(error)) => {
+            return Err(error).context("failed to daemonize process");
+        }
+        daemonize::Outcome::Parent(Ok(parent)) => {
+            if parent.first_child_exit_code == 0 {
+                let pid_path = mempal_home.join("daemon.pid");
+                if wait_for_daemon_pid_file(&pid_path, DAEMONIZE_READY_TIMEOUT) {
+                    std::process::exit(0);
+                }
+                eprintln!(
+                    "daemon did not report ready: {} was not written within {}s",
+                    pid_path.display(),
+                    DAEMONIZE_READY_TIMEOUT.as_secs()
+                );
+                std::process::exit(1);
+            }
+            std::process::exit(parent.first_child_exit_code);
+        }
+        daemonize::Outcome::Parent(Err(error)) => {
+            return Err(error).context("failed to daemonize process");
+        }
+    }
     redirect_stdin_to_dev_null()?;
     Ok(())
+}
+
+#[cfg(not(test))]
+fn wait_for_daemon_pid_file(pid_path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if fs::read_to_string(pid_path)
+            .ok()
+            .and_then(|content| content.trim().parse::<i32>().ok())
+            .is_some_and(|pid| pid > 0)
+        {
+            return true;
+        }
+        std::thread::sleep(DAEMONIZE_READY_POLL);
+    }
+    false
 }
 
 #[cfg(test)]
