@@ -4590,30 +4590,33 @@ struct MaintenanceWriterLeaseGuard {
     heartbeat: Option<std::thread::JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintenanceWriterLeaseCheck {
+    Active,
+    Lost,
+}
+
 impl MaintenanceWriterLeaseGuard {
     fn lease(&self) -> &RuntimeWriterLease {
         &self.lease
     }
 
     fn ensure_active(&self, operation: &'static str) -> Result<()> {
+        match self.active_status(operation)? {
+            MaintenanceWriterLeaseCheck::Active => Ok(()),
+            MaintenanceWriterLeaseCheck::Lost => self.bail_lost(operation),
+        }
+    }
+
+    fn active_status(&self, operation: &'static str) -> Result<MaintenanceWriterLeaseCheck> {
         if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
-            bail!(
-                "SQLite writer lease `{}` for {} was lost before {operation}",
-                self.lease.name,
-                self.lease.owner
-            );
+            return Ok(MaintenanceWriterLeaseCheck::Lost);
         }
         let started = std::time::Instant::now();
         loop {
             match self.lease_is_active_once(operation) {
-                Ok(true) => return Ok(()),
-                Ok(false) => {
-                    bail!(
-                        "SQLite writer lease `{}` for {} was lost before {operation}",
-                        self.lease.name,
-                        self.lease.owner
-                    );
-                }
+                Ok(true) => return Ok(MaintenanceWriterLeaseCheck::Active),
+                Ok(false) => return Ok(MaintenanceWriterLeaseCheck::Lost),
                 Err(error)
                     if is_transient_sqlite_lock_error(&error)
                         && started.elapsed() < MAINTENANCE_WRITER_LEASE_RENEW_RETRY_DEADLINE =>
@@ -4623,6 +4626,14 @@ impl MaintenanceWriterLeaseGuard {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    fn bail_lost<T>(&self, operation: &'static str) -> Result<T> {
+        bail!(
+            "SQLite writer lease `{}` for {} was lost before {operation}",
+            self.lease.name,
+            self.lease.owner
+        )
     }
 
     fn lease_is_active_once(&self, operation: &'static str) -> Result<bool> {
@@ -18593,10 +18604,7 @@ fn save_historical_rejudge_checkpoint_with_writer_lease_outcome(
     operation: &'static str,
     status: &'static str,
 ) -> Result<HistoricalRejudgeCheckpointPersistence> {
-    match historical_rejudge_checkpoint_lease_check_outcome(
-        ensure_maintenance_writer_lease_active(writer_lease, operation),
-        status,
-    )? {
+    match historical_rejudge_checkpoint_lease_check(db, writer_lease, operation, status)? {
         HistoricalRejudgeCheckpointLeaseCheck::Active => {}
         HistoricalRejudgeCheckpointLeaseCheck::DeferredTransientLock => {
             return Ok(HistoricalRejudgeCheckpointPersistence::DeferredTransientLock);
@@ -18646,6 +18654,48 @@ fn persist_historical_rejudge_failed_status_checkpoint(
         checkpoint.updated_at = previous_updated_at;
     }
     Ok(outcome)
+}
+
+fn historical_rejudge_checkpoint_lease_check(
+    db: &Database,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
+    operation: &'static str,
+    status: &'static str,
+) -> Result<HistoricalRejudgeCheckpointLeaseCheck> {
+    let Some(writer_lease) = writer_lease else {
+        return Ok(HistoricalRejudgeCheckpointLeaseCheck::Active);
+    };
+    match writer_lease.active_status(operation) {
+        Ok(MaintenanceWriterLeaseCheck::Active) => {
+            Ok(HistoricalRejudgeCheckpointLeaseCheck::Active)
+        }
+        Ok(MaintenanceWriterLeaseCheck::Lost) => {
+            match historical_rejudge_lost_sqlite_writer_lease_can_defer(db, writer_lease, status) {
+                Ok(true) => Ok(HistoricalRejudgeCheckpointLeaseCheck::DeferredTransientLock),
+                Ok(false) => writer_lease.bail_lost(operation),
+                Err(error) if is_transient_sqlite_lock_error(&error) => {
+                    Ok(HistoricalRejudgeCheckpointLeaseCheck::DeferredTransientLock)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => historical_rejudge_checkpoint_lease_check_outcome(Err(error), status),
+    }
+}
+
+fn historical_rejudge_lost_sqlite_writer_lease_can_defer(
+    db: &Database,
+    writer_lease: &MaintenanceWriterLeaseGuard,
+    status: &'static str,
+) -> Result<bool> {
+    let lease = writer_lease.lease();
+    if status != "failed" || lease.name != SQLITE_WRITER_LEASE_NAME || lease.mode != "maintenance" {
+        return Ok(false);
+    }
+    let active = db
+        .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+        .context("failed to inspect SQLite writer lease after historical rejudge lease loss")?;
+    sqlite_writer_conflict_is_live_daemon(db, &active)
 }
 
 fn historical_rejudge_checkpoint_lease_check_outcome(
@@ -28499,6 +28549,53 @@ threshold = 0.7
             .expect("checkpoint");
         assert_eq!(persisted.status, "failed");
         assert_eq!(persisted.last_processed_rowid, Some(2));
+    }
+
+    #[test]
+    fn historical_rejudge_failed_checkpoint_lost_sqlite_writer_to_live_daemon_is_deferred() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        let db = Database::open(&db_path).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let writer_lease =
+            acquire_historical_rejudge_writer_lease(&db).expect("historical rejudge writer lease");
+        assert_eq!(writer_lease.lease().name, SQLITE_WRITER_LEASE_NAME);
+        let mut checkpoint =
+            historical_rejudge_checkpoint_for_test(&tmp, "lost-sqlite-writer-live-daemon-run");
+        save_historical_rejudge_checkpoint(&db, &checkpoint).expect("save initial checkpoint");
+        release_writer_lease_for_test(&db, &writer_lease);
+        let daemon_lease = hold_test_daemon_writer_lease(&db);
+
+        let outcome = persist_historical_rejudge_failed_status_checkpoint(
+            &db,
+            &mut checkpoint,
+            Some(&writer_lease),
+        )
+        .expect("lost sqlite-writer under live daemon must defer failed checkpoint persistence");
+
+        assert_eq!(
+            outcome,
+            HistoricalRejudgeCheckpointPersistence::DeferredTransientLock
+        );
+        assert_eq!(
+            checkpoint.status, "running",
+            "deferred failed checkpoint must restore in-memory status for same-page retry"
+        );
+        assert_eq!(checkpoint.last_processed_rowid, Some(2));
+        let persisted = load_historical_rejudge_checkpoint(&db)
+            .expect("load unchanged checkpoint")
+            .expect("checkpoint");
+        assert_eq!(persisted.status, "running");
+        assert_eq!(persisted.last_processed_rowid, Some(2));
+        assert!(
+            db.runtime_writer_lease_is_active(
+                &daemon_lease.name,
+                &daemon_lease.owner,
+                &daemon_lease.session_id
+            )
+            .expect("check daemon writer lease"),
+            "deferred checkpoint must not disturb the live daemon sqlite-writer lease"
+        );
     }
 
     #[test]
