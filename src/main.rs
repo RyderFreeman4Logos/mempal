@@ -8,7 +8,7 @@ use std::sync::{Arc, mpsc};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::StreamExt;
 use mempal::aaak::{AaakCodec, AaakMeta};
 use mempal::adoption_analytics::build_runtime_adoption_analytics;
 #[cfg(feature = "rest")]
@@ -3052,6 +3052,21 @@ struct PreparedHistoricalRejudgeWorkItem {
     decision: Option<HistoricalRejudgeDecision>,
     backup_item: Option<HistoricalRejudgeBackupItem>,
     terminal_decision: Option<&'static str>,
+}
+
+struct HistoricalRejudgePreparedPage {
+    prepared: Vec<PreparedHistoricalRejudgeWorkItem>,
+    error: Option<anyhow::Error>,
+}
+
+#[cfg(test)]
+impl HistoricalRejudgePreparedPage {
+    fn into_result(self) -> Result<Vec<PreparedHistoricalRejudgeWorkItem>> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.prepared),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -17729,7 +17744,7 @@ async fn process_historical_rejudge_work_page_with_concurrency(
     context: HistoricalRejudgeWorkContext<'_>,
     llm_concurrency: usize,
 ) -> Result<()> {
-    let prepared = prepare_historical_rejudge_work_page(
+    let prepared_page = prepare_historical_rejudge_work_page_partial(
         db,
         config,
         page,
@@ -17738,63 +17753,170 @@ async fn process_historical_rejudge_work_page_with_concurrency(
         options.stage_mode,
     )
     .await?;
-    process_prepared_historical_rejudge_work_items(
+    process_historical_rejudge_prepared_page(
         db,
         options,
         checkpoint,
-        &prepared,
+        prepared_page,
         context.writer_lease,
     )
 }
 
-async fn prepare_historical_rejudge_work_page(
+fn process_historical_rejudge_prepared_page(
+    db: &Database,
+    options: HistoricalRejudgeOptions<'_>,
+    checkpoint: &mut HistoricalRejudgeCheckpoint,
+    prepared_page: HistoricalRejudgePreparedPage,
+    writer_lease: Option<&MaintenanceWriterLeaseGuard>,
+) -> Result<()> {
+    let HistoricalRejudgePreparedPage { prepared, error } = prepared_page;
+    if let Some(error) = error {
+        if is_retryable_historical_llm_error(&error) && !prepared.is_empty() {
+            process_prepared_historical_rejudge_work_items(
+                db,
+                options,
+                checkpoint,
+                &prepared,
+                writer_lease,
+            )?;
+        }
+        return Err(error);
+    }
+    process_prepared_historical_rejudge_work_items(db, options, checkpoint, &prepared, writer_lease)
+}
+
+async fn prepare_historical_rejudge_work_page_partial(
     db: &Database,
     config: &Config,
     page: &[HistoricalRejudgeWorkItem],
     context: HistoricalRejudgeWorkContext<'_>,
     llm_concurrency: usize,
     stage_mode: HistoricalRejudgeStageMode,
-) -> Result<Vec<PreparedHistoricalRejudgeWorkItem>> {
-    prepare_historical_rejudge_work_page_with(page, llm_concurrency, |work_item| {
+) -> Result<HistoricalRejudgePreparedPage> {
+    prepare_historical_rejudge_work_page_partial_with(page, llm_concurrency, |work_item| {
         prepare_historical_rejudge_work_item(db, config, work_item, context, stage_mode)
     })
     .await
 }
 
+#[cfg(test)]
 async fn prepare_historical_rejudge_work_page_with<'a, F, Fut>(
     page: &'a [HistoricalRejudgeWorkItem],
     llm_concurrency: usize,
     prepare: F,
 ) -> Result<Vec<PreparedHistoricalRejudgeWorkItem>>
 where
-    F: Fn(&'a HistoricalRejudgeWorkItem) -> Fut,
+    F: Fn(&'a HistoricalRejudgeWorkItem) -> Fut + 'a,
+    Fut: Future<Output = Result<PreparedHistoricalRejudgeWorkItem>> + 'a,
+{
+    prepare_historical_rejudge_work_page_partial_with(page, llm_concurrency, prepare)
+        .await?
+        .into_result()
+}
+
+async fn prepare_historical_rejudge_work_page_partial_with<'a, F, Fut>(
+    page: &'a [HistoricalRejudgeWorkItem],
+    llm_concurrency: usize,
+    prepare: F,
+) -> Result<HistoricalRejudgePreparedPage>
+where
+    F: Fn(&'a HistoricalRejudgeWorkItem) -> Fut + 'a,
     Fut: Future<Output = Result<PreparedHistoricalRejudgeWorkItem>> + 'a,
 {
     if llm_concurrency == 0 {
         bail!("--llm-concurrency must be greater than zero");
     }
     if page.is_empty() {
-        return Ok(Vec::new());
+        return Ok(HistoricalRejudgePreparedPage {
+            prepared: Vec::new(),
+            error: None,
+        });
     }
     if llm_concurrency == 1 {
         let mut prepared = Vec::with_capacity(page.len());
         for work_item in page {
-            prepared.push(prepare(work_item).await?);
+            match prepare(work_item).await {
+                Ok(item) => prepared.push(item),
+                Err(error) => {
+                    return Ok(HistoricalRejudgePreparedPage {
+                        prepared,
+                        error: Some(error),
+                    });
+                }
+            }
         }
-        return Ok(prepared);
+        return Ok(HistoricalRejudgePreparedPage {
+            prepared,
+            error: None,
+        });
     }
 
-    let prepare = &prepare;
-    let mut prepared = stream::iter(page.iter().enumerate())
-        .map(|(index, work_item)| {
-            let future = prepare(work_item);
-            async move { future.await.map(|prepared| (index, prepared)) }
-        })
-        .buffer_unordered(llm_concurrency.min(page.len()))
-        .try_collect::<Vec<_>>()
-        .await?;
+    let max_in_flight = llm_concurrency.min(page.len());
+    let prepare = std::rc::Rc::new(prepare);
+    let mut next_index = 0;
+    let mut in_flight = futures::stream::FuturesUnordered::new();
+    while next_index < page.len() && in_flight.len() < max_in_flight {
+        in_flight.push(prepare_indexed_historical_rejudge_work_item(
+            std::rc::Rc::clone(&prepare),
+            next_index,
+            page,
+        ));
+        next_index += 1;
+    }
+
+    let mut prepared = Vec::with_capacity(page.len());
+    let mut error = None;
+    while let Some(result) = in_flight.next().await {
+        match result {
+            Ok(item) => prepared.push(item),
+            Err(item_error) => {
+                record_historical_rejudge_prepare_error(&mut error, item_error);
+            }
+        }
+        if error.is_none() && next_index < page.len() {
+            in_flight.push(prepare_indexed_historical_rejudge_work_item(
+                std::rc::Rc::clone(&prepare),
+                next_index,
+                page,
+            ));
+            next_index += 1;
+        }
+    }
     prepared.sort_by_key(|(index, _)| *index);
-    Ok(prepared.into_iter().map(|(_, prepared)| prepared).collect())
+    Ok(HistoricalRejudgePreparedPage {
+        prepared: prepared.into_iter().map(|(_, prepared)| prepared).collect(),
+        error,
+    })
+}
+
+fn record_historical_rejudge_prepare_error(
+    error: &mut Option<anyhow::Error>,
+    item_error: anyhow::Error,
+) {
+    let should_replace = match error.as_ref() {
+        None => true,
+        Some(existing) => {
+            is_retryable_historical_llm_error(existing)
+                && !is_retryable_historical_llm_error(&item_error)
+        }
+    };
+    if should_replace {
+        *error = Some(item_error);
+    }
+}
+
+async fn prepare_indexed_historical_rejudge_work_item<'a, F, Fut>(
+    prepare: std::rc::Rc<F>,
+    index: usize,
+    page: &'a [HistoricalRejudgeWorkItem],
+) -> Result<(usize, PreparedHistoricalRejudgeWorkItem)>
+where
+    F: Fn(&'a HistoricalRejudgeWorkItem) -> Fut + 'a,
+    Fut: Future<Output = Result<PreparedHistoricalRejudgeWorkItem>> + 'a,
+{
+    prepare(&page[index])
+        .await
+        .map(|prepared| (index, prepared))
 }
 
 async fn prepare_historical_rejudge_work_item(
@@ -24434,6 +24556,263 @@ threshold = 0.7
                 .map(|item| item.work_item.drawer_rowid)
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_parallel_prepare_waits_for_in_flight_work_before_retryable_error() {
+        let page = (1..=3)
+            .map(|rowid| test_historical_rejudge_work_item("parallel-retry-run", rowid))
+            .collect::<Vec<_>>();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let result = prepare_historical_rejudge_work_page_with(&page, 3, |work_item| {
+            let completed = std::sync::Arc::clone(&completed);
+            async move {
+                match work_item.drawer_rowid {
+                    1 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        Err(anyhow::Error::new(LlmError::TemporarilyUnavailable {
+                            retry_after: std::time::Duration::from_millis(1),
+                            reason: "test retryable endpoint backoff".to_string(),
+                        }))
+                    }
+                    _ => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(terminal_prepared_historical_rejudge_work_item(work_item))
+                    }
+                }
+            }
+        })
+        .await;
+        let error = match result {
+            Ok(_) => panic!("retryable LLM failure should still fail the page"),
+            Err(error) => error,
+        };
+
+        assert!(is_retryable_historical_llm_error(&error));
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "retryable LLM failure must not cancel unrelated in-flight LLM work"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_parallel_prepare_returns_successes_with_retryable_error() {
+        let page = (1..=4)
+            .map(|rowid| test_historical_rejudge_work_item("parallel-partial-run", rowid))
+            .collect::<Vec<_>>();
+
+        let prepared_page =
+            prepare_historical_rejudge_work_page_partial_with(&page, 4, |work_item| async move {
+                if work_item.drawer_rowid == 2 {
+                    return Err(anyhow::Error::new(LlmError::TemporarilyUnavailable {
+                        retry_after: std::time::Duration::from_millis(1),
+                        reason: "test retryable endpoint backoff".to_string(),
+                    }));
+                }
+                Ok(terminal_prepared_historical_rejudge_work_item(work_item))
+            })
+            .await
+            .expect("partial prepare");
+
+        let error = prepared_page
+            .error
+            .expect("retryable LLM error should be preserved");
+        assert!(is_retryable_historical_llm_error(&error));
+        assert_eq!(
+            prepared_page
+                .prepared
+                .iter()
+                .map(|item| item.work_item.drawer_rowid)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_parallel_prepare_non_retryable_error_overrides_retryable_error() {
+        let page = (1..=3)
+            .map(|rowid| test_historical_rejudge_work_item("parallel-fatal-run", rowid))
+            .collect::<Vec<_>>();
+
+        let prepared_page =
+            prepare_historical_rejudge_work_page_partial_with(&page, 3, |work_item| async move {
+                match work_item.drawer_rowid {
+                    1 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        Err(anyhow::Error::new(LlmError::TemporarilyUnavailable {
+                            retry_after: std::time::Duration::from_millis(1),
+                            reason: "test retryable endpoint backoff".to_string(),
+                        }))
+                    }
+                    2 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Err(anyhow::Error::new(LlmError::DecodeResponse(
+                            "test permanent decode failure".to_string(),
+                        )))
+                    }
+                    _ => Ok(terminal_prepared_historical_rejudge_work_item(work_item)),
+                }
+            })
+            .await
+            .expect("partial prepare");
+
+        let error = prepared_page
+            .error
+            .expect("non-retryable LLM error should be preserved");
+        assert!(
+            !is_retryable_historical_llm_error(&error),
+            "later non-retryable in-flight errors must not be masked by earlier retryable errors"
+        );
+        assert!(matches!(
+            error.downcast_ref::<LlmError>(),
+            Some(LlmError::DecodeResponse(message)) if message == "test permanent decode failure"
+        ));
+        assert_eq!(
+            prepared_page
+                .prepared
+                .iter()
+                .map(|item| item.work_item.drawer_rowid)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_parallel_prepare_stops_scheduling_after_retryable_error() {
+        let page = (1..=5)
+            .map(|rowid| test_historical_rejudge_work_item("parallel-stop-run", rowid))
+            .collect::<Vec<_>>();
+        let started = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let prepared_page =
+            prepare_historical_rejudge_work_page_partial_with(&page, 2, |work_item| {
+                let started = std::sync::Arc::clone(&started);
+                async move {
+                    {
+                        started
+                            .lock()
+                            .expect("started lock")
+                            .push(work_item.drawer_rowid);
+                    }
+                    match work_item.drawer_rowid {
+                        1 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            Err(anyhow::Error::new(LlmError::TemporarilyUnavailable {
+                                retry_after: std::time::Duration::from_millis(1),
+                                reason: "test retryable endpoint backoff".to_string(),
+                            }))
+                        }
+                        2 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            Ok(terminal_prepared_historical_rejudge_work_item(work_item))
+                        }
+                        rowid => panic!("queued rowid {rowid} should not start after first error"),
+                    }
+                }
+            })
+            .await
+            .expect("partial prepare");
+
+        let error = prepared_page
+            .error
+            .expect("retryable LLM error should be preserved");
+        assert!(is_retryable_historical_llm_error(&error));
+        assert_eq!(
+            prepared_page
+                .prepared
+                .iter()
+                .map(|item| item.work_item.drawer_rowid)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        let mut started = started.lock().expect("started lock").clone();
+        started.sort_unstable();
+        assert_eq!(started, vec![1, 2]);
+    }
+
+    #[test]
+    fn historical_rejudge_retryable_partial_page_marks_successful_work_items_processed() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        ensure_historical_rejudge_checkpoint_storage(&db).expect("ensure checkpoint storage");
+        let run_id = "parallel-partial-process-run";
+        let page = (1..=4)
+            .map(|rowid| test_historical_rejudge_work_item(run_id, rowid))
+            .collect::<Vec<_>>();
+        for item in &page {
+            insert_test_historical_rejudge_work_item(&db, item);
+        }
+        let prepared = [0_usize, 2, 3]
+            .into_iter()
+            .map(|index| terminal_prepared_historical_rejudge_work_item(&page[index]))
+            .collect::<Vec<_>>();
+        let mut checkpoint = HistoricalRejudgeCheckpoint {
+            run_id: run_id.to_string(),
+            status: "running".to_string(),
+            options_hash: "hash".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            snapshot_max_rowid: 4,
+            snapshot_count: 4,
+            last_processed_rowid: None,
+            scanned_count: 0,
+            candidate_count: 0,
+            kept_count: 0,
+            protected_count: 0,
+            mutated_count: 0,
+            estimated_bytes_reclaimed: 0,
+            mutation: "soft_delete".to_string(),
+            page_size: 4,
+            judge_model: Some("test".to_string()),
+            config_version: "cfg".to_string(),
+            backup_path: None,
+        };
+
+        let error = process_historical_rejudge_prepared_page(
+            &db,
+            full_rejudge_options(true, None, 4),
+            &mut checkpoint,
+            HistoricalRejudgePreparedPage {
+                prepared,
+                error: Some(anyhow::Error::new(LlmError::TemporarilyUnavailable {
+                    retry_after: std::time::Duration::from_millis(1),
+                    reason: "test retryable endpoint backoff".to_string(),
+                })),
+            },
+            None,
+        )
+        .expect_err("retryable error should still make caller retry remaining work");
+
+        assert!(is_retryable_historical_llm_error(&error));
+        assert_eq!(checkpoint.scanned_count, 3);
+        assert_eq!(checkpoint.last_processed_rowid, Some(4));
+        assert_eq!(
+            (1..=4)
+                .map(|rowid| historical_rejudge_work_item_decision(&db, run_id, rowid))
+                .collect::<Vec<_>>(),
+            vec![
+                Some("missing".to_string()),
+                None,
+                Some("missing".to_string()),
+                Some("missing".to_string()),
+            ]
+        );
+        assert_eq!(
+            next_historical_rejudge_work_items_for_stage(
+                &db,
+                run_id,
+                10,
+                HistoricalRejudgeStageMode::Paired,
+            )
+            .expect("load pending work")
+            .into_iter()
+            .map(|item| item.drawer_rowid)
+            .collect::<Vec<_>>(),
+            vec![2]
         );
     }
 
