@@ -266,11 +266,15 @@ pub fn rusqlite_error_is_lock(error: &rusqlite::Error) -> bool {
         rusqlite::Error::SqliteFailure(sqlite, _)
             if matches!(
                 sqlite.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::FileLockingProtocolFailed
             )
                 || matches!(
                     sqlite.extended_code & 0xff,
-                    rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED
+                    rusqlite::ffi::SQLITE_BUSY
+                        | rusqlite::ffi::SQLITE_LOCKED
+                        | rusqlite::ffi::SQLITE_PROTOCOL
                 )
     )
 }
@@ -7634,6 +7638,26 @@ fn segment_cjk_query(query: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_protocol_is_classified_as_transient_lock() {
+        let protocol_error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::FileLockingProtocolFailed,
+                extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
+            },
+            Some("Database lock protocol error".to_string()),
+        );
+
+        assert!(
+            rusqlite_error_is_lock(&protocol_error),
+            "SQLITE_PROTOCOL is a transient lock-protocol collision and must be retried"
+        );
+        assert!(
+            db_error_is_sqlite_lock(&DbError::from(protocol_error)),
+            "DbError classification must preserve SQLITE_PROTOCOL as a transient lock"
+        );
+    }
 
     fn test_drawer(id: &str, content: &str) -> Drawer {
         Drawer::new_bootstrap_evidence(super::super::types::BootstrapEvidenceArgs {

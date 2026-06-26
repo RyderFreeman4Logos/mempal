@@ -19005,10 +19005,12 @@ fn is_transient_sqlite_lock_code(sqlite_error: &rusqlite::ffi::Error) -> bool {
     let primary_code = sqlite_error.extended_code & 0xff;
     matches!(
         sqlite_error.code,
-        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            | rusqlite::ErrorCode::FileLockingProtocolFailed
     ) || matches!(
         primary_code,
-        rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED
+        rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED | rusqlite::ffi::SQLITE_PROTOCOL
     )
 }
 
@@ -29352,6 +29354,24 @@ threshold = 0.7
         assert_eq!(decision.score, Some(0.125));
         assert_eq!(decision.tier, 3);
         assert_eq!(decision.judge, "llm");
+    }
+
+    #[test]
+    fn historical_rejudge_treats_sqlite_protocol_as_transient_lock() {
+        let protocol_error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::FileLockingProtocolFailed,
+                extended_code: rusqlite::ffi::SQLITE_PROTOCOL,
+            },
+            Some("Database lock protocol error".to_string()),
+        );
+        let error = anyhow::Error::new(mempal::core::db::DbError::from(protocol_error))
+            .context("failed to load historical rejudge work item test-drawer");
+
+        assert!(
+            is_transient_sqlite_lock_error(&error),
+            "historical rejudge page errors caused by SQLITE_PROTOCOL must defer/retry instead of failing the run: {error:#}"
+        );
     }
 
     #[test]
