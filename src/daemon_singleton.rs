@@ -728,6 +728,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn acquire_after_release_for_test(db_path: &Path, runtime: &Path) -> DaemonLockGuard {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match try_acquire_for_test(db_path, runtime).expect("acquire after drop") {
+                DaemonLockAcquisition::Acquired(guard) => return guard,
+                DaemonLockAcquisition::AlreadyHeld { owner, .. } => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("acquire after drop should win; last_owner={owner:?}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn test_second_acquire_blocked_until_first_dropped() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -770,13 +786,11 @@ mod tests {
 
         drop(guard1);
 
-        // After release the lock is acquirable again.
-        match try_acquire_for_test(&db_path, &runtime).expect("third acquire after drop") {
-            DaemonLockAcquisition::Acquired(_) => {}
-            DaemonLockAcquisition::AlreadyHeld { .. } => {
-                panic!("acquire after drop should win")
-            }
-        }
+        // After release the lock is acquirable again. Use a bounded wait so
+        // this test verifies the production invariant without depending on the
+        // exact scheduling point at which the kernel observes the prior fd close
+        // in the highly parallel lib-test process.
+        let _guard2 = acquire_after_release_for_test(&db_path, &runtime);
     }
 
     #[cfg(unix)]

@@ -11,7 +11,7 @@ use std::{
 use crate::core::{
     anchor,
     config::ConfigHandle,
-    db::{Database, DbError},
+    db::{Database, DbError, db_error_is_sqlite_lock},
     project::{ProjectSearchScope, resolve_project_id},
     remote_calls::{
         RemoteCallService, blocked_remote_endpoint_error, endpoint_policy_display_label,
@@ -56,6 +56,7 @@ const HERMES_COMPAT_VERSION: &str = "mempal-hermes-compat/1";
 const REST_SEARCH_WARNING_HEADER: &str = "mempal-warnings";
 const STATUS_DB_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(1);
 const REST_WRITE_RESTART_HINT: &str = "Restart the mempal daemon after upgrading so REST writes use a binary that supports this palace.db schema.";
+const REST_WRITE_DATABASE_BUSY_HINT: &str = "SQLite is temporarily locked by another writer; retry after the current write or maintenance job releases palace.db.";
 static REST_WRITE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub async fn serve(listener: tokio::net::TcpListener, state: ApiState) -> std::io::Result<()> {
@@ -1261,7 +1262,7 @@ async fn process_ingest_request(
         );
         let drawer_id = db
             .resolve_available_drawer_id(&preferred_drawer_id)
-            .map_err(internal_error)?;
+            .map_err(db_error_to_api_error)?;
         if !raw_turn
             && let Some(outcome) = evaluate_fact_check_gate(
                 &drawer_id,
@@ -1271,7 +1272,7 @@ async fn process_ingest_request(
                 &config.ingest_gating.fact_check,
                 validated.confidence,
             )
-            .map_err(internal_error)?
+            .map_err(db_error_to_api_error)?
         {
             fact_check_warnings.extend(outcome.warnings);
             if outcome.decision.is_rejected() {
@@ -1334,7 +1335,7 @@ async fn process_ingest_request(
         let drawer_exists = *exact_duplicate
             || db
                 .drawer_exists(drawer_id.as_str())
-                .map_err(internal_error)?;
+                .map_err(db_error_to_api_error)?;
 
         if !drawer_exists {
             let source_file = source_file_or_synthetic(drawer_id, request.source.as_deref());
@@ -1395,9 +1396,9 @@ async fn process_ingest_request(
                 request.valid_from.as_deref(),
                 request.valid_until.as_deref(),
             )
-            .map_err(internal_error)?;
+            .map_err(db_error_to_api_error)?;
             db.insert_vector_with_project(drawer_id, vector, project_id.as_deref())
-                .map_err(internal_error)?;
+                .map_err(db_error_to_api_error)?;
         }
         drawer_ids.push(drawer_id.clone());
     }
@@ -1435,10 +1436,10 @@ async fn pinned_facts_handler(
     };
     let limit = query.limit.unwrap_or(50).min(500);
     let budget_chars = limit * 2000;
-    let db = Database::open(&state.db_path).map_err(internal_error)?;
+    let db = Database::open(&state.db_path).map_err(db_error_to_api_error)?;
     let drawers = db
         .get_pinned_facts(project_id.as_deref(), budget_chars)
-        .map_err(internal_error)?;
+        .map_err(db_error_to_api_error)?;
     let facts = drawers
         .into_iter()
         .filter(|d| {
@@ -1476,10 +1477,10 @@ async fn pinned_facts_handler(
 async fn taxonomy_handler(
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<TaxonomyEntryDto>>, ApiError> {
-    let db = Database::open(&state.db_path).map_err(internal_error)?;
+    let db = Database::open(&state.db_path).map_err(db_error_to_api_error)?;
     let entries = db
         .taxonomy_entries()
-        .map_err(internal_error)?
+        .map_err(db_error_to_api_error)?
         .into_iter()
         .map(TaxonomyEntryDto::from)
         .collect();
@@ -1680,6 +1681,7 @@ struct ApiError {
     kind: &'static str,
     schema_skew: Option<SchemaSkew>,
     recovery_hint: Option<&'static str>,
+    retryable: Option<bool>,
 }
 
 impl ApiError {
@@ -1690,6 +1692,7 @@ impl ApiError {
             kind: "http_error",
             schema_skew: None,
             recovery_hint: None,
+            retryable: None,
         }
     }
 
@@ -1702,6 +1705,7 @@ impl ApiError {
             kind: "schema_skew",
             schema_skew: Some(SchemaSkew { current, supported }),
             recovery_hint: Some(REST_WRITE_RESTART_HINT),
+            retryable: Some(false),
         }
     }
 
@@ -1712,6 +1716,18 @@ impl ApiError {
             kind: "stale_daemon",
             schema_skew: None,
             recovery_hint: Some(REST_WRITE_RESTART_HINT),
+            retryable: Some(false),
+        }
+    }
+
+    fn database_busy() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "SQLite database is temporarily busy; retry the mempal write after the active writer completes".to_string(),
+            kind: "database_busy",
+            schema_skew: None,
+            recovery_hint: Some(REST_WRITE_DATABASE_BUSY_HINT),
+            retryable: Some(true),
         }
     }
 }
@@ -1735,6 +1751,9 @@ impl IntoResponse for ApiError {
         }
         if let Some(recovery_hint) = self.recovery_hint {
             error["recovery_hint"] = json!(recovery_hint);
+        }
+        if let Some(retryable) = self.retryable {
+            error["retryable"] = json!(retryable);
         }
         (
             self.status,
@@ -1967,6 +1986,7 @@ fn log_rest_write_failure(metadata: &RestWriteLogMetadata, error: &ApiError) {
         content_hash_prefix = %metadata.content_hash_prefix,
         http_status = error.status.as_u16(),
         error_kind = error.kind,
+        retryable = error.retryable.unwrap_or(false),
         schema_version = schema_current,
         supported_schema_version = schema_supported,
         stale_binary = current_executable_deleted(),
@@ -1980,6 +2000,7 @@ fn db_error_to_api_error(error: DbError) -> ApiError {
         DbError::UnsupportedSchemaVersion { current, supported } => {
             ApiError::schema_skew(current, supported)
         }
+        other if db_error_is_sqlite_lock(&other) => ApiError::database_busy(),
         other => internal_error(other),
     }
 }
@@ -2000,7 +2021,7 @@ fn replacement_error(error: crate::core::db::DbError) -> ApiError {
         | crate::core::db::DbError::ReplacementTextAmbiguous { .. } => {
             ApiError::new(StatusCode::BAD_REQUEST, error.to_string())
         }
-        _ => internal_error(error),
+        _ => db_error_to_api_error(error),
     }
 }
 
@@ -2014,7 +2035,7 @@ fn exact_duplicate_drawer_id(
 ) -> Result<Option<String>, ApiError> {
     Ok(db
         .find_active_drawers_by_content(content, wing, room, project_id)
-        .map_err(internal_error)?
+        .map_err(db_error_to_api_error)?
         .into_iter()
         .find(|summary| Some(summary.id.as_str()) != excluded_drawer_id)
         .map(|summary| summary.id))
@@ -2022,7 +2043,7 @@ fn exact_duplicate_drawer_id(
 
 fn supersede_drawer_for_ingest(db: &Database, old_id: &str, new_id: &str) -> Result<(), ApiError> {
     db.supersede_drawer(old_id, &format!("replaced by {new_id}"))
-        .map_err(internal_error)?;
+        .map_err(db_error_to_api_error)?;
     Ok(())
 }
 
@@ -2080,5 +2101,69 @@ impl From<TaxonomyEntry> for TaxonomyEntryDto {
             display_name: value.display_name,
             keywords: value.keywords,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_lock_error(code: rusqlite::ErrorCode, extended_code: i32) -> DbError {
+        DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code,
+            },
+            Some("database is locked".to_string()),
+        ))
+    }
+
+    #[test]
+    fn sqlite_busy_maps_to_retryable_503() {
+        let error = db_error_to_api_error(sqlite_lock_error(
+            rusqlite::ErrorCode::DatabaseBusy,
+            rusqlite::ffi::SQLITE_BUSY,
+        ));
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.kind, "database_busy");
+        assert_eq!(error.retryable, Some(true));
+        assert_eq!(error.recovery_hint, Some(REST_WRITE_DATABASE_BUSY_HINT));
+    }
+
+    #[test]
+    fn sqlite_protocol_maps_to_retryable_503() {
+        let error = db_error_to_api_error(sqlite_lock_error(
+            rusqlite::ErrorCode::FileLockingProtocolFailed,
+            rusqlite::ffi::SQLITE_PROTOCOL,
+        ));
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.kind, "database_busy");
+        assert_eq!(error.retryable, Some(true));
+    }
+
+    #[tokio::test]
+    async fn sqlite_busy_response_body_is_retryable_non_500() {
+        let response = db_error_to_api_error(sqlite_lock_error(
+            rusqlite::ErrorCode::DatabaseLocked,
+            rusqlite::ffi::SQLITE_LOCKED,
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(body["error"]["kind"], "database_busy");
+        assert_eq!(body["error"]["retryable"], true);
+        assert_ne!(body["error"]["status"], 500);
+        assert!(
+            body["error"]["recovery_hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("retry")),
+            "body={body}"
+        );
     }
 }
