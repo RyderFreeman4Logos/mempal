@@ -1,3 +1,12 @@
+mod operation_telemetry;
+
+pub use operation_telemetry::{
+    OperationTelemetryFormat, OperationTelemetryIo, OperationTelemetryRecord,
+    OperationTelemetrySource, OperationTelemetrySpan, OperationTelemetrySummaryOptions,
+    OperationTelemetrySummaryRow, operation_telemetry_summary, record_operation_telemetry,
+    render_operation_telemetry_summary,
+};
+
 use std::env;
 use std::ffi::OsStr;
 use std::io::{self, Write};

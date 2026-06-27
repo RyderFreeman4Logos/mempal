@@ -37,6 +37,14 @@ pub enum ForesightCommands {
     },
 }
 
+pub fn command_uses_read_only_database(command: &ForesightCommands) -> bool {
+    matches!(command, ForesightCommands::List(_)) || command_is_dry_run(command)
+}
+
+pub fn command_is_dry_run(command: &ForesightCommands) -> bool {
+    matches!(command, ForesightCommands::Add(args) if args.dry_run)
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct ForesightAddArgs {
     /// Future check or risk statement.

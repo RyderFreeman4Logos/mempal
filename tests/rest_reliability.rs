@@ -18,6 +18,7 @@ use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use mempal::core::utils::iso_timestamp;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory, global_embed_status};
+use mempal::observability::{OperationTelemetrySummaryOptions, operation_telemetry_summary};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -312,6 +313,39 @@ async fn post_json(state: ApiState, uri: &str, body: Value) -> (StatusCode, Valu
         .expect("read body");
     let body = serde_json::from_slice(&bytes).expect("parse json");
     (status, body)
+}
+
+#[tokio::test]
+async fn test_rest_request_records_operation_telemetry_without_query_or_body() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (status, _headers, _body) = get_json(
+        state,
+        "/api/status?secret=REST_TELEMETRY_SECRET_DO_NOT_STORE",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let db = env.db();
+    let rows = operation_telemetry_summary(
+        &db,
+        OperationTelemetrySummaryOptions {
+            since_unix_ms: None,
+            limit: 20,
+        },
+    )
+    .expect("summarize operation telemetry");
+    let rest_row = rows
+        .iter()
+        .find(|row| row.source == "rest" && row.operation == "GET /api/status")
+        .expect("REST status request telemetry row");
+    assert_eq!(rest_row.call_site, "rest.request");
+    assert_eq!(rest_row.operation_count, 1);
+    assert_eq!(rest_row.success_count, 1);
+    assert_eq!(rest_row.error_count, 0);
+    assert!(!rest_row.operation.contains("secret="));
 }
 
 #[tokio::test]

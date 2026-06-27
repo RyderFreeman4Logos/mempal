@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS fork_ext_meta (
 );
 "#;
 
-pub const CURRENT_FORK_EXT_VERSION: u32 = 22;
+pub const CURRENT_FORK_EXT_VERSION: u32 = 23;
 
 // Partial indexes on the most expensive GROUP BY + COUNT(*) paths used by `mempal status`.
 // idx_drawers_project_id_active is a partial replacement for the non-partial
@@ -120,6 +120,39 @@ CREATE INDEX IF NOT EXISTS idx_pending_failed_failure_class
 INSERT INTO fork_ext_meta (key, value)
 VALUES ('queue.auto_requeue.last_at_unix_ms', '0')
 ON CONFLICT(key) DO NOTHING;
+"#;
+
+pub const FORK_EXT_V23_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS operation_telemetry (
+    id                         TEXT PRIMARY KEY,
+    started_at_unix_ms         INTEGER NOT NULL,
+    duration_ms                INTEGER NOT NULL,
+    source                     TEXT NOT NULL CHECK(source IN ('cli', 'mcp', 'rest', 'daemon')),
+    operation                  TEXT NOT NULL,
+    call_site                  TEXT NOT NULL,
+    success                    INTEGER NOT NULL CHECK(success IN (0, 1)),
+    error_class                TEXT,
+    sqlite_error_class         TEXT,
+    rows_scanned               INTEGER NOT NULL DEFAULT 0,
+    rows_returned              INTEGER NOT NULL DEFAULT 0,
+    rows_changed               INTEGER NOT NULL DEFAULT 0,
+    lock_wait_count            INTEGER NOT NULL DEFAULT 0,
+    retry_count                INTEGER NOT NULL DEFAULT 0,
+    result_count               INTEGER NOT NULL DEFAULT 0,
+    physical_read_bytes        INTEGER NOT NULL DEFAULT 0,
+    physical_write_bytes       INTEGER NOT NULL DEFAULT 0,
+    logical_read_bytes         INTEGER NOT NULL DEFAULT 0,
+    logical_write_bytes        INTEGER NOT NULL DEFAULT 0,
+    cancelled_write_bytes      INTEGER NOT NULL DEFAULT 0,
+    metadata_json              TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_operation_telemetry_started
+    ON operation_telemetry(started_at_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_operation_telemetry_source_operation
+    ON operation_telemetry(source, operation, started_at_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_operation_telemetry_call_site
+    ON operation_telemetry(call_site, started_at_unix_ms DESC);
 "#;
 
 pub const FORK_EXT_V15_SCHEMA_SQL: &str = r#"
@@ -452,6 +485,10 @@ fn fork_ext_migrations() -> &'static [Migration] {
             version: 22,
             up: apply_v22,
         },
+        Migration {
+            version: 23,
+            up: apply_v23,
+        },
     ]
 }
 
@@ -698,6 +735,10 @@ fn apply_v22(conn: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
     conn.execute_batch(FORK_EXT_V22_SCHEMA_SQL)
+}
+
+fn apply_v23(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(FORK_EXT_V23_SCHEMA_SQL)
 }
 
 fn apply_v10(conn: &Connection) -> rusqlite::Result<()> {

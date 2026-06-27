@@ -86,6 +86,9 @@ use crate::knowledge_lifecycle::{
     DemoteRequest as CoreDemoteRequest, PromoteRequest as CorePromoteRequest, demote_knowledge,
     promote_knowledge,
 };
+use crate::observability::{
+    OperationTelemetryRecord, OperationTelemetrySource, OperationTelemetrySpan,
+};
 use crate::search::{
     SearchFilters, SearchMode, SearchOptions, VectorSearchCircuit, bm25_fallback_warning_degraded,
     bm25_fallback_warning_embed_error, bm25_fallback_warning_timeout, dispatch_access_update,
@@ -98,7 +101,7 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
     service::Peer,
-    tool, tool_handler, tool_router,
+    tool, tool_router,
 };
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -905,17 +908,36 @@ impl MempalMcpServer {
         }
     }
 
+    fn ingest_claim_telemetry_span(
+        &self,
+        call_site: &'static str,
+        claim: &ClaimedMessage,
+    ) -> OperationTelemetrySpan {
+        let source = if self.external_ingest_writer_lease.is_some() {
+            OperationTelemetrySource::Daemon
+        } else {
+            OperationTelemetrySource::Mcp
+        };
+        OperationTelemetrySpan::start(
+            self.db_path.clone(),
+            OperationTelemetryRecord::new(source, format!("ingest {}", claim.kind), call_site)
+                .with_retry_count(claim.retry_count as u64),
+        )
+    }
+
     async fn process_ingest_claim(
         &self,
         queue: &AsyncPendingMessageStore,
         worker_id: &str,
         claim: ClaimedMessage,
     ) -> anyhow::Result<()> {
+        let span = self.ingest_claim_telemetry_span("mcp.ingest_worker", &claim);
         let queue_wait_ms = queue_wait_ms(claim.created_at, claim.claimed_at);
         let prepared: PreparedIngestOperation = match serde_json::from_str(&claim.payload) {
             Ok(prepared) => prepared,
             Err(error) => {
                 let detail = format!("failed to decode ingest operation {}: {error}", claim.id);
+                span.finish_error(&detail);
                 complete_failed_ingest_claim(queue, &claim, queue_wait_ms, detail).await?;
                 return Ok(());
             }
@@ -931,23 +953,32 @@ impl MempalMcpServer {
                 Ok(Some(lease)) => Some(lease),
                 Ok(None) => {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    Self::release_claim_with_lock_retry(queue, claim)
+                    if let Err(error) = Self::release_claim_with_lock_retry(queue, claim)
                         .await
-                        .context("failed to release ingest claim after writer lease conflict")?;
+                        .context("failed to release ingest claim after writer lease conflict")
+                    {
+                        span.finish_error(&error);
+                        return Err(error);
+                    }
+                    span.finish_error_class("writer_lease_conflict");
                     tokio::time::sleep(INGEST_POLL_INTERVAL).await;
                     return Ok(());
                 }
                 Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
                     Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-                    Self::release_claim_with_lock_retry(queue, claim)
+                    if let Err(error) = Self::release_claim_with_lock_retry(queue, claim)
                         .await
-                        .context(
-                            "failed to release ingest claim after transient writer lease lock",
-                        )?;
+                        .context("failed to release ingest claim after transient writer lease lock")
+                    {
+                        span.finish_error(&error);
+                        return Err(error);
+                    }
+                    span.finish_error_class("writer_lease_locked");
                     tokio::time::sleep(INGEST_POLL_INTERVAL).await;
                     return Ok(());
                 }
                 Err(error) => {
+                    span.finish_error(&error);
                     return Err(error).context("failed to acquire MCP ingest writer lease");
                 }
             }
@@ -968,6 +999,7 @@ impl MempalMcpServer {
             Ok(Err(error)) => Err(error.to_string()),
             Err(error) => Err(error.to_string()),
         };
+        let telemetry_error = outcome.as_ref().err().cloned();
 
         Self::refresh_ingest_claim_heartbeat_once(queue, &claim.id, worker_id).await;
         let completed = self
@@ -978,8 +1010,13 @@ impl MempalMcpServer {
             Some(writer_lease) => writer_lease.release().await,
             None => Ok(()),
         };
-        completed?;
-        released
+        let result = completed.and(released);
+        match (&telemetry_error, &result) {
+            (_, Err(error)) => span.finish_error(error),
+            (Some(error), Ok(())) => span.finish_error(error),
+            (None, Ok(())) => span.finish_success(),
+        }
+        result
     }
 
     async fn process_ingest_claim_inline(
@@ -10177,7 +10214,6 @@ fn current_rfc3339() -> String {
     crate::cowork::peek::format_rfc3339(UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
 }
 
-#[tool_handler(router = self.tool_router)]
 impl ServerHandler for MempalMcpServer {
     fn get_info(&self) -> ServerInfo {
         let config = ConfigHandle::current();
@@ -10208,6 +10244,44 @@ impl ServerHandler for MempalMcpServer {
         info.capabilities = capabilities;
         info.instructions = Some(instructions);
         info
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<rmcp::model::CallToolResult, ErrorData> {
+        let operation = request.name.to_string();
+        let span = OperationTelemetrySpan::start(
+            self.db_path.clone(),
+            OperationTelemetryRecord::new(OperationTelemetrySource::Mcp, operation, "mcp.tool"),
+        );
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = self.tool_router.call(tcc).await;
+        match &result {
+            Ok(response) if response.is_error.unwrap_or(false) => {
+                span.finish_error_class("tool_error");
+            }
+            Ok(_) => span.finish_success(),
+            Err(error) => span.finish_error(format!("{error:?}")),
+        }
+        result
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<rmcp::model::ListToolsResult, ErrorData> {
+        Ok(rmcp::model::ListToolsResult {
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        self.tool_router.get(name).cloned()
     }
 
     async fn initialize(

@@ -29,6 +29,9 @@ use crate::core::{
 use crate::embed::global_embed_status;
 use crate::ingest::gating::evaluate_fact_check_gate;
 use crate::ingest::normalize::CURRENT_NORMALIZE_VERSION;
+use crate::observability::{
+    OperationTelemetryRecord, OperationTelemetrySource, OperationTelemetrySpan,
+};
 use crate::process_diagnostics::inspect_process_memory;
 use crate::search::{
     SearchMode, SearchOptions, VectorSearchCircuit, bm25_fallback_warning_degraded,
@@ -39,8 +42,13 @@ use crate::search::{
 };
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Query, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header::CONTENT_TYPE, header::USER_AGENT},
+    http::{
+        HeaderMap, HeaderValue, Method, Request, StatusCode, header::CONTENT_TYPE,
+        header::USER_AGENT,
+    },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -106,6 +114,7 @@ async fn shutdown_signal() {
 }
 
 pub fn router(state: ApiState) -> Router {
+    let telemetry_state = state.clone();
     Router::new()
         .route("/api/search", get(search_handler))
         .route("/api/ingest", post(ingest_handler))
@@ -113,8 +122,34 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/status", get(status_handler))
         .route("/api/pinned_facts", get(pinned_facts_handler))
         .merge(super::hermes_compat::routes())
+        .route_layer(middleware::from_fn_with_state(
+            telemetry_state,
+            rest_operation_telemetry,
+        ))
         .with_state(state)
         .layer(cors_layer())
+}
+
+async fn rest_operation_telemetry(
+    State(state): State<ApiState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let operation = format!("{} {}", request.method().as_str(), request.uri().path());
+    let span = OperationTelemetrySpan::start(
+        state.db_path.clone(),
+        OperationTelemetryRecord::new(OperationTelemetrySource::Rest, operation, "rest.request"),
+    );
+    let response = next.run(request).await;
+    let status = response.status();
+    if status.is_client_error() {
+        span.finish_error_class("http_4xx");
+    } else if status.is_server_error() {
+        span.finish_error_class("http_5xx");
+    } else {
+        span.finish_success();
+    }
+    response
 }
 
 fn cors_layer() -> CorsLayer {

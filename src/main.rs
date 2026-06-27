@@ -816,6 +816,18 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// Summarize operation-scoped latency, I/O, and error telemetry.
+    Telemetry {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(
+            long,
+            help = "Filter to operations after this point. Duration: '10s', '15m', '2h', '3d'. Unix milliseconds are also accepted."
+        )]
+        since: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// View a drawer by ID.
     View {
         drawer_id: String,
@@ -3596,14 +3608,30 @@ fn run() -> Result<()> {
     if read_only_database {
         validate_read_only_command_args(&cli.command)?;
     }
-    if read_only_database && !db_path.exists() {
+    let empty_read_only_db_dir = if read_only_database
+        && !db_path.exists()
+        && command_reads_missing_database_as_empty(&cli.command)
+    {
+        Some(
+            tempfile::TempDir::new()
+                .context("failed to create empty read-only database scratch dir")?,
+        )
+    } else {
+        None
+    };
+    let empty_read_only_db_path = empty_read_only_db_dir
+        .as_ref()
+        .map(|dir| dir.path().join("palace.db"));
+    if read_only_database && !db_path.exists() && empty_read_only_db_path.is_none() {
         bail!(
             "no palace.db found at {}; run `mempal init` first",
             display_path_for_user(&db_path)
         );
     }
 
-    let db = match if read_only_database {
+    let db = match if let Some(path) = empty_read_only_db_path.as_ref() {
+        Database::open(path).context("failed to open empty read-only database")
+    } else if read_only_database {
         open_read_only_database(&db_path).context("failed to open read-only database")
     } else if command_retries_stdin_ingest_startup_open(&cli.command) {
         open_stdin_ingest_database_with_retry(&db_path)
@@ -3641,7 +3669,18 @@ fn run() -> Result<()> {
         Err(error) => return Err(error),
     };
 
-    match cli.command {
+    let cli_span =
+        command_records_cli_operation_telemetry(&cli.command, read_only_database).then(|| {
+            observability::OperationTelemetrySpan::start(
+                db.path().to_path_buf(),
+                observability::OperationTelemetryRecord::new(
+                    observability::OperationTelemetrySource::Cli,
+                    cli_command_telemetry_label(&cli.command),
+                    "main",
+                ),
+            )
+        });
+    let command_result = match cli.command {
         Commands::Init { dir, dry_run } => init_command(&db, &dir, dry_run),
         Commands::Ingest {
             dir,
@@ -4179,6 +4218,9 @@ fn run() -> Result<()> {
         Commands::Stats { raw } => {
             observability::stats_command(&db, config.as_ref(), observability::StatsOptions { raw })
         }
+        Commands::Telemetry { json, since, limit } => {
+            telemetry_command(&db, json, since.as_deref(), limit)
+        }
         Commands::View {
             drawer_id,
             raw,
@@ -4315,6 +4357,247 @@ fn run() -> Result<()> {
         | Commands::ReleaseReadiness { .. }
         | Commands::Cost { .. }
         | Commands::Doctor { .. } => unreachable!(),
+    };
+    if let Some(cli_span) = cli_span {
+        cli_span.finish_result(&command_result);
+    }
+    command_result
+}
+
+fn telemetry_command(db: &Database, json: bool, since: Option<&str>, limit: usize) -> Result<()> {
+    let since_unix_ms = parse_telemetry_since_unix_ms(since)?;
+    let rows = observability::operation_telemetry_summary(
+        db,
+        observability::OperationTelemetrySummaryOptions {
+            since_unix_ms,
+            limit,
+        },
+    )?;
+    let format = if json {
+        observability::OperationTelemetryFormat::Json
+    } else {
+        observability::OperationTelemetryFormat::Plain
+    };
+    let rendered = observability::render_operation_telemetry_summary(&rows, format)?;
+    println!("{rendered}");
+    Ok(())
+}
+
+fn parse_telemetry_since_unix_ms(raw: Option<&str>) -> Result<Option<i64>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("--since must not be empty");
+    }
+    if raw.chars().all(|ch| ch.is_ascii_digit()) {
+        return raw
+            .parse::<i64>()
+            .map(Some)
+            .context("invalid --since Unix millisecond timestamp");
+    }
+    if let Some(duration) = parse_telemetry_duration(raw)? {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let duration_ms = duration.as_millis().min(i64::MAX as u128) as i64;
+        return Ok(Some(now_ms.saturating_sub(duration_ms)));
+    }
+    bail!("invalid --since value: {raw} (use duration suffix s/m/h/d or Unix milliseconds)")
+}
+
+fn parse_telemetry_duration(raw: &str) -> Result<Option<std::time::Duration>> {
+    let Some(unit) = raw.chars().last() else {
+        return Ok(None);
+    };
+    let multiplier = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => return Ok(None),
+    };
+    let digits = &raw[..raw.len().saturating_sub(unit.len_utf8())];
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        bail!("invalid duration for --since: {raw}");
+    }
+    let value = digits
+        .parse::<u64>()
+        .context("invalid --since duration digits")?;
+    if value == 0 {
+        bail!("--since duration must be positive");
+    }
+    let seconds = value
+        .checked_mul(multiplier)
+        .context("--since duration overflow")?;
+    Ok(Some(std::time::Duration::from_secs(seconds)))
+}
+
+fn cli_command_telemetry_label(command: &Commands) -> &'static str {
+    match command {
+        Commands::Init { .. } => "init",
+        Commands::Ingest { .. } => "ingest",
+        Commands::Operation { .. } => "operation",
+        Commands::Export { .. } => "export",
+        Commands::Wiki { .. } => "wiki",
+        Commands::IngestConversation { .. } => "ingest-conversation",
+        Commands::Hermes { .. } => "hermes",
+        Commands::Recall { .. } => "recall",
+        Commands::Search { .. } => "search",
+        Commands::Context { .. } => "context",
+        Commands::Config { .. } => "config",
+        Commands::Project { .. } => "project",
+        Commands::Prime(_) => "prime",
+        Commands::Delete { .. } => "delete",
+        Commands::Pin { .. } => "pin",
+        Commands::Unpin { .. } => "unpin",
+        Commands::Pinned { .. } => "pinned",
+        Commands::Rollback { .. } => "rollback",
+        Commands::Cost { .. } => "cost",
+        Commands::Purge { .. } => "purge",
+        Commands::WakeUp { .. } => "wake-up",
+        Commands::Compress { .. } => "compress",
+        Commands::Bench { .. } => "bench",
+        Commands::Reindex { .. } => "reindex",
+        Commands::Consolidate { .. } => "consolidate",
+        Commands::Crystallize { .. } => "crystallize",
+        Commands::Sleep { .. } => "sleep",
+        Commands::Reflect { .. } => "reflect",
+        Commands::Kg { .. } => "kg",
+        Commands::Knowledge { .. } => "knowledge",
+        Commands::KnowledgeCard { .. } => "knowledge-card",
+        Commands::Cards { .. } => "cards",
+        Commands::Phase3 { .. } => "phase3",
+        Commands::Insight { .. } => "insight",
+        Commands::Tunnels { .. } => "tunnels",
+        Commands::Taxonomy { .. } => "taxonomy",
+        Commands::FieldTaxonomy { .. } => "field-taxonomy",
+        Commands::Serve { .. } => "serve",
+        Commands::Status { .. } => "status",
+        Commands::Queue { .. } => "queue",
+        Commands::Gating { .. } => "gating",
+        Commands::Tail { .. } => "tail",
+        Commands::Timeline { .. } => "timeline",
+        Commands::Stats { .. } => "stats",
+        Commands::Telemetry { .. } => "telemetry",
+        Commands::View { .. } => "view",
+        Commands::Audit { .. } => "audit",
+        Commands::RecomputeImportance => "recompute-importance",
+        Commands::FactCheck { .. } => "fact-check",
+        Commands::CoworkDrain { .. } => "cowork-drain",
+        Commands::CoworkStatus { .. } => "cowork-status",
+        Commands::CoworkInstallHooks { .. } => "cowork-install-hooks",
+        Commands::Integrations { .. } => "integrations",
+        Commands::Hook { .. } => "hook",
+        Commands::Hotpatch { .. } => "hotpatch",
+        Commands::Daemon { .. } => "daemon",
+        Commands::Checkpoint { .. } => "checkpoint",
+        Commands::Patterns { .. } => "patterns",
+        Commands::Case { .. } => "case",
+        Commands::Foresight { .. } => "foresight",
+        Commands::Skills { .. } => "skills",
+        Commands::Repair { .. } => "repair",
+        Commands::Xurl { .. } => "xurl",
+        Commands::CoworkRegister { .. } => "cowork-register",
+        Commands::CoworkHeartbeat { .. } => "cowork-heartbeat",
+        Commands::CoworkAgents { .. } => "cowork-agents",
+        Commands::CoworkSend { .. } => "cowork-send",
+        Commands::CoworkAgentDrain { .. } => "cowork-agent-drain",
+        Commands::CoworkDeliveries { .. } => "cowork-deliveries",
+        Commands::CoworkAck { .. } => "cowork-ack",
+        Commands::CoworkEvents { .. } => "cowork-events",
+        Commands::CoworkChannelSet { .. } => "cowork-channel-set",
+        Commands::CoworkChannelSend { .. } => "cowork-channel-send",
+        Commands::CoworkBroadcast { .. } => "cowork-broadcast",
+        Commands::CoworkRunbook { .. } => "cowork-runbook",
+        Commands::CoworkDoctor { .. } => "cowork-doctor",
+        Commands::CoworkTmuxPeek { .. } => "cowork-tmux-peek",
+        Commands::CoworkSessionCreate { .. } => "cowork-session-create",
+        Commands::CoworkSessions { .. } => "cowork-sessions",
+        Commands::CoworkSessionStatus { .. } => "cowork-session-status",
+        Commands::CoworkSessionClose { .. } => "cowork-session-close",
+        Commands::CoworkHandoff { .. } => "cowork-handoff",
+        Commands::CoworkCapture { .. } => "cowork-capture",
+        Commands::MaintenanceRunbook { .. } => "maintenance-runbook",
+        Commands::Maintenance { .. } => "maintenance",
+        Commands::ReleaseReadiness { .. } => "release-readiness",
+        Commands::Doctor { .. } => "doctor",
+        Commands::Brief { .. } => "brief",
+    }
+}
+
+fn command_records_cli_operation_telemetry(command: &Commands, read_only_database: bool) -> bool {
+    !read_only_database && !command_is_dry_run_cli_operation(command)
+}
+
+fn command_is_dry_run_cli_operation(command: &Commands) -> bool {
+    match command {
+        Commands::Init { dry_run: true, .. }
+        | Commands::Ingest { dry_run: true, .. }
+        | Commands::IngestConversation { dry_run: true, .. }
+        | Commands::Rollback { dry_run: true, .. }
+        | Commands::Reindex { dry_run: true, .. }
+        | Commands::Consolidate { dry_run: true, .. }
+        | Commands::Crystallize { dry_run: true, .. }
+        | Commands::Sleep { dry_run: true, .. } => true,
+        Commands::Knowledge {
+            command: KnowledgeCommands::Distill { dry_run: true, .. },
+        }
+        | Commands::KnowledgeCard {
+            command: KnowledgeCardCommands::BackfillApply { execute: false, .. },
+        }
+        | Commands::Queue {
+            command:
+                QueueCommands::RetryFailed(QueueMutationArgs { execute: false, .. })
+                | QueueCommands::ArchiveFailed(QueueMutationArgs { execute: false, .. }),
+        }
+        | Commands::Checkpoint {
+            command: CheckpointCommands::Cleanup { dry_run: true, .. },
+        }
+        | Commands::Skills {
+            command: skills::SkillsCommands::Propose { dry_run: true, .. },
+        }
+        | Commands::Xurl {
+            command:
+                XurlCommands::Reindex { dry_run: true, .. }
+                | XurlCommands::Backfill { dry_run: true, .. },
+        }
+        | Commands::Audit {
+            command: Some(AuditCommands::Cleanup { dry_run: true, .. }),
+            ..
+        }
+        | Commands::Case {
+            command: case_skill::CaseCommands::Open { dry_run: true, .. },
+        } => true,
+        Commands::Foresight { command } => foresight_cli::command_is_dry_run(command),
+        Commands::Phase3 { command } => phase3_command_is_dry_run(command),
+        Commands::Maintenance {
+            command: MaintenanceCommands::Rejudge(args),
+        } => maintenance_rejudge_command_is_dry_run(args),
+        _ => false,
+    }
+}
+
+fn maintenance_rejudge_command_is_dry_run(args: &MaintenanceRejudgeArgs) -> bool {
+    match &args.command {
+        Some(MaintenanceRejudgeCommands::Restore { execute, .. }) => !*execute,
+        None => !args.execute,
+    }
+}
+
+fn phase3_command_is_dry_run(command: &Phase3Commands) -> bool {
+    match command {
+        Phase3Commands::Adoption { command } => matches!(
+            command,
+            Phase3AdoptionCommands::Capture { execute: false, .. }
+                | Phase3AdoptionCommands::Wrap { execute: false, .. }
+        ),
+        Phase3Commands::RollbackControl { execute, .. }
+        | Phase3Commands::ResearchIngestPlan { execute, .. } => !*execute,
+        _ => false,
     }
 }
 
@@ -4464,18 +4747,25 @@ fn open_historical_rejudge_startup_database_with_retry(
 
 fn command_uses_read_only_database(command: &Commands) -> bool {
     match command {
-        Commands::Status { .. }
+        Commands::Rollback { dry_run: true, .. }
+        | Commands::Reindex { dry_run: true, .. }
+        | Commands::Consolidate { dry_run: true, .. }
+        | Commands::Crystallize { dry_run: true, .. }
+        | Commands::Sleep { dry_run: true, .. }
+        | Commands::Status { .. }
         | Commands::Search { .. }
         | Commands::Context { .. }
         | Commands::WakeUp { .. }
         | Commands::Tail { .. }
         | Commands::Timeline { .. }
         | Commands::Stats { .. }
+        | Commands::Telemetry { .. }
         | Commands::View { .. }
         | Commands::Reflect { .. }
         | Commands::Export { .. }
         | Commands::Wiki { .. }
-        | Commands::FactCheck { .. } => true,
+        | Commands::FactCheck { .. }
+        | Commands::Brief { .. } => true,
         Commands::Pinned { reorder, .. } => reorder.is_empty(),
         Commands::Kg { command } => matches!(
             command,
@@ -4487,7 +4777,9 @@ fn command_uses_read_only_database(command: &Commands) -> bool {
         Commands::Knowledge { command } => {
             matches!(
                 command,
-                KnowledgeCommands::Gate { .. } | KnowledgeCommands::Policy { .. }
+                KnowledgeCommands::Distill { dry_run: true, .. }
+                    | KnowledgeCommands::Gate { .. }
+                    | KnowledgeCommands::Policy { .. }
             )
         }
         Commands::KnowledgeCard { command } => matches!(
@@ -4531,8 +4823,11 @@ fn command_uses_read_only_database(command: &Commands) -> bool {
         ),
         Commands::Skills { command } => matches!(
             command,
-            skills::SkillsCommands::List { .. } | skills::SkillsCommands::Show { .. }
+            skills::SkillsCommands::List { .. }
+                | skills::SkillsCommands::Show { .. }
+                | skills::SkillsCommands::Propose { dry_run: true, .. }
         ),
+        Commands::Foresight { command } => foresight_cli::command_uses_read_only_database(command),
         Commands::Repair { .. } => true,
         Commands::Xurl { command } => matches!(
             command,
@@ -4540,11 +4835,55 @@ fn command_uses_read_only_database(command: &Commands) -> bool {
                 | XurlCommands::Timeline { .. }
                 | XurlCommands::Stats { .. }
                 | XurlCommands::Reindex { dry_run: true, .. }
+                | XurlCommands::Backfill { dry_run: true, .. }
         ),
         Commands::Audit { command, .. } => {
             !matches!(command, Some(AuditCommands::Cleanup { dry_run: false, .. }))
         }
+        Commands::Insight { command } => matches!(
+            command,
+            insights::InsightCommands::List { .. } | insights::InsightCommands::Runbook { .. }
+        ),
+        Commands::Phase3 { command } => phase3_command_uses_read_only_database(command),
+        Commands::Maintenance {
+            command: MaintenanceCommands::Rejudge(args),
+        } if maintenance_rejudge_command_is_dry_run(args) => true,
         _ => false,
+    }
+}
+
+fn command_reads_missing_database_as_empty(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Phase3 { command } if phase3_command_uses_read_only_database(command)
+    )
+}
+
+fn phase3_command_uses_read_only_database(command: &Phase3Commands) -> bool {
+    match command {
+        Phase3Commands::Adoption { command } => matches!(
+            command,
+            Phase3AdoptionCommands::Guidance { .. }
+                | Phase3AdoptionCommands::InstrumentationPolicy { .. }
+                | Phase3AdoptionCommands::PrepareRecord { .. }
+                | Phase3AdoptionCommands::Capture { execute: false, .. }
+                | Phase3AdoptionCommands::CheckRecord { .. }
+                | Phase3AdoptionCommands::Review { .. }
+                | Phase3AdoptionCommands::List { .. }
+                | Phase3AdoptionCommands::Stats { .. }
+                | Phase3AdoptionCommands::Wrap { execute: false, .. }
+                | Phase3AdoptionCommands::Analytics { .. }
+        ),
+        Phase3Commands::Evaluator { .. }
+        | Phase3Commands::DefaultProposal { .. }
+        | Phase3Commands::Gate { .. }
+        | Phase3Commands::Readiness { .. }
+        | Phase3Commands::ResearchValidatePlan { .. } => true,
+        Phase3Commands::RollbackControl { execute, .. }
+        | Phase3Commands::ResearchIngestPlan { execute, .. } => !*execute,
+        Phase3Commands::DefaultControl {
+            enable, disable, ..
+        } => !*enable && !*disable,
     }
 }
 
