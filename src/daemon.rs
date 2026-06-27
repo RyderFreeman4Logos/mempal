@@ -31,6 +31,9 @@ use crate::ingest::gating::{
 };
 use crate::ingest::novelty::{NoveltyAction, NoveltyCandidate, evaluate as evaluate_novelty};
 use crate::llm::LlmError;
+use crate::observability::{
+    OperationTelemetryRecord, OperationTelemetrySource, OperationTelemetrySpan,
+};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use serde_json::{Value, json};
@@ -269,6 +272,7 @@ async fn run_loop(context: &DaemonContext) -> Result<()> {
 
     let hook_worker_state = HookWorkerState {
         async_db: context.async_db.clone(),
+        db_path: db_path.clone(),
         store: context.store.clone(),
         worker_id: worker_id.clone(),
         embedder: Arc::clone(&embedder),
@@ -581,6 +585,7 @@ fn spawn_daemon_ingest_drain_worker(
 #[derive(Clone)]
 struct HookWorkerState {
     async_db: AsyncDb,
+    db_path: PathBuf,
     store: AsyncPendingMessageStore,
     worker_id: String,
     embedder: Arc<DaemonEmbedder>,
@@ -743,6 +748,15 @@ async fn process_hook_worker_message(
     claim_ttl_secs: i64,
 ) {
     let message_id = message.id.clone();
+    let span = OperationTelemetrySpan::start(
+        state.db_path.clone(),
+        OperationTelemetryRecord::new(
+            OperationTelemetrySource::Daemon,
+            format!("hook {}", message.kind),
+            "daemon.hook_worker.message",
+        )
+        .with_retry_count(message.retry_count as u64),
+    );
     refresh_hook_message_heartbeat(&state.store, &message_id, &state.worker_id).await;
     let heartbeat_handle = spawn_hook_message_heartbeat(
         state.store.clone(),
@@ -775,23 +789,29 @@ async fn process_hook_worker_message(
                 state
                     .write_observer
                     .record_error(format!("failed to confirm {message_id}: {error}"));
+                span.finish_error(error);
             } else {
                 state.write_observer.record_successful_write();
+                span.finish_success();
             }
         }
         Err(error) => {
-            tracing::error!("daemon message {message_id} failed: {error}");
-            state.write_observer.record_error(error.to_string());
+            let error_text = error.to_string();
+            tracing::error!("daemon message {message_id} failed: {error_text}");
+            state.write_observer.record_error(error_text.clone());
             let disposition = queue_failure_disposition(&error);
             if let Err(mark_error) = state
                 .store
-                .mark_failed_with_disposition(message.clone(), error.to_string(), disposition)
+                .mark_failed_with_disposition(message.clone(), error_text.clone(), disposition)
                 .await
             {
                 tracing::error!(?mark_error, "failed to mark_failed {message_id}");
                 state
                     .write_observer
                     .record_error(format!("failed to mark_failed {message_id}: {mark_error}"));
+                span.finish_error(mark_error);
+            } else {
+                span.finish_error(error_text);
             }
         }
     }
@@ -3598,6 +3618,7 @@ mod tests {
     use crate::endpoint_health::{EndpointHealthSnapshot, ProbeStatus};
     use crate::hook::{CapturedHookEnvelope, HookEvent};
     use crate::llm::LlmError;
+    use crate::observability::{OperationTelemetrySummaryOptions, operation_telemetry_summary};
     use arc_swap::ArcSwap;
     use std::pin::Pin;
     use tokio::sync::Notify;
@@ -4401,6 +4422,7 @@ mod tests {
         let worker = tokio::spawn(run_hook_worker(
             HookWorkerState {
                 async_db,
+                db_path: db_path.clone(),
                 store: async_store,
                 worker_id: "bounded-continuation-worker".to_string(),
                 embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
@@ -4440,6 +4462,34 @@ mod tests {
         let stats = store.stats().expect("queue stats");
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.claimed, 0);
+
+        let hook_row = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let telemetry_db = Database::open(&db_path).expect("open telemetry db");
+                let telemetry = operation_telemetry_summary(
+                    &telemetry_db,
+                    OperationTelemetrySummaryOptions {
+                        since_unix_ms: None,
+                        limit: 10,
+                    },
+                )
+                .expect("summarize daemon hook telemetry");
+                if let Some(row) = telemetry.into_iter().find(|row| {
+                    row.source == "daemon"
+                        && row.operation == "hook hook_post_tool"
+                        && row.call_site == "daemon.hook_worker.message"
+                        && row.operation_count == 2
+                }) {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("daemon hook operation telemetry should record both completed hooks");
+        assert_eq!(hook_row.operation_count, 2);
+        assert_eq!(hook_row.success_count, 2);
+        assert_eq!(hook_row.error_count, 0);
 
         tokio::time::timeout(Duration::from_secs(5), idle_observer.notified())
             .await
@@ -4558,6 +4608,7 @@ mod tests {
         super::process_hook_worker_message(
             HookWorkerState {
                 async_db,
+                db_path: db_path.clone(),
                 store: async_store,
                 worker_id: "lease-loss-worker".to_string(),
                 embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
@@ -4759,6 +4810,7 @@ mod tests {
         super::process_hook_worker_message(
             HookWorkerState {
                 async_db,
+                db_path: db_path.clone(),
                 store: async_store,
                 worker_id: worker_id.to_string(),
                 embedder: std::sync::Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
@@ -4854,6 +4906,7 @@ mod tests {
         super::process_hook_worker_message(
             HookWorkerState {
                 async_db,
+                db_path: db_path.clone(),
                 store: async_store,
                 worker_id: "merge-conflict-worker".to_string(),
                 embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
@@ -4994,6 +5047,7 @@ mod tests {
         let worker = tokio::spawn(super::process_hook_worker_message(
             HookWorkerState {
                 async_db,
+                db_path: db_path.clone(),
                 store: async_store.clone(),
                 worker_id: worker_id.to_string(),
                 embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
@@ -5533,6 +5587,7 @@ mod tests {
         super::process_hook_worker_message(
             HookWorkerState {
                 async_db,
+                db_path: db_path.clone(),
                 store: async_store,
                 worker_id: "soft-prototype-reject-worker".to_string(),
                 embedder: std::sync::Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
@@ -5776,6 +5831,7 @@ mod tests {
         super::process_hook_worker_message(
             HookWorkerState {
                 async_db,
+                db_path: db_path.clone(),
                 store: async_store,
                 worker_id: "llm-malformed-worker".to_string(),
                 embedder: Arc::new(DaemonEmbedder::from_primary_for_test(Box::new(
