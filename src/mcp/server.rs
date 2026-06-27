@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::adoption_analytics::build_runtime_adoption_analytics;
 use crate::brief::brief_from_context;
-use crate::context::assemble_context_with_vector;
+use crate::context::{ContextPack, assemble_context_with_vector};
 use crate::core::{
     AsyncDb,
     anchor::{self, DerivedAnchor},
@@ -1663,6 +1663,13 @@ impl MempalMcpServer {
         F: FnOnce(&Database) -> std::result::Result<R, ErrorData> + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if let Some(error) = self.async_db_open_error.as_deref() {
+            return Err(ErrorData::internal_error(
+                format!("{stage} failed to open database: {error}"),
+                None,
+            ));
+        }
         let db_path = self.db_path.clone();
         let read = tokio::task::spawn_blocking(move || {
             let db = Database::open_query_only(&db_path).map_err(|error| {
@@ -5411,12 +5418,26 @@ impl MempalMcpServer {
             context_cfg_override: None,
             include_distill_suggestions: request.include_distill_suggestions.unwrap_or(true),
         };
+        let context_request_for_fallback = context_request.clone();
         let pack = self
             .run_query_only_read_bounded("mempal_context", self.search_db_deadline, move |db| {
                 assemble_context_with_vector(db, context_request, &query_vector)
                     .map_err(context_error)
             })
-            .await?;
+            .await
+            .or_else(|error| {
+                if mcp_context_read_error_is_degradable(&error) {
+                    tracing::warn!(
+                        error = %error,
+                        "mempal_context returning empty context after bounded read contention"
+                    );
+                    Ok(empty_context_pack_from_request(
+                        context_request_for_fallback,
+                    ))
+                } else {
+                    Err(error)
+                }
+            })?;
 
         Ok(Json(ContextResponse::from(pack)))
     }
@@ -6891,7 +6912,12 @@ impl MempalMcpServer {
 
         let embedding_started = Instant::now();
         let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();
-        let vectors = if first_vector.is_some() && chunks.len() == 1 {
+        let vectors = if request.smoke.unwrap_or(false) && no_gate && bypass_novelty {
+            let dim = current_vector_dim(&db)
+                .map_err(db_error)?
+                .unwrap_or_else(|| embedder.dimensions());
+            deterministic_smoke_vectors(&chunks, dim)
+        } else if first_vector.is_some() && chunks.len() == 1 {
             vec![first_vector.take().expect("checked Some")]
         } else if let Some(fv) = first_vector.take() {
             if chunks.len() > 1 {
@@ -8240,13 +8266,27 @@ impl MempalMcpServer {
             context_cfg_override: None,
             include_distill_suggestions: false,
         };
+        let context_request_for_fallback = context_request.clone();
         let context = self
             .run_query_only_read_bounded("mempal_brief", self.search_db_deadline, move |db| {
                 assemble_context_with_vector(db, context_request, &query_vector).map_err(|error| {
                     ErrorData::internal_error(format!("brief failed: {error}"), None)
                 })
             })
-            .await?;
+            .await
+            .or_else(|error| {
+                if mcp_context_read_error_is_degradable(&error) {
+                    tracing::warn!(
+                        error = %error,
+                        "mempal_brief returning empty brief after bounded read contention"
+                    );
+                    Ok(empty_context_pack_from_request(
+                        context_request_for_fallback,
+                    ))
+                } else {
+                    Err(error)
+                }
+            })?;
         let brief = brief_from_context(context);
         Ok(Json(BriefMcpResponse::from(brief)))
     }
@@ -10521,6 +10561,35 @@ fn context_error(error: crate::context::ContextError) -> ErrorData {
     }
 }
 
+fn mcp_context_read_error_is_degradable(error: &ErrorData) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    let lock_or_busy = message.contains("database is locked")
+        || message.contains("database locked")
+        || message.contains("database is busy")
+        || message.contains("database busy")
+        || message.contains("sqlite_busy")
+        || message.contains("sqlite_locked")
+        || message.contains("locked_or_busy");
+    let query_timeout = message.contains("query-only database read exceeded");
+    let open_failure = message.contains("failed to open database");
+    lock_or_busy || query_timeout || open_failure
+}
+
+fn empty_context_pack_from_request(request: crate::context::ContextRequest) -> ContextPack {
+    ContextPack {
+        query: request.query,
+        domain: request.domain,
+        field: request.field,
+        anchors: Vec::new(),
+        sections: Vec::new(),
+        recurring_themes: Vec::new(),
+        tiered: None,
+        repair_warnings: Vec::new(),
+        active_skills: Vec::new(),
+        distill_suggestions: Vec::new(),
+    }
+}
+
 fn parse_context_trigger(s: &str) -> crate::search::tiered::ContextTrigger {
     match s {
         "on_demand" => crate::search::tiered::ContextTrigger::OnDemand,
@@ -10571,6 +10640,38 @@ fn current_vector_dim(
         .optional()?
         .map(|value| value as usize);
     Ok(dimension)
+}
+
+fn deterministic_smoke_vectors(chunks: &[String], dim: usize) -> Vec<Vec<f32>> {
+    chunks
+        .iter()
+        .map(|chunk| deterministic_smoke_vector(chunk, dim))
+        .collect()
+}
+
+fn deterministic_smoke_vector(content: &str, dim: usize) -> Vec<f32> {
+    if dim == 0 {
+        return Vec::new();
+    }
+    let hash = blake3::hash(content.as_bytes());
+    let hash_bytes = hash.as_bytes();
+    let mut vector = Vec::with_capacity(dim);
+    for index in 0..dim {
+        let byte = hash_bytes[index % hash_bytes.len()];
+        let value = (f32::from(byte) / 255.0) * 2.0 - 1.0;
+        vector.push(if value.abs() < f32::EPSILON {
+            0.003_921_569
+        } else {
+            value
+        });
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
 }
 
 fn degraded_write_error() -> ErrorData {
@@ -15327,6 +15428,55 @@ pattern_boost = 0.2
     }
 
     #[tokio::test]
+    async fn test_mcp_context_returns_empty_pack_when_query_read_is_locked() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test("database is locked");
+
+        let response = server
+            .context_json_for_test(serde_json::json!({
+                "query": "debug",
+                "max_items": 3
+            }))
+            .await
+            .expect("context should degrade instead of returning JSON-RPC internal error");
+
+        assert_eq!(response.query, "debug");
+        assert_eq!(response.domain, "project");
+        assert!(response.sections.is_empty());
+        assert!(response.anchors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_brief_returns_empty_brief_when_query_read_is_locked() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test("database is locked");
+
+        let response = server
+            .mempal_brief(Parameters(BriefMcpRequest {
+                query: "debug".to_string(),
+                field: Some("smoke".to_string()),
+                domain: Some("project".to_string()),
+                cwd: None,
+                max_items: Some(3),
+                dao_tian_limit: None,
+            }))
+            .await
+            .expect("brief should degrade instead of returning JSON-RPC internal error")
+            .0;
+
+        assert_eq!(response.query, "debug");
+        assert_eq!(response.field, "smoke");
+        assert_eq!(response.summary.key_fact_count, 0);
+        assert_eq!(response.summary.evidence_count, 0);
+        assert!(
+            response
+                .uncertainty
+                .iter()
+                .any(|item| item.kind == "no_evidence")
+        );
+    }
+
+    #[tokio::test]
     async fn test_mcp_context_has_no_db_side_effects() {
         let (_tempdir, db_path, server) = setup_server();
         insert_knowledge_drawer(
@@ -18782,7 +18932,7 @@ enabled = false
     }
 
     #[tokio::test]
-    async fn test_mcp_ingest_smoke_mode_sets_internal_controls() {
+    async fn test_mcp_ingest_smoke_mode_uses_deterministic_local_vector() {
         let _tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = _tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open db");
@@ -18823,50 +18973,30 @@ enabled = false
                 domain: Some("project".to_string()),
                 field: Some("smoke".to_string()),
                 smoke: Some(true),
-                wait: Some(false),
+                wait: Some(true),
+                wait_timeout_secs: Some(5),
                 ..IngestRequest::default()
             }))
             .await
-            .expect("smoke ingest should queue")
+            .expect("smoke ingest should complete")
             .0;
 
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        let operation_id = response.operation_id.as_deref().expect("operation id");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while call_count.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("worker should reach embed");
-        let db = Database::open(&db_path).expect("open db");
-        let payload: String = db
-            .conn()
-            .query_row(
-                "SELECT payload FROM pending_messages WHERE id = ?1",
-                [operation_id],
-                |row| row.get(0),
-            )
-            .expect("read queued ingest payload");
-        let decoded: PreparedIngestOperation =
-            serde_json::from_str(&payload).expect("decode queued ingest payload");
-
-        assert_eq!(decoded.request.smoke, Some(true));
-        assert!(decoded.controls.no_gate);
-        assert!(decoded.controls.bypass_novelty);
-
-        gate.notify_one();
-
-        let completed = server
-            .wait_for_operation_completion(operation_id)
-            .await
-            .expect("cleanup ingest completion");
-        assert_eq!(completed.state, Some(IngestOperationState::Completed));
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(
+            !response.created_drawer_ids.is_empty(),
+            "smoke wait response must expose cleanup authority"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "smoke writes must not block on the configured embedder"
+        );
+        gate.notify_waiters();
     }
 
     #[tokio::test]
-    async fn test_mcp_smoke_ingest_wait_and_status_return_created_ids() {
-        let (_tempdir, _db_path, server) = setup_server();
+    async fn test_mcp_smoke_ingest_wait_update_and_status_return_created_ids() {
+        let (_tempdir, db_path, server) = setup_server();
 
         let response = server
             .mempal_ingest(Parameters(IngestRequest {
@@ -18904,6 +19034,56 @@ enabled = false
         assert_eq!(status.drawer_ids, status.created_drawer_ids);
         assert!(!status.dropped);
         assert!(status.rejected_reason.is_none());
+
+        let old_id = response.created_drawer_ids[0].clone();
+        let update = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "cleanup-authoritative MCP smoke write two".to_string(),
+                wing: "smoke".to_string(),
+                room: Some("mcp".to_string()),
+                source_type: Some("agent_inference".to_string()),
+                memory_kind: Some("evidence".to_string()),
+                domain: Some("project".to_string()),
+                field: Some("smoke".to_string()),
+                supersedes: Some(old_id.clone()),
+                smoke: Some(true),
+                wait: Some(true),
+                wait_timeout_secs: Some(5),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("smoke update should complete")
+            .0;
+
+        assert_eq!(update.state, Some(IngestOperationState::Completed));
+        assert_eq!(
+            update.superseded_drawer_id.as_deref(),
+            Some(old_id.as_str())
+        );
+        assert_eq!(
+            update.created_drawer_ids.len(),
+            1,
+            "smoke update wait response must expose cleanup-safe new drawer id"
+        );
+        assert_eq!(update.drawer_ids, update.created_drawer_ids);
+        assert_ne!(update.created_drawer_ids[0], old_id);
+
+        let operation_id = update.operation_id.as_deref().expect("update operation id");
+        let update_status = server
+            .operation_status_json_for_test(operation_id)
+            .await
+            .expect("update operation status should load");
+        assert_eq!(update_status.state, Some(IngestOperationState::Completed));
+        assert_eq!(update_status.created_drawer_ids, update.created_drawer_ids);
+        assert_eq!(update_status.drawer_ids, update.created_drawer_ids);
+
+        let db = Database::open(&db_path).expect("open db");
+        assert!(db.get_drawer(&old_id).expect("old lookup").is_none());
+        assert!(
+            db.get_drawer(&update.created_drawer_ids[0])
+                .expect("new lookup")
+                .is_some()
+        );
     }
 
     // =========================================================================
