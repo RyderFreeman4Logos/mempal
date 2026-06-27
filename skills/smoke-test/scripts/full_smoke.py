@@ -299,6 +299,7 @@ def run_cli(name: str, args: list[str], *, input_text: str | None = None, expect
         latency_ms=result['latency_ms'],
         stdout_bytes=len(result['stdout']),
         stderr_bytes=len(result['stderr']),
+        stderr_class=classify_stderr(result['stderr']) if result['stderr'] else None,
         timeout=result.get('timed_out') or None,
         killed=result.get('killed') or None,
         json=shape or None,
@@ -306,19 +307,70 @@ def run_cli(name: str, args: list[str], *, input_text: str | None = None, expect
     return result['returncode'], result['stdout'], result['stderr'], parsed, shape
 
 
+def classify_stderr(data: bytes) -> str:
+    text = data.decode('utf-8', errors='replace').lower()
+    if 'classification=extra_holder' in text or 'extra process holding' in text:
+        return 'database_lock_extra_holder'
+    if 'database is locked' in text or 'sqlite' in text and 'locked' in text:
+        return 'database_locked'
+    if 'operation' in text and 'not found' in text:
+        return 'operation_not_found'
+    if 'timed out' in text or 'timeout' in text:
+        return 'timeout'
+    if 'degraded' in text and 'write' in text:
+        return 'write_degraded'
+    if 'error:' in text:
+        return 'error'
+    return 'stderr_present'
+
+
+def receipt_dicts_from(value: Any) -> list[dict[str, Any]]:
+    """Return operation-style receipt dicts without parsing raw text payloads."""
+    receipts: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        receipts.append(value)
+        for key in ('structuredContent', 'result', 'payload', 'response'):
+            nested = value.get(key)
+            if isinstance(nested, (dict, list)):
+                receipts.extend(receipt_dicts_from(nested))
+        return receipts
+    if isinstance(value, list):
+        for item in value:
+            receipts.extend(receipt_dicts_from(item))
+    return receipts
+
+
 def created_ids_from(value: Any) -> list[str]:
-    if not isinstance(value, dict):
-        return []
     ids: list[str] = []
-    for key in ('created_drawer_ids', 'cleanup_drawer_ids'):
-        values = value.get(key)
-        if isinstance(values, list):
-            ids.extend(x for x in values if isinstance(x, str) and x)
+    for receipt in receipt_dicts_from(value):
+        for key in ('created_drawer_ids', 'cleanup_drawer_ids'):
+            values = receipt.get(key)
+            if isinstance(values, list):
+                ids.extend(x for x in values if isinstance(x, str) and x)
     return list(dict.fromkeys(ids))
 
 
 def terminal_state(value: Any) -> bool:
-    return isinstance(value, dict) and value.get('state') in {'completed', 'rejected', 'failed'}
+    return operation_state_from(value) in {'completed', 'rejected', 'failed'}
+
+
+def operation_id_from(value: Any) -> str | None:
+    for receipt in receipt_dicts_from(value):
+        operation_id = receipt.get('operation_id')
+        if isinstance(operation_id, str) and operation_id:
+            return operation_id
+    return None
+
+
+def operation_state_from(value: Any) -> str | None:
+    last_state: str | None = None
+    for receipt in receipt_dicts_from(value):
+        state = receipt.get('state')
+        if isinstance(state, str) and state:
+            if state in {'completed', 'rejected', 'failed'}:
+                return state
+            last_state = state
+    return last_state
 
 
 def count_marker_matches(value: Any, room: str) -> int:
@@ -387,9 +439,34 @@ def delete_exact_ids_cli(drawer_ids: list[str], label: str, room: str | None = N
 
 def wait_operation(operation_id: str, name: str) -> Any | None:
     rc, out, _err, parsed, _shape = run_cli(name, ['mempal', 'operation', 'wait', operation_id, '--timeout-secs', '300', '--json'], expect_json=True, timeout=330)
+    if created_ids_from(parsed):
+        return parsed
     if rc != 0 or not terminal_state(parsed):
         rc, out, _err, parsed, _shape = run_cli(name + '_status', ['mempal', 'operation', 'status', operation_id, '--json'], expect_json=True, timeout=30)
     return parsed
+
+
+def recover_created_ids(value: Any, wait_label: str) -> tuple[list[str], dict[str, Any]]:
+    ids = created_ids_from(value)
+    operation_id = operation_id_from(value)
+    info: dict[str, Any] = {
+        'operation_id_present': bool(operation_id),
+        'operation_state': operation_state_from(value),
+        'recovered_via': None,
+        'recovered_state': None,
+    }
+    if ids or operation_id is None:
+        return ids, info
+
+    waited = wait_operation(operation_id, wait_label)
+    ids = created_ids_from(waited)
+    info['recovered_via'] = wait_label
+    info['recovered_state'] = operation_state_from(waited)
+    return ids, info
+
+
+def recovery_fields(info: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in info.items() if value not in (None, False)}
 
 
 def cli_crud() -> list[str]:
@@ -402,14 +479,11 @@ def cli_crud() -> list[str]:
         expect_json=True,
         timeout=130,
     )
-    ids = created_ids_from(parsed)
-    if not ids and isinstance(parsed, dict) and parsed.get('operation_id'):
-        parsed2 = wait_operation(parsed['operation_id'], 'cli_create_wait')
-        ids = created_ids_from(parsed2)
-        if ids:
-            note('cli_create', True, recovered_via='cli_create_wait', created_id_count=len(ids))
+    ids, create_recovery = recover_created_ids(parsed, 'cli_create_wait')
+    if ids and create_recovery.get('recovered_via'):
+        note('cli_create', True, created_id_count=len(ids), **recovery_fields(create_recovery))
     if not ids:
-        note('cli_crud', False, reason='create_missing_created_drawer_ids')
+        note('cli_crud', False, reason='create_missing_created_drawer_ids', **recovery_fields(create_recovery))
         return cleanup_ids
     cleanup_ids.extend(ids)
     created_id = ids[0]
@@ -433,15 +507,12 @@ def cli_crud() -> list[str]:
         expect_json=True,
         timeout=130,
     )
-    upd_ids = created_ids_from(upd_parsed)
-    if not upd_ids and isinstance(upd_parsed, dict) and upd_parsed.get('operation_id'):
-        upd_parsed2 = wait_operation(upd_parsed['operation_id'], 'cli_update_wait')
-        upd_ids = created_ids_from(upd_parsed2)
-        if upd_ids:
-            note('cli_update', True, recovered_via='cli_update_wait', created_id_count=len(upd_ids))
+    upd_ids, update_recovery = recover_created_ids(upd_parsed, 'cli_update_wait')
+    if upd_ids and update_recovery.get('recovered_via'):
+        note('cli_update', True, created_id_count=len(upd_ids), **recovery_fields(update_recovery))
     if not upd_ids:
         delete_exact_ids_cli(cleanup_ids, 'cli_cleanup_after_update_failure', room='cli')
-        note('cli_crud', False, reason='update_missing_created_drawer_ids', cleanup_id_count=len(cleanup_ids))
+        note('cli_crud', False, reason='update_missing_created_drawer_ids', cleanup_id_count=len(cleanup_ids), **recovery_fields(update_recovery))
         return cleanup_ids
     cleanup_ids.extend(upd_ids)
     SUMMARY['created_counts']['cli'] = len(cleanup_ids)
@@ -678,21 +749,27 @@ def mcp_crud() -> list[str]:
         create_args = {'content': f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'wait': True, 'wait_timeout_secs': 90}
         create, info = client.tool('mempal_ingest', create_args, timeout=130)
         ids = created_ids_from(create)
-        if not ids and isinstance(create, dict) and create.get('operation_id'):
+        create_recovery: dict[str, Any] = {
+            'operation_id_present': bool(operation_id_from(create)),
+            'operation_state': operation_state_from(create),
+        }
+        if not ids and operation_id_from(create):
             # A non-terminal MCP ingest receipt means the daemon may still be
             # processing the write. Close this stdio server before following the
             # operation via CLI so the smoke runner never observes a result while
             # its own MCP process is still an extra SQLite holder.
             client.close()
             client = None
-            waited = wait_operation(create['operation_id'], 'mcp_create_cli_wait')
+            waited = wait_operation(operation_id_from(create) or '', 'mcp_create_cli_wait')
             ids = created_ids_from(waited)
-        note('mcp_create', bool(info.get('ok')) and bool(ids), created_id_count=len(ids), **without_ok(info))
+            create_recovery.update({'recovered_via': 'mcp_create_cli_wait', 'recovered_state': operation_state_from(waited)})
+        note('mcp_create', bool(info.get('ok')) and bool(ids), created_id_count=len(ids), **recovery_fields(create_recovery), **without_ok(info))
         if not ids:
             note(
                 'mcp_inconclusive_no_cleanup_id',
                 False,
                 reason='create_missing_created_drawer_ids',
+                **recovery_fields(create_recovery),
                 product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/545',
             )
             return cleanup_ids
@@ -727,18 +804,24 @@ def mcp_crud() -> list[str]:
         update_args = {'content': f'{MARKER} reversible MCP smoke drawer updated; nonce {NONCE[::-1]}; lexical tokens deltaorchid embervault frostcairn; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'supersedes': created_id, 'wait': True, 'wait_timeout_secs': 90}
         update, uinfo = client.tool('mempal_ingest', update_args, timeout=130)
         upd_ids = created_ids_from(update)
-        if not upd_ids and isinstance(update, dict) and update.get('operation_id'):
+        update_recovery: dict[str, Any] = {
+            'operation_id_present': bool(operation_id_from(update)),
+            'operation_state': operation_state_from(update),
+        }
+        if not upd_ids and operation_id_from(update):
             client.close()
             client = None
-            waited = wait_operation(update['operation_id'], 'mcp_update_cli_wait')
+            waited = wait_operation(operation_id_from(update) or '', 'mcp_update_cli_wait')
             upd_ids = created_ids_from(waited)
-        note('mcp_update', bool(uinfo.get('ok')) and bool(upd_ids), created_id_count=len(upd_ids), **without_ok(uinfo))
+            update_recovery.update({'recovered_via': 'mcp_update_cli_wait', 'recovered_state': operation_state_from(waited)})
+        note('mcp_update', bool(uinfo.get('ok')) and bool(upd_ids), created_id_count=len(upd_ids), **recovery_fields(update_recovery), **without_ok(uinfo))
         if not upd_ids:
             delete_exact_ids_cli(cleanup_ids, 'mcp_cleanup_after_update_failure', room='mcp')
             note(
                 'mcp_inconclusive_no_cleanup_id',
                 False,
                 reason='update_missing_created_drawer_ids',
+                **recovery_fields(update_recovery),
                 product_issue='https://github.com/RyderFreeman4Logos/mempal/issues/545',
             )
             return cleanup_ids
