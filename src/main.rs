@@ -17265,17 +17265,22 @@ async fn maintenance_rejudge_all_command(
     )?;
 
     let mut checkpoint_lock_retry = HistoricalRejudgeCheckpointLockRetryState::default();
+    let mut active_stage_mode = options.stage_mode;
     loop {
         let page = next_historical_rejudge_work_items_for_stage(
             db,
             &checkpoint.run_id,
             checkpoint.page_size,
-            options.stage_mode,
+            active_stage_mode,
         )?;
         if page.is_empty() {
             break;
         }
 
+        let page_options = HistoricalRejudgeOptions {
+            stage_mode: active_stage_mode,
+            ..options
+        };
         let work_context = HistoricalRejudgeWorkContext {
             llm_context: llm_context.as_ref(),
             writer_lease,
@@ -17284,7 +17289,7 @@ async fn maintenance_rejudge_all_command(
             process_historical_rejudge_work_page(
                 db,
                 config,
-                options,
+                page_options,
                 &mut checkpoint,
                 &page,
                 work_context,
@@ -17294,7 +17299,7 @@ async fn maintenance_rejudge_all_command(
             process_historical_rejudge_work_page_with_concurrency(
                 db,
                 config,
-                options,
+                page_options,
                 &mut checkpoint,
                 &page,
                 work_context,
@@ -17312,6 +17317,41 @@ async fn maintenance_rejudge_all_command(
                 .last()
                 .map(|work_item| work_item.drawer_rowid)
                 .unwrap_or(page_start);
+            if options.stage_mode == HistoricalRejudgeStageMode::Paired
+                && is_historical_rejudge_confirmation_unavailable(&error)
+            {
+                active_stage_mode = HistoricalRejudgeStageMode::ProposalOnly;
+                checkpoint_lock_retry.record_persisted();
+                if let Some(writer) = progress.as_mut() {
+                    writer.write_event(build_historical_rejudge_progress_event(
+                        HistoricalRejudgeProgressEventInput {
+                            status: "confirmation_unavailable",
+                            dry_run: false,
+                            all: true,
+                            limit: None,
+                            page_size: checkpoint.page_size,
+                            snapshot_count: Some(checkpoint.snapshot_count),
+                            snapshot_max_rowid: Some(checkpoint.snapshot_max_rowid),
+                            counts: historical_rejudge_progress_counts_from_checkpoint(
+                                db,
+                                &checkpoint,
+                            ),
+                            cursor_rowid: checkpoint.last_processed_rowid,
+                            remaining_count: Some(
+                                checkpoint
+                                    .snapshot_count
+                                    .saturating_sub(checkpoint.scanned_count),
+                            ),
+                            judge_model: checkpoint.judge_model.as_deref(),
+                            config_version: &checkpoint.config_version,
+                            started,
+                            last_successful_page_at: None,
+                            error: Some("historical_rejudge_confirmation_unavailable"),
+                        },
+                    ))?;
+                }
+                continue;
+            }
             let waiting_for_llm = is_retryable_historical_llm_error(&error);
             let waiting_for_sqlite_lock =
                 !waiting_for_llm && is_transient_sqlite_lock_error(&error);
@@ -21234,13 +21274,50 @@ fn evaluate_historical_pre_llm(
 }
 
 fn is_retryable_historical_llm_error(error: &anyhow::Error) -> bool {
+    if is_historical_rejudge_confirmation_unavailable(error) {
+        return true;
+    }
     error
         .chain()
         .filter_map(|cause| cause.downcast_ref::<LlmError>())
         .any(LlmError::is_retryable)
 }
 
+#[derive(Debug)]
+struct HistoricalRejudgeConfirmationUnavailable {
+    retry_after: std::time::Duration,
+}
+
+impl std::fmt::Display for HistoricalRejudgeConfirmationUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("historical rejudge confirmation lane unavailable")
+    }
+}
+
+impl std::error::Error for HistoricalRejudgeConfirmationUnavailable {}
+
+fn is_historical_rejudge_confirmation_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<HistoricalRejudgeConfirmationUnavailable>()
+            .is_some()
+    })
+}
+
+fn historical_rejudge_confirmation_unavailable_error(error: &anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(HistoricalRejudgeConfirmationUnavailable {
+        retry_after: historical_rejudge_llm_retry_delay(error),
+    })
+}
+
 fn historical_rejudge_llm_retry_delay(error: &anyhow::Error) -> std::time::Duration {
+    if let Some(duration) = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<HistoricalRejudgeConfirmationUnavailable>()
+            .map(|error| error.retry_after)
+    }) {
+        return duration;
+    }
     error
         .chain()
         .filter_map(|cause| cause.downcast_ref::<LlmError>())
@@ -21525,7 +21602,16 @@ impl HistoricalRejudgeLlmContext {
                 };
 
                 let (confirm_score, confirm_reason) =
-                    request_historical_llm_score(confirm_router, drawer, config).await?;
+                    match request_historical_llm_score(confirm_router, drawer, config).await {
+                        Ok(score) => score,
+                        Err(error)
+                            if stage_mode == HistoricalRejudgeStageMode::Paired
+                                && is_retryable_historical_llm_error(&error) =>
+                        {
+                            return Err(historical_rejudge_confirmation_unavailable_error(&error));
+                        }
+                        Err(error) => return Err(error),
+                    };
                 Ok(HistoricalRejudgeDecision {
                     delete_candidate: confirm_score < threshold,
                     protected: false,
@@ -24183,6 +24269,38 @@ threshold = 0.3
             }]
         })
         .to_string()
+    }
+
+    fn insert_low_signal_rejudge_drawers(db: &Database, prefix: &str, count: usize) -> Vec<i64> {
+        (0..count)
+            .map(|index| {
+                let drawer_id = format!("{prefix}-{index}");
+                insert_drawer(
+                    db,
+                    &drawer_id,
+                    &format!(
+                        "Low-signal transient output {index} for Issue 592 rejudge backlog tests."
+                    ),
+                    "notes",
+                    None,
+                );
+                drawer_rowid(db, &drawer_id)
+            })
+            .collect()
+    }
+
+    fn historical_rejudge_confirm_pending_count_for_rows(
+        db: &Database,
+        run_id: &str,
+        rowids: &[i64],
+    ) -> usize {
+        rowids
+            .iter()
+            .filter(|rowid| {
+                historical_rejudge_work_item_stage(db, run_id, **rowid).as_deref()
+                    == Some("confirm_pending")
+            })
+            .count()
     }
 
     #[test]
@@ -28165,7 +28283,8 @@ threshold = 0.7
     }
 
     #[tokio::test]
-    async fn historical_rejudge_two_stage_retries_confirm_without_rerunning_proposal() {
+    async fn historical_rejudge_two_stage_drains_confirm_after_recovery_without_rerunning_proposal()
+    {
         let mut proposal_server = mockito::Server::new_async().await;
         let mut confirm_server = mockito::Server::new_async().await;
         let proposal_mock = proposal_server
@@ -28216,10 +28335,35 @@ threshold = 0.7
             },
         )
         .await
-        .expect("confirm outage should wait and retry until Spark recovers");
+        .expect("confirm outage should persist backlog without waiting for Spark recovery");
+
+        failing_confirm_mock.assert_async().await;
+        let pending_checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load pending checkpoint")
+            .expect("pending checkpoint");
+        assert_eq!(pending_checkpoint.status, "confirm_pending");
+        assert_eq!(pending_checkpoint.mutated_count, 0);
+        assert!(
+            db.get_drawer("proposal-confirm-retry")
+                .expect("load active drawer before Spark recovery")
+                .is_some(),
+            "Spark outage must not soft-delete an unconfirmed candidate"
+        );
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                resume: true,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("Spark recovery should drain the persisted confirmation backlog");
 
         proposal_mock.assert_async().await;
-        failing_confirm_mock.assert_async().await;
         successful_confirm_mock.assert_async().await;
         let checkpoint = load_historical_rejudge_checkpoint(&db)
             .expect("load checkpoint")
@@ -28233,6 +28377,385 @@ threshold = 0.7
             "successful Spark retry should soft-delete the confirmed candidate"
         );
         assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_paired_spark_exhausted_persists_confirm_backlog_and_continues_qwen()
+    {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_delete_secret_reason",
+            ))
+            .expect(6)
+            .create_async()
+            .await;
+        let exhausted_confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(429)
+            .with_header("Retry-After", "0")
+            .with_body("spark quota exhausted raw body")
+            .expect(6)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let rowids = insert_low_signal_rejudge_drawers(&db, "paired-spark-exhausted", 6);
+        let backups = backup_dir(&tmp);
+        let progress_file = tmp.path().join("paired-spark-exhausted-progress.jsonl");
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            maintenance_rejudge_command_with_runtime(
+                &db,
+                &config,
+                HistoricalRejudgeOptions {
+                    progress_file: Some(&progress_file),
+                    proposal_llm_endpoint: Some("qwen"),
+                    confirm_llm_endpoint: Some("spark"),
+                    ..full_rejudge_options(true, Some(&backups), 6)
+                },
+                HistoricalRejudgeRuntimeOptions { llm_concurrency: 6 },
+            ),
+        )
+        .await
+        .expect("Spark quota exhaustion must not keep paired rejudge sleeping forever")
+        .expect("paired rejudge should preserve Qwen proposals as confirmation backlog");
+
+        proposal_mock.assert_async().await;
+        exhausted_confirm_mock.assert_async().await;
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_eq!(
+            audit_count(&db),
+            0,
+            "unconfirmed proposals must not audit a final mutation"
+        );
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.status, "confirm_pending");
+        assert_eq!(checkpoint.mutated_count, 0);
+        let backlog = historical_rejudge_backlog_counts(&db, &checkpoint.run_id)
+            .expect("load backlog counts");
+        assert_eq!(backlog.no_stage_pending_count, 0);
+        assert_eq!(backlog.confirm_pending_count, 6);
+        assert_eq!(
+            historical_rejudge_confirm_pending_count_for_rows(&db, &checkpoint.run_id, &rowids),
+            6
+        );
+
+        let raw_progress = std::fs::read_to_string(&progress_file).expect("read progress");
+        assert!(
+            !raw_progress.contains("Low-signal transient output"),
+            "{raw_progress}"
+        );
+        assert!(
+            !raw_progress.contains("paired-spark-exhausted"),
+            "{raw_progress}"
+        );
+        assert!(
+            !raw_progress.contains("proposal_delete_secret_reason"),
+            "{raw_progress}"
+        );
+        assert!(
+            !raw_progress.contains("spark quota exhausted raw body"),
+            "{raw_progress}"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_paired_resume_drains_confirm_pending_without_rerunning_qwen() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_delete",
+            ))
+            .expect(3)
+            .create_async()
+            .await;
+        let exhausted_confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(429)
+            .with_header("Retry-After", "0")
+            .with_body("quota exhausted")
+            .expect(3)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_low_signal_rejudge_drawers(&db, "paired-recovery", 3);
+        let backups = backup_dir(&tmp);
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        maintenance_rejudge_command_with_runtime(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 3)
+            },
+            HistoricalRejudgeRuntimeOptions { llm_concurrency: 6 },
+        )
+        .await
+        .expect("seed paired confirmation backlog while Spark is exhausted");
+
+        exhausted_confirm_mock.assert_async().await;
+        let pending_checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load pending checkpoint")
+            .expect("pending checkpoint");
+        assert_eq!(pending_checkpoint.status, "confirm_pending");
+        assert_eq!(pending_checkpoint.mutated_count, 0);
+        assert_eq!(
+            historical_rejudge_backlog_counts(&db, &pending_checkpoint.run_id)
+                .expect("load pending backlog")
+                .confirm_pending_count,
+            3
+        );
+
+        let recovered_confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.02, "confirm_delete"))
+            .expect(3)
+            .create_async()
+            .await;
+        maintenance_rejudge_command_with_runtime(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                resume: true,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 3)
+            },
+            HistoricalRejudgeRuntimeOptions { llm_concurrency: 6 },
+        )
+        .await
+        .expect("paired resume should automatically drain persisted Spark confirmations");
+
+        proposal_mock.assert_async().await;
+        recovered_confirm_mock.assert_async().await;
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 3);
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load completed checkpoint")
+            .expect("completed checkpoint");
+        assert_eq!(checkpoint.status, "done");
+        assert_eq!(checkpoint.mutated_count, 3);
+        assert_eq!(
+            historical_rejudge_backlog_counts(&db, &checkpoint.run_id)
+                .expect("load final backlog")
+                .remaining_count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_paired_spark_exhausted_retries_do_not_advance_unconfirmed() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_delete",
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let exhausted_confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(429)
+            .with_header("Retry-After", "0")
+            .with_body("quota exhausted")
+            .expect(2)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let rowid = insert_low_signal_rejudge_drawers(&db, "paired-retry", 1)
+            .pop()
+            .expect("rowid");
+        let backups = backup_dir(&tmp);
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("first Spark exhaustion should keep an unconfirmed backlog item");
+        let first_checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load first checkpoint")
+            .expect("first checkpoint");
+        assert_eq!(first_checkpoint.mutated_count, 0);
+        assert_eq!(
+            historical_rejudge_work_item_stage(&db, &first_checkpoint.run_id, rowid).as_deref(),
+            Some("confirm_pending")
+        );
+
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                resume: true,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("second Spark exhaustion should retry confirmation without mutation");
+        exhausted_confirm_mock.assert_async().await;
+        let retry_checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load retry checkpoint")
+            .expect("retry checkpoint");
+        assert_eq!(retry_checkpoint.mutated_count, 0);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert_eq!(
+            historical_rejudge_work_item_decision(&db, &retry_checkpoint.run_id, rowid),
+            None
+        );
+
+        let recovered_confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.02, "confirm_delete"))
+            .expect(1)
+            .create_async()
+            .await;
+        maintenance_rejudge_command(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                resume: true,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 1)
+            },
+        )
+        .await
+        .expect("Spark success should advance the mutation once");
+
+        proposal_mock.assert_async().await;
+        recovered_confirm_mock.assert_async().await;
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load completed checkpoint")
+            .expect("completed checkpoint");
+        assert_eq!(checkpoint.status, "done");
+        assert_eq!(checkpoint.mutated_count, 1);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_paired_partial_spark_failure_keeps_remaining_pending() {
+        let mut proposal_server = mockito::Server::new_async().await;
+        let mut confirm_server = mockito::Server::new_async().await;
+        let proposal_mock = proposal_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response(
+                "qwen3.6-27b-decensor-by-aeon",
+                0.05,
+                "proposal_delete",
+            ))
+            .expect(2)
+            .create_async()
+            .await;
+        let successful_confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.02, "confirm_delete"))
+            .expect(1)
+            .create_async()
+            .await;
+        let exhausted_confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(429)
+            .with_header("Retry-After", "0")
+            .with_body("quota exhausted")
+            .expect(1)
+            .create_async()
+            .await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        insert_low_signal_rejudge_drawers(&db, "paired-partial", 2);
+        let backups = backup_dir(&tmp);
+        let config = two_stage_llm_rejudge_config(&proposal_server.url(), &confirm_server.url());
+
+        maintenance_rejudge_command_with_runtime(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 2)
+            },
+            HistoricalRejudgeRuntimeOptions { llm_concurrency: 1 },
+        )
+        .await
+        .expect("partial Spark failure should keep remaining proposal pending");
+
+        successful_confirm_mock.assert_async().await;
+        exhausted_confirm_mock.assert_async().await;
+        let pending_checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load pending checkpoint")
+            .expect("pending checkpoint");
+        assert_eq!(pending_checkpoint.status, "confirm_pending");
+        assert_eq!(pending_checkpoint.mutated_count, 1);
+        let pending_backlog = historical_rejudge_backlog_counts(&db, &pending_checkpoint.run_id)
+            .expect("load pending backlog");
+        assert_eq!(pending_backlog.no_stage_pending_count, 0);
+        assert_eq!(pending_backlog.confirm_pending_count, 1);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 1);
+
+        let recovered_confirm_mock = confirm_server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(llm_chat_response("spark", 0.02, "confirm_delete_later"))
+            .expect(1)
+            .create_async()
+            .await;
+        maintenance_rejudge_command_with_runtime(
+            &db,
+            &config,
+            HistoricalRejudgeOptions {
+                resume: true,
+                proposal_llm_endpoint: Some("qwen"),
+                confirm_llm_endpoint: Some("spark"),
+                ..full_rejudge_options(true, Some(&backups), 2)
+            },
+            HistoricalRejudgeRuntimeOptions { llm_concurrency: 1 },
+        )
+        .await
+        .expect("next paired run should drain the remaining pending proposal");
+
+        proposal_mock.assert_async().await;
+        recovered_confirm_mock.assert_async().await;
+        let checkpoint = load_historical_rejudge_checkpoint(&db)
+            .expect("load completed checkpoint")
+            .expect("completed checkpoint");
+        assert_eq!(checkpoint.status, "done");
+        assert_eq!(checkpoint.mutated_count, 2);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 2);
     }
 
     #[tokio::test]
