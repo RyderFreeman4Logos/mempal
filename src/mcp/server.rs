@@ -10563,16 +10563,22 @@ fn context_error(error: crate::context::ContextError) -> ErrorData {
 
 fn mcp_context_read_error_is_degradable(error: &ErrorData) -> bool {
     let message = error.message.to_ascii_lowercase();
-    let lock_or_busy = message.contains("database is locked")
+    let transient_contention = message.contains("database is locked")
         || message.contains("database locked")
         || message.contains("database is busy")
         || message.contains("database busy")
         || message.contains("sqlite_busy")
         || message.contains("sqlite_locked")
-        || message.contains("locked_or_busy");
+        || message.contains("sqlite_protocol")
+        || message.contains("database protocol")
+        || message.contains("locked_or_busy")
+        || message.contains("classification=extra_holder")
+        || message.contains("extra process holding")
+        || message.contains("extra_holder")
+        || message.contains("stale_mcp_server")
+        || message.contains("orphan_daemon");
     let query_timeout = message.contains("query-only database read exceeded");
-    let open_failure = message.contains("failed to open database");
-    lock_or_busy || query_timeout || open_failure
+    transient_contention || query_timeout
 }
 
 fn empty_context_pack_from_request(request: crate::context::ContextRequest) -> ContextPack {
@@ -15474,6 +15480,52 @@ pattern_boost = 0.2
                 .iter()
                 .any(|item| item.kind == "no_evidence")
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_context_surfaces_non_transient_query_open_error() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test("permission denied");
+
+        let error = match server
+            .context_json_for_test(serde_json::json!({
+                "query": "debug",
+                "max_items": 3
+            }))
+            .await
+        {
+            Ok(_) => panic!("context should not hide non-transient database open failures"),
+            Err(error) => error,
+        };
+
+        let error_text = error.to_string();
+        assert!(error_text.contains("failed to open database"));
+        assert!(error_text.contains("permission denied"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_brief_surfaces_non_transient_query_open_error() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test("permission denied");
+
+        let error = match server
+            .mempal_brief(Parameters(BriefMcpRequest {
+                query: "debug".to_string(),
+                field: Some("smoke".to_string()),
+                domain: Some("project".to_string()),
+                cwd: None,
+                max_items: Some(3),
+                dao_tian_limit: None,
+            }))
+            .await
+        {
+            Ok(_) => panic!("brief should not hide non-transient database open failures"),
+            Err(error) => error,
+        };
+
+        let error_text = error.to_string();
+        assert!(error_text.contains("failed to open database"));
+        assert!(error_text.contains("permission denied"));
     }
 
     #[tokio::test]
