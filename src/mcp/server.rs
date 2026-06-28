@@ -184,8 +184,7 @@ const MCP_INGEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
 const MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(5);
 const MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(30);
-const MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT: Duration =
-    MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE;
+const MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_INGEST_QUEUE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 const MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -13232,10 +13231,58 @@ quality_policy = "llm_required_for_keep"
             "MCP daemon ingest enqueue must not reuse hook fail-fast IPC timeout"
         );
         assert!(
-            MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT
-                >= MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE,
-            "MCP daemon ingest enqueue IPC timeout must cover the observed SQLite holder retry budget"
+            MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT < MCP_INGEST_ADMISSION_DEADLINE,
+            "wait=false MCP ingest must not spend the whole admission budget waiting for daemon IPC"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_wait_false_falls_back_when_daemon_ipc_stalls() {
+        let (tempdir, db_path, server) = setup_server();
+        let (listener, _socket_guard) =
+            crate::hook_ipc::bind_listener(tempdir.path()).expect("bind fake daemon IPC socket");
+        let fake_daemon = tokio::spawn(async move {
+            if let Ok((_stream, _addr)) = listener.accept().await {
+                tokio::time::sleep(MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT * 3).await;
+            }
+        });
+
+        let started_at = Instant::now();
+        let response = tokio::time::timeout(
+            MCP_INGEST_ADMISSION_DEADLINE,
+            server.mempal_ingest(Parameters(IngestRequest {
+                content: "normal project case should not wait for stalled daemon IPC".to_string(),
+                wing: "verbatim".to_string(),
+                room: Some("bugfixes".to_string()),
+                source_type: Some("agent_observation".to_string()),
+                memory_kind: Some("case".to_string()),
+                domain: Some("project".to_string()),
+                field: Some("software-engineering".to_string()),
+                source_file: Some(
+                    "/home/obj/project/github/RyderFreeman4Logos/verbatim/crates/verbatim-daemon/src/main.rs"
+                        .to_string(),
+                ),
+                wait: Some(false),
+                ..IngestRequest::default()
+            })),
+        )
+        .await
+        .expect("wait=false ingest must return before the MCP admission deadline")
+        .expect("stalled daemon IPC should fall back to local idempotent admission")
+        .0;
+
+        fake_daemon.abort();
+        assert_eq!(response.state, Some(IngestOperationState::Queued));
+        assert!(
+            started_at.elapsed() < MCP_INGEST_ADMISSION_DEADLINE,
+            "wait=false ingest should not wait until a client can close the transport"
+        );
+        let operation_id = response.operation_id.as_deref().expect("operation id");
+        let record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(operation_id)
+            .expect("query queued operation")
+            .expect("queued operation");
+        assert_eq!(record.kind, INGEST_ASYNC_KIND);
     }
 
     #[tokio::test]
