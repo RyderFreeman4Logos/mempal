@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::adoption_analytics::build_runtime_adoption_analytics;
 use crate::brief::brief_from_context;
-use crate::context::{ContextPack, assemble_context_with_vector};
+use crate::context::assemble_context_with_vector;
 use crate::core::{
     AsyncDb,
     anchor::{self, DerivedAnchor},
@@ -271,6 +271,8 @@ pub struct MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     ingest_warning_snapshot_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    query_only_read_delay: Option<Duration>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_error: Option<String>,
     #[cfg(any(test, feature = "db-test-seam"))]
     daemon_writer_lease_check_error: Option<String>,
@@ -519,6 +521,8 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             ingest_warning_snapshot_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            query_only_read_delay: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_error: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             daemon_writer_lease_check_error: None,
@@ -580,6 +584,12 @@ impl MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_ingest_warning_snapshot_delay_for_test(mut self, delay: Duration) -> Self {
         self.ingest_warning_snapshot_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_query_only_read_delay_for_test(mut self, delay: Duration) -> Self {
+        self.query_only_read_delay = Some(delay);
         self
     }
 
@@ -1670,8 +1680,14 @@ impl MempalMcpServer {
                 None,
             ));
         }
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let query_only_read_delay = self.query_only_read_delay;
         let db_path = self.db_path.clone();
         let read = tokio::task::spawn_blocking(move || {
+            #[cfg(any(test, feature = "db-test-seam"))]
+            if let Some(delay) = query_only_read_delay {
+                std::thread::sleep(delay);
+            }
             let db = Database::open_query_only(&db_path).map_err(|error| {
                 ErrorData::internal_error(format!("{stage} failed to open database: {error}"), None)
             })?;
@@ -5421,26 +5437,12 @@ impl MempalMcpServer {
             context_cfg_override: None,
             include_distill_suggestions: request.include_distill_suggestions.unwrap_or(true),
         };
-        let context_request_for_fallback = context_request.clone();
         let pack = self
             .run_query_only_read_bounded("mempal_context", self.search_db_deadline, move |db| {
                 assemble_context_with_vector(db, context_request, &query_vector)
                     .map_err(context_error)
             })
-            .await
-            .or_else(|error| {
-                if mcp_context_read_error_is_degradable(&error) {
-                    tracing::warn!(
-                        error = %error,
-                        "mempal_context returning empty context after bounded read contention"
-                    );
-                    Ok(empty_context_pack_from_request(
-                        context_request_for_fallback,
-                    ))
-                } else {
-                    Err(error)
-                }
-            })?;
+            .await?;
 
         Ok(Json(ContextResponse::from(pack)))
     }
@@ -8271,27 +8273,13 @@ impl MempalMcpServer {
             context_cfg_override: None,
             include_distill_suggestions: false,
         };
-        let context_request_for_fallback = context_request.clone();
         let context = self
             .run_query_only_read_bounded("mempal_brief", self.search_db_deadline, move |db| {
                 assemble_context_with_vector(db, context_request, &query_vector).map_err(|error| {
                     ErrorData::internal_error(format!("brief failed: {error}"), None)
                 })
             })
-            .await
-            .or_else(|error| {
-                if mcp_context_read_error_is_degradable(&error) {
-                    tracing::warn!(
-                        error = %error,
-                        "mempal_brief returning empty brief after bounded read contention"
-                    );
-                    Ok(empty_context_pack_from_request(
-                        context_request_for_fallback,
-                    ))
-                } else {
-                    Err(error)
-                }
-            })?;
+            .await?;
         let brief = brief_from_context(context);
         Ok(Json(BriefMcpResponse::from(brief)))
     }
@@ -10563,41 +10551,6 @@ fn context_error(error: crate::context::ContextError) -> ErrorData {
         | crate::context::ContextError::Tiered(_) => {
             ErrorData::internal_error(format!("context assembly failed: {error}"), None)
         }
-    }
-}
-
-fn mcp_context_read_error_is_degradable(error: &ErrorData) -> bool {
-    let message = error.message.to_ascii_lowercase();
-    let transient_contention = message.contains("database is locked")
-        || message.contains("database locked")
-        || message.contains("database is busy")
-        || message.contains("database busy")
-        || message.contains("sqlite_busy")
-        || message.contains("sqlite_locked")
-        || message.contains("sqlite_protocol")
-        || message.contains("database protocol")
-        || message.contains("locked_or_busy")
-        || message.contains("classification=extra_holder")
-        || message.contains("extra process holding")
-        || message.contains("extra_holder")
-        || message.contains("stale_mcp_server")
-        || message.contains("orphan_daemon");
-    let query_timeout = message.contains("query-only database read exceeded");
-    transient_contention || query_timeout
-}
-
-fn empty_context_pack_from_request(request: crate::context::ContextRequest) -> ContextPack {
-    ContextPack {
-        query: request.query,
-        domain: request.domain,
-        field: request.field,
-        anchors: Vec::new(),
-        sections: Vec::new(),
-        recurring_themes: Vec::new(),
-        tiered: None,
-        repair_warnings: Vec::new(),
-        active_skills: Vec::new(),
-        distill_suggestions: Vec::new(),
     }
 }
 
@@ -15534,30 +15487,29 @@ pattern_boost = 0.2
     }
 
     #[tokio::test]
-    async fn test_mcp_context_returns_empty_pack_when_query_read_is_locked() {
+    async fn test_mcp_context_surfaces_transient_query_lock_error() {
         let (_tempdir, _db_path, server) = setup_server();
         let server = server.with_async_db_open_error_for_test("database is locked");
 
-        let response = server
+        let error = server
             .context_json_for_test(serde_json::json!({
                 "query": "debug",
                 "max_items": 3
             }))
             .await
-            .expect("context should degrade instead of returning JSON-RPC internal error");
+            .expect_err("context must not hide transient database lock failures");
 
-        assert_eq!(response.query, "debug");
-        assert_eq!(response.domain, "project");
-        assert!(response.sections.is_empty());
-        assert!(response.anchors.is_empty());
+        let error_text = error.to_string();
+        assert!(error_text.contains("failed to open database"));
+        assert!(error_text.contains("database is locked"));
     }
 
     #[tokio::test]
-    async fn test_mcp_brief_returns_empty_brief_when_query_read_is_locked() {
+    async fn test_mcp_brief_surfaces_transient_query_lock_error() {
         let (_tempdir, _db_path, server) = setup_server();
         let server = server.with_async_db_open_error_for_test("database is locked");
 
-        let response = server
+        let error = match server
             .mempal_brief(Parameters(BriefMcpRequest {
                 query: "debug".to_string(),
                 field: Some("smoke".to_string()),
@@ -15567,19 +15519,80 @@ pattern_boost = 0.2
                 dao_tian_limit: None,
             }))
             .await
-            .expect("brief should degrade instead of returning JSON-RPC internal error")
-            .0;
+        {
+            Ok(_) => panic!("brief must not hide transient database lock failures"),
+            Err(error) => error,
+        };
 
-        assert_eq!(response.query, "debug");
-        assert_eq!(response.field, "smoke");
-        assert_eq!(response.summary.key_fact_count, 0);
-        assert_eq!(response.summary.evidence_count, 0);
+        let error_text = error.to_string();
+        assert!(error_text.contains("failed to open database"));
+        assert!(error_text.contains("database is locked"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_context_surfaces_query_read_timeout_error() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server
+            .with_query_only_read_delay_for_test(Duration::from_millis(150))
+            .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.context_json_for_test(serde_json::json!({
+                "query": "debug",
+                "max_items": 3
+            })),
+        )
+        .await
+        .expect("context should return before client timeout");
+        let error = match result {
+            Ok(_) => panic!("context must not convert read timeout to empty success"),
+            Err(error) => error,
+        };
+
         assert!(
-            response
-                .uncertainty
-                .iter()
-                .any(|item| item.kind == "no_evidence")
+            error
+                .to_string()
+                .contains("mempal_context query-only database read exceeded"),
+            "unexpected error: {error}"
         );
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+
+    #[tokio::test]
+    async fn test_mcp_brief_surfaces_query_read_timeout_error() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server
+            .with_query_only_read_delay_for_test(Duration::from_millis(150))
+            .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.mempal_brief(Parameters(BriefMcpRequest {
+                query: "debug".to_string(),
+                field: Some("smoke".to_string()),
+                domain: Some("project".to_string()),
+                cwd: None,
+                max_items: Some(3),
+                dao_tian_limit: None,
+            })),
+        )
+        .await
+        .expect("brief should return before client timeout");
+        let error = match result {
+            Ok(_) => panic!("brief must not convert read timeout to empty success"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("mempal_brief query-only database read exceeded"),
+            "unexpected error: {error}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
     }
 
     #[tokio::test]
