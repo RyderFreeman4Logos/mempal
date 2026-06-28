@@ -191,6 +191,8 @@ const MCP_SELF_HOLDER_WRITE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5
 const MCP_INGEST_CLAIM_RELEASE_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 const MCP_INGEST_CLAIM_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MCP_INGEST_CLAIM_RELEASE_BUSY_TIMEOUT: Duration = Duration::ZERO;
+const MCP_INGEST_RESULT_RETRY_DEADLINE: Duration = Duration::from_secs(300);
+const MCP_INGEST_RESULT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MCP_SCOPED_INGEST_CLAIM_CLEANUP_MARGIN: Duration = Duration::from_millis(250);
 // Caller-bounded scoped waits may claim only when this much budget remains. The
 // cleanup margin is reserved for releasing the claim if processing hits the
@@ -1346,19 +1348,17 @@ impl MempalMcpServer {
                     }
                     _ => None,
                 };
-                queue
-                    .complete_operation(
-                        claim.clone(),
-                        state.as_str().to_string(),
-                        result_drawer_id.map(ToOwned::to_owned),
-                        rejected_reason.clone(),
-                        None,
-                        Some(result_json),
-                    )
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to store async ingest result: {error}")
-                    })?;
+                complete_ingest_operation_with_lock_retry(
+                    queue,
+                    claim,
+                    state.as_str().to_string(),
+                    result_drawer_id.map(ToOwned::to_owned),
+                    rejected_reason.clone(),
+                    None,
+                    Some(result_json),
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("failed to store async ingest result: {error}"))?;
             }
             Err(detail) => {
                 complete_failed_ingest_claim(queue, claim, queue_wait_ms, detail).await?;
@@ -11170,18 +11170,58 @@ async fn complete_failed_ingest_claim(
         .insert("queue_wait_ms".to_string(), queue_wait_ms);
     let result_json =
         serde_json::to_string(&finalized).context("failed to serialize failed ingest response")?;
-    queue
-        .complete_operation(
-            claim.clone(),
-            IngestOperationState::Failed.as_str().to_string(),
-            None,
-            None,
-            Some(detail),
-            Some(result_json),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to store async ingest failure: {error}"))?;
+    complete_ingest_operation_with_lock_retry(
+        queue,
+        claim,
+        IngestOperationState::Failed.as_str().to_string(),
+        None,
+        None,
+        Some(detail),
+        Some(result_json),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("failed to store async ingest failure: {error}"))?;
     Ok(())
+}
+
+async fn complete_ingest_operation_with_lock_retry(
+    queue: &AsyncPendingMessageStore,
+    claim: &ClaimedMessage,
+    op_state: String,
+    result_drawer_id: Option<String>,
+    rejected_reason: Option<String>,
+    failure_detail: Option<String>,
+    result_json: Option<String>,
+) -> crate::core::queue::Result<()> {
+    let started = Instant::now();
+    loop {
+        match queue
+            .complete_operation(
+                claim.clone(),
+                op_state.clone(),
+                result_drawer_id.clone(),
+                rejected_reason.clone(),
+                failure_detail.clone(),
+                result_json.clone(),
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.is_sqlite_lock()
+                    && started.elapsed() < MCP_INGEST_RESULT_RETRY_DEADLINE =>
+            {
+                let remaining = MCP_INGEST_RESULT_RETRY_DEADLINE.saturating_sub(started.elapsed());
+                tracing::warn!(
+                    ?error,
+                    operation_id = %claim.id,
+                    "retrying async ingest result persistence after SQLite lock"
+                );
+                tokio::time::sleep(MCP_INGEST_RESULT_RETRY_DELAY.min(remaining)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn rfc3339_from_secs(secs: i64) -> String {
@@ -14257,6 +14297,62 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_async_ingest_completion_retries_transient_sqlite_lock() {
+        let (_tempdir, db_path, server) = setup_server();
+        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let request = IngestRequest {
+            content: "completion receipt survives transient sqlite lock".to_string(),
+            wing: "mcp".to_string(),
+            room: Some("runtime".to_string()),
+            project_id: Some("project-complete-lock".to_string()),
+            dry_run: Some(false),
+            ..IngestRequest::default()
+        };
+        let project_id = server
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await
+            .expect("resolve project");
+        let prepared = server
+            .prepare_async_ingest_operation(
+                &request,
+                IngestControls::default(),
+                config.as_ref(),
+                compiled_privacy.as_ref(),
+                project_id,
+            )
+            .await
+            .expect("prepare async ingest");
+        let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, &payload)
+            .expect("enqueue async ingest");
+        let claim = queue
+            .claim_next_by_kind("worker-complete-lock", 60, INGEST_ASYNC_KIND)
+            .expect("claim queued op")
+            .expect("claimed queued op");
+        let async_queue = AsyncPendingMessageStore::from_store(queue.clone())
+            .with_complete_lock_failures_for_test(2);
+
+        server
+            .process_ingest_claim(&async_queue, "worker-complete-lock", claim)
+            .await
+            .expect("transient result persistence locks should be retried");
+
+        let completed = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("completed status");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
+        assert!(!completed.drawer_id.is_empty());
+        assert_eq!(completed.drawer_ids, completed.created_drawer_ids);
+        assert!(
+            !completed.created_drawer_ids.is_empty(),
+            "completed receipt must preserve cleanup-safe drawer ids after retry"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_async_ingest_uses_admission_supersedes_target_after_queue_wait() {
         let (_tempdir, db_path, server) = setup_server();
         let seed_id = "async-supersedes-old";
@@ -14351,6 +14447,46 @@ pattern_boost = 0.2
         );
 
         let record = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(&operation_id)
+            .expect("load operation record")
+            .expect("operation record exists");
+        assert_eq!(record.op_state, IngestOperationState::Failed.as_str());
+        assert!(record.completed_at.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_async_ingest_failure_receipt_retries_transient_sqlite_lock() {
+        let (_tempdir, db_path, server) = setup_server();
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, "{not json")
+            .expect("enqueue malformed async ingest");
+        let claim = queue
+            .claim_next_by_kind("worker-failure-lock", 60, INGEST_ASYNC_KIND)
+            .expect("claim malformed op")
+            .expect("claimed malformed op");
+        let async_queue = AsyncPendingMessageStore::from_store(queue.clone())
+            .with_complete_lock_failures_for_test(2);
+
+        server
+            .process_ingest_claim(&async_queue, "worker-failure-lock", claim)
+            .await
+            .expect("transient failure receipt persistence locks should be retried");
+
+        let failed = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("failed status");
+        assert_eq!(failed.state, Some(IngestOperationState::Failed));
+        assert!(failed.drawer_id.is_empty());
+        assert!(
+            failed
+                .failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("failed to decode ingest operation")),
+            "{failed:?}"
+        );
+        let record = queue
             .operation_status(&operation_id)
             .expect("load operation record")
             .expect("operation record exists");

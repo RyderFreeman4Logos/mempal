@@ -232,6 +232,8 @@ pub struct AsyncPendingMessageStore {
     claim_blocking_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
     release_lock_failures: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    complete_lock_failures: Arc<AtomicUsize>,
 }
 
 impl AsyncPendingMessageStore {
@@ -259,6 +261,8 @@ impl AsyncPendingMessageStore {
             claim_blocking_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             release_lock_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            complete_lock_failures: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -289,6 +293,13 @@ impl AsyncPendingMessageStore {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_release_lock_failures_for_test(self, failures: usize) -> Self {
         self.release_lock_failures.store(failures, Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_complete_lock_failures_for_test(self, failures: usize) -> Self {
+        self.complete_lock_failures
+            .store(failures, Ordering::SeqCst);
         self
     }
 
@@ -451,6 +462,16 @@ impl AsyncPendingMessageStore {
         failure_detail: Option<String>,
         result_json: Option<String>,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .complete_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(sqlite_busy_queue_error());
+        }
         self.run(move |store| {
             store.complete_operation(
                 &claim,
