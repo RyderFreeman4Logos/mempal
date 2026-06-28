@@ -15514,6 +15514,7 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
     {
         print_daemon_rest_embedder_cache(&status);
         print_daemon_rest_resource_usage(&status);
+        print_daemon_ingest_worker_backoff(&status);
         if let Some(telemetry) = status.get("search_telemetry") {
             print_daemon_search_telemetry(telemetry);
         }
@@ -15713,6 +15714,29 @@ fn print_daemon_rest_resource_usage(status: &Value) {
         "rest.resource.access_writeback_failed_total: {}",
         json_u64(counters, "access_writeback_failed_total")
     );
+}
+
+#[cfg(feature = "rest")]
+fn print_daemon_ingest_worker_backoff(status: &Value) {
+    let Some(backoff) = status.get("ingest_worker_backoff") else {
+        return;
+    };
+    println!(
+        "rest.ingest_worker.retry_count: {}",
+        json_u64(backoff, "retry_count")
+    );
+    println!(
+        "rest.ingest_worker.next_delay_ms: {}",
+        json_u64(backoff, "next_delay_ms")
+    );
+    match backoff
+        .get("last_error_class")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        Some(class) => println!("rest.ingest_worker.last_error_class: {class}"),
+        None => println!("rest.ingest_worker.last_error_class: none"),
+    }
 }
 
 fn display_opt_u64(value: Option<u64>) -> String {

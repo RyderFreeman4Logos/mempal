@@ -12,7 +12,10 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::core::config::{Config, ConfigHandle};
@@ -21,8 +24,9 @@ use crate::core::project::{ProjectFilterMode, ProjectSearchScope, resolve_projec
 use crate::cowork::peek::{format_rfc3339, parse_rfc3339};
 use anyhow::{Context, Result, bail};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 const FOLLOW_POLL_SECS: u64 = 2;
@@ -67,6 +71,39 @@ pub fn reset_resource_counters_for_tests() {
     ACCESS_WRITEBACK_SCHEDULED_TOTAL.store(0, Ordering::Relaxed);
     ACCESS_WRITEBACK_SKIPPED_TOTAL.store(0, Ordering::Relaxed);
     ACCESS_WRITEBACK_FAILED_TOTAL.store(0, Ordering::Relaxed);
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+pub struct IngestWorkerBackoffSnapshot {
+    pub retry_count: u64,
+    pub next_delay_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_class: Option<String>,
+}
+
+pub fn record_ingest_worker_backoff(snapshot: IngestWorkerBackoffSnapshot) {
+    *global_ingest_worker_backoff()
+        .lock()
+        .expect("ingest worker backoff mutex poisoned") = snapshot;
+}
+
+pub fn ingest_worker_backoff_snapshot() -> IngestWorkerBackoffSnapshot {
+    global_ingest_worker_backoff()
+        .lock()
+        .expect("ingest worker backoff mutex poisoned")
+        .clone()
+}
+
+#[cfg(test)]
+pub fn reset_ingest_worker_backoff_for_tests() {
+    *global_ingest_worker_backoff()
+        .lock()
+        .expect("ingest worker backoff mutex poisoned") = IngestWorkerBackoffSnapshot::default();
+}
+
+fn global_ingest_worker_backoff() -> &'static Mutex<IngestWorkerBackoffSnapshot> {
+    static INGEST_WORKER_BACKOFF: OnceLock<Mutex<IngestWorkerBackoffSnapshot>> = OnceLock::new();
+    INGEST_WORKER_BACKOFF.get_or_init(|| Mutex::new(IngestWorkerBackoffSnapshot::default()))
 }
 
 pub struct TailOptions<'a> {
