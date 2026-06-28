@@ -3351,8 +3351,10 @@ enum DaemonIngestEnqueue {
 fn should_defer_local_ingest_to_daemon(
     daemon_ingest_ipc_available: bool,
     daemon_enqueue_may_have_reached: bool,
+    local_fallback_persisted_after_daemon_uncertainty: bool,
 ) -> bool {
-    daemon_ingest_ipc_available || daemon_enqueue_may_have_reached
+    !local_fallback_persisted_after_daemon_uncertainty
+        && (daemon_ingest_ipc_available || daemon_enqueue_may_have_reached)
 }
 
 fn should_start_local_ingest_worker(
@@ -3379,6 +3381,7 @@ struct IngestQueueAdmission {
     operation_id: String,
     processor: IngestQueueProcessor,
     daemon_enqueue_may_have_reached: bool,
+    local_fallback_persisted_after_daemon_uncertainty: bool,
 }
 
 #[doc(hidden)]
@@ -6129,6 +6132,7 @@ impl MempalMcpServer {
                 && should_defer_local_ingest_to_daemon(
                     self.daemon_ingest_ipc_available() || daemon_writer_lease_visible,
                     queue_admission.daemon_enqueue_may_have_reached,
+                    queue_admission.local_fallback_persisted_after_daemon_uncertainty,
                 );
         let use_local_ingest_worker = should_start_local_ingest_worker(
             queue_admission.processor,
@@ -6267,6 +6271,7 @@ impl MempalMcpServer {
                     operation_id,
                     processor: IngestQueueProcessor::Daemon,
                     daemon_enqueue_may_have_reached: true,
+                    local_fallback_persisted_after_daemon_uncertainty: false,
                 });
             }
             DaemonIngestEnqueue::Fallback {
@@ -6284,6 +6289,7 @@ impl MempalMcpServer {
                     operation_id,
                     processor: IngestQueueProcessor::Daemon,
                     daemon_enqueue_may_have_reached,
+                    local_fallback_persisted_after_daemon_uncertainty: false,
                 });
             }
 
@@ -6295,6 +6301,7 @@ impl MempalMcpServer {
                     operation_id,
                     processor: IngestQueueProcessor::Local,
                     daemon_enqueue_may_have_reached,
+                    local_fallback_persisted_after_daemon_uncertainty: true,
                 }),
                 Err(error) if anyhow_chain_contains_sqlite_lock(&error) => {
                     if self
@@ -6305,6 +6312,7 @@ impl MempalMcpServer {
                             operation_id,
                             processor: IngestQueueProcessor::Daemon,
                             daemon_enqueue_may_have_reached,
+                            local_fallback_persisted_after_daemon_uncertainty: false,
                         });
                     }
                     Err(error.context(
@@ -6322,6 +6330,7 @@ impl MempalMcpServer {
             operation_id,
             processor: IngestQueueProcessor::Local,
             daemon_enqueue_may_have_reached,
+            local_fallback_persisted_after_daemon_uncertainty: false,
         })
     }
 
@@ -12220,9 +12229,11 @@ mod tests {
 
     #[test]
     fn test_mcp_local_queue_defers_when_daemon_enqueue_may_have_arrived() {
-        assert!(should_defer_local_ingest_to_daemon(false, true));
-        assert!(should_defer_local_ingest_to_daemon(true, false));
-        assert!(!should_defer_local_ingest_to_daemon(false, false));
+        assert!(should_defer_local_ingest_to_daemon(false, true, false));
+        assert!(should_defer_local_ingest_to_daemon(true, false, false));
+        assert!(!should_defer_local_ingest_to_daemon(false, false, false));
+        assert!(!should_defer_local_ingest_to_daemon(false, true, true));
+        assert!(!should_defer_local_ingest_to_daemon(true, false, true));
         assert!(!should_start_local_ingest_worker(
             IngestQueueProcessor::Local,
             true
@@ -12706,7 +12717,7 @@ quality_policy = "llm_required_for_keep"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_mcp_ingest_falls_back_when_daemon_ack_lacks_queryable_operation() {
+    async fn test_mcp_ingest_completes_local_fallback_when_daemon_ack_lacks_queryable_operation() {
         let (tempdir, db_path, server) = setup_server();
         let (listener, _socket_guard) =
             crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
@@ -12725,22 +12736,32 @@ quality_policy = "llm_required_for_keep"
         });
 
         let response = server
-            .mempal_ingest(Parameters(IngestRequest {
-                content: "daemon ACK without durable operation must use local admission"
-                    .to_string(),
-                wing: "mcp".to_string(),
-                room: Some("receipt".to_string()),
-                wait: Some(true),
-                wait_timeout_secs: Some(0),
-                ..IngestRequest::default()
-            }))
+            .mempal_ingest_with_controls(
+                IngestRequest {
+                    content: "daemon ACK without durable operation must complete local fallback"
+                        .to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("receipt".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(10),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
+            )
             .await
-            .expect("ingest admission should recover with local idempotent enqueue")
+            .expect("ingest admission should complete through local idempotent fallback")
             .0;
 
         let request = daemon.await.expect("daemon IPC task");
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        assert!(response.timed_out);
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(!response.timed_out);
+        assert!(
+            !response.created_drawer_ids.is_empty(),
+            "local fallback completion must expose cleanup-safe created ids"
+        );
         let operation_id = response.operation_id.as_deref().expect("operation id");
         assert_eq!(
             operation_id,
@@ -12749,14 +12770,14 @@ quality_policy = "llm_required_for_keep"
         let record = PendingMessageStore::new_without_reclaim(&db_path)
             .operation_status(operation_id)
             .expect("query operation")
-            .expect("returned operation id must be queryable");
+            .expect("returned operation id must be completed");
         assert_eq!(record.id, operation_id);
-        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+        assert_eq!(record.op_state, IngestOperationState::Completed.as_str());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_mcp_ingest_uncertain_daemon_lock_returns_queryable_local_receipt() {
+    async fn test_mcp_ingest_uncertain_daemon_read_failure_completes_local_fallback() {
         let (tempdir, db_path, server) = setup_server();
         let (listener, _socket_guard) =
             crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
@@ -12771,28 +12792,37 @@ quality_policy = "llm_required_for_keep"
         });
 
         let response = tokio::time::timeout(
-            Duration::from_secs(3),
-            server.mempal_ingest(Parameters(IngestRequest {
-                content:
-                    "uncertain daemon enqueue with local SQLite lock waits for durable receipt"
-                        .to_string(),
-                wing: "mcp".to_string(),
-                room: Some("receipt".to_string()),
-                wait: Some(true),
-                wait_timeout_secs: Some(0),
-                ..IngestRequest::default()
-            })),
+            Duration::from_secs(8),
+            server.mempal_ingest_with_controls(
+                IngestRequest {
+                    content:
+                        "uncertain daemon enqueue with local SQLite lock completes local fallback"
+                            .to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("receipt".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(5),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
+            ),
         )
         .await
-        .expect("uncertain daemon lock path should stay bounded by admission retry")
-        .expect("uncertain daemon lock should wait for a durable local operation row")
+        .expect("uncertain daemon lock path should complete within the wait budget")
+        .expect("uncertain daemon lock should complete a durable local operation row")
         .0;
 
         let request = daemon.await.expect("daemon IPC task");
         lock.join().expect("release SQLite lock");
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        assert!(response.timed_out);
-        assert!(response.created_drawer_ids.is_empty());
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(!response.timed_out);
+        assert!(
+            !response.created_drawer_ids.is_empty(),
+            "local fallback completion must expose cleanup-safe created ids"
+        );
         let operation_id = response.operation_id.as_deref().expect("operation id");
         assert_eq!(
             operation_id,
@@ -12801,9 +12831,9 @@ quality_policy = "llm_required_for_keep"
         let record = PendingMessageStore::new_without_reclaim(&db_path)
             .operation_status(operation_id)
             .expect("query operation")
-            .expect("returned operation id must be queryable after lock clears");
+            .expect("returned operation id must be completed after lock clears");
         assert_eq!(record.id, operation_id);
-        assert_eq!(record.op_state, IngestOperationState::Queued.as_str());
+        assert_eq!(record.op_state, IngestOperationState::Completed.as_str());
     }
 
     #[tokio::test]
@@ -13382,6 +13412,19 @@ quality_policy = "llm_required_for_keep"
             .expect("query queued operation")
             .expect("queued operation");
         assert_eq!(record.kind, INGEST_ASYNC_KIND);
+
+        let completed = tokio::time::timeout(
+            Duration::from_secs(8),
+            server.wait_for_operation_completion(operation_id),
+        )
+        .await
+        .expect("stalled daemon IPC local fallback should finish in the background")
+        .expect("stalled daemon IPC local fallback should reach terminal status");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
+        assert!(
+            !completed.created_drawer_ids.is_empty(),
+            "background local fallback must expose cleanup-safe created ids"
+        );
     }
 
     #[tokio::test]

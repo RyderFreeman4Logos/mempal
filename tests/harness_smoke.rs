@@ -328,6 +328,39 @@ async fn mcp_stdio_ingest_stalled_daemon_ipc_keeps_transport_alive() -> Result<(
         Some("queued"),
         "{ingest:#?}"
     );
+    let operation_id = ingest["structuredContent"]["operation_id"]
+        .as_str()
+        .expect("queued ingest operation id")
+        .to_string();
+
+    let mut completed = None;
+    for _ in 0..20 {
+        let status = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call(
+                "tools/call",
+                serde_json::json!({
+                    "name": "mempal_operation_status",
+                    "arguments": {
+                        "operation_id": operation_id.clone(),
+                    },
+                }),
+            ),
+        )
+        .await??;
+        if status["structuredContent"]["state"].as_str() == Some("completed") {
+            completed = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let completed = completed.expect("stalled daemon IPC local fallback should complete");
+    assert!(
+        completed["structuredContent"]["created_drawer_ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty()),
+        "{completed:#?}"
+    );
 
     let recovered_status = tokio::time::timeout(
         Duration::from_secs(5),
