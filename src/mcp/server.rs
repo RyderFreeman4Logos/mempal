@@ -293,6 +293,8 @@ pub struct MempalMcpServer {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum McpIngestSideEffectStage {
+    AfterInsertDrawer,
+    AfterInsertFallbackDrawer,
     Repair,
     Pattern,
 }
@@ -1011,7 +1013,7 @@ impl MempalMcpServer {
         };
         let telemetry_error = outcome.as_ref().err().cloned();
         if let Err(detail) = &outcome
-            && mcp_ingest_failure_is_writer_lease_lost(detail)
+            && mcp_ingest_failure_is_retryable_writer_lease_lost(detail)
         {
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
             let released = match writer_lease {
@@ -1116,7 +1118,7 @@ impl MempalMcpServer {
             Err(error) => Err(error.to_string()),
         };
         if let Err(detail) = &outcome
-            && mcp_ingest_failure_is_writer_lease_lost(detail)
+            && mcp_ingest_failure_is_retryable_writer_lease_lost(detail)
         {
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
             let released = match writer_lease {
@@ -1272,7 +1274,7 @@ impl MempalMcpServer {
             }
         };
         if let Err(detail) = &outcome
-            && mcp_ingest_failure_is_writer_lease_lost(detail)
+            && mcp_ingest_failure_is_retryable_writer_lease_lost(detail)
         {
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
             if let Some(writer_lease) = writer_lease {
@@ -2852,6 +2854,10 @@ impl MempalMcpServer {
                 request.valid_until.as_deref(),
             )
             .map_err(db_error)?;
+            #[cfg(test)]
+            self.run_mcp_ingest_side_effect_hook_for_test(
+                McpIngestSideEffectStage::AfterInsertFallbackDrawer,
+            );
             ensure_mcp_runtime_writer_lease_active(
                 db,
                 runtime_writer_lease,
@@ -7162,6 +7168,10 @@ impl MempalMcpServer {
                         request.valid_until.as_deref(),
                     )
                     .map_err(db_error)?;
+                    #[cfg(test)]
+                    self.run_mcp_ingest_side_effect_hook_for_test(
+                        McpIngestSideEffectStage::AfterInsertDrawer,
+                    );
                     ensure_mcp_runtime_writer_lease_active(
                         &db,
                         runtime_writer_lease,
@@ -10990,9 +11000,25 @@ fn mcp_operation_wait_error_is_missing_pending_admission(error: &ErrorData) -> b
         .contains("operation not found:")
 }
 
-fn mcp_ingest_failure_is_writer_lease_lost(detail: &str) -> bool {
+fn mcp_ingest_failure_is_retryable_writer_lease_lost(detail: &str) -> bool {
     let lower = detail.to_ascii_lowercase();
-    lower.contains("sqlite writer lease") && lower.contains("was lost before")
+    if !(lower.contains("sqlite writer lease") && lower.contains("was lost before")) {
+        return false;
+    }
+
+    const SAFE_RETRY_OPERATIONS: &[&str] = &[
+        "record mcp ingest gating audit",
+        "record mcp ingest llm gating audit",
+        "record mcp ingest tier2 audit",
+        "record mcp ingest fact-check audit",
+        "record mcp ingest novelty audit",
+        "record mcp ingest fallback novelty audit",
+        "insert mcp ingest drawer",
+        "insert mcp ingest fallback drawer",
+    ];
+    SAFE_RETRY_OPERATIONS
+        .iter()
+        .any(|operation| lower.contains(operation))
 }
 
 fn queue_admission_for_uncertain_daemon_enqueue(
@@ -12177,10 +12203,22 @@ mod tests {
 
     #[test]
     fn test_ingest_failure_classifies_writer_lease_lost_as_retryable_claim() {
-        assert!(mcp_ingest_failure_is_writer_lease_lost(
+        assert!(mcp_ingest_failure_is_retryable_writer_lease_lost(
             "Internal error: SQLite writer lease `sqlite-writer` for mempal-daemon-123 was lost before record MCP ingest tier2 audit"
         ));
-        assert!(!mcp_ingest_failure_is_writer_lease_lost(
+        assert!(mcp_ingest_failure_is_retryable_writer_lease_lost(
+            "Internal error: SQLite writer lease `sqlite-writer` for mempal-daemon-123 was lost before insert MCP ingest drawer"
+        ));
+        assert!(!mcp_ingest_failure_is_retryable_writer_lease_lost(
+            "Internal error: SQLite writer lease `sqlite-writer` for mempal-daemon-123 was lost before insert MCP ingest vector"
+        ));
+        assert!(!mcp_ingest_failure_is_retryable_writer_lease_lost(
+            "Internal error: SQLite writer lease `sqlite-writer` for mempal-daemon-123 was lost before insert MCP ingest fallback vector"
+        ));
+        assert!(!mcp_ingest_failure_is_retryable_writer_lease_lost(
+            "Internal error: SQLite writer lease `sqlite-writer` for mempal-daemon-123 was lost before record MCP ingest repair signal"
+        ));
+        assert!(!mcp_ingest_failure_is_retryable_writer_lease_lost(
             "failed to record MCP ingest tier2 audit: malformed row"
         ));
     }
@@ -14368,7 +14406,114 @@ prototypes = ["keep"]
             !completed.created_drawer_ids.is_empty(),
             "retry completion must preserve cleanup-safe created drawer IDs"
         );
+        assert_eq!(
+            vector_row_count(
+                &Database::open(&db_path).expect("open db"),
+                &completed.drawer_id
+            ),
+            1,
+            "retry completion must include the vector row"
+        );
         assert!(completed.failure_detail.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_async_ingest_does_not_retry_writer_lease_lost_after_drawer_before_vector() {
+        let (_tempdir, db_path, server) = setup_server();
+        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let request = IngestRequest {
+            content: "writer lease lost after drawer before vector must not complete".to_string(),
+            wing: "mcp".to_string(),
+            room: Some("lease-lost".to_string()),
+            dry_run: Some(false),
+            wait: Some(true),
+            wait_timeout_secs: Some(10),
+            ..IngestRequest::default()
+        };
+        let project_id = server
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await
+            .expect("resolve project");
+        let prepared = server
+            .prepare_async_ingest_operation(
+                &request,
+                side_effect_controls(),
+                config.as_ref(),
+                compiled_privacy.as_ref(),
+                project_id,
+            )
+            .await
+            .expect("prepare async ingest");
+        let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, &payload)
+            .expect("enqueue async ingest");
+        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
+
+        let lease = acquire_test_ingest_writer_lease(&db_path, "lost-after-drawer-test");
+        let released = Arc::new(AtomicBool::new(false));
+        let hook = {
+            let db_path = db_path.clone();
+            let lease = lease.clone();
+            let released = Arc::clone(&released);
+            Arc::new(move |stage| {
+                if stage == McpIngestSideEffectStage::AfterInsertDrawer
+                    && !released.swap(true, Ordering::SeqCst)
+                {
+                    release_test_ingest_writer_lease(&db_path, &lease);
+                }
+            })
+        };
+        let claim = queue
+            .claim_next_by_kind("worker-lost-after-drawer", 60, INGEST_ASYNC_KIND)
+            .expect("claim queued op")
+            .expect("claimed queued op");
+        server
+            .clone()
+            .with_external_ingest_writer_lease(lease)
+            .with_mcp_ingest_side_effect_hook_for_test(hook)
+            .process_ingest_claim(&async_queue, "worker-lost-after-drawer", claim)
+            .await
+            .expect("post-drawer lease loss should store a failed receipt");
+
+        let failed = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("failed status");
+        assert_eq!(failed.state, Some(IngestOperationState::Failed));
+        assert!(failed.drawer_id.is_empty(), "{failed:?}");
+        assert!(
+            failed
+                .failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("was lost before insert MCP ingest vector")),
+            "{failed:?}"
+        );
+
+        let record = queue
+            .operation_status(&operation_id)
+            .expect("load operation after lost lease")
+            .expect("operation remains durable");
+        assert_eq!(record.op_state, IngestOperationState::Failed.as_str());
+        assert!(record.completed_at.is_some());
+        assert_eq!(
+            Database::open(&db_path)
+                .expect("open db")
+                .drawer_count()
+                .expect("drawer count"),
+            1,
+            "the forced failure happens after the drawer write"
+        );
+        assert_eq!(
+            Database::open(&db_path)
+                .expect("open db")
+                .vector_row_count()
+                .expect("vector row count"),
+            0,
+            "failed receipt must not be mistaken for successful vector-backed ingest"
+        );
+        assert!(released.load(Ordering::SeqCst));
     }
 
     fn recreate_vectors_with_metric(db_path: &Path, metric: &str) {
