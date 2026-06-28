@@ -1010,6 +1010,25 @@ impl MempalMcpServer {
             Err(error) => Err(error.to_string()),
         };
         let telemetry_error = outcome.as_ref().err().cloned();
+        if let Err(detail) = &outcome
+            && mcp_ingest_failure_is_writer_lease_lost(detail)
+        {
+            Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+            let released = match writer_lease {
+                Some(writer_lease) => writer_lease.release().await,
+                None => Ok(()),
+            };
+            let claim_released = Self::release_claim_with_lock_retry(queue, claim)
+                .await
+                .context("failed to release ingest claim after writer lease was lost");
+            let result = claim_released.and(released);
+            match &result {
+                Ok(()) => span.finish_error_class("writer_lease_lost"),
+                Err(error) => span.finish_error(error),
+            }
+            tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+            return result;
+        }
 
         Self::refresh_ingest_claim_heartbeat_once(queue, &claim.id, worker_id).await;
         let completed = self
@@ -1096,6 +1115,21 @@ impl MempalMcpServer {
             Ok(Err(error)) => Err(error.to_string()),
             Err(error) => Err(error.to_string()),
         };
+        if let Err(detail) = &outcome
+            && mcp_ingest_failure_is_writer_lease_lost(detail)
+        {
+            Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+            let released = match writer_lease {
+                Some(writer_lease) => writer_lease.release().await,
+                None => Ok(()),
+            };
+            Self::release_claim_with_lock_retry(queue, claim)
+                .await
+                .context("failed to release scoped ingest claim after writer lease was lost")?;
+            released?;
+            tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+            return Ok(());
+        }
 
         Self::refresh_ingest_claim_heartbeat_once(queue, &claim.id, worker_id).await;
         let completed = self
@@ -1237,6 +1271,23 @@ impl MempalMcpServer {
                 return Ok(ScopedIngestProcessResult::TimedOut);
             }
         };
+        if let Err(detail) = &outcome
+            && mcp_ingest_failure_is_writer_lease_lost(detail)
+        {
+            Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+            if let Some(writer_lease) = writer_lease {
+                let _ = writer_lease.release().await;
+            }
+            let release_deadline = scoped_process_remaining(started, budget).unwrap_or_default();
+            Self::release_claim_with_lock_retry_deadline(
+                queue,
+                claim,
+                release_deadline.min(CLAIM_LOCK_RETRY_DEADLINE),
+            )
+            .await
+            .context("failed to release scoped ingest claim after writer lease was lost")?;
+            return Ok(ScopedIngestProcessResult::ReleasedForRetry);
+        }
 
         Self::refresh_ingest_claim_heartbeat_once(queue, &claim.id, worker_id).await;
         let completed = self
@@ -10939,6 +10990,11 @@ fn mcp_operation_wait_error_is_missing_pending_admission(error: &ErrorData) -> b
         .contains("operation not found:")
 }
 
+fn mcp_ingest_failure_is_writer_lease_lost(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("sqlite writer lease") && lower.contains("was lost before")
+}
+
 fn queue_admission_for_uncertain_daemon_enqueue(
     idempotency_key: &str,
     daemon_enqueue_may_have_reached: bool,
@@ -12116,6 +12172,16 @@ mod tests {
         assert!(mcp_operation_wait_error_is_ignorable_during_wait(
             &pending_admission,
             true
+        ));
+    }
+
+    #[test]
+    fn test_ingest_failure_classifies_writer_lease_lost_as_retryable_claim() {
+        assert!(mcp_ingest_failure_is_writer_lease_lost(
+            "Internal error: SQLite writer lease `sqlite-writer` for mempal-daemon-123 was lost before record MCP ingest tier2 audit"
+        ));
+        assert!(!mcp_ingest_failure_is_writer_lease_lost(
+            "failed to record MCP ingest tier2 audit: malformed row"
         ));
     }
 
@@ -14205,6 +14271,104 @@ pattern_boost = 0.2
             .expect("operation record exists");
         assert_eq!(record.op_state, IngestOperationState::Failed.as_str());
         assert!(record.completed_at.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_async_ingest_retries_when_writer_lease_lost_before_tier2_audit() {
+        let _config_guard = ConfigOverrideGuard::install(
+            r#"
+[gating]
+enabled = true
+
+[gating.embedding_classifier]
+enabled = true
+threshold = 0.8
+prototypes = ["keep"]
+"#,
+        )
+        .await;
+        let (_tempdir, db_path, server) = setup_server();
+        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let request = IngestRequest {
+            content: "writer lease lost before tier2 audit should retry".to_string(),
+            wing: "mcp".to_string(),
+            room: Some("lease-lost".to_string()),
+            dry_run: Some(false),
+            wait: Some(true),
+            wait_timeout_secs: Some(10),
+            ..IngestRequest::default()
+        };
+        let project_id = server
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await
+            .expect("resolve project");
+        let prepared = server
+            .prepare_async_ingest_operation(
+                &request,
+                IngestControls::default(),
+                config.as_ref(),
+                compiled_privacy.as_ref(),
+                project_id,
+            )
+            .await
+            .expect("prepare async ingest");
+        let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, &payload)
+            .expect("enqueue async ingest");
+        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
+
+        let stale_lease = acquire_test_ingest_writer_lease(&db_path, "lost-tier2-audit-test");
+        release_test_ingest_writer_lease(&db_path, &stale_lease);
+        let first_claim = queue
+            .claim_next_by_kind("worker-lost-lease", 60, INGEST_ASYNC_KIND)
+            .expect("claim queued op")
+            .expect("claimed queued op");
+        server
+            .clone()
+            .with_external_ingest_writer_lease(stale_lease)
+            .process_ingest_claim(&async_queue, "worker-lost-lease", first_claim)
+            .await
+            .expect("lost writer lease should release claim for retry");
+
+        let queued = queue
+            .operation_status(&operation_id)
+            .expect("load operation after lost lease")
+            .expect("operation remains durable");
+        assert_eq!(queued.op_state, IngestOperationState::Queued.as_str());
+        assert!(queued.completed_at.is_none());
+        assert!(queued.failure_detail.is_none());
+        assert_eq!(
+            Database::open(&db_path)
+                .expect("open db")
+                .drawer_count()
+                .expect("drawer count"),
+            0,
+            "lost lease before audit must not lose content into a terminal failed receipt"
+        );
+
+        let retry_claim = queue
+            .claim_next_by_kind("worker-retry-lease", 60, INGEST_ASYNC_KIND)
+            .expect("claim retry op")
+            .expect("retry claim remains available");
+        server
+            .process_ingest_claim(&async_queue, "worker-retry-lease", retry_claim)
+            .await
+            .expect("retry should complete after reacquiring writer lease");
+
+        let completed = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("completed status");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
+        assert!(!completed.drawer_id.is_empty());
+        assert_eq!(completed.drawer_ids, completed.created_drawer_ids);
+        assert!(
+            !completed.created_drawer_ids.is_empty(),
+            "retry completion must preserve cleanup-safe created drawer IDs"
+        );
+        assert!(completed.failure_detail.is_none());
     }
 
     fn recreate_vectors_with_metric(db_path: &Path, metric: &str) {
