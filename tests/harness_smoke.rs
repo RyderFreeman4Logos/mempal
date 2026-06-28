@@ -272,6 +272,114 @@ async fn mcp_stdio_ingest_succeeds_with_existing_status_holder() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn mcp_stdio_ingest_stalled_daemon_ipc_keeps_transport_alive() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let mempal_home = tmp.path().join(".mempal");
+    fs::create_dir_all(&mempal_home)?;
+    let db_path = mempal_home.join("palace.db");
+    Database::open(&db_path)?;
+
+    let listener = tokio::net::UnixListener::bind(mempal_home.join("daemon-hook.sock"))?;
+    let fake_daemon = tokio::spawn(async move {
+        if let Ok((_stream, _addr)) = listener.accept().await {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    });
+
+    let mut client = McpStdio::start(&db_path, HashMap::new()).await?;
+    client.initialize().await?;
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call(
+            "tools/call",
+            serde_json::json!({
+                "name": "mempal_status",
+                "arguments": {},
+            }),
+        ),
+    )
+    .await??;
+    assert!(status["structuredContent"].is_object());
+
+    let ingest = tokio::time::timeout(
+        Duration::from_secs(6),
+        client.call(
+            "tools/call",
+            serde_json::json!({
+                "name": "mempal_ingest",
+                "arguments": {
+                    "content": "issue 597 normal case stalled daemon IPC regression payload",
+                    "wing": "verbatim",
+                    "room": "bugfixes",
+                    "source_type": "agent_observation",
+                    "memory_kind": "case",
+                    "domain": "project",
+                    "field": "software-engineering",
+                    "source_file": "/home/obj/project/github/RyderFreeman4Logos/verbatim/crates/verbatim-daemon/src/main.rs",
+                    "wait": false
+                },
+            }),
+        ),
+    )
+    .await??;
+    assert_eq!(
+        ingest["structuredContent"]["state"].as_str(),
+        Some("queued"),
+        "{ingest:#?}"
+    );
+    let operation_id = ingest["structuredContent"]["operation_id"]
+        .as_str()
+        .expect("queued ingest operation id")
+        .to_string();
+
+    let mut completed = None;
+    for _ in 0..20 {
+        let status = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call(
+                "tools/call",
+                serde_json::json!({
+                    "name": "mempal_operation_status",
+                    "arguments": {
+                        "operation_id": operation_id.clone(),
+                    },
+                }),
+            ),
+        )
+        .await??;
+        if status["structuredContent"]["state"].as_str() == Some("completed") {
+            completed = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let completed = completed.expect("stalled daemon IPC local fallback should complete");
+    assert!(
+        completed["structuredContent"]["created_drawer_ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty()),
+        "{completed:#?}"
+    );
+
+    let recovered_status = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call(
+            "tools/call",
+            serde_json::json!({
+                "name": "mempal_status",
+                "arguments": {},
+            }),
+        ),
+    )
+    .await??;
+    assert!(recovered_status["structuredContent"].is_object());
+
+    fake_daemon.abort();
+    client.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn harness_integration_smoke() -> Result<()> {
     let tmp = TempDir::new()?;
