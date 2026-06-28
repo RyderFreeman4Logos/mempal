@@ -31,7 +31,7 @@ use crate::core::{
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
     queue::{
         AsyncPendingMessageStore, CLAIM_LOCK_RETRY_DEADLINE, ClaimedMessage, PendingMessageStore,
-        QueueError,
+        PendingOperationCompletion, QueueError,
     },
     reindex::ReindexProgressStore,
     remote_calls::{
@@ -1041,6 +1041,7 @@ impl MempalMcpServer {
                 queue_wait_ms,
                 outcome,
                 MCP_INGEST_RESULT_RETRY_DEADLINE,
+                false,
             )
             .await;
         Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
@@ -1148,6 +1149,7 @@ impl MempalMcpServer {
                 queue_wait_ms,
                 outcome,
                 MCP_INGEST_RESULT_RETRY_DEADLINE,
+                false,
             )
             .await;
         Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
@@ -1179,7 +1181,8 @@ impl MempalMcpServer {
                     &claim,
                     queue_wait_ms,
                     detail,
-                    completion_deadline,
+                    completion_deadline.saturating_sub(MCP_SCOPED_INGEST_CLAIM_CLEANUP_MARGIN),
+                    true,
                 )
                 .await
                 {
@@ -1332,6 +1335,7 @@ impl MempalMcpServer {
                 queue_wait_ms,
                 outcome,
                 completion_deadline,
+                true,
             )
             .await;
         Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
@@ -1351,6 +1355,7 @@ impl MempalMcpServer {
         queue_wait_ms: u64,
         outcome: std::result::Result<IngestResponse, String>,
         result_retry_deadline: Duration,
+        bound_attempt_busy_timeout: bool,
     ) -> anyhow::Result<()> {
         match outcome {
             Ok(mut response) => {
@@ -1390,7 +1395,7 @@ impl MempalMcpServer {
                 complete_ingest_operation_with_lock_retry_deadline(
                     queue,
                     claim,
-                    IngestOperationCompletion {
+                    PendingOperationCompletion {
                         op_state: state.as_str().to_string(),
                         result_drawer_id: result_drawer_id.map(ToOwned::to_owned),
                         rejected_reason: rejected_reason.clone(),
@@ -1398,6 +1403,7 @@ impl MempalMcpServer {
                         result_json: Some(result_json),
                     },
                     result_retry_deadline,
+                    bound_attempt_busy_timeout,
                 )
                 .await
                 .map_err(|error| {
@@ -1411,6 +1417,7 @@ impl MempalMcpServer {
                     queue_wait_ms,
                     detail,
                     result_retry_deadline,
+                    bound_attempt_busy_timeout,
                 )
                 .await?;
             }
@@ -11208,14 +11215,6 @@ fn queue_wait_ms(created_at_secs: i64, claimed_at_secs: i64) -> u64 {
         .saturating_mul(1_000) as u64
 }
 
-struct IngestOperationCompletion {
-    op_state: String,
-    result_drawer_id: Option<String>,
-    rejected_reason: Option<String>,
-    failure_detail: Option<String>,
-    result_json: Option<String>,
-}
-
 async fn complete_failed_ingest_claim(
     queue: &AsyncPendingMessageStore,
     claim: &ClaimedMessage,
@@ -11228,6 +11227,7 @@ async fn complete_failed_ingest_claim(
         queue_wait_ms,
         detail,
         MCP_INGEST_RESULT_RETRY_DEADLINE,
+        false,
     )
     .await
 }
@@ -11238,6 +11238,7 @@ async fn complete_failed_ingest_claim_with_lock_retry_deadline(
     queue_wait_ms: u64,
     detail: String,
     result_retry_deadline: Duration,
+    bound_attempt_busy_timeout: bool,
 ) -> anyhow::Result<()> {
     let mut finalized =
         finalize_failed_ingest_response(claim.id.clone(), claim.created_at, detail.clone());
@@ -11249,7 +11250,7 @@ async fn complete_failed_ingest_claim_with_lock_retry_deadline(
     complete_ingest_operation_with_lock_retry_deadline(
         queue,
         claim,
-        IngestOperationCompletion {
+        PendingOperationCompletion {
             op_state: IngestOperationState::Failed.as_str().to_string(),
             result_drawer_id: None,
             rejected_reason: None,
@@ -11257,6 +11258,7 @@ async fn complete_failed_ingest_claim_with_lock_retry_deadline(
             result_json: Some(result_json),
         },
         result_retry_deadline,
+        bound_attempt_busy_timeout,
     )
     .await
     .map_err(|error| anyhow::Error::new(error).context("failed to store async ingest failure"))?;
@@ -11266,20 +11268,20 @@ async fn complete_failed_ingest_claim_with_lock_retry_deadline(
 async fn complete_ingest_operation_with_lock_retry_deadline(
     queue: &AsyncPendingMessageStore,
     claim: &ClaimedMessage,
-    completion: IngestOperationCompletion,
+    completion: PendingOperationCompletion,
     retry_deadline: Duration,
+    bound_attempt_busy_timeout: bool,
 ) -> crate::core::queue::Result<()> {
     let started = Instant::now();
     loop {
+        let remaining = retry_deadline.saturating_sub(started.elapsed());
+        let busy_timeout = if bound_attempt_busy_timeout {
+            Some(MCP_INGEST_RESULT_RETRY_DELAY.min(remaining))
+        } else {
+            None
+        };
         match queue
-            .complete_operation(
-                claim.clone(),
-                completion.op_state.clone(),
-                completion.result_drawer_id.clone(),
-                completion.rejected_reason.clone(),
-                completion.failure_detail.clone(),
-                completion.result_json.clone(),
-            )
+            .complete_operation_with_busy_timeout(claim.clone(), completion.clone(), busy_timeout)
             .await
         {
             Ok(()) => return Ok(()),
@@ -14499,6 +14501,75 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_scoped_finite_completion_real_sqlite_lock_respects_budget() {
+        let (_tempdir, db_path, server) = setup_server();
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, "{}")
+            .expect("enqueue async ingest");
+        let claim = queue
+            .claim_next_by_kind("worker-real-complete-lock", 60, INGEST_ASYNC_KIND)
+            .expect("claim queued op")
+            .expect("claimed queued op");
+        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
+        let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_secs(2));
+        let response = IngestResponse {
+            operation_id: None,
+            accepted_at: None,
+            state: None,
+            timed_out: false,
+            drawer_id: "drawer-real-complete-lock".to_string(),
+            drawer_ids: vec!["drawer-real-complete-lock".to_string()],
+            created_drawer_ids: vec!["drawer-real-complete-lock".to_string()],
+            chunk_count: 1,
+            dropped: false,
+            gating_decision: None,
+            novelty_action: None,
+            near_drawer_id: None,
+            duplicate_warning: None,
+            lock_wait_ms: None,
+            superseded_drawer_id: None,
+            rejected_reason: None,
+            failure_detail: None,
+            timings: BTreeMap::new(),
+            fact_check_warnings: Vec::new(),
+            system_warnings: Vec::new(),
+        };
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            server.complete_ingest_claim_outcome(
+                &async_queue,
+                &claim,
+                queue_wait_ms(claim.created_at, claim.claimed_at),
+                Ok(response),
+                Duration::from_secs(1),
+                true,
+            ),
+        )
+        .await
+        .expect("finite scoped completion must not wait for SQLite's default busy timeout");
+        let error =
+            result.expect_err("real locked completion receipt should return a bounded error");
+        assert!(
+            anyhow_chain_contains_sqlite_lock(&error),
+            "bounded completion error should preserve the SQLite lock source: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "finite scoped completion waited for the default SQLite busy timeout"
+        );
+        lock.join().expect("lock thread");
+        let record = queue
+            .operation_status(&operation_id)
+            .expect("load operation record")
+            .expect("operation record exists");
+        assert_eq!(record.op_state, IngestOperationState::Running.as_str());
+        assert!(record.completed_at.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_async_ingest_uses_admission_supersedes_target_after_queue_wait() {
         let (_tempdir, db_path, server) = setup_server();
         let seed_id = "async-supersedes-old";
@@ -14682,6 +14753,52 @@ pattern_boost = 0.2
             record.claimed_at.is_none(),
             "malformed payload must release the claim when failure receipt persistence times out"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_scoped_finite_malformed_payload_real_sqlite_lock_respects_budget() {
+        let (_tempdir, db_path, server) = setup_server();
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, "{not json")
+            .expect("enqueue malformed async ingest");
+        let claim = queue
+            .claim_next_by_kind("worker-real-failure-lock", 60, INGEST_ASYNC_KIND)
+            .expect("claim malformed op")
+            .expect("claimed malformed op");
+        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
+        let lock = hold_sqlite_write_lock(db_path.clone(), Duration::from_secs(2));
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            server.process_ingest_claim_inline_with_budget(
+                &async_queue,
+                "worker-real-failure-lock",
+                claim,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("finite scoped failure receipt must not wait for SQLite's default busy timeout");
+        let error = result.expect_err("real locked failure receipt should return a bounded error");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to release timed-out scoped ingest claim"),
+            "{error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "finite scoped malformed-payload completion waited for the default SQLite busy timeout"
+        );
+        lock.join().expect("lock thread");
+        let record = queue
+            .operation_status(&operation_id)
+            .expect("load operation record")
+            .expect("operation record exists");
+        assert_eq!(record.op_state, IngestOperationState::Running.as_str());
+        assert!(record.completed_at.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

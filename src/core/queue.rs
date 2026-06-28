@@ -86,6 +86,15 @@ pub struct PendingOperationRecord {
     pub result_json: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingOperationCompletion {
+    pub op_state: String,
+    pub result_drawer_id: Option<String>,
+    pub rejected_reason: Option<String>,
+    pub failure_detail: Option<String>,
+    pub result_json: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueueStats {
     pub pending: u64,
@@ -462,6 +471,26 @@ impl AsyncPendingMessageStore {
         failure_detail: Option<String>,
         result_json: Option<String>,
     ) -> Result<()> {
+        self.complete_operation_with_busy_timeout(
+            claim,
+            PendingOperationCompletion {
+                op_state,
+                result_drawer_id,
+                rejected_reason,
+                failure_detail,
+                result_json,
+            },
+            None,
+        )
+        .await
+    }
+
+    pub async fn complete_operation_with_busy_timeout(
+        &self,
+        claim: ClaimedMessage,
+        completion: PendingOperationCompletion,
+        busy_timeout: Option<Duration>,
+    ) -> Result<()> {
         #[cfg(any(test, feature = "db-test-seam"))]
         if self
             .complete_lock_failures
@@ -473,14 +502,7 @@ impl AsyncPendingMessageStore {
             return Err(sqlite_busy_queue_error());
         }
         self.run(move |store| {
-            store.complete_operation(
-                &claim,
-                &op_state,
-                result_drawer_id.as_deref(),
-                rejected_reason.as_deref(),
-                failure_detail.as_deref(),
-                result_json.as_deref(),
-            )
+            store.complete_operation_with_busy_timeout(&claim, completion, busy_timeout)
         })
         .await
     }
@@ -1017,8 +1039,31 @@ impl PendingMessageStore {
         failure_detail: Option<&str>,
         result_json: Option<&str>,
     ) -> Result<()> {
-        let mut conn = self.open_connection()?;
+        self.complete_operation_with_busy_timeout(
+            claim,
+            PendingOperationCompletion {
+                op_state: op_state.to_owned(),
+                result_drawer_id: result_drawer_id.map(str::to_owned),
+                rejected_reason: rejected_reason.map(str::to_owned),
+                failure_detail: failure_detail.map(str::to_owned),
+                result_json: result_json.map(str::to_owned),
+            },
+            None,
+        )
+    }
+
+    pub fn complete_operation_with_busy_timeout(
+        &self,
+        claim: &ClaimedMessage,
+        completion: PendingOperationCompletion,
+        busy_timeout: Option<Duration>,
+    ) -> Result<()> {
+        let mut conn = self.open_connection_with_busy_timeout(busy_timeout)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result_drawer_id = completion.result_drawer_id.as_deref();
+        let rejected_reason = completion.rejected_reason.as_deref();
+        let failure_detail = completion.failure_detail.as_deref();
+        let result_json = completion.result_json.as_deref();
         let updated = tx.execute(
             r#"
             UPDATE pending_messages
@@ -1031,7 +1076,7 @@ impl PendingMessageStore {
             "#,
             params![
                 claim.id,
-                op_state,
+                completion.op_state,
                 result_drawer_id,
                 rejected_reason,
                 failure_detail,
@@ -1042,7 +1087,7 @@ impl PendingMessageStore {
         if updated == 0 {
             return Err(claim_miss_error(&tx, &claim.id)?);
         }
-        confirm_in_tx(&tx, claim, op_state)?;
+        confirm_in_tx(&tx, claim, &completion.op_state)?;
         tx.commit()?;
         Ok(())
     }
