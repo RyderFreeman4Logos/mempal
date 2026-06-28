@@ -2125,9 +2125,7 @@ impl MempalMcpServer {
         poll_interval: Duration,
         claim_policy: ScopedIngestClaimPolicy,
     ) -> std::result::Result<Option<IngestResponse>, ErrorData> {
-        if claim_policy == ScopedIngestClaimPolicy::PollOnly
-            || !should_claim_scoped_ingest_worker(self.daemon_ingest_ipc_available())
-        {
+        if claim_policy == ScopedIngestClaimPolicy::PollOnly {
             return self
                 .wait_for_operation_status(operation_id, timeout, poll_interval)
                 .await;
@@ -2174,9 +2172,7 @@ impl MempalMcpServer {
                 tokio::time::sleep(poll_interval.min(remaining)).await;
                 continue;
             }
-            if self.daemon_ingest_ipc_available()
-                || self.daemon_writer_lease_visible_for_ingest_wait().await
-            {
+            if self.daemon_writer_lease_visible_for_ingest_wait().await {
                 tokio::time::sleep(poll_interval.min(remaining)).await;
                 continue;
             }
@@ -3236,8 +3232,15 @@ fn should_start_local_ingest_worker(
     matches!(processor, IngestQueueProcessor::Local) && !defer_to_daemon_ingest_worker
 }
 
-fn should_claim_scoped_ingest_worker(defer_to_daemon_ingest_worker: bool) -> bool {
-    !defer_to_daemon_ingest_worker
+fn should_use_scoped_ingest_wait_worker(
+    processor: IngestQueueProcessor,
+    worker_mode: IngestWaitWorkerMode,
+    claim_policy: ScopedIngestClaimPolicy,
+    use_local_ingest_worker: bool,
+) -> bool {
+    claim_policy != ScopedIngestClaimPolicy::PollOnly
+        && ((use_local_ingest_worker && matches!(worker_mode, IngestWaitWorkerMode::Scoped))
+            || matches!(processor, IngestQueueProcessor::Daemon))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6059,10 +6062,12 @@ impl MempalMcpServer {
                     queue_admission.daemon_enqueue_may_have_reached,
                 )
                 .await
-            } else if use_local_ingest_worker
-                && matches!(worker_mode, IngestWaitWorkerMode::Scoped)
-                && claim_policy != ScopedIngestClaimPolicy::PollOnly
-            {
+            } else if should_use_scoped_ingest_wait_worker(
+                queue_admission.processor,
+                worker_mode,
+                claim_policy,
+                use_local_ingest_worker,
+            ) {
                 self.wait_for_operation_status_with_scoped_worker_mode(
                     operation_id,
                     wait_remaining,
@@ -12086,13 +12091,40 @@ mod tests {
             IngestQueueProcessor::Local,
             true
         ));
-        assert!(!should_claim_scoped_ingest_worker(true));
+        assert!(should_use_scoped_ingest_wait_worker(
+            IngestQueueProcessor::Daemon,
+            IngestWaitWorkerMode::Background,
+            ScopedIngestClaimPolicy::InlineWithinDeadline,
+            false,
+        ));
     }
 
     #[test]
-    fn test_operation_wait_uses_daemon_worker_when_daemon_ipc_is_live() {
-        assert!(should_claim_scoped_ingest_worker(false));
-        assert!(!should_claim_scoped_ingest_worker(true));
+    fn test_operation_wait_can_scope_claim_daemon_admitted_operation() {
+        assert!(should_use_scoped_ingest_wait_worker(
+            IngestQueueProcessor::Daemon,
+            IngestWaitWorkerMode::Background,
+            ScopedIngestClaimPolicy::InlineWithinDeadline,
+            false,
+        ));
+        assert!(should_use_scoped_ingest_wait_worker(
+            IngestQueueProcessor::Local,
+            IngestWaitWorkerMode::Scoped,
+            ScopedIngestClaimPolicy::InlineWithinDeadline,
+            true,
+        ));
+        assert!(!should_use_scoped_ingest_wait_worker(
+            IngestQueueProcessor::Local,
+            IngestWaitWorkerMode::Background,
+            ScopedIngestClaimPolicy::InlineWithinDeadline,
+            true,
+        ));
+        assert!(!should_use_scoped_ingest_wait_worker(
+            IngestQueueProcessor::Daemon,
+            IngestWaitWorkerMode::Background,
+            ScopedIngestClaimPolicy::PollOnly,
+            false,
+        ));
     }
 
     #[test]
@@ -12446,6 +12478,74 @@ quality_policy = "llm_required_for_keep"
             .expect("daemon-accepted operation must be status-queryable");
         assert_eq!(local_record.id, operation_id);
         assert_eq!(local_record.op_state, IngestOperationState::Queued.as_str());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_mcp_ingest_wait_completes_daemon_admitted_operation_without_daemon_worker() {
+        let (tempdir, db_path, server) = setup_server();
+        let (listener, _socket_guard) =
+            crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
+        let daemon_db_path = db_path.clone();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
+            let request = crate::hook_ipc::read_enqueue_request(&mut stream)
+                .await
+                .expect("read daemon IPC request");
+            let operation_id = PendingMessageStore::new_without_reclaim(&daemon_db_path)
+                .enqueue_idempotent_with_key(
+                    &request.kind,
+                    &request.payload,
+                    &request.idempotency_key,
+                )
+                .expect("persist daemon-admitted operation");
+            crate::hook_ipc::write_enqueue_response(
+                &mut stream,
+                &crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
+            )
+            .await
+            .expect("write daemon IPC response");
+            (request, operation_id)
+        });
+
+        let response = server
+            .mempal_ingest_with_controls(
+                IngestRequest {
+                    content: "daemon-admitted MCP wait caller completes receipt".to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("daemon-wait-receipt".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(10),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
+            )
+            .await
+            .expect("daemon-admitted wait should complete through scoped worker")
+            .0;
+
+        let (request, operation_id) = daemon.await.expect("daemon IPC task");
+        assert_eq!(request.kind, INGEST_ASYNC_KIND);
+        assert_eq!(
+            response.operation_id.as_deref(),
+            Some(operation_id.as_str())
+        );
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(!response.timed_out);
+        assert!(
+            !response.created_drawer_ids.is_empty(),
+            "completed daemon-backed wait must return cleanup-safe created drawer ids"
+        );
+
+        let status = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("completed operation status");
+        assert_eq!(status.state, Some(IngestOperationState::Completed));
+        assert_eq!(status.created_drawer_ids, response.created_drawer_ids);
     }
 
     #[cfg(unix)]
