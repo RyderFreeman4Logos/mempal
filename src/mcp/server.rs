@@ -271,6 +271,8 @@ pub struct MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     ingest_warning_snapshot_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
+    query_only_read_delay: Option<Duration>,
+    #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_error: Option<String>,
     #[cfg(any(test, feature = "db-test-seam"))]
     daemon_writer_lease_check_error: Option<String>,
@@ -519,6 +521,8 @@ impl MempalMcpServer {
             #[cfg(any(test, feature = "db-test-seam"))]
             ingest_warning_snapshot_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
+            query_only_read_delay: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_error: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             daemon_writer_lease_check_error: None,
@@ -580,6 +584,12 @@ impl MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_ingest_warning_snapshot_delay_for_test(mut self, delay: Duration) -> Self {
         self.ingest_warning_snapshot_delay = Some(delay);
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_query_only_read_delay_for_test(mut self, delay: Duration) -> Self {
+        self.query_only_read_delay = Some(delay);
         self
     }
 
@@ -1663,8 +1673,21 @@ impl MempalMcpServer {
         F: FnOnce(&Database) -> std::result::Result<R, ErrorData> + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if let Some(error) = self.async_db_open_error.as_deref() {
+            return Err(ErrorData::internal_error(
+                format!("{stage} failed to open database: {error}"),
+                None,
+            ));
+        }
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let query_only_read_delay = self.query_only_read_delay;
         let db_path = self.db_path.clone();
         let read = tokio::task::spawn_blocking(move || {
+            #[cfg(any(test, feature = "db-test-seam"))]
+            if let Some(delay) = query_only_read_delay {
+                std::thread::sleep(delay);
+            }
             let db = Database::open_query_only(&db_path).map_err(|error| {
                 ErrorData::internal_error(format!("{stage} failed to open database: {error}"), None)
             })?;
@@ -2118,9 +2141,7 @@ impl MempalMcpServer {
         poll_interval: Duration,
         claim_policy: ScopedIngestClaimPolicy,
     ) -> std::result::Result<Option<IngestResponse>, ErrorData> {
-        if claim_policy == ScopedIngestClaimPolicy::PollOnly
-            || !should_claim_scoped_ingest_worker(self.daemon_ingest_ipc_available())
-        {
+        if claim_policy == ScopedIngestClaimPolicy::PollOnly {
             return self
                 .wait_for_operation_status(operation_id, timeout, poll_interval)
                 .await;
@@ -2167,9 +2188,7 @@ impl MempalMcpServer {
                 tokio::time::sleep(poll_interval.min(remaining)).await;
                 continue;
             }
-            if self.daemon_ingest_ipc_available()
-                || self.daemon_writer_lease_visible_for_ingest_wait().await
-            {
+            if self.daemon_writer_lease_visible_for_ingest_wait().await {
                 tokio::time::sleep(poll_interval.min(remaining)).await;
                 continue;
             }
@@ -3229,8 +3248,15 @@ fn should_start_local_ingest_worker(
     matches!(processor, IngestQueueProcessor::Local) && !defer_to_daemon_ingest_worker
 }
 
-fn should_claim_scoped_ingest_worker(defer_to_daemon_ingest_worker: bool) -> bool {
-    !defer_to_daemon_ingest_worker
+fn should_use_scoped_ingest_wait_worker(
+    processor: IngestQueueProcessor,
+    worker_mode: IngestWaitWorkerMode,
+    claim_policy: ScopedIngestClaimPolicy,
+    use_local_ingest_worker: bool,
+) -> bool {
+    claim_policy != ScopedIngestClaimPolicy::PollOnly
+        && ((use_local_ingest_worker && matches!(worker_mode, IngestWaitWorkerMode::Scoped))
+            || matches!(processor, IngestQueueProcessor::Daemon))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6038,10 +6064,12 @@ impl MempalMcpServer {
                     queue_admission.daemon_enqueue_may_have_reached,
                 )
                 .await
-            } else if use_local_ingest_worker
-                && matches!(worker_mode, IngestWaitWorkerMode::Scoped)
-                && claim_policy != ScopedIngestClaimPolicy::PollOnly
-            {
+            } else if should_use_scoped_ingest_wait_worker(
+                queue_admission.processor,
+                worker_mode,
+                claim_policy,
+                use_local_ingest_worker,
+            ) {
                 self.wait_for_operation_status_with_scoped_worker_mode(
                     operation_id,
                     wait_remaining,
@@ -6891,7 +6919,12 @@ impl MempalMcpServer {
 
         let embedding_started = Instant::now();
         let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.as_str()).collect();
-        let vectors = if first_vector.is_some() && chunks.len() == 1 {
+        let vectors = if request.smoke.unwrap_or(false) && no_gate && bypass_novelty {
+            let dim = current_vector_dim(&db)
+                .map_err(db_error)?
+                .unwrap_or_else(|| embedder.dimensions());
+            deterministic_smoke_vectors(&chunks, dim)
+        } else if first_vector.is_some() && chunks.len() == 1 {
             vec![first_vector.take().expect("checked Some")]
         } else if let Some(fv) = first_vector.take() {
             if chunks.len() > 1 {
@@ -10573,6 +10606,38 @@ fn current_vector_dim(
     Ok(dimension)
 }
 
+fn deterministic_smoke_vectors(chunks: &[String], dim: usize) -> Vec<Vec<f32>> {
+    chunks
+        .iter()
+        .map(|chunk| deterministic_smoke_vector(chunk, dim))
+        .collect()
+}
+
+fn deterministic_smoke_vector(content: &str, dim: usize) -> Vec<f32> {
+    if dim == 0 {
+        return Vec::new();
+    }
+    let hash = blake3::hash(content.as_bytes());
+    let hash_bytes = hash.as_bytes();
+    let mut vector = Vec::with_capacity(dim);
+    for index in 0..dim {
+        let byte = hash_bytes[index % hash_bytes.len()];
+        let value = (f32::from(byte) / 255.0) * 2.0 - 1.0;
+        vector.push(if value.abs() < f32::EPSILON {
+            0.003_921_569
+        } else {
+            value
+        });
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
+}
+
 fn degraded_write_error() -> ErrorData {
     let warnings = current_system_warnings();
     let message = "mempal embed backend degraded; writes are paused until recovery. Read operations remain available.";
@@ -11979,13 +12044,40 @@ mod tests {
             IngestQueueProcessor::Local,
             true
         ));
-        assert!(!should_claim_scoped_ingest_worker(true));
+        assert!(should_use_scoped_ingest_wait_worker(
+            IngestQueueProcessor::Daemon,
+            IngestWaitWorkerMode::Background,
+            ScopedIngestClaimPolicy::InlineWithinDeadline,
+            false,
+        ));
     }
 
     #[test]
-    fn test_operation_wait_uses_daemon_worker_when_daemon_ipc_is_live() {
-        assert!(should_claim_scoped_ingest_worker(false));
-        assert!(!should_claim_scoped_ingest_worker(true));
+    fn test_operation_wait_can_scope_claim_daemon_admitted_operation() {
+        assert!(should_use_scoped_ingest_wait_worker(
+            IngestQueueProcessor::Daemon,
+            IngestWaitWorkerMode::Background,
+            ScopedIngestClaimPolicy::InlineWithinDeadline,
+            false,
+        ));
+        assert!(should_use_scoped_ingest_wait_worker(
+            IngestQueueProcessor::Local,
+            IngestWaitWorkerMode::Scoped,
+            ScopedIngestClaimPolicy::InlineWithinDeadline,
+            true,
+        ));
+        assert!(!should_use_scoped_ingest_wait_worker(
+            IngestQueueProcessor::Local,
+            IngestWaitWorkerMode::Background,
+            ScopedIngestClaimPolicy::InlineWithinDeadline,
+            true,
+        ));
+        assert!(!should_use_scoped_ingest_wait_worker(
+            IngestQueueProcessor::Daemon,
+            IngestWaitWorkerMode::Background,
+            ScopedIngestClaimPolicy::PollOnly,
+            false,
+        ));
     }
 
     #[test]
@@ -12339,6 +12431,74 @@ quality_policy = "llm_required_for_keep"
             .expect("daemon-accepted operation must be status-queryable");
         assert_eq!(local_record.id, operation_id);
         assert_eq!(local_record.op_state, IngestOperationState::Queued.as_str());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_mcp_ingest_wait_completes_daemon_admitted_operation_without_daemon_worker() {
+        let (tempdir, db_path, server) = setup_server();
+        let (listener, _socket_guard) =
+            crate::hook_ipc::bind_listener(tempdir.path()).expect("bind daemon IPC");
+        let daemon_db_path = db_path.clone();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon IPC");
+            let request = crate::hook_ipc::read_enqueue_request(&mut stream)
+                .await
+                .expect("read daemon IPC request");
+            let operation_id = PendingMessageStore::new_without_reclaim(&daemon_db_path)
+                .enqueue_idempotent_with_key(
+                    &request.kind,
+                    &request.payload,
+                    &request.idempotency_key,
+                )
+                .expect("persist daemon-admitted operation");
+            crate::hook_ipc::write_enqueue_response(
+                &mut stream,
+                &crate::hook_ipc::HookIpcEnqueueResponse::Accepted,
+            )
+            .await
+            .expect("write daemon IPC response");
+            (request, operation_id)
+        });
+
+        let response = server
+            .mempal_ingest_with_controls(
+                IngestRequest {
+                    content: "daemon-admitted MCP wait caller completes receipt".to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("daemon-wait-receipt".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(10),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
+            )
+            .await
+            .expect("daemon-admitted wait should complete through scoped worker")
+            .0;
+
+        let (request, operation_id) = daemon.await.expect("daemon IPC task");
+        assert_eq!(request.kind, INGEST_ASYNC_KIND);
+        assert_eq!(
+            response.operation_id.as_deref(),
+            Some(operation_id.as_str())
+        );
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(!response.timed_out);
+        assert!(
+            !response.created_drawer_ids.is_empty(),
+            "completed daemon-backed wait must return cleanup-safe created drawer ids"
+        );
+
+        let status = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("completed operation status");
+        assert_eq!(status.state, Some(IngestOperationState::Completed));
+        assert_eq!(status.created_drawer_ids, response.created_drawer_ids);
     }
 
     #[cfg(unix)]
@@ -15324,6 +15484,161 @@ pattern_boost = 0.2
             .await
             .expect_err("invalid domain should reject");
         assert!(error.to_string().contains("domain"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_context_surfaces_transient_query_lock_error() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test("database is locked");
+
+        let error = server
+            .context_json_for_test(serde_json::json!({
+                "query": "debug",
+                "max_items": 3
+            }))
+            .await
+            .expect_err("context must not hide transient database lock failures");
+
+        let error_text = error.to_string();
+        assert!(error_text.contains("failed to open database"));
+        assert!(error_text.contains("database is locked"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_brief_surfaces_transient_query_lock_error() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test("database is locked");
+
+        let error = match server
+            .mempal_brief(Parameters(BriefMcpRequest {
+                query: "debug".to_string(),
+                field: Some("smoke".to_string()),
+                domain: Some("project".to_string()),
+                cwd: None,
+                max_items: Some(3),
+                dao_tian_limit: None,
+            }))
+            .await
+        {
+            Ok(_) => panic!("brief must not hide transient database lock failures"),
+            Err(error) => error,
+        };
+
+        let error_text = error.to_string();
+        assert!(error_text.contains("failed to open database"));
+        assert!(error_text.contains("database is locked"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_context_surfaces_query_read_timeout_error() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server
+            .with_query_only_read_delay_for_test(Duration::from_millis(150))
+            .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.context_json_for_test(serde_json::json!({
+                "query": "debug",
+                "max_items": 3
+            })),
+        )
+        .await
+        .expect("context should return before client timeout");
+        let error = match result {
+            Ok(_) => panic!("context must not convert read timeout to empty success"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("mempal_context query-only database read exceeded"),
+            "unexpected error: {error}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+
+    #[tokio::test]
+    async fn test_mcp_brief_surfaces_query_read_timeout_error() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server
+            .with_query_only_read_delay_for_test(Duration::from_millis(150))
+            .with_mcp_deadline_for_test(Duration::from_millis(20));
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            server.mempal_brief(Parameters(BriefMcpRequest {
+                query: "debug".to_string(),
+                field: Some("smoke".to_string()),
+                domain: Some("project".to_string()),
+                cwd: None,
+                max_items: Some(3),
+                dao_tian_limit: None,
+            })),
+        )
+        .await
+        .expect("brief should return before client timeout");
+        let error = match result {
+            Ok(_) => panic!("brief must not convert read timeout to empty success"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("mempal_brief query-only database read exceeded"),
+            "unexpected error: {error}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+
+    #[tokio::test]
+    async fn test_mcp_context_surfaces_non_transient_query_open_error() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test("permission denied");
+
+        let error = match server
+            .context_json_for_test(serde_json::json!({
+                "query": "debug",
+                "max_items": 3
+            }))
+            .await
+        {
+            Ok(_) => panic!("context should not hide non-transient database open failures"),
+            Err(error) => error,
+        };
+
+        let error_text = error.to_string();
+        assert!(error_text.contains("failed to open database"));
+        assert!(error_text.contains("permission denied"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_brief_surfaces_non_transient_query_open_error() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test("permission denied");
+
+        let error = match server
+            .mempal_brief(Parameters(BriefMcpRequest {
+                query: "debug".to_string(),
+                field: Some("smoke".to_string()),
+                domain: Some("project".to_string()),
+                cwd: None,
+                max_items: Some(3),
+                dao_tian_limit: None,
+            }))
+            .await
+        {
+            Ok(_) => panic!("brief should not hide non-transient database open failures"),
+            Err(error) => error,
+        };
+
+        let error_text = error.to_string();
+        assert!(error_text.contains("failed to open database"));
+        assert!(error_text.contains("permission denied"));
     }
 
     #[tokio::test]
@@ -18782,7 +19097,7 @@ enabled = false
     }
 
     #[tokio::test]
-    async fn test_mcp_ingest_smoke_mode_sets_internal_controls() {
+    async fn test_mcp_ingest_smoke_mode_uses_deterministic_local_vector() {
         let _tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = _tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open db");
@@ -18823,50 +19138,30 @@ enabled = false
                 domain: Some("project".to_string()),
                 field: Some("smoke".to_string()),
                 smoke: Some(true),
-                wait: Some(false),
+                wait: Some(true),
+                wait_timeout_secs: Some(5),
                 ..IngestRequest::default()
             }))
             .await
-            .expect("smoke ingest should queue")
+            .expect("smoke ingest should complete")
             .0;
 
-        assert_eq!(response.state, Some(IngestOperationState::Queued));
-        let operation_id = response.operation_id.as_deref().expect("operation id");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while call_count.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("worker should reach embed");
-        let db = Database::open(&db_path).expect("open db");
-        let payload: String = db
-            .conn()
-            .query_row(
-                "SELECT payload FROM pending_messages WHERE id = ?1",
-                [operation_id],
-                |row| row.get(0),
-            )
-            .expect("read queued ingest payload");
-        let decoded: PreparedIngestOperation =
-            serde_json::from_str(&payload).expect("decode queued ingest payload");
-
-        assert_eq!(decoded.request.smoke, Some(true));
-        assert!(decoded.controls.no_gate);
-        assert!(decoded.controls.bypass_novelty);
-
-        gate.notify_one();
-
-        let completed = server
-            .wait_for_operation_completion(operation_id)
-            .await
-            .expect("cleanup ingest completion");
-        assert_eq!(completed.state, Some(IngestOperationState::Completed));
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(
+            !response.created_drawer_ids.is_empty(),
+            "smoke wait response must expose cleanup authority"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "smoke writes must not block on the configured embedder"
+        );
+        gate.notify_waiters();
     }
 
     #[tokio::test]
-    async fn test_mcp_smoke_ingest_wait_and_status_return_created_ids() {
-        let (_tempdir, _db_path, server) = setup_server();
+    async fn test_mcp_smoke_ingest_wait_update_and_status_return_created_ids() {
+        let (_tempdir, db_path, server) = setup_server();
 
         let response = server
             .mempal_ingest(Parameters(IngestRequest {
@@ -18904,6 +19199,56 @@ enabled = false
         assert_eq!(status.drawer_ids, status.created_drawer_ids);
         assert!(!status.dropped);
         assert!(status.rejected_reason.is_none());
+
+        let old_id = response.created_drawer_ids[0].clone();
+        let update = server
+            .mempal_ingest(Parameters(IngestRequest {
+                content: "cleanup-authoritative MCP smoke write two".to_string(),
+                wing: "smoke".to_string(),
+                room: Some("mcp".to_string()),
+                source_type: Some("agent_inference".to_string()),
+                memory_kind: Some("evidence".to_string()),
+                domain: Some("project".to_string()),
+                field: Some("smoke".to_string()),
+                supersedes: Some(old_id.clone()),
+                smoke: Some(true),
+                wait: Some(true),
+                wait_timeout_secs: Some(5),
+                ..IngestRequest::default()
+            }))
+            .await
+            .expect("smoke update should complete")
+            .0;
+
+        assert_eq!(update.state, Some(IngestOperationState::Completed));
+        assert_eq!(
+            update.superseded_drawer_id.as_deref(),
+            Some(old_id.as_str())
+        );
+        assert_eq!(
+            update.created_drawer_ids.len(),
+            1,
+            "smoke update wait response must expose cleanup-safe new drawer id"
+        );
+        assert_eq!(update.drawer_ids, update.created_drawer_ids);
+        assert_ne!(update.created_drawer_ids[0], old_id);
+
+        let operation_id = update.operation_id.as_deref().expect("update operation id");
+        let update_status = server
+            .operation_status_json_for_test(operation_id)
+            .await
+            .expect("update operation status should load");
+        assert_eq!(update_status.state, Some(IngestOperationState::Completed));
+        assert_eq!(update_status.created_drawer_ids, update.created_drawer_ids);
+        assert_eq!(update_status.drawer_ids, update.created_drawer_ids);
+
+        let db = Database::open(&db_path).expect("open db");
+        assert!(db.get_drawer(&old_id).expect("old lookup").is_none());
+        assert!(
+            db.get_drawer(&update.created_drawer_ids[0])
+                .expect("new lookup")
+                .is_some()
+        );
     }
 
     // =========================================================================
