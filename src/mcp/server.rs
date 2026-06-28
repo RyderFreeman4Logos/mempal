@@ -31,7 +31,7 @@ use crate::core::{
     project::{ProjectSearchScope, infer_project_id_from_root_uri, validate_project_id},
     queue::{
         AsyncPendingMessageStore, CLAIM_LOCK_RETRY_DEADLINE, ClaimedMessage, PendingMessageStore,
-        PendingOperationCompletion, QueueError,
+        PendingOperationCompletion, QueueError, QueueFailureDisposition,
     },
     reindex::ReindexProgressStore,
     remote_calls::{
@@ -193,6 +193,7 @@ const MCP_INGEST_CLAIM_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50)
 const MCP_INGEST_CLAIM_RELEASE_BUSY_TIMEOUT: Duration = Duration::ZERO;
 const MCP_INGEST_RESULT_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 const MCP_INGEST_RESULT_RETRY_DELAY: Duration = Duration::from_millis(50);
+const MCP_INGEST_TRANSIENT_WRITE_LOCK_RETRY_DELAY_MS: i64 = 1_000;
 const MCP_SCOPED_INGEST_CLAIM_CLEANUP_MARGIN: Duration = Duration::from_millis(250);
 // Caller-bounded scoped waits may claim only when this much budget remains. The
 // cleanup margin is reserved for releasing the claim if processing hits the
@@ -1032,6 +1033,25 @@ impl MempalMcpServer {
             tokio::time::sleep(INGEST_POLL_INTERVAL).await;
             return result;
         }
+        if let Err(detail) = &outcome
+            && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
+        {
+            Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+            let requeued =
+                requeue_ingest_claim_after_transient_write_lock(queue, &claim, detail.clone())
+                    .await;
+            let released = match writer_lease {
+                Some(writer_lease) => writer_lease.release().await,
+                None => Ok(()),
+            };
+            let result = requeued.and(released);
+            match &result {
+                Ok(()) => span.finish_error_class("transient_write_lock_requeued"),
+                Err(error) => span.finish_error(error),
+            }
+            tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+            return result;
+        }
 
         Self::refresh_ingest_claim_heartbeat_once(queue, &claim.id, worker_id).await;
         let completed = self
@@ -1136,6 +1156,19 @@ impl MempalMcpServer {
             Self::release_claim_with_lock_retry(queue, claim)
                 .await
                 .context("failed to release scoped ingest claim after writer lease was lost")?;
+            released?;
+            tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+            return Ok(());
+        }
+        if let Err(detail) = &outcome
+            && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
+        {
+            Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+            requeue_ingest_claim_after_transient_write_lock(queue, &claim, detail.clone()).await?;
+            let released = match writer_lease {
+                Some(writer_lease) => writer_lease.release().await,
+                None => Ok(()),
+            };
             released?;
             tokio::time::sleep(INGEST_POLL_INTERVAL).await;
             return Ok(());
@@ -1323,6 +1356,23 @@ impl MempalMcpServer {
             )
             .await
             .context("failed to release scoped ingest claim after writer lease was lost")?;
+            return Ok(ScopedIngestProcessResult::ReleasedForRetry);
+        }
+        if let Err(detail) = &outcome
+            && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
+        {
+            Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
+            if let Some(writer_lease) = writer_lease {
+                let _ = writer_lease.release().await;
+            }
+            let release_deadline = scoped_process_remaining(started, budget).unwrap_or_default();
+            Self::release_claim_with_lock_retry_deadline(
+                queue,
+                claim,
+                release_deadline.min(CLAIM_LOCK_RETRY_DEADLINE),
+            )
+            .await
+            .context("failed to release scoped ingest claim after transient write lock")?;
             return Ok(ScopedIngestProcessResult::ReleasedForRetry);
         }
 
@@ -6661,6 +6711,26 @@ impl MempalMcpServer {
         let scrubbed_content =
             config.scrub_content_with_compiled(&request.content, compiled_privacy.as_ref());
         let room = request.room.as_deref();
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .sync_db_open_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(database_write_refused_error(
+                &self.db_path,
+                "sync_ingest_open_db",
+                &rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::DatabaseBusy,
+                        extended_code: rusqlite::ffi::SQLITE_BUSY,
+                    },
+                    Some("database is locked".to_string()),
+                ),
+            ));
+        }
         let db = Database::open(&self.db_path).map_err(|error| {
             database_write_refused_error(&self.db_path, "sync_ingest_open_db", &error)
         })?;
@@ -11093,6 +11163,37 @@ fn mcp_ingest_failure_is_retryable_writer_lease_lost(detail: &str) -> bool {
         .any(|operation| lower.contains(operation))
 }
 
+fn mcp_ingest_failure_is_retryable_transient_write_lock(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    let retry_action = lower.contains("retry_after_transient_lock");
+    let database_locked = lower.contains("database_locked")
+        || lower.contains("locked_or_busy")
+        || lower.contains("database is locked")
+        || lower.contains("database is busy");
+    let unconfirmed_write = lower.contains("write admission was not confirmed");
+    retry_action && database_locked && unconfirmed_write
+}
+
+async fn requeue_ingest_claim_after_transient_write_lock(
+    queue: &AsyncPendingMessageStore,
+    claim: &ClaimedMessage,
+    detail: String,
+) -> anyhow::Result<()> {
+    queue
+        .mark_failed_with_disposition(
+            claim.clone(),
+            detail,
+            QueueFailureDisposition::RetryableAfter {
+                delay_ms: MCP_INGEST_TRANSIENT_WRITE_LOCK_RETRY_DELAY_MS,
+            },
+        )
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(error)
+                .context("failed to requeue async ingest after transient write lock")
+        })
+}
+
 fn push_mcp_timeout_warning(
     response_warnings: &mut Vec<String>,
     system_warnings: &mut Vec<SystemWarning>,
@@ -13156,6 +13257,70 @@ quality_policy = "llm_required_for_keep"
     }
 
     #[tokio::test]
+    async fn test_scoped_operation_wait_retries_transient_write_lock_without_failed_receipt() {
+        let (_tempdir, db_path, server) = setup_server();
+        let server = server.with_sync_db_open_lock_failures_for_test(1);
+        let operation_id = enqueue_prepared_test_ingest_operation(
+            &server,
+            &db_path,
+            "scoped operation wait must retry transient write locks",
+            "transient-write-lock",
+        )
+        .await;
+
+        let wait_result = tokio::time::timeout(
+            Duration::from_secs(15),
+            server.wait_for_operation_status_with_scoped_worker(
+                &operation_id,
+                Duration::from_secs(12),
+                Duration::from_millis(25),
+            ),
+        )
+        .await
+        .expect("scoped operation wait should stay within the caller budget")
+        .expect("scoped operation wait should not fail after a transient write lock");
+        let Some(response) = wait_result else {
+            let record = PendingMessageStore::new_without_reclaim(&db_path)
+                .operation_status(&operation_id)
+                .expect("load timed-out operation")
+                .expect("operation remains queryable");
+            panic!(
+                "scoped operation wait should reach terminal status; state={} claimed_at={:?} completed_at={:?} failure_detail={:?}",
+                record.op_state, record.claimed_at, record.completed_at, record.failure_detail
+            );
+        };
+
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(
+            !response.created_drawer_ids.is_empty(),
+            "retry completion must expose cleanup-safe created drawer IDs"
+        );
+        assert!(response.failure_detail.is_none());
+
+        let completion_count: i64 = rusqlite::Connection::open(&db_path)
+            .expect("open db")
+            .query_row(
+                "SELECT COUNT(*) FROM pending_message_completions WHERE message_id = ?1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count completions");
+        assert_eq!(
+            completion_count, 1,
+            "transient write lock must produce only the final completed receipt"
+        );
+        let final_record = PendingMessageStore::new_without_reclaim(&db_path)
+            .operation_status(&operation_id)
+            .expect("load final operation")
+            .expect("operation remains queryable");
+        assert_eq!(
+            final_record.op_state,
+            IngestOperationState::Completed.as_str()
+        );
+        assert!(final_record.failure_detail.is_none());
+    }
+
+    #[tokio::test]
     async fn test_mcp_ingest_scoped_finite_wait_processes_local_queue() {
         let (_tempdir, db_path, server) = setup_server();
 
@@ -14452,6 +14617,105 @@ pattern_boost = 0.2
             !completed.created_drawer_ids.is_empty(),
             "completed receipt must preserve cleanup-safe drawer ids after retry"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_async_ingest_transient_write_lock_requeues_instead_of_failing() {
+        let (_tempdir, db_path, server) = setup_server();
+        let server = server.with_sync_db_open_lock_failures_for_test(1);
+        let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
+        let request = IngestRequest {
+            content: "transient write lock should retry async ingest".to_string(),
+            wing: "smoke".to_string(),
+            room: Some("mcp".to_string()),
+            source_type: Some("agent_inference".to_string()),
+            memory_kind: Some("evidence".to_string()),
+            domain: Some("project".to_string()),
+            field: Some("smoke".to_string()),
+            smoke: Some(true),
+            project_id: Some("project-transient-write-lock".to_string()),
+            dry_run: Some(false),
+            ..IngestRequest::default()
+        };
+        let project_id = server
+            .resolve_mcp_project_id(request.project_id.as_deref(), config.as_ref())
+            .await
+            .expect("resolve project");
+        let prepared = server
+            .prepare_async_ingest_operation(
+                &request,
+                IngestControls::default(),
+                config.as_ref(),
+                compiled_privacy.as_ref(),
+                project_id,
+            )
+            .await
+            .expect("prepare async ingest");
+        let payload = serde_json::to_string(&prepared).expect("serialize prepared ingest");
+        let queue = crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path);
+        let operation_id = queue
+            .enqueue(INGEST_ASYNC_KIND, &payload)
+            .expect("enqueue async ingest");
+        let claim = queue
+            .claim_next_by_kind("worker-transient-write-lock", 60, INGEST_ASYNC_KIND)
+            .expect("claim queued op")
+            .expect("claimed queued op");
+        let async_queue = AsyncPendingMessageStore::from_store(queue.clone());
+
+        server
+            .process_ingest_claim(&async_queue, "worker-transient-write-lock", claim)
+            .await
+            .expect("transient write lock should requeue the ingest");
+
+        let queued = queue
+            .operation_status(&operation_id)
+            .expect("load requeued operation")
+            .expect("operation remains durable");
+        assert_eq!(queued.op_state, IngestOperationState::Queued.as_str());
+        assert!(queued.claimed_at.is_none());
+        assert!(queued.completed_at.is_none());
+        assert!(queued.failure_detail.is_none());
+
+        let completion_count: i64 = rusqlite::Connection::open(&db_path)
+            .expect("open db")
+            .query_row(
+                "SELECT COUNT(*) FROM pending_message_completions WHERE message_id = ?1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count completions");
+        assert_eq!(
+            completion_count, 0,
+            "transient write lock must not create a failed completion receipt"
+        );
+
+        tokio::time::sleep(Duration::from_millis(
+            MCP_INGEST_TRANSIENT_WRITE_LOCK_RETRY_DELAY_MS as u64 + 200,
+        ))
+        .await;
+        let retry_claim = queue
+            .claim_next_by_kind("worker-transient-write-lock-retry", 60, INGEST_ASYNC_KIND)
+            .expect("claim retry op")
+            .expect("retry claim remains available");
+        server
+            .process_ingest_claim(
+                &async_queue,
+                "worker-transient-write-lock-retry",
+                retry_claim,
+            )
+            .await
+            .expect("retry should complete after lock clears");
+
+        let completed = server
+            .operation_status_json_for_test(&operation_id)
+            .await
+            .expect("completed status");
+        assert_eq!(completed.state, Some(IngestOperationState::Completed));
+        assert!(
+            !completed.created_drawer_ids.is_empty(),
+            "retry completion must expose cleanup-safe created drawer IDs"
+        );
+        assert!(completed.failure_detail.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
