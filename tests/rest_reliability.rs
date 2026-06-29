@@ -484,6 +484,45 @@ async fn test_status_reports_schema_skew_restart_warning() {
     assert_eq!(body["drawer_count"].as_i64(), Some(0));
 }
 
+#[tokio::test]
+async fn test_status_includes_vector_scan_and_backoff_telemetry() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+
+    let (status, _headers, body) = get_json(state, "/api/status").await;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let vector_scan = body["vector_scan"].as_object().expect("vector scan");
+    assert_eq!(
+        vector_scan.get("mode").and_then(Value::as_str),
+        None,
+        "vector scan mode should be absent until a search records one"
+    );
+    assert_eq!(
+        vector_scan.get("candidate_count").and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        vector_scan.get("candidate_cap").and_then(Value::as_u64),
+        Some(0)
+    );
+
+    let backoff = body["ingest_worker_backoff"]
+        .as_object()
+        .expect("ingest worker backoff");
+    assert_eq!(backoff.get("retry_count").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        backoff.get("next_delay_ms").and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        backoff.get("last_error_class").and_then(Value::as_str),
+        None
+    );
+}
+
 fn insert_search_drawer(db: &Database) {
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: "drawer_rest_bm25_fallback".to_string(),

@@ -15515,6 +15515,7 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
         print_daemon_rest_embedder_cache(&status);
         print_daemon_rest_resource_usage(&status);
         print_daemon_ingest_worker_backoff(&status);
+        print_daemon_vector_scan(&status);
         if let Some(telemetry) = status.get("search_telemetry") {
             print_daemon_search_telemetry(telemetry);
         }
@@ -15537,10 +15538,12 @@ async fn fetch_daemon_status(addr: &str) -> Result<Option<Value>> {
     if !response.status().is_success() {
         return Ok(None);
     }
-    let body = response
-        .json::<Value>()
+    let body_text = response
+        .text()
         .await
-        .context("failed to parse REST status JSON")?;
+        .context("failed to read REST status body")?;
+    let body =
+        serde_json::from_str::<Value>(&body_text).context("failed to parse REST status JSON")?;
     Ok(Some(body))
 }
 
@@ -15737,6 +15740,29 @@ fn print_daemon_ingest_worker_backoff(status: &Value) {
         Some(class) => println!("rest.ingest_worker.last_error_class: {class}"),
         None => println!("rest.ingest_worker.last_error_class: none"),
     }
+}
+
+#[cfg(feature = "rest")]
+fn print_daemon_vector_scan(status: &Value) {
+    let Some(scan) = status.get("vector_scan") else {
+        return;
+    };
+    match scan
+        .get("mode")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        Some(mode) => println!("rest.vector_scan.mode: {mode}"),
+        None => println!("rest.vector_scan.mode: none"),
+    }
+    println!(
+        "rest.vector_scan.candidate_count: {}",
+        json_u64(scan, "candidate_count")
+    );
+    println!(
+        "rest.vector_scan.candidate_cap: {}",
+        json_u64(scan, "candidate_cap")
+    );
 }
 
 fn display_opt_u64(value: Option<u64>) -> String {

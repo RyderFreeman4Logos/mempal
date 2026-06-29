@@ -4974,6 +4974,7 @@ impl MempalMcpServer {
                 raw_turn_rooms: config.turns.raw_turn_rooms.clone(),
             },
             ingest_worker_backoff: crate::observability::ingest_worker_backoff_snapshot(),
+            vector_scan: crate::observability::vector_scan_snapshot(),
             database_diagnostic,
             system_warnings,
         }))

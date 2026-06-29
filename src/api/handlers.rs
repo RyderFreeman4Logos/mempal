@@ -530,6 +530,7 @@ struct StatusResponse {
     source_type_distribution: Vec<SourceTypeCount>,
     turn_storage: TurnStorageStatus,
     ingest_worker_backoff: crate::observability::IngestWorkerBackoffSnapshot,
+    vector_scan: crate::observability::VectorScanSnapshot,
     search_telemetry: SearchTelemetrySnapshot,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     status_warnings: Vec<String>,
@@ -1684,6 +1685,7 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
             raw_turn_rooms: config.turns.raw_turn_rooms.clone(),
         },
         ingest_worker_backoff: crate::observability::ingest_worker_backoff_snapshot(),
+        vector_scan: crate::observability::vector_scan_snapshot(),
         search_telemetry,
         status_warnings,
     }))
