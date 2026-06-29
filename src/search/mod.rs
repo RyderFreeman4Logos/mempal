@@ -14,6 +14,7 @@ use crate::core::{
     utils::source_file_or_synthetic,
 };
 use crate::embed::{EmbedError, Embedder, global_embed_status};
+use crate::observability::{VectorScanMode, VectorScanSnapshot, record_vector_scan};
 use thiserror::Error;
 
 use crate::search::filter::{
@@ -1386,13 +1387,24 @@ fn search_by_vector_with_filters(
         return Ok(Vec::new());
     }
 
-    let applied_wing = route.wing.as_deref();
-    let applied_room = route.room.as_deref();
+    let applied_wing = route.wing.clone();
+    let applied_room = route.room.clone();
 
     let candidate_count = count_vector_candidate_drawers(db, &route, scope, filters)?;
     if candidate_count == 0 {
         return Ok(Vec::new());
     }
+
+    let scan_mode = if candidate_count <= EXACT_VECTOR_CANDIDATE_LIMIT {
+        VectorScanMode::Exact
+    } else {
+        VectorScanMode::Knn
+    };
+    record_vector_scan(VectorScanSnapshot {
+        mode: Some(scan_mode),
+        candidate_count: candidate_count as u64,
+        candidate_cap: EXACT_VECTOR_CANDIDATE_LIMIT as u64,
+    });
 
     // When the *bounded* candidate set fits within the sqlite-vec KNN limit,
     // use the exact in-memory path regardless of scope mode. This is a
@@ -1421,8 +1433,8 @@ fn search_by_vector_with_filters(
             ExactVectorSearchRequest {
                 query_vector,
                 route: route.clone(),
-                applied_wing,
-                applied_room,
+                applied_wing: applied_wing.as_deref(),
+                applied_room: applied_room.as_deref(),
                 top_k,
                 scope,
                 filters,
@@ -1430,75 +1442,17 @@ fn search_by_vector_with_filters(
         );
     }
 
-    let query_json =
-        serde_json::to_string(query_vector).map_err(SearchError::SerializeQueryVector)?;
-    let top_k_i64 = i64::try_from(top_k).map_err(|_| SearchError::InvalidTopK)?;
-    let knn_k = compute_knn_k(top_k);
-
-    let search_sql = build_vector_search_sql(scope.mode);
-
-    let mut statement = db
-        .conn()
-        .prepare(&search_sql)
-        .map_err(SearchError::PrepareSearch)?;
-    let results = statement
-        .query_map(
-            (
-                query_json.as_str(),
-                knn_k,
-                scope.mode_param(),
-                scope.project_id.as_deref(),
-                applied_wing,
-                applied_room,
-                top_k_i64,
-            ),
-            |row| {
-                let distance: f64 = row.get(6)?;
-                let drawer_id: String = row.get(0)?;
-                let source_file = row.get::<_, Option<String>>(4)?;
-                let row_project_id = row.get::<_, Option<String>>(5)?;
-                Ok(SearchResult {
-                    drawer_id: drawer_id.clone(),
-                    content: row.get(1)?,
-                    wing: row.get(2)?,
-                    room: row.get(3)?,
-                    source_file: source_file_or_synthetic(&drawer_id, source_file.as_deref()),
-                    source: scope.classify_row(row_project_id.as_deref()),
-                    source_type: SourceType::AgentInference,
-                    confidence: crate::core::types::default_confidence(SourceType::AgentInference),
-                    // Knowledge fields are not available from the vector-only
-                    // SQL path; use defaults.  Callers that need them should
-                    // hydrate via the drawer record.
-                    memory_kind: MemoryKind::Evidence,
-                    domain: MemoryDomain::Project,
-                    field: String::new(),
-                    statement: None,
-                    tier: None,
-                    status: None,
-                    anchor_kind: AnchorKind::Global,
-                    anchor_id: String::new(),
-                    parent_anchor_id: None,
-                    is_pinned: false,
-                    importance: 0,
-                    similarity: (1.0_f64 - distance) as f32,
-                    route: route.clone(),
-                    chunk_index: None,
-                    neighbors: None,
-                    tunnel_hints: vec![],
-                    // Hydrated by `hydrate_result_metadata` below.
-                    effective_importance: 0.0,
-                    matched_pattern_id: None,
-                })
-            },
-        )
-        .map_err(SearchError::ExecuteSearch)?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(SearchError::CollectSearchRows)?;
-
-    Ok(results
-        .into_iter()
-        .map(|result| hydrate_result_metadata(db, result))
-        .collect())
+    search_by_vector_scoped_knn(
+        db,
+        KnnVectorSearchRequest {
+            route,
+            applied_wing: applied_wing.as_deref(),
+            applied_room: applied_room.as_deref(),
+            top_k,
+            scope,
+            query_vector,
+        },
+    )
 }
 
 pub fn count_vector_candidate_drawers(
@@ -1558,6 +1512,15 @@ struct ExactVectorSearchRequest<'a> {
     top_k: usize,
     scope: &'a ProjectSearchScope,
     filters: &'a SearchFilters,
+}
+
+struct KnnVectorSearchRequest<'a> {
+    query_vector: &'a [f32],
+    route: RouteDecision,
+    applied_wing: Option<&'a str>,
+    applied_room: Option<&'a str>,
+    top_k: usize,
+    scope: &'a ProjectSearchScope,
 }
 
 fn search_by_vector_scoped_exact(
@@ -1690,6 +1653,89 @@ fn search_by_vector_scoped_exact(
             },
         )
         .collect::<Result<Vec<_>>>()?;
+    Ok(results
+        .into_iter()
+        .map(|result| hydrate_result_metadata(db, result))
+        .collect())
+}
+
+fn search_by_vector_scoped_knn(
+    db: &Database,
+    request: KnnVectorSearchRequest<'_>,
+) -> Result<Vec<SearchResult>> {
+    let KnnVectorSearchRequest {
+        query_vector,
+        route,
+        applied_wing,
+        applied_room,
+        top_k,
+        scope,
+    } = request;
+    let query_json =
+        serde_json::to_string(query_vector).map_err(SearchError::SerializeQueryVector)?;
+    let top_k_i64 = i64::try_from(top_k).map_err(|_| SearchError::InvalidTopK)?;
+    let knn_k = compute_knn_k(top_k);
+
+    let search_sql = build_vector_search_sql(scope.mode);
+
+    let mut statement = db
+        .conn()
+        .prepare(&search_sql)
+        .map_err(SearchError::PrepareSearch)?;
+    let results = statement
+        .query_map(
+            (
+                query_json.as_str(),
+                knn_k,
+                scope.mode_param(),
+                scope.project_id.as_deref(),
+                applied_wing,
+                applied_room,
+                top_k_i64,
+            ),
+            |row| {
+                let distance: f64 = row.get(6)?;
+                let drawer_id: String = row.get(0)?;
+                let source_file = row.get::<_, Option<String>>(4)?;
+                let row_project_id = row.get::<_, Option<String>>(5)?;
+                Ok(SearchResult {
+                    drawer_id: drawer_id.clone(),
+                    content: row.get(1)?,
+                    wing: row.get(2)?,
+                    room: row.get(3)?,
+                    source_file: source_file_or_synthetic(&drawer_id, source_file.as_deref()),
+                    source: scope.classify_row(row_project_id.as_deref()),
+                    source_type: SourceType::AgentInference,
+                    confidence: crate::core::types::default_confidence(SourceType::AgentInference),
+                    // Knowledge fields are not available from the vector-only
+                    // SQL path; use defaults.  Callers that need them should
+                    // hydrate via the drawer record.
+                    memory_kind: MemoryKind::Evidence,
+                    domain: MemoryDomain::Project,
+                    field: String::new(),
+                    statement: None,
+                    tier: None,
+                    status: None,
+                    anchor_kind: AnchorKind::Global,
+                    anchor_id: String::new(),
+                    parent_anchor_id: None,
+                    is_pinned: false,
+                    importance: 0,
+                    similarity: (1.0_f64 - distance) as f32,
+                    route: route.clone(),
+                    chunk_index: None,
+                    neighbors: None,
+                    tunnel_hints: vec![],
+                    // Hydrated by `hydrate_result_metadata` below.
+                    effective_importance: 0.0,
+                    matched_pattern_id: None,
+                })
+            },
+        )
+        .map_err(SearchError::ExecuteSearch)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(SearchError::CollectSearchRows)?;
+
     Ok(results
         .into_iter()
         .map(|result| hydrate_result_metadata(db, result))
