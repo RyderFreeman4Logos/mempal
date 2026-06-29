@@ -1232,7 +1232,12 @@ async fn process_ingest_request(
     let validated = validate_ingest_request(&request)?;
     let project_id = resolve_project_id(request.project_id.as_deref(), config.as_ref(), None)
         .map_err(internal_error)?;
-    let raw_turn = is_raw_turn(&request.wing, request.room.as_deref(), &config.turns);
+    let raw_turn = is_raw_turn(
+        &request.wing,
+        request.room.as_deref(),
+        validated.typed_memory_kind.as_ref(),
+        &config.turns,
+    );
     if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
         return Ok(IngestResponse {
             drawer_id: String::new(),
@@ -1243,9 +1248,13 @@ async fn process_ingest_request(
             fact_check_warnings: Vec::new(),
         });
     }
-    let drawer_importance =
-        raw_turn_importance(&request.wing, request.room.as_deref(), &config.turns)
-            .unwrap_or_else(|| request.importance.unwrap_or(0));
+    let drawer_importance = raw_turn_importance(
+        &request.wing,
+        request.room.as_deref(),
+        validated.typed_memory_kind.as_ref(),
+        &config.turns,
+    )
+    .unwrap_or_else(|| request.importance.unwrap_or(0));
 
     // Chunk the content using the token-aware chunker (issue #57).
     let chunks =

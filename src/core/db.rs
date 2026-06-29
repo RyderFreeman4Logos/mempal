@@ -368,6 +368,14 @@ pub enum DbError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTurnClassificationRow {
+    pub wing: String,
+    pub room: Option<String>,
+    pub memory_kind: MemoryKind,
+    pub importance: i32,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FtsMetadataFilters<'a> {
     pub memory_kind: Option<&'a str>,
@@ -2468,6 +2476,29 @@ impl Database {
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, i64>(2)?,
                 ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn raw_turn_classification_rows(&self) -> Result<Vec<RawTurnClassificationRow>, DbError> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT wing, room, memory_kind, importance
+            FROM drawers
+            WHERE deleted_at IS NULL
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let memory_kind =
+                    memory_kind_from_str(&row.get::<_, String>(2)?).map_err(row_decode_error)?;
+                Ok(RawTurnClassificationRow {
+                    wing: row.get::<_, String>(0)?,
+                    room: row.get::<_, Option<String>>(1)?,
+                    memory_kind,
+                    importance: row.get::<_, i32>(3)?,
+                })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)

@@ -263,7 +263,7 @@ fn should_drop_hook_capture(event: HookEvent, bytes: &[u8], config: &Config) -> 
 
 fn is_raw_turn_for_hook_event(event: HookEvent, bytes: &[u8], config: &Config) -> bool {
     let (wing, room) = raw_turn_target_for_hook_event(event, bytes);
-    is_raw_turn(wing, Some(room.as_str()), &config.turns)
+    is_raw_turn(wing, Some(room.as_str()), None, &config.turns)
 }
 
 fn raw_turn_target_for_hook_event(event: HookEvent, bytes: &[u8]) -> (&'static str, String) {

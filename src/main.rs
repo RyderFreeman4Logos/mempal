@@ -5942,8 +5942,9 @@ fn resolve_stdin_ingest(
     let cwd = env::current_dir().ok();
     let project_id = resolve_project_id(project, config, cwd.as_deref())
         .context("failed to resolve stdin ingest project id")?;
-    let raw_turn = is_raw_turn(&wing, room.as_deref(), &config.turns);
-    let drawer_importance = raw_turn_importance(&wing, room.as_deref(), &config.turns).unwrap_or(0);
+    let raw_turn = is_raw_turn(&wing, room.as_deref(), Some(&memory_kind), &config.turns);
+    let drawer_importance =
+        raw_turn_importance(&wing, room.as_deref(), Some(&memory_kind), &config.turns).unwrap_or(0);
 
     Ok(ResolvedStdinIngest {
         content,

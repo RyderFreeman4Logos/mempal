@@ -265,6 +265,50 @@ async fn test_typed_ingest_persists_memory_kind() {
 }
 
 #[tokio::test]
+async fn test_hermes_user_facts_are_visible_in_default_rest_timeline() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+
+    let (status, body) = post_json(
+        env.state(Arc::new(StaticEmbedderFactory { dim: 4 })),
+        "/api/ingest",
+        json!({
+            "content": "Hermes user fact should remain durable.",
+            "wing": "hermes-user/obj/default",
+            "room": "facts",
+            "memory_kind": "profile_fact",
+            "domain": "user",
+            "field": "preferences",
+            "importance": 4,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    let drawer_id = body["drawer_id"].as_str().expect("drawer_id").to_string();
+    let drawer = env
+        .db()
+        .get_drawer(&drawer_id)
+        .expect("load drawer")
+        .expect("drawer exists");
+    assert_eq!(drawer.importance, 4);
+
+    let (status, timeline) = get_json(
+        env.state(Arc::new(StaticEmbedderFactory { dim: 4 })),
+        "/api/timeline?limit=10",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "timeline={timeline}");
+    let entries = timeline.as_array().expect("timeline response is an array");
+    let entry = entries
+        .iter()
+        .find(|entry| entry["drawer_id"].as_str() == Some(drawer_id.as_str()))
+        .expect("hermes-user facts drawer should be visible without include_raw_turns=true");
+    assert_eq!(entry["importance"].as_i64(), Some(4));
+}
+
+#[tokio::test]
 async fn test_typed_ingest_status_and_tier() {
     let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();

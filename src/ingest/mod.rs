@@ -406,7 +406,12 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
             route_room_from_taxonomy(&scrubbed, wing, &taxonomy)
         }
     };
-    let raw_turn = is_raw_turn(wing, Some(resolved_room.as_str()), &config.turns);
+    let raw_turn = is_raw_turn(
+        wing,
+        Some(resolved_room.as_str()),
+        options.memory_kind.as_ref(),
+        &config.turns,
+    );
     if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
         return Ok(IngestStats {
             files: 1,
@@ -415,8 +420,13 @@ pub async fn ingest_file_with_options_and_writer_lease<E: Embedder + ?Sized>(
             ..IngestStats::default()
         });
     }
-    let drawer_importance =
-        raw_turn_importance(wing, Some(resolved_room.as_str()), &config.turns).unwrap_or(0);
+    let drawer_importance = raw_turn_importance(
+        wing,
+        Some(resolved_room.as_str()),
+        options.memory_kind.as_ref(),
+        &config.turns,
+    )
+    .unwrap_or(0);
     let source_display = path.to_string_lossy();
     let chunker_config = &config.chunker;
 
