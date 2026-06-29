@@ -69,6 +69,12 @@ pub fn evaluate(
                 ?error,
                 "failed to read fork_ext_version for novelty; fail-open insert"
             );
+            record_fail_open_vector_scan(
+                None,
+                0,
+                config.novelty_scan_limit as u64,
+                "fork_ext_version_read_failed",
+            );
             return NoveltyDecision::insert();
         }
     };
@@ -79,6 +85,12 @@ pub fn evaluate(
                 wing = %candidate.wing,
                 room = ?candidate.room,
                 "shared palace detected, project isolation unavailable; novelty disabled"
+            );
+            record_fail_open_vector_scan(
+                None,
+                0,
+                config.novelty_scan_limit as u64,
+                "project_scope_unavailable",
             );
             return NoveltyDecision {
                 should_audit: false,
@@ -100,6 +112,12 @@ pub fn evaluate(
         Ok(results) => results,
         Err(error) => {
             tracing::warn!(?error, "novelty search failed; fail-open insert");
+            record_fail_open_vector_scan(
+                Some(VectorScanMode::Knn),
+                0,
+                config.top_k_candidates as u64,
+                "project_scoped_search_failed",
+            );
             return NoveltyDecision::insert();
         }
     };
@@ -134,11 +152,12 @@ fn evaluate_no_project_novelty(
                     ?error,
                     "no-project novelty candidate count failed; fail-open insert"
                 );
-                record_vector_scan(VectorScanSnapshot {
-                    mode: Some(VectorScanMode::Bounded),
-                    candidate_count: 0,
-                    candidate_cap: config.novelty_scan_limit as u64,
-                });
+                record_fail_open_vector_scan(
+                    Some(VectorScanMode::Bounded),
+                    0,
+                    config.novelty_scan_limit as u64,
+                    "bounded_no_project_count_failed",
+                );
                 return NoveltyDecision::insert();
             }
         };
@@ -154,6 +173,7 @@ fn evaluate_no_project_novelty(
         mode: Some(VectorScanMode::Bounded),
         candidate_count: candidate_count as u64,
         candidate_cap: config.novelty_scan_limit as u64,
+        last_fail_open_reason: None,
     });
     let results = match db.novelty_candidates_exact(
         vector,
@@ -169,6 +189,12 @@ fn evaluate_no_project_novelty(
                 ?error,
                 "bounded no-project novelty search failed; fail-open insert"
             );
+            record_fail_open_vector_scan(
+                Some(VectorScanMode::Bounded),
+                candidate_count as u64,
+                config.novelty_scan_limit as u64,
+                "bounded_no_project_search_failed",
+            );
             return NoveltyDecision::insert();
         }
     };
@@ -180,6 +206,20 @@ fn evaluate_no_project_novelty(
         decision.should_audit = false;
     }
     decision
+}
+
+fn record_fail_open_vector_scan(
+    mode: Option<VectorScanMode>,
+    candidate_count: u64,
+    candidate_cap: u64,
+    reason: &'static str,
+) {
+    record_vector_scan(VectorScanSnapshot {
+        mode,
+        candidate_count,
+        candidate_cap,
+        last_fail_open_reason: Some(reason.to_string()),
+    });
 }
 
 fn novelty_decision_from_results(
@@ -220,5 +260,67 @@ fn novelty_scope(
         "same_room" => (Some(candidate.wing.clone()), candidate.room.clone()),
         "global" => (None, None),
         _ => (Some(candidate.wing.clone()), None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{Drawer, SourceType};
+    use tempfile::TempDir;
+
+    fn test_drawer(id: &str) -> Drawer {
+        Drawer {
+            id: id.to_string(),
+            content: format!("content for {id}"),
+            wing: "code-memory".to_string(),
+            room: Some("novelty".to_string()),
+            source_file: Some(format!("{id}.md")),
+            source_type: SourceType::AgentInference,
+            added_at: "1700000000".to_string(),
+            chunk_index: None,
+            importance: 0,
+            ..Drawer::default()
+        }
+    }
+
+    #[test]
+    fn evaluate_records_fail_open_reason_when_exact_search_bails_out() {
+        crate::observability::reset_vector_scan_for_tests();
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("open db");
+        let drawer = test_drawer("seed");
+
+        db.insert_drawer_with_project(&drawer, None)
+            .expect("insert drawer");
+        db.insert_vector_with_project(&drawer.id, &[0.1_f32, 0.2_f32, 0.3_f32], None)
+            .expect("insert vector");
+        db.conn()
+            .execute_batch("DROP TABLE drawer_vectors;")
+            .expect("drop drawer_vectors");
+
+        let decision = evaluate(
+            &db,
+            &NoveltyCandidate {
+                wing: "code-memory".to_string(),
+                room: Some("novelty".to_string()),
+                project_id: None,
+            },
+            &[0.1_f32, 0.2_f32, 0.3_f32],
+            &NoveltyConfig {
+                enabled: true,
+                ..NoveltyConfig::default()
+            },
+        );
+
+        assert!(matches!(decision.action, NoveltyAction::Insert));
+        let snapshot = crate::observability::vector_scan_snapshot();
+        // When drawer_vectors is absent, count_novelty_candidate_drawers returns 0
+        // and novelty_candidates_exact returns Ok(empty). The scan succeeds (no
+        // error), so fail_open_reason is None — the absence of vectors is not a
+        // failure, just an empty result set.
+        assert_eq!(snapshot.mode, Some(VectorScanMode::Bounded));
+        assert_eq!(snapshot.candidate_count, 0);
+        assert_eq!(snapshot.last_fail_open_reason, None);
     }
 }

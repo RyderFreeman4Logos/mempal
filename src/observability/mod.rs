@@ -120,6 +120,8 @@ pub struct VectorScanSnapshot {
     pub mode: Option<VectorScanMode>,
     pub candidate_count: u64,
     pub candidate_cap: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fail_open_reason: Option<String>,
 }
 
 pub fn record_vector_scan(snapshot: VectorScanSnapshot) {

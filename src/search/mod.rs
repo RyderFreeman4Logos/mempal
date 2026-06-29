@@ -1404,6 +1404,7 @@ fn search_by_vector_with_filters(
         mode: Some(scan_mode),
         candidate_count: candidate_count as u64,
         candidate_cap: EXACT_VECTOR_CANDIDATE_LIMIT as u64,
+        last_fail_open_reason: None,
     });
 
     // When the *bounded* candidate set fits within the sqlite-vec KNN limit,
@@ -1464,8 +1465,13 @@ pub fn count_vector_candidate_drawers(
     let applied_wing = route.wing.as_deref();
     let applied_room = route.room.as_deref();
 
+    // Count actual vector rows (not just drawers) so the exact/KNN dispatch
+    // reflects the real number of embeddings to scan. When drawer_vectors is
+    // unreadable (e.g. vec0 shadow tables locked), fall back to counting
+    // drawers only — the worst case is entering the exact path for a set that
+    // has fewer vectors than expected, which is safe and preserves recall.
     let count_sql = format!(
-        "SELECT COUNT(*) FROM drawers d {}",
+        "SELECT COUNT(*) FROM drawer_vectors v JOIN drawers d ON d.id = v.id {}",
         build_retrieval_filter_clause(
             "d",
             RetrievalFilterParamIndexes {
@@ -1500,6 +1506,47 @@ pub fn count_vector_candidate_drawers(
             ),
             |row| row.get(0),
         )
+        .or_else(|_| {
+            // Fall back to counting drawers only when drawer_vectors is
+            // unreadable (e.g. vec0 shadow tables locked by another
+            // connection). The worst case is entering the exact path for a
+            // set that has fewer vectors than expected — safe and recall-
+            // preserving.
+            let fallback_sql = format!(
+                "SELECT COUNT(*) FROM drawers d {}",
+                build_retrieval_filter_clause(
+                    "d",
+                    RetrievalFilterParamIndexes {
+                        wing: 1,
+                        room: 2,
+                        project_mode: 3,
+                        project_id: 4,
+                        memory_kind: 5,
+                        domain: 6,
+                        field: 7,
+                        tier: 8,
+                        status: 9,
+                        anchor_kind: 10,
+                    },
+                )
+            );
+            db.conn().query_row(
+                &fallback_sql,
+                (
+                    applied_wing,
+                    applied_room,
+                    scope.mode_param(),
+                    scope.project_id.as_deref(),
+                    filters.memory_kind.as_deref(),
+                    filters.domain.as_deref(),
+                    filters.field.as_deref(),
+                    filters.tier.as_deref(),
+                    filters.status.as_deref(),
+                    filters.anchor_kind.as_deref(),
+                ),
+                |row| row.get(0),
+            )
+        })
         .map_err(SearchError::CountCandidateDrawers)?;
     Ok(candidate_count)
 }
@@ -2117,6 +2164,33 @@ mod tests {
             db.insert_drawer_with_project(&drawer, Some("proj-b"))
                 .expect("insert beta");
         }
+    }
+
+    #[test]
+    fn count_vector_candidate_drawers_ignores_drawers_without_vectors() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("db");
+        let route = route();
+        let scope =
+            ProjectSearchScope::from_request(Some("proj-a".to_string()), false, false, false);
+        let filters = SearchFilters::default();
+        let with_vector = make_drawer("with-vector", "alpha", "decision");
+        let without_vector = make_drawer("without-vector", "alpha", "decision");
+
+        db.insert_drawer_with_project(&with_vector, Some("proj-a"))
+            .expect("insert drawer with vector");
+        db.insert_drawer_with_project(&without_vector, Some("proj-a"))
+            .expect("insert drawer without vector");
+        db.insert_vector_with_project(
+            &with_vector.id,
+            &[0.1_f32, 0.2_f32, 0.3_f32],
+            Some("proj-a"),
+        )
+        .expect("insert vector");
+
+        let count = count_vector_candidate_drawers(&db, &route, &scope, &filters)
+            .expect("count vector candidates");
+        assert_eq!(count, 1);
     }
 
     fn scoped_to_proj_a() -> ProjectSearchScope {

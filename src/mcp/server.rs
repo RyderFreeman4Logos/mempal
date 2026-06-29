@@ -193,7 +193,6 @@ const MCP_INGEST_CLAIM_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50)
 const MCP_INGEST_CLAIM_RELEASE_BUSY_TIMEOUT: Duration = Duration::ZERO;
 const MCP_INGEST_RESULT_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 const MCP_INGEST_RESULT_RETRY_DELAY: Duration = Duration::from_millis(50);
-const MCP_INGEST_TRANSIENT_WRITE_LOCK_RETRY_DELAY_MS: i64 = 1_000;
 const MCP_SCOPED_INGEST_CLAIM_CLEANUP_MARGIN: Duration = Duration::from_millis(250);
 // Caller-bounded scoped waits may claim only when this much budget remains. The
 // cleanup margin is reserved for releasing the claim if processing hits the
@@ -1099,9 +1098,22 @@ impl MempalMcpServer {
             && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
         {
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-            let requeued =
-                requeue_ingest_claim_after_transient_write_lock(queue, &claim, detail.clone())
-                    .await;
+            let next_retry_count = u64::from(claim.retry_count).saturating_add(1);
+            let next_delay = ingest_worker_backoff_delay(next_retry_count);
+            crate::observability::record_ingest_worker_backoff(
+                crate::observability::IngestWorkerBackoffSnapshot {
+                    retry_count: next_retry_count,
+                    next_delay_ms: u64::try_from(next_delay.as_millis()).unwrap_or(u64::MAX),
+                    last_error_class: Some("transient_write_lock".to_string()),
+                },
+            );
+            let requeued = requeue_ingest_claim_after_transient_write_lock(
+                queue,
+                &claim,
+                detail.clone(),
+                next_delay,
+            )
+            .await;
             let released = match writer_lease {
                 Some(writer_lease) => writer_lease.release().await,
                 None => Ok(()),
@@ -1111,7 +1123,7 @@ impl MempalMcpServer {
                 Ok(()) => span.finish_error_class("transient_write_lock_requeued"),
                 Err(error) => span.finish_error(error),
             }
-            tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+            tokio::time::sleep(next_delay).await;
             return result;
         }
 
@@ -1226,13 +1238,28 @@ impl MempalMcpServer {
             && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
         {
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-            requeue_ingest_claim_after_transient_write_lock(queue, &claim, detail.clone()).await?;
+            let next_retry_count = u64::from(claim.retry_count).saturating_add(1);
+            let next_delay = ingest_worker_backoff_delay(next_retry_count);
+            crate::observability::record_ingest_worker_backoff(
+                crate::observability::IngestWorkerBackoffSnapshot {
+                    retry_count: next_retry_count,
+                    next_delay_ms: u64::try_from(next_delay.as_millis()).unwrap_or(u64::MAX),
+                    last_error_class: Some("transient_write_lock".to_string()),
+                },
+            );
+            requeue_ingest_claim_after_transient_write_lock(
+                queue,
+                &claim,
+                detail.clone(),
+                next_delay,
+            )
+            .await?;
             let released = match writer_lease {
                 Some(writer_lease) => writer_lease.release().await,
                 None => Ok(()),
             };
             released?;
-            tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+            tokio::time::sleep(next_delay).await;
             return Ok(());
         }
 
@@ -11259,13 +11286,14 @@ async fn requeue_ingest_claim_after_transient_write_lock(
     queue: &AsyncPendingMessageStore,
     claim: &ClaimedMessage,
     detail: String,
+    retry_delay: Duration,
 ) -> anyhow::Result<()> {
     queue
         .mark_failed_with_disposition(
             claim.clone(),
             detail,
             QueueFailureDisposition::RetryableAfter {
-                delay_ms: MCP_INGEST_TRANSIENT_WRITE_LOCK_RETRY_DELAY_MS,
+                delay_ms: i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
             },
         )
         .await
@@ -14817,6 +14845,7 @@ pattern_boost = 0.2
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_async_ingest_transient_write_lock_requeues_instead_of_failing() {
+        crate::observability::reset_ingest_worker_backoff_for_tests();
         let (_tempdir, db_path, server) = setup_server();
         let server = server.with_sync_db_open_lock_failures_for_test(1);
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
@@ -14884,11 +14913,17 @@ pattern_boost = 0.2
             completion_count, 0,
             "transient write lock must not create a failed completion receipt"
         );
+        // Note: we intentionally do NOT assert on the global ingest worker backoff
+        // snapshot here. That state is shared across parallel test threads, and
+        // asserting on it produces intermittent failures when another test resets
+        // the global between process_ingest_claim and the read. The backoff
+        // telemetry is verified in the dedicated backoff test
+        // (test_mcp_async_ingest_worker_backoff_caps_when_claim_is_locked).
+        //
+        // The behavioral assertions above (requeue + no completion receipt +
+        // successful retry) are sufficient to prove the transient lock path works.
 
-        tokio::time::sleep(Duration::from_millis(
-            MCP_INGEST_TRANSIENT_WRITE_LOCK_RETRY_DELAY_MS as u64 + 200,
-        ))
-        .await;
+        tokio::time::sleep(ingest_worker_backoff_delay(1) + Duration::from_millis(200)).await;
         let retry_claim = queue
             .claim_next_by_kind("worker-transient-write-lock-retry", 60, INGEST_ASYNC_KIND)
             .expect("claim retry op")
