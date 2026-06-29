@@ -2013,6 +2013,8 @@ pub struct StatusResponse {
     /// counters and configured SQLite cache ceilings; never drawer content,
     /// prompts, tokens, argv, or secret-bearing URLs.
     pub resource_usage: ResourceUsageDto,
+    pub ingest_worker_backoff: crate::observability::IngestWorkerBackoffSnapshot,
+    pub vector_scan: crate::observability::VectorScanSnapshot,
     pub scrub_stats: ScrubStatsDto,
     pub chunker_stats: ChunkerStatsDto,
     pub llm_status: LlmStatusDto,

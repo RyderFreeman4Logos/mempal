@@ -389,6 +389,16 @@ impl AsyncPendingMessageStore {
         worker_id: String,
         claim_ttl_secs: i64,
     ) -> Result<Option<ClaimedMessage>> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .claim_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(sqlite_busy_queue_error());
+        }
         self.run(move |store| store.claim_next(&worker_id, claim_ttl_secs))
             .await
     }
@@ -399,6 +409,16 @@ impl AsyncPendingMessageStore {
         claim_ttl_secs: i64,
         kind_filter: String,
     ) -> Result<Option<ClaimedMessage>> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if self
+            .claim_lock_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(sqlite_busy_queue_error());
+        }
         self.run(move |store| store.claim_next_by_kind(&worker_id, claim_ttl_secs, &kind_filter))
             .await
     }

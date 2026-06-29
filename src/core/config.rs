@@ -363,6 +363,11 @@ impl Config {
                 "search.reranker.top_k must be greater than 0".to_string(),
             ));
         }
+        if self.ingest_gating.novelty.novelty_scan_limit == 0 {
+            return Err(ConfigError::InvalidConfig(
+                "ingest_gating.novelty.novelty_scan_limit must be greater than 0".to_string(),
+            ));
+        }
         if self.search.reranker.enabled {
             normalize_reranker_endpoint_url(
                 self.search.reranker.endpoint.as_deref().unwrap_or_default(),
@@ -2647,6 +2652,7 @@ pub struct NoveltyConfig {
     pub merge_threshold: f32,
     pub wing_scope: String,
     pub top_k_candidates: usize,
+    pub novelty_scan_limit: usize,
     pub max_merges_per_drawer: u32,
     pub max_content_bytes_per_drawer: usize,
 }
@@ -2659,6 +2665,7 @@ impl Default for NoveltyConfig {
             merge_threshold: 0.80,
             wing_scope: "same_wing".to_string(),
             top_k_candidates: 5,
+            novelty_scan_limit: 10_000,
             max_merges_per_drawer: 10,
             max_content_bytes_per_drawer: 65_536,
         }
@@ -3285,6 +3292,22 @@ mod tests {
         .expect_err("zero top_k must be rejected");
         assert!(
             err.to_string().contains("search.reranker.top_k"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn novelty_scan_limit_rejects_zero() {
+        let err = Config::parse(
+            r#"
+            [ingest_gating.novelty]
+            novelty_scan_limit = 0
+            "#,
+        )
+        .expect_err("zero novelty_scan_limit must be rejected");
+        assert!(
+            err.to_string()
+                .contains("ingest_gating.novelty.novelty_scan_limit"),
             "unexpected error: {err}"
         );
     }

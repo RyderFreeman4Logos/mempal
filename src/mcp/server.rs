@@ -193,7 +193,6 @@ const MCP_INGEST_CLAIM_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(50)
 const MCP_INGEST_CLAIM_RELEASE_BUSY_TIMEOUT: Duration = Duration::ZERO;
 const MCP_INGEST_RESULT_RETRY_DEADLINE: Duration = Duration::from_secs(300);
 const MCP_INGEST_RESULT_RETRY_DELAY: Duration = Duration::from_millis(50);
-const MCP_INGEST_TRANSIENT_WRITE_LOCK_RETRY_DELAY_MS: i64 = 1_000;
 const MCP_SCOPED_INGEST_CLAIM_CLEANUP_MARGIN: Duration = Duration::from_millis(250);
 // Caller-bounded scoped waits may claim only when this much budget remains. The
 // cleanup margin is reserved for releasing the claim if processing hits the
@@ -810,15 +809,28 @@ impl MempalMcpServer {
         let mut restart_backoff_ms = INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS;
         loop {
             let worker = self.clone();
-            let join_handle = tokio::spawn(async move {
-                worker.run_ingest_drain_worker().await;
-            });
+            let join_handle = tokio::spawn(async move { worker.run_ingest_drain_worker().await });
 
             match join_handle.await {
-                Ok(()) => {
+                Ok(Ok(())) => {
                     tracing::error!(
                         db_path = %self.db_path.display(),
                         "async ingest worker exited unexpectedly; restarting"
+                    );
+                }
+                Ok(Err(error)) if ingest_worker_error_is_terminal(&error) => {
+                    tracing::error!(
+                        db_path = %self.db_path.display(),
+                        error = %error,
+                        "async ingest worker stopped on terminal claim failure; not restarting"
+                    );
+                    return;
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        db_path = %self.db_path.display(),
+                        error = %error,
+                        "async ingest worker stopped unexpectedly; restarting"
                     );
                 }
                 Err(error) => {
@@ -839,7 +851,7 @@ impl MempalMcpServer {
 
     async fn run_ingest_drain_worker_until_shutdown(
         self,
-        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) {
         let worker_id = format!(
             "mcp-ingest-scoped-worker-{:x}-{:x}",
@@ -848,8 +860,44 @@ impl MempalMcpServer {
         );
         let queue = self.async_queue.clone();
 
+        if let Err(error) = self
+            .run_ingest_drain_worker_loop(queue, worker_id, Some(shutdown_rx))
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                "scoped async ingest worker stopped on terminal claim failure"
+            );
+        }
+    }
+
+    async fn run_ingest_drain_worker(self) -> anyhow::Result<()> {
+        let worker_id = format!(
+            "mcp-ingest-worker-{:x}-{:x}",
+            std::process::id(),
+            Arc::as_ptr(&self.ingest_worker_started) as usize
+        );
+        let queue = self.async_queue.clone();
+
+        self.run_ingest_drain_worker_loop(queue, worker_id, None)
+            .await
+    }
+
+    async fn run_ingest_drain_worker_loop(
+        &self,
+        queue: AsyncPendingMessageStore,
+        worker_id: String,
+        mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> anyhow::Result<()> {
+        crate::observability::record_ingest_worker_backoff(
+            crate::observability::IngestWorkerBackoffSnapshot::default(),
+        );
+        let mut retry_count = 0_u64;
+
         loop {
-            if *shutdown_rx.borrow() {
+            if let Some(shutdown_rx) = shutdown_rx.as_ref()
+                && *shutdown_rx.borrow()
+            {
                 break;
             }
 
@@ -862,62 +910,75 @@ impl MempalMcpServer {
                 .await
             {
                 Ok(Some(claim)) => {
-                    if let Err(error) = self.process_ingest_claim(&queue, &worker_id, claim).await {
-                        tracing::warn!(error = %error, "scoped async ingest worker failed to process op");
-                    }
-                }
-                Ok(None) => {
-                    tokio::select! {
-                        result = shutdown_rx.changed() => {
-                            if result.is_err() || *shutdown_rx.borrow() {
-                                break;
-                            }
-                        }
-                        _ = tokio::time::sleep(INGEST_POLL_INTERVAL) => {}
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(error = %error, "scoped async ingest worker claim failed");
-                    tokio::select! {
-                        result = shutdown_rx.changed() => {
-                            if result.is_err() || *shutdown_rx.borrow() {
-                                break;
-                            }
-                        }
-                        _ = tokio::time::sleep(INGEST_POLL_INTERVAL) => {}
-                    }
-                }
-            }
-        }
-    }
-
-    async fn run_ingest_drain_worker(self) {
-        let worker_id = format!(
-            "mcp-ingest-worker-{:x}-{:x}",
-            std::process::id(),
-            Arc::as_ptr(&self.ingest_worker_started) as usize
-        );
-        let queue = self.async_queue.clone();
-
-        loop {
-            match queue
-                .claim_next_by_kind(
-                    worker_id.clone(),
-                    INGEST_CLAIM_TTL_SECS,
-                    INGEST_ASYNC_KIND.to_string(),
-                )
-                .await
-            {
-                Ok(Some(claim)) => {
+                    retry_count = 0;
+                    crate::observability::record_ingest_worker_backoff(
+                        crate::observability::IngestWorkerBackoffSnapshot::default(),
+                    );
                     if let Err(error) = self.process_ingest_claim(&queue, &worker_id, claim).await {
                         tracing::warn!(error = %error, "async ingest worker failed to process op");
                     }
                 }
-                Ok(None) => tokio::time::sleep(INGEST_POLL_INTERVAL).await,
-                Err(error) => {
-                    tracing::warn!(error = %error, "async ingest worker claim failed");
-                    tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+                Ok(None) => {
+                    retry_count = 0;
+                    crate::observability::record_ingest_worker_backoff(
+                        crate::observability::IngestWorkerBackoffSnapshot::default(),
+                    );
+                    if !Self::sleep_ingest_worker_delay(INGEST_POLL_INTERVAL, shutdown_rx.as_mut())
+                        .await
+                    {
+                        break;
+                    }
                 }
+                Err(error) if error.is_sqlite_lock() => {
+                    retry_count = retry_count.saturating_add(1);
+                    let next_delay = ingest_worker_backoff_delay(retry_count);
+                    crate::observability::record_ingest_worker_backoff(
+                        crate::observability::IngestWorkerBackoffSnapshot {
+                            retry_count,
+                            next_delay_ms: u64::try_from(next_delay.as_millis())
+                                .unwrap_or(u64::MAX),
+                            last_error_class: Some("sqlite_locked".to_string()),
+                        },
+                    );
+                    if !Self::sleep_ingest_worker_delay(next_delay, shutdown_rx.as_mut()).await {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    crate::observability::record_ingest_worker_backoff(
+                        crate::observability::IngestWorkerBackoffSnapshot {
+                            retry_count: 0,
+                            next_delay_ms: 0,
+                            last_error_class: Some("terminal".to_string()),
+                        },
+                    );
+                    return Err(error).context("async ingest worker claim failed");
+                }
+            }
+        }
+
+        crate::observability::record_ingest_worker_backoff(
+            crate::observability::IngestWorkerBackoffSnapshot::default(),
+        );
+        Ok(())
+    }
+
+    async fn sleep_ingest_worker_delay(
+        duration: Duration,
+        shutdown_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    ) -> bool {
+        match shutdown_rx {
+            Some(shutdown_rx) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(duration) => true,
+                    result = shutdown_rx.changed() => {
+                        result.is_ok() && !*shutdown_rx.borrow()
+                    }
+                }
+            }
+            None => {
+                tokio::time::sleep(duration).await;
+                true
             }
         }
     }
@@ -1037,9 +1098,22 @@ impl MempalMcpServer {
             && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
         {
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-            let requeued =
-                requeue_ingest_claim_after_transient_write_lock(queue, &claim, detail.clone())
-                    .await;
+            let next_retry_count = u64::from(claim.retry_count).saturating_add(1);
+            let next_delay = ingest_worker_backoff_delay(next_retry_count);
+            crate::observability::record_ingest_worker_backoff(
+                crate::observability::IngestWorkerBackoffSnapshot {
+                    retry_count: next_retry_count,
+                    next_delay_ms: u64::try_from(next_delay.as_millis()).unwrap_or(u64::MAX),
+                    last_error_class: Some("transient_write_lock".to_string()),
+                },
+            );
+            let requeued = requeue_ingest_claim_after_transient_write_lock(
+                queue,
+                &claim,
+                detail.clone(),
+                next_delay,
+            )
+            .await;
             let released = match writer_lease {
                 Some(writer_lease) => writer_lease.release().await,
                 None => Ok(()),
@@ -1049,7 +1123,7 @@ impl MempalMcpServer {
                 Ok(()) => span.finish_error_class("transient_write_lock_requeued"),
                 Err(error) => span.finish_error(error),
             }
-            tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+            tokio::time::sleep(next_delay).await;
             return result;
         }
 
@@ -1164,13 +1238,28 @@ impl MempalMcpServer {
             && mcp_ingest_failure_is_retryable_transient_write_lock(detail)
         {
             Self::stop_ingest_claim_heartbeat(stop_tx, heartbeat).await;
-            requeue_ingest_claim_after_transient_write_lock(queue, &claim, detail.clone()).await?;
+            let next_retry_count = u64::from(claim.retry_count).saturating_add(1);
+            let next_delay = ingest_worker_backoff_delay(next_retry_count);
+            crate::observability::record_ingest_worker_backoff(
+                crate::observability::IngestWorkerBackoffSnapshot {
+                    retry_count: next_retry_count,
+                    next_delay_ms: u64::try_from(next_delay.as_millis()).unwrap_or(u64::MAX),
+                    last_error_class: Some("transient_write_lock".to_string()),
+                },
+            );
+            requeue_ingest_claim_after_transient_write_lock(
+                queue,
+                &claim,
+                detail.clone(),
+                next_delay,
+            )
+            .await?;
             let released = match writer_lease {
                 Some(writer_lease) => writer_lease.release().await,
                 None => Ok(()),
             };
             released?;
-            tokio::time::sleep(INGEST_POLL_INTERVAL).await;
+            tokio::time::sleep(next_delay).await;
             return Ok(());
         }
 
@@ -3426,6 +3515,23 @@ fn should_use_scoped_ingest_wait_worker(
         && matches!(worker_mode, IngestWaitWorkerMode::Scoped)
 }
 
+fn ingest_worker_backoff_delay(retry_count: u64) -> Duration {
+    match retry_count {
+        0 => Duration::ZERO,
+        1 => Duration::from_secs(2),
+        2 => Duration::from_secs(4),
+        3 => Duration::from_secs(8),
+        4 => Duration::from_secs(16),
+        _ => Duration::from_secs(30),
+    }
+}
+
+fn ingest_worker_error_is_terminal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::core::queue::QueueError>()
+        .is_some_and(|queue_error| !queue_error.is_sqlite_lock())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IngestQueueAdmission {
     operation_id: String,
@@ -4894,6 +5000,8 @@ impl MempalMcpServer {
                 raw_turn_wings: config.turns.raw_turn_wings.clone(),
                 raw_turn_rooms: config.turns.raw_turn_rooms.clone(),
             },
+            ingest_worker_backoff: crate::observability::ingest_worker_backoff_snapshot(),
+            vector_scan: crate::observability::vector_scan_snapshot(),
             database_diagnostic,
             system_warnings,
         }))
@@ -11178,13 +11286,14 @@ async fn requeue_ingest_claim_after_transient_write_lock(
     queue: &AsyncPendingMessageStore,
     claim: &ClaimedMessage,
     detail: String,
+    retry_delay: Duration,
 ) -> anyhow::Result<()> {
     queue
         .mark_failed_with_disposition(
             claim.clone(),
             detail,
             QueueFailureDisposition::RetryableAfter {
-                delay_ms: MCP_INGEST_TRANSIENT_WRITE_LOCK_RETRY_DELAY_MS,
+                delay_ms: i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
             },
         )
         .await
@@ -13976,6 +14085,51 @@ pattern_boost = 0.2
         );
     }
 
+    fn assert_ingest_worker_backoff_snapshot(
+        expected_retry_count: u64,
+        expected_next_delay_ms: u64,
+        expected_error_class: Option<&str>,
+    ) {
+        let snapshot = crate::observability::ingest_worker_backoff_snapshot();
+        assert_eq!(
+            snapshot.retry_count, expected_retry_count,
+            "unexpected ingest worker retry_count snapshot: {snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.next_delay_ms, expected_next_delay_ms,
+            "unexpected ingest worker next_delay_ms snapshot: {snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.last_error_class.as_deref(),
+            expected_error_class,
+            "unexpected ingest worker error class snapshot: {snapshot:?}"
+        );
+    }
+
+    async fn wait_for_ingest_worker_backoff_snapshot(
+        expected_retry_count: u64,
+        expected_next_delay_ms: u64,
+        expected_error_class: Option<&str>,
+    ) {
+        for _ in 0..32 {
+            let snapshot = crate::observability::ingest_worker_backoff_snapshot();
+            if snapshot.retry_count == expected_retry_count
+                && snapshot.next_delay_ms == expected_next_delay_ms
+                && snapshot.last_error_class.as_deref() == expected_error_class
+            {
+                return;
+            }
+
+            tokio::task::yield_now().await;
+        }
+
+        assert_ingest_worker_backoff_snapshot(
+            expected_retry_count,
+            expected_next_delay_ms,
+            expected_error_class,
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_status_db_work_runs_off_runtime() {
         let (_tempdir, db_path, server) = setup_server();
@@ -14619,8 +14773,93 @@ pattern_boost = 0.2
         );
     }
 
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn test_mcp_async_ingest_worker_backoff_caps_when_claim_is_locked() {
+        crate::observability::reset_ingest_worker_backoff_for_tests();
+        let (_tempdir, db_path, server) = setup_server();
+        let queue = AsyncPendingMessageStore::from_store(
+            crate::core::queue::PendingMessageStore::new_without_reclaim(&db_path),
+        )
+        .with_claim_lock_failures_for_test(5);
+        let server = server.with_async_queue_for_test(queue);
+        let handle = server.spawn_scoped_ingest_drain_worker();
+
+        wait_for_ingest_worker_backoff_snapshot(1, 2_000, Some("sqlite_locked")).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        wait_for_ingest_worker_backoff_snapshot(2, 4_000, Some("sqlite_locked")).await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        wait_for_ingest_worker_backoff_snapshot(3, 8_000, Some("sqlite_locked")).await;
+        tokio::time::advance(Duration::from_secs(8)).await;
+        wait_for_ingest_worker_backoff_snapshot(4, 16_000, Some("sqlite_locked")).await;
+        tokio::time::advance(Duration::from_secs(16)).await;
+        wait_for_ingest_worker_backoff_snapshot(5, 30_000, Some("sqlite_locked")).await;
+
+        // After the 30s cap, subsequent retries should continue at the 30s cap,
+        // not exceed it. The claim_lock_failures_for_test(5) means the 6th
+        // attempt will succeed (failures exhausted), but we verify the cap
+        // by checking the sequence up to retry 5 already shows 30_000.
+        // For an explicit cap test, we'd need more failures, but the 30_000
+        // assertion at retry 5 proves the cap is enforced.
+        // ingest_worker_backoff_delay(5) = 30s (capped), and
+        // ingest_worker_backoff_delay(6) would also return 30s.
+        assert_eq!(
+            ingest_worker_backoff_delay(6),
+            Duration::from_secs(30),
+            "backoff delay must cap at 30s even beyond retry 5"
+        );
+
+        handle.shutdown_and_drain().await;
+        assert_ingest_worker_backoff_snapshot(0, 0, None);
+    }
+
+    #[test]
+    fn test_mcp_async_ingest_worker_classifies_terminal_queue_errors() {
+        let terminal = anyhow::Error::new(crate::core::queue::QueueError::MessageNotFound(
+            "missing-message".to_string(),
+        ));
+        assert!(ingest_worker_error_is_terminal(&terminal));
+
+        let retryable = anyhow::Error::new(crate::core::queue::QueueError::Sqlite(
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseBusy,
+                    extended_code: rusqlite::ffi::SQLITE_BUSY,
+                },
+                Some("database is locked".to_string()),
+            ),
+        ));
+        assert!(!ingest_worker_error_is_terminal(&retryable));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mcp_async_ingest_worker_stops_on_terminal_claim_failure() {
+        crate::observability::reset_ingest_worker_backoff_for_tests();
+        let (_tempdir, db_path, server) = setup_server();
+        let db = Database::open(&db_path).expect("open db");
+        db.conn()
+            .execute_batch("ALTER TABLE pending_messages RENAME TO pending_messages_terminal_test;")
+            .expect("break pending_messages table for terminal failure test");
+
+        let handle = server.spawn_scoped_ingest_drain_worker();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if handle.handle.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal queue failure should stop the worker without retrying forever");
+
+        assert_ingest_worker_backoff_snapshot(0, 0, Some("terminal"));
+        handle.shutdown_and_drain().await;
+        assert_ingest_worker_backoff_snapshot(0, 0, Some("terminal"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_mcp_async_ingest_transient_write_lock_requeues_instead_of_failing() {
+        crate::observability::reset_ingest_worker_backoff_for_tests();
         let (_tempdir, db_path, server) = setup_server();
         let server = server.with_sync_db_open_lock_failures_for_test(1);
         let (config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
@@ -14688,11 +14927,17 @@ pattern_boost = 0.2
             completion_count, 0,
             "transient write lock must not create a failed completion receipt"
         );
+        // Note: we intentionally do NOT assert on the global ingest worker backoff
+        // snapshot here. That state is shared across parallel test threads, and
+        // asserting on it produces intermittent failures when another test resets
+        // the global between process_ingest_claim and the read. The backoff
+        // telemetry is verified in the dedicated backoff test
+        // (test_mcp_async_ingest_worker_backoff_caps_when_claim_is_locked).
+        //
+        // The behavioral assertions above (requeue + no completion receipt +
+        // successful retry) are sufficient to prove the transient lock path works.
 
-        tokio::time::sleep(Duration::from_millis(
-            MCP_INGEST_TRANSIENT_WRITE_LOCK_RETRY_DELAY_MS as u64 + 200,
-        ))
-        .await;
+        tokio::time::sleep(ingest_worker_backoff_delay(1) + Duration::from_millis(200)).await;
         let retry_claim = queue
             .claim_next_by_kind("worker-transient-write-lock-retry", 60, INGEST_ASYNC_KIND)
             .expect("claim retry op")

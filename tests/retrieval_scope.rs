@@ -11,6 +11,7 @@ use mempal::core::types::{
 };
 use mempal::embed::{Embedder, EmbedderFactory};
 use mempal::mcp::{MempalMcpServer, RetrievalScopeRequest, SearchRequest};
+use mempal::observability::{self, VectorScanMode};
 use mempal::search::{
     SearchFilters, SearchOptions, search_bm25_only_with_options,
     search_with_vector_and_scope_options,
@@ -175,9 +176,18 @@ fn ids(results: Vec<mempal::core::types::SearchResult>) -> Vec<String> {
     results.into_iter().map(|result| result.drawer_id).collect()
 }
 
+fn reset_vector_scan_telemetry() {
+    observability::reset_vector_scan_for_tests();
+}
+
+fn vector_scan_telemetry() -> observability::VectorScanSnapshot {
+    observability::vector_scan_snapshot()
+}
+
 #[tokio::test]
 async fn test_vector_and_bm25_apply_memory_kind_status_scope() {
     let _guard = config_guard().await;
+    reset_vector_scan_telemetry();
     let env = TestEnv::new(Some("project-a"));
     let db = env.db();
     insert(
@@ -229,6 +239,10 @@ async fn test_vector_and_bm25_apply_memory_kind_status_scope() {
     )
     .expect("vector search"));
     assert_eq!(vector_ids, vec!["drawer_scope_promoted"]);
+    let scan = vector_scan_telemetry();
+    assert_eq!(scan.mode, Some(VectorScanMode::Exact));
+    assert_eq!(scan.candidate_count, 1);
+    assert_eq!(scan.candidate_cap, 4_096);
 
     let bm25_ids = ids(search_bm25_only_with_options(
         &db,
@@ -245,6 +259,7 @@ async fn test_vector_and_bm25_apply_memory_kind_status_scope() {
 #[tokio::test]
 async fn test_tunnel_fanout_preserves_typed_scope_filters() {
     let _guard = config_guard().await;
+    reset_vector_scan_telemetry();
     let env = TestEnv::new(Some("project-a"));
     let db = env.db();
     let mut direct = knowledge_drawer(
@@ -285,6 +300,10 @@ async fn test_tunnel_fanout_preserves_typed_scope_filters() {
     )
     .expect("vector search"));
     assert_eq!(vector_ids, vec!["drawer_scope_promoted"]);
+    let scan = vector_scan_telemetry();
+    assert_eq!(scan.mode, Some(VectorScanMode::Exact));
+    assert_eq!(scan.candidate_count, 1);
+    assert_eq!(scan.candidate_cap, 4_096);
 
     let bm25_ids = ids(search_bm25_only_with_options(
         &db,
@@ -301,6 +320,7 @@ async fn test_tunnel_fanout_preserves_typed_scope_filters() {
 #[tokio::test]
 async fn test_large_typed_vector_filter_uses_bounded_knn_fallback() {
     let _guard = config_guard().await;
+    reset_vector_scan_telemetry();
     let env = TestEnv::new(Some("project-a"));
     let db = env.db();
     let query_vector = vec![1.0, 0.0, 0.0];
@@ -356,6 +376,10 @@ async fn test_large_typed_vector_filter_uses_bounded_knn_fallback() {
         result_ids.is_empty(),
         "large typed filters must use the bounded KNN fallback instead of exact-scanning all evidence vectors"
     );
+    let scan = vector_scan_telemetry();
+    assert_eq!(scan.mode, Some(VectorScanMode::Knn));
+    assert!(scan.candidate_count > 4_096);
+    assert_eq!(scan.candidate_cap, 4_096);
 }
 
 #[tokio::test]
