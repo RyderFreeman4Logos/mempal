@@ -1823,25 +1823,21 @@ impl Database {
             .map_err(|_| DbError::InvalidSourceType("scan_limit".to_string()))?;
         let mut statement = self.conn.prepare(
             r#"
-            WITH recent_vectors AS (
-                SELECT d.id,
-                       d.deleted_at,
-                       d.wing,
-                       d.room,
-                       d.project_id,
-                       v.embedding
-                FROM drawer_vectors v
-                JOIN drawers d ON d.id = v.id
+            WITH recent_drawers AS (
+                SELECT d.id
+                FROM drawers d
                 WHERE d.deleted_at IS NULL
                   AND (?2 IS NULL OR d.wing = ?2)
                   AND (?3 IS NULL OR d.room = ?3)
                   AND (?4 IS NULL OR d.project_id = ?4)
+                  AND EXISTS (SELECT 1 FROM drawer_vectors v WHERE v.id = d.id)
                 ORDER BY d.rowid DESC
                 LIMIT ?6
             )
-            SELECT id,
-                   CAST(1.0 - vec_distance_cosine(embedding, vec_f32(?1)) AS REAL) AS similarity
-            FROM recent_vectors
+            SELECT rd.id,
+                   CAST(1.0 - vec_distance_cosine(v.embedding, vec_f32(?1)) AS REAL) AS similarity
+            FROM recent_drawers rd
+            JOIN drawer_vectors v ON v.id = rd.id
             ORDER BY similarity DESC
             LIMIT ?5
             "#,
