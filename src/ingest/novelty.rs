@@ -323,4 +323,45 @@ mod tests {
         assert_eq!(snapshot.candidate_count, 0);
         assert_eq!(snapshot.last_fail_open_reason, None);
     }
+
+    #[test]
+    fn evaluate_records_fail_open_reason_when_novelty_search_errors() {
+        crate::observability::reset_vector_scan_for_tests();
+        let tmp = TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("test.db")).expect("open db");
+        let drawer = test_drawer("seed-fail-open");
+
+        db.insert_drawer_with_project(&drawer, None)
+            .expect("insert drawer");
+        // Insert a 3-dim vector so the table exists and count > 0.
+        db.insert_vector_with_project(&drawer.id, &[0.1_f32, 0.2_f32, 0.3_f32], None)
+            .expect("insert vector");
+
+        // Query with a mismatched dimension (4-dim vs 3-dim stored).
+        // This causes vec_distance_cosine to error inside
+        // novelty_candidates_exact, triggering the fail-open path that
+        // records last_fail_open_reason = "bounded_no_project_search_failed".
+        let decision = evaluate(
+            &db,
+            &NoveltyCandidate {
+                wing: "code-memory".to_string(),
+                room: Some("novelty".to_string()),
+                project_id: None,
+            },
+            // 4-dim query vector vs 3-dim stored vectors
+            &[0.1_f32, 0.2_f32, 0.3_f32, 0.4_f32],
+            &NoveltyConfig {
+                enabled: true,
+                ..NoveltyConfig::default()
+            },
+        );
+
+        assert!(matches!(decision.action, NoveltyAction::Insert));
+        let snapshot = crate::observability::vector_scan_snapshot();
+        assert_eq!(snapshot.mode, Some(VectorScanMode::Bounded));
+        assert!(
+            snapshot.last_fail_open_reason.is_some(),
+            "fail-open reason should be recorded when novelty search errors: {snapshot:?}"
+        );
+    }
 }
