@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -2454,6 +2454,9 @@ struct MaintenanceRejudgeArgs {
     /// Write content-free JSONL progress telemetry to this file.
     #[arg(long = "progress-file")]
     progress_file: Option<PathBuf>,
+    /// Directory for read-only rejudge proposal/confirmation JSONL artifacts.
+    #[arg(long = "candidates-file", conflicts_with = "execute")]
+    candidates_file: Option<PathBuf>,
     /// Run only the proposal stage and persist confirmation backlog without deleting drawers.
     #[arg(long = "proposal-only", default_value_t = false)]
     proposal_only: bool,
@@ -2478,6 +2481,23 @@ struct MaintenanceRejudgeArgs {
 
 #[derive(Subcommand)]
 enum MaintenanceRejudgeCommands {
+    /// Apply deferred deletions from a read-only rejudge confirmations artifact.
+    Apply {
+        /// Absolute path to confirmations.jsonl produced by --candidates-file scan mode.
+        #[arg(long = "confirmations-file")]
+        confirmations_file: PathBuf,
+        /// Absolute directory for atomic rejudge backup files.
+        #[arg(long = "backup-dir")]
+        backup_dir: PathBuf,
+        /// Mutate storage. Omit for dry-run.
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+        /// Irreversibly delete candidates instead of auditable soft-delete.
+        #[arg(long = "hard-delete", default_value_t = false)]
+        hard_delete: bool,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
     /// Restore drawers from a historical rejudge backup.
     Restore {
         /// Absolute path to a rejudge backup JSON file.
@@ -2644,6 +2664,7 @@ struct HistoricalRejudgeOptions<'a> {
     unsafe_allow_config_version_drift: bool,
     page_size: usize,
     progress_file: Option<&'a Path>,
+    candidates_file: Option<&'a Path>,
     stage_mode: HistoricalRejudgeStageMode,
     proposal_llm_endpoint: Option<&'a str>,
     confirm_llm_endpoint: Option<&'a str>,
@@ -2791,6 +2812,126 @@ struct HistoricalRejudgeDecision {
     tier: u8,
     judge: String,
     requires_confirmation: bool,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalRejudgeArtifactProposalDecision {
+    score: f64,
+    reason: String,
+    should_forget: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HistoricalRejudgeArtifactSnapshot {
+    content_hash: String,
+    added_at: String,
+    importance: i32,
+    is_pinned: bool,
+    effective_importance: f64,
+    status: String,
+    memory_kind: String,
+    wing: String,
+    room: String,
+    source_file: Option<String>,
+    source_type: String,
+    project_id: String,
+    chunk_index: Option<i64>,
+    normalize_version: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalRejudgeProposalArtifactLine {
+    drawer_id: String,
+    drawer_rowid: i64,
+    #[serde(default)]
+    snapshot_content_hash: String,
+    #[serde(default)]
+    snapshot_importance: Option<i32>,
+    #[serde(default)]
+    snapshot_is_pinned: Option<bool>,
+    #[serde(default)]
+    snapshot_effective_importance: Option<f64>,
+    #[serde(default)]
+    snapshot_status: Option<String>,
+    #[serde(default)]
+    snapshot_memory_kind: Option<String>,
+    #[serde(default)]
+    snapshot_room: Option<String>,
+    #[serde(default)]
+    snapshot_source_file: Option<String>,
+    #[serde(default)]
+    snapshot_chunk_index: Option<i64>,
+    #[serde(default)]
+    snapshot_normalize_version: Option<i64>,
+    #[serde(default)]
+    snapshot_project_id: Option<String>,
+    proposal_decision: String,
+    proposal_score: f64,
+    proposal_reason: String,
+    snapshot_added_at: String,
+    snapshot_wing: String,
+    snapshot_source_type: String,
+    timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalRejudgeConfirmationArtifactLine {
+    drawer_id: String,
+    drawer_rowid: i64,
+    #[serde(default)]
+    snapshot_content_hash: String,
+    #[serde(default)]
+    snapshot_importance: Option<i32>,
+    #[serde(default)]
+    snapshot_is_pinned: Option<bool>,
+    #[serde(default)]
+    snapshot_effective_importance: Option<f64>,
+    #[serde(default)]
+    snapshot_status: Option<String>,
+    #[serde(default)]
+    snapshot_memory_kind: Option<String>,
+    #[serde(default)]
+    snapshot_wing: Option<String>,
+    #[serde(default)]
+    snapshot_room: Option<String>,
+    #[serde(default)]
+    snapshot_source_file: Option<String>,
+    #[serde(default)]
+    snapshot_source_type: String,
+    #[serde(default)]
+    snapshot_chunk_index: Option<i64>,
+    #[serde(default)]
+    snapshot_normalize_version: Option<i64>,
+    #[serde(default)]
+    snapshot_project_id: Option<String>,
+    final_decision: String,
+    confirm_score: f64,
+    confirm_reason: String,
+    proposal_score: f64,
+    snapshot_added_at: String,
+    timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalRejudgeArtifactCursor {
+    last_processed_rowid: i64,
+    options_hash: String,
+    judge_model: String,
+    started_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HistoricalRejudgeApplyReport {
+    dry_run: bool,
+    confirmations_file: PathBuf,
+    backup_path: Option<PathBuf>,
+    backup_format: Option<String>,
+    hard_delete: bool,
+    confirmation_count: usize,
+    delete_count: usize,
+    skipped_count: usize,
+    mutated_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4089,6 +4230,7 @@ fn run() -> Result<()> {
                 page_size,
                 llm_concurrency,
                 progress_file,
+                candidates_file,
                 proposal_only,
                 confirm_pending_only,
                 proposal_llm_endpoint,
@@ -4117,6 +4259,7 @@ fn run() -> Result<()> {
                 unsafe_allow_config_version_drift,
                 page_size,
                 progress_file: progress_file.as_deref(),
+                candidates_file: candidates_file.as_deref(),
                 stage_mode,
                 proposal_llm_endpoint: proposal_llm_endpoint.as_deref(),
                 confirm_llm_endpoint: confirm_llm_endpoint.as_deref(),
@@ -4135,6 +4278,20 @@ fn run() -> Result<()> {
                     options,
                     HistoricalRejudgeRuntimeOptions { llm_concurrency },
                 )),
+                Some(MaintenanceRejudgeCommands::Apply {
+                    confirmations_file,
+                    backup_dir,
+                    execute,
+                    hard_delete,
+                    format,
+                }) => maintenance_rejudge_apply_command(
+                    &db,
+                    &confirmations_file,
+                    &backup_dir,
+                    execute,
+                    hard_delete,
+                    format.as_str(),
+                ),
                 Some(MaintenanceRejudgeCommands::Restore {
                     backup,
                     execute,
@@ -4583,6 +4740,7 @@ fn command_is_dry_run_cli_operation(command: &Commands) -> bool {
 
 fn maintenance_rejudge_command_is_dry_run(args: &MaintenanceRejudgeArgs) -> bool {
     match &args.command {
+        Some(MaintenanceRejudgeCommands::Apply { execute, .. }) => !*execute,
         Some(MaintenanceRejudgeCommands::Restore { execute, .. }) => !*execute,
         None => !args.execute,
     }
@@ -16886,8 +17044,28 @@ fn validate_historical_rejudge_options(options: HistoricalRejudgeOptions<'_>) ->
     if options.unsafe_no_backup && !options.hard_delete {
         bail!("--unsafe-no-backup is only valid with --hard-delete");
     }
-    if options.resume && (!options.all || !options.execute) {
-        bail!("--resume requires --all --execute");
+    if options.resume {
+        if options.candidates_file.is_some() {
+            if !options.all || options.execute {
+                bail!("--resume with --candidates-file requires --all without --execute");
+            }
+        } else if !options.all || !options.execute {
+            bail!("--resume requires --all --execute");
+        }
+    }
+    if options.candidates_file.is_some() {
+        if options.execute {
+            bail!("--candidates-file is mutually exclusive with --execute");
+        }
+        if !options.all {
+            bail!("--candidates-file requires --all");
+        }
+        if options.proposal_llm_endpoint.is_none() || options.confirm_llm_endpoint.is_none() {
+            bail!("--candidates-file requires --proposal-llm-endpoint and --confirm-llm-endpoint");
+        }
+        if options.stage_mode != HistoricalRejudgeStageMode::Paired {
+            bail!("--candidates-file cannot be combined with split-stage rejudge flags");
+        }
     }
     if options.confirm_llm_endpoint.is_some() && options.proposal_llm_endpoint.is_none() {
         bail!("--confirm-llm-endpoint requires --proposal-llm-endpoint");
@@ -17268,6 +17446,26 @@ async fn maintenance_rejudge_all_command(
         options,
         historical_rejudge_backup_required(options),
     )?;
+
+    if let Some(candidates_dir) = options.candidates_file {
+        let report = scan_historical_rejudge_artifacts(
+            db,
+            config,
+            options,
+            HistoricalRejudgeArtifactScanContext {
+                candidates_dir,
+                project_id: project_id.as_deref(),
+                llm_context: llm_context.as_ref(),
+                judge_model,
+                config_version,
+                started,
+                progress: progress.as_deref_mut(),
+                llm_concurrency: runtime.llm_concurrency,
+            },
+        )
+        .await?;
+        return print_historical_rejudge_report(&report, options.format);
+    }
 
     if !options.execute {
         let report = dry_run_historical_rejudge_all(
@@ -17862,6 +18060,715 @@ struct HistoricalRejudgeDryRunContext<'a> {
     config_version: String,
     started: std::time::Instant,
     progress: Option<&'a mut HistoricalRejudgeProgressWriter>,
+}
+
+struct HistoricalRejudgeArtifactScanContext<'a> {
+    candidates_dir: &'a Path,
+    project_id: Option<&'a str>,
+    llm_context: Option<&'a HistoricalRejudgeLlmContext>,
+    judge_model: Option<String>,
+    config_version: String,
+    started: std::time::Instant,
+    progress: Option<&'a mut HistoricalRejudgeProgressWriter>,
+    llm_concurrency: usize,
+}
+
+async fn scan_historical_rejudge_artifacts(
+    db: &Database,
+    config: &Config,
+    options: HistoricalRejudgeOptions<'_>,
+    mut context: HistoricalRejudgeArtifactScanContext<'_>,
+) -> Result<HistoricalRejudgeReport> {
+    fs::create_dir_all(context.candidates_dir).with_context(|| {
+        format!(
+            "failed to create candidates dir {}",
+            context.candidates_dir.display()
+        )
+    })?;
+    let proposals_path = context.candidates_dir.join("proposals.jsonl");
+    let confirmations_path = context.candidates_dir.join("confirmations.jsonl");
+    let cursor_path = context.candidates_dir.join("cursor.json");
+    let options_hash =
+        historical_rejudge_options_hash(options, context.project_id, &context.config_version)?;
+    let judge_model = context
+        .judge_model
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let started_at = iso_timestamp();
+    let existing_cursor = if options.resume {
+        let cursor = read_historical_rejudge_artifact_cursor(&cursor_path)?;
+        if cursor.options_hash != options_hash {
+            bail!("historical rejudge artifact cursor options_hash does not match current options");
+        }
+        if cursor.judge_model != judge_model {
+            bail!("historical rejudge artifact cursor judge_model does not match current options");
+        }
+        Some(cursor)
+    } else {
+        None
+    };
+    let mut cursor = existing_cursor
+        .as_ref()
+        .map(|cursor| cursor.last_processed_rowid)
+        .unwrap_or(0);
+    let cursor_started_at = existing_cursor
+        .map(|cursor| cursor.started_at)
+        .unwrap_or(started_at);
+    let max_rowid = db
+        .historical_rejudge_scope_max_rowid(options.wing, options.room, context.project_id)
+        .context("failed to snapshot historical rejudge artifact max rowid")?
+        .unwrap_or(0);
+    let snapshot_count = db
+        .historical_rejudge_scope_count_until(
+            options.wing,
+            options.room,
+            context.project_id,
+            max_rowid,
+        )
+        .context("failed to count historical rejudge artifact snapshot")?;
+    let mut summary = HistoricalRejudgeProgressSummary::default();
+    let mut proposal_keys = read_historical_rejudge_artifact_proposal_keys(&proposals_path)?;
+    let mut confirmation_keys =
+        read_historical_rejudge_artifact_confirmation_keys(&confirmations_path)?;
+
+    if let Some(writer) = context.progress.as_mut() {
+        writer.write_event(build_historical_rejudge_progress_event(
+            HistoricalRejudgeProgressEventInput {
+                status: "started",
+                dry_run: true,
+                all: true,
+                limit: None,
+                page_size: options.page_size,
+                snapshot_count: Some(snapshot_count),
+                snapshot_max_rowid: Some(max_rowid),
+                counts: HistoricalRejudgeProgressCounts::default(),
+                cursor_rowid: (cursor > 0).then_some(cursor),
+                remaining_count: Some(snapshot_count),
+                judge_model: context.judge_model.as_deref(),
+                config_version: &context.config_version,
+                started: context.started,
+                last_successful_page_at: None,
+                error: None,
+            },
+        ))?;
+    }
+
+    loop {
+        let rows = db
+            .historical_rejudge_candidates_page(
+                options.wing,
+                options.room,
+                context.project_id,
+                cursor,
+                max_rowid,
+                options.page_size,
+            )
+            .context("failed to load historical rejudge artifact page")?;
+        if rows.is_empty() {
+            break;
+        }
+
+        let pending_rows = rows
+            .iter()
+            .filter(|row| {
+                !proposal_keys.contains(&historical_rejudge_artifact_key(row.rowid, &row.drawer.id))
+            })
+            .collect::<Vec<_>>();
+        let mut stream = futures::stream::iter(pending_rows)
+            .map(|row| async move {
+                let proposal =
+                    evaluate_historical_artifact_proposal(row, config, context.llm_context).await?;
+                Ok::<_, anyhow::Error>((row, proposal))
+            })
+            .buffer_unordered(context.llm_concurrency);
+        let mut page_outcomes = Vec::with_capacity(rows.len());
+        while let Some(outcome) = stream.next().await {
+            page_outcomes.push(outcome?);
+        }
+        page_outcomes.sort_by_key(|(row, _)| row.rowid);
+
+        for (row, proposal) in page_outcomes {
+            let line = historical_rejudge_proposal_artifact_line(row, &proposal);
+            append_jsonl_record(&proposals_path, &line)?;
+            proposal_keys.insert(historical_rejudge_artifact_key(row.rowid, &row.drawer.id));
+            let decision = historical_rejudge_decision_from_artifact_proposal(&proposal);
+            record_historical_rejudge_summary(&mut summary, row, &decision, 0);
+        }
+        for row in &rows {
+            cursor = row.rowid;
+        }
+
+        write_historical_rejudge_artifact_cursor(
+            &cursor_path,
+            &HistoricalRejudgeArtifactCursor {
+                last_processed_rowid: cursor,
+                options_hash: options_hash.clone(),
+                judge_model: judge_model.clone(),
+                started_at: cursor_started_at.clone(),
+                updated_at: iso_timestamp(),
+            },
+        )?;
+
+        if let Some(writer) = context.progress.as_mut() {
+            let page_at = iso_timestamp();
+            writer.write_event(build_historical_rejudge_progress_event(
+                HistoricalRejudgeProgressEventInput {
+                    status: "page_completed",
+                    dry_run: true,
+                    all: true,
+                    limit: None,
+                    page_size: options.page_size,
+                    snapshot_count: Some(snapshot_count),
+                    snapshot_max_rowid: Some(max_rowid),
+                    counts: HistoricalRejudgeProgressCounts::from_summary(&summary),
+                    cursor_rowid: (cursor > 0).then_some(cursor),
+                    remaining_count: Some(snapshot_count.saturating_sub(summary.scanned_count)),
+                    judge_model: context.judge_model.as_deref(),
+                    config_version: &context.config_version,
+                    started: context.started,
+                    last_successful_page_at: Some(&page_at),
+                    error: None,
+                },
+            ))?;
+        }
+    }
+
+    if let Err(error) = confirm_historical_rejudge_artifact_backlog(
+        db,
+        config,
+        context.llm_context,
+        &proposals_path,
+        &confirmations_path,
+        &mut confirmation_keys,
+        context.llm_concurrency,
+    )
+    .await
+    {
+        eprintln!("historical rejudge artifact confirmations deferred: {error:#}");
+    }
+
+    let remaining_count = if cursor >= max_rowid {
+        0
+    } else {
+        snapshot_count.saturating_sub(summary.scanned_count)
+    };
+    let final_counts = HistoricalRejudgeProgressCounts::from_summary(&summary);
+    let report = historical_rejudge_report_from_summary(
+        summary,
+        HistoricalRejudgeReportEnvelope {
+            dry_run: true,
+            mutation: "artifact_scan",
+            all: true,
+            completed: cursor >= max_rowid,
+            page_size: options.page_size,
+            snapshot_count,
+            remaining_count,
+            cursor_rowid: (cursor > 0).then_some(cursor),
+            elapsed_ms: context.started.elapsed().as_millis(),
+            judge_model: context.judge_model,
+            config_version: context.config_version,
+            progress_file: context
+                .progress
+                .as_ref()
+                .map(|writer| writer.path().to_path_buf()),
+            backup_path: None,
+            backup_format: None,
+        },
+    );
+    if let Some(writer) = context.progress.as_mut() {
+        writer.write_event(build_historical_rejudge_progress_event(
+            HistoricalRejudgeProgressEventInput {
+                status: "completed",
+                dry_run: true,
+                all: true,
+                limit: None,
+                page_size: options.page_size,
+                snapshot_count: Some(snapshot_count),
+                snapshot_max_rowid: Some(max_rowid),
+                counts: final_counts,
+                cursor_rowid: report.cursor_rowid,
+                remaining_count: Some(report.remaining_count),
+                judge_model: report.judge_model.as_deref(),
+                config_version: &report.config_version,
+                started: context.started,
+                last_successful_page_at: Some(&iso_timestamp()),
+                error: None,
+            },
+        ))?;
+    }
+    Ok(report)
+}
+
+fn historical_rejudge_artifact_key(rowid: i64, drawer_id: &str) -> String {
+    format!("{rowid}:{drawer_id}")
+}
+
+fn historical_rejudge_artifact_snapshot_from_row(
+    row: &mempal::core::db::HistoricalRejudgeCandidate,
+) -> HistoricalRejudgeArtifactSnapshot {
+    HistoricalRejudgeArtifactSnapshot {
+        content_hash: historical_rejudge_content_hash(&row.drawer.content),
+        added_at: row.drawer.added_at.clone(),
+        importance: row.drawer.importance,
+        is_pinned: row.drawer.is_pinned,
+        effective_importance: row.drawer.effective_importance,
+        status: row
+            .drawer
+            .status
+            .as_ref()
+            .map(knowledge_status_slug)
+            .unwrap_or_default()
+            .to_string(),
+        memory_kind: memory_kind_slug(&row.drawer.memory_kind).to_string(),
+        wing: row.drawer.wing.clone(),
+        room: row.drawer.room.clone().unwrap_or_default(),
+        source_file: row.drawer.source_file.clone(),
+        source_type: row.drawer.source_type.as_str().to_string(),
+        project_id: row.project_id.clone().unwrap_or_default(),
+        chunk_index: row.drawer.chunk_index,
+        normalize_version: i64::from(row.drawer.normalize_version),
+    }
+}
+
+fn historical_rejudge_snapshot_from_proposal(
+    proposal: &HistoricalRejudgeProposalArtifactLine,
+) -> Option<HistoricalRejudgeArtifactSnapshot> {
+    Some(HistoricalRejudgeArtifactSnapshot {
+        content_hash: non_empty_snapshot_string(&proposal.snapshot_content_hash)?,
+        added_at: non_empty_snapshot_string(&proposal.snapshot_added_at)?,
+        importance: proposal.snapshot_importance?,
+        is_pinned: proposal.snapshot_is_pinned?,
+        effective_importance: proposal.snapshot_effective_importance?,
+        status: proposal.snapshot_status.clone()?,
+        memory_kind: proposal.snapshot_memory_kind.clone()?,
+        wing: non_empty_snapshot_string(&proposal.snapshot_wing)?,
+        room: proposal.snapshot_room.clone()?,
+        source_file: proposal.snapshot_source_file.clone(),
+        source_type: non_empty_snapshot_string(&proposal.snapshot_source_type)?,
+        project_id: proposal.snapshot_project_id.clone()?,
+        chunk_index: proposal.snapshot_chunk_index,
+        normalize_version: proposal.snapshot_normalize_version?,
+    })
+}
+
+fn historical_rejudge_snapshot_from_confirmation(
+    confirmation: &HistoricalRejudgeConfirmationArtifactLine,
+) -> Option<HistoricalRejudgeArtifactSnapshot> {
+    Some(HistoricalRejudgeArtifactSnapshot {
+        content_hash: non_empty_snapshot_string(&confirmation.snapshot_content_hash)?,
+        added_at: non_empty_snapshot_string(&confirmation.snapshot_added_at)?,
+        importance: confirmation.snapshot_importance?,
+        is_pinned: confirmation.snapshot_is_pinned?,
+        effective_importance: confirmation.snapshot_effective_importance?,
+        status: confirmation.snapshot_status.clone()?,
+        memory_kind: confirmation.snapshot_memory_kind.clone()?,
+        wing: confirmation.snapshot_wing.clone()?,
+        room: confirmation.snapshot_room.clone()?,
+        source_file: confirmation.snapshot_source_file.clone(),
+        source_type: non_empty_snapshot_string(&confirmation.snapshot_source_type)?,
+        project_id: confirmation.snapshot_project_id.clone()?,
+        chunk_index: confirmation.snapshot_chunk_index,
+        normalize_version: confirmation.snapshot_normalize_version?,
+    })
+}
+
+fn non_empty_snapshot_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn historical_rejudge_proposal_artifact_line(
+    row: &mempal::core::db::HistoricalRejudgeCandidate,
+    proposal: &HistoricalRejudgeArtifactProposalDecision,
+) -> HistoricalRejudgeProposalArtifactLine {
+    let snapshot = historical_rejudge_artifact_snapshot_from_row(row);
+    HistoricalRejudgeProposalArtifactLine {
+        drawer_id: row.drawer.id.clone(),
+        drawer_rowid: row.rowid,
+        snapshot_content_hash: snapshot.content_hash,
+        snapshot_importance: Some(snapshot.importance),
+        snapshot_is_pinned: Some(snapshot.is_pinned),
+        snapshot_effective_importance: Some(snapshot.effective_importance),
+        snapshot_status: Some(snapshot.status),
+        snapshot_memory_kind: Some(snapshot.memory_kind),
+        snapshot_room: Some(snapshot.room),
+        snapshot_source_file: snapshot.source_file,
+        snapshot_source_type: snapshot.source_type,
+        snapshot_chunk_index: snapshot.chunk_index,
+        snapshot_normalize_version: Some(snapshot.normalize_version),
+        snapshot_project_id: Some(snapshot.project_id),
+        proposal_decision: if proposal.should_forget {
+            "forget"
+        } else {
+            "keep"
+        }
+        .to_string(),
+        proposal_score: proposal.score,
+        proposal_reason: proposal.reason.clone(),
+        snapshot_added_at: snapshot.added_at,
+        snapshot_wing: snapshot.wing,
+        timestamp: iso_timestamp(),
+    }
+}
+
+fn historical_rejudge_confirmation_artifact_line(
+    row: &mempal::core::db::HistoricalRejudgeCandidate,
+    proposal: &HistoricalRejudgeProposalArtifactLine,
+    decision: &HistoricalRejudgeDecision,
+) -> HistoricalRejudgeConfirmationArtifactLine {
+    let snapshot = historical_rejudge_artifact_snapshot_from_row(row);
+    HistoricalRejudgeConfirmationArtifactLine {
+        drawer_id: row.drawer.id.clone(),
+        drawer_rowid: row.rowid,
+        snapshot_content_hash: snapshot.content_hash,
+        snapshot_importance: Some(snapshot.importance),
+        snapshot_is_pinned: Some(snapshot.is_pinned),
+        snapshot_effective_importance: Some(snapshot.effective_importance),
+        snapshot_status: Some(snapshot.status),
+        snapshot_memory_kind: Some(snapshot.memory_kind),
+        snapshot_wing: Some(snapshot.wing),
+        snapshot_room: Some(snapshot.room),
+        snapshot_source_file: snapshot.source_file,
+        snapshot_source_type: snapshot.source_type,
+        snapshot_chunk_index: snapshot.chunk_index,
+        snapshot_normalize_version: Some(snapshot.normalize_version),
+        snapshot_project_id: Some(snapshot.project_id),
+        final_decision: if decision.delete_candidate {
+            "delete"
+        } else {
+            "keep"
+        }
+        .to_string(),
+        confirm_score: decision.score.unwrap_or_default(),
+        confirm_reason: decision.reason.clone(),
+        proposal_score: proposal.proposal_score,
+        snapshot_added_at: snapshot.added_at,
+        timestamp: iso_timestamp(),
+    }
+}
+
+fn historical_rejudge_decision_from_artifact_proposal(
+    proposal: &HistoricalRejudgeArtifactProposalDecision,
+) -> HistoricalRejudgeDecision {
+    HistoricalRejudgeDecision {
+        delete_candidate: proposal.should_forget,
+        protected: false,
+        reason: if proposal.should_forget {
+            format!("llm_proposal_pending:{}", proposal.reason)
+        } else {
+            format!("llm_proposal_keep:{}", proposal.reason)
+        },
+        label: Some("llm_judge".to_string()),
+        score: Some(proposal.score),
+        tier: 3,
+        judge: "llm".to_string(),
+        requires_confirmation: proposal.should_forget,
+    }
+}
+
+async fn evaluate_historical_artifact_proposal(
+    row: &mempal::core::db::HistoricalRejudgeCandidate,
+    config: &Config,
+    llm_context: Option<&HistoricalRejudgeLlmContext>,
+) -> Result<HistoricalRejudgeArtifactProposalDecision> {
+    if let Some(decision) = evaluate_historical_pre_llm(row, config) {
+        return Ok(HistoricalRejudgeArtifactProposalDecision {
+            score: decision
+                .score
+                .unwrap_or(if decision.delete_candidate { 0.0 } else { 1.0 }),
+            reason: decision.reason,
+            should_forget: decision.delete_candidate,
+        });
+    }
+    let Some(llm_context) = llm_context else {
+        let decision = deterministic_historical_decision(&row.drawer);
+        return Ok(HistoricalRejudgeArtifactProposalDecision {
+            score: decision
+                .score
+                .unwrap_or(if decision.delete_candidate { 0.0 } else { 1.0 }),
+            reason: decision.reason,
+            should_forget: decision.delete_candidate,
+        });
+    };
+    llm_context
+        .evaluate_artifact_proposal(&row.drawer, config)
+        .await
+}
+
+async fn confirm_historical_rejudge_artifact_backlog(
+    db: &Database,
+    config: &Config,
+    llm_context: Option<&HistoricalRejudgeLlmContext>,
+    proposals_path: &Path,
+    confirmations_path: &Path,
+    confirmation_keys: &mut BTreeSet<String>,
+    llm_concurrency: usize,
+) -> Result<()> {
+    let proposals = read_jsonl_records::<HistoricalRejudgeProposalArtifactLine>(proposals_path)?;
+    let pending = proposals
+        .into_iter()
+        .filter(|proposal| proposal.proposal_decision == "forget")
+        .filter(|proposal| {
+            !confirmation_keys.contains(&historical_rejudge_artifact_key(
+                proposal.drawer_rowid,
+                &proposal.drawer_id,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut stream = futures::stream::iter(pending.iter())
+        .map(|proposal| async move {
+            let row = db
+                .historical_rejudge_candidate_by_rowid(proposal.drawer_rowid, &proposal.drawer_id)
+                .with_context(|| {
+                    format!(
+                        "failed to load artifact confirmation drawer {} at rowid {}",
+                        proposal.drawer_id, proposal.drawer_rowid
+                    )
+                })?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let Some(snapshot) = historical_rejudge_snapshot_from_proposal(proposal) else {
+                eprintln!(
+                    "drawer {} artifact proposal missing snapshot provenance, skipping confirmation",
+                    proposal.drawer_id
+                );
+                return Ok(None);
+            };
+            let current_snapshot = historical_rejudge_artifact_snapshot_from_row(&row);
+            if current_snapshot != snapshot {
+                let summary =
+                    historical_rejudge_artifact_snapshot_mismatch_summary(&current_snapshot, &snapshot)
+                        .unwrap_or_else(|| "unknown snapshot mismatch".to_string());
+                eprintln!(
+                    "drawer {} changed since proposal scan ({}), skipping confirmation",
+                    proposal.drawer_id, summary
+                );
+                return Ok(None);
+            }
+            let Some(llm_context) = llm_context else {
+                bail!("artifact confirmation requires an active two-stage LLM context");
+            };
+            let decision = llm_context
+                .evaluate_artifact_confirmation(
+                    &row.drawer,
+                    config,
+                    proposal.proposal_score,
+                    &proposal.proposal_reason,
+                )
+                .await?;
+            Ok(Some((
+                historical_rejudge_artifact_key(row.rowid, &row.drawer.id),
+                historical_rejudge_confirmation_artifact_line(&row, proposal, &decision),
+            )))
+        })
+        .buffer_unordered(llm_concurrency);
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(Some((key, line))) => {
+                append_jsonl_record(confirmations_path, &line)?;
+                confirmation_keys.insert(key);
+            }
+            Ok(None) => {}
+            Err(error) if is_retryable_historical_llm_error(&error) => {
+                eprintln!("historical rejudge artifact confirmation deferred: {error:#}");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn historical_rejudge_content_hash(content: &str) -> String {
+    blake3::hash(content.as_bytes()).to_hex().to_string()
+}
+
+fn historical_rejudge_artifact_snapshot_mismatch_summary(
+    current: &HistoricalRejudgeArtifactSnapshot,
+    snapshot: &HistoricalRejudgeArtifactSnapshot,
+) -> Option<String> {
+    let mut changes = Vec::new();
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "content_hash",
+        &snapshot.content_hash,
+        &current.content_hash,
+    );
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "added_at",
+        &snapshot.added_at,
+        &current.added_at,
+    );
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "importance",
+        snapshot.importance,
+        current.importance,
+    );
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "is_pinned",
+        snapshot.is_pinned,
+        current.is_pinned,
+    );
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "effective_importance",
+        snapshot.effective_importance,
+        current.effective_importance,
+    );
+    push_rejudge_snapshot_change(&mut changes, "status", &snapshot.status, &current.status);
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "memory_kind",
+        &snapshot.memory_kind,
+        &current.memory_kind,
+    );
+    push_rejudge_snapshot_change(&mut changes, "wing", &snapshot.wing, &current.wing);
+    push_rejudge_snapshot_change(&mut changes, "room", &snapshot.room, &current.room);
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "source_file",
+        display_optional_snapshot_string(snapshot.source_file.as_deref()),
+        display_optional_snapshot_string(current.source_file.as_deref()),
+    );
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "source_type",
+        &snapshot.source_type,
+        &current.source_type,
+    );
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "project_id",
+        &snapshot.project_id,
+        &current.project_id,
+    );
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "chunk_index",
+        display_optional_snapshot_i64(snapshot.chunk_index),
+        display_optional_snapshot_i64(current.chunk_index),
+    );
+    push_rejudge_snapshot_change(
+        &mut changes,
+        "normalize_version",
+        snapshot.normalize_version,
+        current.normalize_version,
+    );
+    (!changes.is_empty()).then(|| changes.join(", "))
+}
+
+fn display_optional_snapshot_string(value: Option<&str>) -> String {
+    value.unwrap_or("<none>").to_string()
+}
+
+fn display_optional_snapshot_i64(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn push_rejudge_snapshot_change<T: std::fmt::Display + PartialEq>(
+    changes: &mut Vec<String>,
+    label: &str,
+    old: T,
+    new: T,
+) {
+    if old != new {
+        changes.push(format!("{label}: {old}\u{2192}{new}"));
+    }
+}
+
+fn append_jsonl_record<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open JSONL artifact {}", path.display()))?;
+    serde_json::to_writer(&mut file, value)
+        .with_context(|| format!("failed to write JSONL artifact {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("failed to terminate JSONL artifact {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush JSONL artifact {}", path.display()))?;
+    Ok(())
+}
+
+fn read_jsonl_records<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open JSONL artifact {}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let mut records = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| {
+            format!(
+                "failed to read JSONL artifact {} line {}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        records.push(serde_json::from_str(&line).with_context(|| {
+            format!(
+                "failed to parse JSONL artifact {} line {}",
+                path.display(),
+                index + 1
+            )
+        })?);
+    }
+    Ok(records)
+}
+
+fn read_historical_rejudge_artifact_proposal_keys(path: &Path) -> Result<BTreeSet<String>> {
+    Ok(
+        read_jsonl_records::<HistoricalRejudgeProposalArtifactLine>(path)?
+            .into_iter()
+            .map(|line| historical_rejudge_artifact_key(line.drawer_rowid, &line.drawer_id))
+            .collect(),
+    )
+}
+
+fn read_historical_rejudge_artifact_confirmation_keys(path: &Path) -> Result<BTreeSet<String>> {
+    Ok(
+        read_jsonl_records::<HistoricalRejudgeConfirmationArtifactLine>(path)?
+            .into_iter()
+            .map(|line| historical_rejudge_artifact_key(line.drawer_rowid, &line.drawer_id))
+            .collect(),
+    )
+}
+
+fn read_historical_rejudge_artifact_cursor(path: &Path) -> Result<HistoricalRejudgeArtifactCursor> {
+    let raw = fs::read(path)
+        .with_context(|| format!("failed to read artifact cursor {}", path.display()))?;
+    serde_json::from_slice(&raw)
+        .with_context(|| format!("failed to parse artifact cursor {}", path.display()))
+}
+
+fn write_historical_rejudge_artifact_cursor(
+    path: &Path,
+    cursor: &HistoricalRejudgeArtifactCursor,
+) -> Result<()> {
+    let tmp_path = path.with_extension("json.tmp");
+    let payload = serde_json::to_vec_pretty(cursor).context("failed to encode artifact cursor")?;
+    fs::write(&tmp_path, payload)
+        .with_context(|| format!("failed to write artifact cursor {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to replace artifact cursor {} from {}",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 struct HistoricalRejudgeReportEnvelope {
@@ -20605,6 +21512,214 @@ fn maintenance_rejudge_restore_command(
     print_historical_rejudge_restore_report(&report, format)
 }
 
+fn maintenance_rejudge_apply_command(
+    db: &Database,
+    confirmations_file: &Path,
+    backup_dir: &Path,
+    execute: bool,
+    hard_delete: bool,
+    format: &str,
+) -> Result<()> {
+    validate_absolute_path(confirmations_file, "--confirmations-file")?;
+    validate_absolute_path(backup_dir, "--backup-dir")?;
+    let confirmations =
+        read_jsonl_records::<HistoricalRejudgeConfirmationArtifactLine>(confirmations_file)?;
+    let delete_confirmations = confirmations
+        .iter()
+        .filter(|line| line.final_decision == "delete")
+        .collect::<Vec<_>>();
+    let writer_lease = if execute {
+        Some(acquire_historical_rejudge_writer_lease(db)?)
+    } else {
+        None
+    };
+    let writer_lease = writer_lease.as_ref();
+    let mutation = if hard_delete {
+        "hard_delete"
+    } else {
+        "soft_delete"
+    };
+    let mut skipped_count = 0usize;
+    let mut backup_items = Vec::new();
+    for confirmation in &delete_confirmations {
+        let current_content_hash = current_historical_rejudge_drawer_content_hash(
+            db,
+            confirmation.drawer_rowid,
+            &confirmation.drawer_id,
+        )
+        .with_context(|| {
+            format!(
+                "failed to load confirmed drawer {} content hash at rowid {}",
+                confirmation.drawer_id, confirmation.drawer_rowid
+            )
+        })?;
+        let Some(current_content_hash) = current_content_hash else {
+            skipped_count += 1;
+            continue;
+        };
+        if confirmation.snapshot_content_hash.is_empty()
+            || current_content_hash != confirmation.snapshot_content_hash
+        {
+            eprintln!(
+                "drawer {} content changed since scan, skipping",
+                confirmation.drawer_id
+            );
+            skipped_count += 1;
+            continue;
+        }
+        let row = db
+            .historical_rejudge_candidate_by_rowid(
+                confirmation.drawer_rowid,
+                &confirmation.drawer_id,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to load confirmed drawer {} at rowid {}",
+                    confirmation.drawer_id, confirmation.drawer_rowid
+                )
+            })?;
+        let Some(row) = row else {
+            skipped_count += 1;
+            continue;
+        };
+        let Some(snapshot) = historical_rejudge_snapshot_from_confirmation(confirmation) else {
+            eprintln!(
+                "drawer {} retention metadata changed since scan (artifact snapshot missing retention fields), skipping",
+                confirmation.drawer_id
+            );
+            skipped_count += 1;
+            continue;
+        };
+        let current_snapshot = historical_rejudge_artifact_snapshot_from_row(&row);
+        if current_snapshot != snapshot {
+            let summary =
+                historical_rejudge_artifact_snapshot_mismatch_summary(&current_snapshot, &snapshot)
+                    .unwrap_or_else(|| "unknown metadata mismatch".to_string());
+            eprintln!(
+                "drawer {} retention metadata changed since scan ({}), skipping",
+                confirmation.drawer_id, summary
+            );
+            skipped_count += 1;
+            continue;
+        }
+        let decision = HistoricalRejudgeDecision {
+            delete_candidate: true,
+            protected: false,
+            reason: confirmation.confirm_reason.clone(),
+            label: Some("llm_judge".to_string()),
+            score: Some(confirmation.confirm_score),
+            tier: 3,
+            judge: "llm".to_string(),
+            requires_confirmation: false,
+        };
+        match build_historical_rejudge_backup_item(db, &row, &decision, mutation)? {
+            Some(item) => backup_items.push(item),
+            None => skipped_count += 1,
+        }
+    }
+
+    let backup_path = if execute && !backup_items.is_empty() {
+        let options = HistoricalRejudgeOptions {
+            execute,
+            hard_delete,
+            backup_dir: Some(backup_dir),
+            unsafe_no_backup: false,
+            limit: delete_confirmations.len(),
+            all: true,
+            resume: false,
+            unsafe_allow_config_version_drift: false,
+            page_size: delete_confirmations.len().max(1),
+            progress_file: None,
+            candidates_file: None,
+            stage_mode: HistoricalRejudgeStageMode::Paired,
+            proposal_llm_endpoint: None,
+            confirm_llm_endpoint: None,
+            wing: None,
+            room: None,
+            project: None,
+            format,
+        };
+        let path = create_historical_rejudge_sqlite_backup(
+            db,
+            backup_dir,
+            options,
+            Some("artifact-confirmations".to_string()),
+            "artifact".to_string(),
+        )
+        .context("failed to create historical rejudge apply backup")?;
+        append_historical_rejudge_backup_items_durable(&path, &backup_items)?;
+        Some(path)
+    } else {
+        None
+    };
+
+    let mutated_count = if execute {
+        with_historical_rejudge_transaction_with_writer_lease(
+            db,
+            writer_lease,
+            "apply historical rejudge artifact confirmations",
+            || delete_rejudge_backup_items_by_version_inner(db, &backup_items, hard_delete),
+        )?
+    } else {
+        0
+    };
+
+    if execute {
+        append_audit_entry_with_writer_lease(
+            db,
+            writer_lease,
+            "append historical rejudge artifact apply audit",
+            "maintenance-rejudge-apply",
+            &serde_json::json!({
+                "confirmations_file": confirmations_file,
+                "backup_path": backup_path,
+                "hard_delete": hard_delete,
+                "confirmation_count": confirmations.len(),
+                "delete_count": delete_confirmations.len(),
+                "skipped_count": skipped_count,
+                "mutated_count": mutated_count,
+            }),
+        )
+        .context("failed to append historical rejudge artifact apply audit log")?;
+    }
+
+    let report = HistoricalRejudgeApplyReport {
+        dry_run: !execute,
+        confirmations_file: confirmations_file.to_path_buf(),
+        backup_path,
+        backup_format: execute.then_some("sqlite".to_string()),
+        hard_delete,
+        confirmation_count: confirmations.len(),
+        delete_count: delete_confirmations.len(),
+        skipped_count,
+        mutated_count,
+    };
+    print_historical_rejudge_apply_report(&report, format)
+}
+
+fn current_historical_rejudge_drawer_content_hash(
+    db: &Database,
+    drawer_rowid: i64,
+    drawer_id: &str,
+) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+
+    db.conn()
+        .query_row(
+            r#"
+            SELECT COALESCE(content_hash, '')
+            FROM drawers
+            WHERE deleted_at IS NULL
+              AND rowid = ?1
+              AND id = ?2
+            "#,
+            rusqlite::params![drawer_rowid, drawer_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to query current drawer content hash")
+}
+
 fn read_historical_rejudge_backup(path: &Path) -> Result<HistoricalRejudgeBackup> {
     validate_absolute_path(path, "--backup")?;
     if historical_rejudge_backup_is_sqlite(path)? {
@@ -21343,6 +22458,36 @@ fn print_historical_rejudge_restore_report(
     }
 }
 
+fn print_historical_rejudge_apply_report(
+    report: &HistoricalRejudgeApplyReport,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(report)?);
+            Ok(())
+        }
+        "plain" => {
+            println!("Historical Memory Rejudge Apply");
+            println!("dry_run={}", report.dry_run);
+            println!("confirmations_file={}", report.confirmations_file.display());
+            println!("hard_delete={}", report.hard_delete);
+            println!("confirmations={}", report.confirmation_count);
+            println!("delete_candidates={}", report.delete_count);
+            println!("skipped={}", report.skipped_count);
+            println!("mutated={}", report.mutated_count);
+            if let Some(path) = &report.backup_path {
+                println!("backup={}", path.display());
+            }
+            if report.dry_run && report.delete_count > 0 {
+                println!("rerun with --execute to apply confirmed deletions");
+            }
+            Ok(())
+        }
+        other => bail!("unsupported maintenance rejudge apply format: {other}"),
+    }
+}
+
 async fn evaluate_historical_drawer(
     row: &mempal::core::db::HistoricalRejudgeCandidate,
     config: &Config,
@@ -21644,6 +22789,72 @@ impl HistoricalRejudgeLlmContext {
                     } else {
                         format!(
                             "llm_two_stage_confirm_keep:proposal={proposal_reason};confirm={confirm_reason}"
+                        )
+                    },
+                    label: Some("llm_judge".to_string()),
+                    score: Some(confirm_score),
+                    tier: 3,
+                    judge: "llm".to_string(),
+                    requires_confirmation: false,
+                })
+            }
+        }
+    }
+
+    async fn evaluate_artifact_proposal(
+        &self,
+        drawer: &Drawer,
+        config: &Config,
+    ) -> Result<HistoricalRejudgeArtifactProposalDecision> {
+        let threshold = historical_llm_threshold(config);
+        match self {
+            Self::Single { router, .. } => {
+                let (score, reason) = request_historical_llm_score(router, drawer, config).await?;
+                Ok(HistoricalRejudgeArtifactProposalDecision {
+                    score,
+                    reason,
+                    should_forget: score < threshold,
+                })
+            }
+            Self::TwoStage {
+                proposal_router, ..
+            } => {
+                let (score, reason) =
+                    request_historical_llm_score(proposal_router, drawer, config).await?;
+                Ok(HistoricalRejudgeArtifactProposalDecision {
+                    score,
+                    reason,
+                    should_forget: score < threshold,
+                })
+            }
+        }
+    }
+
+    async fn evaluate_artifact_confirmation(
+        &self,
+        drawer: &Drawer,
+        config: &Config,
+        proposal_score: f64,
+        proposal_reason: &str,
+    ) -> Result<HistoricalRejudgeDecision> {
+        let threshold = historical_llm_threshold(config);
+        match self {
+            Self::Single { .. } => {
+                bail!("artifact confirmation requires --confirm-llm-endpoint")
+            }
+            Self::TwoStage { confirm_router, .. } => {
+                let (confirm_score, confirm_reason) =
+                    request_historical_llm_score(confirm_router, drawer, config).await?;
+                Ok(HistoricalRejudgeDecision {
+                    delete_candidate: confirm_score < threshold,
+                    protected: false,
+                    reason: if confirm_score < threshold {
+                        format!(
+                            "llm_two_stage_confirm_delete:proposal_score={proposal_score:.3};proposal={proposal_reason};confirm={confirm_reason}"
+                        )
+                    } else {
+                        format!(
+                            "llm_two_stage_confirm_keep:proposal_score={proposal_score:.3};proposal={proposal_reason};confirm={confirm_reason}"
                         )
                     },
                     label: Some("llm_judge".to_string()),
@@ -24196,6 +25407,7 @@ mod historical_rejudge_tests {
             page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
             llm_concurrency: DEFAULT_HISTORICAL_REJUDGE_LLM_CONCURRENCY,
             progress_file: None,
+            candidates_file: None,
             proposal_only: false,
             confirm_pending_only: false,
             proposal_llm_endpoint: None,
@@ -24209,6 +25421,514 @@ mod historical_rejudge_tests {
         Commands::Maintenance {
             command: MaintenanceCommands::Rejudge(Box::new(args)),
         }
+    }
+
+    fn append_test_delete_confirmation(
+        db: &Database,
+        confirmations_path: &Path,
+        drawer_rowid: i64,
+        drawer_id: &str,
+    ) {
+        let row = db
+            .historical_rejudge_candidate_by_rowid(drawer_rowid, drawer_id)
+            .expect("load rejudge candidate")
+            .expect("rejudge candidate exists");
+        let proposal = historical_rejudge_proposal_artifact_line(
+            &row,
+            &HistoricalRejudgeArtifactProposalDecision {
+                score: 0.2,
+                reason: "low value".to_string(),
+                should_forget: true,
+            },
+        );
+        let decision = HistoricalRejudgeDecision {
+            delete_candidate: true,
+            protected: false,
+            reason: "confirmed low value".to_string(),
+            label: Some("llm_judge".to_string()),
+            score: Some(0.1),
+            tier: 3,
+            judge: "llm".to_string(),
+            requires_confirmation: false,
+        };
+        append_jsonl_record(
+            confirmations_path,
+            &historical_rejudge_confirmation_artifact_line(&row, &proposal, &decision),
+        )
+        .expect("write confirmation");
+    }
+
+    #[test]
+    fn historical_rejudge_artifact_jsonl_and_cursor_round_trip() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let proposals_path = tmp.path().join("proposals.jsonl");
+        let confirmations_path = tmp.path().join("confirmations.jsonl");
+        let cursor_path = tmp.path().join("cursor.json");
+        let proposal = HistoricalRejudgeProposalArtifactLine {
+            drawer_id: "drawer-a".to_string(),
+            drawer_rowid: 42,
+            snapshot_content_hash: "snapshot-hash-a".to_string(),
+            snapshot_importance: Some(1),
+            snapshot_is_pinned: Some(false),
+            snapshot_effective_importance: Some(1.0),
+            snapshot_status: Some(String::new()),
+            snapshot_memory_kind: Some("evidence".to_string()),
+            snapshot_room: Some("Read".to_string()),
+            snapshot_source_file: Some("artifact-delete.json".to_string()),
+            snapshot_source_type: "agent_inference".to_string(),
+            snapshot_chunk_index: Some(0),
+            snapshot_normalize_version: Some(2),
+            snapshot_project_id: Some("default".to_string()),
+            proposal_decision: "forget".to_string(),
+            proposal_score: 0.2,
+            proposal_reason: "low value".to_string(),
+            snapshot_added_at: "2026-01-01T00:00:00Z".to_string(),
+            snapshot_wing: "hooks-raw".to_string(),
+            timestamp: "2026-01-01T00:00:01Z".to_string(),
+        };
+        let confirmation = HistoricalRejudgeConfirmationArtifactLine {
+            drawer_id: "drawer-a".to_string(),
+            drawer_rowid: 42,
+            snapshot_content_hash: proposal.snapshot_content_hash.clone(),
+            snapshot_importance: proposal.snapshot_importance,
+            snapshot_is_pinned: proposal.snapshot_is_pinned,
+            snapshot_effective_importance: proposal.snapshot_effective_importance,
+            snapshot_status: proposal.snapshot_status.clone(),
+            snapshot_memory_kind: proposal.snapshot_memory_kind.clone(),
+            snapshot_wing: Some(proposal.snapshot_wing.clone()),
+            snapshot_room: proposal.snapshot_room.clone(),
+            snapshot_source_file: proposal.snapshot_source_file.clone(),
+            snapshot_source_type: proposal.snapshot_source_type.clone(),
+            snapshot_chunk_index: proposal.snapshot_chunk_index,
+            snapshot_normalize_version: proposal.snapshot_normalize_version,
+            snapshot_project_id: proposal.snapshot_project_id.clone(),
+            final_decision: "delete".to_string(),
+            confirm_score: 0.1,
+            confirm_reason: "confirmed low value".to_string(),
+            proposal_score: proposal.proposal_score,
+            snapshot_added_at: proposal.snapshot_added_at.clone(),
+            timestamp: "2026-01-01T00:00:02Z".to_string(),
+        };
+        append_jsonl_record(&proposals_path, &proposal).expect("write proposal");
+        append_jsonl_record(&confirmations_path, &confirmation).expect("write confirmation");
+        write_historical_rejudge_artifact_cursor(
+            &cursor_path,
+            &HistoricalRejudgeArtifactCursor {
+                last_processed_rowid: 42,
+                options_hash: "options".to_string(),
+                judge_model: "proposal:qwen, confirm:spark".to_string(),
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:03Z".to_string(),
+            },
+        )
+        .expect("write cursor");
+
+        let proposals =
+            read_jsonl_records::<HistoricalRejudgeProposalArtifactLine>(&proposals_path)
+                .expect("read proposals");
+        let confirmation_keys =
+            read_historical_rejudge_artifact_confirmation_keys(&confirmations_path)
+                .expect("read confirmation keys");
+        let confirmations =
+            read_jsonl_records::<HistoricalRejudgeConfirmationArtifactLine>(&confirmations_path)
+                .expect("read confirmations");
+        let cursor = read_historical_rejudge_artifact_cursor(&cursor_path).expect("read cursor");
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].proposal_decision, "forget");
+        assert_eq!(proposals[0].snapshot_content_hash, "snapshot-hash-a");
+        assert_eq!(
+            proposals[0].snapshot_source_file.as_deref(),
+            Some("artifact-delete.json")
+        );
+        assert_eq!(proposals[0].snapshot_source_type, "agent_inference");
+        assert_eq!(proposals[0].snapshot_chunk_index, Some(0));
+        assert_eq!(proposals[0].snapshot_normalize_version, Some(2));
+        assert_eq!(confirmations.len(), 1);
+        assert_eq!(
+            confirmations[0].snapshot_source_file.as_deref(),
+            Some("artifact-delete.json")
+        );
+        assert_eq!(confirmations[0].snapshot_source_type, "agent_inference");
+        assert_eq!(confirmations[0].snapshot_chunk_index, Some(0));
+        assert_eq!(confirmations[0].snapshot_normalize_version, Some(2));
+        assert!(confirmation_keys.contains("42:drawer-a"));
+        assert_eq!(cursor.last_processed_rowid, 42);
+        assert_eq!(cursor.options_hash, "options");
+    }
+
+    #[tokio::test]
+    async fn historical_rejudge_artifact_confirmation_skips_provenance_drift() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let drawer = Drawer {
+            id: "artifact-proposal-provenance".to_string(),
+            content: "low value hook transcript".to_string(),
+            wing: "hooks-raw".to_string(),
+            room: Some("Read".to_string()),
+            source_file: Some("artifact-proposal-original.json".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            chunk_index: Some(0),
+            normalize_version: 2,
+            ..Drawer::default()
+        };
+        db.insert_drawer(&drawer).expect("insert drawer");
+        let rowid = drawer_rowid(&db, "artifact-proposal-provenance");
+        let row = db
+            .historical_rejudge_candidate_by_rowid(rowid, "artifact-proposal-provenance")
+            .expect("load proposal candidate")
+            .expect("proposal candidate exists");
+        let proposal = historical_rejudge_proposal_artifact_line(
+            &row,
+            &HistoricalRejudgeArtifactProposalDecision {
+                score: 0.2,
+                reason: "low value".to_string(),
+                should_forget: true,
+            },
+        );
+        let proposals_path = tmp.path().join("proposals.jsonl");
+        let confirmations_path = tmp.path().join("confirmations.jsonl");
+        append_jsonl_record(&proposals_path, &proposal).expect("write proposal");
+        db.conn()
+            .execute(
+                r#"
+                UPDATE drawers
+                SET source_file = 'artifact-proposal-moved.json',
+                    source_type = 'user_explicit',
+                    chunk_index = 7,
+                    normalize_version = 99,
+                    updated_at = ?1
+                WHERE id = 'artifact-proposal-provenance'
+                "#,
+                [current_timestamp()],
+            )
+            .expect("concurrent provenance update");
+        let mut confirmation_keys = BTreeSet::new();
+
+        confirm_historical_rejudge_artifact_backlog(
+            &db,
+            &Config::default(),
+            None,
+            &proposals_path,
+            &confirmations_path,
+            &mut confirmation_keys,
+            1,
+        )
+        .await
+        .expect("provenance drift should skip before requiring LLM confirmation");
+
+        let confirmations =
+            read_jsonl_records::<HistoricalRejudgeConfirmationArtifactLine>(&confirmations_path)
+                .expect("read confirmations");
+        assert!(confirmations.is_empty());
+        assert!(confirmation_keys.is_empty());
+    }
+
+    #[test]
+    fn historical_rejudge_apply_dry_run_reads_confirmations_without_deleting() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let drawer = Drawer {
+            id: "artifact-delete".to_string(),
+            content: "low value hook transcript".to_string(),
+            wing: "hooks-raw".to_string(),
+            room: Some("Read".to_string()),
+            source_file: Some("artifact-delete.json".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            ..Drawer::default()
+        };
+        db.insert_drawer(&drawer).expect("insert drawer");
+        let rowid = db
+            .conn()
+            .query_row(
+                "SELECT rowid FROM drawers WHERE id = ?1",
+                ["artifact-delete"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("load rowid");
+        let confirmations_path = tmp.path().join("confirmations.jsonl");
+        append_test_delete_confirmation(&db, &confirmations_path, rowid, "artifact-delete");
+        let backup_dir = tmp.path().join("backups");
+
+        maintenance_rejudge_apply_command(
+            &db,
+            &confirmations_path,
+            &backup_dir,
+            false,
+            false,
+            "json",
+        )
+        .expect("dry-run apply");
+
+        assert_eq!(
+            drawer_deleted_at(&db, "artifact-delete").expect("load deleted_at"),
+            Some(None)
+        );
+        assert!(
+            fs::read_dir(&backup_dir).is_err(),
+            "dry-run apply must not create backup artifacts"
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_apply_execute_skips_changed_content_hash() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let original_content = "low value hook transcript";
+        let drawer = Drawer {
+            id: "artifact-changed".to_string(),
+            content: original_content.to_string(),
+            wing: "hooks-raw".to_string(),
+            room: Some("Read".to_string()),
+            source_file: Some("artifact-changed.json".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            ..Drawer::default()
+        };
+        db.insert_drawer(&drawer).expect("insert drawer");
+        let rowid = db
+            .conn()
+            .query_row(
+                "SELECT rowid FROM drawers WHERE id = ?1",
+                ["artifact-changed"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("load rowid");
+        let confirmations_path = tmp.path().join("confirmations.jsonl");
+        append_test_delete_confirmation(&db, &confirmations_path, rowid, "artifact-changed");
+        let changed_content = "This later high-value drawer should survive stale artifact apply.";
+        db.conn()
+            .execute(
+                r#"
+                UPDATE drawers
+                SET content = ?1,
+                    content_hash = ?2,
+                    importance = 5,
+                    merge_count = COALESCE(merge_count, 0) + 1,
+                    updated_at = ?3
+                WHERE id = 'artifact-changed'
+                "#,
+                rusqlite::params![
+                    changed_content,
+                    historical_rejudge_content_hash(changed_content),
+                    current_timestamp(),
+                ],
+            )
+            .expect("concurrent drawer update");
+        let backup_dir = tmp.path().join("backups");
+
+        maintenance_rejudge_apply_command(
+            &db,
+            &confirmations_path,
+            &backup_dir,
+            true,
+            false,
+            "json",
+        )
+        .expect("execute apply with changed content");
+
+        let active = db
+            .get_drawer("artifact-changed")
+            .expect("load changed drawer")
+            .expect("changed drawer must remain active");
+        assert_eq!(active.content, changed_content);
+        assert_eq!(active.importance, 5);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert!(
+            fs::read_dir(&backup_dir).is_err(),
+            "skipped apply must not create an empty backup"
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_apply_execute_skips_changed_retention_metadata() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let drawer = Drawer {
+            id: "artifact-retained".to_string(),
+            content: "low value hook transcript".to_string(),
+            wing: "hooks-raw".to_string(),
+            room: Some("Read".to_string()),
+            source_file: Some("artifact-retained.json".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            ..Drawer::default()
+        };
+        db.insert_drawer(&drawer).expect("insert drawer");
+        let rowid = db
+            .conn()
+            .query_row(
+                "SELECT rowid FROM drawers WHERE id = ?1",
+                ["artifact-retained"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("load rowid");
+        let confirmations_path = tmp.path().join("confirmations.jsonl");
+        append_test_delete_confirmation(&db, &confirmations_path, rowid, "artifact-retained");
+        db.conn()
+            .execute(
+                r#"
+                UPDATE drawers
+                SET importance = 5,
+                    is_pinned = 1,
+                    effective_importance = 5.0,
+                    updated_at = ?1
+                WHERE id = 'artifact-retained'
+                "#,
+                [current_timestamp()],
+            )
+            .expect("concurrent retention metadata update");
+        let backup_dir = tmp.path().join("backups");
+
+        maintenance_rejudge_apply_command(
+            &db,
+            &confirmations_path,
+            &backup_dir,
+            true,
+            false,
+            "json",
+        )
+        .expect("execute apply with changed retention metadata");
+
+        let active = db
+            .get_drawer("artifact-retained")
+            .expect("load retained drawer")
+            .expect("retained drawer must remain active");
+        assert_eq!(active.content, drawer.content);
+        assert_eq!(active.importance, 5);
+        assert!(active.is_pinned);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert!(
+            fs::read_dir(&backup_dir).is_err(),
+            "skipped apply must not create an empty backup"
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_apply_execute_skips_fractional_effective_importance_change() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let drawer = Drawer {
+            id: "artifact-fractional-importance".to_string(),
+            content: "low value hook transcript".to_string(),
+            wing: "hooks-raw".to_string(),
+            room: Some("Read".to_string()),
+            source_file: Some("artifact-fractional-importance.json".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            effective_importance: 2.6,
+            ..Drawer::default()
+        };
+        db.insert_drawer(&drawer).expect("insert drawer");
+        let rowid = drawer_rowid(&db, "artifact-fractional-importance");
+        let confirmations_path = tmp.path().join("confirmations.jsonl");
+        append_test_delete_confirmation(
+            &db,
+            &confirmations_path,
+            rowid,
+            "artifact-fractional-importance",
+        );
+        db.conn()
+            .execute(
+                r#"
+                UPDATE drawers
+                SET effective_importance = 3.4,
+                    updated_at = ?1
+                WHERE id = 'artifact-fractional-importance'
+                "#,
+                [current_timestamp()],
+            )
+            .expect("concurrent effective_importance update");
+        let backup_dir = tmp.path().join("backups");
+
+        maintenance_rejudge_apply_command(
+            &db,
+            &confirmations_path,
+            &backup_dir,
+            true,
+            false,
+            "json",
+        )
+        .expect("execute apply with changed fractional effective_importance");
+
+        let active = db
+            .get_drawer("artifact-fractional-importance")
+            .expect("load fractional importance drawer")
+            .expect("drawer must remain active after stale artifact snapshot");
+        assert_eq!(active.content, drawer.content);
+        assert_eq!(active.effective_importance, 3.4);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert!(
+            fs::read_dir(&backup_dir).is_err(),
+            "skipped apply must not create an empty backup"
+        );
+    }
+
+    #[test]
+    fn historical_rejudge_apply_execute_skips_changed_provenance_metadata() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db = Database::open(&tmp.path().join("palace.db")).expect("open db");
+        let drawer = Drawer {
+            id: "artifact-provenance".to_string(),
+            content: "low value hook transcript".to_string(),
+            wing: "hooks-raw".to_string(),
+            room: Some("Read".to_string()),
+            source_file: Some("artifact-provenance-original.json".to_string()),
+            source_type: SourceType::AgentInference,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            chunk_index: Some(0),
+            normalize_version: 2,
+            ..Drawer::default()
+        };
+        db.insert_drawer(&drawer).expect("insert drawer");
+        let rowid = drawer_rowid(&db, "artifact-provenance");
+        let confirmations_path = tmp.path().join("confirmations.jsonl");
+        append_test_delete_confirmation(&db, &confirmations_path, rowid, "artifact-provenance");
+        db.conn()
+            .execute(
+                r#"
+                UPDATE drawers
+                SET source_file = 'artifact-provenance-moved.json',
+                    source_type = 'user_explicit',
+                    chunk_index = 7,
+                    normalize_version = 99,
+                    updated_at = ?1
+                WHERE id = 'artifact-provenance'
+                "#,
+                [current_timestamp()],
+            )
+            .expect("concurrent provenance metadata update");
+        let backup_dir = tmp.path().join("backups");
+
+        maintenance_rejudge_apply_command(
+            &db,
+            &confirmations_path,
+            &backup_dir,
+            true,
+            false,
+            "json",
+        )
+        .expect("execute apply with changed provenance metadata");
+
+        let active = db
+            .get_drawer("artifact-provenance")
+            .expect("load provenance drawer")
+            .expect("provenance drawer must remain active");
+        assert_eq!(active.content, drawer.content);
+        assert_eq!(
+            active.source_file.as_deref(),
+            Some("artifact-provenance-moved.json")
+        );
+        assert_eq!(active.source_type, SourceType::UserExplicit);
+        assert_eq!(active.chunk_index, Some(7));
+        assert_eq!(active.normalize_version, 99);
+        assert_eq!(db.deleted_drawer_count().expect("deleted count"), 0);
+        assert!(
+            fs::read_dir(&backup_dir).is_err(),
+            "skipped apply must not create an empty backup"
+        );
     }
 
     fn assert_historical_rejudge_startup_retry(name: &str, command: Commands) {
@@ -24958,6 +26678,7 @@ threshold = 0.7
             unsafe_allow_config_version_drift: false,
             page_size,
             progress_file: None,
+            candidates_file: None,
             stage_mode: HistoricalRejudgeStageMode::Paired,
             proposal_llm_endpoint: None,
             confirm_llm_endpoint: None,
@@ -26172,6 +27893,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -26213,6 +27935,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -26253,6 +27976,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -26413,6 +28137,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -26539,6 +28264,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -26606,6 +28332,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -26896,6 +28623,7 @@ threshold = 0.7
                     unsafe_allow_config_version_drift: false,
                     page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                     progress_file: None,
+                    candidates_file: None,
                     stage_mode: HistoricalRejudgeStageMode::Paired,
                     proposal_llm_endpoint: None,
                     confirm_llm_endpoint: None,
@@ -26939,6 +28667,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -26975,6 +28704,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27012,6 +28742,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27047,6 +28778,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27087,6 +28819,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27134,6 +28867,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27201,6 +28935,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27274,6 +29009,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27354,6 +29090,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27451,6 +29188,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27545,6 +29283,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27612,6 +29351,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27706,6 +29446,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -27762,6 +29503,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -30666,6 +32408,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
@@ -30718,6 +32461,7 @@ threshold = 0.7
                 unsafe_allow_config_version_drift: false,
                 page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
                 progress_file: None,
+                candidates_file: None,
                 stage_mode: HistoricalRejudgeStageMode::Paired,
                 proposal_llm_endpoint: None,
                 confirm_llm_endpoint: None,
