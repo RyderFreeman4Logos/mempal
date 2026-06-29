@@ -7,8 +7,10 @@ pub use operation_telemetry::{
     render_operation_telemetry_summary,
 };
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
@@ -34,6 +36,7 @@ const FOLLOW_DEBOUNCE_MS: u64 = 250;
 const FOLLOW_SILENCE_TIMEOUT_MS: u64 = 3_000;
 const PREVIEW_CHARS: usize = 120;
 const GATING_STATUS_RECENT_WINDOW_SECS: u64 = 86_400;
+const IO_BURST_HIGH_READ_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 
 static ACCESS_WRITEBACK_SCHEDULED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static ACCESS_WRITEBACK_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +74,317 @@ pub fn reset_resource_counters_for_tests() {
     ACCESS_WRITEBACK_SCHEDULED_TOTAL.store(0, Ordering::Relaxed);
     ACCESS_WRITEBACK_SKIPPED_TOTAL.store(0, Ordering::Relaxed);
     ACCESS_WRITEBACK_FAILED_TOTAL.store(0, Ordering::Relaxed);
+}
+
+#[derive(
+    Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IoOperationPath {
+    Search,
+    Context,
+    Timeline,
+    Ingest,
+    Status,
+    Maintenance,
+    Queue,
+    Other,
+}
+
+impl IoOperationPath {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Context => "context",
+            Self::Timeline => "timeline",
+            Self::Ingest => "ingest",
+            Self::Status => "status",
+            Self::Maintenance => "maintenance",
+            Self::Queue => "queue",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+pub struct IoBurstSnapshot {
+    pub high_read_threshold_bytes: u64,
+    pub sample_count: u64,
+    pub high_read_sample_count: u64,
+    pub total_read_bytes: u64,
+    pub total_logical_read_bytes: u64,
+    pub peak_read_bytes_per_sec: u64,
+    pub avg_read_bytes_per_sec: u64,
+    pub paths: Vec<IoBurstPathSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct IoBurstPathSnapshot {
+    pub path: IoOperationPath,
+    pub sample_count: u64,
+    pub high_read_sample_count: u64,
+    pub total_read_bytes: u64,
+    pub total_logical_read_bytes: u64,
+    pub peak_read_bytes: u64,
+    pub avg_read_bytes: u64,
+    pub peak_read_bytes_per_sec: u64,
+    pub avg_read_bytes_per_sec: u64,
+    pub last_read_bytes: u64,
+    pub last_duration_ms: u64,
+}
+
+impl Default for IoBurstPathSnapshot {
+    fn default() -> Self {
+        Self {
+            path: IoOperationPath::Other,
+            sample_count: 0,
+            high_read_sample_count: 0,
+            total_read_bytes: 0,
+            total_logical_read_bytes: 0,
+            peak_read_bytes: 0,
+            avg_read_bytes: 0,
+            peak_read_bytes_per_sec: 0,
+            avg_read_bytes_per_sec: 0,
+            last_read_bytes: 0,
+            last_duration_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct IoBurstAccumulator {
+    sample_count: u64,
+    high_read_sample_count: u64,
+    total_read_bytes: u64,
+    total_logical_read_bytes: u64,
+    total_duration_ms: u64,
+    peak_read_bytes: u64,
+    peak_read_bytes_per_sec: u64,
+    last_read_bytes: u64,
+    last_duration_ms: u64,
+}
+
+impl IoBurstAccumulator {
+    fn record(&mut self, read_bytes: u64, logical_read_bytes: u64, duration_ms: u64) {
+        self.sample_count = self.sample_count.saturating_add(1);
+        self.total_read_bytes = self.total_read_bytes.saturating_add(read_bytes);
+        self.total_logical_read_bytes = self
+            .total_logical_read_bytes
+            .saturating_add(logical_read_bytes);
+        self.total_duration_ms = self.total_duration_ms.saturating_add(duration_ms.max(1));
+        self.peak_read_bytes = self.peak_read_bytes.max(read_bytes);
+        self.peak_read_bytes_per_sec = self
+            .peak_read_bytes_per_sec
+            .max(bytes_per_sec(read_bytes, duration_ms));
+        self.last_read_bytes = read_bytes;
+        self.last_duration_ms = duration_ms;
+        if read_bytes >= IO_BURST_HIGH_READ_THRESHOLD_BYTES {
+            self.high_read_sample_count = self.high_read_sample_count.saturating_add(1);
+        }
+    }
+
+    fn snapshot(&self, path: IoOperationPath) -> IoBurstPathSnapshot {
+        IoBurstPathSnapshot {
+            path,
+            sample_count: self.sample_count,
+            high_read_sample_count: self.high_read_sample_count,
+            total_read_bytes: self.total_read_bytes,
+            total_logical_read_bytes: self.total_logical_read_bytes,
+            peak_read_bytes: self.peak_read_bytes,
+            avg_read_bytes: average_u64(self.total_read_bytes, self.sample_count),
+            peak_read_bytes_per_sec: self.peak_read_bytes_per_sec,
+            avg_read_bytes_per_sec: bytes_per_sec(self.total_read_bytes, self.total_duration_ms),
+            last_read_bytes: self.last_read_bytes,
+            last_duration_ms: self.last_duration_ms,
+        }
+    }
+}
+
+pub struct IoBurstGuard {
+    path: IoOperationPath,
+    started_at: std::time::Instant,
+    start_io: Option<IoBurstIoSnapshot>,
+    finished: bool,
+}
+
+impl IoBurstGuard {
+    pub fn start(path: IoOperationPath) -> Self {
+        Self {
+            path,
+            started_at: std::time::Instant::now(),
+            start_io: read_io_burst_snapshot(),
+            finished: false,
+        }
+    }
+
+    pub fn finish(mut self) {
+        self.finish_inner();
+    }
+
+    fn finish_inner(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let Some(start) = self.start_io else {
+            return;
+        };
+        let Some(end) = read_io_burst_snapshot() else {
+            return;
+        };
+        record_io_burst_sample(
+            self.path,
+            end.read_bytes.saturating_sub(start.read_bytes),
+            end.rchar.saturating_sub(start.rchar),
+            duration_ms(self.started_at.elapsed()),
+        );
+    }
+}
+
+impl Drop for IoBurstGuard {
+    fn drop(&mut self) {
+        self.finish_inner();
+    }
+}
+
+pub fn record_io_burst_sample(
+    path: IoOperationPath,
+    read_bytes: u64,
+    logical_read_bytes: u64,
+    duration_ms: u64,
+) {
+    global_io_burst()
+        .lock()
+        .expect("io burst mutex poisoned")
+        .entry(path)
+        .or_default()
+        .record(read_bytes, logical_read_bytes, duration_ms);
+}
+
+pub fn io_burst_snapshot() -> IoBurstSnapshot {
+    let guard = global_io_burst().lock().expect("io burst mutex poisoned");
+    let total_duration_ms = guard
+        .values()
+        .map(|path| path.total_duration_ms)
+        .sum::<u64>();
+    let paths = guard
+        .iter()
+        .map(|(path, accumulator)| accumulator.snapshot(*path))
+        .collect::<Vec<_>>();
+    let sample_count = paths.iter().map(|path| path.sample_count).sum::<u64>();
+    let high_read_sample_count = paths
+        .iter()
+        .map(|path| path.high_read_sample_count)
+        .sum::<u64>();
+    let total_read_bytes = paths.iter().map(|path| path.total_read_bytes).sum::<u64>();
+    let total_logical_read_bytes = paths
+        .iter()
+        .map(|path| path.total_logical_read_bytes)
+        .sum::<u64>();
+    let peak_read_bytes_per_sec = paths
+        .iter()
+        .map(|path| path.peak_read_bytes_per_sec)
+        .max()
+        .unwrap_or_default();
+    IoBurstSnapshot {
+        high_read_threshold_bytes: IO_BURST_HIGH_READ_THRESHOLD_BYTES,
+        sample_count,
+        high_read_sample_count,
+        total_read_bytes,
+        total_logical_read_bytes,
+        peak_read_bytes_per_sec,
+        avg_read_bytes_per_sec: bytes_per_sec(total_read_bytes, total_duration_ms),
+        paths,
+    }
+}
+
+pub fn classify_io_operation_path(operation: &str, call_site: &str) -> IoOperationPath {
+    let operation = operation.to_ascii_lowercase();
+    let call_site = call_site.to_ascii_lowercase();
+    if call_site.contains("ingest_worker") || call_site.contains("write_worker") {
+        IoOperationPath::Queue
+    } else if operation.contains("search") || operation.contains("/api/search") {
+        IoOperationPath::Search
+    } else if operation.contains("context") {
+        IoOperationPath::Context
+    } else if operation.contains("timeline") {
+        IoOperationPath::Timeline
+    } else if operation.contains("ingest") || operation.contains("/api/ingest") {
+        IoOperationPath::Ingest
+    } else if operation.contains("status") || operation.contains("/api/status") {
+        IoOperationPath::Status
+    } else if operation.contains("maintenance")
+        || call_site.contains("maintenance")
+        || operation.contains("reindex")
+        || operation.contains("consolidate")
+        || operation.contains("sleep")
+    {
+        IoOperationPath::Maintenance
+    } else {
+        IoOperationPath::Other
+    }
+}
+
+pub fn reset_io_burst_for_tests() {
+    global_io_burst()
+        .lock()
+        .expect("io burst mutex poisoned")
+        .clear();
+}
+
+fn global_io_burst() -> &'static Mutex<BTreeMap<IoOperationPath, IoBurstAccumulator>> {
+    static IO_BURST: OnceLock<Mutex<BTreeMap<IoOperationPath, IoBurstAccumulator>>> =
+        OnceLock::new();
+    IO_BURST.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IoBurstIoSnapshot {
+    rchar: u64,
+    read_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn read_io_burst_snapshot() -> Option<IoBurstIoSnapshot> {
+    let raw = fs::read_to_string("/proc/self/io").ok()?;
+    let mut snapshot = IoBurstIoSnapshot {
+        rchar: 0,
+        read_bytes: 0,
+    };
+    for line in raw.lines() {
+        let (key, value) = line.split_once(':')?;
+        let parsed = value.trim().parse::<u64>().ok()?;
+        match key {
+            "rchar" => snapshot.rchar = parsed,
+            "read_bytes" => snapshot.read_bytes = parsed,
+            _ => {}
+        }
+    }
+    Some(snapshot)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_io_burst_snapshot() -> Option<IoBurstIoSnapshot> {
+    None
+}
+
+fn average_u64(total: u64, count: u64) -> u64 {
+    total.checked_div(count).unwrap_or_default()
+}
+
+fn bytes_per_sec(bytes: u64, duration_ms: u64) -> u64 {
+    if duration_ms == 0 {
+        return 0;
+    }
+    let scaled = u128::from(bytes).saturating_mul(1_000);
+    scaled
+        .checked_div(u128::from(duration_ms.max(1)))
+        .unwrap_or_default()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -2096,6 +2410,15 @@ mod tests {
 
     const FIXED_NOW: i64 = 1_800_000_000;
 
+    fn io_burst_path(snapshot: &IoBurstSnapshot, path: IoOperationPath) -> IoBurstPathSnapshot {
+        snapshot
+            .paths
+            .iter()
+            .find(|candidate| candidate.path == path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     #[test]
     fn test_parse_since_10_minutes() {
         let cutoff = parse_since_str("10m", FIXED_NOW).unwrap();
@@ -2166,5 +2489,89 @@ mod tests {
     fn test_parse_since_7_days() {
         let cutoff = parse_since_str("7d", FIXED_NOW).unwrap();
         assert_eq!(cutoff, FIXED_NOW - 7 * 86400);
+    }
+
+    #[test]
+    fn test_io_burst_snapshot_aggregates_path_counters_and_rates() {
+        let before = io_burst_snapshot();
+        let before_search = io_burst_path(&before, IoOperationPath::Search);
+
+        record_io_burst_sample(
+            IoOperationPath::Search,
+            20 * 1024 * 1024,
+            30 * 1024 * 1024,
+            2_000,
+        );
+        record_io_burst_sample(
+            IoOperationPath::Search,
+            4 * 1024 * 1024,
+            6 * 1024 * 1024,
+            1_000,
+        );
+        record_io_burst_sample(IoOperationPath::Status, 1_000, 2_000, 10);
+
+        let snapshot = io_burst_snapshot();
+        assert!(snapshot.sample_count.saturating_sub(before.sample_count) >= 3);
+        assert!(
+            snapshot
+                .high_read_sample_count
+                .saturating_sub(before.high_read_sample_count)
+                >= 1
+        );
+        assert!(
+            snapshot
+                .total_read_bytes
+                .saturating_sub(before.total_read_bytes)
+                >= 24 * 1024 * 1024 + 1_000
+        );
+        assert!(snapshot.peak_read_bytes_per_sec >= 10 * 1024 * 1024);
+
+        let search = io_burst_path(&snapshot, IoOperationPath::Search);
+        assert!(
+            search
+                .sample_count
+                .saturating_sub(before_search.sample_count)
+                >= 2
+        );
+        assert!(
+            search
+                .high_read_sample_count
+                .saturating_sub(before_search.high_read_sample_count)
+                >= 1
+        );
+        assert!(
+            search
+                .total_read_bytes
+                .saturating_sub(before_search.total_read_bytes)
+                >= 24 * 1024 * 1024
+        );
+        assert!(
+            search
+                .total_logical_read_bytes
+                .saturating_sub(before_search.total_logical_read_bytes)
+                >= 36 * 1024 * 1024
+        );
+        assert!(search.peak_read_bytes >= 20 * 1024 * 1024);
+        assert!(search.peak_read_bytes_per_sec >= 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_classify_io_operation_path_uses_content_safe_operation_kind() {
+        assert_eq!(
+            classify_io_operation_path("mempal_search", "mcp.tool"),
+            IoOperationPath::Search
+        );
+        assert_eq!(
+            classify_io_operation_path("GET /api/status", "rest.request"),
+            IoOperationPath::Status
+        );
+        assert_eq!(
+            classify_io_operation_path("ingest ingest_async", "mcp.ingest_worker"),
+            IoOperationPath::Queue
+        );
+        assert_eq!(
+            classify_io_operation_path("maintenance-rejudge", "main"),
+            IoOperationPath::Maintenance
+        );
     }
 }

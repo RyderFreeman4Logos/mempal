@@ -18,7 +18,10 @@ use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use mempal::core::types::{BootstrapEvidenceArgs, Drawer, SourceType};
 use mempal::core::utils::iso_timestamp;
 use mempal::embed::{EmbedError, Embedder, EmbedderFactory, global_embed_status};
-use mempal::observability::{OperationTelemetrySummaryOptions, operation_telemetry_summary};
+use mempal::observability::{
+    IoOperationPath, OperationTelemetrySummaryOptions, operation_telemetry_summary,
+    record_io_burst_sample, reset_io_burst_for_tests,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -489,10 +492,27 @@ async fn test_status_includes_vector_scan_and_backoff_telemetry() {
     let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
+    reset_io_burst_for_tests();
+    record_io_burst_sample(IoOperationPath::Status, 4096, 8192, 2);
 
     let (status, _headers, body) = get_json(state, "/api/status").await;
 
     assert_eq!(status, StatusCode::OK);
+
+    let io_burst = body["io_burst"].as_object().expect("io burst");
+    assert_eq!(
+        io_burst.get("total_read_bytes").and_then(Value::as_u64),
+        Some(4096)
+    );
+    let paths = io_burst["paths"].as_array().expect("io burst paths");
+    assert!(
+        paths.iter().any(|path| {
+            path.get("path").and_then(Value::as_str) == Some("status")
+                && path.get("sample_count").and_then(Value::as_u64) == Some(1)
+                && path.get("peak_read_bytes_per_sec").and_then(Value::as_u64) == Some(2_048_000)
+        }),
+        "status io burst path should be exposed without content: {io_burst:#?}"
+    );
 
     let vector_scan = body["vector_scan"].as_object().expect("vector scan");
     assert_eq!(
@@ -521,6 +541,7 @@ async fn test_status_includes_vector_scan_and_backoff_telemetry() {
         backoff.get("last_error_class").and_then(Value::as_str),
         None
     );
+    reset_io_burst_for_tests();
 }
 
 fn insert_search_drawer(db: &Database) {

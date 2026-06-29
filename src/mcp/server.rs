@@ -4962,6 +4962,7 @@ impl MempalMcpServer {
             },
             db_holders,
             resource_usage,
+            io_burst: crate::observability::io_burst_snapshot(),
             scrub_stats: ScrubStatsDto::from(ConfigHandle::scrub_stats()),
             chunker_stats: ChunkerStatsDto::from(
                 crate::ingest::chunk::global_chunker_stats().snapshot(),
@@ -15651,6 +15652,18 @@ prototypes = ["keep"]
         keys
     }
 
+    fn io_burst_path(
+        snapshot: &crate::observability::IoBurstSnapshot,
+        path: crate::observability::IoOperationPath,
+    ) -> crate::observability::IoBurstPathSnapshot {
+        snapshot
+            .paths
+            .iter()
+            .find(|candidate| candidate.path == path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     #[tokio::test]
     async fn test_mempal_status_compact_default_omits_protocol_but_keeps_health() {
         let (_tempdir, db_path, server) = setup_server();
@@ -15684,6 +15697,17 @@ prototypes = ["keep"]
                 crate::core::queue::QueueFailureDisposition::Terminal,
             )
             .expect("mark terminal failed");
+        let before_io_burst = crate::observability::io_burst_snapshot();
+        let before_search = io_burst_path(
+            &before_io_burst,
+            crate::observability::IoOperationPath::Search,
+        );
+        crate::observability::record_io_burst_sample(
+            crate::observability::IoOperationPath::Search,
+            12_000,
+            24_000,
+            3,
+        );
 
         let status = server.mempal_status().await.expect("status").0;
         let json = serde_json::to_value(&status).expect("serialize compact status");
@@ -15709,6 +15733,31 @@ prototypes = ["keep"]
         assert!(json.get("endpoint_health").is_some());
         assert!(json.get("intelligence_status").is_some());
         assert!(json.get("resource_usage").is_some());
+        assert!(json.get("io_burst").is_some());
+        assert!(
+            status
+                .io_burst
+                .total_read_bytes
+                .saturating_sub(before_io_burst.total_read_bytes)
+                >= 12_000
+        );
+        let search_io_burst = io_burst_path(
+            &status.io_burst,
+            crate::observability::IoOperationPath::Search,
+        );
+        assert!(
+            search_io_burst
+                .sample_count
+                .saturating_sub(before_search.sample_count)
+                >= 1
+        );
+        assert!(
+            search_io_burst
+                .total_read_bytes
+                .saturating_sub(before_search.total_read_bytes)
+                >= 12_000
+        );
+        assert!(search_io_burst.peak_read_bytes_per_sec >= 4_000_000);
         assert!(status.resource_usage.sqlite.async_pool_loaded);
         assert_eq!(
             status.resource_usage.sqlite.per_connection_cache_bytes,

@@ -12977,6 +12977,7 @@ fn status_command(db: &Database, config: &Config, full: bool) -> Result<()> {
         println!("triples: {triple_count}");
     }
     println!("db_size_bytes: {db_size_bytes}");
+    print_io_burst_snapshot(&observability::io_burst_snapshot(), "");
     println!("Source Types:");
     if source_type_counts.is_empty() {
         println!("  none");
@@ -15515,6 +15516,7 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
     {
         print_daemon_rest_embedder_cache(&status);
         print_daemon_rest_resource_usage(&status);
+        print_daemon_rest_io_burst(&status);
         print_daemon_ingest_worker_backoff(&status);
         print_daemon_vector_scan(&status);
         if let Some(telemetry) = status.get("search_telemetry") {
@@ -15607,6 +15609,50 @@ fn print_daemon_process_report(pid: i32, prefix: &str) {
         println!(
             "{prefix}warning: daemon binary has been deleted or replaced; run `mempal daemon restart` after upgrade"
         );
+    }
+}
+
+fn print_io_burst_snapshot(snapshot: &observability::IoBurstSnapshot, prefix: &str) {
+    println!("{prefix}IO Bursts:");
+    println!(
+        "{prefix}  high_read_threshold_bytes: {}",
+        snapshot.high_read_threshold_bytes
+    );
+    println!("{prefix}  sample_count: {}", snapshot.sample_count);
+    println!(
+        "{prefix}  high_read_sample_count: {}",
+        snapshot.high_read_sample_count
+    );
+    println!("{prefix}  total_read_bytes: {}", snapshot.total_read_bytes);
+    println!(
+        "{prefix}  total_logical_read_bytes: {}",
+        snapshot.total_logical_read_bytes
+    );
+    println!(
+        "{prefix}  peak_read_bytes_per_sec: {}",
+        snapshot.peak_read_bytes_per_sec
+    );
+    println!(
+        "{prefix}  avg_read_bytes_per_sec: {}",
+        snapshot.avg_read_bytes_per_sec
+    );
+    if snapshot.paths.is_empty() {
+        println!("{prefix}  paths: none");
+    } else {
+        println!("{prefix}  paths:");
+        for path in &snapshot.paths {
+            println!(
+                "{prefix}    {}: samples={} high_read_samples={} total_read_bytes={} peak_read_bytes={} avg_read_bytes={} peak_read_bytes_per_sec={} avg_read_bytes_per_sec={}",
+                path.path.as_str(),
+                path.sample_count,
+                path.high_read_sample_count,
+                path.total_read_bytes,
+                path.peak_read_bytes,
+                path.avg_read_bytes,
+                path.peak_read_bytes_per_sec,
+                path.avg_read_bytes_per_sec
+            );
+        }
     }
 }
 
@@ -15717,6 +15763,29 @@ fn print_daemon_rest_resource_usage(status: &Value) {
     println!(
         "rest.resource.access_writeback_failed_total: {}",
         json_u64(counters, "access_writeback_failed_total")
+    );
+}
+
+#[cfg(feature = "rest")]
+fn print_daemon_rest_io_burst(status: &Value) {
+    let Some(io_burst) = status.get("io_burst") else {
+        return;
+    };
+    println!(
+        "rest.io_burst.sample_count: {}",
+        json_u64(io_burst, "sample_count")
+    );
+    println!(
+        "rest.io_burst.high_read_sample_count: {}",
+        json_u64(io_burst, "high_read_sample_count")
+    );
+    println!(
+        "rest.io_burst.total_read_bytes: {}",
+        json_u64(io_burst, "total_read_bytes")
+    );
+    println!(
+        "rest.io_burst.peak_read_bytes_per_sec: {}",
+        json_u64(io_burst, "peak_read_bytes_per_sec")
     );
 }
 
