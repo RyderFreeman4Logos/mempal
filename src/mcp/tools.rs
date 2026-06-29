@@ -2013,6 +2013,10 @@ pub struct StatusResponse {
     /// counters and configured SQLite cache ceilings; never drawer content,
     /// prompts, tokens, argv, or secret-bearing URLs.
     pub resource_usage: ResourceUsageDto,
+    /// Aggregate per-operation-path read burst counters. Contains only numeric
+    /// deltas/rates and path classes; never drawer content, prompts, raw
+    /// payloads, argv, or secret-bearing URLs.
+    pub io_burst: crate::observability::IoBurstSnapshot,
     pub ingest_worker_backoff: crate::observability::IngestWorkerBackoffSnapshot,
     pub vector_scan: crate::observability::VectorScanSnapshot,
     pub scrub_stats: ScrubStatsDto,

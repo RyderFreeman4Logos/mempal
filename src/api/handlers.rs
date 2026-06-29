@@ -522,6 +522,7 @@ struct StatusResponse {
     search_mode: String,
     embedder_circuit: EmbedderCircuitStatus,
     resource_usage: ResourceUsageStatus,
+    io_burst: crate::observability::IoBurstSnapshot,
     write_queue: WriteQueueStats,
     feature_flags: FeatureFlags,
     hermes_compat_version: String,
@@ -1673,6 +1674,7 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
             .to_string(),
         embedder_circuit: vector_search_circuit.into(),
         resource_usage,
+        io_burst: crate::observability::io_burst_snapshot(),
         write_queue: state.write_queue().stats(),
         feature_flags: FeatureFlags {
             typed_ingest: true,

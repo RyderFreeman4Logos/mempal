@@ -191,12 +191,24 @@ impl OperationTelemetrySpan {
     pub fn finish_success(mut self) {
         let record = self.finished_record(true, None);
         self.finished = true;
+        crate::observability::record_io_burst_sample(
+            crate::observability::classify_io_operation_path(&record.operation, &record.call_site),
+            record.io.physical_read_bytes,
+            record.io.logical_read_bytes,
+            record.duration_ms,
+        );
         let _ = record_operation_telemetry_path(&self.db_path, record);
     }
 
     pub fn finish_error(mut self, error: impl std::fmt::Display) {
         let record = self.finished_record(false, Some(error.to_string()));
         self.finished = true;
+        crate::observability::record_io_burst_sample(
+            crate::observability::classify_io_operation_path(&record.operation, &record.call_site),
+            record.io.physical_read_bytes,
+            record.io.logical_read_bytes,
+            record.duration_ms,
+        );
         let _ = record_operation_telemetry_path(&self.db_path, record);
     }
 
@@ -211,6 +223,12 @@ impl OperationTelemetrySpan {
             ))
             .with_error_class(error_class);
         self.finished = true;
+        crate::observability::record_io_burst_sample(
+            crate::observability::classify_io_operation_path(&record.operation, &record.call_site),
+            record.io.physical_read_bytes,
+            record.io.logical_read_bytes,
+            record.duration_ms,
+        );
         let _ = record_operation_telemetry_path(&self.db_path, record);
     }
 
@@ -220,6 +238,12 @@ impl OperationTelemetrySpan {
             Err(error) => self.finished_record(false, Some(error.to_string())),
         };
         self.finished = true;
+        crate::observability::record_io_burst_sample(
+            crate::observability::classify_io_operation_path(&record.operation, &record.call_site),
+            record.io.physical_read_bytes,
+            record.io.logical_read_bytes,
+            record.duration_ms,
+        );
         let _ = record_operation_telemetry_path(&self.db_path, record);
     }
 
@@ -249,6 +273,12 @@ impl Drop for OperationTelemetrySpan {
             return;
         }
         let record = self.finished_record(false, Some("unfinished_span".to_string()));
+        crate::observability::record_io_burst_sample(
+            crate::observability::classify_io_operation_path(&record.operation, &record.call_site),
+            record.io.physical_read_bytes,
+            record.io.logical_read_bytes,
+            record.duration_ms,
+        );
         let _ = record_operation_telemetry_path(&self.db_path, record);
         self.finished = true;
     }
