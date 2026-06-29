@@ -2005,9 +2005,12 @@ fn build_drawer_records(
 }
 
 fn apply_turn_strata(record: &mut DrawerRecord, config: &crate::core::config::Config) {
-    if let Some(importance) =
-        raw_turn_importance(&record.wing, Some(record.room.as_str()), &config.turns)
-    {
+    if let Some(importance) = raw_turn_importance(
+        &record.wing,
+        Some(record.room.as_str()),
+        None,
+        &config.turns,
+    ) {
         record.importance = importance;
     }
 }
@@ -2017,7 +2020,7 @@ fn should_keep_drawer_record(record: &DrawerRecord, config: &crate::core::config
 }
 
 fn raw_turn_storage_disabled(wing: &str, room: &str, config: &crate::core::config::Config) -> bool {
-    is_raw_turn(wing, Some(room), &config.turns)
+    is_raw_turn(wing, Some(room), None, &config.turns)
         && !should_store_raw_turns(&config.turns.storage_mode)
 }
 

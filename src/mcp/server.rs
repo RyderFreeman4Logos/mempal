@@ -6185,7 +6185,8 @@ impl MempalMcpServer {
             .await?;
         let wait = request.wait.unwrap_or(false);
         let wait_timeout_secs = request.wait_timeout_secs.unwrap_or(30);
-        let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
+        let memory_kind = parse_memory_kind(request.memory_kind.as_deref())?;
+        let raw_turn = is_raw_turn(&request.wing, room, memory_kind.as_ref(), &config.turns);
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
             return Ok(Json(IngestResponse {
                 operation_id: None,
@@ -6677,12 +6678,22 @@ impl MempalMcpServer {
             .as_deref()
             .map(|value| config.scrub_content_with_compiled(value, compiled_privacy));
         let room = request.room.as_deref();
-        let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
-        let drawer_importance = raw_turn_importance(&request.wing, room, &config.turns)
-            .unwrap_or_else(|| request.importance.unwrap_or(0));
         let source_type = parse_source_type_param(request.source_type.as_deref())?;
         let confidence = resolve_confidence_param(source_type, request.confidence)?;
         let metadata = validate_ingest_request(request, &source_type)?;
+        let raw_turn = is_raw_turn(
+            &request.wing,
+            room,
+            Some(&metadata.memory_kind),
+            &config.turns,
+        );
+        let drawer_importance = raw_turn_importance(
+            &request.wing,
+            room,
+            Some(&metadata.memory_kind),
+            &config.turns,
+        )
+        .unwrap_or_else(|| request.importance.unwrap_or(0));
         let scrubbed_replace_text = request
             .replace_text
             .as_deref()
@@ -6849,7 +6860,15 @@ impl MempalMcpServer {
         let mut request_system_warnings = system_warnings_with_stale_index(&db);
         let no_gate = controls.no_gate;
         let bypass_novelty = controls.bypass_novelty;
-        let raw_turn = is_raw_turn(&request.wing, room, &config.turns);
+        let source_type = parse_source_type_param(request.source_type.as_deref())?;
+        let confidence = resolve_confidence_param(source_type, request.confidence)?;
+        let metadata = validate_ingest_request(&request, &source_type)?;
+        let raw_turn = is_raw_turn(
+            &request.wing,
+            room,
+            Some(&metadata.memory_kind),
+            &config.turns,
+        );
         if raw_turn && !should_store_raw_turns(&config.turns.storage_mode) {
             return Ok(Json(IngestResponse {
                 operation_id: None,
@@ -6874,11 +6893,13 @@ impl MempalMcpServer {
                 system_warnings: request_system_warnings,
             }));
         }
-        let drawer_importance = raw_turn_importance(&request.wing, room, &config.turns)
-            .unwrap_or_else(|| request.importance.unwrap_or(0));
-        let source_type = parse_source_type_param(request.source_type.as_deref())?;
-        let confidence = resolve_confidence_param(source_type, request.confidence)?;
-        let metadata = validate_ingest_request(&request, &source_type)?;
+        let drawer_importance = raw_turn_importance(
+            &request.wing,
+            room,
+            Some(&metadata.memory_kind),
+            &config.turns,
+        )
+        .unwrap_or_else(|| request.importance.unwrap_or(0));
         let mut timings = BTreeMap::new();
 
         let embedder = self.embedder_factory.build().await.map_err(|error| {

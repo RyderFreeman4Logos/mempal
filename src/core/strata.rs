@@ -1,8 +1,17 @@
 use super::config::{TurnStorageMode, TurnsConfig};
 use super::db::{Database, DbError};
-use super::types::{Drawer, SearchResult};
+use super::types::{Drawer, MemoryKind, SearchResult};
 
-pub fn is_raw_turn(wing: &str, room: Option<&str>, config: &TurnsConfig) -> bool {
+pub fn is_raw_turn(
+    wing: &str,
+    room: Option<&str>,
+    memory_kind: Option<&MemoryKind>,
+    config: &TurnsConfig,
+) -> bool {
+    if room == Some("facts") || memory_kind.is_some_and(|kind| kind == &MemoryKind::ProfileFact) {
+        return false;
+    }
+
     config
         .raw_turn_wings
         .iter()
@@ -21,23 +30,30 @@ pub fn should_store_raw_turns(mode: &TurnStorageMode) -> bool {
     matches!(mode, TurnStorageMode::RawEvidence)
 }
 
-pub fn raw_turn_importance(wing: &str, room: Option<&str>, config: &TurnsConfig) -> Option<i32> {
-    is_raw_turn(wing, room, config).then_some(config.default_importance)
+pub fn raw_turn_importance(
+    wing: &str,
+    room: Option<&str>,
+    memory_kind: Option<&MemoryKind>,
+    config: &TurnsConfig,
+) -> Option<i32> {
+    is_raw_turn(wing, room, memory_kind, config).then_some(config.default_importance)
 }
 
 pub fn is_excluded_raw_turn(
     wing: &str,
     room: Option<&str>,
+    memory_kind: &MemoryKind,
     importance: i32,
     config: &TurnsConfig,
 ) -> bool {
-    importance == 0 && is_raw_turn(wing, room, config)
+    importance == 0 && is_raw_turn(wing, room, Some(memory_kind), config)
 }
 
 pub fn is_excluded_raw_turn_result(result: &SearchResult, config: &TurnsConfig) -> bool {
     is_excluded_raw_turn(
         &result.wing,
         result.room.as_deref(),
+        &result.memory_kind,
         result.importance,
         config,
     )
@@ -47,6 +63,7 @@ pub fn is_excluded_raw_turn_drawer(drawer: &Drawer, config: &TurnsConfig) -> boo
     is_excluded_raw_turn(
         &drawer.wing,
         drawer.room.as_deref(),
+        &drawer.memory_kind,
         drawer.importance,
         config,
     )
@@ -54,11 +71,18 @@ pub fn is_excluded_raw_turn_drawer(drawer: &Drawer, config: &TurnsConfig) -> boo
 
 pub fn count_raw_turn_drawers(db: &Database, config: &TurnsConfig) -> Result<i64, DbError> {
     Ok(db
-        .scope_counts()?
+        .raw_turn_classification_rows()?
         .into_iter()
-        .filter(|(wing, room, _)| is_raw_turn(wing, room.as_deref(), config))
-        .map(|(_, _, count)| count)
-        .sum())
+        .filter(|row| {
+            is_excluded_raw_turn(
+                &row.wing,
+                row.room.as_deref(),
+                &row.memory_kind,
+                row.importance,
+                config,
+            )
+        })
+        .count() as i64)
 }
 
 #[cfg(test)]
@@ -73,10 +97,21 @@ mod tests {
             ..TurnsConfig::default()
         };
 
-        assert!(is_raw_turn("hooks-raw", Some("user-prompt"), &config));
-        assert!(is_raw_turn("hermes-user/alice", Some("facts"), &config));
-        assert!(is_raw_turn("project", Some("turns"), &config));
-        assert!(!is_raw_turn("project", Some("decision"), &config));
+        assert!(is_raw_turn("hooks-raw", Some("user-prompt"), None, &config));
+        assert!(!is_raw_turn(
+            "hermes-user/alice",
+            Some("facts"),
+            None,
+            &config
+        ));
+        assert!(is_raw_turn("project", Some("turns"), None, &config));
+        assert!(!is_raw_turn("project", Some("decision"), None, &config));
+        assert!(!is_raw_turn(
+            "hermes-user/alice",
+            Some("turns"),
+            Some(&MemoryKind::ProfileFact),
+            &config
+        ));
     }
 
     #[test]
@@ -87,6 +122,6 @@ mod tests {
             ..TurnsConfig::default()
         };
 
-        assert!(!is_raw_turn("project", Some("decision"), &config));
+        assert!(!is_raw_turn("project", Some("decision"), None, &config));
     }
 }
