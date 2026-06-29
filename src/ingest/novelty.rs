@@ -1,5 +1,6 @@
 use crate::core::config::NoveltyConfig;
 use crate::core::db::{Database, read_fork_ext_version};
+use crate::observability::{VectorScanMode, VectorScanSnapshot, record_vector_scan};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 
@@ -133,36 +134,34 @@ fn evaluate_no_project_novelty(
                     ?error,
                     "no-project novelty candidate count failed; fail-open insert"
                 );
+                record_vector_scan(VectorScanSnapshot {
+                    mode: Some(VectorScanMode::Bounded),
+                    candidate_count: 0,
+                    candidate_cap: config.novelty_scan_limit as u64,
+                });
                 return NoveltyDecision::insert();
             }
         };
-
-    if candidate_count > crate::search::EXACT_VECTOR_CANDIDATE_LIMIT {
-        tracing::warn!(
-            wing = %candidate.wing,
-            room = ?candidate.room,
-            candidate_count,
-            limit = crate::search::EXACT_VECTOR_CANDIDATE_LIMIT,
-            "no-project novelty disabled because scoped candidate count exceeds exact vector limit"
-        );
-        return NoveltyDecision {
-            should_audit: false,
-            ..NoveltyDecision::insert()
-        };
-    }
 
     tracing::warn!(
         wing = %candidate.wing,
         room = ?candidate.room,
         candidate_count,
-        "no-project novelty using bounded exact vector scan because sqlite-vec KNN has no pushed-down project scope"
+        scan_limit = config.novelty_scan_limit,
+        "no-project novelty using bounded recent vector scan because sqlite-vec KNN has no pushed-down project scope"
     );
+    record_vector_scan(VectorScanSnapshot {
+        mode: Some(VectorScanMode::Bounded),
+        candidate_count: candidate_count as u64,
+        candidate_cap: config.novelty_scan_limit as u64,
+    });
     let results = match db.novelty_candidates_exact(
         vector,
         wing.as_deref(),
         room.as_deref(),
         None,
         config.top_k_candidates,
+        config.novelty_scan_limit,
     ) {
         Ok(results) => results,
         Err(error) => {
@@ -174,7 +173,13 @@ fn evaluate_no_project_novelty(
         }
     };
 
-    novelty_decision_from_results(results, config)
+    let mut decision = novelty_decision_from_results(results, config);
+    if matches!(decision.action, NoveltyAction::Insert)
+        && candidate_count > config.novelty_scan_limit as i64
+    {
+        decision.should_audit = false;
+    }
+    decision
 }
 
 fn novelty_decision_from_results(

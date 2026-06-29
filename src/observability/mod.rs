@@ -106,6 +106,46 @@ fn global_ingest_worker_backoff() -> &'static Mutex<IngestWorkerBackoffSnapshot>
     INGEST_WORKER_BACKOFF.get_or_init(|| Mutex::new(IngestWorkerBackoffSnapshot::default()))
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorScanMode {
+    Exact,
+    Knn,
+    Bounded,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+pub struct VectorScanSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<VectorScanMode>,
+    pub candidate_count: u64,
+    pub candidate_cap: u64,
+}
+
+pub fn record_vector_scan(snapshot: VectorScanSnapshot) {
+    *global_vector_scan()
+        .lock()
+        .expect("vector scan mutex poisoned") = snapshot;
+}
+
+pub fn vector_scan_snapshot() -> VectorScanSnapshot {
+    global_vector_scan()
+        .lock()
+        .expect("vector scan mutex poisoned")
+        .clone()
+}
+
+pub fn reset_vector_scan_for_tests() {
+    *global_vector_scan()
+        .lock()
+        .expect("vector scan mutex poisoned") = VectorScanSnapshot::default();
+}
+
+fn global_vector_scan() -> &'static Mutex<VectorScanSnapshot> {
+    static VECTOR_SCAN: OnceLock<Mutex<VectorScanSnapshot>> = OnceLock::new();
+    VECTOR_SCAN.get_or_init(|| Mutex::new(VectorScanSnapshot::default()))
+}
+
 pub struct TailOptions<'a> {
     pub limit: usize,
     pub follow: bool,

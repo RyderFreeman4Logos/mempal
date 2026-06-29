@@ -1805,36 +1805,57 @@ impl Database {
         room: Option<&str>,
         project_id: Option<&str>,
         limit: usize,
+        scan_limit: usize,
     ) -> Result<Vec<(String, f32)>, DbError> {
         let vectors_exist: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drawer_vectors')",
             [],
             |row| row.get(0),
         )?;
-        if !vectors_exist || limit == 0 {
+        if !vectors_exist || limit == 0 || scan_limit == 0 {
             return Ok(Vec::new());
         }
 
         let query_json = serde_json::to_string(query_vector)?;
         let limit =
             i64::try_from(limit).map_err(|_| DbError::InvalidSourceType("limit".to_string()))?;
+        let scan_limit = i64::try_from(scan_limit)
+            .map_err(|_| DbError::InvalidSourceType("scan_limit".to_string()))?;
         let mut statement = self.conn.prepare(
             r#"
-            SELECT d.id,
-                   CAST(1.0 - vec_distance_cosine(v.embedding, vec_f32(?1)) AS REAL) AS similarity
-            FROM drawer_vectors v
-            JOIN drawers d ON d.id = v.id
-            WHERE d.deleted_at IS NULL
-              AND (?2 IS NULL OR d.wing = ?2)
-              AND (?3 IS NULL OR d.room = ?3)
-              AND (?4 IS NULL OR d.project_id = ?4)
+            WITH recent_vectors AS (
+                SELECT d.id,
+                       d.deleted_at,
+                       d.wing,
+                       d.room,
+                       d.project_id,
+                       v.embedding
+                FROM drawer_vectors v
+                JOIN drawers d ON d.id = v.id
+                WHERE d.deleted_at IS NULL
+                  AND (?2 IS NULL OR d.wing = ?2)
+                  AND (?3 IS NULL OR d.room = ?3)
+                  AND (?4 IS NULL OR d.project_id = ?4)
+                ORDER BY d.rowid DESC
+                LIMIT ?6
+            )
+            SELECT id,
+                   CAST(1.0 - vec_distance_cosine(embedding, vec_f32(?1)) AS REAL) AS similarity
+            FROM recent_vectors
             ORDER BY similarity DESC
             LIMIT ?5
             "#,
         )?;
         statement
             .query_map(
-                (query_json.as_str(), wing, room, project_id, limit),
+                (
+                    query_json.as_str(),
+                    wing,
+                    room,
+                    project_id,
+                    limit,
+                    scan_limit,
+                ),
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?)),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()

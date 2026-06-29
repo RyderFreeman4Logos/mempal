@@ -131,13 +131,21 @@ impl Write for LogCapture {
 
 impl TestEnv {
     fn new(novelty_enabled: bool) -> Self {
+        Self::new_with_novelty_scan_limit(novelty_enabled, 10_000)
+    }
+
+    fn new_with_novelty_scan_limit(novelty_enabled: bool, novelty_scan_limit: usize) -> Self {
         let tmp = TempDir::new().expect("tempdir");
         let mempal_home = tmp.path().join(".mempal");
         fs::create_dir_all(&mempal_home).expect("create mempal home");
         let db_path = mempal_home.join("palace.db");
         let config_path = mempal_home.join("config.toml");
         Database::open(&db_path).expect("open db");
-        fs::write(&config_path, config_text(&db_path, novelty_enabled)).expect("write config");
+        fs::write(
+            &config_path,
+            config_text(&db_path, novelty_enabled, novelty_scan_limit),
+        )
+        .expect("write config");
         Self {
             _tmp: tmp,
             db_path,
@@ -175,7 +183,7 @@ impl TestEnv {
     }
 }
 
-fn config_text(db_path: &Path, novelty_enabled: bool) -> String {
+fn config_text(db_path: &Path, novelty_enabled: bool, novelty_scan_limit: usize) -> String {
     format!(
         r#"
 db_path = "{}"
@@ -192,11 +200,13 @@ duplicate_threshold = 0.95
 merge_threshold = 0.85
 wing_scope = "same_wing"
 top_k_candidates = 5
+novelty_scan_limit = {}
 max_merges_per_drawer = 10
 max_content_bytes_per_drawer = 65536
 "#,
         db_path.display(),
-        novelty_enabled
+        novelty_enabled,
+        novelty_scan_limit
     )
 }
 
@@ -266,6 +276,14 @@ fn novelty_rows(db_path: &Path) -> Vec<NoveltyAuditRow> {
     .expect("query novelty rows")
     .collect::<Result<Vec<_>, _>>()
     .expect("collect novelty rows")
+}
+
+fn reset_vector_scan_telemetry() {
+    mempal::observability::reset_vector_scan_for_tests();
+}
+
+fn vector_scan_telemetry() -> mempal::observability::VectorScanSnapshot {
+    mempal::observability::vector_scan_snapshot()
 }
 
 fn drawer_count(db_path: &Path) -> i64 {
@@ -555,6 +573,7 @@ async fn test_fts_finds_merged_supplementary() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_no_project_novelty_uses_exact_same_wing_scope_not_global_knn_window() {
     let _guard = test_guard().await;
+    reset_vector_scan_telemetry();
     let env = TestEnv::new(true);
     for idx in 0..5 {
         let id = format!("other-wing-{idx}");
@@ -599,6 +618,64 @@ async fn test_no_project_novelty_uses_exact_same_wing_scope_not_global_knn_windo
         6,
         "bounded exact no-project novelty should merge instead of inserting"
     );
+    let scan = vector_scan_telemetry();
+    assert_eq!(
+        scan.mode,
+        Some(mempal::observability::VectorScanMode::Bounded)
+    );
+    assert_eq!(scan.candidate_count, 1);
+    assert_eq!(scan.candidate_cap, 10_000);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_no_project_novelty_window_miss_inserts_without_full_scan() {
+    let _guard = test_guard().await;
+    reset_vector_scan_telemetry();
+    let env = TestEnv::new_with_novelty_scan_limit(true, 3);
+    insert_drawer(
+        &env.db_path,
+        DrawerSeed {
+            id: "window-miss-existing",
+            content: "Decision: keep bounded novelty scans",
+            wing: DEFAULT_WING,
+            room: DEFAULT_ROOM,
+            project_id: None,
+        },
+        &[1.0, 0.0],
+    );
+    for idx in 0..3 {
+        let id = format!("window-miss-distractor-{idx}");
+        insert_drawer(
+            &env.db_path,
+            DrawerSeed {
+                id: &id,
+                content: "window miss distractor",
+                wing: DEFAULT_WING,
+                room: DEFAULT_ROOM,
+                project_id: None,
+            },
+            &[0.0, 1.0],
+        );
+    }
+    let candidate = "Decision: keep bounded novelty scans, but keep the old copy out of the window";
+    let server = env.server(&[(candidate, vec![1.0, 0.0])], &[]);
+
+    let response = ingest(&server, DEFAULT_WING, DEFAULT_ROOM, candidate, None).await;
+
+    assert_eq!(drawer_count(&env.db_path), 5);
+    assert_eq!(
+        response.novelty_action,
+        Some(mempal::ingest::novelty::NoveltyAction::Insert)
+    );
+    assert_eq!(response.near_drawer_id, None);
+    assert!(novelty_rows(&env.db_path).is_empty());
+    let scan = vector_scan_telemetry();
+    assert_eq!(
+        scan.mode,
+        Some(mempal::observability::VectorScanMode::Bounded)
+    );
+    assert_eq!(scan.candidate_count, 4);
+    assert_eq!(scan.candidate_cap, 3);
 }
 
 #[tokio::test(flavor = "current_thread")]
