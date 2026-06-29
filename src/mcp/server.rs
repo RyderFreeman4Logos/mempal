@@ -14794,6 +14794,20 @@ pattern_boost = 0.2
         tokio::time::advance(Duration::from_secs(16)).await;
         wait_for_ingest_worker_backoff_snapshot(5, 30_000, Some("sqlite_locked")).await;
 
+        // After the 30s cap, subsequent retries should continue at the 30s cap,
+        // not exceed it. The claim_lock_failures_for_test(5) means the 6th
+        // attempt will succeed (failures exhausted), but we verify the cap
+        // by checking the sequence up to retry 5 already shows 30_000.
+        // For an explicit cap test, we'd need more failures, but the 30_000
+        // assertion at retry 5 proves the cap is enforced.
+        // ingest_worker_backoff_delay(5) = 30s (capped), and
+        // ingest_worker_backoff_delay(6) would also return 30s.
+        assert_eq!(
+            ingest_worker_backoff_delay(6),
+            Duration::from_secs(30),
+            "backoff delay must cap at 30s even beyond retry 5"
+        );
+
         handle.shutdown_and_drain().await;
         assert_ingest_worker_backoff_snapshot(0, 0, None);
     }
