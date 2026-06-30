@@ -3,6 +3,8 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{BufRead, Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -17063,8 +17065,8 @@ fn validate_historical_rejudge_options(options: HistoricalRejudgeOptions<'_>) ->
         if options.proposal_llm_endpoint.is_none() || options.confirm_llm_endpoint.is_none() {
             bail!("--candidates-file requires --proposal-llm-endpoint and --confirm-llm-endpoint");
         }
-        if options.stage_mode != HistoricalRejudgeStageMode::Paired {
-            bail!("--candidates-file cannot be combined with split-stage rejudge flags");
+        if options.stage_mode == HistoricalRejudgeStageMode::ProposalOnly {
+            bail!("--candidates-file cannot be combined with --proposal-only");
         }
     }
     if options.confirm_llm_endpoint.is_some() && options.proposal_llm_endpoint.is_none() {
@@ -17083,13 +17085,22 @@ fn validate_historical_rejudge_options(options: HistoricalRejudgeOptions<'_>) ->
             }
         }
         HistoricalRejudgeStageMode::ConfirmPendingOnly => {
-            if !options.all || !options.execute || !options.resume {
-                bail!("--confirm-pending-only requires --all --resume --execute");
-            }
-            if options.proposal_llm_endpoint.is_none() || options.confirm_llm_endpoint.is_none() {
-                bail!(
-                    "--confirm-pending-only requires --proposal-llm-endpoint and --confirm-llm-endpoint"
-                );
+            if options.candidates_file.is_some() {
+                if !options.all || options.execute {
+                    bail!(
+                        "--confirm-pending-only with --candidates-file requires --all without --execute"
+                    );
+                }
+            } else {
+                if !options.all || !options.execute || !options.resume {
+                    bail!("--confirm-pending-only requires --all --resume --execute");
+                }
+                if options.proposal_llm_endpoint.is_none() || options.confirm_llm_endpoint.is_none()
+                {
+                    bail!(
+                        "--confirm-pending-only requires --proposal-llm-endpoint and --confirm-llm-endpoint"
+                    );
+                }
             }
         }
     }
@@ -18066,11 +18077,121 @@ struct HistoricalRejudgeArtifactScanContext<'a> {
     candidates_dir: &'a Path,
     project_id: Option<&'a str>,
     llm_context: Option<&'a HistoricalRejudgeLlmContext>,
+    llm_concurrency: usize,
     judge_model: Option<String>,
     config_version: String,
     started: std::time::Instant,
     progress: Option<&'a mut HistoricalRejudgeProgressWriter>,
-    llm_concurrency: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct HistoricalRejudgeArtifactConfirmationStats {
+    proposal_count: usize,
+    pending_count: usize,
+    confirmed_count: usize,
+    confirmed_delete_count: usize,
+    skipped_count: usize,
+    deferred_count: usize,
+}
+
+#[cfg(unix)]
+struct HistoricalRejudgeArtifactConfirmationLock {
+    file: fs::File,
+}
+
+#[cfg(not(unix))]
+struct HistoricalRejudgeArtifactConfirmationLock;
+
+fn lock_historical_rejudge_artifact_confirmations(
+    confirmations_path: &Path,
+) -> Result<HistoricalRejudgeArtifactConfirmationLock> {
+    #[cfg(unix)]
+    {
+        let lock_path = confirmations_path.with_file_name("confirmations.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "failed to open historical rejudge artifact confirmation lock {}",
+                    lock_path.display()
+                )
+            })?;
+        // SAFETY: `file` is a live file descriptor owned by this guard for the
+        // lifetime of the lock attempt. `flock` does not retain pointers into
+        // Rust memory; on success the descriptor stays open until Drop unlocks it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "failed to lock historical rejudge artifact confirmations {}",
+                    lock_path.display()
+                )
+            });
+        }
+        Ok(HistoricalRejudgeArtifactConfirmationLock { file })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = confirmations_path;
+        Ok(HistoricalRejudgeArtifactConfirmationLock)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HistoricalRejudgeArtifactConfirmationLock {
+    fn drop(&mut self) {
+        // SAFETY: `self.file` is the same live descriptor locked during guard
+        // construction. Unlocking it in Drop releases the advisory flock and
+        // does not access Rust-managed memory.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn historical_rejudge_artifact_confirmation_report(
+    stats: HistoricalRejudgeArtifactConfirmationStats,
+    options: HistoricalRejudgeOptions<'_>,
+    context: HistoricalRejudgeArtifactScanContext<'_>,
+) -> HistoricalRejudgeReport {
+    let pending_remaining = stats.pending_count.saturating_sub(stats.confirmed_count);
+    HistoricalRejudgeReport {
+        dry_run: true,
+        mutation: "artifact_confirm_pending".to_string(),
+        all: options.all,
+        completed: pending_remaining == 0,
+        page_size: options.page_size,
+        snapshot_count: stats.proposal_count,
+        remaining_count: pending_remaining,
+        cursor_rowid: None,
+        scanned_count: stats.proposal_count,
+        candidate_count: stats.pending_count,
+        kept_count: stats.proposal_count.saturating_sub(stats.pending_count),
+        protected_count: stats.skipped_count.saturating_add(stats.deferred_count),
+        mutated_count: stats.confirmed_count,
+        estimated_bytes_reclaimed: 0,
+        elapsed_ms: context.started.elapsed().as_millis(),
+        judge_model: context.judge_model,
+        config_version: context.config_version,
+        progress_file: context
+            .progress
+            .as_ref()
+            .map(|writer| writer.path().to_path_buf()),
+        backup_path: None,
+        backup_format: None,
+        stage_mode: options.stage_mode.as_str().to_string(),
+        status: if pending_remaining == 0 {
+            "completed".to_string()
+        } else {
+            "partial".to_string()
+        },
+        no_stage_pending_count: stats.deferred_count,
+        confirm_pending_count: pending_remaining,
+        memory: current_historical_rejudge_memory_report(),
+        wings_rooms: Vec::new(),
+        examples: Vec::new(),
+    }
 }
 
 async fn scan_historical_rejudge_artifacts(
@@ -18087,6 +18208,22 @@ async fn scan_historical_rejudge_artifacts(
     })?;
     let proposals_path = context.candidates_dir.join("proposals.jsonl");
     let confirmations_path = context.candidates_dir.join("confirmations.jsonl");
+    if options.stage_mode == HistoricalRejudgeStageMode::ConfirmPendingOnly {
+        let mut confirmation_keys = BTreeSet::new();
+        let stats = confirm_historical_rejudge_artifact_backlog(
+            db,
+            config,
+            context.llm_context,
+            &proposals_path,
+            &confirmations_path,
+            &mut confirmation_keys,
+            context.llm_concurrency,
+        )
+        .await?;
+        return Ok(historical_rejudge_artifact_confirmation_report(
+            stats, options, context,
+        ));
+    }
     let cursor_path = context.candidates_dir.join("cursor.json");
     let options_hash =
         historical_rejudge_options_hash(options, context.project_id, &context.config_version)?;
@@ -18128,8 +18265,7 @@ async fn scan_historical_rejudge_artifacts(
         .context("failed to count historical rejudge artifact snapshot")?;
     let mut summary = HistoricalRejudgeProgressSummary::default();
     let mut proposal_keys = read_historical_rejudge_artifact_proposal_keys(&proposals_path)?;
-    let mut confirmation_keys =
-        read_historical_rejudge_artifact_confirmation_keys(&confirmations_path)?;
+    let mut confirmation_keys = BTreeSet::new();
 
     if let Some(writer) = context.progress.as_mut() {
         writer.write_event(build_historical_rejudge_progress_event(
@@ -18502,8 +18638,15 @@ async fn confirm_historical_rejudge_artifact_backlog(
     confirmations_path: &Path,
     confirmation_keys: &mut BTreeSet<String>,
     llm_concurrency: usize,
-) -> Result<()> {
-    let proposals = read_jsonl_records::<HistoricalRejudgeProposalArtifactLine>(proposals_path)?;
+) -> Result<HistoricalRejudgeArtifactConfirmationStats> {
+    let _confirmation_lock = lock_historical_rejudge_artifact_confirmations(confirmations_path)?;
+    confirmation_keys.extend(read_historical_rejudge_artifact_confirmation_keys(
+        confirmations_path,
+    )?);
+    let proposals = read_jsonl_records_allow_trailing_partial::<
+        HistoricalRejudgeProposalArtifactLine,
+    >(proposals_path)?;
+    let proposal_count = proposals.len();
     let pending = proposals
         .into_iter()
         .filter(|proposal| proposal.proposal_decision == "forget")
@@ -18514,8 +18657,14 @@ async fn confirm_historical_rejudge_artifact_backlog(
             ))
         })
         .collect::<Vec<_>>();
+    let pending_count = pending.len();
+    let mut stats = HistoricalRejudgeArtifactConfirmationStats {
+        proposal_count,
+        pending_count,
+        ..Default::default()
+    };
     if pending.is_empty() {
-        return Ok(());
+        return Ok(stats);
     }
     let mut stream = futures::stream::iter(pending.iter())
         .map(|proposal| async move {
@@ -18568,17 +18717,25 @@ async fn confirm_historical_rejudge_artifact_backlog(
     while let Some(result) = stream.next().await {
         match result {
             Ok(Some((key, line))) => {
+                let delete = line.final_decision == "delete";
                 append_jsonl_record(confirmations_path, &line)?;
                 confirmation_keys.insert(key);
+                stats.confirmed_count += 1;
+                if delete {
+                    stats.confirmed_delete_count += 1;
+                }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                stats.skipped_count += 1;
+            }
             Err(error) if is_retryable_historical_llm_error(&error) => {
+                stats.deferred_count += 1;
                 eprintln!("historical rejudge artifact confirmation deferred: {error:#}");
             }
             Err(error) => return Err(error),
         }
     }
-    Ok(())
+    Ok(stats)
 }
 
 fn historical_rejudge_content_hash(content: &str) -> String {
@@ -18699,31 +18856,67 @@ fn append_jsonl_record<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 fn read_jsonl_records<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
+    read_jsonl_records_with_options(path, false)
+}
+
+fn read_jsonl_records_allow_trailing_partial<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+) -> Result<Vec<T>> {
+    read_jsonl_records_with_options(path, true)
+}
+
+fn read_jsonl_records_with_options<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    allow_trailing_partial: bool,
+) -> Result<Vec<T>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
     let file = fs::File::open(path)
         .with_context(|| format!("failed to open JSONL artifact {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
+    let mut reader = std::io::BufReader::new(file);
     let mut records = Vec::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| {
+    let mut line = String::new();
+    let mut index = 0usize;
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line).with_context(|| {
             format!(
                 "failed to read JSONL artifact {} line {}",
                 path.display(),
                 index + 1
             )
         })?;
-        if line.trim().is_empty() {
+        if bytes_read == 0 {
+            break;
+        }
+        index += 1;
+        let complete_line = line.ends_with('\n');
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        records.push(serde_json::from_str(&line).with_context(|| {
-            format!(
-                "failed to parse JSONL artifact {} line {}",
-                path.display(),
-                index + 1
-            )
-        })?);
+        match serde_json::from_str(trimmed) {
+            Ok(record) => records.push(record),
+            Err(error) if allow_trailing_partial && !complete_line => {
+                eprintln!(
+                    "ignoring partial trailing JSONL artifact {} line {} while writer is active: {}",
+                    path.display(),
+                    index,
+                    error
+                );
+                break;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to parse JSONL artifact {} line {}",
+                        path.display(),
+                        index
+                    )
+                });
+            }
+        }
     }
     Ok(records)
 }
@@ -25421,6 +25614,53 @@ mod historical_rejudge_tests {
         Commands::Maintenance {
             command: MaintenanceCommands::Rejudge(Box::new(args)),
         }
+    }
+
+    #[test]
+    fn artifact_confirm_pending_only_candidates_file_is_read_only_and_resumeless() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let options = HistoricalRejudgeOptions {
+            execute: false,
+            hard_delete: false,
+            backup_dir: None,
+            unsafe_no_backup: false,
+            limit: 1000,
+            all: true,
+            resume: false,
+            unsafe_allow_config_version_drift: false,
+            page_size: DEFAULT_HISTORICAL_REJUDGE_PAGE_SIZE,
+            progress_file: None,
+            candidates_file: Some(tmp.path()),
+            stage_mode: HistoricalRejudgeStageMode::ConfirmPendingOnly,
+            proposal_llm_endpoint: Some("qwen"),
+            confirm_llm_endpoint: Some("spark"),
+            wing: None,
+            room: None,
+            project: None,
+            format: "json",
+        };
+
+        validate_historical_rejudge_options(options)
+            .expect("artifact confirmation drain should be allowed without --execute or --resume");
+    }
+
+    #[test]
+    fn artifact_jsonl_reader_allows_live_writer_partial_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("proposals.jsonl");
+        fs::write(&path, "{\"ok\":true}\n{\"incomplete\":").unwrap();
+
+        let records: Vec<Value> = read_jsonl_records_allow_trailing_partial(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["ok"], true);
+
+        let strict_error = read_jsonl_records::<Value>(&path).unwrap_err();
+        assert!(
+            strict_error
+                .to_string()
+                .contains("failed to parse JSONL artifact"),
+            "unexpected strict parse error: {strict_error:#}"
+        );
     }
 
     fn append_test_delete_confirmation(
