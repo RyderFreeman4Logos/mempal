@@ -258,6 +258,43 @@ Progress files and `mempal status` expose aggregate `no_stage_pending_count` and
 `confirm_pending_count` values only. They do not include drawer content, prompts,
 model responses, endpoint credentials, URLs with secrets, or other raw payloads.
 
+For a write-free historical artifact run, use `--candidates-file` instead of
+`--execute`. The main process keeps the source SQLite database read-only and
+writes `proposals.jsonl`, `confirmations.jsonl`, and `cursor.json` under the
+artifact directory. To avoid waiting for the full Qwen scan before spending Spark
+quota, run an independent Spark confirmation drainer against the same artifact
+directory while the Qwen proposal scanner is still appending proposals:
+
+```bash
+ART_DIR="$HOME/.mempal/runs/rejudge-artifacts-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$ART_DIR"
+
+mempal maintenance rejudge \
+  --all \
+  --candidates-file "$ART_DIR" \
+  --progress-file "$ART_DIR/progress.jsonl" \
+  --proposal-llm-endpoint qwen \
+  --confirm-llm-endpoint spark &
+
+while true; do
+  mempal maintenance rejudge \
+    --all \
+    --confirm-pending-only \
+    --candidates-file "$ART_DIR" \
+    --proposal-llm-endpoint qwen \
+    --confirm-llm-endpoint spark \
+    --format json || true
+  sleep 300
+done
+```
+
+The drainer does not call Qwen, does not need `--execute` or `--resume`, and does
+not mutate the SQLite database. It reads completed `proposal_decision=forget`
+JSONL records, tolerates the proposal scanner actively appending the final line,
+and appends Spark results to `confirmations.jsonl`. Later, after reviewing the
+artifacts and taking an explicit backup, use the artifact apply command to mutate
+or delete rows.
+
 Maintenance rejudge is designed as an IO-first service path when proposal and
 confirmation judges are external endpoints. Full `--all` runs snapshot work into
 SQLite `historical_rejudge_work_items`, page through that table with
