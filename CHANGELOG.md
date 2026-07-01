@@ -6,7 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR bumps introduce new features, PATCH bumps are bug-fix only).
 
-## [Unreleased] — absorbed from upstream (fork remains 0.4.0)
+## [Unreleased]
+
+### Changed
+
+- **Package identity**: `Cargo.toml` `repository`/`homepage`/`documentation` fields now point to `RyderFreeman4Logos/mempal` (the active fork) instead of upstream `ZhangHanDong/mempal`. README link references updated accordingly. Crate/binary names unchanged.
+
+## [pre-fork Unreleased] — absorbed from upstream (fork remains 0.4.0)
 
 This fork's package version remains `0.4.0`. The notes below record upstream
 0.5.x/0.6.0 material absorbed during the 2026-06-05 sync; they are not released
