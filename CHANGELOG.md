@@ -10,6 +10,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Changed
 
+- **English-only documentation**: removed the Chinese README and local Chinese
+  mdBook source, and updated book references to point to the English edition.
 - **Documentation drift cleanup**: README and usage guide now document the same
   19 verified MCP baseline tools, cover the major current CLI command families,
   and mark the original design spec as a historical baseline where
@@ -158,8 +160,9 @@ their semantics.
 - **Release & ops tooling (P97–P104).** `mempal doctor` / `mempal_doctor`,
   `mempal release-readiness`, `mempal maintenance guided-run`, maintenance &
   cowork runbooks, adoption analytics.
-- **Chinese mdBook (P105).** `books/zh-CN` — preface + 10 chapters + appendix,
-  Mermaid via committed local JS assets. Excluded from the published crate.
+- **Book manuscript (P105).** Historical upstream material for a local mdBook
+  manuscript is not retained in this fork's English-only documentation surface;
+  use the public English book link from the README.
 
 ### Changed
 
