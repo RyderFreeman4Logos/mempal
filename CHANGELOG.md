@@ -8,6 +8,12 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- Current architecture overview at `docs/architecture.md`, linked from README,
+  to document the post-fork module map, data flow, runtime surfaces, and the
+  boundary between current behavior and historical specs.
+
 ### Changed
 
 - **English-only documentation**: removed the Chinese README and local Chinese
