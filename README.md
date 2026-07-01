@@ -181,11 +181,20 @@ Daemon low-memory mode:
 
 ## Commands
 
+This is the main user-facing command surface, not an exhaustive list of every
+maintenance subcommand. Use `mempal --help` and nested `--help` output for the
+full tree.
+
 | Command | Purpose |
 |---------|---------|
 | `mempal init <DIR> [--dry-run]` | Infer wing/rooms from project tree |
 | `mempal ingest <DIR> --wing <W> [--dry-run]` | Chunk, embed, and store |
 | `mempal search <QUERY> [--wing W] [--room R] [--json]` | Hybrid search (BM25 + vector + RRF) |
+| `mempal brief <QUERY>` | Citation-first cognitive brief with facts, evidence, uncertainty, and next actions |
+| `mempal context <QUERY> [--format json]` | Typed runtime guidance (`dao_tian` -> `dao_ren` -> `shu` -> `qi`) |
+| `mempal timeline [--limit N]` | Project-scoped recent/important memory digest |
+| `mempal pinned-facts` | Read canonical pinned facts without embedding lookup |
+| `mempal field-taxonomy [--format json]` | Inspect recommended `field` values for typed memory |
 | `mempal wake-up [--format aaak]` | Context refresh, sorted by importance |
 | `mempal compress <TEXT>` | AAAK format output |
 | `mempal delete <DRAWER_ID>` | Soft-delete a drawer |
@@ -196,8 +205,13 @@ Daemon low-memory mode:
 | `mempal kg stats` | Knowledge graph statistics |
 | `mempal tunnels` | Cross-wing room links |
 | `mempal taxonomy list / edit` | Manage routing keywords |
+| `mempal knowledge distill/gate/policy` | Governed knowledge lifecycle checks and candidate creation |
 | `mempal reindex` | Re-embed all drawers after model change |
 | `mempal status` | DB stats, schema version, scopes |
+| `mempal doctor` | Install, schema, runtime, and MCP diagnostics |
+| `mempal operation status <OPERATION_ID>` | Poll receipt-backed async ingest work |
+| `mempal tools list` | Show the runtime MCP tool surface |
+| `mempal skill ...` | Inspect skill/runtime guidance helpers |
 | `mempal serve [--mcp]` | MCP server (+ REST with feature) |
 | `mempal cowork-install-hooks [--global-codex]` | Install UserPromptSubmit hooks for Claude Code (+ optional Codex merge) |
 | `mempal cowork-drain --target <claude\|codex>` | Drain inbox messages (for hook use; exits 0 on any failure) |
@@ -222,22 +236,33 @@ mempal recall hermes --cwd . --latest --query "what is the current issue queue?"
 
 Default profile reads `~/.hermes/state.db`; named profiles read `~/.hermes/profiles/<profile>/state.db` unless `--db` or `--export-jsonl` is supplied. Searches default to the process cwd, preserve Hermes profile boundaries, and return `profile/session/message` citations so exact pages can be fetched later through Hermes or xurl.
 
-## MCP Server (11 tools)
+## MCP Server (20 verified baseline tools)
 
-`mempal serve --mcp` exposes these tools via Model Context Protocol:
+`mempal serve --mcp` exposes at least this smoke-tested MCP baseline via Model
+Context Protocol. Use `mempal_tools_list` for the runtime-advertised surface in
+a specific build:
 
 | Tool | Purpose |
 |------|---------|
 | `mempal_status` | State + protocol + AAAK spec (teaches agent on first call) |
-| `mempal_operation_status` | Poll a receipt-backed ingest op; returns drawer_id / rejection / failure and timing breakdowns when available |
 | `mempal_search` | Hybrid search with tunnel hints, citations, and AAAK-derived structured signals |
+| `mempal_brief` | Citation-first cognitive brief with facts, evidence, uncertainty, and next actions |
+| `mempal_context` | Typed runtime context assembler (`dao_tian` -> `dao_ren` -> `shu` -> `qi`) |
+| `mempal_timeline` | Project-scoped memory overview ordered by importance and recency |
+| `mempal_pinned_facts` | Read canonical pinned facts without vector lookup |
+| `mempal_field_taxonomy` | Recommended `field` values for typed memory |
 | `mempal_ingest` | Store memories with optional importance (0-5), dry_run, and receipt-based `wait` / `wait_timeout_secs`; reports `lock_wait_ms` when concurrent ingest was observed and can be polled via `mempal_operation_status` |
+| `mempal_operation_status` | Poll a receipt-backed ingest op; returns drawer_id / rejection / failure and timing breakdowns when available |
+| `mempal_read_drawer` | Fetch one full raw drawer after a truncated search preview |
+| `mempal_read_drawers` | Fetch multiple full raw drawers after truncated search previews |
 | `mempal_delete` | Soft-delete with audit trail |
 | `mempal_taxonomy` | List or edit routing keywords |
 | `mempal_kg` | Knowledge graph: add/query/invalidate/timeline/stats |
 | `mempal_tunnels` | Cross-wing room discovery |
-| `mempal_peek_partner` | Read partner agent's live session (Claude ↔ Codex), pure read, never writes |
-| `mempal_cowork_push` | Send a short handoff message to partner agent's inbox (at-next-submit delivery) |
+| `mempal_doctor` | Release, install, schema, and MCP runtime diagnostics |
+| `mempal_tools_list` | Runtime list of MCP tools advertised by the server |
+| `mempal_skill` | Skill/runtime guidance helper for agents |
+| `mempal_knowledge_distill` | Create candidate `dao_ren` / `qi` knowledge from existing evidence refs |
 | `mempal_fact_check` | Offline contradiction detection vs KG triples + known entities (similar-name, relation mismatch, stale facts) |
 
 The server embeds MEMORY_PROTOCOL (11 behavioral rules) in the MCP `initialize.instructions` field. Any MCP client learns the workflow automatically.
@@ -429,7 +454,7 @@ mempal reindex
 
 ## Docs
 
-- Design: [`docs/specs/2026-04-08-mempal-design.md`](docs/specs/2026-04-08-mempal-design.md)
+- Historical design baseline: [`docs/specs/2026-04-08-mempal-design.md`](docs/specs/2026-04-08-mempal-design.md) — useful for intent, but some package-layout details are implementation history; use the current package layout above for install/runtime facts.
 - Usage guide: [`docs/usage.md`](docs/usage.md)
 - AAAK dialect: [`docs/aaak-dialect.md`](docs/aaak-dialect.md)
 - Specs (internal agent-spec contracts, on GitHub): <https://github.com/RyderFreeman4Logos/mempal/tree/main/specs>

@@ -352,14 +352,19 @@ tail -n 100 "$RUN_DIR/runner.log"
 
 ## Command Cheat Sheet
 
-Use this when you already know the concepts and just need the right command quickly.
+Use this when you already know the concepts and just need the right command
+quickly. This table covers the main user-facing commands; use `mempal --help`
+and nested `--help` output for the full maintenance command tree.
 
 | Command | Purpose |
 |---------|---------|
 | `mempal init <DIR> [--dry-run]` | infer a `wing` and seed initial taxonomy rooms from a project tree |
 | `mempal ingest --wing <WING> <DIR> [--parser auto --no-llm] [--dry-run]` | chunk, embed, and store a project tree or deterministic document set |
 | `mempal search <QUERY> [--wing W] [--room R] [--json]` | hybrid search (BM25 + vector + RRF) with tunnel hints |
+| `mempal brief <QUERY>` | generate a citation-first brief with facts, evidence, uncertainty, and next actions |
 | `mempal context <QUERY> [--format json] [--include-evidence] [--dao-tian-limit N]` | assemble mind-model runtime context (`dao_tian -> dao_ren -> shu -> qi`); default `dao_tian` budget is 1 |
+| `mempal timeline [--limit N]` | show a project-scoped digest ordered by importance and recency |
+| `mempal pinned-facts` | read canonical pinned facts without embedding lookup |
 | `mempal field-taxonomy [--format json]` | inspect read-only recommended `field` values for typed memory |
 | `mempal knowledge distill --statement ... --content ... --tier dao_ren --supporting-ref <ID>` | create candidate knowledge from evidence refs |
 | `mempal knowledge policy [--format json]` | inspect read-only Stage-1 promotion policy thresholds |
@@ -377,6 +382,10 @@ Use this when you already know the concepts and just need the right command quic
 | `mempal taxonomy edit <WING> <ROOM> --keywords ...` | tune routing behavior |
 | `mempal reindex` | re-embed all drawers after model/backend change |
 | `mempal status` | schema version, drawer counts, triples, deleted drawers, scopes |
+| `mempal doctor` | inspect install, schema, runtime, and MCP diagnostics |
+| `mempal operation status <OPERATION_ID>` | poll receipt-backed async ingest work |
+| `mempal tools list` | inspect the MCP tools advertised by the runtime server |
+| `mempal skill ...` | inspect skill/runtime guidance helpers |
 | `mempal delete <DRAWER_ID>` | soft-delete one drawer |
 | `mempal purge [--before ...]` | permanently remove soft-deleted drawers |
 | `mempal serve --mcp` | run the MCP server over stdio |
@@ -858,25 +867,28 @@ mempal serve --mcp
 
 If `mempal` was built without the `rest` feature, plain `mempal serve` behaves the same way.
 
-The MCP server exposes eighteen tools:
+The smoke-tested MCP baseline currently documents 20 verified tools. Use
+`mempal_tools_list` for the runtime-advertised surface in a specific build:
 
 - `mempal_status` — state + protocol + AAAK spec
 - `mempal_search` — hybrid search (BM25 + vector + RRF) with tunnel hints and AAAK-derived structured signals (`entities` / `topics` / `flags` / `emotions` / `importance_stars`)
+- `mempal_brief` — citation-first cognitive brief with facts, evidence, uncertainty, and next actions
 - `mempal_context` — mind-model runtime context pack (`dao_tian -> dao_ren -> shu -> qi`, evidence opt-in, `dao_tian_limit` default 1); guides workflow / skill / tool choice but never executes skills
+- `mempal_timeline` — project-scoped overview ordered by importance and recency
+- `mempal_pinned_facts` — canonical pinned facts without vector lookup
 - `mempal_field_taxonomy` — read-only recommended `field` values for typed evidence / knowledge; guidance only, custom fields remain valid
 - `mempal_knowledge_distill` — create candidate `dao_ren` / `qi` knowledge from existing evidence refs; deterministic and never auto-promotes
-- `mempal_knowledge_policy` — read-only Stage-1 promotion policy table for `dao_tian`, `dao_ren`, `shu`, and `qi`
-- `mempal_knowledge_gate` — read-only promotion readiness check for knowledge drawers; returns the same deterministic gate report as `mempal knowledge gate --format json`
-- `mempal_knowledge_promote` — gate-enforced lifecycle promotion with supplied verification refs
-- `mempal_knowledge_demote` — demote or retire knowledge with counterexample evidence refs
-- `mempal_knowledge_publish_anchor` — metadata-only outward anchor publication for active knowledge
 - `mempal_ingest` — store memories with optional importance (0-5) and dry_run
+- `mempal_operation_status` — poll a receipt-backed ingest operation and return terminal status/timing details when available
+- `mempal_read_drawer` — fetch one full raw drawer after a truncated search preview
+- `mempal_read_drawers` — fetch multiple full raw drawers after truncated search previews
 - `mempal_delete` — soft-delete with audit
 - `mempal_taxonomy` — list or edit routing keywords
 - `mempal_kg` — knowledge graph: add/query/invalidate/timeline/stats
 - `mempal_tunnels` — cross-wing room discovery
-- `mempal_peek_partner` — read the partner coding agent's live session (Claude ↔ Codex); pure read, never writes to mempal
-- `mempal_cowork_push` — send a short handoff message (≤ 8 KB) to the partner agent's inbox; delivered at the partner's next UserPromptSubmit via a drain hook
+- `mempal_doctor` — release, install, schema, and MCP runtime diagnostics
+- `mempal_tools_list` — runtime list of MCP tools advertised by the server
+- `mempal_skill` — skill/runtime guidance helper for agents
 - `mempal_fact_check` — offline contradiction detection against KG triples and known entities
 
 The server also embeds MEMORY_PROTOCOL (behavioral rules) in the MCP `initialize.instructions` field so any MCP client learns the workflow on connect — zero configuration. The protocol treats `wake-up` as an L0/L1 refresh surface, `mempal_context` as typed guidance for choosing an approach, workflow, skill, or tool, `mempal_field_taxonomy` as guidance for choosing typed-memory `field` values, and `trigger_hints` as bias metadata only. These hints never override system, user, repo, or client-native skill rules.
