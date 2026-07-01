@@ -461,15 +461,15 @@ mempal reindex
 
 ## Book: MemPalace — Reforging Memory in Rust
 
-mempal 的设计分析和完整技术叙事，收录在《MemPalace: AI 记忆的第一性原理》Part 10（第 26-30 章）：
+The mempal design analysis and full technical narrative are covered in Part 10
+of *MemPalace: First Principles of AI Memory* (chapters 26-30):
 
-- [中文版](https://zhanghandong.github.io/mempalace-book/ch26-why-rewrite-in-rust.html)
 - [English](https://zhanghandong.github.io/mempalace-book/en/ch26-why-rewrite-in-rust.html)
 
-| 章节 | 内容 |
-|------|------|
-| 第 26 章 | 为什么用 Rust 重铸 — 触发点、重写判断、语言选择 |
-| 第 27 章 | 保留了什么、改变了什么 — 5 维度对比 + 架构图 |
-| 第 28 章 | 自描述协议 — MEMORY_PROTOCOL、7 条规则、agent 生命周期 |
-| 第 29 章 | 多 Agent 协作 — Claude↔Codex 接力、反模式发现、agent 日记 |
-| 第 30 章 | 诚实的差距 — benchmark 数据、6 个 gap |
+| Chapter | Coverage |
+|---------|----------|
+| 26 | Why reforge in Rust: trigger points, rewrite criteria, and language choice |
+| 27 | What stayed and what changed: five-dimension comparison plus architecture diagrams |
+| 28 | Self-describing protocol: MEMORY_PROTOCOL, operating rules, and agent lifecycle |
+| 29 | Multi-agent cowork: Claude/Codex handoffs, antipattern discovery, and agent diary |
+| 30 | Honest gaps: benchmark data and remaining gaps |
