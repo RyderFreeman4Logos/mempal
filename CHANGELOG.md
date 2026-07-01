@@ -11,7 +11,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Changed
 
 - **Documentation drift cleanup**: README and usage guide now document the same
-  20 verified MCP baseline tools, cover the major current CLI command families,
+  19 verified MCP baseline tools, cover the major current CLI command families,
   and mark the original design spec as a historical baseline where
   package-layout details are outdated.
 - **Package identity**: `Cargo.toml` `repository`/`homepage`/`documentation` fields now point to `RyderFreeman4Logos/mempal` (the active fork) instead of upstream `ZhangHanDong/mempal`. README link references updated accordingly. Crate/binary names unchanged.

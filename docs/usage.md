@@ -363,8 +363,8 @@ and nested `--help` output for the full maintenance command tree.
 | `mempal search <QUERY> [--wing W] [--room R] [--json]` | hybrid search (BM25 + vector + RRF) with tunnel hints |
 | `mempal brief <QUERY>` | generate a citation-first brief with facts, evidence, uncertainty, and next actions |
 | `mempal context <QUERY> [--format json] [--include-evidence] [--dao-tian-limit N]` | assemble mind-model runtime context (`dao_tian -> dao_ren -> shu -> qi`); default `dao_tian` budget is 1 |
-| `mempal timeline [--limit N]` | show a project-scoped digest ordered by importance and recency |
-| `mempal pinned-facts` | read canonical pinned facts without embedding lookup |
+| `mempal timeline [--wing W] [--since S] [--format F] [--raw]` | show a project-scoped digest ordered by importance and recency |
+| `mempal pinned [--project P] [--reorder ...] [--json]` | read canonical pinned facts without embedding lookup |
 | `mempal field-taxonomy [--format json]` | inspect read-only recommended `field` values for typed memory |
 | `mempal knowledge distill --statement ... --content ... --tier dao_ren --supporting-ref <ID>` | create candidate knowledge from evidence refs |
 | `mempal knowledge policy [--format json]` | inspect read-only Stage-1 promotion policy thresholds |
@@ -384,7 +384,6 @@ and nested `--help` output for the full maintenance command tree.
 | `mempal status` | schema version, drawer counts, triples, deleted drawers, scopes |
 | `mempal doctor` | inspect install, schema, runtime, and MCP diagnostics |
 | `mempal operation status <OPERATION_ID>` | poll receipt-backed async ingest work |
-| `mempal tools list` | inspect the MCP tools advertised by the runtime server |
 | `mempal skill ...` | inspect skill/runtime guidance helpers |
 | `mempal delete <DRAWER_ID>` | soft-delete one drawer |
 | `mempal purge [--before ...]` | permanently remove soft-deleted drawers |
@@ -867,8 +866,9 @@ mempal serve --mcp
 
 If `mempal` was built without the `rest` feature, plain `mempal serve` behaves the same way.
 
-The smoke-tested MCP baseline currently documents 20 verified tools. Use
-`mempal_tools_list` for the runtime-advertised surface in a specific build:
+The smoke-tested MCP baseline currently documents 19 verified tools. Use
+`mempal doctor` or protocol-level `tools/list` against `mempal serve --mcp`
+for the runtime-advertised surface in a specific build:
 
 - `mempal_status` — state + protocol + AAAK spec
 - `mempal_search` — hybrid search (BM25 + vector + RRF) with tunnel hints and AAAK-derived structured signals (`entities` / `topics` / `flags` / `emotions` / `importance_stars`)
@@ -887,7 +887,6 @@ The smoke-tested MCP baseline currently documents 20 verified tools. Use
 - `mempal_kg` — knowledge graph: add/query/invalidate/timeline/stats
 - `mempal_tunnels` — cross-wing room discovery
 - `mempal_doctor` — release, install, schema, and MCP runtime diagnostics
-- `mempal_tools_list` — runtime list of MCP tools advertised by the server
 - `mempal_skill` — skill/runtime guidance helper for agents
 - `mempal_fact_check` — offline contradiction detection against KG triples and known entities
 

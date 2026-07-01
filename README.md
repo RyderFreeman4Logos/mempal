@@ -192,8 +192,8 @@ full tree.
 | `mempal search <QUERY> [--wing W] [--room R] [--json]` | Hybrid search (BM25 + vector + RRF) |
 | `mempal brief <QUERY>` | Citation-first cognitive brief with facts, evidence, uncertainty, and next actions |
 | `mempal context <QUERY> [--format json]` | Typed runtime guidance (`dao_tian` -> `dao_ren` -> `shu` -> `qi`) |
-| `mempal timeline [--limit N]` | Project-scoped recent/important memory digest |
-| `mempal pinned-facts` | Read canonical pinned facts without embedding lookup |
+| `mempal timeline [--wing W] [--since S] [--format F] [--raw]` | Project-scoped recent/important memory digest |
+| `mempal pinned [--project P] [--reorder ...] [--json]` | Read canonical pinned facts without embedding lookup |
 | `mempal field-taxonomy [--format json]` | Inspect recommended `field` values for typed memory |
 | `mempal wake-up [--format aaak]` | Context refresh, sorted by importance |
 | `mempal compress <TEXT>` | AAAK format output |
@@ -210,7 +210,6 @@ full tree.
 | `mempal status` | DB stats, schema version, scopes |
 | `mempal doctor` | Install, schema, runtime, and MCP diagnostics |
 | `mempal operation status <OPERATION_ID>` | Poll receipt-backed async ingest work |
-| `mempal tools list` | Show the runtime MCP tool surface |
 | `mempal skill ...` | Inspect skill/runtime guidance helpers |
 | `mempal serve [--mcp]` | MCP server (+ REST with feature) |
 | `mempal cowork-install-hooks [--global-codex]` | Install UserPromptSubmit hooks for Claude Code (+ optional Codex merge) |
@@ -236,11 +235,11 @@ mempal recall hermes --cwd . --latest --query "what is the current issue queue?"
 
 Default profile reads `~/.hermes/state.db`; named profiles read `~/.hermes/profiles/<profile>/state.db` unless `--db` or `--export-jsonl` is supplied. Searches default to the process cwd, preserve Hermes profile boundaries, and return `profile/session/message` citations so exact pages can be fetched later through Hermes or xurl.
 
-## MCP Server (20 verified baseline tools)
+## MCP Server (19 verified baseline tools)
 
 `mempal serve --mcp` exposes at least this smoke-tested MCP baseline via Model
-Context Protocol. Use `mempal_tools_list` for the runtime-advertised surface in
-a specific build:
+Context Protocol. Use `mempal doctor` or protocol-level `tools/list` against
+`mempal serve --mcp` for the runtime-advertised surface in a specific build:
 
 | Tool | Purpose |
 |------|---------|
@@ -260,7 +259,6 @@ a specific build:
 | `mempal_kg` | Knowledge graph: add/query/invalidate/timeline/stats |
 | `mempal_tunnels` | Cross-wing room discovery |
 | `mempal_doctor` | Release, install, schema, and MCP runtime diagnostics |
-| `mempal_tools_list` | Runtime list of MCP tools advertised by the server |
 | `mempal_skill` | Skill/runtime guidance helper for agents |
 | `mempal_knowledge_distill` | Create candidate `dao_ren` / `qi` knowledge from existing evidence refs |
 | `mempal_fact_check` | Offline contradiction detection vs KG triples + known entities (similar-name, relation mismatch, stale facts) |
