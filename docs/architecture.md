@@ -72,9 +72,67 @@ mempal is a Rust, single-binary, SQLite-first project memory system for coding a
 - **MCP**: `mempal serve --mcp` exposes the smoke-tested baseline of 19 documented MCP tools for status, search, timeline, drawer reads, context, ingest, delete, taxonomy, field taxonomy, KG, tunnels, cowork, fact-check, doctor, brief, and governed knowledge operations. Some builds or newer code paths may register additional governed or diagnostic tools; treat README/usage as the baseline compatibility contract.
 - **REST**: With the `rest` feature and daemon configuration enabled, the daemon serves loopback REST/Hermes-compatible endpoints from `src/api/`. REST search and writes run inside the daemon process and share daemon-owned database/embedder state.
 
-## Stable vs Experimental
+Compatibility expectations for these entry points are defined in the next section.
 
-Stable current behavior includes the single-package install path, raw SQLite drawer storage, cited hybrid search, CLI-first operation, MCP baseline tools, daemon queue processing, deterministic fact checking, knowledge lifecycle gates, and local-first embedding/LLM configuration. More experimental or operator-gated areas include hotpatch suggestions, phase3 runtime adoption evidence, auto-generated knowledge cards, LLM-assisted gating, advanced cowork bus transports, xurl transcript recall, and sleep-cycle maintenance. Those areas are implemented in code, but their policies and defaults may evolve faster than the core ingest/search/store contract.
+## Product Surface Classification
+
+This classification describes compatibility expectations for current product surfaces. CLI and MCP names are listed together when they expose the same capability. REST endpoints inherit the classification of the underlying store/search/ingest/status capability; an experimental module does not become stable solely because it is reachable through HTTP.
+
+### Stable
+
+Stable surfaces are the core product contract. Command names, MCP tool names, raw-storage semantics, citations, and operation receipts should remain compatible across normal 0.x updates unless a migration note calls out a change.
+
+| Surface | Compatibility expectation |
+| --- | --- |
+| `mempal serve --mcp` | The stdio MCP server remains the stable protocol entry point; individual tools follow the classification in this table. |
+| `mempal status` / `mempal_status` | System status, warnings, schema/config/runtime diagnostics, and protocol discovery remain a stable entry point. |
+| `mempal search` / `mempal_search` | Hybrid retrieval with citations, drawer IDs, source files, project scoping, and fallback warnings remains stable. |
+| `mempal_read_drawer` / `mempal_read_drawers` | Full raw drawer reads remain stable companion tools for search preview expansion. |
+| `mempal ingest` / `mempal_ingest` | Memory storage preserves raw drawer content and returns operation receipts or drawer IDs. |
+| `mempal operation status` / `mempal_operation_status` | Receipt-backed async ingest polling remains the stable way to observe queued writes. |
+| `mempal delete` / `mempal_delete` | Soft-delete with audit trail remains the stable deletion contract. |
+| `mempal pinned` / `mempal_pinned_facts` | Canonical pinned fact reads remain available without embedding lookup. |
+| `mempal wake-up` | Importance-ordered context refresh remains a stable CLI convenience surface. |
+| `mempal context` / `mempal_context` | Tiered dao/shu/qi context assembly remains the stable agent guidance surface. |
+| `mempal brief` / `mempal_brief` | Citation-first cognitive briefs remain the stable compact human/agent summary surface. |
+| `mempal doctor` / `mempal_doctor` | Health diagnostics for install, schema, daemon, MCP, REST, and runtime environment remain stable. |
+| Local SQLite storage and embedding routing | Raw drawers stay in SQLite; embedding backend routing is configurable and observable. |
+| REST core operations | REST handlers that delegate to stable status/search/ingest/delete-style operations follow the same compatibility expectations when the `rest` feature is enabled. |
+
+### Advanced
+
+Advanced surfaces are supported and useful, but they expose governance, operator policy, or specialized data models. Expect additive fields, policy tightening, and more setup-specific behavior than the stable core.
+
+| Surface | Notes |
+| --- | --- |
+| `mempal kg` / `mempal_kg` | Knowledge graph triples and temporal facts. |
+| `mempal fact-check` / `mempal_fact_check` | Deterministic contradiction detection over KG triples and known entities. |
+| `mempal taxonomy` / `mempal_taxonomy` | Routing keyword management. |
+| `mempal field-taxonomy` / `mempal_field_taxonomy` | Recommended typed memory fields. |
+| `mempal tunnels` / `mempal_tunnels` | Cross-scope links and tunnel hints. |
+| `mempal timeline` / `mempal_timeline` | Recent/important memory timelines. |
+| `mempal skill` / `mempal_skill` | Skill and runtime guidance helpers. |
+| `mempal knowledge distill` / `mempal_knowledge_distill` | Governed knowledge lifecycle candidate creation; promotion remains gate-controlled. |
+| LLM gating | Tier 1, Tier 2, and optional local/OpenAI-compatible LLM classifier paths are configuration-sensitive. |
+| `mempal bench longmemeval` | Benchmark harness for local retrieval evaluation. |
+| `mempal xurl` | Conversation transcript indexing, search, timeline, stats, reindex, and backfill. |
+
+### Experimental
+
+Experimental surfaces are implemented but not compatibility commitments. They may change command names, MCP/REST payloads, defaults, storage layout, or required operator workflow before 1.0. Automation should pin the mempal version and review the changelog before depending on them.
+
+| Surface | Experimental scope |
+| --- | --- |
+| Hermes plugin intelligence layer (`src/intelligence.rs`) | Plugin intelligence and Hermes-adjacent behavior. |
+| Cowork bus (`src/cowork/`, all `mempal cowork-*` commands) | Multi-agent bus, channel, session, handoff, delivery, and tmux transport workflows. |
+| Hotpatch (`src/hotpatch/`, `mempal hotpatch`) | CLAUDE.md suggestion generation and operator-applied patches. |
+| Sleep/Reflect/Repair/Crystallization | `mempal sleep`, `mempal reflect`, `mempal repair`, and `mempal crystallize` maintenance workflows. |
+| Maintenance rejudge artifact mode | `mempal maintenance rejudge --candidates-file` artifact-driven cleanup. |
+| Session self-review | `mempal patterns` and `SessionEnd` hook self-review extraction. |
+| `mempal phase3` | Runtime adoption analytics and default-readiness evidence. |
+| `mempal insight` | Design insight recording and drain workflow. |
+| `mempal foresight` | Future-bound memory signals. |
+| `mempal case` | Case/procedural memory surface. |
 
 ## Historical Context
 

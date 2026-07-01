@@ -13,6 +13,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Current architecture overview at `docs/architecture.md`, linked from README,
   to document the post-fork module map, data flow, runtime surfaces, and the
   boundary between current behavior and historical specs.
+- Product surface classification in `docs/architecture.md`, linked from README,
+  to mark stable, advanced, and experimental CLI/MCP/REST compatibility
+  expectations.
 
 ### Changed
 
