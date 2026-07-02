@@ -10,6 +10,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- Scoped pre-push CHANGELOG guard that requires an `[Unreleased]` entry only
+  when `src/**/*.rs` files changed on the branch.
 - Current architecture overview at `docs/architecture.md`, linked from README,
   to document the post-fork module map, data flow, runtime surfaces, and the
   boundary between current behavior and historical specs.
