@@ -19,6 +19,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - MCP tool profiles in `docs/architecture.md` and `docs/usage.md`, grouping the
   19 verified MCP baseline tools into default agent, knowledge management, and
   workspace/skills profiles.
+- Fact-check contract documentation in `docs/architecture.md` and
+  `docs/usage.md`, clarifying that fact-check is a deterministic, pattern-based,
+  advisory pre-ingest guard rather than a truth oracle.
 
 ### Changed
 

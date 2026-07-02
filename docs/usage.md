@@ -895,6 +895,15 @@ Knowledge management profile:
 - `mempal_knowledge_distill` -- create candidate dao_ren/qi knowledge from evidence refs.
 - `mempal_fact_check` -- detect offline name, relation, and stale-fact contradictions.
 
+Fact-check workflow: call `mempal_fact_check` on draft memory text before
+`mempal_ingest` when the draft asserts named-entity relationships or dated KG
+facts. The check is deterministic, pattern-based, and does not use LLM or
+network calls. It can flag bounded conflicts such as similar-name typos,
+incompatible relationship predicates, and expired KG facts; it does not prove
+truth, resolve ambiguity, or catch semantic contradictions outside those
+patterns. Treat every issue as advisory evidence that needs human or agent
+judgment before the draft is committed.
+
 Workspace and skills profile:
 
 - `mempal_skill` -- inspect skill and runtime guidance helpers for agents.
