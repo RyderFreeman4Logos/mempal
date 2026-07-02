@@ -866,29 +866,39 @@ mempal serve --mcp
 
 If `mempal` was built without the `rest` feature, plain `mempal serve` behaves the same way.
 
-The smoke-tested MCP baseline currently documents 19 verified tools. Use
+The smoke-tested MCP baseline currently documents 19 verified tools. The
+[architecture overview](architecture.md#mcp-tool-profiles) groups them into
+conceptual profiles for agent discovery. Profiles are documentation-only; use
 `mempal doctor` or protocol-level `tools/list` against `mempal serve --mcp`
-for the runtime-advertised surface in a specific build:
+for the runtime-advertised surface in a specific build.
 
-- `mempal_status` — state + protocol + AAAK spec
-- `mempal_search` — hybrid search (BM25 + vector + RRF) with tunnel hints and AAAK-derived structured signals (`entities` / `topics` / `flags` / `emotions` / `importance_stars`)
-- `mempal_brief` — citation-first cognitive brief with facts, evidence, uncertainty, and next actions
-- `mempal_context` — mind-model runtime context pack (`dao_tian -> dao_ren -> shu -> qi`, evidence opt-in, `dao_tian_limit` default 1); guides workflow / skill / tool choice but never executes skills
-- `mempal_timeline` — project-scoped overview ordered by importance and recency
-- `mempal_pinned_facts` — canonical pinned facts without vector lookup
-- `mempal_field_taxonomy` — read-only recommended `field` values for typed evidence / knowledge; guidance only, custom fields remain valid
-- `mempal_knowledge_distill` — create candidate `dao_ren` / `qi` knowledge from existing evidence refs; deterministic and never auto-promotes
-- `mempal_ingest` — store memories with optional importance (0-5) and dry_run
-- `mempal_operation_status` — poll a receipt-backed ingest operation and return terminal status/timing details when available
-- `mempal_read_drawer` — fetch one full raw drawer after a truncated search preview
-- `mempal_read_drawers` — fetch multiple full raw drawers after truncated search previews
-- `mempal_delete` — soft-delete with audit
-- `mempal_taxonomy` — list or edit routing keywords
-- `mempal_kg` — knowledge graph: add/query/invalidate/timeline/stats
-- `mempal_tunnels` — cross-wing room discovery
-- `mempal_doctor` — release, install, schema, and MCP runtime diagnostics
-- `mempal_skill` — skill/runtime guidance helper for agents
-- `mempal_fact_check` — offline contradiction detection against KG triples and known entities
+Default agent profile:
+
+- `mempal_status` -- system health, warnings, protocol discovery, and runtime status.
+- `mempal_search` -- hybrid BM25/vector search with citations and preview metadata.
+- `mempal_ingest` -- store raw memories with optional importance and dry-run support.
+- `mempal_operation_status` -- poll receipt-backed asynchronous ingest operations.
+- `mempal_delete` -- soft-delete drawers with audit metadata.
+- `mempal_context` -- assemble tiered dao/shu/qi guidance and optional evidence.
+- `mempal_brief` -- produce a citation-first cognitive brief for a query.
+- `mempal_pinned_facts` -- read canonical pinned facts without vector lookup.
+- `mempal_read_drawer` -- fetch one full raw drawer after a truncated search preview.
+- `mempal_read_drawers` -- fetch multiple full raw drawers by drawer ID.
+
+Knowledge management profile:
+
+- `mempal_kg` -- add, query, invalidate, timeline, or summarize knowledge graph triples.
+- `mempal_taxonomy` -- inspect or edit wing/room routing keywords.
+- `mempal_field_taxonomy` -- read recommended typed-memory `field` values.
+- `mempal_tunnels` -- discover and manage cross-scope memory links.
+- `mempal_timeline` -- inspect recent or important memory by project scope.
+- `mempal_knowledge_distill` -- create candidate dao_ren/qi knowledge from evidence refs.
+- `mempal_fact_check` -- detect offline name, relation, and stale-fact contradictions.
+
+Workspace and skills profile:
+
+- `mempal_skill` -- inspect skill and runtime guidance helpers for agents.
+- `mempal_doctor` -- run install, schema, daemon, MCP, and runtime diagnostics.
 
 The server also embeds MEMORY_PROTOCOL (behavioral rules) in the MCP `initialize.instructions` field so any MCP client learns the workflow on connect — zero configuration. The protocol treats `wake-up` as an L0/L1 refresh surface, `mempal_context` as typed guidance for choosing an approach, workflow, skill, or tool, `mempal_field_taxonomy` as guidance for choosing typed-memory `field` values, and `trigger_hints` as bias metadata only. These hints never override system, user, repo, or client-native skill rules.
 
