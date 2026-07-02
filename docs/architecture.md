@@ -69,10 +69,49 @@ mempal is a Rust, single-binary, SQLite-first project memory system for coding a
 ## Key Surfaces
 
 - **CLI**: `src/main.rs` exposes the broad operator surface: init, ingest, search, context, brief, timeline, status, daemon, doctor, reindex, KG, tunnels, taxonomy, cards, lifecycle, phase3, cowork, xurl, hook, sleep, repair, patterns, skills, benchmarks, and export/wiki workflows. The current CLI has 80+ subcommand paths across these families.
-- **MCP**: `mempal serve --mcp` exposes the smoke-tested baseline of 19 documented MCP tools for status, search, timeline, drawer reads, context, ingest, delete, taxonomy, field taxonomy, KG, tunnels, cowork, fact-check, doctor, brief, and governed knowledge operations. Some builds or newer code paths may register additional governed or diagnostic tools; treat README/usage as the baseline compatibility contract.
+- **MCP**: `mempal serve --mcp` exposes the smoke-tested baseline of 19 documented MCP tools grouped below as conceptual profiles for agent discovery. Some builds or newer code paths may register additional governed or diagnostic tools; treat README/usage as the baseline compatibility contract.
 - **REST**: With the `rest` feature and daemon configuration enabled, the daemon serves loopback REST/Hermes-compatible endpoints from `src/api/`. REST search and writes run inside the daemon process and share daemon-owned database/embedder state.
 
 Compatibility expectations for these entry points are defined in the next section.
+
+### MCP Tool Profiles
+
+MCP profiles are documentation-only groupings. They do not change tool
+registration, permissions, compatibility, or runtime behavior.
+
+#### Default Agent
+
+Use these tools for the normal agent recall, write, and context loop.
+
+- `mempal_status` -- system health, warnings, protocol discovery, and runtime status.
+- `mempal_search` -- hybrid BM25/vector search with citations and preview metadata.
+- `mempal_ingest` -- store raw memories with optional importance and dry-run support.
+- `mempal_operation_status` -- poll receipt-backed asynchronous ingest operations.
+- `mempal_delete` -- soft-delete drawers with audit metadata.
+- `mempal_context` -- assemble tiered dao/shu/qi guidance and optional evidence.
+- `mempal_brief` -- produce a citation-first cognitive brief for a query.
+- `mempal_pinned_facts` -- read canonical pinned facts without vector lookup.
+- `mempal_read_drawer` -- fetch one full raw drawer after a truncated search preview.
+- `mempal_read_drawers` -- fetch multiple full raw drawers by drawer ID.
+
+#### Knowledge Management
+
+Use these tools when curating typed memory, graph facts, and cross-scope links.
+
+- `mempal_kg` -- add, query, invalidate, timeline, or summarize knowledge graph triples.
+- `mempal_taxonomy` -- inspect or edit wing/room routing keywords.
+- `mempal_field_taxonomy` -- read recommended typed-memory `field` values.
+- `mempal_tunnels` -- discover and manage cross-scope memory links.
+- `mempal_timeline` -- inspect recent or important memory by project scope.
+- `mempal_knowledge_distill` -- create candidate dao_ren/qi knowledge from evidence refs.
+- `mempal_fact_check` -- detect offline name, relation, and stale-fact contradictions.
+
+#### Workspace And Skills
+
+Use these tools for local environment and agent-skill support.
+
+- `mempal_skill` -- inspect skill and runtime guidance helpers for agents.
+- `mempal_doctor` -- run install, schema, daemon, MCP, and runtime diagnostics.
 
 ## Product Surface Classification
 

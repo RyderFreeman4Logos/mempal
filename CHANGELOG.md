@@ -16,6 +16,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Product surface classification in `docs/architecture.md`, linked from README,
   to mark stable, advanced, and experimental CLI/MCP/REST compatibility
   expectations.
+- MCP tool profiles in `docs/architecture.md` and `docs/usage.md`, grouping the
+  19 verified MCP baseline tools into default agent, knowledge management, and
+  workspace/skills profiles.
 
 ### Changed
 
