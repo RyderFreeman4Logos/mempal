@@ -22,6 +22,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Fact-check contract documentation in `docs/architecture.md` and
   `docs/usage.md`, clarifying that fact-check is a deterministic, pattern-based,
   advisory pre-ingest guard rather than a truth oracle.
+- Cowork READ/SEND/PERSIST semantics in `docs/architecture.md` and
+  `docs/usage.md`, clarifying live partner reads, ephemeral handoffs, and
+  durable memory writes.
 
 ### Changed
 
