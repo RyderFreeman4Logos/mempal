@@ -28,6 +28,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Benchmark roadmap documentation in `docs/architecture.md`, covering current
   LongMemEval retrieval results and the missing write-quality,
   context-assembly, and end-to-end agent usefulness evaluation layers.
+- Module boundary expectations in `docs/architecture.md`, documenting expected
+  dependency direction and where to avoid business logic in surfaces.
 
 ### Changed
 

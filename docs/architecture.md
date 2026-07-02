@@ -58,6 +58,28 @@ mempal is a Rust, single-binary, SQLite-first project memory system for coding a
 | `src/doctor.rs` | Health diagnostics for install, schema, daemon, MCP, REST, and runtime environment checks. |
 | `src/bench_matrix.rs`, `src/longmemeval.rs` | Benchmark harnesses and LongMemEval support for local evaluation. |
 
+## Module Boundaries
+
+These boundaries document expected separation of concerns; they are not an
+automated enforcement check. Dependencies should flow from surfaces into
+business logic, then into `core`, then into pure algorithms. Avoid circular
+dependencies and keep lower layers free of presentation concerns.
+
+| Layer | Expected dependencies | Avoid |
+| --- | --- | --- |
+| `src/algo/` | Pure ranking, scoring, and other deterministic algorithms. Keep this layer independent from storage, CLI, protocol, and runtime services. | I/O, SQLite access, config loading, `tokio`, side-effecting trait objects, and CLI/MCP/REST types. |
+| `src/core/` | Core data types, SQLite schema and migrations, vector index tables, project scope, queue state, taxonomy, triples, and storage primitives. | CLI, MCP, REST, daemon lifecycle, output formatting, or protocol-specific payloads. |
+| Root business modules such as `src/ingest/`, `src/search/`, `src/context.rs`, and `src/brief.rs` | Product behavior shared by all entry points. These modules may depend on `core`, `algo`, embedding, and integration adapters as needed. | Depending on CLI/MCP/REST modules or hiding surface-specific rendering and argument parsing in business logic. |
+| `src/daemon*.rs` | Daemon lifecycle, singleton ownership, REST listener startup, hook IPC, queue consumers, worker scheduling, and runtime status wiring. | Ranking, search, ingest, gating, or storage business rules that should live in reusable modules. |
+| `src/main.rs` and `src/cli/` | Command parsing, operator-facing validation, output rendering, and delegation to shared business logic. | Independent storage, search, ingest, queue, or scoring behavior that can diverge from other surfaces. |
+| `src/mcp/` | MCP tool schemas, protocol adaptation, request validation, warnings, and delegation to shared business logic. | MCP-only copies of ingest, search, context, lifecycle, or persistence rules. |
+| `src/api/` | REST/Hermes route mapping, HTTP request/response shaping, daemon state access, and delegation to shared business logic. | REST-only product behavior that should stay consistent with CLI and MCP behavior. |
+
+When a capability is reachable through CLI, MCP, and REST, the surface modules
+should call the same underlying business module. Add shared behavior in
+`core`, `ingest`, `search`, `context`, or another root-level product module;
+use surfaces only as adapters.
+
 ## Data Flow
 
 1. **Ingest**: CLI, hooks, MCP, REST/Hermes, or transcript indexers submit raw content. The ingest layer detects format, normalizes text, strips known transcript noise, chunks content, applies privacy/gating/novelty rules where configured, and preserves the original drawer content as raw evidence.
