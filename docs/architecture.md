@@ -27,7 +27,7 @@ mempal is a Rust, single-binary, SQLite-first project memory system for coding a
 | `src/cli/` | CLI command helpers that are split out of `main.rs` when command logic needs a smaller module. |
 | `src/llm/` | Local/OpenAI-compatible LLM client pool, routing, retry/status tracking, and worker tasks used by optional gating and intelligence features. |
 | `src/cowork/` | Multi-agent cowork primitives: Claude/Codex live-session peek, inbox push, concrete-agent bus, channels, sessions, handoff, delivery status, and tmux transport helpers. |
-| `src/factcheck/` | Deterministic contradiction detection over names, relations, KG triples, stale facts, and repeated-failure repair signals. |
+| `src/factcheck/` | Deterministic pre-ingest contradiction guard over names, relations, KG triples, stale facts, and repeated-failure repair signals. |
 | `src/algo/` | Pure algorithms, currently including ranking utilities kept independent from storage and IO. |
 | `src/observability/` | Runtime telemetry and status snapshots for operations, vector scan mode, ingest worker backoff, resource usage, and endpoint health. |
 | `src/hotpatch/` | CLAUDE.md hotpatch suggestion generation and management; suggestions are gated and operator-applied. |
@@ -155,6 +155,14 @@ Advanced surfaces are supported and useful, but they expose governance, operator
 | LLM gating | Tier 1, Tier 2, and optional local/OpenAI-compatible LLM classifier paths are configuration-sensitive. |
 | `mempal bench longmemeval` | Benchmark harness for local retrieval evaluation. |
 | `mempal xurl` | Conversation transcript indexing, search, timeline, stats, reindex, and backfill. |
+
+#### Fact-Check Contract
+
+`mempal fact-check` and `mempal_fact_check` are deterministic pre-ingest guards for draft memories that assert named-entity relationships or dated KG facts. Agents should run fact-check before committing those drafts with `mempal ingest` or `mempal_ingest`.
+
+What it does: extract bounded patterns from the candidate text, compare them with known entities and KG triples, and report `SimilarNameConflict`, `RelationContradiction`, or `StaleFact` issues. A reported issue is advisory: pause, inspect the evidence, and use human or agent judgment before deciding whether to rewrite, reject, or ingest the draft.
+
+What it does not do: prove truth, call an LLM, use the network, resolve ambiguous claims, or detect semantic contradictions outside the supported patterns. A clean report means only that no supported deterministic pattern matched a known conflict.
 
 ### Experimental
 
