@@ -88,6 +88,56 @@ use surfaces only as adapters.
 4. **Search**: Queries combine BM25 and vector candidates through RRF, apply project/wing/room/tunnel filters, and return cited results with drawer IDs, source files, structured signals, preview metadata, and warnings when fallback modes are active.
 5. **Context Assembly**: `context` and `brief` turn retrieval results into agent-facing guidance: wake-up/status surfaces, typed dao/shu/qi context, linked evidence, knowledge cards, repair warnings, skill/pattern hints, and compact cognitive briefs.
 
+## Context Assembly
+
+Context assembly is the agent-facing layer above raw search. `mempal context`
+and `mempal_context` build a cited `ContextPack` for runtime guidance;
+`mempal brief` and `mempal_brief` use the same assembler, then compress the
+pack into a `CognitiveBrief` with summary counts, key facts, evidence, cards,
+uncertainty signals, and next actions.
+
+Pinned facts are the always-on prelude to assembled context. They are created
+by pinning an existing drawer (`mempal pin <drawer_id>`) or ingesting with the
+pinned flag, listed or reordered with `mempal pinned`, and read by
+`mempal_pinned_facts`. Pinned recall bypasses BM25, vector search, and query
+embedding entirely: it is a pure SQL read, scoped by project when requested,
+ordered by `pin_order`, importance, update time, and drawer ID, and capped by a
+character budget. Integrations should inject this prompt-ready text before
+ranked context or brief output when durable constraints or user preferences
+must always be visible.
+
+The ranked context path resolves project scope and anchor candidates first
+(worktree, repo, legacy repo, then global), embeds the query, and then chooses
+the configured context strategy. In tiered mode, the total token budget is split
+across three retrieval passes and adjusted by trigger (`session_start`,
+`on_demand`, or `repair`). T1 selects high-importance decision, feedback, and
+rule drawers and scores them as effective importance multiplied by exponential
+recency decay. T3 adds recent drawers from a configured recency window plus KG
+neighbor drawers related to query terms. T2 fills the query-relevant middle with
+the normal hybrid search path, combining BM25 and vector candidates through RRF
+while filtering by project, domain, field, and anchor; drawers already used by
+T1 or T3 are excluded, and unused T1/T3 budget can overflow to T2.
+
+Budget enforcement happens during retrieval, not as a final text rewrite. Each
+pass estimates item tokens and stops before lower-ranked items exceed its
+budget, while due foresight items may be prepended within the remaining budget
+and item cap. The tiered path emits compatibility sections named `dao_tian`,
+`shu`, and `qi`; the legacy flat path still walks governed knowledge tiers in
+`dao_tian`, `dao_ren`, `shu`, `qi` order, then optional evidence and cards.
+Every included item keeps its drawer ID and source file so agents can cite the
+memory they used.
+
+The brief surface is deterministic and compact. It does not run a separate
+search or call an LLM; it classifies the assembled sections into key facts,
+evidence, knowledge cards, unresolved cues, conflict/coverage uncertainty, and
+next-action prompts. Use brief output for prompt injection or quick orientation
+when full raw context would be too large.
+
+`mempal timeline` and `mempal_timeline` are complementary rather than
+substitutes for context assembly. Timeline presents recent or important memory
+chronologically for inspection, while context and brief rank memory for a
+specific query and budget.
+
 ## Benchmarks
 
 mempal currently measures retrieval quality with the local LongMemEval

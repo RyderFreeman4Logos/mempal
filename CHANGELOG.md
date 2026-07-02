@@ -30,6 +30,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   context-assembly, and end-to-end agent usefulness evaluation layers.
 - Module boundary expectations in `docs/architecture.md`, documenting expected
   dependency direction and where to avoid business logic in surfaces.
+- Context assembly model documentation in `docs/architecture.md`, covering
+  pinned facts, tiered retrieval, budget enforcement, recency scoring,
+  cognitive briefs, and timeline use.
 
 ### Changed
 
