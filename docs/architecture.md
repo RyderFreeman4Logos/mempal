@@ -74,6 +74,18 @@ mempal is a Rust, single-binary, SQLite-first project memory system for coding a
 
 Compatibility expectations for these entry points are defined in the next section.
 
+### Cowork Semantics
+
+Cowork has three separate verbs. They must not be treated as interchangeable:
+
+| Verb | Surface | Storage contract | Use when |
+| --- | --- | --- | --- |
+| READ | `mempal_peek_partner`, `mempal cowork-tmux-peek` | Reads live partner session output. Nothing is written to the mempal drawer database. | An agent needs current partner context. |
+| SEND | `mempal_cowork_push`; `mempal_cowork_bus action=send\|broadcast\|channel_send`; CLI `mempal cowork-send`, `mempal cowork-broadcast`, `mempal cowork-channel-send` | Best-effort ephemeral delivery through a bounded inbox file or tmux transport. Transport metadata and bus events are coordination state, not durable memory. The target agent must drain or otherwise read the message. | A partner should notice transient status, a blocker, or a handoff on its next turn. |
+| PERSIST | `mempal ingest`, `mempal_ingest`, and explicit cowork handoff capture | Writes a normal drawer to SQLite, with the same fact-check, importance, decay, search, and citation rules as other memories. | The information must survive sessions or be searchable later. |
+
+READ means "read live partner output", not "read the memory database"; database reads use `mempal search`, `mempal context`, `mempal brief`, or drawer-read tools. SEND messages are not queued for database ingestion or durable replay, and SEND is not a substitute for PERSIST. If a partner must remember something permanently, ingest it or run explicit handoff capture instead of only sending it.
+
 ### MCP Tool Profiles
 
 MCP profiles are documentation-only groupings. They do not change tool

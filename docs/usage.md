@@ -961,12 +961,15 @@ Soft-delete a drawer:
 
 `mempal_status` also returns the self-describing memory protocol and a dynamically generated AAAK spec so AI clients can learn the tool without a hardcoded prompt.
 
-## Agent Cowork (peek + push)
+## Agent Cowork (READ, SEND, PERSIST)
 
-Two coding agents running on the same repo — typically Claude Code and Codex — can collaborate through two primitives:
+Two coding agents running on the same repo — typically Claude Code and Codex — can collaborate through live reads, ephemeral handoffs, and normal durable memory:
 
-- **`mempal_peek_partner`** (P6) — read the partner's live session file without storing anything in mempal. Use for "what is partner currently doing" questions.
-- **`mempal_cowork_push`** (P8) — send a short handoff (≤ 8 KB) to the partner's inbox. The partner sees it prepended to their next user prompt via a UserPromptSubmit hook. Use for "make sure partner notices X" status updates that are too transient for an ingest drawer.
+- **READ** — `mempal_peek_partner` reads the partner's live session file without storing anything in mempal. Use it for "what is partner currently doing" questions. This does not read the database; use `mempal search`, `mempal context`, or drawer-read tools for stored memory.
+- **SEND** — `mempal_cowork_push` sends a short handoff (≤ 8 KB) to the partner's inbox. `mempal_cowork_bus` adds concrete `agent_id` routing, channels, broadcast, sessions, delivery status, and optional tmux transport. SEND is best-effort ephemeral delivery, not queued for database ingestion or durable replay; the partner must drain or otherwise read the message.
+- **PERSIST** — `mempal ingest`, `mempal_ingest`, and explicit cowork handoff capture write normal drawers to SQLite. Use PERSIST for decisions, facts, or handoffs that must survive sessions, pass through fact-check/importance/decay, or be searchable later.
+
+Common rule: if the partner should remember it permanently, PERSIST it. Do not rely on SEND alone for durable decisions. If you only need current partner context, READ the live session instead of searching historical drawers.
 
 ### Install hooks
 
@@ -1000,6 +1003,7 @@ Lists both inbox targets (`claude` and `codex`) for the given cwd along with mes
 - **MCP server re-spawn required in Claude Code**: Claude Code spawns the mempal MCP server at client startup. After upgrading the mempal binary, restart Claude Code so the MCP server respawns with the new tool list (notably `mempal_cowork_push`).
 - **Claude ↔ Codex scope**: `mempal_cowork_push` requires the MCP client to identify itself as `claude-code` or `codex` (or their recognized aliases). Generic MCP clients cannot push because caller identity is required to fill the message `from` field and enforce self-push rejection. This is by design for the Claude ↔ Codex pair.
 - **At-next-submit, not real-time**: a push is visible on the partner's *next* user prompt turn — never mid-turn. Codex's TUI will not re-render to inject a message on an external trigger.
+- **Ephemeral by design**: SEND transport state uses bounded inbox files, bus events, or tmux delivery. It is coordination state, not durable project memory, and it can be full, drained, acknowledged, or missed. Use PERSIST for anything that must be recalled later.
 
 ## REST Server
 
