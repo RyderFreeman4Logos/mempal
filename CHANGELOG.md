@@ -25,6 +25,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Cowork READ/SEND/PERSIST semantics in `docs/architecture.md` and
   `docs/usage.md`, clarifying live partner reads, ephemeral handoffs, and
   durable memory writes.
+- Benchmark roadmap documentation in `docs/architecture.md`, covering current
+  LongMemEval retrieval results and the missing write-quality,
+  context-assembly, and end-to-end agent usefulness evaluation layers.
 
 ### Changed
 
