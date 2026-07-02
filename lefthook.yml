@@ -23,6 +23,23 @@ pre-push:
   commands:
     branch-protection:
       run: scripts/hooks/branch-protection.sh
+    changelog-check:
+      run: |
+        # Require CHANGELOG.md in the diff when source files change.
+        # This is intentionally a simple presence check, not a content
+        # validator — the PR review process verifies entry quality.
+        base="$(git merge-base HEAD origin/main)"
+        changed_files="$(git diff --name-only "${base}..HEAD")"
+
+        if echo "$changed_files" | grep -qE '^src/.*\.rs$'; then
+          if echo "$changed_files" | grep -q '^CHANGELOG.md$'; then
+            echo "✔️ CHANGELOG.md updated"
+          else
+            echo "❌ Source files changed but CHANGELOG.md not updated."
+            echo "   Add an entry under [Unreleased] in CHANGELOG.md."
+            exit 1
+          fi
+        fi
     local-gates:
       env:
         CARGO_BUILD_JOBS: "2"
