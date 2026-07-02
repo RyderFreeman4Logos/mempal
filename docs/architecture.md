@@ -66,6 +66,36 @@ mempal is a Rust, single-binary, SQLite-first project memory system for coding a
 4. **Search**: Queries combine BM25 and vector candidates through RRF, apply project/wing/room/tunnel filters, and return cited results with drawer IDs, source files, structured signals, preview metadata, and warnings when fallback modes are active.
 5. **Context Assembly**: `context` and `brief` turn retrieval results into agent-facing guidance: wake-up/status surfaces, typed dao/shu/qi context, linked evidence, knowledge cards, repair warnings, skill/pattern hints, and compact cognitive briefs.
 
+## Benchmarks
+
+mempal currently measures retrieval quality with the local LongMemEval
+`s_cleaned` harness in `src/longmemeval.rs` and matrix helpers in
+`src/bench_matrix.rs`. The tracked summary is
+`benchmarks/longmemeval_s_summary.md`; generated JSONL run logs under
+`benchmarks/` are ignored and reproducible from the documented benchmark
+commands.
+
+Current coverage is retrieval-only. On `LongMemEval s_cleaned`, the best
+tracked default is BM25+vector hybrid retrieval over raw session drawers:
+`raw + session` reaches `Recall@5 = 0.966`, `Recall@1 = 0.806`, and
+`NDCG@10 = 0.889`. `aaak + session` improves top-1 slightly
+(`Recall@1 = 0.830`) but is slower and lower at deeper recall
+(`Recall@5 = 0.952`). `rooms + session` underperforms
+(`Recall@5 = 0.878`), and `raw + turn` is too expensive for routine runs.
+
+The benchmark roadmap should add three evaluation layers that are not yet
+covered by the current LongMemEval harness:
+
+- **Write quality**: measure whether fact-check, importance scoring, and
+  novelty detection reject contradictory, low-value, duplicate, or stale
+  memories without suppressing useful evidence.
+- **Context assembly**: measure signal-to-noise for `context` and `brief`
+  outputs, including tier ordering, citation usefulness, linked evidence,
+  knowledge cards, and warning placement.
+- **End-to-end coding-agent usefulness**: compare agent task completion,
+  review quality, rework rate, and evidence citation quality with mempal
+  enabled, disabled, and partially degraded.
+
 ## Key Surfaces
 
 - **CLI**: `src/main.rs` exposes the broad operator surface: init, ingest, search, context, brief, timeline, status, daemon, doctor, reindex, KG, tunnels, taxonomy, cards, lifecycle, phase3, cowork, xurl, hook, sleep, repair, patterns, skills, benchmarks, and export/wiki workflows. The current CLI has 80+ subcommand paths across these families.
