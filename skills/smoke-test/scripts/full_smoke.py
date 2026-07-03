@@ -1087,7 +1087,31 @@ def main() -> int:
     run_cli('version', ['mempal', '--version'], timeout=30)
     run_cli('daemon_status_pre', ['mempal', 'daemon', 'status'], timeout=30)
     run_cli('doctor_rest', ['mempal', 'doctor', 'rest', '--format', 'json'], expect_json=True, timeout=60)
-    run_cli('doctor_json', ['mempal', 'doctor', '--format', 'json'], expect_json=True, timeout=60)
+    _doc_rc, _doc_out, _doc_err, doc_parsed, _doc_shape = run_cli('doctor_json', ['mempal', 'doctor', '--format', 'json'], expect_json=True, timeout=60)
+    if isinstance(doc_parsed, dict):
+        db_info = doc_parsed.get('db') or {}
+        db_compatible = db_info.get('compatible') if isinstance(db_info, dict) else None
+        db_schema_version = db_info.get('schema_version') if isinstance(db_info, dict) else None
+        supported_schema = doc_parsed.get('supported_schema_version')
+        schema_ok = bool(db_compatible) or (db_schema_version == supported_schema)
+        warnings = doc_parsed.get('warnings') or []
+        # Classify warnings: critical if they contain error/fail/mismatch/corrupt/missing
+        # "extra process" and "locked" are operational, not critical regressions.
+        critical_keywords = ('corrupt', 'mismatch', 'missing', 'incompatible', 'migration failed')
+        critical_warnings = [w for w in warnings if isinstance(w, str) and any(k in w.lower() for k in critical_keywords)]
+        note(
+            'doctor_json_validation',
+            bool(schema_ok) and len(critical_warnings) == 0,
+            db_schema_version=db_schema_version,
+            supported_schema_version=supported_schema,
+            db_compatible=db_compatible,
+            schema_ok=bool(schema_ok),
+            total_warning_count=len(warnings),
+            critical_warning_count=len(critical_warnings),
+        )
+        if not schema_ok:
+            SUMMARY['failures'] = [f for f in SUMMARY['failures'] if f != 'doctor_json_validation']
+            SUMMARY['failures'].append('doctor_json_validation')
     run_cli('status', ['mempal', 'status'], timeout=60)
     run_cli('timeline_json', ['mempal', 'timeline', '--since', '1h', '--format', 'json'], expect_json=True, timeout=60)
     run_cli('pinned_json', ['mempal', 'pinned', '--json'], expect_json=True, timeout=60)
