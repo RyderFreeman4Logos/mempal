@@ -147,6 +147,7 @@ Ask user: "Which commits should I port? (all/recommended/none/select)"
 
 ### 2.1 Create Sync Branch
 
+Use the project's standard branch creation workflow (per AGENTS.md).
 ```bash
 BRANCH="sync/upstream-$(date +%Y-%m-%d)"
 git checkout -b "$BRANCH" "$LOCAL_DEFAULT"
@@ -260,20 +261,18 @@ data['syncs'].append({
 with open('.upstream-sync.json', 'w') as f:
     json.dump(data, f, indent=2)
 "
-git add .upstream-sync.json
-git commit -m "chore: update upstream sync tracking to $UPSTREAM_TIP" || true
+# Commit the tracking file update following the project's standard
+# commit workflow (pre-commit hooks, quality gates, etc.). Do NOT
+# use raw git commit — invoke the project's commit skill or toolchain.
 ```
 
 ### 4.2 Push + PR
 
-```bash
-git push origin "$BRANCH"
-```
+Follow the project's standard push/PR workflow (per AGENTS.md Practice 015).
+Use `gh pr create` with appropriate flags. The PR body template:
 
-```bash
-gh pr create --base "$LOCAL_DEFAULT" \
-  --title "sync: port upstream commits ({LAST_SYNCED_COMMIT}..{UPSTREAM_TIP})" \
-  --body "## Summary
+```
+## Summary
 - Ported {N} upstream commits via selective porting
 - Skipped {M} commits (already have / obsolete / conflict risk)
 - Tracked in .upstream-sync.json

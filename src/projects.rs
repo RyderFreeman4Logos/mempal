@@ -128,7 +128,7 @@ pub fn list_projects(db: &Database) -> Result<Vec<ProjectSummary>, DbError> {
         WHERE deleted_at IS NULL
           AND anchor_kind = 'worktree'
           AND anchor_id LIKE 'worktree://%'
-        ORDER BY CAST(added_at AS INTEGER) DESC, rowid DESC
+        ORDER BY added_at DESC, rowid DESC
         "#,
     )?;
     let path_map: HashMap<String, String> = paths
@@ -206,12 +206,14 @@ pub fn resume_project(
             let recent_evidence = recent_evidence(db, &project.wing, evidence_limit)?;
             let in_flight = candidate_knowledge(db, &project.wing, candidate_limit)?;
             let next_step = match project.path.as_deref() {
-                // Shell-quote path and wing to prevent injection from persisted data.
-                Some(path) => format!(
-                    "cd {} && mempal context \"resume {}\"",
-                    shell_quote(path),
-                    shell_quote(&project.wing),
-                ),
+                // Build the shell command with each drawer-controlled value
+                // safely quoted. The wing goes inside the outer single-quote
+                // pair for the resume argument, not nested in double quotes.
+                Some(path) => {
+                    let quoted_path = shell_quote(path);
+                    let quoted_wing = shell_quote(&project.wing);
+                    format!("cd {quoted_path} && mempal context {quoted_wing}")
+                }
                 None => format!(
                     "project '{}' has no recorded worktree path; supply the path, then run mempal context",
                     project.wing
@@ -259,7 +261,7 @@ fn recent_evidence(
         WHERE deleted_at IS NULL
           AND wing = ?1
           AND memory_kind = 'evidence'
-        ORDER BY CAST(added_at AS INTEGER) DESC, importance DESC, rowid DESC
+        ORDER BY added_at DESC, importance DESC, rowid DESC
         LIMIT ?2
         "#,
     )?;
@@ -291,7 +293,7 @@ fn candidate_knowledge(
           AND wing = ?1
           AND memory_kind = 'knowledge'
           AND status = 'candidate'
-        ORDER BY CAST(added_at AS INTEGER) DESC, rowid DESC
+        ORDER BY added_at DESC, rowid DESC
         LIMIT ?2
         "#,
     )?;
