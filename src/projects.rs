@@ -13,6 +13,24 @@ use serde::Serialize;
 
 use crate::core::db::{Database, DbError};
 
+/// Maximum number of evidence/candidate rows a single resume call can return.
+const MAX_RESUME_LIMIT: usize = 100;
+
+/// Shell-quote a string for safe interpolation into a shell command.
+///
+/// Uses POSIX single-quote escaping: wraps in single quotes and escapes
+/// any embedded single quotes. This prevents shell injection from
+/// drawer-controlled data (worktree paths, wing names).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// Clamp a caller-supplied limit to a safe maximum and convert to i64.
+fn sanitize_limit(limit: Option<usize>) -> i64 {
+    let capped = limit.unwrap_or(20).min(MAX_RESUME_LIMIT);
+    i64::try_from(capped).unwrap_or(MAX_RESUME_LIMIT as i64)
+}
+
 const WORKTREE_PREFIX: &str = "worktree://";
 
 /// One project's summary, derived from active drawers in a wing.
@@ -188,7 +206,12 @@ pub fn resume_project(
             let recent_evidence = recent_evidence(db, &project.wing, evidence_limit)?;
             let in_flight = candidate_knowledge(db, &project.wing, candidate_limit)?;
             let next_step = match project.path.as_deref() {
-                Some(path) => format!("cd {path} && mempal context \"resume {}\"", project.wing),
+                // Shell-quote path and wing to prevent injection from persisted data.
+                Some(path) => format!(
+                    "cd {} && mempal context \"resume {}\"",
+                    shell_quote(path),
+                    shell_quote(&project.wing),
+                ),
                 None => format!(
                     "project '{}' has no recorded worktree path; supply the path, then run mempal context",
                     project.wing
@@ -228,6 +251,7 @@ fn recent_evidence(
     wing: &str,
     limit: usize,
 ) -> Result<Vec<ResumeEvidence>, DbError> {
+    let safe_limit = sanitize_limit(Some(limit));
     let mut statement = db.conn().prepare(
         r#"
         SELECT id, source_file, substr(content, 1, 200), added_at, importance
@@ -240,7 +264,7 @@ fn recent_evidence(
         "#,
     )?;
     let rows = statement
-        .query_map(rusqlite::params![wing, limit as i64], |row| {
+        .query_map(rusqlite::params![wing, safe_limit], |row| {
             Ok(ResumeEvidence {
                 drawer_id: row.get(0)?,
                 source_file: row.get(1)?,
@@ -258,6 +282,7 @@ fn candidate_knowledge(
     wing: &str,
     limit: usize,
 ) -> Result<Vec<ResumeCandidate>, DbError> {
+    let safe_limit = sanitize_limit(Some(limit));
     let mut statement = db.conn().prepare(
         r#"
         SELECT id, statement, tier
@@ -271,7 +296,7 @@ fn candidate_knowledge(
         "#,
     )?;
     let rows = statement
-        .query_map(rusqlite::params![wing, limit as i64], |row| {
+        .query_map(rusqlite::params![wing, safe_limit], |row| {
             Ok(ResumeCandidate {
                 drawer_id: row.get(0)?,
                 statement: row.get(1)?,

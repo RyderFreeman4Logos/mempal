@@ -192,12 +192,14 @@ Can be done by main agent if trivial (1-2 files), or delegated to CSA.
 
 ### 2.3 Post-Port AI-Config Reject
 
-After each port, ensure no AI-config files leaked into the commit:
+After each port, ensure no AI-config files leaked into the staging area.
+Do NOT use `git reset` or `git checkout` on AI-config files — those are
+never tracked in the fork and live as symlinks. Instead, simply unstage
+them if CSA accidentally staged them:
 
 ```bash
-# AI-config files are never tracked in this fork
-git reset HEAD AGENTS.md CLAUDE.md GEMINI.md .claude/ .codex/ .gemini/ .agents/ weave.lock 2>/dev/null || true
-git checkout -- AGENTS.md CLAUDE.md GEMINI.md .claude/ .codex/ .gemini/ .agents/ weave.lock 2>/dev/null || true
+# Only unstage — never checkout/reset AI-config paths
+git restore --staged AGENTS.md CLAUDE.md GEMINI.md .claude/ .codex/ .gemini/ .agents/ weave.lock 2>/dev/null || true
 ```
 
 ### 2.4 Build + Test After Each Commit
@@ -208,7 +210,7 @@ After porting each commit, build and test before moving to the next:
 cargo fmt --all --check && cargo clippy --workspace -- -D warnings && cargo test --workspace
 ```
 
-If a port breaks the build, delegate the fix to CSA (max 2 rounds). If unfixable, `git reset HEAD~1` and report.
+If a port breaks the build, delegate the fix to CSA (max 2 rounds). If unfixable, revert the port commit following the project's standard workflow and report.
 
 ---
 

@@ -35,12 +35,12 @@ You are porting ONE upstream commit to a heavily diverged fork.
 ```bash
 git cherry-pick --no-commit {COMMIT_SHA}
 # Resolve any conflicts manually
-# Remove any AI-config files from staging
-git checkout --ours AGENTS.md CLAUDE.md .claude/ .codex/ .gemini/ 2>/dev/null || true
-git rm --cached AGENTS.md CLAUDE.md 2>/dev/null || true
+# Unstage any AI-config files that leaked in (never tracked in fork)
+git restore --staged AGENTS.md CLAUDE.md .claude/ .codex/ .gemini/ 2>/dev/null || true
 git add -A
-git commit -m "sync: port {COMMIT_SHA} from upstream"
 ```
+Then commit following the project's standard commit workflow (do NOT use
+raw `git commit` — follow AGENTS.md commit rules).
 
 ### If strategy is `new_file_copy`:
 Copy the new file(s) from upstream. Adapt `mod.rs` declarations.
