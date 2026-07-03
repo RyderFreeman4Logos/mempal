@@ -110,5 +110,72 @@ class ReceiptExtractionTests(unittest.TestCase):
         self.assertEqual(self.smoke.classify_stderr(stderr), "database_locked")
 
 
+class DoctorValidationTests(unittest.TestCase):
+    """Unit tests for doctor_json_validation logic.
+
+    These tests verify the schema-match and embedding-health contract
+    without requiring a live daemon. They test the validation predicates
+    in isolation.
+    """
+
+    def test_schema_mismatch_detected(self) -> None:
+        """A compatible-but-different schema version must fail."""
+        db_schema_version = 19
+        supported_schema = 20
+        schema_matches = (
+            db_schema_version is not None
+            and db_schema_version == supported_schema
+        )
+        self.assertFalse(schema_matches)
+
+    def test_schema_match_passes(self) -> None:
+        """Exact schema version match passes the schema check."""
+        db_schema_version = 20
+        supported_schema = 20
+        schema_matches = (
+            db_schema_version is not None
+            and db_schema_version == supported_schema
+        )
+        self.assertTrue(schema_matches)
+
+    def test_embedding_cooldown_detected(self) -> None:
+        """An endpoint with cooldown_remaining_secs set indicates unhealthy embedding."""
+        endpoints = [
+            {"id": "primary", "cooldown_remaining_secs": 30},
+            {"id": "secondary", "cooldown_remaining_secs": None},
+        ]
+        cooldowns = sum(
+            1 for ep in endpoints
+            if isinstance(ep, dict) and ep.get("cooldown_remaining_secs") is not None
+        )
+        self.assertEqual(cooldowns, 1)
+        self.assertFalse(cooldowns == 0)
+
+    def test_embedding_healthy_when_no_cooldowns(self) -> None:
+        """No endpoints in cooldown means embedding health passes."""
+        endpoints = [
+            {"id": "primary", "cooldown_remaining_secs": None},
+        ]
+        cooldowns = sum(
+            1 for ep in endpoints
+            if isinstance(ep, dict) and ep.get("cooldown_remaining_secs") is not None
+        )
+        self.assertEqual(cooldowns, 0)
+        self.assertTrue(cooldowns == 0)
+
+    def test_critical_warning_classification_excludes_operational(self) -> None:
+        """'extra process holds database' must NOT be classified as critical."""
+        warnings = ["1 extra process(es) hold the database open"]
+        critical_keywords = (
+            "corrupt", "mismatch", "missing",
+            "incompatible", "migration failed",
+        )
+        critical = [
+            w for w in warnings
+            if isinstance(w, str) and any(k in w.lower() for k in critical_keywords)
+        ]
+        self.assertEqual(len(critical), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

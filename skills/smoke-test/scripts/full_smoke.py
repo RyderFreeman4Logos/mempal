@@ -1090,26 +1090,45 @@ def main() -> int:
     _doc_rc, _doc_out, _doc_err, doc_parsed, _doc_shape = run_cli('doctor_json', ['mempal', 'doctor', '--format', 'json'], expect_json=True, timeout=60)
     if isinstance(doc_parsed, dict):
         db_info = doc_parsed.get('db') or {}
-        db_compatible = db_info.get('compatible') if isinstance(db_info, dict) else None
         db_schema_version = db_info.get('schema_version') if isinstance(db_info, dict) else None
         supported_schema = doc_parsed.get('supported_schema_version')
-        schema_ok = bool(db_compatible) or (db_schema_version == supported_schema)
+        # Schema must match exactly — a compatible-but-different version means
+        # a migration is pending or the binary was downgraded.
+        schema_matches = db_schema_version is not None and db_schema_version == supported_schema
         warnings = doc_parsed.get('warnings') or []
-        # Classify warnings: critical if they contain error/fail/mismatch/corrupt/missing
+        # Classify warnings: critical if they indicate data integrity issues.
         # "extra process" and "locked" are operational, not critical regressions.
         critical_keywords = ('corrupt', 'mismatch', 'missing', 'incompatible', 'migration failed')
         critical_warnings = [w for w in warnings if isinstance(w, str) and any(k in w.lower() for k in critical_keywords)]
+        # Check embedding health: endpoint cooldowns or terminal queue failures.
+        emb_info = doc_parsed.get('embedding') or {}
+        emb_endpoints = emb_info.get('endpoints') if isinstance(emb_info, dict) else None
+        emb_cooldowns = 0
+        if isinstance(emb_endpoints, list):
+            for ep in emb_endpoints:
+                if isinstance(ep, dict) and ep.get('cooldown_remaining_secs') is not None:
+                    emb_cooldowns += 1
+        emb_queue = emb_info.get('queue') if isinstance(emb_info, dict) else None
+        emb_terminal_failures = 0
+        if isinstance(emb_queue, dict):
+            emb_terminal_failures = int(emb_queue.get('failed_terminal') or 0)
+        # Terminal failures are historical and don't indicate current regression
+        # unless they're growing. We report them but only fail if endpoints are
+        # in cooldown (active health problem).
+        embedding_ok = emb_cooldowns == 0
         note(
             'doctor_json_validation',
-            bool(schema_ok) and len(critical_warnings) == 0,
+            bool(schema_matches) and len(critical_warnings) == 0 and embedding_ok,
             db_schema_version=db_schema_version,
             supported_schema_version=supported_schema,
-            db_compatible=db_compatible,
-            schema_ok=bool(schema_ok),
+            schema_matches=bool(schema_matches),
             total_warning_count=len(warnings),
             critical_warning_count=len(critical_warnings),
+            embedding_endpoint_cooldowns=emb_cooldowns,
+            embedding_terminal_failures=emb_terminal_failures,
+            embedding_ok=embedding_ok,
         )
-        if not schema_ok:
+        if not (schema_matches and len(critical_warnings) == 0 and embedding_ok):
             SUMMARY['failures'] = [f for f in SUMMARY['failures'] if f != 'doctor_json_validation']
             SUMMARY['failures'].append('doctor_json_validation')
     run_cli('status', ['mempal', 'status'], timeout=60)
