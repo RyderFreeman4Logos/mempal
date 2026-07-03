@@ -201,3 +201,87 @@ fn test_resume_reports_not_found() {
         other => panic!("expected not found, got {other:?}"),
     }
 }
+
+#[test]
+fn test_project_isolation_same_wing_different_project_id() {
+    // Regression: two worktrees with the same wing but different project_id
+    // must not leak evidence across project boundaries.
+    let (_tmp, db) = new_db();
+
+    // Project A: wing "shared", project_id "proj-a"
+    db.insert_drawer(&worktree_evidence(
+        "d_a1",
+        "shared",
+        "/Work/proj-a",
+        "1710000100",
+    ))
+    .unwrap();
+
+    // Project B: same wing "shared", different project_id "proj-b"
+    db.insert_drawer(&worktree_evidence(
+        "d_b1",
+        "shared",
+        "/Work/proj-b",
+        "1710000200",
+    ))
+    .unwrap();
+
+    // Set project_id via raw SQL (Drawer struct doesn't expose this fork_ext column)
+    db.conn()
+        .execute(
+            "UPDATE drawers SET project_id = 'proj-a' WHERE id = 'd_a1'",
+            [],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE drawers SET project_id = 'proj-b' WHERE id = 'd_b1'",
+            [],
+        )
+        .unwrap();
+
+    let projects = list_projects(&db).expect("list projects");
+
+    // Should see TWO separate project entries, not one merged entry
+    assert_eq!(
+        projects.len(),
+        2,
+        "same wing + different project_id must not collapse"
+    );
+
+    // Each entry should have exactly 1 evidence, not 2
+    for p in &projects {
+        assert_eq!(
+            p.evidence, 1,
+            "project {:?} should have 1 evidence, not {}",
+            p, p.evidence
+        );
+        assert_eq!(p.total, 1, "project {:?} should have total=1", p);
+    }
+
+    // Verify paths are project-scoped
+    let proj_a = projects
+        .iter()
+        .find(|p| p.project_id == "proj-a")
+        .expect("proj-a");
+    assert_eq!(proj_a.path.as_deref(), Some("/Work/proj-a"));
+
+    let proj_b = projects
+        .iter()
+        .find(|p| p.project_id == "proj-b")
+        .expect("proj-b");
+    assert_eq!(proj_b.path.as_deref(), Some("/Work/proj-b"));
+
+    // Resume should be ambiguous (two projects match wing "shared")
+    let resolution = resume_project(&db, "shared", 5, 5).expect("resume");
+    match resolution {
+        ResumeResolution::Ambiguous { candidates, .. } => {
+            assert_eq!(
+                candidates.len(),
+                2,
+                "should see 2 candidates for shared wing"
+            );
+        }
+        other => panic!("expected ambiguous for same-wing/different-project_id, got {other:?}"),
+    }
+}

@@ -10,6 +10,34 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- `mempal_projects_list` MCP tool to discover all projects with memory,
+  their evidence/knowledge counts, last activity, and worktree path.
+  Ported from upstream P109 (70727f0).
+- `mempal_projects_resume` MCP tool to resume any project from any
+  directory, returning recent evidence, candidate knowledge, and the
+  next-step command. Ported from upstream P109.
+- `cowork_peek_command` cwd flag (CLI) and `mempal_peek_partner` cwd parameter
+  (MCP) to peek a partner's live session per-project by working directory.
+  Relative cwd paths are canonicalized to absolute. Ported from upstream P108
+  (b227afc).
+- Evidence/knowledge ingest boundary discoverability improvements in tool
+  descriptions and protocol docs, so agents steer knowledge-only fields to
+  the distill tool before rejection. Ported from upstream P107 (3cb979a).
+- `upstream-sync` skill with `.upstream-sync.json` tracking file for
+  selectively porting upstream features to the heavily diverged fork.
+
+### Fixed
+
+- Project resume timestamp ordering now uses ISO 8601 string comparison
+  instead of `CAST(added_at AS INTEGER)`, which collapsed RFC 3339 timestamps
+  to their year prefix.
+- Cowork peek now canonicalizes relative cwd paths to absolute before
+  querying partner sessions, preventing silent no-session results.
+- Shell injection prevention in `mempal_projects_resume` next-step command:
+  drawer-controlled path and wing values are POSIX single-quote escaped.
+
+### Changed
+
 - Scoped pre-push CHANGELOG guard that requires an `[Unreleased]` entry only
   when `src/**/*.rs` files changed on the branch.
 - Current architecture overview at `docs/architecture.md`, linked from README,

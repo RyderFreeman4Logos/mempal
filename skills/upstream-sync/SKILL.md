@@ -115,7 +115,7 @@ Classify each new upstream commit as port or skip, producing a structured JSON t
 Write the recon prompt (from `prompts/recon.md`) to a temp file with variables filled in, then launch a CSA session:
 
 ```bash
-csa run --sa-mode false --tool codex --prompt-file /tmp/upstream-sync-recon.md
+csa run --sa-mode true --tier tier-1-quick --prompt-file /tmp/upstream-sync-recon.md
 ```
 
 The subagent reads each commit diff, compares against the fork's current code, and outputs a JSON classification.
@@ -164,7 +164,7 @@ For each commit, determine the strategy from recon data:
 Delegate to CSA:
 
 ```bash
-csa run --sa-mode false --tool codex "Port upstream commit {SHA} to this fork via cherry-pick. Strategy: clean_cherry_pick. Read skills/upstream-sync/prompts/port.md for instructions."
+csa run --sa-mode true --tier tier-2-standard "Port upstream commit {SHA} to this fork via cherry-pick. Strategy: clean_cherry_pick. Read skills/upstream-sync/prompts/port.md for instructions."
 ```
 
 #### Strategy: manual_adapt (shared files with massive divergence)
@@ -178,7 +178,7 @@ csa run --sa-mode false --tool codex "Port upstream commit {SHA} to this fork vi
 Delegate to CSA with explicit context:
 
 ```bash
-csa run --sa-mode false --tool codex "Port upstream commit {SHA} ({MESSAGE}) to this fork. The fork has heavily rewritten the affected files. Read skills/upstream-sync/prompts/port.md for instructions. Strategy: manual_adapt. Upstream commit diff: $(git show {SHA})"
+csa run --sa-mode true --tier tier-3-complex "Port upstream commit {SHA} ({MESSAGE}) to this fork. The fork has heavily rewritten the affected files. Read skills/upstream-sync/prompts/port.md for instructions. Strategy: manual_adapt. Upstream commit diff: $(git show {SHA})"
 ```
 
 #### Strategy: new_file_copy (upstream adds entirely new files)
@@ -232,7 +232,7 @@ cargo test --workspace
 ### 3.2 CSA Review
 
 ```bash
-csa review --range main...HEAD --sa-mode true
+csa review --range main...HEAD --sa-mode true --tier tier-4-critical
 ```
 
 Fix any findings (max 2 rounds via CSA `--fix-finding`).
@@ -362,7 +362,7 @@ Check `Cargo.toml` changes. If upstream adds a new crate, decide whether the for
 ### Pattern 1: CSA for code analysis + implementation
 
 ```bash
-csa run --sa-mode false --tool codex --prompt-file /tmp/recon-filled.md
+csa run --sa-mode true --tier tier-1-quick --prompt-file /tmp/recon-filled.md
 ```
 
 Best for: multi-file analysis, complex porting, conflict resolution.

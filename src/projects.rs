@@ -37,6 +37,8 @@ const WORKTREE_PREFIX: &str = "worktree://";
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ProjectSummary {
     pub wing: String,
+    /// Project identity (empty string if the drawer predates project_id support).
+    pub project_id: String,
     /// Absolute worktree path from the latest `worktree://` anchor, when known.
     pub path: Option<String>,
     /// Epoch-seconds string of the most recent drawer in this wing.
@@ -99,31 +101,33 @@ pub fn list_projects(db: &Database) -> Result<Vec<ProjectSummary>, DbError> {
     let mut statement = db.conn().prepare(
         r#"
         SELECT wing,
+               COALESCE(project_id, '') AS project_id,
                COUNT(*) AS total,
                SUM(CASE WHEN memory_kind = 'evidence' THEN 1 ELSE 0 END) AS evidence,
                SUM(CASE WHEN memory_kind = 'knowledge' THEN 1 ELSE 0 END) AS knowledge,
                MAX(added_at) AS last_activity
         FROM drawers
         WHERE deleted_at IS NULL
-        GROUP BY wing
+        GROUP BY wing, project_id
         "#,
     )?;
     let mut summaries = statement
         .query_map([], |row| {
             Ok(ProjectSummary {
                 wing: row.get(0)?,
+                project_id: row.get(1)?,
                 path: None,
-                total: row.get(1)?,
-                evidence: row.get(2)?,
-                knowledge: row.get(3)?,
-                last_activity: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                total: row.get(2)?,
+                evidence: row.get(3)?,
+                knowledge: row.get(4)?,
+                last_activity: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut paths = db.conn().prepare(
         r#"
-        SELECT wing, anchor_id
+        SELECT wing, COALESCE(project_id, '') AS project_id, anchor_id
         FROM drawers
         WHERE deleted_at IS NULL
           AND anchor_kind = 'worktree'
@@ -131,26 +135,29 @@ pub fn list_projects(db: &Database) -> Result<Vec<ProjectSummary>, DbError> {
         ORDER BY added_at DESC, rowid DESC
         "#,
     )?;
-    let path_map: HashMap<String, String> = paths
+    let path_map: HashMap<(String, String), String> = paths
         .query_map([], |row| {
             let wing: String = row.get(0)?;
-            let anchor: String = row.get(1)?;
-            Ok((wing, anchor))
+            let project_id: String = row.get(1)?;
+            let anchor: String = row.get(2)?;
+            Ok(((wing, project_id), anchor))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
-        .filter_map(|(wing, anchor)| {
+        .filter_map(|((wing, project_id), anchor)| {
             anchor
                 .strip_prefix(WORKTREE_PREFIX)
-                .map(|path| (wing, path.to_string()))
+                .map(|path| ((wing, project_id), path.to_string()))
         })
-        .fold(HashMap::new(), |mut map, (wing, path)| {
-            map.entry(wing).or_insert(path);
+        .fold(HashMap::new(), |mut map, (key, path)| {
+            map.entry(key).or_insert(path);
             map
         });
 
     for summary in &mut summaries {
-        summary.path = path_map.get(&summary.wing).cloned();
+        summary.path = path_map
+            .get(&(summary.wing.clone(), summary.project_id.clone()))
+            .cloned();
     }
 
     // Sort by last_activity descending. ISO 8601 / RFC 3339 timestamps sort
@@ -206,8 +213,10 @@ pub fn resume_project(
         }),
         1 => {
             let project = matches[0];
-            let recent_evidence = recent_evidence(db, &project.wing, evidence_limit)?;
-            let in_flight = candidate_knowledge(db, &project.wing, candidate_limit)?;
+            let recent_evidence =
+                recent_evidence(db, &project.wing, &project.project_id, evidence_limit)?;
+            let in_flight =
+                candidate_knowledge(db, &project.wing, &project.project_id, candidate_limit)?;
             let next_step = match project.path.as_deref() {
                 // Build the shell command with each drawer-controlled value
                 // safely quoted. The wing goes inside the outer single-quote
@@ -254,6 +263,7 @@ fn path_basename_matches(project: &ProjectSummary, needle: &str) -> bool {
 fn recent_evidence(
     db: &Database,
     wing: &str,
+    project_id: &str,
     limit: usize,
 ) -> Result<Vec<ResumeEvidence>, DbError> {
     let safe_limit = sanitize_limit(Some(limit));
@@ -263,13 +273,14 @@ fn recent_evidence(
         FROM drawers
         WHERE deleted_at IS NULL
           AND wing = ?1
+          AND COALESCE(project_id, '') = ?2
           AND memory_kind = 'evidence'
         ORDER BY added_at DESC, importance DESC, rowid DESC
-        LIMIT ?2
+        LIMIT ?3
         "#,
     )?;
     let rows = statement
-        .query_map(rusqlite::params![wing, safe_limit], |row| {
+        .query_map(rusqlite::params![wing, project_id, safe_limit], |row| {
             Ok(ResumeEvidence {
                 drawer_id: row.get(0)?,
                 source_file: row.get(1)?,
@@ -285,6 +296,7 @@ fn recent_evidence(
 fn candidate_knowledge(
     db: &Database,
     wing: &str,
+    project_id: &str,
     limit: usize,
 ) -> Result<Vec<ResumeCandidate>, DbError> {
     let safe_limit = sanitize_limit(Some(limit));
@@ -294,14 +306,15 @@ fn candidate_knowledge(
         FROM drawers
         WHERE deleted_at IS NULL
           AND wing = ?1
+          AND COALESCE(project_id, '') = ?2
           AND memory_kind = 'knowledge'
           AND status = 'candidate'
         ORDER BY added_at DESC, rowid DESC
-        LIMIT ?2
+        LIMIT ?3
         "#,
     )?;
     let rows = statement
-        .query_map(rusqlite::params![wing, safe_limit], |row| {
+        .query_map(rusqlite::params![wing, project_id, safe_limit], |row| {
             Ok(ResumeCandidate {
                 drawer_id: row.get(0)?,
                 statement: row.get(1)?,
