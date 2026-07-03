@@ -43,6 +43,10 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    with their question. Do not rely on conversation memory alone. You can also
    call mempal_tunnels with action="list" to discover related rooms across
    wings when context may live in another project.
+   When the user wants to continue a project that is not the current directory,
+   call mempal_projects_list to discover known projects, then
+   mempal_projects_resume with a wing/name fragment. mempal returns the path to
+   cd into; it does not change directory for you.
 
 3b. USE MIND-MODEL CONTEXT FOR GUIDANCE
    When you need ordered operating guidance rather than raw evidence search,
@@ -368,6 +372,8 @@ You have persistent project memory via mempal. Follow these rules in every sessi
 TOOLS:
   mempal_status        — current state, feature/status flags, intelligence mode, queue stats + this protocol + AAAK format spec
   mempal_pinned_facts  — pinned/canonical facts for always-on session context, no embedding needed
+  mempal_projects_list — list known project wings, worktree paths, counts, and latest activity
+  mempal_projects_resume — fuzzy-resolve a project wing/path basename and return a read-only resume pack
   mempal_timeline      — project-scoped overview without a query, ordered by importance+recency
   mempal_doctor        — release/install and MCP runtime diagnostics
   mempal_search        — hybrid/BM25 search with search_mode, typed fields, wing/room/project filters, citation-bearing

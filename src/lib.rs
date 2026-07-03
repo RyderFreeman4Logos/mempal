@@ -47,6 +47,7 @@ pub mod markdown_export;
 pub mod mcp;
 pub mod observability;
 pub mod process_diagnostics;
+pub mod projects;
 pub mod reflect;
 pub mod repair;
 pub mod search;

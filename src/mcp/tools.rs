@@ -1602,6 +1602,70 @@ pub struct ReadDrawersResponse {
     pub warnings: Vec<String>,
 }
 
+/// Response for `mempal_projects_list`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ProjectsListResponse {
+    pub projects: Vec<crate::projects::ProjectSummary>,
+}
+
+/// Request for `mempal_projects_resume`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ProjectsResumeRequest {
+    /// Project name or fragment; matches a wing or a worktree-path basename.
+    pub query: String,
+    /// Recent evidence drawers to include. Defaults to 5.
+    pub evidence_limit: Option<usize>,
+    /// In-flight candidate knowledge drawers to include. Defaults to 5.
+    pub candidate_limit: Option<usize>,
+}
+
+/// Flat response for `mempal_projects_resume`, with an object root for MCP.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ProjectsResumeResponse {
+    /// One of `resolved`, `ambiguous`, or `not_found`.
+    pub resolution: String,
+    pub query: String,
+    /// The resume pack when `resolution == "resolved"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack: Option<crate::projects::ResumePack>,
+    /// Candidate projects when `resolution == "ambiguous"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<crate::projects::ProjectSummary>,
+    /// Available wings when `resolution == "not_found"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub available: Vec<String>,
+}
+
+impl From<crate::projects::ResumeResolution> for ProjectsResumeResponse {
+    fn from(resolution: crate::projects::ResumeResolution) -> Self {
+        use crate::projects::ResumeResolution;
+
+        match resolution {
+            ResumeResolution::Resolved(pack) => Self {
+                resolution: "resolved".to_string(),
+                query: pack.wing.clone(),
+                pack: Some(*pack),
+                candidates: Vec::new(),
+                available: Vec::new(),
+            },
+            ResumeResolution::Ambiguous { query, candidates } => Self {
+                resolution: "ambiguous".to_string(),
+                query,
+                pack: None,
+                candidates,
+                available: Vec::new(),
+            },
+            ResumeResolution::NotFound { query, available } => Self {
+                resolution: "not_found".to_string(),
+                query,
+                pack: None,
+                candidates: Vec::new(),
+                available,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct PinnedFactsRequest {
     /// Optional explicit project scope. When omitted, mempal resolves the

@@ -130,15 +130,16 @@ use super::tools::{
     MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest,
     PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
     Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
-    ProcessResourceUsageDto, QueueFailureBucketDto, QueueStatsDto, ReadDrawerRequest,
-    ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto,
-    ResearchIngestPlanDto, ResourceCounterDto, ResourceUsageDto, RetrievalScopeRequest,
-    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto,
-    RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
-    SearchResultDto, SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount,
-    SqliteResourceUsageDto, StatusDetail, StatusRequest, StatusResponse, StatusScope,
-    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
-    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    ProcessResourceUsageDto, ProjectsListResponse, ProjectsResumeRequest, ProjectsResumeResponse,
+    QueueFailureBucketDto, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
+    ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto,
+    ResourceCounterDto, ResourceUsageDto, RetrievalScopeRequest, RetrievedKnowledgeCardDto,
+    RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto,
+    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, SkillDto,
+    SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, SqliteResourceUsageDto,
+    StatusDetail, StatusRequest, StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto,
+    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
+    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
@@ -5648,6 +5649,45 @@ impl MempalMcpServer {
             not_found,
             warnings,
         }))
+    }
+
+    #[tool(
+        name = "mempal_projects_list",
+        description = "List every project (wing) mempal knows: wing name, absolute worktree path when known, drawer counts, and last activity. Read-only and works from any directory."
+    )]
+    async fn mempal_projects_list(
+        &self,
+    ) -> std::result::Result<Json<ProjectsListResponse>, ErrorData> {
+        let projects = self
+            .run_query_only_read_bounded("mempal_projects_list", self.search_db_deadline, |db| {
+                crate::projects::list_projects(db).map_err(db_error)
+            })
+            .await?;
+        Ok(Json(ProjectsListResponse { projects }))
+    }
+
+    #[tool(
+        name = "mempal_projects_resume",
+        description = "Resume a project by fuzzy name from any directory. Resolves the query against wing names and worktree-path basenames and returns the project's worktree path, recent evidence, in-flight candidate knowledge, and a concrete next step. Read-only: mempal returns the path to cd into, it does not move you."
+    )]
+    async fn mempal_projects_resume(
+        &self,
+        Parameters(request): Parameters<ProjectsResumeRequest>,
+    ) -> std::result::Result<Json<ProjectsResumeResponse>, ErrorData> {
+        let query = request.query;
+        let evidence_limit = request.evidence_limit.unwrap_or(5);
+        let candidate_limit = request.candidate_limit.unwrap_or(5);
+        let resolution = self
+            .run_query_only_read_bounded(
+                "mempal_projects_resume",
+                self.search_db_deadline,
+                move |db| {
+                    crate::projects::resume_project(db, &query, evidence_limit, candidate_limit)
+                        .map_err(db_error)
+                },
+            )
+            .await?;
+        Ok(Json(ProjectsResumeResponse::from(resolution)))
     }
 
     #[tool(
@@ -17172,6 +17212,39 @@ prototypes = ["keep"]
                 .unwrap_or_default()
                 .contains("dao_tian -> dao_ren -> shu -> qi")
         );
+    }
+
+    #[test]
+    fn test_mcp_tool_registry_and_protocol_include_projects_resume() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let tools = server.tool_router.list_all();
+
+        let list_tool = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_projects_list")
+            .expect("mempal_projects_list tool exists");
+        assert!(
+            list_tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("List every project")
+        );
+
+        let resume_tool = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_projects_resume")
+            .expect("mempal_projects_resume tool exists");
+        let props = resume_tool
+            .input_schema
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .expect("mempal_projects_resume must have a properties object");
+        assert!(props.get("query").is_some());
+        assert!(props.get("evidence_limit").is_some());
+        assert!(props.get("candidate_limit").is_some());
+        assert!(crate::core::protocol::MEMORY_PROTOCOL.contains("mempal_projects_list"));
+        assert!(crate::core::protocol::MEMORY_PROTOCOL.contains("mempal_projects_resume"));
     }
 
     #[test]
