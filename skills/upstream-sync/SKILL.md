@@ -196,11 +196,13 @@ Can be done by main agent if trivial (1-2 files), or delegated to CSA.
 After each port, ensure no AI-config files leaked into the staging area.
 Do NOT use `git reset` or `git checkout` on AI-config files — those are
 never tracked in the fork and live as symlinks. Instead, simply unstage
-them if CSA accidentally staged them:
+them if CSA accidentally staged them. Note: `weave.lock` is NOT AI-config
+— it is a lockfile that must be committed with the related change (per
+AGENTS.md lockfile-commit-hygiene rule).
 
 ```bash
-# Only unstage — never checkout/reset AI-config paths
-git restore --staged AGENTS.md CLAUDE.md GEMINI.md .claude/ .codex/ .gemini/ .agents/ weave.lock 2>/dev/null || true
+# Only unstage AI-config paths — never unstage weave.lock (it's a lockfile)
+git restore --staged AGENTS.md CLAUDE.md GEMINI.md .claude/ .codex/ .gemini/ .agents/ 2>/dev/null || true
 ```
 
 ### 2.4 Build + Test After Each Commit

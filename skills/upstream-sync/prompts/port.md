@@ -35,12 +35,15 @@ You are porting ONE upstream commit to a heavily diverged fork.
 ```bash
 git cherry-pick --no-commit {COMMIT_SHA}
 # Resolve any conflicts manually
+# Stage only the ported source files (do NOT use git add -A, which
+# can re-stage AI-config paths that were just unstaged)
+git add src/ tests/ Cargo.toml Cargo.lock  # adjust per commit
 # Unstage any AI-config files that leaked in (never tracked in fork)
 git restore --staged AGENTS.md CLAUDE.md .claude/ .codex/ .gemini/ 2>/dev/null || true
-git add -A
 ```
 Then commit following the project's standard commit workflow (do NOT use
-raw `git commit` — follow AGENTS.md commit rules).
+raw `git commit` — follow AGENTS.md commit rules). Note: `weave.lock` is
+a lockfile, not AI-config — commit it with the related change if it changed.
 
 ### If strategy is `new_file_copy`:
 Copy the new file(s) from upstream. Adapt `mod.rs` declarations.
