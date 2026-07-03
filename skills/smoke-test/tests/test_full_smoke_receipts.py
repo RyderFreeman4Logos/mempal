@@ -98,6 +98,17 @@ class ReceiptExtractionTests(unittest.TestCase):
             "database_lock_extra_holder",
         )
 
+    def test_classify_stderr_returns_none_for_pure_hot_reload_noise(self) -> None:
+        stderr = b"config hot-reload: bootstrapped version 8213fc2392e7\n"
+        self.assertIsNone(self.smoke.classify_stderr(stderr))
+
+    def test_classify_stderr_filters_hot_reload_but_keeps_real_errors(self) -> None:
+        stderr = (
+            b"config hot-reload: bootstrapped version 8213fc2392e7\n"
+            b"error: database is locked\n"
+        )
+        self.assertEqual(self.smoke.classify_stderr(stderr), "database_locked")
+
 
 if __name__ == "__main__":
     unittest.main()

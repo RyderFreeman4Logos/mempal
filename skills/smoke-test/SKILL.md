@@ -77,8 +77,8 @@ Classify each group as `pass`, `fail`, or `skipped_<reason>`:
 
 | Group | Required coverage |
 |---|---|
-| Runtime | installed binary, daemon singleton, current executable, DB holders, RSS/resource summary |
-| Read-only CLI | status/stats/search/context/timeline/tail/pinned/knowledge/card/repair/pattern/skill shapes where supported |
+| Runtime | installed binary, daemon singleton, **daemon binary consistency** (exe vs installed), DB holders, RSS/resource summary |
+| Read-only CLI | status/stats/**doctor (schema/embedding health)**/search/context/timeline/tail/pinned/knowledge/card/repair/pattern/skill shapes where supported |
 | Reversible CLI CRUD | create, search/read/context, update via `--supersedes`, pin/unpin, exact-ID delete, post-delete verification |
 | REST | doctor/route availability, degraded warning categories if any |
 | MCP read-only | status/search/context/pinned/timeline/doctor plus optional skill/brief/taxonomy tools exposed by the client |
@@ -97,9 +97,12 @@ Never downgrade a failed CRUD path to pass because another surface worked. Repor
 
 - [ ] Preflight recorded without leaking content.
 - [ ] Installed binary and daemon are current; singleton/holder state is classified.
+- [ ] **Daemon binary consistency check passes** (exe path matches installed binary, not deleted).
 - [ ] Read-only matrix exits 0 or failures are classified by command/error class.
+- [ ] **`doctor --format json` probe verifies schema version match and no critical warnings.**
 - [ ] CLI CRUD creates, reads/searches/contexts, updates, pin/unpins, deletes, and verifies cleanup using only `created_drawer_ids`.
 - [ ] MCP CRUD passes or is explicitly skipped/unavailable; failures are not hidden by CLI success.
+- [ ] **MCP ingest fallback-to-CLI count is reported as degradation signal** (non-zero = MCP async ingest path didn't return IDs within timeout).
 - [ ] REST/MCP checks do not leave extra processes or DB holders.
 - [ ] Memory/I/O before/after is summarized aggregate-only.
 - [ ] Worktree remains clean except intentional skill/code changes.

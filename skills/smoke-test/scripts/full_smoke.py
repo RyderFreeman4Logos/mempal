@@ -26,6 +26,7 @@ SUMMARY: dict[str, Any] = {
     'cleanup': {'cli_deleted_count': 0, 'mcp_deleted_count': 0, 'failures': 0},
     'created_counts': {'cli': 0, 'mcp': 0},
     'failures': [],
+    'mcp_ingest_fallback_to_cli': 0,
     'io': {
         'schema': 'mempal_smoke_io_v2',
         'included_sources': [
@@ -69,6 +70,28 @@ def daemon_main_pid() -> int | None:
     except Exception:
         return None
     return None
+
+
+def daemon_exe_path(pid: int | None) -> str | None:
+    """Return the on-disk path of the running daemon's executable.
+
+    Returns ``None`` if the PID is unknown or the link cannot be read.
+    On Linux, ``/proc/<pid>/exe`` may carry a `` (deleted)`` suffix when
+    the binary has been replaced on disk but the daemon has not been
+    restarted — a silent regression that the smoke test must surface.
+    """
+    if pid is None or pid == 0:
+        return None
+    try:
+        return os.readlink(f'/proc/{pid}/exe')
+    except Exception:
+        return None
+
+
+def installed_binary_path() -> str | None:
+    """Return the ``command -v mempal`` result, or None."""
+    import shutil
+    return shutil.which('mempal')
 
 
 def read_proc_io(pid: int | None) -> dict[str, int] | None:
@@ -307,8 +330,25 @@ def run_cli(name: str, args: list[str], *, input_text: str | None = None, expect
     return result['returncode'], result['stdout'], result['stderr'], parsed, shape
 
 
-def classify_stderr(data: bytes) -> str:
-    text = data.decode('utf-8', errors='replace').lower()
+def classify_stderr(data: bytes) -> str | None:
+    """Classify stderr output, filtering known informational noise.
+
+    ``config hot-reload: bootstrapped version ...`` is emitted by every mempal
+    CLI invocation and carries no signal for smoke purposes. If we leave it
+    unfiltered, every probe reports ``stderr_class=stderr_present`` with 53
+    bytes of noise, which masks genuine errors hidden in the same payload.
+    """
+    text_raw = data.decode('utf-8', errors='replace')
+    noise_prefixes = (
+        'config hot-reload:',
+    )
+    filtered_lines = [
+        line for line in text_raw.splitlines()
+        if line.strip() and not any(line.strip().startswith(p) for p in noise_prefixes)
+    ]
+    if not filtered_lines:
+        return None
+    text = '\n'.join(filtered_lines).lower()
     if 'classification=extra_holder' in text or 'extra process holding' in text:
         return 'database_lock_extra_holder'
     if 'database is locked' in text or 'sqlite' in text and 'locked' in text:
@@ -763,6 +803,7 @@ def mcp_crud() -> list[str]:
             waited = wait_operation(operation_id_from(create) or '', 'mcp_create_cli_wait')
             ids = created_ids_from(waited)
             create_recovery.update({'recovered_via': 'mcp_create_cli_wait', 'recovered_state': operation_state_from(waited)})
+            SUMMARY['mcp_ingest_fallback_to_cli'] += 1
         note('mcp_create', bool(info.get('ok')) and bool(ids), created_id_count=len(ids), **recovery_fields(create_recovery), **without_ok(info))
         if not ids:
             note(
@@ -814,6 +855,7 @@ def mcp_crud() -> list[str]:
             waited = wait_operation(operation_id_from(update) or '', 'mcp_update_cli_wait')
             upd_ids = created_ids_from(waited)
             update_recovery.update({'recovered_via': 'mcp_update_cli_wait', 'recovered_state': operation_state_from(waited)})
+            SUMMARY['mcp_ingest_fallback_to_cli'] += 1
         note('mcp_update', bool(uinfo.get('ok')) and bool(upd_ids), created_id_count=len(upd_ids), **recovery_fields(update_recovery), **without_ok(uinfo))
         if not upd_ids:
             delete_exact_ids_cli(cleanup_ids, 'mcp_cleanup_after_update_failure', room='mcp')
@@ -928,6 +970,88 @@ def classify_daemon(pid_before: int | None, pid_after: int | None) -> dict[str, 
     }
 
 
+def check_binary_consistency(daemon_pid: int | None) -> dict[str, Any]:
+    """Verify the running daemon's executable matches the installed CLI binary.
+
+    A common regression: ``cargo install`` or ``cp`` replaces the on-disk
+    binary but the daemon service is not restarted. The daemon keeps running
+    the old binary, so smoke passes against stale code while the installed CLI
+    already has the new version. This check surfaces that mismatch.
+
+    Comparison strategy (in order of preference):
+    1. If both paths resolve to the same inode (hardlink/identical), pass.
+    2. If file sizes differ, fail (different binaries).
+    3. If sizes match, compare SHA-256 hashes — pass if identical.
+
+    ``ok=False`` is only set when the binaries are genuinely different or
+    the daemon exe carries `` (deleted)``.
+    """
+    import hashlib
+
+    daemon_exe = daemon_exe_path(daemon_pid)
+    installed = installed_binary_path()
+    result: dict[str, Any] = {
+        'ok': True,
+        'daemon_pid': daemon_pid,
+        'daemon_exe': daemon_exe,
+        'installed_binary': installed,
+    }
+    if daemon_exe is None or installed is None:
+        result['ok'] = True
+        result['reason'] = 'exe_or_installed_path_unavailable'
+        return result
+
+    deleted = daemon_exe.endswith(' (deleted)')
+    daemon_norm = daemon_exe.removesuffix(' (deleted')
+
+    if deleted:
+        result['ok'] = False
+        result['reason'] = 'daemon_binary_deleted_on_disk_not_restarted'
+        return result
+
+    # Check inode equality first (hardlinks, bind mounts, etc.)
+    try:
+        daemon_stat = os.stat(daemon_norm)
+        installed_stat = os.stat(installed)
+        if daemon_stat.st_dev == installed_stat.st_dev and daemon_stat.st_ino == installed_stat.st_ino:
+            result['method'] = 'inode_match'
+            return result
+    except Exception:
+        pass
+
+    # Different inodes — compare file size, then hash.
+    try:
+        daemon_size = os.path.getsize(daemon_norm)
+        installed_size = os.path.getsize(installed)
+    except Exception as exc:
+        result['reason'] = f'size_comparison_failed: {type(exc).__name__}'
+        return result
+
+    if daemon_size != installed_size:
+        result['ok'] = False
+        result['reason'] = f'size_mismatch: daemon={daemon_size} installed={installed_size}'
+        return result
+
+    # Same size — compare hashes to distinguish identical copies from different builds.
+    def _file_hash(path: str) -> str | None:
+        try:
+            h = hashlib.sha256()
+            with open(path, 'rb') as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                    h.update(chunk)
+            return h.hexdigest()[:16]
+        except Exception:
+            return None
+
+    daemon_hash = _file_hash(daemon_norm)
+    installed_hash = _file_hash(installed)
+    result['method'] = 'hash_compare'
+    if daemon_hash is not None and installed_hash is not None and daemon_hash != installed_hash:
+        result['ok'] = False
+        result['reason'] = f'hash_mismatch: daemon={daemon_hash} installed={installed_hash}'
+    return result
+
+
 def append_io_history() -> None:
     record = {
         'schema': 'mempal_smoke_io_history_v1',
@@ -963,6 +1087,7 @@ def main() -> int:
     run_cli('version', ['mempal', '--version'], timeout=30)
     run_cli('daemon_status_pre', ['mempal', 'daemon', 'status'], timeout=30)
     run_cli('doctor_rest', ['mempal', 'doctor', 'rest', '--format', 'json'], expect_json=True, timeout=60)
+    run_cli('doctor_json', ['mempal', 'doctor', '--format', 'json'], expect_json=True, timeout=60)
     run_cli('status', ['mempal', 'status'], timeout=60)
     run_cli('timeline_json', ['mempal', 'timeline', '--since', '1h', '--format', 'json'], expect_json=True, timeout=60)
     run_cli('pinned_json', ['mempal', 'pinned', '--json'], expect_json=True, timeout=60)
@@ -980,11 +1105,13 @@ def main() -> int:
     daemon_io_after = read_proc_io(daemon_pid_after)
     child_io_after = child_io_blocks_snapshot()
     SUMMARY['daemon'] = classify_daemon(daemon_pid_before, daemon_pid_after)
+    SUMMARY['binary_consistency'] = check_binary_consistency(daemon_pid_after)
     SUMMARY['io']['daemon_pid_after'] = daemon_pid_after
     SUMMARY['io']['daemon_proc_io_delta'] = io_delta(daemon_io_before, daemon_io_after) if daemon_pid_before == daemon_pid_after else None
     SUMMARY['io']['child_block_io_delta'] = child_io_blocks_delta(child_io_before, child_io_after)
     SUMMARY['duration_ms'] = int((time.monotonic() - start) * 1000)
-    SUMMARY['overall_ok'] = not SUMMARY['failures'] and SUMMARY['cleanup']['failures'] == 0
+    binary_ok = SUMMARY.get('binary_consistency', {}).get('ok', True)
+    SUMMARY['overall_ok'] = not SUMMARY['failures'] and SUMMARY['cleanup']['failures'] == 0 and binary_ok
     append_io_history()
     print(json.dumps(SUMMARY, sort_keys=True))
     return 0 if SUMMARY['overall_ok'] else 1
