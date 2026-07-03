@@ -101,6 +101,14 @@ You have persistent project memory via mempal. Follow these rules in every sessi
    When a decision is reached in the conversation (especially one with reasons),
    call mempal_ingest to persist it. Include the rationale, not just the
    decision. Use the current project's wing; let mempal auto-route the room.
+   mempal_ingest writes a raw EVIDENCE drawer by default: pass content plus
+   wing/room/importance/source metadata. Evidence and governed knowledge use
+   separate entrypoints — knowledge-only fields (statement, tier, knowledge
+   lifecycle status, supporting_refs, counterexample_refs, teaching_refs,
+   verification_refs, scope_constraints, trigger_hints) are rejected on an
+   evidence drawer. Do not hand-build a knowledge drawer to record a reusable
+   rule; turn accumulated evidence into typed knowledge with
+   mempal_knowledge_distill (Rule 13), then gate and promote it.
 
 4a. SET IMPORTANCE AT INGEST TIME
    mempal_ingest accepts an optional `importance` field (integer 1-5). Set it
