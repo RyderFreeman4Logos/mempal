@@ -130,15 +130,16 @@ use super::tools::{
     MAX_READ_DRAWERS_MAX_COUNT, MAX_READ_DRAWERS_REQUEST_IDS, OperationStatusRequest,
     PeekMessageDto, PeekPartnerRequest, PeekPartnerResponse, Phase3GateDto, Phase3Request,
     Phase3Response, PinnedFactDto, PinnedFactProjectCount, PinnedFactsRequest, PinnedFactsResponse,
-    ProcessResourceUsageDto, QueueFailureBucketDto, QueueStatsDto, ReadDrawerRequest,
-    ReadDrawerResponse, ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto,
-    ResearchIngestPlanDto, ResourceCounterDto, ResourceUsageDto, RetrievalScopeRequest,
-    RetrievedKnowledgeCardDto, RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto,
-    RuntimeAdoptionStatsDto, ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse,
-    SearchResultDto, SkillDto, SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount,
-    SqliteResourceUsageDto, StatusDetail, StatusRequest, StatusResponse, StatusScope,
-    SystemWarning, TaxonomyEntryDto, TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto,
-    TunnelDto, TunnelEndpointDto, TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
+    ProcessResourceUsageDto, ProjectsListResponse, ProjectsResumeRequest, ProjectsResumeResponse,
+    QueueFailureBucketDto, QueueStatsDto, ReadDrawerRequest, ReadDrawerResponse,
+    ReadDrawersRequest, ReadDrawersResponse, ResearchAdapterPlanDto, ResearchIngestPlanDto,
+    ResourceCounterDto, ResourceUsageDto, RetrievalScopeRequest, RetrievedKnowledgeCardDto,
+    RollbackRequest, RollbackResponse, RuntimeAdoptionEventDto, RuntimeAdoptionStatsDto,
+    ScopeCount, ScrubStatsDto, SearchRequest, SearchResponse, SearchResultDto, SkillDto,
+    SkillRequest, SkillResponse, SkillSummaryDto, SourceTypeCount, SqliteResourceUsageDto,
+    StatusDetail, StatusRequest, StatusResponse, StatusScope, SystemWarning, TaxonomyEntryDto,
+    TaxonomyRequest, TaxonomyResponse, TriggerHintsDto, TripleDto, TunnelDto, TunnelEndpointDto,
+    TunnelsRequest, TunnelsResponse, TurnStorageStatusDto,
 };
 
 fn config_db_path_matches_server(config: &Config, server_db_path: &Path) -> bool {
@@ -373,6 +374,28 @@ impl Drop for McpIngestWriterLeaseGuard {
                 &self.lease.session_id,
             );
         }
+    }
+}
+
+/// Resolve the project directory a peek should read. An explicit non-empty
+/// `cwd` wins; otherwise fall back to the server's process directory.
+fn resolve_peek_cwd(cwd: Option<String>) -> std::result::Result<PathBuf, ErrorData> {
+    match cwd.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()) {
+        Some(explicit) => {
+            let path = PathBuf::from(&explicit);
+            path.canonicalize().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!(
+                        "cwd does not exist or cannot be canonicalized: {}: {e}",
+                        path.display()
+                    ),
+                    None,
+                )
+            })
+        }
+        None => std::env::current_dir()
+            .and_then(|cwd| cwd.canonicalize())
+            .map_err(|e| ErrorData::internal_error(format!("cwd unavailable: {e}"), None)),
     }
 }
 
@@ -3276,7 +3299,11 @@ fn validate_ingest_request(
                 || trigger_hints.is_some()
             {
                 return Err(ErrorData::invalid_params(
-                    "evidence drawer does not allow knowledge-only fields",
+                    "evidence drawer does not allow knowledge-only fields \
+                     (statement, tier, supporting_refs, counterexample_refs, teaching_refs, \
+                     verification_refs, scope_constraints, trigger_hints); omit them for a raw \
+                     evidence drawer, or use mempal_knowledge_distill to create governed \
+                     knowledge from existing evidence",
                     None,
                 ));
             }
@@ -3284,7 +3311,9 @@ fn validate_ingest_request(
                 !matches!(value, KnowledgeStatus::Active | KnowledgeStatus::Canonical)
             }) {
                 return Err(ErrorData::invalid_params(
-                    "evidence status must be active or canonical",
+                    "evidence status must be active or canonical; use \
+                     mempal_knowledge_distill for knowledge lifecycle states such as candidate, \
+                     promoted, demoted, retired, pending_review, or superseded",
                     None,
                 ));
             }
@@ -5635,6 +5664,45 @@ impl MempalMcpServer {
     }
 
     #[tool(
+        name = "mempal_projects_list",
+        description = "List every project (wing) mempal knows: wing name, absolute worktree path when known, drawer counts, and last activity. Read-only and works from any directory."
+    )]
+    async fn mempal_projects_list(
+        &self,
+    ) -> std::result::Result<Json<ProjectsListResponse>, ErrorData> {
+        let projects = self
+            .run_query_only_read_bounded("mempal_projects_list", self.search_db_deadline, |db| {
+                crate::projects::list_projects(db).map_err(db_error)
+            })
+            .await?;
+        Ok(Json(ProjectsListResponse { projects }))
+    }
+
+    #[tool(
+        name = "mempal_projects_resume",
+        description = "Resume a project by fuzzy name from any directory. Resolves the query against wing names and worktree-path basenames and returns the project's worktree path, recent evidence, in-flight candidate knowledge, and a concrete next step. Read-only: mempal returns the path to cd into, it does not move you."
+    )]
+    async fn mempal_projects_resume(
+        &self,
+        Parameters(request): Parameters<ProjectsResumeRequest>,
+    ) -> std::result::Result<Json<ProjectsResumeResponse>, ErrorData> {
+        let query = request.query;
+        let evidence_limit = request.evidence_limit.unwrap_or(5);
+        let candidate_limit = request.candidate_limit.unwrap_or(5);
+        let resolution = self
+            .run_query_only_read_bounded(
+                "mempal_projects_resume",
+                self.search_db_deadline,
+                move |db| {
+                    crate::projects::resume_project(db, &query, evidence_limit, candidate_limit)
+                        .map_err(db_error)
+                },
+            )
+            .await?;
+        Ok(Json(ProjectsResumeResponse::from(resolution)))
+    }
+
+    #[tool(
         name = "mempal_context",
         description = "Assemble a mind-model runtime context pack from typed memory. Use the unified `scope` object for project/domain/field context scope; search-only scope fields are rejected instead of ignored. Use this when you need ordered guidance rather than raw search results: dao_tian -> dao_ren -> shu -> qi, with evidence and Phase-2 knowledge cards opt-in. Returns source-backed items with citations and trigger_hints metadata, but never executes skills."
     )]
@@ -6129,7 +6197,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_ingest",
-        description = "Persist a decision, bug fix, design insight, profile fact, or typed knowledge/evidence drawer to project memory. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, `statement`, `tier`, `status`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, dry_run preview, and receipt-based waiting via `wait`/`wait_timeout_secs` (wait=true blocks to a terminal state or returns a timed_out receipt you can poll with `mempal_operation_status`). Constrained smoke writes may set `smoke=true` only for small synthetic `wing=\"smoke\"`, `room=\"mcp\"` payloads."
+        description = "Persist a decision, bug fix, design insight, profile fact, or typed memory drawer. By default mempal_ingest writes a raw EVIDENCE drawer: pass content plus wing/room/importance/source metadata. Knowledge-only fields (`statement`, `tier`, knowledge lifecycle `status`, `supporting_refs`, `counterexample_refs`, `teaching_refs`, `verification_refs`, `scope_constraints`, `trigger_hints`) are rejected on evidence drawers; use mempal_knowledge_distill to turn existing evidence into governed typed knowledge instead. Call this when a durable fact is reached in conversation and include the rationale, not just the outcome. Wing is required; room is optional. Supports typed metadata params (`memory_kind`, `domain`, `field`, anchors), pinned facts (`is_pinned`), supersession (`supersedes`/`replace_text`), validity windows, confidence/source_type, dry_run preview, and receipt-based waiting via `wait`/`wait_timeout_secs` (wait=true blocks to a terminal state or returns a timed_out receipt you can poll with `mempal_operation_status`). Constrained smoke writes may set `smoke=true` only for small synthetic `wing=\"smoke\"`, `room=\"mcp\"` payloads."
     )]
     pub async fn mempal_ingest(
         &self,
@@ -8395,7 +8463,7 @@ impl MempalMcpServer {
 
     #[tool(
         name = "mempal_peek_partner",
-        description = "Read the partner coding agent's LIVE session log (Claude Code <-> Codex) without storing it in mempal. Returns the most recent user+assistant messages from their active session file. Use this for CURRENT partner state; use mempal_search for CRYSTALLIZED past decisions. Peek is a pure read -- it never writes to mempal drawers. Pass tool=\"auto\" to infer the partner from MCP ClientInfo, or tool=\"claude\"/\"codex\" explicitly."
+        description = "Read the partner coding agent's LIVE session log (Claude Code <-> Codex) without storing it in mempal. Returns the most recent user+assistant messages from their active session file. Use this for CURRENT partner state; use mempal_search for CRYSTALLIZED past decisions. Peek is a pure read -- it never writes to mempal drawers. Pass tool=\"auto\" to infer the partner from MCP ClientInfo, or tool=\"claude\"/\"codex\" explicitly. Pass cwd to read a partner session in another project; when omitted it reads the partner session for the project this server runs in."
     )]
     async fn mempal_peek_partner(
         &self,
@@ -8418,8 +8486,7 @@ impl MempalMcpServer {
             .and_then(|g| g.clone())
             .and_then(|n| Tool::from_str_ci(&n));
 
-        let cwd = std::env::current_dir()
-            .map_err(|e| ErrorData::internal_error(format!("cwd unavailable: {e}"), None))?;
+        let cwd = resolve_peek_cwd(request.cwd)?;
 
         let cowork_req = CoworkPeekRequest {
             tool,
@@ -12077,6 +12144,56 @@ mod tests {
         .expect("create MCP server")
         .with_async_db_for_test(async_db);
         (tempdir, db_path, server)
+    }
+
+    #[test]
+    fn test_resolve_peek_cwd_honors_explicit_and_falls_back() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let explicit = resolve_peek_cwd(Some(tempdir.path().display().to_string()))
+            .expect("explicit cwd resolves");
+        assert_eq!(
+            explicit,
+            tempdir.path().canonicalize().expect("canonical tempdir")
+        );
+
+        let relative = resolve_peek_cwd(Some(".".to_string())).expect("relative cwd resolves");
+        let current = std::env::current_dir()
+            .expect("current dir")
+            .canonicalize()
+            .expect("canonical current dir");
+        assert_eq!(relative, current, "relative cwd resolves to absolute cwd");
+
+        let blank = resolve_peek_cwd(Some("   ".to_string())).expect("blank cwd resolves");
+        assert_eq!(blank, current, "blank cwd falls back to current dir");
+
+        let omitted = resolve_peek_cwd(None).expect("omitted cwd resolves");
+        assert_eq!(omitted, current, "omitted cwd falls back to current dir");
+
+        let missing = format!("mempal-missing-cowork-peek-cwd-{}", std::process::id());
+        assert!(
+            resolve_peek_cwd(Some(missing)).is_err(),
+            "missing cwd must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_mcp_peek_partner_schema_documents_cwd() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let tools = server.tool_router.list_all();
+        let peek = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_peek_partner")
+            .expect("mempal_peek_partner tool exists");
+        let schema = serde_json::to_string(&peek.input_schema)
+            .expect("serialize mempal_peek_partner input schema");
+        assert!(
+            schema.contains("cwd"),
+            "peek input schema exposes a cwd property"
+        );
+        assert!(
+            schema.contains("another project"),
+            "peek cwd doc explains cross-project reads"
+        );
     }
 
     #[test]
@@ -17126,6 +17243,39 @@ prototypes = ["keep"]
     }
 
     #[test]
+    fn test_mcp_tool_registry_and_protocol_include_projects_resume() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let tools = server.tool_router.list_all();
+
+        let list_tool = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_projects_list")
+            .expect("mempal_projects_list tool exists");
+        assert!(
+            list_tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("List every project")
+        );
+
+        let resume_tool = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_projects_resume")
+            .expect("mempal_projects_resume tool exists");
+        let props = resume_tool
+            .input_schema
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .expect("mempal_projects_resume must have a properties object");
+        assert!(props.get("query").is_some());
+        assert!(props.get("evidence_limit").is_some());
+        assert!(props.get("candidate_limit").is_some());
+        assert!(crate::core::protocol::MEMORY_PROTOCOL.contains("mempal_projects_list"));
+        assert!(crate::core::protocol::MEMORY_PROTOCOL.contains("mempal_projects_resume"));
+    }
+
+    #[test]
     fn test_mcp_tool_registry_includes_operation_status_and_ingest_wait_fields() {
         let (_tempdir, _db_path, server) = setup_server();
         let tools = server.tool_router.list_all();
@@ -17608,6 +17758,81 @@ prototypes = ["keep"]
                 .contains("candidate knowledge from existing evidence")
         );
         assert!(crate::core::protocol::MEMORY_PROTOCOL.contains("mempal_knowledge_distill"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_ingest_evidence_rejects_knowledge_fields_with_remedy() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let error = server
+            .ingest_json_for_test(serde_json::json!({
+                "wing": "mempal",
+                "room": "review",
+                "content": "raw evidence content",
+                "statement": "this field belongs to typed knowledge"
+            }))
+            .await
+            .expect_err("evidence ingest carrying a knowledge-only field must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("statement"),
+            "P107: rejection must name the rejected field, got: {message}"
+        );
+        assert!(
+            message.contains("mempal_knowledge_distill"),
+            "P107: rejection must steer to the distill entrypoint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_ingest_tool_description_steers_to_distill() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let tools = server.tool_router.list_all();
+        let ingest = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_ingest")
+            .expect("mempal_ingest tool exists");
+        let description = ingest.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("EVIDENCE drawer"),
+            "P107: ingest description must state the evidence-drawer default"
+        );
+        assert!(
+            description.contains("mempal_knowledge_distill"),
+            "P107: ingest description must steer to mempal_knowledge_distill"
+        );
+    }
+
+    #[test]
+    fn test_mcp_ingest_schema_documents_knowledge_only_fields() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let tools = server.tool_router.list_all();
+        let ingest = tools
+            .iter()
+            .find(|tool| tool.name == "mempal_ingest")
+            .expect("mempal_ingest tool exists");
+        let schema =
+            serde_json::to_string(&ingest.input_schema).expect("serialize ingest input schema");
+        assert!(
+            schema.contains("Knowledge-only"),
+            "P107: input schema must mark knowledge-only fields"
+        );
+        assert!(
+            schema.contains("mempal_knowledge_distill"),
+            "P107: input schema must steer to mempal_knowledge_distill"
+        );
+    }
+
+    #[test]
+    fn test_mcp_protocol_documents_evidence_vs_knowledge_entrypoint() {
+        let protocol = crate::core::protocol::MEMORY_PROTOCOL;
+        assert!(
+            protocol.contains("EVIDENCE drawer by default"),
+            "P107: protocol must state default ingest writes evidence"
+        );
+        assert!(
+            protocol.contains("mempal_knowledge_distill"),
+            "P107: protocol must direct knowledge distill to mempal_knowledge_distill"
+        );
     }
 
     #[tokio::test]

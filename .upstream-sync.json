@@ -1,0 +1,28 @@
+{
+  "last_synced_commit": "ff341fc121850c6aaca7d29d87673ff19bc47186",
+  "last_synced_date": "2026-07-03",
+  "upstream_remote": "upstream",
+  "upstream_branch": "main",
+  "syncs": [
+    {
+      "date": "2026-05-20",
+      "commit": "83052b34061a83ba1c23b08ca4098739bcc756e1",
+      "method": "manual_selective",
+      "note": "Initial tracking file. Fork had already diverged ~900+ commits. Synced through P106/v0.6.0 by manual selective porting."
+    },
+    {
+      "date": "2026-07-03",
+      "commit": "ff341fc121850c6aaca7d29d87673ff19bc47186",
+      "method": "selective_port",
+      "ported": [
+        {"sha": "3cb979a", "feature": "P107 ingest boundary discoverability"},
+        {"sha": "b227afc", "feature": "P108 peek partner via cwd"},
+        {"sha": "70727f0", "feature": "P109 cross-project list and resume"}
+      ],
+      "skipped": [
+        {"sha": "ff341fc", "reason": "skip_already_have", "detail": "Fork has EmbedEndpointConfig.dim per-endpoint dimensions, more advanced than upstream's simple global dimensions field"}
+      ],
+      "note": "Ported 3 of 4 upstream commits via CSA subagents. Skipped embedding dimensions (fork already has superior per-endpoint system)."
+    }
+  ]
+}

@@ -885,6 +885,21 @@ enum Commands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Read a partner agent's LIVE session log for a project (no tmux needed).
+    CoworkPeek {
+        /// Which agent tool's session to read (claude|codex).
+        #[arg(long)]
+        tool: String,
+        /// Project directory whose partner session to read.
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
     /// Show current cowork inbox state for both targets at the given cwd.
     CoworkStatus {
         #[arg(long)]
@@ -3439,6 +3454,21 @@ fn run() -> Result<()> {
                 format.clone(),
             );
         }
+        Commands::CoworkPeek {
+            tool,
+            cwd,
+            limit,
+            since,
+            format,
+        } => {
+            return cowork_peek_command(
+                tool.clone(),
+                cwd.clone(),
+                *limit,
+                since.clone(),
+                format.clone(),
+            );
+        }
         Commands::CoworkStatus { cwd } => {
             let resolved = match cwd {
                 Some(p) => p.clone(),
@@ -4485,6 +4515,7 @@ fn run() -> Result<()> {
             block_on_result(brief_command(&db, config.as_ref(), query, format))
         }
         Commands::CoworkDrain { .. }
+        | Commands::CoworkPeek { .. }
         | Commands::CoworkStatus { .. }
         | Commands::CoworkInstallHooks { .. }
         | Commands::Integrations { .. }
@@ -4647,6 +4678,7 @@ fn cli_command_telemetry_label(command: &Commands) -> &'static str {
         Commands::RecomputeImportance => "recompute-importance",
         Commands::FactCheck { .. } => "fact-check",
         Commands::CoworkDrain { .. } => "cowork-drain",
+        Commands::CoworkPeek { .. } => "cowork-peek",
         Commands::CoworkStatus { .. } => "cowork-status",
         Commands::CoworkInstallHooks { .. } => "cowork-install-hooks",
         Commands::Integrations { .. } => "integrations",
@@ -16130,6 +16162,58 @@ fn cowork_drain_command(
     Ok(())
 }
 
+fn cowork_peek_command(
+    tool: String,
+    cwd: PathBuf,
+    limit: usize,
+    since: Option<String>,
+    format: String,
+) -> Result<()> {
+    use mempal::cowork::{PeekRequest, Tool, peek_partner};
+
+    let target = Tool::from_str_ci(&tool)
+        .ok_or_else(|| anyhow::anyhow!("unknown tool `{tool}`: expected claude|codex"))?;
+    let cwd = resolve_cowork_peek_cwd(&cwd)?;
+    let resp = peek_partner(PeekRequest {
+        tool: target,
+        limit,
+        since,
+        cwd,
+        caller_tool: None,
+        home_override: None,
+    })
+    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    match format.as_str() {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+            Ok(())
+        }
+        "plain" => {
+            println!(
+                "partner={} active={} session={}",
+                resp.partner_tool.as_str(),
+                resp.partner_active,
+                resp.session_path.as_deref().unwrap_or("(none)")
+            );
+            for msg in &resp.messages {
+                println!("[{} @ {}] {}", msg.role, msg.at, msg.text);
+            }
+            Ok(())
+        }
+        other => bail!("unknown format: {other}"),
+    }
+}
+
+fn resolve_cowork_peek_cwd(cwd: &Path) -> Result<PathBuf> {
+    cwd.canonicalize().with_context(|| {
+        format!(
+            "cowork-peek cwd does not exist or cannot be canonicalized: {}",
+            cwd.display()
+        )
+    })
+}
+
 fn cowork_status_command(cwd: PathBuf) -> Result<()> {
     use mempal::cowork::Tool;
     use mempal::cowork::inbox;
@@ -24174,8 +24258,6 @@ mod tests {
     #[cfg(feature = "model2vec")]
     use safetensors::{Dtype, serialize_to_file};
     use std::collections::BTreeSet;
-    #[cfg(feature = "model2vec")]
-    use std::path::Path;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -32733,5 +32815,69 @@ threshold = 0.7
             )
             .expect("load read-hook audit reason");
         assert_eq!(reason, "read_tool");
+    }
+
+    #[test]
+    fn test_cli_cowork_peek_parses() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "mempal",
+                    "cowork-peek",
+                    "--tool",
+                    "codex",
+                    "--cwd",
+                    "/tmp/project",
+                ])
+                .expect("cowork-peek must parse");
+                match cli.command {
+                    Commands::CoworkPeek {
+                        tool,
+                        cwd,
+                        limit,
+                        since,
+                        format,
+                    } => {
+                        assert_eq!(tool, "codex");
+                        assert_eq!(cwd, PathBuf::from("/tmp/project"));
+                        assert_eq!(limit, 30, "default limit");
+                        assert!(since.is_none());
+                        assert_eq!(format, "plain", "default format");
+                    }
+                    _ => panic!("expected CoworkPeek command variant"),
+                }
+            })
+            .expect("spawn large-stack CLI parse test")
+            .join()
+            .expect("large-stack CLI parse test panicked");
+    }
+
+    #[test]
+    fn test_resolve_cowork_peek_cwd_canonicalizes_and_rejects_missing() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let absolute = resolve_cowork_peek_cwd(tempdir.path()).expect("absolute cwd resolves");
+        assert_eq!(
+            absolute,
+            tempdir.path().canonicalize().expect("canonical tempdir")
+        );
+
+        let relative =
+            resolve_cowork_peek_cwd(std::path::Path::new(".")).expect("relative cwd resolves");
+        let current = std::env::current_dir()
+            .expect("current dir")
+            .canonicalize()
+            .expect("canonical current dir");
+        assert_eq!(relative, current, "relative cwd resolves to absolute cwd");
+
+        let missing = PathBuf::from(format!(
+            "mempal-missing-cowork-peek-cwd-{}",
+            std::process::id()
+        ));
+        let error = resolve_cowork_peek_cwd(&missing).expect_err("missing cwd must be rejected");
+        assert!(
+            format!("{error:#}").contains("cannot be canonicalized"),
+            "error should explain canonicalization failure"
+        );
     }
 }

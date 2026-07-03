@@ -1602,6 +1602,70 @@ pub struct ReadDrawersResponse {
     pub warnings: Vec<String>,
 }
 
+/// Response for `mempal_projects_list`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ProjectsListResponse {
+    pub projects: Vec<crate::projects::ProjectSummary>,
+}
+
+/// Request for `mempal_projects_resume`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ProjectsResumeRequest {
+    /// Project name or fragment; matches a wing or a worktree-path basename.
+    pub query: String,
+    /// Recent evidence drawers to include. Defaults to 5.
+    pub evidence_limit: Option<usize>,
+    /// In-flight candidate knowledge drawers to include. Defaults to 5.
+    pub candidate_limit: Option<usize>,
+}
+
+/// Flat response for `mempal_projects_resume`, with an object root for MCP.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ProjectsResumeResponse {
+    /// One of `resolved`, `ambiguous`, or `not_found`.
+    pub resolution: String,
+    pub query: String,
+    /// The resume pack when `resolution == "resolved"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack: Option<crate::projects::ResumePack>,
+    /// Candidate projects when `resolution == "ambiguous"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<crate::projects::ProjectSummary>,
+    /// Available wings when `resolution == "not_found"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub available: Vec<String>,
+}
+
+impl From<crate::projects::ResumeResolution> for ProjectsResumeResponse {
+    fn from(resolution: crate::projects::ResumeResolution) -> Self {
+        use crate::projects::ResumeResolution;
+
+        match resolution {
+            ResumeResolution::Resolved(pack) => Self {
+                resolution: "resolved".to_string(),
+                query: pack.wing.clone(),
+                pack: Some(*pack),
+                candidates: Vec::new(),
+                available: Vec::new(),
+            },
+            ResumeResolution::Ambiguous { query, candidates } => Self {
+                resolution: "ambiguous".to_string(),
+                query,
+                pack: None,
+                candidates,
+                available: Vec::new(),
+            },
+            ResumeResolution::NotFound { query, available } => Self {
+                resolution: "not_found".to_string(),
+                query,
+                pack: None,
+                candidates: Vec::new(),
+                available,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct PinnedFactsRequest {
     /// Optional explicit project scope. When omitted, mempal resolves the
@@ -1693,8 +1757,10 @@ pub struct IngestRequest {
     /// Default 0. Use 3-5 for key decisions, architecture choices, and lessons learned.
     pub importance: Option<i32>,
 
-    /// Optional typed memory kind: evidence, knowledge, atomic_fact, decision,
-    /// case, skill, foresight, profile_fact, or profile_trait.
+    /// Optional typed memory kind. Defaults to "evidence", a raw verbatim
+    /// drawer. Set "knowledge" only for a fully formed typed knowledge drawer;
+    /// to turn existing evidence into a governed rule, prefer
+    /// mempal_knowledge_distill over hand-built knowledge ingest.
     pub memory_kind: Option<String>,
     /// Optional typed domain: project, user, agent, skill, or global.
     pub domain: Option<String>,
@@ -1704,18 +1770,38 @@ pub struct IngestRequest {
     pub is_pinned: Option<bool>,
     /// Optional provenance: runtime, research, or human.
     pub provenance: Option<String>,
-    /// Knowledge/profile statement for typed recall and card generation.
+    /// Knowledge-only on the default evidence entrypoint. A default evidence
+    /// ingest rejects this field; use memory_kind="knowledge" only for a fully
+    /// formed knowledge drawer, or use mempal_knowledge_distill to create
+    /// governed knowledge from existing evidence.
     pub statement: Option<String>,
-    /// Optional knowledge tier: qi, shu, dao_ren, or dao_tian.
+    /// Knowledge-only field. Rejected on an evidence drawer; use
+    /// memory_kind="knowledge" or mempal_knowledge_distill.
     pub tier: Option<String>,
-    /// Optional lifecycle status such as active, candidate, promoted,
-    /// canonical, demoted, retired, pending_review, or superseded.
+    /// Knowledge lifecycle status. Evidence drawers accept only active or
+    /// canonical; candidate/promoted/demoted/retired/pending_review/superseded
+    /// are knowledge-only lifecycle states for memory_kind="knowledge" or
+    /// mempal_knowledge_distill.
     pub status: Option<String>,
+    /// Knowledge-only field. Rejected on an evidence drawer; use
+    /// memory_kind="knowledge" or mempal_knowledge_distill.
     pub supporting_refs: Option<Vec<String>>,
+    /// Knowledge-only field. Rejected on an evidence drawer; use
+    /// memory_kind="knowledge" or mempal_knowledge_distill.
     pub counterexample_refs: Option<Vec<String>>,
+    /// Knowledge-only field. Rejected on an evidence drawer; use
+    /// memory_kind="knowledge" or mempal_knowledge_distill.
     pub teaching_refs: Option<Vec<String>>,
+    /// Knowledge-only field. Rejected on an evidence drawer; use
+    /// memory_kind="knowledge" or mempal_knowledge_distill.
     pub verification_refs: Option<Vec<String>>,
+    /// Knowledge-only on the default evidence entrypoint. A default evidence
+    /// ingest rejects this field; use memory_kind="knowledge" or
+    /// mempal_knowledge_distill for reusable rule scope constraints.
     pub scope_constraints: Option<String>,
+    /// Knowledge-only on the default evidence entrypoint. A default evidence
+    /// ingest rejects this field; use memory_kind="knowledge" or
+    /// mempal_knowledge_distill for typed guidance hints.
     pub trigger_hints: Option<TriggerHintsDto>,
     pub anchor_kind: Option<String>,
     pub anchor_id: Option<String>,
@@ -2629,6 +2715,11 @@ pub struct PeekPartnerRequest {
     /// Optional RFC3339 timestamp cutoff — only messages strictly newer than
     /// this are returned.
     pub since: Option<String>,
+
+    /// Optional project directory whose partner session to read. Use this to
+    /// peek a partner working in another project; when omitted, mempal reads the
+    /// partner session for the project this MCP server runs in.
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
