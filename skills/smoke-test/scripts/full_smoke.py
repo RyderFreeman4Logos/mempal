@@ -1076,6 +1076,53 @@ def append_io_history() -> None:
         SUMMARY['io_history'] = {'appended': False, 'error_type': type(exc).__name__}
 
 
+_DOCTOR_CRITICAL_KEYWORDS = ('corrupt', 'mismatch', 'missing', 'incompatible', 'migration failed')
+
+
+def validate_doctor_health(doc_json: Any) -> dict[str, Any]:
+    """Validate a parsed ``mempal doctor --format json`` report.
+
+    Returns a dict with ``ok`` plus diagnostic fields. Used by both
+    the smoke runner and unit tests so the validation logic is exercised
+    identically in both paths.
+    """
+    if not isinstance(doc_json, dict):
+        return {'ok': False, 'reason': 'not_a_dict'}
+    db_info = doc_json.get('db') or {}
+    db_schema_version = db_info.get('schema_version') if isinstance(db_info, dict) else None
+    supported_schema = doc_json.get('supported_schema_version')
+    schema_matches = db_schema_version is not None and db_schema_version == supported_schema
+    warnings = doc_json.get('warnings') or []
+    critical_warnings = [
+        w for w in warnings
+        if isinstance(w, str) and any(k in w.lower() for k in _DOCTOR_CRITICAL_KEYWORDS)
+    ]
+    emb_info = doc_json.get('embedding') or {}
+    emb_endpoints = emb_info.get('endpoints') if isinstance(emb_info, dict) else None
+    emb_cooldowns = 0
+    if isinstance(emb_endpoints, list):
+        for ep in emb_endpoints:
+            if isinstance(ep, dict) and ep.get('cooldown_remaining_secs') is not None:
+                emb_cooldowns += 1
+    emb_queue = emb_info.get('queue') if isinstance(emb_info, dict) else None
+    emb_terminal_failures = 0
+    if isinstance(emb_queue, dict):
+        emb_terminal_failures = int(emb_queue.get('failed_terminal') or 0)
+    embedding_ok = emb_cooldowns == 0
+    ok = bool(schema_matches) and len(critical_warnings) == 0 and embedding_ok
+    return {
+        'ok': ok,
+        'db_schema_version': db_schema_version,
+        'supported_schema_version': supported_schema,
+        'schema_matches': bool(schema_matches),
+        'total_warning_count': len(warnings),
+        'critical_warning_count': len(critical_warnings),
+        'embedding_endpoint_cooldowns': emb_cooldowns,
+        'embedding_terminal_failures': emb_terminal_failures,
+        'embedding_ok': embedding_ok,
+    }
+
+
 def main() -> int:
     import hashlib
     SUMMARY['marker_hash'] = hashlib.sha256(MARKER.encode()).hexdigest()[:16]
@@ -1088,49 +1135,11 @@ def main() -> int:
     run_cli('daemon_status_pre', ['mempal', 'daemon', 'status'], timeout=30)
     run_cli('doctor_rest', ['mempal', 'doctor', 'rest', '--format', 'json'], expect_json=True, timeout=60)
     _doc_rc, _doc_out, _doc_err, doc_parsed, _doc_shape = run_cli('doctor_json', ['mempal', 'doctor', '--format', 'json'], expect_json=True, timeout=60)
-    if isinstance(doc_parsed, dict):
-        db_info = doc_parsed.get('db') or {}
-        db_schema_version = db_info.get('schema_version') if isinstance(db_info, dict) else None
-        supported_schema = doc_parsed.get('supported_schema_version')
-        # Schema must match exactly — a compatible-but-different version means
-        # a migration is pending or the binary was downgraded.
-        schema_matches = db_schema_version is not None and db_schema_version == supported_schema
-        warnings = doc_parsed.get('warnings') or []
-        # Classify warnings: critical if they indicate data integrity issues.
-        # "extra process" and "locked" are operational, not critical regressions.
-        critical_keywords = ('corrupt', 'mismatch', 'missing', 'incompatible', 'migration failed')
-        critical_warnings = [w for w in warnings if isinstance(w, str) and any(k in w.lower() for k in critical_keywords)]
-        # Check embedding health: endpoint cooldowns or terminal queue failures.
-        emb_info = doc_parsed.get('embedding') or {}
-        emb_endpoints = emb_info.get('endpoints') if isinstance(emb_info, dict) else None
-        emb_cooldowns = 0
-        if isinstance(emb_endpoints, list):
-            for ep in emb_endpoints:
-                if isinstance(ep, dict) and ep.get('cooldown_remaining_secs') is not None:
-                    emb_cooldowns += 1
-        emb_queue = emb_info.get('queue') if isinstance(emb_info, dict) else None
-        emb_terminal_failures = 0
-        if isinstance(emb_queue, dict):
-            emb_terminal_failures = int(emb_queue.get('failed_terminal') or 0)
-        # Terminal failures are historical and don't indicate current regression
-        # unless they're growing. We report them but only fail if endpoints are
-        # in cooldown (active health problem).
-        embedding_ok = emb_cooldowns == 0
-        note(
-            'doctor_json_validation',
-            bool(schema_matches) and len(critical_warnings) == 0 and embedding_ok,
-            db_schema_version=db_schema_version,
-            supported_schema_version=supported_schema,
-            schema_matches=bool(schema_matches),
-            total_warning_count=len(warnings),
-            critical_warning_count=len(critical_warnings),
-            embedding_endpoint_cooldowns=emb_cooldowns,
-            embedding_terminal_failures=emb_terminal_failures,
-            embedding_ok=embedding_ok,
-        )
-        if not (schema_matches and len(critical_warnings) == 0 and embedding_ok):
-            SUMMARY['failures'] = [f for f in SUMMARY['failures'] if f != 'doctor_json_validation']
-            SUMMARY['failures'].append('doctor_json_validation')
+    doc_validation = validate_doctor_health(doc_parsed)
+    note('doctor_json_validation', doc_validation['ok'], **without_ok(doc_validation))
+    if not doc_validation['ok']:
+        SUMMARY['failures'] = [f for f in SUMMARY['failures'] if f != 'doctor_json_validation']
+        SUMMARY['failures'].append('doctor_json_validation')
     run_cli('status', ['mempal', 'status'], timeout=60)
     run_cli('timeline_json', ['mempal', 'timeline', '--since', '1h', '--format', 'json'], expect_json=True, timeout=60)
     run_cli('pinned_json', ['mempal', 'pinned', '--json'], expect_json=True, timeout=60)
@@ -1148,7 +1157,9 @@ def main() -> int:
     daemon_io_after = read_proc_io(daemon_pid_after)
     child_io_after = child_io_blocks_snapshot()
     SUMMARY['daemon'] = classify_daemon(daemon_pid_before, daemon_pid_after)
-    SUMMARY['binary_consistency'] = check_binary_consistency(daemon_pid_after)
+    binary_result = check_binary_consistency(daemon_pid_after)
+    SUMMARY['binary_consistency'] = binary_result
+    note('binary_consistency', bool(binary_result.get('ok')), **without_ok({k: v for k, v in binary_result.items() if k != 'daemon_exe'}))
     SUMMARY['io']['daemon_pid_after'] = daemon_pid_after
     SUMMARY['io']['daemon_proc_io_delta'] = io_delta(daemon_io_before, daemon_io_after) if daemon_pid_before == daemon_pid_after else None
     SUMMARY['io']['child_block_io_delta'] = child_io_blocks_delta(child_io_before, child_io_after)

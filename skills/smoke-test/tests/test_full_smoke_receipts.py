@@ -111,70 +111,64 @@ class ReceiptExtractionTests(unittest.TestCase):
 
 
 class DoctorValidationTests(unittest.TestCase):
-    """Unit tests for doctor_json_validation logic.
+    """Unit tests for validate_doctor_health.
 
-    These tests verify the schema-match and embedding-health contract
-    without requiring a live daemon. They test the validation predicates
-    in isolation.
+    These tests feed representative doctor JSON into the same validation
+    function used by main(), ensuring the schema-match and embedding-health
+    contract is exercised against the real implementation.
     """
 
-    def test_schema_mismatch_detected(self) -> None:
-        """A compatible-but-different schema version must fail."""
-        db_schema_version = 19
-        supported_schema = 20
-        schema_matches = (
-            db_schema_version is not None
-            and db_schema_version == supported_schema
-        )
-        self.assertFalse(schema_matches)
+    def setUp(self) -> None:
+        self.smoke = load_full_smoke()
 
-    def test_schema_match_passes(self) -> None:
-        """Exact schema version match passes the schema check."""
-        db_schema_version = 20
-        supported_schema = 20
-        schema_matches = (
-            db_schema_version is not None
-            and db_schema_version == supported_schema
-        )
-        self.assertTrue(schema_matches)
+    def _base_report(self) -> dict[str, Any]:
+        return {
+            "supported_schema_version": 20,
+            "db": {"schema_version": 20, "compatible": True},
+            "warnings": [],
+            "embedding": {
+                "endpoints": [{"id": "primary", "cooldown_remaining_secs": None}],
+                "queue": {"failed_terminal": 0},
+            },
+        }
 
-    def test_embedding_cooldown_detected(self) -> None:
-        """An endpoint with cooldown_remaining_secs set indicates unhealthy embedding."""
-        endpoints = [
-            {"id": "primary", "cooldown_remaining_secs": 30},
-            {"id": "secondary", "cooldown_remaining_secs": None},
-        ]
-        cooldowns = sum(
-            1 for ep in endpoints
-            if isinstance(ep, dict) and ep.get("cooldown_remaining_secs") is not None
-        )
-        self.assertEqual(cooldowns, 1)
-        self.assertFalse(cooldowns == 0)
+    def test_healthy_report_passes(self) -> None:
+        result = self.smoke.validate_doctor_health(self._base_report())
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["schema_matches"])
+        self.assertTrue(result["embedding_ok"])
 
-    def test_embedding_healthy_when_no_cooldowns(self) -> None:
-        """No endpoints in cooldown means embedding health passes."""
-        endpoints = [
-            {"id": "primary", "cooldown_remaining_secs": None},
-        ]
-        cooldowns = sum(
-            1 for ep in endpoints
-            if isinstance(ep, dict) and ep.get("cooldown_remaining_secs") is not None
-        )
-        self.assertEqual(cooldowns, 0)
-        self.assertTrue(cooldowns == 0)
+    def test_schema_mismatch_fails(self) -> None:
+        report = self._base_report()
+        report["db"]["schema_version"] = 19
+        result = self.smoke.validate_doctor_health(report)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["schema_matches"])
 
-    def test_critical_warning_classification_excludes_operational(self) -> None:
-        """'extra process holds database' must NOT be classified as critical."""
-        warnings = ["1 extra process(es) hold the database open"]
-        critical_keywords = (
-            "corrupt", "mismatch", "missing",
-            "incompatible", "migration failed",
-        )
-        critical = [
-            w for w in warnings
-            if isinstance(w, str) and any(k in w.lower() for k in critical_keywords)
-        ]
-        self.assertEqual(len(critical), 0)
+    def test_embedding_cooldown_fails(self) -> None:
+        report = self._base_report()
+        report["embedding"]["endpoints"][0]["cooldown_remaining_secs"] = 30
+        result = self.smoke.validate_doctor_health(report)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["embedding_endpoint_cooldowns"], 1)
+
+    def test_critical_warning_fails(self) -> None:
+        report = self._base_report()
+        report["warnings"] = ["database is corrupt"]
+        result = self.smoke.validate_doctor_health(report)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["critical_warning_count"], 1)
+
+    def test_operational_warning_does_not_fail(self) -> None:
+        report = self._base_report()
+        report["warnings"] = ["1 extra process(es) hold the database open"]
+        result = self.smoke.validate_doctor_health(report)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["critical_warning_count"], 0)
+
+    def test_non_dict_input_fails(self) -> None:
+        result = self.smoke.validate_doctor_health(None)
+        self.assertFalse(result["ok"])
 
 
 if __name__ == "__main__":
