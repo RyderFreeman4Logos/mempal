@@ -885,6 +885,21 @@ enum Commands {
         #[arg(long, default_value = "plain")]
         format: String,
     },
+    /// Read a partner agent's LIVE session log for a project (no tmux needed).
+    CoworkPeek {
+        /// Which agent tool's session to read (claude|codex).
+        #[arg(long)]
+        tool: String,
+        /// Project directory whose partner session to read.
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value = "plain")]
+        format: String,
+    },
     /// Show current cowork inbox state for both targets at the given cwd.
     CoworkStatus {
         #[arg(long)]
@@ -3439,6 +3454,21 @@ fn run() -> Result<()> {
                 format.clone(),
             );
         }
+        Commands::CoworkPeek {
+            tool,
+            cwd,
+            limit,
+            since,
+            format,
+        } => {
+            return cowork_peek_command(
+                tool.clone(),
+                cwd.clone(),
+                *limit,
+                since.clone(),
+                format.clone(),
+            );
+        }
         Commands::CoworkStatus { cwd } => {
             let resolved = match cwd {
                 Some(p) => p.clone(),
@@ -4485,6 +4515,7 @@ fn run() -> Result<()> {
             block_on_result(brief_command(&db, config.as_ref(), query, format))
         }
         Commands::CoworkDrain { .. }
+        | Commands::CoworkPeek { .. }
         | Commands::CoworkStatus { .. }
         | Commands::CoworkInstallHooks { .. }
         | Commands::Integrations { .. }
@@ -4647,6 +4678,7 @@ fn cli_command_telemetry_label(command: &Commands) -> &'static str {
         Commands::RecomputeImportance => "recompute-importance",
         Commands::FactCheck { .. } => "fact-check",
         Commands::CoworkDrain { .. } => "cowork-drain",
+        Commands::CoworkPeek { .. } => "cowork-peek",
         Commands::CoworkStatus { .. } => "cowork-status",
         Commands::CoworkInstallHooks { .. } => "cowork-install-hooks",
         Commands::Integrations { .. } => "integrations",
@@ -16128,6 +16160,48 @@ fn cowork_drain_command(
         eprintln!("mempal cowork-drain: {e}");
     }
     Ok(())
+}
+
+fn cowork_peek_command(
+    tool: String,
+    cwd: PathBuf,
+    limit: usize,
+    since: Option<String>,
+    format: String,
+) -> Result<()> {
+    use mempal::cowork::{PeekRequest, Tool, peek_partner};
+
+    let target = Tool::from_str_ci(&tool)
+        .ok_or_else(|| anyhow::anyhow!("unknown tool `{tool}`: expected claude|codex"))?;
+    let resp = peek_partner(PeekRequest {
+        tool: target,
+        limit,
+        since,
+        cwd,
+        caller_tool: None,
+        home_override: None,
+    })
+    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    match format.as_str() {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+            Ok(())
+        }
+        "plain" => {
+            println!(
+                "partner={} active={} session={}",
+                resp.partner_tool.as_str(),
+                resp.partner_active,
+                resp.session_path.as_deref().unwrap_or("(none)")
+            );
+            for msg in &resp.messages {
+                println!("[{} @ {}] {}", msg.role, msg.at, msg.text);
+            }
+            Ok(())
+        }
+        other => bail!("unknown format: {other}"),
+    }
 }
 
 fn cowork_status_command(cwd: PathBuf) -> Result<()> {
@@ -32733,5 +32807,41 @@ threshold = 0.7
             )
             .expect("load read-hook audit reason");
         assert_eq!(reason, "read_tool");
+    }
+
+    #[test]
+    fn test_cli_cowork_peek_parses() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "mempal",
+                    "cowork-peek",
+                    "--tool",
+                    "codex",
+                    "--cwd",
+                    "/tmp/project",
+                ])
+                .expect("cowork-peek must parse");
+                match cli.command {
+                    Commands::CoworkPeek {
+                        tool,
+                        cwd,
+                        limit,
+                        since,
+                        format,
+                    } => {
+                        assert_eq!(tool, "codex");
+                        assert_eq!(cwd, PathBuf::from("/tmp/project"));
+                        assert_eq!(limit, 30, "default limit");
+                        assert!(since.is_none());
+                        assert_eq!(format, "plain", "default format");
+                    }
+                    _ => panic!("expected CoworkPeek command variant"),
+                }
+            })
+            .expect("spawn large-stack CLI parse test")
+            .join()
+            .expect("large-stack CLI parse test panicked");
     }
 }
