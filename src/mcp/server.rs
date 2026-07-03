@@ -381,8 +381,20 @@ impl Drop for McpIngestWriterLeaseGuard {
 /// `cwd` wins; otherwise fall back to the server's process directory.
 fn resolve_peek_cwd(cwd: Option<String>) -> std::result::Result<PathBuf, ErrorData> {
     match cwd.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()) {
-        Some(explicit) => Ok(PathBuf::from(explicit)),
+        Some(explicit) => {
+            let path = PathBuf::from(&explicit);
+            path.canonicalize().map_err(|e| {
+                ErrorData::invalid_params(
+                    format!(
+                        "cwd does not exist or cannot be canonicalized: {}: {e}",
+                        path.display()
+                    ),
+                    None,
+                )
+            })
+        }
         None => std::env::current_dir()
+            .and_then(|cwd| cwd.canonicalize())
             .map_err(|e| ErrorData::internal_error(format!("cwd unavailable: {e}"), None)),
     }
 }
@@ -12136,16 +12148,32 @@ mod tests {
 
     #[test]
     fn test_resolve_peek_cwd_honors_explicit_and_falls_back() {
-        let explicit =
-            resolve_peek_cwd(Some("/tmp/some-project".to_string())).expect("explicit cwd resolves");
-        assert_eq!(explicit, PathBuf::from("/tmp/some-project"));
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let explicit = resolve_peek_cwd(Some(tempdir.path().display().to_string()))
+            .expect("explicit cwd resolves");
+        assert_eq!(
+            explicit,
+            tempdir.path().canonicalize().expect("canonical tempdir")
+        );
+
+        let relative = resolve_peek_cwd(Some(".".to_string())).expect("relative cwd resolves");
+        let current = std::env::current_dir()
+            .expect("current dir")
+            .canonicalize()
+            .expect("canonical current dir");
+        assert_eq!(relative, current, "relative cwd resolves to absolute cwd");
 
         let blank = resolve_peek_cwd(Some("   ".to_string())).expect("blank cwd resolves");
-        let current = std::env::current_dir().expect("current dir");
         assert_eq!(blank, current, "blank cwd falls back to current dir");
 
         let omitted = resolve_peek_cwd(None).expect("omitted cwd resolves");
         assert_eq!(omitted, current, "omitted cwd falls back to current dir");
+
+        let missing = format!("mempal-missing-cowork-peek-cwd-{}", std::process::id());
+        assert!(
+            resolve_peek_cwd(Some(missing)).is_err(),
+            "missing cwd must be rejected"
+        );
     }
 
     #[test]

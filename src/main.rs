@@ -16173,6 +16173,7 @@ fn cowork_peek_command(
 
     let target = Tool::from_str_ci(&tool)
         .ok_or_else(|| anyhow::anyhow!("unknown tool `{tool}`: expected claude|codex"))?;
+    let cwd = resolve_cowork_peek_cwd(&cwd)?;
     let resp = peek_partner(PeekRequest {
         tool: target,
         limit,
@@ -16202,6 +16203,15 @@ fn cowork_peek_command(
         }
         other => bail!("unknown format: {other}"),
     }
+}
+
+fn resolve_cowork_peek_cwd(cwd: &Path) -> Result<PathBuf> {
+    cwd.canonicalize().with_context(|| {
+        format!(
+            "cowork-peek cwd does not exist or cannot be canonicalized: {}",
+            cwd.display()
+        )
+    })
 }
 
 fn cowork_status_command(cwd: PathBuf) -> Result<()> {
@@ -24248,8 +24258,6 @@ mod tests {
     #[cfg(feature = "model2vec")]
     use safetensors::{Dtype, serialize_to_file};
     use std::collections::BTreeSet;
-    #[cfg(feature = "model2vec")]
-    use std::path::Path;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -32843,5 +32851,33 @@ threshold = 0.7
             .expect("spawn large-stack CLI parse test")
             .join()
             .expect("large-stack CLI parse test panicked");
+    }
+
+    #[test]
+    fn test_resolve_cowork_peek_cwd_canonicalizes_and_rejects_missing() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let absolute = resolve_cowork_peek_cwd(tempdir.path()).expect("absolute cwd resolves");
+        assert_eq!(
+            absolute,
+            tempdir.path().canonicalize().expect("canonical tempdir")
+        );
+
+        let relative =
+            resolve_cowork_peek_cwd(std::path::Path::new(".")).expect("relative cwd resolves");
+        let current = std::env::current_dir()
+            .expect("current dir")
+            .canonicalize()
+            .expect("canonical current dir");
+        assert_eq!(relative, current, "relative cwd resolves to absolute cwd");
+
+        let missing = PathBuf::from(format!(
+            "mempal-missing-cowork-peek-cwd-{}",
+            std::process::id()
+        ));
+        let error = resolve_cowork_peek_cwd(&missing).expect_err("missing cwd must be rejected");
+        assert!(
+            format!("{error:#}").contains("cannot be canonicalized"),
+            "error should explain canonicalization failure"
+        );
     }
 }

@@ -153,11 +153,14 @@ pub fn list_projects(db: &Database) -> Result<Vec<ProjectSummary>, DbError> {
         summary.path = path_map.get(&summary.wing).cloned();
     }
 
+    // Sort by last_activity descending. ISO 8601 / RFC 3339 timestamps sort
+    // correctly as strings (lexicographic order matches chronological order
+    // for fixed-format timestamps). Legacy epoch-seconds strings also sort
+    // correctly relative to each other, though they may interleave oddly with
+    // ISO timestamps — this is acceptable since production uses ISO timestamps.
     summaries.sort_by(|a, b| {
         b.last_activity
-            .parse::<i64>()
-            .unwrap_or(0)
-            .cmp(&a.last_activity.parse::<i64>().unwrap_or(0))
+            .cmp(&a.last_activity)
             .then_with(|| a.wing.cmp(&b.wing))
     });
     Ok(summaries)
