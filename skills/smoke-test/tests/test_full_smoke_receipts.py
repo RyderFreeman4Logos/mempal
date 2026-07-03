@@ -98,6 +98,78 @@ class ReceiptExtractionTests(unittest.TestCase):
             "database_lock_extra_holder",
         )
 
+    def test_classify_stderr_returns_none_for_pure_hot_reload_noise(self) -> None:
+        stderr = b"config hot-reload: bootstrapped version 8213fc2392e7\n"
+        self.assertIsNone(self.smoke.classify_stderr(stderr))
+
+    def test_classify_stderr_filters_hot_reload_but_keeps_real_errors(self) -> None:
+        stderr = (
+            b"config hot-reload: bootstrapped version 8213fc2392e7\n"
+            b"error: database is locked\n"
+        )
+        self.assertEqual(self.smoke.classify_stderr(stderr), "database_locked")
+
+
+class DoctorValidationTests(unittest.TestCase):
+    """Unit tests for validate_doctor_health.
+
+    These tests feed representative doctor JSON into the same validation
+    function used by main(), ensuring the schema-match and embedding-health
+    contract is exercised against the real implementation.
+    """
+
+    def setUp(self) -> None:
+        self.smoke = load_full_smoke()
+
+    def _base_report(self) -> dict[str, Any]:
+        return {
+            "supported_schema_version": 20,
+            "db": {"schema_version": 20, "compatible": True},
+            "warnings": [],
+            "embedding": {
+                "endpoints": [{"id": "primary", "cooldown_remaining_secs": None}],
+                "queue": {"failed_terminal": 0},
+            },
+        }
+
+    def test_healthy_report_passes(self) -> None:
+        result = self.smoke.validate_doctor_health(self._base_report())
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["schema_matches"])
+        self.assertTrue(result["embedding_ok"])
+
+    def test_schema_mismatch_fails(self) -> None:
+        report = self._base_report()
+        report["db"]["schema_version"] = 19
+        result = self.smoke.validate_doctor_health(report)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["schema_matches"])
+
+    def test_embedding_cooldown_fails(self) -> None:
+        report = self._base_report()
+        report["embedding"]["endpoints"][0]["cooldown_remaining_secs"] = 30
+        result = self.smoke.validate_doctor_health(report)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["embedding_endpoint_cooldowns"], 1)
+
+    def test_critical_warning_fails(self) -> None:
+        report = self._base_report()
+        report["warnings"] = ["database is corrupt"]
+        result = self.smoke.validate_doctor_health(report)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["critical_warning_count"], 1)
+
+    def test_operational_warning_does_not_fail(self) -> None:
+        report = self._base_report()
+        report["warnings"] = ["1 extra process(es) hold the database open"]
+        result = self.smoke.validate_doctor_health(report)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["critical_warning_count"], 0)
+
+    def test_non_dict_input_fails(self) -> None:
+        result = self.smoke.validate_doctor_health(None)
+        self.assertFalse(result["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()
