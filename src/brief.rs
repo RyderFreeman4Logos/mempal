@@ -6,9 +6,19 @@ use std::path::PathBuf;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::context::{ContextError, ContextItem, ContextPack, ContextRequest, assemble_context};
-use crate::core::types::{AnchorKind, KnowledgeEvidenceRole, MemoryDomain};
-use crate::embed::Embedder;
+use crate::context::{
+    ContextAnchor, ContextError, ContextItem, ContextPack, ContextRequest, ContextSection,
+    assemble_context_with_vector,
+};
+use crate::core::project::ProjectSearchScope;
+use crate::core::types::{AnchorKind, KnowledgeEvidenceRole, MemoryDomain, RouteDecision};
+use crate::embed::{EmbedError, Embedder};
+use crate::search::{
+    SearchError, SearchFilters, SearchMode, SearchOptions, VectorSearchCircuit,
+    bm25_fallback_warning_degraded, bm25_fallback_warning_dimension_mismatch,
+    bm25_fallback_warning_embed_error, bm25_fallback_warning_missing_query_vector,
+    bm25_fallback_warning_timeout, current_vector_dim, search_bm25_only_with_options,
+};
 
 pub type Result<T> = std::result::Result<T, BriefError>;
 
@@ -16,6 +26,18 @@ pub type Result<T> = std::result::Result<T, BriefError>;
 pub enum BriefError {
     #[error("failed to assemble brief context")]
     Context(#[from] ContextError),
+    #[error("failed to search brief candidates")]
+    Search(#[source] SearchError),
+    #[error("failed to embed brief query")]
+    EmbedQuery(#[source] EmbedError),
+    #[error("embedder returned no brief query vector")]
+    MissingQueryVector,
+    #[error("brief query embedding deadline exceeded after {deadline_secs}s")]
+    EmbedQueryTimeout { deadline_secs: u64 },
+    #[error(
+        "embedding dimension mismatch: drawer_vectors uses {current_dim}d but embedder returned {new_dim}d; run `mempal reindex --embedder <name>` before searching with this backend"
+    )]
+    VectorDimensionMismatch { current_dim: usize, new_dim: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +55,9 @@ pub struct CognitiveBrief {
     pub query: String,
     pub domain: MemoryDomain,
     pub field: String,
+    pub search_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub summary: BriefSummary,
     pub key_facts: Vec<BriefFact>,
     pub evidence: Vec<BriefEvidence>,
@@ -105,36 +130,133 @@ pub struct BriefEvidenceCitation {
     pub source_file: String,
 }
 
+#[derive(Debug, Clone)]
+pub enum BriefRetrievalPlan {
+    Hybrid { query_vector: Vec<f32> },
+    Bm25Only { warning: String },
+}
+
 pub async fn assemble_brief<E: Embedder + ?Sized>(
     db: &crate::core::db::Database,
     embedder: &E,
     request: BriefRequest,
 ) -> Result<CognitiveBrief> {
-    let context = assemble_context(
-        db,
-        embedder,
-        ContextRequest {
-            query: request.query,
-            domain: request.domain,
-            field: request.field,
-            cwd: request.cwd,
-            include_evidence: true,
-            include_cards: true,
-            max_items: request.max_items,
-            dao_tian_limit: request.dao_tian_limit,
-            project_id: None,
-            trigger: None,
-            context_cfg_override: None,
-            // brief is a separate surface; the P106 distill signal is scoped to
-            // mempal context / mempal_context only.
-            include_distill_suggestions: false,
-        },
+    let plan = plan_brief_retrieval(embedder, &request.query).await?;
+    assemble_brief_with_plan(db, request, plan)
+}
+
+pub async fn plan_brief_retrieval<E: Embedder + ?Sized>(
+    embedder: &E,
+    query: &str,
+) -> Result<BriefRetrievalPlan> {
+    let vector_search_circuit = VectorSearchCircuit::current();
+    if vector_search_circuit.bm25_fallback_enabled && vector_search_circuit.open {
+        return Ok(BriefRetrievalPlan::Bm25Only {
+            warning: bm25_fallback_warning_degraded(vector_search_circuit.failure_count),
+        });
+    }
+
+    let embeddings = match tokio::time::timeout(
+        std::time::Duration::from_secs(vector_search_circuit.search_deadline_secs),
+        embedder.embed(&[query]),
     )
-    .await?;
-    Ok(brief_from_context(context))
+    .await
+    {
+        Ok(Ok(embeddings)) => embeddings,
+        Ok(Err(error)) if vector_search_circuit.bm25_fallback_enabled => {
+            return Ok(BriefRetrievalPlan::Bm25Only {
+                warning: bm25_fallback_warning_embed_error(
+                    &crate::core::config::scrub_sensitive_text(&error.to_string()),
+                ),
+            });
+        }
+        Ok(Err(error)) => return Err(BriefError::EmbedQuery(error)),
+        Err(_) if vector_search_circuit.bm25_fallback_enabled => {
+            return Ok(BriefRetrievalPlan::Bm25Only {
+                warning: bm25_fallback_warning_timeout(vector_search_circuit.search_deadline_secs),
+            });
+        }
+        Err(_) => {
+            return Err(BriefError::EmbedQueryTimeout {
+                deadline_secs: vector_search_circuit.search_deadline_secs,
+            });
+        }
+    };
+
+    let Some(query_vector) = embeddings.into_iter().next() else {
+        if vector_search_circuit.bm25_fallback_enabled {
+            return Ok(BriefRetrievalPlan::Bm25Only {
+                warning: bm25_fallback_warning_missing_query_vector(),
+            });
+        }
+        return Err(BriefError::MissingQueryVector);
+    };
+
+    Ok(BriefRetrievalPlan::Hybrid { query_vector })
+}
+
+pub fn assemble_brief_with_plan(
+    db: &crate::core::db::Database,
+    request: BriefRequest,
+    plan: BriefRetrievalPlan,
+) -> Result<CognitiveBrief> {
+    match plan {
+        BriefRetrievalPlan::Hybrid { query_vector } => {
+            if let Some(current_dim) = current_vector_dim(db)
+                .map_err(SearchError::KeywordSearch)
+                .map_err(BriefError::Search)?
+                && current_dim != query_vector.len()
+            {
+                let vector_search_circuit = VectorSearchCircuit::current();
+                if vector_search_circuit.bm25_fallback_enabled {
+                    return assemble_brief_from_bm25(
+                        db,
+                        request,
+                        bm25_fallback_warning_dimension_mismatch(query_vector.len(), current_dim),
+                    );
+                }
+                return Err(BriefError::VectorDimensionMismatch {
+                    current_dim,
+                    new_dim: query_vector.len(),
+                });
+            }
+            let context = assemble_context_with_vector(
+                db,
+                context_request_from_brief(request),
+                &query_vector,
+            )?;
+            Ok(brief_from_context_with_metadata(
+                context,
+                SearchMode::Hybrid,
+                Vec::new(),
+            ))
+        }
+        BriefRetrievalPlan::Bm25Only { warning } => assemble_brief_from_bm25(db, request, warning),
+    }
+}
+
+pub fn assemble_brief_from_bm25(
+    db: &crate::core::db::Database,
+    request: BriefRequest,
+    warning: String,
+) -> Result<CognitiveBrief> {
+    let context = assemble_bm25_context(db, request)?;
+    Ok(brief_from_context_with_metadata(
+        context,
+        SearchMode::Bm25Only,
+        vec![warning],
+    ))
 }
 
 pub fn brief_from_context(context: ContextPack) -> CognitiveBrief {
+    brief_from_context_with_metadata(context, SearchMode::Hybrid, Vec::new())
+}
+
+fn brief_from_context_with_metadata(
+    context: ContextPack,
+    search_mode: SearchMode,
+    warnings: Vec<String>,
+) -> CognitiveBrief {
     let mut key_facts = Vec::new();
     let mut evidence = Vec::new();
     let mut cards = Vec::new();
@@ -204,6 +326,8 @@ pub fn brief_from_context(context: ContextPack) -> CognitiveBrief {
         query: context.query,
         domain: context.domain,
         field: context.field,
+        search_mode: search_mode.as_str().to_string(),
+        warnings,
         summary,
         key_facts,
         evidence,
@@ -213,6 +337,116 @@ pub fn brief_from_context(context: ContextPack) -> CognitiveBrief {
         uncertainty,
         next_actions,
     }
+}
+
+fn context_request_from_brief(request: BriefRequest) -> ContextRequest {
+    ContextRequest {
+        query: request.query,
+        domain: request.domain,
+        field: request.field,
+        cwd: request.cwd,
+        include_evidence: true,
+        include_cards: true,
+        max_items: request.max_items,
+        dao_tian_limit: request.dao_tian_limit,
+        project_id: None,
+        trigger: None,
+        context_cfg_override: None,
+        // brief is a separate surface; the P106 distill signal is scoped to
+        // mempal context / mempal_context only.
+        include_distill_suggestions: false,
+    }
+}
+
+fn assemble_bm25_context(
+    db: &crate::core::db::Database,
+    request: BriefRequest,
+) -> Result<ContextPack> {
+    let route = RouteDecision {
+        wing: None,
+        room: None,
+        confidence: 0.0,
+        reason: "brief BM25-only fallback".to_string(),
+    };
+    let scope = ProjectSearchScope::from_request(None, false, false, false);
+    let filters = SearchFilters {
+        domain: Some(domain_slug(&request.domain).to_string()),
+        field: Some(request.field.clone()),
+        ..SearchFilters::default()
+    };
+    let results = search_bm25_only_with_options(
+        db,
+        &request.query,
+        route,
+        &scope,
+        SearchOptions {
+            filters,
+            ..SearchOptions::default()
+        },
+        request.max_items,
+    )
+    .map_err(BriefError::Search)?;
+
+    let mut knowledge_items = Vec::new();
+    let mut evidence_items = Vec::new();
+    for result in results {
+        let text = result
+            .statement
+            .as_deref()
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .unwrap_or(result.content.as_str())
+            .to_string();
+        let item = ContextItem {
+            drawer_id: result.drawer_id,
+            source_file: result.source_file,
+            memory_kind: result.memory_kind,
+            text,
+            card_id: None,
+            tier: result.tier,
+            status: result.status,
+            anchor_kind: result.anchor_kind,
+            anchor_id: result.anchor_id,
+            parent_anchor_id: result.parent_anchor_id,
+            trigger_hints: None,
+            evidence_citations: Vec::new(),
+        };
+        if item.memory_kind.prefers_statement_text() {
+            knowledge_items.push(item);
+        } else {
+            evidence_items.push(item);
+        }
+    }
+
+    let mut sections = Vec::new();
+    if !knowledge_items.is_empty() {
+        sections.push(ContextSection {
+            name: "knowledge".to_string(),
+            items: knowledge_items,
+        });
+    }
+    if !evidence_items.is_empty() {
+        sections.push(ContextSection {
+            name: "evidence".to_string(),
+            items: evidence_items,
+        });
+    }
+
+    Ok(ContextPack {
+        query: request.query,
+        domain: request.domain,
+        field: request.field,
+        anchors: vec![ContextAnchor {
+            anchor_kind: AnchorKind::Repo,
+            anchor_id: crate::core::anchor::LEGACY_REPO_ANCHOR_ID.to_string(),
+        }],
+        sections,
+        recurring_themes: Vec::new(),
+        tiered: None,
+        repair_warnings: Vec::new(),
+        active_skills: Vec::new(),
+        distill_suggestions: Vec::new(),
+    })
 }
 
 fn citation_from_item(item: &ContextItem) -> BriefCitation {
@@ -387,4 +621,14 @@ fn is_entity_stopword(token: &str) -> bool {
         token,
         "The" | "This" | "That" | "No" | "Brief" | "Use" | "Review"
     )
+}
+
+fn domain_slug(value: &MemoryDomain) -> &'static str {
+    match value {
+        MemoryDomain::Project => "project",
+        MemoryDomain::User => "user",
+        MemoryDomain::Agent => "agent",
+        MemoryDomain::Skill => "skill",
+        MemoryDomain::Global => "global",
+    }
 }

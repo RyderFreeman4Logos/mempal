@@ -1,9 +1,10 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use mempal::core::anchor;
 use mempal::core::db::Database;
@@ -72,6 +73,36 @@ fn run_mempal_with_env(
         cmd.env(key, value);
     }
     cmd.output().expect("run mempal")
+}
+
+fn run_mempal_with_env_timeout(
+    home: &TempDir,
+    args: &[&str],
+    envs: &[(&str, String)],
+    timeout: Duration,
+) -> Output {
+    let mut cmd = Command::new(mempal_bin());
+    cmd.args(args)
+        .env("HOME", home.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    inject_embed_env(&mut cmd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().expect("spawn mempal");
+    let started = Instant::now();
+    loop {
+        if child.try_wait().expect("poll mempal").is_some() {
+            return child.wait_with_output().expect("collect mempal output");
+        }
+        if started.elapsed() > timeout {
+            child.kill().expect("kill timed out mempal");
+            let _ = child.wait_with_output();
+            panic!("mempal command exceeded {:?}", timeout);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn vector() -> Vec<f32> {
@@ -194,6 +225,14 @@ fn start_openai_embedding_stub(
     expected_query: &str,
     request_count: usize,
 ) -> (String, thread::JoinHandle<()>) {
+    start_openai_embedding_stub_with_vector(expected_query, request_count, vector())
+}
+
+fn start_openai_embedding_stub_with_vector(
+    expected_query: &str,
+    request_count: usize,
+    response_vector: Vec<f32>,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding stub");
     listener
         .set_nonblocking(true)
@@ -221,7 +260,7 @@ fn start_openai_embedding_stub(
             let payload: Value = serde_json::from_str(body).expect("parse embedding request");
             assert_eq!(payload["input"][0], expected_query);
             let body = serde_json::to_string(&json!({
-                "data": [{ "embedding": vector() }]
+                "data": [{ "embedding": response_vector.clone() }]
             }))
             .expect("serialize embedding response");
             let response = format!(
@@ -235,6 +274,57 @@ fn start_openai_embedding_stub(
         }
     });
     (format!("http://{address}/v1/embeddings"), handle)
+}
+
+fn start_slow_openai_embedding_stub(
+    expected_query: &str,
+    delay: Duration,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding stub");
+    listener
+        .set_nonblocking(true)
+        .expect("set slow embedding stub nonblocking");
+    let address = listener.local_addr().expect("local addr");
+    let expected_query = expected_query.to_string();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = (0..50)
+            .find_map(|_| match listener.accept() {
+                Ok(connection) => Some(connection),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    None
+                }
+                Err(error) => panic!("accept slow request: {error}"),
+            })
+            .expect("slow embedding stub timed out waiting for request");
+        let mut request = [0_u8; 4096];
+        let bytes_read = stream.read(&mut request).expect("read embedding request");
+        let request = String::from_utf8_lossy(&request[..bytes_read]);
+        let (_, body) = request
+            .split_once("\r\n\r\n")
+            .expect("request should contain JSON body");
+        let payload: Value = serde_json::from_str(body).expect("parse embedding request");
+        assert_eq!(payload["input"][0], expected_query);
+        thread::sleep(delay);
+        let body = serde_json::to_string(&json!({
+            "data": [{ "embedding": vector() }]
+        }))
+        .expect("serialize embedding response");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+    (format!("http://{address}/v1/embeddings"), handle)
+}
+
+fn write_brief_deadline_config(home: &TempDir, bm25_fallback: bool, deadline_secs: u64) {
+    let config = format!(
+        "[search]\nbm25_fallback = {bm25_fallback}\n\n[embed.retry]\nsearch_deadline_secs = {deadline_secs}\n"
+    );
+    fs::write(home.path().join(".mempal/config.toml"), config).expect("write brief config");
 }
 
 fn seed_brief_fixture(db: &Database) {
@@ -385,6 +475,131 @@ fn test_cli_brief_no_evidence_reports_uncertainty() {
             .iter()
             .any(|item| item.as_str().unwrap().contains("Ingest"))
     );
+}
+
+#[test]
+fn test_cli_brief_embedding_deadline_falls_back_to_bm25_json() {
+    let (home, db) = setup_cli_home();
+    write_brief_deadline_config(&home, true, 1);
+    let drawer = evidence_drawer(
+        "brief_evidence_deadline",
+        "Synthetic deadline query evidence exists for BM25 fallback citation.",
+    );
+    db.insert_drawer(&drawer).expect("insert drawer");
+    let query = "Synthetic deadline query";
+    let (endpoint, handle) = start_slow_openai_embedding_stub(query, Duration::from_millis(1500));
+    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
+
+    let output = run_mempal_with_env_timeout(
+        &home,
+        &["brief", query, "--format", "json"],
+        &[
+            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
+            ("MEMPAL_EMBED_BASE_URL", base_url),
+            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
+            ("MEMPAL_EMBED_DIM", "384".to_string()),
+        ],
+        Duration::from_secs(5),
+    );
+    assert!(
+        output.status.success(),
+        "brief fallback should exit 0; stderr bytes={}",
+        output.stderr.len()
+    );
+    assert!(!output.stdout.is_empty());
+    let brief: Value = serde_json::from_slice(&output.stdout).expect("brief json");
+    assert_eq!(brief["search_mode"], "bm25_only");
+    assert!(
+        brief["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .any(|warning| warning.as_str().is_some_and(|text| {
+                text.contains("embedding deadline exceeded after 1s")
+                    && text.contains("BM25-only search")
+            }))
+    );
+    assert_eq!(
+        brief["evidence"][0]["citation"]["drawer_id"],
+        "brief_evidence_deadline"
+    );
+    handle.join().expect("slow embedding stub");
+}
+
+#[test]
+fn test_cli_brief_embedding_dimension_mismatch_falls_back_to_bm25_json() {
+    let (home, db) = setup_cli_home();
+    write_brief_deadline_config(&home, true, 5);
+    let drawer = evidence_drawer(
+        "brief_evidence_dimension_mismatch",
+        "Synthetic dimension query evidence exists for BM25 fallback citation.",
+    );
+    db.insert_drawer(&drawer).expect("insert drawer");
+    db.insert_vector(&drawer.id, &[0.8, 0.2])
+        .expect("insert 2d vector");
+    let query = "Synthetic dimension query";
+    let (endpoint, handle) = start_openai_embedding_stub_with_vector(query, 1, vec![0.1, 0.2, 0.3]);
+    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
+
+    let output = run_mempal_with_env(
+        &home,
+        &["brief", query, "--format", "json"],
+        &[
+            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
+            ("MEMPAL_EMBED_BASE_URL", base_url),
+            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
+            ("MEMPAL_EMBED_DIM", "3".to_string()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "brief fallback should exit 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    handle.join().expect("embedding stub");
+    assert!(!output.stdout.is_empty());
+    let brief: Value = serde_json::from_slice(&output.stdout).expect("brief json");
+    assert_eq!(brief["search_mode"], "bm25_only");
+    assert!(
+        brief["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains("dimension mismatch")))
+    );
+    assert!(
+        brief["summary"]["narrative"]
+            .as_str()
+            .is_some_and(|summary| !summary.is_empty())
+    );
+    assert_eq!(
+        brief["evidence"][0]["citation"]["drawer_id"],
+        "brief_evidence_dimension_mismatch"
+    );
+    assert!(
+        brief["evidence"][0]["citation"]["source_file"]
+            .as_str()
+            .is_some_and(|source| !source.is_empty())
+    );
+}
+
+#[test]
+fn test_cli_brief_plain_no_results_is_not_blank() {
+    let (home, _db) = setup_cli_home();
+    let output = run_mempal(&home, &["brief", "No matching memory"]);
+    assert!(
+        output.status.success(),
+        "brief no-results failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.stdout.is_empty());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("## Summary"));
+    assert!(stdout.contains("No cited memory was found"));
+    assert!(stdout.contains("## Uncertainty"));
+    assert!(stdout.contains("## Next Actions"));
 }
 
 #[test]

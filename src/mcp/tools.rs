@@ -2901,6 +2901,11 @@ pub struct BriefMcpResponse {
     pub query: String,
     pub domain: String,
     pub field: String,
+    pub search_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_warnings: Vec<SystemWarning>,
     pub summary: BriefSummaryDto,
     pub key_facts: Vec<BriefFactDto>,
     pub evidence: Vec<BriefEvidenceDto>,
@@ -3203,6 +3208,9 @@ impl From<CognitiveBrief> for BriefMcpResponse {
             query: brief.query,
             domain: domain_slug(&brief.domain).to_string(),
             field: brief.field,
+            search_mode: brief.search_mode,
+            warnings: brief.warnings,
+            system_warnings: Vec::new(),
             summary: brief.summary.into(),
             key_facts: brief.key_facts.into_iter().map(Into::into).collect(),
             evidence: brief.evidence.into_iter().map(Into::into).collect(),

@@ -19,7 +19,7 @@ use mempal::bench_matrix::{
     BenchmarkMatrixArgs, BenchmarkMatrixDataset, BenchmarkMatrixFormat, BenchmarkMatrixModeArg,
     default_matrix_top_k, run_benchmark_matrix_command,
 };
-use mempal::brief::{BriefRequest, assemble_brief};
+use mempal::brief::{BriefRequest, assemble_brief, assemble_brief_from_bm25};
 use mempal::context::{ContextPack, ContextRequest, assemble_context};
 use mempal::core::{
     anchor,
@@ -125,7 +125,7 @@ use mempal::search::{
     bm25_fallback_warning_degraded, bm25_fallback_warning_dimension_mismatch,
     bm25_fallback_warning_embed_error, bm25_fallback_warning_missing_query_vector,
     bm25_fallback_warning_timeout, current_vector_dim as search_current_vector_dim,
-    maybe_rerank_search_results, search_bm25_only_with_options,
+    maybe_rerank_search_results, sanitize_search_warning_detail, search_bm25_only_with_options,
     search_with_vector_and_scope_options,
 };
 use mempal::sleep::{
@@ -24121,22 +24121,28 @@ async fn brief_command(
     if !matches!(format.as_str(), "plain" | "json") {
         bail!("unsupported brief format: {format}");
     }
-    let embedder = build_embedder(config).await?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let brief = assemble_brief(
-        db,
-        embedder.as_ref(),
-        BriefRequest {
-            query: query.clone(),
-            domain: mempal::core::types::MemoryDomain::Project,
-            field: "general".to_string(),
-            cwd,
-            max_items: 20,
-            dao_tian_limit: 5,
-        },
-    )
-    .await
-    .context("failed to assemble cognitive brief")?;
+    let request = BriefRequest {
+        query: query.clone(),
+        domain: mempal::core::types::MemoryDomain::Project,
+        field: "general".to_string(),
+        cwd,
+        max_items: 20,
+        dao_tian_limit: 5,
+    };
+    let brief = match build_embedder(config).await {
+        Ok(embedder) => assemble_brief(db, embedder.as_ref(), request)
+            .await
+            .context("failed to assemble cognitive brief")?,
+        Err(error) if config.search.bm25_fallback => {
+            let warning = bm25_fallback_warning_embed_error(&sanitize_search_warning_detail(
+                &error.to_string(),
+            ));
+            assemble_brief_from_bm25(db, request, warning)
+                .context("failed to assemble cognitive brief")?
+        }
+        Err(error) => return Err(error),
+    };
     match format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&brief)?),
         _ => print_brief_plain(&brief),
@@ -24145,6 +24151,13 @@ async fn brief_command(
 }
 
 fn print_brief_plain(brief: &mempal::brief::CognitiveBrief) {
+    if !brief.warnings.is_empty() {
+        println!("## Warnings");
+        for warning in &brief.warnings {
+            println!("- {warning}");
+        }
+        println!();
+    }
     println!("## Summary\n{}", brief.summary.narrative);
     println!("\n## Key Facts");
     for fact in &brief.key_facts {
