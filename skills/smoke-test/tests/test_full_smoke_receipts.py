@@ -209,5 +209,116 @@ class FailureLedgerTests(unittest.TestCase):
         self.assertEqual(self.smoke.SUMMARY['failures'], [])
 
 
+class ConformanceReportTests(unittest.TestCase):
+    """Regression tests for aggregate conformance reporting."""
+
+    def setUp(self) -> None:
+        self.smoke = load_full_smoke()
+        self.smoke.SUMMARY['failures'] = []
+        self.smoke.SUMMARY['groups'] = {}
+
+    def test_conformance_report_summarizes_pass_fail_and_missing(self) -> None:
+        self.smoke.note('probe_pass', True, stdout_bytes=10)
+        self.smoke.note('probe_fail', False, stderr_class='database_locked')
+        specs = {
+            'example': {
+                'features': ['feature.a', 'feature.b'],
+                'probes': ['probe_pass', 'probe_fail', 'probe_missing'],
+                'skipped_reason': 'not available',
+            }
+        }
+
+        report = self.smoke.build_conformance_report(specs)
+        group = report['groups']['example']
+
+        self.assertEqual(report['schema'], 'mempal_conformance_smoke_v1')
+        self.assertEqual(group['status'], 'fail')
+        self.assertEqual(group['feature_count'], 2)
+        self.assertEqual(group['failed_probes'], ['probe_fail'])
+        self.assertEqual(group['missing_probes'], ['probe_missing'])
+        self.assertEqual(group['failure_classes'], {'probe_fail': 'database_locked'})
+
+    def test_conformance_report_fails_when_passed_group_has_missing_probe(self) -> None:
+        self.smoke.note('probe_pass', True, stdout_bytes=10)
+        specs = {
+            'example': {
+                'features': ['feature.a', 'feature.b'],
+                'probes': ['probe_pass', 'probe_missing'],
+                'skipped_reason': 'not available',
+            }
+        }
+
+        report = self.smoke.build_conformance_report(specs)
+        group = report['groups']['example']
+
+        self.assertEqual(group['status'], 'fail')
+        self.assertEqual(group['passed_probe_count'], 1)
+        self.assertEqual(group['missing_probe_count'], 1)
+        self.assertEqual(group['missing_probes'], ['probe_missing'])
+        self.assertEqual(report['summary']['fail'], 1)
+
+    def test_overall_ok_fails_when_conformance_group_fails(self) -> None:
+        self.smoke.note('probe_pass', True, stdout_bytes=10)
+        specs = {
+            'example': {
+                'features': ['feature.a'],
+                'probes': ['probe_pass', 'probe_missing'],
+            }
+        }
+        self.smoke.SUMMARY['conformance'] = self.smoke.build_conformance_report(specs)
+        self.smoke.SUMMARY['cleanup'] = {'failures': 0}
+        self.smoke.SUMMARY['binary_consistency'] = {'ok': True}
+
+        self.assertEqual(self.smoke.SUMMARY['failures'], [])
+        self.assertFalse(self.smoke.smoke_overall_ok(self.smoke.SUMMARY))
+
+    def test_conformance_report_fails_group_when_expected_probes_are_missing(self) -> None:
+        specs = {
+            'optional': {
+                'features': ['feature.optional'],
+                'probes': ['probe_missing'],
+                'skipped_reason': 'tool not advertised',
+            }
+        }
+
+        report = self.smoke.build_conformance_report(specs)
+        group = report['groups']['optional']
+
+        self.assertEqual(group['status'], 'fail')
+        self.assertIsNone(group['skipped_reason'])
+        self.assertEqual(report['summary']['fail'], 1)
+
+    def test_conformance_report_marks_recorded_skips_without_probe_passes_as_skipped(self) -> None:
+        self.smoke.note('probe_skipped', True, skipped='tool_not_advertised')
+        specs = {
+            'optional': {
+                'features': ['feature.optional'],
+                'probes': ['probe_skipped'],
+                'skipped_reason': 'tool not advertised',
+            }
+        }
+
+        report = self.smoke.build_conformance_report(specs)
+        group = report['groups']['optional']
+
+        self.assertEqual(group['status'], 'skipped')
+        self.assertEqual(group['skipped_reason'], 'tool not advertised')
+        self.assertEqual(report['summary']['skipped'], 1)
+
+    def test_conformance_report_does_not_copy_raw_probe_fields(self) -> None:
+        self.smoke.note(
+            'probe_pass',
+            True,
+            content='raw drawer text must not be copied',
+            preview='raw preview must not be copied',
+        )
+        specs = {'safe': {'features': ['feature.safe'], 'probes': ['probe_pass']}}
+
+        encoded = repr(self.smoke.build_conformance_report(specs))
+
+        self.assertNotIn('raw drawer text', encoded)
+        self.assertNotIn('raw preview', encoded)
+
+
 if __name__ == "__main__":
     unittest.main()

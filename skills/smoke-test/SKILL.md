@@ -13,6 +13,7 @@ Keep this file as the high-level runbook. Load references only when the current 
 - `references/reversible-crud.md` — reversible CLI and MCP memory CRUD, exact-created-ID cleanup authority, and MCP stdio lifecycle.
 - `references/rest-resource-and-done.md` — REST checks, dangerous/non-default surfaces, memory/I/O guardrails, and done criteria.
 - `scripts/full_smoke.py` — preferred automated full smoke runner; execute it instead of reimplementing the matrix when broad coverage is requested.
+- `../../docs/conformance-matrix.md` — feature-preservation conformance matrix; `scripts/full_smoke.py` emits aggregate pass/fail/skipped status for its feature groups under the final JSON `conformance` key.
 
 ## Safety rules
 
@@ -32,6 +33,7 @@ python3 skills/smoke-test/scripts/full_smoke.py > /tmp/mempal-skill-full-smoke.l
 ```
 
 The runner prints one aggregate JSON object and avoids raw memory content. It covers installed CLI identity/status, read-only surfaces, reversible CLI CRUD, short-lived MCP read/CRUD, cleanup, and coarse I/O telemetry.
+It also reports feature-preservation conformance by group according to `docs/conformance-matrix.md`.
 
 If it exits nonzero or times out, parse only the final JSON summary:
 
@@ -46,6 +48,7 @@ print({
     'failures': data.get('failures'),
     'cleanup': data.get('cleanup'),
     'created_counts': data.get('created_counts'),
+    'conformance': data.get('conformance', {}).get('summary'),
     'group_count': len(data.get('groups', {})),
 })
 for name, info in (data.get('groups') or {}).items():
