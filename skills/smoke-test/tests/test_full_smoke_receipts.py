@@ -209,5 +209,65 @@ class FailureLedgerTests(unittest.TestCase):
         self.assertEqual(self.smoke.SUMMARY['failures'], [])
 
 
+class ConformanceReportTests(unittest.TestCase):
+    """Regression tests for aggregate conformance reporting."""
+
+    def setUp(self) -> None:
+        self.smoke = load_full_smoke()
+        self.smoke.SUMMARY['failures'] = []
+        self.smoke.SUMMARY['groups'] = {}
+
+    def test_conformance_report_summarizes_pass_fail_and_missing(self) -> None:
+        self.smoke.note('probe_pass', True, stdout_bytes=10)
+        self.smoke.note('probe_fail', False, stderr_class='database_locked')
+        specs = {
+            'example': {
+                'features': ['feature.a', 'feature.b'],
+                'probes': ['probe_pass', 'probe_fail', 'probe_missing'],
+                'skipped_reason': 'not available',
+            }
+        }
+
+        report = self.smoke.build_conformance_report(specs)
+        group = report['groups']['example']
+
+        self.assertEqual(report['schema'], 'mempal_conformance_smoke_v1')
+        self.assertEqual(group['status'], 'fail')
+        self.assertEqual(group['feature_count'], 2)
+        self.assertEqual(group['failed_probes'], ['probe_fail'])
+        self.assertEqual(group['missing_probes'], ['probe_missing'])
+        self.assertEqual(group['failure_classes'], {'probe_fail': 'database_locked'})
+
+    def test_conformance_report_marks_group_skipped_without_probe_passes(self) -> None:
+        specs = {
+            'optional': {
+                'features': ['feature.optional'],
+                'probes': ['probe_missing'],
+                'skipped_reason': 'tool not advertised',
+            }
+        }
+
+        report = self.smoke.build_conformance_report(specs)
+        group = report['groups']['optional']
+
+        self.assertEqual(group['status'], 'skipped')
+        self.assertEqual(group['skipped_reason'], 'tool not advertised')
+        self.assertEqual(report['summary']['skipped'], 1)
+
+    def test_conformance_report_does_not_copy_raw_probe_fields(self) -> None:
+        self.smoke.note(
+            'probe_pass',
+            True,
+            content='raw drawer text must not be copied',
+            preview='raw preview must not be copied',
+        )
+        specs = {'safe': {'features': ['feature.safe'], 'probes': ['probe_pass']}}
+
+        encoded = repr(self.smoke.build_conformance_report(specs))
+
+        self.assertNotIn('raw drawer text', encoded)
+        self.assertNotIn('raw preview', encoded)
+
+
 if __name__ == "__main__":
     unittest.main()

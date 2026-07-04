@@ -40,6 +40,178 @@ SUMMARY: dict[str, Any] = {
 OWNED_MCP_CHILDREN: dict[int, subprocess.Popen[Any]] = {}
 
 PROC_IO_KEYS = ('read_bytes', 'write_bytes', 'cancelled_write_bytes', 'rchar', 'wchar')
+CONFORMANCE_MATRIX_PATH = 'docs/conformance-matrix.md'
+CONFORMANCE_GROUPS: dict[str, dict[str, Any]] = {
+    'runtime_daemon_service': {
+        'features': [
+            'runtime.installed_binary',
+            'runtime.daemon_singleton',
+            'runtime.db_holders',
+            'runtime.schema_compatibility',
+        ],
+        'probes': [
+            'version',
+            'daemon_status_pre',
+            'status',
+            'queue_failed',
+            'doctor_json',
+            'doctor_json_validation',
+            'binary_consistency',
+        ],
+        'skipped_reason': 'installed binary, daemon, or doctor command unavailable',
+    },
+    'core_cli_memory_lifecycle': {
+        'features': [
+            'cli.ingest',
+            'cli.search',
+            'cli.context',
+            'cli.view_read',
+            'cli.pinned_facts',
+            'cli.pin_unpin',
+            'cli.delete_soft_delete',
+        ],
+        'probes': [
+            'cli_create',
+            'cli_read_view',
+            'cli_search_created',
+            'cli_search_created_match',
+            'cli_context_created',
+            'cli_pinned_before',
+            'cli_pin',
+            'cli_unpin',
+            'cli_pinned_after',
+            'cli_update',
+            'cli_read_updated',
+            'cli_delete_batch',
+            'cli_search_post_delete',
+            'cli_crud',
+        ],
+        'skipped_reason': 'write smoke could not create cleanup-authorized drawer ids',
+    },
+    'typed_project_metadata': {
+        'features': [
+            'metadata.wing',
+            'metadata.room',
+            'metadata.project',
+            'metadata.source_type',
+            'metadata.memory_kind',
+            'metadata.domain',
+            'metadata.field',
+        ],
+        'probes': [
+            'field_taxonomy_json',
+            'mcp_read_field_taxonomy',
+            'cli_create',
+            'cli_search_created_match',
+            'mcp_create',
+            'mcp_search_created_match',
+        ],
+        'skipped_reason': 'metadata smoke skipped because live create/search path was unavailable',
+    },
+    'cli_dashboard_maintenance': {
+        'features': [
+            'cli.timeline',
+            'cli.tail',
+            'cli.stats',
+            'cli.repair',
+            'cli.purge',
+        ],
+        'probes': [
+            'timeline_json',
+            'tail_shape',
+            'stats_shape',
+            'repair_json',
+        ],
+        'skipped_reason': 'dashboard or maintenance commands unavailable in installed binary',
+    },
+    'rest_availability': {
+        'features': [
+            'rest.doctor',
+            'rest.status',
+            'rest.search',
+            'rest.ingest',
+            'rest.taxonomy',
+            'rest.timeline',
+            'rest.pinned_facts',
+        ],
+        'probes': [
+            'doctor_rest',
+        ],
+        'skipped_reason': 'REST feature disabled or daemon REST endpoint unreachable',
+    },
+    'mcp_tools': {
+        'features': [
+            'mcp.status',
+            'mcp.search',
+            'mcp.context',
+            'mcp.read',
+            'mcp.pinned',
+            'mcp.timeline',
+            'mcp.doctor',
+            'mcp.ingest',
+            'mcp.delete',
+            'mcp.operation_status',
+        ],
+        'probes': [
+            'mcp_tools_list',
+            'mcp_read_pinned_facts',
+            'mcp_read_timeline',
+            'mcp_read_doctor',
+            'mcp_read_field_taxonomy',
+            'mcp_read_taxonomy',
+            'mcp_read_kg',
+            'mcp_read_skill',
+            'mcp_create',
+            'mcp_operation_status',
+            'mcp_search',
+            'mcp_search_created_match',
+            'mcp_read_drawer',
+            'mcp_read_drawers',
+            'mcp_context',
+            'mcp_brief',
+            'mcp_update',
+            'mcp_read_updated',
+            'mcp_delete_batch',
+            'mcp_crud',
+            'mcp_status_last',
+        ],
+        'skipped_reason': 'MCP stdio server unavailable or required tools not advertised',
+    },
+    'embedding_search_behavior': {
+        'features': [
+            'search.hybrid_vector_bm25',
+            'search.bm25_fallback',
+            'search.degraded_warnings',
+            'search.bounded_query',
+            'context.brief_bounded',
+        ],
+        'probes': [
+            'doctor_json_validation',
+            'cli_search_created_match',
+            'cli_context_created',
+            'mcp_search_created_match',
+            'mcp_brief',
+        ],
+        'skipped_reason': 'embedding/search probes skipped because live create/search path was unavailable',
+    },
+    'privacy_cleanup_safety': {
+        'features': [
+            'safety.aggregate_diagnostics',
+            'safety.cleanup_exact_created_ids',
+            'safety.no_raw_diagnostics',
+            'safety.queue_payload_redaction',
+        ],
+        'probes': [
+            'doctor_json',
+            'queue_failed',
+            'cli_delete_batch',
+            'mcp_delete_batch',
+            'cli_crud',
+            'mcp_crud',
+        ],
+        'skipped_reason': 'cleanup safety probes skipped because no cleanup-authorized ids were created',
+    },
+}
 
 
 def note(name: str, ok: bool, **fields: Any) -> None:
@@ -64,6 +236,82 @@ def clear_probe_failures(*labels: str) -> None:
 
 def without_ok(info: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in info.items() if key != 'ok'}
+
+
+def _probe_result(label: str) -> tuple[str, dict[str, Any]]:
+    info = SUMMARY['groups'].get(label)
+    if not isinstance(info, dict):
+        return 'missing', {}
+    if info.get('ok') is True:
+        if info.get('skipped') or info.get('skipped_reason'):
+            return 'skipped', info
+        return 'pass', info
+    return 'fail', info
+
+
+def build_conformance_report(
+    group_specs: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build aggregate feature-group conformance from existing smoke probes.
+
+    The report intentionally references only feature ids, probe labels, counts,
+    and error classes already present in aggregate probe notes. It never copies
+    command stdout, drawer content, search previews, prompts, or headers.
+    """
+    specs = group_specs or CONFORMANCE_GROUPS
+    groups: dict[str, Any] = {}
+    summary_counts = {'pass': 0, 'fail': 0, 'skipped': 0}
+    for group_name, spec in specs.items():
+        probes = [p for p in spec.get('probes', []) if isinstance(p, str)]
+        features = [f for f in spec.get('features', []) if isinstance(f, str)]
+        passed: list[str] = []
+        failed: list[str] = []
+        skipped: list[str] = []
+        missing: list[str] = []
+        failure_classes: dict[str, str] = {}
+
+        for probe in probes:
+            status, info = _probe_result(probe)
+            if status == 'pass':
+                passed.append(probe)
+            elif status == 'fail':
+                failed.append(probe)
+                failure_class = info.get('stderr_class') or info.get('error_type') or info.get('reason')
+                if isinstance(failure_class, str):
+                    failure_classes[probe] = failure_class
+            elif status == 'skipped':
+                skipped.append(probe)
+            else:
+                missing.append(probe)
+
+        if failed:
+            status = 'fail'
+        elif passed:
+            status = 'pass'
+        else:
+            status = 'skipped'
+        summary_counts[status] += 1
+
+        groups[group_name] = {
+            'status': status,
+            'feature_count': len(features),
+            'probe_count': len(probes),
+            'passed_probe_count': len(passed),
+            'skipped_probe_count': len(skipped),
+            'missing_probe_count': len(missing),
+            'feature_ids': features,
+            'failed_probes': failed or None,
+            'failure_classes': failure_classes or None,
+            'missing_probes': missing or None,
+            'skipped_reason': spec.get('skipped_reason') if status == 'skipped' else None,
+        }
+
+    return {
+        'schema': 'mempal_conformance_smoke_v1',
+        'matrix': CONFORMANCE_MATRIX_PATH,
+        'groups': groups,
+        'summary': summary_counts,
+    }
 
 
 def daemon_main_pid() -> int | None:
@@ -924,18 +1172,31 @@ def mcp_crud() -> list[str]:
         create_args = {'content': f'{MARKER} reversible MCP smoke drawer; nonce {NONCE}; lexical tokens azurequill basaltfern cobaltlyric; safe to delete', 'wing': 'smoke', 'room': 'mcp', 'source_type': 'agent_inference', 'memory_kind': 'evidence', 'domain': 'project', 'field': 'smoke', 'smoke': True, 'wait': True, 'wait_timeout_secs': 15}
         create, info = _mcp_tool_with_hard_timeout(client, 'mempal_ingest', create_args, timeout=30)
         ids = created_ids_from(create)
+        create_operation_id = operation_id_from(create)
         create_recovery: dict[str, Any] = {
-            'operation_id_present': bool(operation_id_from(create)),
+            'operation_id_present': bool(create_operation_id),
             'operation_state': operation_state_from(create),
         }
-        if not ids and operation_id_from(create):
+        if create_operation_id and client is not None:
+            status_structured, status_info = client.tool(
+                'mempal_operation_status',
+                {'operation_id': create_operation_id},
+                timeout=30,
+            )
+            note('mcp_operation_status', bool(status_info.get('ok')), **without_ok(status_info))
+        elif 'mempal_operation_status' in tool_names:
+            note('mcp_operation_status', True, skipped='no_operation_receipt')
+        else:
+            note('mcp_operation_status', True, skipped='tool_not_advertised')
+
+        if not ids and create_operation_id:
             # A non-terminal MCP ingest receipt means the daemon may still be
             # processing the write. Close this stdio server before following the
             # operation via CLI so the smoke runner never observes a result while
             # its own MCP process is still an extra SQLite holder.
             client.close()
             client = None
-            waited = wait_operation(operation_id_from(create) or '', 'mcp_create_cli_wait')
+            waited = wait_operation(create_operation_id, 'mcp_create_cli_wait')
             ids = created_ids_from(waited)
             create_recovery.update({'recovered_via': 'mcp_create_cli_wait', 'recovered_state': operation_state_from(waited)})
             SUMMARY['mcp_ingest_fallback_to_cli'] += 1
@@ -1322,7 +1583,10 @@ def main() -> int:
         SUMMARY['failures'] = [f for f in SUMMARY['failures'] if f != 'doctor_json_validation']
         SUMMARY['failures'].append('doctor_json_validation')
     run_cli('status', ['mempal', 'status'], timeout=60)
+    run_cli('queue_failed', ['mempal', 'queue', 'failed'], timeout=60)
     run_cli('timeline_json', ['mempal', 'timeline', '--since', '1h', '--format', 'json'], expect_json=True, timeout=60)
+    run_cli('tail_shape', ['mempal', 'tail', '--limit', '3'], timeout=60)
+    run_cli('stats_shape', ['mempal', 'stats'], timeout=60)
     run_cli('pinned_json', ['mempal', 'pinned', '--json'], expect_json=True, timeout=60)
     run_cli('field_taxonomy_json', ['mempal', 'field-taxonomy', '--format', 'json'], expect_json=True, timeout=60)
     run_cli('patterns_json', ['mempal', 'patterns', 'list', '--json'], expect_json=True, timeout=60)
@@ -1345,6 +1609,7 @@ def main() -> int:
     SUMMARY['io']['daemon_proc_io_delta'] = io_delta(daemon_io_before, daemon_io_after) if daemon_pid_before == daemon_pid_after else None
     SUMMARY['io']['child_block_io_delta'] = child_io_blocks_delta(child_io_before, child_io_after)
     SUMMARY['duration_ms'] = int((time.monotonic() - start) * 1000)
+    SUMMARY['conformance'] = build_conformance_report()
     binary_ok = SUMMARY.get('binary_consistency', {}).get('ok', True)
     SUMMARY['overall_ok'] = not SUMMARY['failures'] and SUMMARY['cleanup']['failures'] == 0 and binary_ok
     append_io_history()
