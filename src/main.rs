@@ -5475,14 +5475,14 @@ fn sqlite_writer_conflict_is_live_daemon(
         .context("failed to inspect daemon writer lease")
 }
 
-fn sqlite_writer_conflict_is_live_daemon_ingest_worker(
+fn sqlite_writer_conflict_is_live_durable_ingest_worker(
     db: &Database,
     active: &[RuntimeWriterLease],
 ) -> Result<bool> {
     if !matches!(active, [lease] if matches!(lease.mode.as_str(), "daemon" | "mcp-ingest-worker")) {
         return Ok(false);
     }
-    db.runtime_writer_lease_has_live_daemon_ingest_worker(SQLITE_WRITER_LEASE_NAME)
+    db.runtime_writer_lease_has_live_durable_ingest_worker(SQLITE_WRITER_LEASE_NAME)
         .context("failed to inspect daemon ingest writer lease")
 }
 
@@ -5493,7 +5493,7 @@ fn stdin_wait_should_use_queue_admission(db: &Database) -> Result<bool> {
     let active = db
         .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
         .unwrap_or_default();
-    sqlite_writer_conflict_is_live_daemon_ingest_worker(db, &active)
+    sqlite_writer_conflict_is_live_durable_ingest_worker(db, &active)
 }
 
 fn spawn_maintenance_writer_lease_heartbeat(

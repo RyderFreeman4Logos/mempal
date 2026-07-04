@@ -1654,6 +1654,18 @@ impl MempalMcpServer {
         let _ = heartbeat.await;
     }
 
+    fn ingest_worker_role(worker_id: &str) -> &'static str {
+        if worker_id.starts_with("mcp-ingest-scoped-wait-") {
+            "scoped-wait"
+        } else if worker_id.starts_with("mcp-ingest-scoped-worker-") {
+            "scoped-drain"
+        } else if worker_id.starts_with("mcp-ingest-worker-") {
+            "background"
+        } else {
+            "unknown"
+        }
+    }
+
     async fn acquire_ingest_writer_lease(
         &self,
         worker_id: &str,
@@ -1662,6 +1674,7 @@ impl MempalMcpServer {
         let owner = worker_id.to_string();
         let metadata_json = serde_json::json!({
             "component": "mcp-ingest-worker",
+            "worker_role": Self::ingest_worker_role(worker_id),
             "db_path": db_path.display().to_string(),
         })
         .to_string();
@@ -2000,7 +2013,7 @@ impl MempalMcpServer {
                 self.operation_status_deadline
                     .min(Duration::from_millis(500)),
                 |db| {
-                    db.runtime_writer_lease_has_live_daemon_ingest_worker(SQLITE_WRITER_LEASE_NAME)
+                    db.runtime_writer_lease_has_live_durable_ingest_worker(SQLITE_WRITER_LEASE_NAME)
                         .map_err(db_error)
                 },
             )
@@ -12415,6 +12428,56 @@ mod tests {
             .await
             .expect("scoped unbounded wait should complete locally")
             .0;
+
+        assert_eq!(response.state, Some(IngestOperationState::Completed));
+        assert!(!response.timed_out);
+        assert!(!response.created_drawer_ids.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_mcp_scoped_wait_holder_does_not_suppress_scoped_processing() {
+        let (_tempdir, db_path, server) = setup_server();
+        let scoped_wait_lease = Database::open(&db_path)
+            .expect("open db")
+            .runtime_writer_lease_acquire(
+                SQLITE_WRITER_LEASE_NAME,
+                "mcp-ingest-scoped-wait-test-holder",
+                "mcp-ingest-worker",
+                300,
+                None,
+            )
+            .expect("acquire scoped wait writer lease")
+            .expect("scoped wait writer lease");
+
+        let release_db_path = db_path.clone();
+        let release_lease = scoped_wait_lease.clone();
+        let release_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            release_test_ingest_writer_lease(&release_db_path, &release_lease);
+        });
+
+        let response = server
+            .mempal_ingest_with_controls_scoped_worker(
+                IngestRequest {
+                    content: "scoped wait holder must not make unrelated wait ingest queue-only"
+                        .to_string(),
+                    wing: "mcp".to_string(),
+                    room: Some("lease-probe".to_string()),
+                    wait: Some(true),
+                    wait_timeout_secs: Some(6),
+                    ..IngestRequest::default()
+                },
+                IngestControls {
+                    no_gate: true,
+                    bypass_novelty: true,
+                },
+            )
+            .await
+            .expect("scoped wait should process once holder exits")
+            .0;
+
+        release_task.await.expect("release scoped wait lease");
 
         assert_eq!(response.state, Some(IngestOperationState::Completed));
         assert!(!response.timed_out);
