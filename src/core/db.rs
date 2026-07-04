@@ -83,6 +83,47 @@ fn runtime_writer_session_id(name: &str, owner: &str) -> String {
     hasher.finalize().to_hex()[..16].to_string()
 }
 
+const MCP_INGEST_BACKGROUND_WORKER_OWNER_PREFIX: &str = "mcp-ingest-worker-";
+const MCP_INGEST_SCOPED_WORKER_OWNER_PREFIX: &str = "mcp-ingest-scoped-worker-";
+const MCP_INGEST_SCOPED_WAIT_OWNER_PREFIX: &str = "mcp-ingest-scoped-wait-";
+
+fn runtime_writer_lease_is_durable_ingest_worker(
+    owner: &str,
+    mode: &str,
+    metadata_json: Option<&str>,
+) -> bool {
+    match mode {
+        "daemon" => true,
+        "mcp-ingest-worker" => runtime_writer_mcp_ingest_worker_is_durable(owner, metadata_json),
+        _ => false,
+    }
+}
+
+fn runtime_writer_mcp_ingest_worker_is_durable(owner: &str, metadata_json: Option<&str>) -> bool {
+    if owner.starts_with(MCP_INGEST_SCOPED_WAIT_OWNER_PREFIX) {
+        return false;
+    }
+    owner.starts_with(MCP_INGEST_BACKGROUND_WORKER_OWNER_PREFIX)
+        || owner.starts_with(MCP_INGEST_SCOPED_WORKER_OWNER_PREFIX)
+        || runtime_writer_metadata_marks_durable_mcp_ingest_worker(metadata_json)
+}
+
+fn runtime_writer_metadata_marks_durable_mcp_ingest_worker(metadata_json: Option<&str>) -> bool {
+    let Some(metadata_json) = metadata_json else {
+        return false;
+    };
+    let Ok(metadata) = serde_json::from_str::<Value>(metadata_json) else {
+        return false;
+    };
+    if metadata.get("component").and_then(Value::as_str) != Some("mcp-ingest-worker") {
+        return false;
+    }
+    matches!(
+        metadata.get("worker_role").and_then(Value::as_str),
+        Some("background" | "scoped-drain")
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn runtime_boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
@@ -5571,6 +5612,40 @@ impl Database {
         Ok(false)
     }
 
+    pub fn runtime_writer_lease_has_live_durable_ingest_worker(
+        &self,
+        name: &str,
+    ) -> Result<bool, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT owner, pid, boot_id, mode, metadata_json \
+             FROM runtime_writer_leases \
+             WHERE name = ?1 AND mode IN ('daemon', 'mcp-ingest-worker')",
+        )?;
+        let rows = stmt.query_map([name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (owner, pid_i64, boot_id, mode, metadata_json) = row?;
+            if runtime_writer_lease_is_durable_ingest_worker(
+                &owner,
+                &mode,
+                metadata_json.as_deref(),
+            ) && u32::try_from(pid_i64)
+                .ok()
+                .is_some_and(|pid| runtime_writer_process_is_live_holder(pid, boot_id.as_deref()))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn runtime_writer_lease_cleanup_expired(&self) -> Result<usize, DbError> {
         self.with_immediate_tx(|| self.runtime_writer_lease_cleanup_expired_tx(false))
     }
@@ -7811,6 +7886,52 @@ mod tests {
             .expect("maintenance acquire")
             .expect("maintenance can reclaim expired lease");
         assert_eq!(maintenance.owner, "maintenance");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_writer_live_durable_ingest_worker_detects_mcp_worker_holder() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::open(&db_path).expect("open db");
+        db.runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "mcp-ingest-worker-test",
+            "mcp-ingest-worker",
+            300,
+            None,
+        )
+        .expect("acquire runtime writer lease")
+        .expect("runtime writer lease");
+
+        assert!(
+            db.runtime_writer_lease_has_live_durable_ingest_worker("sqlite-writer")
+                .expect("check live daemon ingest worker lease"),
+            "current-process MCP ingest worker lease must be visible to wait deferral"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_writer_live_durable_ingest_worker_excludes_scoped_wait_holder() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::open(&db_path).expect("open db");
+        db.runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "mcp-ingest-scoped-wait-test",
+            "mcp-ingest-worker",
+            300,
+            Some(r#"{"component":"mcp-ingest-worker","worker_role":"scoped-wait"}"#),
+        )
+        .expect("acquire runtime writer lease")
+        .expect("runtime writer lease");
+
+        assert!(
+            !db.runtime_writer_lease_has_live_durable_ingest_worker("sqlite-writer")
+                .expect("check live scoped wait lease"),
+            "scoped wait workers only process their own operation and must not prove durable queue drainage"
+        );
     }
 
     #[test]

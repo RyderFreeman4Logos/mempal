@@ -112,7 +112,7 @@ use mempal::llm::{DEFAULT_GATING_JUDGE_PROMPT, LlmError, LlmMessage, LlmRequest,
 use mempal::markdown_export::{MarkdownExportOptions, default_max_body_bytes, export_markdown};
 use mempal::mcp::{
     IngestControls, IngestOperationState, IngestRequest, IngestResponse, MempalMcpServer,
-    OperationStatusRequest,
+    OperationStatusRequest, daemon_ingest_ipc_available_for_path,
 };
 use mempal::observability;
 use mempal::reflect::{
@@ -5475,6 +5475,27 @@ fn sqlite_writer_conflict_is_live_daemon(
         .context("failed to inspect daemon writer lease")
 }
 
+fn sqlite_writer_conflict_is_live_durable_ingest_worker(
+    db: &Database,
+    active: &[RuntimeWriterLease],
+) -> Result<bool> {
+    if !matches!(active, [lease] if matches!(lease.mode.as_str(), "daemon" | "mcp-ingest-worker")) {
+        return Ok(false);
+    }
+    db.runtime_writer_lease_has_live_durable_ingest_worker(SQLITE_WRITER_LEASE_NAME)
+        .context("failed to inspect daemon ingest writer lease")
+}
+
+fn stdin_wait_should_use_queue_admission(db: &Database) -> Result<bool> {
+    if daemon_ingest_ipc_available_for_path(db.path()) {
+        return Ok(true);
+    }
+    let active = db
+        .runtime_writer_lease_status(Some(SQLITE_WRITER_LEASE_NAME))
+        .unwrap_or_default();
+    sqlite_writer_conflict_is_live_durable_ingest_worker(db, &active)
+}
+
 fn spawn_maintenance_writer_lease_heartbeat(
     db_path: PathBuf,
     lease: RuntimeWriterLease,
@@ -6210,6 +6231,68 @@ fn resolve_confidence_bound(
     }
 }
 
+async fn run_stdin_wait_ingest_queue(
+    db: &Database,
+    config: &Config,
+    record: &StdinIngestRecord,
+    resolved: &ResolvedStdinIngest,
+    wait_timeout_secs: u64,
+    json: bool,
+) -> Result<()> {
+    let wait_request = resolved.wait_request(wait_timeout_secs);
+    let controls = IngestControls {
+        no_gate: resolved.no_gate,
+        bypass_novelty: resolved.bypass_novelty,
+    };
+    let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone())?;
+    let response = server
+        .mempal_ingest_with_controls_scoped_worker(wait_request, controls)
+        .await
+        .map(|response| response.0)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if response.timed_out {
+        print_ingest_wait_receipt_response(json, &response)?;
+        std::io::stdout()
+            .flush()
+            .context("failed to flush timed-out ingest receipt")?;
+        return Err(IngestWaitTimedOut::new(response.operation_id.as_deref()).into());
+    }
+
+    let mut wait_stats = ingest_stdin_wait_stats_from_response(&response);
+    match response.state {
+        Some(IngestOperationState::Completed) => {
+            append_ingest_stdin_audit_log(db, &resolved.wing, false, record, &wait_stats)
+                .context("failed to append ingest audit log")?;
+            print_stdin_ingest_output_with_created_ids(
+                json,
+                false,
+                &wait_stats,
+                &response.created_drawer_ids,
+            )?;
+            Ok(())
+        }
+        Some(IngestOperationState::Rejected) => {
+            wait_stats.drawer_ids.clear();
+            append_ingest_stdin_audit_log(db, &resolved.wing, false, record, &wait_stats)
+                .context("failed to append ingest audit log")?;
+            print_stdin_ingest_output(json, false, &wait_stats)?;
+            Ok(())
+        }
+        Some(IngestOperationState::Failed) => {
+            print_stdin_ingest_output(json, false, &wait_stats)?;
+            bail!(
+                "ingest operation {} failed: {}",
+                response.operation_id.as_deref().unwrap_or(""),
+                response.failure_detail.as_deref().unwrap_or("failed")
+            );
+        }
+        _ => {
+            print_ingest_wait_receipt_response(json, &response)?;
+            Ok(())
+        }
+    }
+}
+
 async fn ingest_stdin_command(
     db: &Database,
     config: &Config,
@@ -6272,6 +6355,22 @@ async fn ingest_stdin_command(
         print_stdin_ingest_output(options.json, options.dry_run, &stats)?;
         return Ok(());
     }
+    let wait_timeout_secs = options.wait_timeout_secs.unwrap_or(30);
+    if options.wait
+        && !options.dry_run
+        && stdin_wait_should_use_queue_admission(db)
+            .context("failed to inspect stdin wait queue admission ownership")?
+    {
+        return run_stdin_wait_ingest_queue(
+            db,
+            config,
+            &record,
+            &resolved,
+            wait_timeout_secs,
+            options.json,
+        )
+        .await;
+    }
     let (privacy_config, compiled_privacy) = ConfigHandle::current_privacy_snapshot();
     let scrubbed_replace_text = resolved
         .replace_text
@@ -6325,7 +6424,11 @@ async fn ingest_stdin_command(
     // terminal stats/audit path as the direct stdin ingest instead of
     // queueing a receipt that would report different skip semantics.
     if options.wait && exact_duplicate.is_some() {
-        let _writer_lease = acquire_cli_ingest_writer_lease(db, "ingest-stdin")?;
+        let _writer_lease = if resolved.is_pinned || superseded_drawer_id.is_some() {
+            Some(acquire_cli_ingest_writer_lease(db, "ingest-stdin")?)
+        } else {
+            None
+        };
         finalize_exact_duplicate_stdin_ingest(ExactDuplicateStdinIngest {
             db,
             wing: &resolved.wing,
@@ -6340,58 +6443,15 @@ async fn ingest_stdin_command(
     }
 
     if options.wait {
-        let wait_request = resolved.wait_request(options.wait_timeout_secs.unwrap_or(30));
-        let controls = IngestControls {
-            no_gate: resolved.no_gate,
-            bypass_novelty: resolved.bypass_novelty,
-        };
-        let server = MempalMcpServer::new(db.path().to_path_buf(), config.clone())?;
-        let response = server
-            .mempal_ingest_with_controls_scoped_worker(wait_request, controls)
-            .await
-            .map(|response| response.0)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        if response.timed_out {
-            print_ingest_wait_receipt_response(options.json, &response)?;
-            std::io::stdout()
-                .flush()
-                .context("failed to flush timed-out ingest receipt")?;
-            return Err(IngestWaitTimedOut::new(response.operation_id.as_deref()).into());
-        }
-
-        let mut wait_stats = ingest_stdin_wait_stats_from_response(&response);
-        match response.state {
-            Some(IngestOperationState::Completed) => {
-                append_ingest_stdin_audit_log(db, &resolved.wing, false, &record, &wait_stats)
-                    .context("failed to append ingest audit log")?;
-                print_stdin_ingest_output_with_created_ids(
-                    options.json,
-                    false,
-                    &wait_stats,
-                    &response.created_drawer_ids,
-                )?;
-                return Ok(());
-            }
-            Some(IngestOperationState::Rejected) => {
-                wait_stats.drawer_ids.clear();
-                append_ingest_stdin_audit_log(db, &resolved.wing, false, &record, &wait_stats)
-                    .context("failed to append ingest audit log")?;
-                print_stdin_ingest_output(options.json, false, &wait_stats)?;
-                return Ok(());
-            }
-            Some(IngestOperationState::Failed) => {
-                print_stdin_ingest_output(options.json, false, &wait_stats)?;
-                bail!(
-                    "ingest operation {} failed: {}",
-                    response.operation_id.as_deref().unwrap_or(""),
-                    response.failure_detail.as_deref().unwrap_or("failed")
-                );
-            }
-            _ => {
-                print_ingest_wait_receipt_response(options.json, &response)?;
-                return Ok(());
-            }
-        }
+        return run_stdin_wait_ingest_queue(
+            db,
+            config,
+            &record,
+            &resolved,
+            wait_timeout_secs,
+            options.json,
+        )
+        .await;
     }
 
     let writer_lease = acquire_cli_ingest_writer_lease(db, "ingest-stdin")?;
