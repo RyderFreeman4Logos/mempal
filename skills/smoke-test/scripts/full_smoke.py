@@ -314,6 +314,29 @@ def build_conformance_report(
     }
 
 
+def conformance_failure_count(report: Any) -> int:
+    if not isinstance(report, dict):
+        return 0
+    summary = report.get('summary')
+    if not isinstance(summary, dict):
+        return 0
+    failure_count = summary.get('fail', 0)
+    return failure_count if isinstance(failure_count, int) else 0
+
+
+def smoke_overall_ok(summary: dict[str, Any]) -> bool:
+    cleanup = summary.get('cleanup')
+    cleanup_failures = cleanup.get('failures', 0) if isinstance(cleanup, dict) else 0
+    binary_consistency = summary.get('binary_consistency')
+    binary_ok = binary_consistency.get('ok', True) if isinstance(binary_consistency, dict) else True
+    return (
+        not summary.get('failures')
+        and cleanup_failures == 0
+        and binary_ok
+        and conformance_failure_count(summary.get('conformance')) == 0
+    )
+
+
 def daemon_main_pid() -> int | None:
     try:
         proc = run_child_process(
@@ -1610,8 +1633,7 @@ def main() -> int:
     SUMMARY['io']['child_block_io_delta'] = child_io_blocks_delta(child_io_before, child_io_after)
     SUMMARY['duration_ms'] = int((time.monotonic() - start) * 1000)
     SUMMARY['conformance'] = build_conformance_report()
-    binary_ok = SUMMARY.get('binary_consistency', {}).get('ok', True)
-    SUMMARY['overall_ok'] = not SUMMARY['failures'] and SUMMARY['cleanup']['failures'] == 0 and binary_ok
+    SUMMARY['overall_ok'] = smoke_overall_ok(SUMMARY)
     append_io_history()
     print(json.dumps(SUMMARY, sort_keys=True))
     return 0 if SUMMARY['overall_ok'] else 1

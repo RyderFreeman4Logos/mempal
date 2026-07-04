@@ -257,6 +257,21 @@ class ConformanceReportTests(unittest.TestCase):
         self.assertEqual(group['missing_probes'], ['probe_missing'])
         self.assertEqual(report['summary']['fail'], 1)
 
+    def test_overall_ok_fails_when_conformance_group_fails(self) -> None:
+        self.smoke.note('probe_pass', True, stdout_bytes=10)
+        specs = {
+            'example': {
+                'features': ['feature.a'],
+                'probes': ['probe_pass', 'probe_missing'],
+            }
+        }
+        self.smoke.SUMMARY['conformance'] = self.smoke.build_conformance_report(specs)
+        self.smoke.SUMMARY['cleanup'] = {'failures': 0}
+        self.smoke.SUMMARY['binary_consistency'] = {'ok': True}
+
+        self.assertEqual(self.smoke.SUMMARY['failures'], [])
+        self.assertFalse(self.smoke.smoke_overall_ok(self.smoke.SUMMARY))
+
     def test_conformance_report_fails_group_when_expected_probes_are_missing(self) -> None:
         specs = {
             'optional': {
