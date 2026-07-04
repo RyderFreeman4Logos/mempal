@@ -284,7 +284,7 @@ def build_conformance_report(
             else:
                 missing.append(probe)
 
-        if failed:
+        if failed or missing:
             status = 'fail'
         elif passed:
             status = 'pass'

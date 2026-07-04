@@ -238,11 +238,47 @@ class ConformanceReportTests(unittest.TestCase):
         self.assertEqual(group['missing_probes'], ['probe_missing'])
         self.assertEqual(group['failure_classes'], {'probe_fail': 'database_locked'})
 
-    def test_conformance_report_marks_group_skipped_without_probe_passes(self) -> None:
+    def test_conformance_report_fails_when_passed_group_has_missing_probe(self) -> None:
+        self.smoke.note('probe_pass', True, stdout_bytes=10)
+        specs = {
+            'example': {
+                'features': ['feature.a', 'feature.b'],
+                'probes': ['probe_pass', 'probe_missing'],
+                'skipped_reason': 'not available',
+            }
+        }
+
+        report = self.smoke.build_conformance_report(specs)
+        group = report['groups']['example']
+
+        self.assertEqual(group['status'], 'fail')
+        self.assertEqual(group['passed_probe_count'], 1)
+        self.assertEqual(group['missing_probe_count'], 1)
+        self.assertEqual(group['missing_probes'], ['probe_missing'])
+        self.assertEqual(report['summary']['fail'], 1)
+
+    def test_conformance_report_fails_group_when_expected_probes_are_missing(self) -> None:
         specs = {
             'optional': {
                 'features': ['feature.optional'],
                 'probes': ['probe_missing'],
+                'skipped_reason': 'tool not advertised',
+            }
+        }
+
+        report = self.smoke.build_conformance_report(specs)
+        group = report['groups']['optional']
+
+        self.assertEqual(group['status'], 'fail')
+        self.assertIsNone(group['skipped_reason'])
+        self.assertEqual(report['summary']['fail'], 1)
+
+    def test_conformance_report_marks_recorded_skips_without_probe_passes_as_skipped(self) -> None:
+        self.smoke.note('probe_skipped', True, skipped='tool_not_advertised')
+        specs = {
+            'optional': {
+                'features': ['feature.optional'],
+                'probes': ['probe_skipped'],
                 'skipped_reason': 'tool not advertised',
             }
         }
