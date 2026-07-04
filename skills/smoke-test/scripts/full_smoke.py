@@ -553,8 +553,9 @@ def _rest_ingest_fallback(content: str, label: str, supersedes: str | None = Non
         resp = urllib.request.urlopen(req, timeout=30)
         if resp.status in (200, 201):
             body = json.loads(resp.read().decode())
-            ids = body.get('drawer_ids') or [body.get('drawer_id')] if body.get('drawer_id') else []
-            return [i for i in ids if i]
+            ids = created_ids_from(body)
+            note(label, bool(ids), created_id_count=len(ids), json=json_shape(body))
+            return ids
     except Exception as exc:
         note(label, False, error_type=type(exc).__name__)
         return []

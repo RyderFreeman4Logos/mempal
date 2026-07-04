@@ -222,6 +222,10 @@ struct IngestResponse {
     drawer_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     drawer_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    created_drawer_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cleanup_drawer_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     chunk_count: usize,
     #[serde(default)]
@@ -1243,6 +1247,8 @@ async fn process_ingest_request(
         return Ok(IngestResponse {
             drawer_id: String::new(),
             drawer_ids: Vec::new(),
+            created_drawer_ids: Vec::new(),
+            cleanup_drawer_ids: Vec::new(),
             chunk_count: 0,
             dropped: false,
             superseded_drawer_id: None,
@@ -1333,6 +1339,8 @@ async fn process_ingest_request(
         return Ok(IngestResponse {
             drawer_id: String::new(),
             drawer_ids: Vec::new(),
+            created_drawer_ids: Vec::new(),
+            cleanup_drawer_ids: Vec::new(),
             chunk_count: 0,
             dropped: true,
             superseded_drawer_id: None,
@@ -1354,6 +1362,8 @@ async fn process_ingest_request(
         return Ok(IngestResponse {
             drawer_id: primary_drawer_id,
             drawer_ids,
+            created_drawer_ids: Vec::new(),
+            cleanup_drawer_ids: Vec::new(),
             chunk_count: accepted_chunks.len(),
             dropped: false,
             superseded_drawer_id: superseded_response_id,
@@ -1376,6 +1386,7 @@ async fn process_ingest_request(
 
     // Insert each chunk as a separate drawer.
     let mut drawer_ids: Vec<String> = Vec::with_capacity(accepted_chunks.len());
+    let mut newly_created_drawer_ids: Vec<String> = Vec::new();
     for ((chunk_idx, chunk, drawer_id, exact_duplicate), vector) in
         accepted_chunks.iter().zip(vectors.iter())
     {
@@ -1446,6 +1457,7 @@ async fn process_ingest_request(
             .map_err(db_error_to_api_error)?;
             db.insert_vector_with_project(drawer_id, vector, project_id.as_deref())
                 .map_err(db_error_to_api_error)?;
+            newly_created_drawer_ids.push(drawer_id.clone());
         }
         drawer_ids.push(drawer_id.clone());
     }
@@ -1462,6 +1474,8 @@ async fn process_ingest_request(
     Ok(IngestResponse {
         drawer_id: primary_drawer_id,
         drawer_ids,
+        cleanup_drawer_ids: newly_created_drawer_ids.clone(),
+        created_drawer_ids: newly_created_drawer_ids,
         chunk_count,
         dropped: false,
         superseded_drawer_id: superseded_response_id,
