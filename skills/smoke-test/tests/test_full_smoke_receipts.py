@@ -171,5 +171,43 @@ class DoctorValidationTests(unittest.TestCase):
         self.assertFalse(result["ok"])
 
 
+class FailureLedgerTests(unittest.TestCase):
+    """Regression tests for note()/clear_probe_failures failure accounting.
+
+    Guards against F001-style bugs where a REST probe failure stays in the
+    failure ledger after a later fallback succeeds, and F001(r3) where REST
+    success masks a never-exercised MCP ingest path.
+    """
+
+    def setUp(self) -> None:
+        self.smoke = load_full_smoke()
+        # Reset SUMMARY to a clean slate for each test.
+        self.smoke.SUMMARY['failures'] = []
+        self.smoke.SUMMARY['groups'] = {}
+
+    def test_note_false_appends_failure(self) -> None:
+        self.smoke.note('probe_a', False)
+        self.assertIn('probe_a', self.smoke.SUMMARY['failures'])
+
+    def test_note_true_clears_same_label(self) -> None:
+        self.smoke.note('probe_a', False)
+        self.smoke.note('probe_a', True)
+        self.assertNotIn('probe_a', self.smoke.SUMMARY['failures'])
+
+    def test_clear_probe_failures_removes_specified_labels(self) -> None:
+        self.smoke.note('mcp_create_rest_fallback', False)
+        self.smoke.note('unrelated_failure', False)
+        self.smoke.clear_probe_failures('mcp_create_rest', 'mcp_create_rest_fallback')
+        self.assertNotIn('mcp_create_rest_fallback', self.smoke.SUMMARY['failures'])
+        self.assertIn('unrelated_failure', self.smoke.SUMMARY['failures'])
+
+    def test_successful_fallback_does_not_leave_stale_probe_failure(self) -> None:
+        # Simulate: first REST probe fails, then a fallback succeeds.
+        self.smoke.note('mcp_create_rest_fallback', False, error_type='ConnectionRefusedError')
+        self.smoke.clear_probe_failures('mcp_create_rest_fallback')
+        self.smoke.note('mcp_create', True, created_id_count=1)
+        self.assertEqual(self.smoke.SUMMARY['failures'], [])
+
+
 if __name__ == "__main__":
     unittest.main()
