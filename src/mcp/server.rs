@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::adoption_analytics::build_runtime_adoption_analytics;
-use crate::brief::brief_from_context;
+use crate::brief::{
+    BriefRequest as CoreBriefRequest, BriefRetrievalPlan, assemble_brief_from_bm25,
+    assemble_brief_with_plan, plan_brief_retrieval,
+};
 use crate::context::assemble_context_with_vector;
 use crate::core::{
     AsyncDb,
@@ -8666,41 +8669,65 @@ impl MempalMcpServer {
             })?,
         };
 
-        let embedder = self.embedder_factory.build().await.map_err(|error| {
-            ErrorData::internal_error(format!("failed to build embedder: {error}"), None)
-        })?;
-        let query_vector = embedder
-            .embed(&[request.query.as_str()])
-            .await
-            .map_err(|error| ErrorData::internal_error(format!("embedding failed: {error}"), None))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| ErrorData::internal_error("embedder returned no query vector", None))?;
-        let context_request = crate::context::ContextRequest {
+        let config = ConfigHandle::current();
+        let core_request = CoreBriefRequest {
             query: request.query,
             domain,
             field: request
                 .field
                 .unwrap_or_else(|| anchor::DEFAULT_FIELD.to_string()),
             cwd,
-            include_evidence: true,
-            include_cards: true,
             max_items,
             dao_tian_limit: request.dao_tian_limit.unwrap_or(1),
-            project_id: None,
-            trigger: None,
-            context_cfg_override: None,
-            include_distill_suggestions: false,
         };
-        let context = self
+        let retrieval_plan = match self.embedder_factory.build().await {
+            Ok(embedder) => plan_brief_retrieval(embedder.as_ref(), &core_request.query)
+                .await
+                .map_err(|error| ErrorData::internal_error(format!("{error}"), None))?,
+            Err(error) if config.search.bm25_fallback => BriefRetrievalPlan::Bm25Only {
+                warning: bm25_fallback_warning_embed_error(
+                    &crate::core::config::scrub_sensitive_text(&error.to_string()),
+                ),
+            },
+            Err(error) => {
+                return Err(ErrorData::internal_error(
+                    format!("failed to build embedder: {error}"),
+                    None,
+                ));
+            }
+        };
+        let brief = self
             .run_query_only_read_bounded("mempal_brief", self.search_db_deadline, move |db| {
-                assemble_context_with_vector(db, context_request, &query_vector).map_err(|error| {
-                    ErrorData::internal_error(format!("brief failed: {error}"), None)
-                })
+                match retrieval_plan {
+                    BriefRetrievalPlan::Hybrid { query_vector } => assemble_brief_with_plan(
+                        db,
+                        core_request,
+                        BriefRetrievalPlan::Hybrid { query_vector },
+                    ),
+                    BriefRetrievalPlan::Bm25Only { warning } => {
+                        assemble_brief_from_bm25(db, core_request, warning)
+                    }
+                }
+                .map_err(|error| ErrorData::internal_error(format!("brief failed: {error}"), None))
             })
             .await?;
-        let brief = brief_from_context(context);
-        Ok(Json(BriefMcpResponse::from(brief)))
+        let mut response = BriefMcpResponse::from(brief);
+        if !response.warnings.is_empty() {
+            response
+                .system_warnings
+                .extend(
+                    response
+                        .warnings
+                        .iter()
+                        .cloned()
+                        .map(|message| SystemWarning {
+                            level: "warn".to_string(),
+                            message,
+                            source: "embedding".to_string(),
+                        }),
+                );
+        }
+        Ok(Json(response))
     }
 
     #[tool(
@@ -17078,6 +17105,108 @@ prototypes = ["keep"]
             .await
             .expect_err("invalid domain should reject");
         assert!(error.to_string().contains("domain"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_brief_embedding_deadline_falls_back_to_bm25() {
+        let _config_guard = ConfigOverrideGuard::install(
+            "[search]\nbm25_fallback = true\n\n[embed.retry]\nsearch_deadline_secs = 1\n",
+        )
+        .await;
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        insert_drawer(
+            &db_path,
+            "drawer_brief_bm25_deadline",
+            "MCP synthetic deadline query evidence for BM25 fallback.",
+            "mempal",
+            Some("brief"),
+            "tests://mcp/brief/deadline",
+            4,
+        );
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db fixture");
+        let gate = Arc::new(Notify::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let server = MempalMcpServer::new_with_factory(
+            db_path,
+            Arc::new(BlockingEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+                call_count: Arc::clone(&call_count),
+                gate: Arc::clone(&gate),
+                released: Arc::new(AtomicBool::new(false)),
+            }),
+        )
+        .expect("create MCP server")
+        .with_async_db_for_test(async_db);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(4),
+            server.mempal_brief(Parameters(BriefMcpRequest {
+                query: "MCP synthetic deadline query".to_string(),
+                field: Some(anchor::DEFAULT_FIELD.to_string()),
+                domain: Some("project".to_string()),
+                cwd: None,
+                max_items: Some(3),
+                dao_tian_limit: None,
+            })),
+        )
+        .await
+        .expect("brief should return before client timeout")
+        .expect("brief response")
+        .0;
+
+        gate.notify_waiters();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(response.search_mode, "bm25_only");
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("embedding deadline exceeded after 1s"))
+        );
+        assert!(response.system_warnings.iter().any(|warning| {
+            warning.source == "embedding"
+                && warning
+                    .message
+                    .contains("embedding deadline exceeded after 1s")
+        }));
+        assert_eq!(response.evidence.len(), 1);
+        assert_eq!(
+            response.evidence[0].citation.drawer_id,
+            "drawer_brief_bm25_deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_brief_no_results_returns_nonempty_structured_brief() {
+        let (_tempdir, _db_path, server) = setup_server();
+
+        let response = server
+            .mempal_brief(Parameters(BriefMcpRequest {
+                query: "no matching memory".to_string(),
+                field: Some(anchor::DEFAULT_FIELD.to_string()),
+                domain: Some("project".to_string()),
+                cwd: None,
+                max_items: Some(3),
+                dao_tian_limit: None,
+            }))
+            .await
+            .expect("brief response")
+            .0;
+
+        assert_eq!(response.search_mode, "hybrid");
+        assert!(response.warnings.is_empty());
+        assert!(response.key_facts.is_empty());
+        assert!(response.evidence.is_empty());
+        assert!(response.cards.is_empty());
+        assert!(response.summary.narrative.contains("No cited memory"));
+        assert!(
+            response
+                .uncertainty
+                .iter()
+                .any(|item| item.kind == "no_evidence")
+        );
+        assert!(!response.next_actions.is_empty());
     }
 
     #[tokio::test]

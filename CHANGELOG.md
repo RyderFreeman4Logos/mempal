@@ -28,6 +28,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- `mempal brief` and MCP `mempal_brief` now bound query embedding by
+  `embed.retry.search_deadline_secs`, fall back to BM25-only briefs when
+  configured, and return deterministic non-empty no-results briefs instead of
+  hanging or emitting blank output.
 - MCP `mempal_ingest` `wait=true` now has subprocess regression coverage
   proving finite queued receipts under daemon and MCP worker writer ownership.
 - `mempal ingest --stdin --wait` now uses daemon/queue admission when the

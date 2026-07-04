@@ -143,6 +143,11 @@ pub fn bm25_fallback_warning_embed_error(error: &str) -> String {
     format!("embedding unavailable; using BM25-only search: {error} (retry may help)")
 }
 
+/// Scrub sensitive details before embedding them in user-visible search warnings.
+pub fn sanitize_search_warning_detail(input: &str) -> String {
+    crate::core::config::scrub_sensitive_text(input)
+}
+
 /// Wording for query-embedding deadline expiry while BM25 fallback is enabled.
 pub fn bm25_fallback_warning_timeout(deadline_secs: u64) -> String {
     format!(
