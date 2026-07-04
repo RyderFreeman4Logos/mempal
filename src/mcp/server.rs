@@ -178,6 +178,11 @@ fn daemon_ingest_ipc_available_for_db(_db_path: &Path) -> bool {
     false
 }
 
+#[doc(hidden)]
+pub fn daemon_ingest_ipc_available_for_path(db_path: &Path) -> bool {
+    daemon_ingest_ipc_available_for_db(db_path)
+}
+
 const MCP_SEARCH_ROUTE_DEADLINE: Duration = Duration::from_secs(5);
 pub(super) const MCP_SEARCH_DB_DEADLINE: Duration = Duration::from_secs(60);
 const MCP_SEARCH_STALE_INDEX_DEADLINE: Duration = Duration::from_secs(2);
@@ -1995,7 +2000,7 @@ impl MempalMcpServer {
                 self.operation_status_deadline
                     .min(Duration::from_millis(500)),
                 |db| {
-                    db.runtime_writer_lease_has_live_daemon(SQLITE_WRITER_LEASE_NAME)
+                    db.runtime_writer_lease_has_live_daemon_ingest_worker(SQLITE_WRITER_LEASE_NAME)
                         .map_err(db_error)
                 },
             )

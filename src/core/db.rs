@@ -5571,6 +5571,30 @@ impl Database {
         Ok(false)
     }
 
+    pub fn runtime_writer_lease_has_live_daemon_ingest_worker(
+        &self,
+        name: &str,
+    ) -> Result<bool, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pid, boot_id \
+             FROM runtime_writer_leases \
+             WHERE name = ?1 AND mode IN ('daemon', 'mcp-ingest-worker')",
+        )?;
+        let rows = stmt.query_map([name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (pid_i64, boot_id) = row?;
+            if u32::try_from(pid_i64)
+                .ok()
+                .is_some_and(|pid| runtime_writer_process_is_live_holder(pid, boot_id.as_deref()))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn runtime_writer_lease_cleanup_expired(&self) -> Result<usize, DbError> {
         self.with_immediate_tx(|| self.runtime_writer_lease_cleanup_expired_tx(false))
     }
@@ -7811,6 +7835,29 @@ mod tests {
             .expect("maintenance acquire")
             .expect("maintenance can reclaim expired lease");
         assert_eq!(maintenance.owner, "maintenance");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_writer_live_daemon_ingest_worker_detects_mcp_worker_holder() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::open(&db_path).expect("open db");
+        db.runtime_writer_lease_acquire(
+            "sqlite-writer",
+            "mcp-ingest-worker-test",
+            "mcp-ingest-worker",
+            300,
+            None,
+        )
+        .expect("acquire runtime writer lease")
+        .expect("runtime writer lease");
+
+        assert!(
+            db.runtime_writer_lease_has_live_daemon_ingest_worker("sqlite-writer")
+                .expect("check live daemon ingest worker lease"),
+            "current-process MCP ingest worker lease must be visible to wait deferral"
+        );
     }
 
     #[test]

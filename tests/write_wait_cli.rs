@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::harness::embed_mock::start as start_embed_mock;
 use mempal::core::config::{Config, ConfigHandle};
@@ -86,6 +86,21 @@ enabled = false
     config_path
 }
 
+fn enable_daemon_in_config(config_path: &Path, home: &Path) {
+    use std::io::Write as _;
+
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(config_path)
+        .expect("open config for daemon append");
+    writeln!(
+        config,
+        "\n[hooks]\nenabled = true\ndaemon_poll_interval_ms = 100\n\n[daemon]\nlog_path = \"{}\"",
+        home.join(".mempal/daemon.log").display()
+    )
+    .expect("append daemon config");
+}
+
 fn run_cli(home: &Path, args: &[&str]) -> Output {
     Command::new(mempal_bin())
         .args(args)
@@ -139,6 +154,71 @@ fn wait_child_output_timeout(mut child: Child, timeout: Duration) -> Output {
             );
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn daemon_runtime_dir(home: &Path) -> PathBuf {
+    home.join(".mempal").join("runtime")
+}
+
+#[cfg(unix)]
+fn wait_for_path(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+#[cfg(unix)]
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait().expect("poll daemon child").is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[cfg(unix)]
+fn spawn_foreground_daemon(home: &Path) -> Child {
+    let mut child = Command::new(mempal_bin())
+        .args(["daemon", "--foreground"])
+        .env("HOME", home)
+        .env(
+            mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
+            daemon_runtime_dir(home),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn foreground daemon");
+    wait_for_path(&home.join(".mempal/daemon.pid"), Duration::from_secs(10));
+    wait_for_path(
+        &home.join(".mempal/daemon-hook.sock"),
+        Duration::from_secs(10),
+    );
+    if child.try_wait().expect("poll daemon").is_some() {
+        panic!("foreground daemon exited before test command");
+    }
+    child
+}
+
+#[cfg(unix)]
+fn terminate_daemon(child: &mut Child) {
+    // SAFETY: this test owns the foreground daemon child process.
+    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(rc, 0, "failed to send SIGTERM to daemon");
+    if !wait_for_child_exit(child, Duration::from_secs(10)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("daemon did not exit after SIGTERM");
     }
 }
 
@@ -297,11 +377,37 @@ fn hold_daemon_writer_lease(home: &Path) -> mempal::core::types::RuntimeWriterLe
         .expect("daemon writer lease")
 }
 
+fn hold_mcp_ingest_worker_writer_lease(home: &Path) -> mempal::core::types::RuntimeWriterLease {
+    let db = Database::open(&home.join(".mempal/palace.db")).expect("open db");
+    db.runtime_writer_lease_acquire(
+        "sqlite-writer",
+        "mcp-ingest-worker-test-owner",
+        "mcp-ingest-worker",
+        300,
+        None,
+    )
+    .expect("acquire MCP ingest worker writer lease")
+    .expect("MCP ingest worker writer lease")
+}
+
 fn insert_existing_drawer(home: &Path, drawer_id: &str) {
+    insert_existing_drawer_with_content(home, drawer_id, "existing novelty target");
+}
+
+fn insert_existing_drawer_with_content(home: &Path, drawer_id: &str, content: &str) {
+    insert_existing_drawer_with_content_and_project(home, drawer_id, content, None);
+}
+
+fn insert_existing_drawer_with_content_and_project(
+    home: &Path,
+    drawer_id: &str,
+    content: &str,
+    project_id: Option<&str>,
+) {
     let db = Database::open(&home.join(".mempal/palace.db")).expect("open db");
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: drawer_id.to_string(),
-        content: "existing novelty target".to_string(),
+        content: content.to_string(),
         wing: "smoke".to_string(),
         room: Some("manual".to_string()),
         source_file: Some("test://existing-novelty-target".to_string()),
@@ -310,7 +416,8 @@ fn insert_existing_drawer(home: &Path, drawer_id: &str) {
         chunk_index: Some(0),
         importance: 0,
     });
-    db.insert_drawer(&drawer).expect("insert existing drawer");
+    db.insert_drawer_with_project_validity(&drawer, project_id, None, None, None)
+        .expect("insert existing drawer");
 }
 
 #[test]
@@ -771,6 +878,156 @@ async fn test_ingest_wait_json_cleanup_id_writes_under_daemon_lease() {
             .is_none(),
         "created cleanup id must be soft-deleted"
     );
+}
+
+#[test]
+fn test_ingest_wait_duplicate_under_mcp_ingest_worker_lease_avoids_writer_conflict() {
+    let home = setup_home();
+    let _config = write_config(home.path(), "http://127.0.0.1:9/v1");
+    insert_existing_drawer_with_content_and_project(
+        home.path(),
+        "existing-wait-duplicate-under-lease",
+        "duplicate under MCP ingest worker lease",
+        Some("lease-project"),
+    );
+    let _lease = hold_mcp_ingest_worker_writer_lease(home.path());
+    let payload = br#"{"content":"duplicate under MCP ingest worker lease","wing":"smoke","room":"manual","project":"lease-project"}"#;
+
+    let output = run_cli_with_stdin(
+        home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            "0",
+            "--json",
+        ],
+        payload,
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
+        "stdin wait must not direct-claim the CLI writer lease under MCP worker ownership: {stderr}"
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("parse stdin wait JSON");
+    assert!(
+        cleanup_ids_from_ingest_json(&stdout).is_empty(),
+        "receipt for a pre-existing duplicate must not expose cleanup ids: {stdout}"
+    );
+    if output.status.success() {
+        assert_eq!(stdout["stats"]["chunks"], 0);
+        assert_eq!(stdout["stats"]["skipped"], 1);
+    } else {
+        assert_eq!(stdout["state"], "queued");
+        assert_eq!(stdout["timed_out"], true);
+    }
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    assert_eq!(db.drawer_count().expect("drawer count"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_ingest_wait_json_uses_daemon_ipc_receipt_when_daemon_is_running() {
+    let home = setup_home();
+    let config = write_config(home.path(), "http://127.0.0.1:9/v1");
+    enable_daemon_in_config(&config, home.path());
+    let mut daemon = spawn_foreground_daemon(home.path());
+    let payload =
+        br#"{"content":"stdin wait daemon ipc receipt content","wing":"smoke","room":"manual"}"#;
+
+    let output = run_cli_with_stdin(
+        home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            "0",
+            "--json",
+        ],
+        payload,
+    );
+
+    terminate_daemon(&mut daemon);
+
+    assert!(
+        !output.status.success(),
+        "zero-budget daemon receipt should exit non-zero, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
+        "daemon-backed stdin wait must not direct-claim the CLI writer lease: {stderr}"
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("parse daemon receipt JSON");
+    assert_eq!(stdout["state"], "queued");
+    assert_eq!(stdout["timed_out"], true);
+    assert!(
+        stdout["operation_id"]
+            .as_str()
+            .is_some_and(|operation_id| !operation_id.is_empty()),
+        "daemon receipt must include an operation id: {stdout}"
+    );
+    assert!(
+        cleanup_ids_from_ingest_json(&stdout).is_empty(),
+        "timed-out daemon receipt must not expose cleanup ids: {stdout}"
+    );
+}
+
+#[test]
+fn test_ingest_wait_new_content_under_mcp_ingest_worker_lease_times_out_as_receipt() {
+    let home = setup_home();
+    let _config = write_config(home.path(), "http://127.0.0.1:9/v1");
+    let _lease = hold_mcp_ingest_worker_writer_lease(home.path());
+    let payload = br#"{"content":"new stdin wait content queued behind MCP worker lease","wing":"smoke","room":"manual"}"#;
+
+    let output = run_cli_with_stdin(
+        home.path(),
+        &[
+            "ingest",
+            "--stdin",
+            "--source-type",
+            "user_explicit",
+            "--no-gate",
+            "--wait",
+            "--wait-timeout-secs",
+            "0",
+            "--json",
+        ],
+        payload,
+    );
+
+    assert!(
+        !output.status.success(),
+        "bounded receipt timeouts should exit non-zero, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("SQLite writer lease `sqlite-writer` is already held"),
+        "stdin wait must return a queue receipt, not a writer-lease conflict: {stderr}"
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).expect("parse receipt JSON");
+    assert_eq!(stdout["state"], "queued");
+    assert_eq!(stdout["timed_out"], true);
+    assert_eq!(stdout["drawer_id"], "");
+    assert!(
+        cleanup_ids_from_ingest_json(&stdout).is_empty(),
+        "timed-out receipt must not expose cleanup ids: {stdout}"
+    );
+    let db = Database::open(&home.path().join(".mempal/palace.db")).expect("open db");
+    assert_eq!(db.drawer_count().expect("drawer count"), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
