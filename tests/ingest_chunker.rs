@@ -341,6 +341,14 @@ mod rest_tests {
 
         let drawer_ids = resp["drawer_ids"].as_array().expect("drawer_ids array");
         assert_eq!(drawer_ids.len() as u64, chunk_count);
+        assert_eq!(
+            resp["created_drawer_ids"], resp["drawer_ids"],
+            "REST ingest must expose cleanup-safe IDs for newly-created chunks"
+        );
+        assert_eq!(
+            resp["cleanup_drawer_ids"], resp["created_drawer_ids"],
+            "REST cleanup authority must mirror created_drawer_ids"
+        );
 
         let db = env.db();
         assert!(drawer_count(&db) >= 2);

@@ -46,6 +46,13 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   querying partner sessions, preventing silent no-session results.
 - Shell injection prevention in `mempal_projects_resume` next-step command:
   drawer-controlled path and wing values are POSIX single-quote escaped.
+- REST ingest now returns runtime-designated `created_drawer_ids` /
+  `cleanup_drawer_ids` for newly-created drawers, so the full smoke runner
+  can safely prove reversible cleanup without treating informational
+  `drawer_id`/`drawer_ids` as cleanup authority.
+- `mempal daemon status` now uses a bounded 2-second DB-holder scan instead
+  of an unbounded `/proc/*/fd` traversal, preventing spurious 30-second
+  timeouts under a healthy singleton daemon.
 
 ### Changed
 

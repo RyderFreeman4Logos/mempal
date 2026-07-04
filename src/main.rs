@@ -7,6 +7,7 @@ use std::io::{BufRead, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -15759,7 +15760,8 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
         );
     }
     print_daemon_embedder_status(&mempal_home, "");
-    let db_holders = mempal::process_diagnostics::inspect_db_holders(db_path);
+    let db_holders =
+        mempal::process_diagnostics::inspect_db_holders_bounded(db_path, Duration::from_secs(2));
     print_db_holder_report("db_holders", &db_holders, "");
     #[cfg(feature = "rest")]
     if let Ok(config) = Config::load()
