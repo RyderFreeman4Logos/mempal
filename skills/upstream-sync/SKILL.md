@@ -229,13 +229,50 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 ```
 
-### 3.2 CSA Review
+### 3.2 CSA Review — DELEGATE TO SUBAGENT (MANDATORY)
 
-```bash
-csa review --range main...HEAD --sa-mode true --tier tier-4-critical
+**The main agent MUST NOT run `csa session wait` directly.** The review-fix
+cycle must be entirely encapsulated in a subagent to prevent context rot
+from `csa session wait` output (4KB directory listings every 240s, KV-cache
+hints, findings details).
+
+**Main agent**: dispatch ONE subagent to handle the entire review-fix loop,
+then pair it with a `wd` heartbeat relay (CHECKIN=3000) per AGENTS.md
+wait-discipline:
+
+```
+delegate_task(
+  goal="Review branch sync/upstream-YYYY-MM-DD until CSA PASS",
+  context="Repo: ..., Branch: ..., Range: main...HEAD,
+           Max rounds: 3, Use: csa review --sa-mode true --tier tier-4-critical"
+)
+# Main agent: launch wd heartbeat relay on the subagent to monitor progress
+
+Subagent (isolated context, does NOT return to main agent until done):
+  1. Run: csa review --range main...HEAD --sa-mode true --tier tier-4-critical
+     → extract SESSION_ID from the <!-- CSA:SESSION_STARTED --> marker
+  2. Run: csa session wait --session $SESSION_ID --cd '<repo>'
+     → read output/findings.toml and output/details.md for verdict + findings
+  3. If FAIL: patch fixes → cargo fmt --all → cargo clippy --workspace -- -D warnings
+     → cargo test --workspace → stage fixes → commit following project's
+     standard commit workflow (do NOT use raw git commit — follow AGENTS.md rules)
+  4. Repeat from step 1 with a new review session (max 3 rounds total)
+  5. Return to main agent: {verdict: PASS/FAIL, rounds: N, fixes: [...]}
+
+For long-running build/test steps, the subagent must follow the repo's
+`wd` heartbeat relay pattern (per AGENTS.md wait-discipline): background
+the task with completion notification and launch a periodic heartbeat.
 ```
 
-Fix any findings (max 2 rounds via CSA `--fix-finding`).
+Note: the subagent must run the FULL quality gate suite (fmt + clippy + test)
+after each fix, not just `cargo check`, because the pre-push hook enforces
+all three. Skipping any gate would cause the next push to fail.
+
+This prevents the main agent's context from being polluted by:
+- 4KB+ directory listings from `csa session wait` (every 240s timeout)
+- KV-cache warm hints (dozens per session)
+- Full findings details.md text (2-5KB per review round)
+- Build/test output noise
 
 ---
 
@@ -307,7 +344,8 @@ Ask user: "PR created: {url}. 合并？"
 | Read commit diffs | **Subagent** | Avoids flooding context with diffs |
 | Classify port/skip | **Subagent** | Returns compact JSON, not raw diffs |
 | Implement ports | **CSA** | Heavy code reading + writing |
-| Build/test | Main agent | Just reads exit codes |
+| Build/test | **Subagent** | Return only exit codes, not full output |
+| CSA review-fix loop | **Subagent** | `csa session wait` output floods context (4KB/240s) |
 | Update tracking file | Main agent | Simple JSON edit |
 
 **Main agent never reads a raw diff**. All diff analysis is delegated to subagents that return structured summaries.
