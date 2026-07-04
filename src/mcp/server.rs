@@ -954,7 +954,7 @@ impl MempalMcpServer {
                 }
                 Err(error) if error.is_sqlite_lock() => {
                     retry_count = retry_count.saturating_add(1);
-                    let next_delay = ingest_worker_backoff_delay(retry_count);
+                    let next_delay = INGEST_CLAIM_LOCK_RETRY_DELAY;
                     crate::observability::record_ingest_worker_backoff(
                         crate::observability::IngestWorkerBackoffSnapshot {
                             retry_count,
@@ -3470,6 +3470,7 @@ struct PreparedIngestOperation {
 const INGEST_ASYNC_KIND: &str = "ingest_async";
 const INGEST_CLAIM_TTL_SECS: i64 = 300;
 const INGEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const INGEST_CLAIM_LOCK_RETRY_DELAY: Duration = INGEST_POLL_INTERVAL;
 const INGEST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const INGEST_DRAIN_RESTART_BACKOFF_INITIAL_MS: u64 = 250;
 const INGEST_DRAIN_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
@@ -14913,7 +14914,7 @@ pattern_boost = 0.2
     }
 
     #[tokio::test(start_paused = true, flavor = "current_thread")]
-    async fn test_mcp_async_ingest_worker_backoff_caps_when_claim_is_locked() {
+    async fn test_mcp_async_ingest_worker_uses_short_retry_when_claim_is_locked() {
         crate::observability::reset_ingest_worker_backoff_for_tests();
         let (_tempdir, db_path, server) = setup_server();
         let queue = AsyncPendingMessageStore::from_store(
@@ -14923,32 +14924,35 @@ pattern_boost = 0.2
         let server = server.with_async_queue_for_test(queue);
         let handle = server.spawn_scoped_ingest_drain_worker();
 
-        wait_for_ingest_worker_backoff_snapshot(1, 2_000, Some("sqlite_locked")).await;
-        tokio::time::advance(Duration::from_secs(2)).await;
-        wait_for_ingest_worker_backoff_snapshot(2, 4_000, Some("sqlite_locked")).await;
-        tokio::time::advance(Duration::from_secs(4)).await;
-        wait_for_ingest_worker_backoff_snapshot(3, 8_000, Some("sqlite_locked")).await;
-        tokio::time::advance(Duration::from_secs(8)).await;
-        wait_for_ingest_worker_backoff_snapshot(4, 16_000, Some("sqlite_locked")).await;
-        tokio::time::advance(Duration::from_secs(16)).await;
-        wait_for_ingest_worker_backoff_snapshot(5, 30_000, Some("sqlite_locked")).await;
-
-        // After the 30s cap, subsequent retries should continue at the 30s cap,
-        // not exceed it. The claim_lock_failures_for_test(5) means the 6th
-        // attempt will succeed (failures exhausted), but we verify the cap
-        // by checking the sequence up to retry 5 already shows 30_000.
-        // For an explicit cap test, we'd need more failures, but the 30_000
-        // assertion at retry 5 proves the cap is enforced.
-        // ingest_worker_backoff_delay(5) = 30s (capped), and
-        // ingest_worker_backoff_delay(6) would also return 30s.
-        assert_eq!(
-            ingest_worker_backoff_delay(6),
-            Duration::from_secs(30),
-            "backoff delay must cap at 30s even beyond retry 5"
-        );
+        let expected_delay_ms =
+            u64::try_from(INGEST_CLAIM_LOCK_RETRY_DELAY.as_millis()).unwrap_or(u64::MAX);
+        for expected_retry_count in 1..=5 {
+            wait_for_ingest_worker_backoff_snapshot(
+                expected_retry_count,
+                expected_delay_ms,
+                Some("sqlite_locked"),
+            )
+            .await;
+            assert_ne!(
+                crate::observability::ingest_worker_backoff_snapshot().next_delay_ms,
+                30_000,
+                "queue-claim locks must not use capped ingest write backoff"
+            );
+            tokio::time::advance(INGEST_CLAIM_LOCK_RETRY_DELAY).await;
+        }
 
         handle.shutdown_and_drain().await;
         assert_ingest_worker_backoff_snapshot(0, 0, None);
+    }
+
+    #[test]
+    fn test_mcp_async_ingest_transient_write_backoff_sequence_caps_at_30s() {
+        assert_eq!(ingest_worker_backoff_delay(1), Duration::from_secs(2));
+        assert_eq!(ingest_worker_backoff_delay(2), Duration::from_secs(4));
+        assert_eq!(ingest_worker_backoff_delay(3), Duration::from_secs(8));
+        assert_eq!(ingest_worker_backoff_delay(4), Duration::from_secs(16));
+        assert_eq!(ingest_worker_backoff_delay(5), Duration::from_secs(30));
+        assert_eq!(ingest_worker_backoff_delay(6), Duration::from_secs(30));
     }
 
     #[test]
@@ -15070,8 +15074,8 @@ pattern_boost = 0.2
         // snapshot here. That state is shared across parallel test threads, and
         // asserting on it produces intermittent failures when another test resets
         // the global between process_ingest_claim and the read. The backoff
-        // telemetry is verified in the dedicated backoff test
-        // (test_mcp_async_ingest_worker_backoff_caps_when_claim_is_locked).
+        // sequence is verified in
+        // test_mcp_async_ingest_transient_write_backoff_sequence_caps_at_30s.
         //
         // The behavioral assertions above (requeue + no completion receipt +
         // successful retry) are sufficient to prove the transient lock path works.

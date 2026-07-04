@@ -28,6 +28,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Daemon ingest queue-claim SQLite lock retries now stay on the short poll
+  delay instead of escalating to the post-claim write-failure backoff loop.
 - Project resume timestamp ordering now uses ISO 8601 string comparison
   instead of `CAST(added_at AS INTEGER)`, which collapsed RFC 3339 timestamps
   to their year prefix.
