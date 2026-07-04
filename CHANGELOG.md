@@ -28,6 +28,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- MCP `mempal_ingest` `wait=true` now has subprocess regression coverage
+  proving finite queued receipts under daemon and MCP worker writer ownership.
 - `mempal ingest --stdin --wait` now uses daemon/queue admission when the
   daemon or MCP ingest worker owns the SQLite writer lease, returning the
   existing wait receipt instead of failing with a writer-lease conflict.

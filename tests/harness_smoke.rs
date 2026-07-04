@@ -4,7 +4,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use common::harness::{
@@ -15,9 +15,10 @@ use mempal::bootstrap_events::BootstrapEvent;
 use mempal::core::config::ConfigHandle;
 use mempal::core::db::{Database, MigrationHook, apply_fork_ext_migrations_with_hook};
 use mempal::core::queue::PendingMessageStore;
-use mempal::core::types::{Drawer, SourceType};
+use mempal::core::types::{Drawer, RuntimeWriterLease, SourceType};
 use mempal::daemon_bootstrap::DaemonContext;
 use mempal::hook::{CapturedHookEnvelope, HookEvent};
+use serde_json::Value;
 use tempfile::TempDir;
 
 #[test]
@@ -273,6 +274,95 @@ async fn mcp_stdio_ingest_succeeds_with_existing_status_holder() -> Result<()> {
 }
 
 #[tokio::test]
+async fn mcp_stdio_wait_ingest_under_durable_writer_lease_returns_queued_receipt() -> Result<()> {
+    for (owner, mode) in [
+        ("daemon-owner", "daemon"),
+        ("mcp-ingest-worker-issue-639", "mcp-ingest-worker"),
+    ] {
+        let tmp = TempDir::new()?;
+        let mempal_home = tmp.path().join(".mempal");
+        fs::create_dir_all(&mempal_home)?;
+        let db_path = mempal_home.join("palace.db");
+        let db = Database::open(&db_path)?;
+        let lease = db
+            .runtime_writer_lease_acquire("sqlite-writer", owner, mode, 300, None)?
+            .expect("durable writer lease");
+
+        let mut client = McpStdio::start(&db_path, HashMap::new()).await?;
+        let server_info =
+            tokio::time::timeout(Duration::from_secs(5), client.initialize()).await??;
+        assert!(!server_info.server_info.name.trim().is_empty());
+
+        let started = Instant::now();
+        let ingest = tokio::time::timeout(
+            Duration::from_secs(4),
+            client.call(
+                "tools/call",
+                serde_json::json!({
+                    "name": "mempal_ingest",
+                    "arguments": {
+                        "content": format!(
+                            "issue 639 MCP stdio wait receipt under {mode} writer lease"
+                        ),
+                        "wing": "smoke",
+                        "room": "mcp",
+                        "source_type": "agent_inference",
+                        "memory_kind": "evidence",
+                        "domain": "project",
+                        "field": "smoke",
+                        "smoke": true,
+                        "wait": true,
+                        "wait_timeout_secs": 1
+                    },
+                }),
+            ),
+        )
+        .await??;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(750) && elapsed < Duration::from_secs(4),
+            "wait receipt must honor the 1s timeout without hanging: elapsed={elapsed:?}, ingest={ingest:#?}"
+        );
+
+        let body = &ingest["structuredContent"];
+        assert_eq!(body["state"].as_str(), Some("queued"), "{ingest:#?}");
+        assert_eq!(body["timed_out"].as_bool(), Some(true), "{ingest:#?}");
+        let operation_id = body["operation_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .expect("queued wait receipt operation id")
+            .to_string();
+        assert_json_array_empty_or_absent(body, "created_drawer_ids");
+
+        let status = tokio::time::timeout(
+            Duration::from_secs(4),
+            client.call(
+                "tools/call",
+                serde_json::json!({
+                    "name": "mempal_operation_status",
+                    "arguments": {
+                        "operation_id": operation_id,
+                    },
+                }),
+            ),
+        )
+        .await??;
+        let status_body = &status["structuredContent"];
+        assert_eq!(
+            status_body["operation_id"].as_str(),
+            body["operation_id"].as_str(),
+            "{status:#?}"
+        );
+        assert_eq!(status_body["state"].as_str(), Some("queued"), "{status:#?}");
+        assert_json_array_empty_or_absent(status_body, "created_drawer_ids");
+
+        release_runtime_writer_lease(&db_path, &lease)?;
+        client.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_stdio_ingest_stalled_daemon_ipc_keeps_transport_alive() -> Result<()> {
     let tmp = TempDir::new()?;
     let mempal_home = tmp.path().join(".mempal");
@@ -377,6 +467,29 @@ async fn mcp_stdio_ingest_stalled_daemon_ipc_keeps_transport_alive() -> Result<(
 
     fake_daemon.abort();
     client.shutdown().await?;
+    Ok(())
+}
+
+fn assert_json_array_empty_or_absent(value: &Value, field: &str) {
+    if let Some(array) = value.get(field).and_then(Value::as_array) {
+        assert!(array.is_empty(), "{field} must be empty: {value:#?}");
+    } else {
+        assert!(
+            value.get(field).is_none(),
+            "{field} must be absent or an array: {value:#?}"
+        );
+    }
+}
+
+fn release_runtime_writer_lease(
+    db_path: &std::path::Path,
+    lease: &RuntimeWriterLease,
+) -> Result<()> {
+    let db = Database::open(db_path)?;
+    assert!(
+        db.runtime_writer_lease_release(&lease.name, &lease.owner, &lease.session_id)?,
+        "writer lease should be active before release"
+    );
     Ok(())
 }
 
