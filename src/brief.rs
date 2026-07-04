@@ -15,9 +15,9 @@ use crate::core::types::{AnchorKind, KnowledgeEvidenceRole, MemoryDomain, RouteD
 use crate::embed::{EmbedError, Embedder};
 use crate::search::{
     SearchError, SearchFilters, SearchMode, SearchOptions, VectorSearchCircuit,
-    bm25_fallback_warning_degraded, bm25_fallback_warning_embed_error,
-    bm25_fallback_warning_missing_query_vector, bm25_fallback_warning_timeout,
-    search_bm25_only_with_options,
+    bm25_fallback_warning_degraded, bm25_fallback_warning_dimension_mismatch,
+    bm25_fallback_warning_embed_error, bm25_fallback_warning_missing_query_vector,
+    bm25_fallback_warning_timeout, current_vector_dim, search_bm25_only_with_options,
 };
 
 pub type Result<T> = std::result::Result<T, BriefError>;
@@ -34,6 +34,10 @@ pub enum BriefError {
     MissingQueryVector,
     #[error("brief query embedding deadline exceeded after {deadline_secs}s")]
     EmbedQueryTimeout { deadline_secs: u64 },
+    #[error(
+        "embedding dimension mismatch: drawer_vectors uses {current_dim}d but embedder returned {new_dim}d; run `mempal reindex --embedder <name>` before searching with this backend"
+    )]
+    VectorDimensionMismatch { current_dim: usize, new_dim: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +202,24 @@ pub fn assemble_brief_with_plan(
 ) -> Result<CognitiveBrief> {
     match plan {
         BriefRetrievalPlan::Hybrid { query_vector } => {
+            if let Some(current_dim) = current_vector_dim(db)
+                .map_err(SearchError::KeywordSearch)
+                .map_err(BriefError::Search)?
+                && current_dim != query_vector.len()
+            {
+                let vector_search_circuit = VectorSearchCircuit::current();
+                if vector_search_circuit.bm25_fallback_enabled {
+                    return assemble_brief_from_bm25(
+                        db,
+                        request,
+                        bm25_fallback_warning_dimension_mismatch(query_vector.len(), current_dim),
+                    );
+                }
+                return Err(BriefError::VectorDimensionMismatch {
+                    current_dim,
+                    new_dim: query_vector.len(),
+                });
+            }
             let context = assemble_context_with_vector(
                 db,
                 context_request_from_brief(request),

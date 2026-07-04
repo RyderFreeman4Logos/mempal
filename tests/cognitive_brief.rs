@@ -225,6 +225,14 @@ fn start_openai_embedding_stub(
     expected_query: &str,
     request_count: usize,
 ) -> (String, thread::JoinHandle<()>) {
+    start_openai_embedding_stub_with_vector(expected_query, request_count, vector())
+}
+
+fn start_openai_embedding_stub_with_vector(
+    expected_query: &str,
+    request_count: usize,
+    response_vector: Vec<f32>,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding stub");
     listener
         .set_nonblocking(true)
@@ -252,7 +260,7 @@ fn start_openai_embedding_stub(
             let payload: Value = serde_json::from_str(body).expect("parse embedding request");
             assert_eq!(payload["input"][0], expected_query);
             let body = serde_json::to_string(&json!({
-                "data": [{ "embedding": vector() }]
+                "data": [{ "embedding": response_vector.clone() }]
             }))
             .expect("serialize embedding response");
             let response = format!(
@@ -516,6 +524,65 @@ fn test_cli_brief_embedding_deadline_falls_back_to_bm25_json() {
         "brief_evidence_deadline"
     );
     handle.join().expect("slow embedding stub");
+}
+
+#[test]
+fn test_cli_brief_embedding_dimension_mismatch_falls_back_to_bm25_json() {
+    let (home, db) = setup_cli_home();
+    write_brief_deadline_config(&home, true, 5);
+    let drawer = evidence_drawer(
+        "brief_evidence_dimension_mismatch",
+        "Synthetic dimension query evidence exists for BM25 fallback citation.",
+    );
+    db.insert_drawer(&drawer).expect("insert drawer");
+    db.insert_vector(&drawer.id, &[0.8, 0.2])
+        .expect("insert 2d vector");
+    let query = "Synthetic dimension query";
+    let (endpoint, handle) = start_openai_embedding_stub_with_vector(query, 1, vec![0.1, 0.2, 0.3]);
+    let base_url = endpoint.trim_end_matches("/embeddings").to_string();
+
+    let output = run_mempal_with_env(
+        &home,
+        &["brief", query, "--format", "json"],
+        &[
+            ("MEMPAL_EMBED_BACKEND", "openai_compat".to_string()),
+            ("MEMPAL_EMBED_BASE_URL", base_url),
+            ("MEMPAL_EMBED_MODEL", "test-model".to_string()),
+            ("MEMPAL_EMBED_DIM", "3".to_string()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "brief fallback should exit 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    handle.join().expect("embedding stub");
+    assert!(!output.stdout.is_empty());
+    let brief: Value = serde_json::from_slice(&output.stdout).expect("brief json");
+    assert_eq!(brief["search_mode"], "bm25_only");
+    assert!(
+        brief["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains("dimension mismatch")))
+    );
+    assert!(
+        brief["summary"]["narrative"]
+            .as_str()
+            .is_some_and(|summary| !summary.is_empty())
+    );
+    assert_eq!(
+        brief["evidence"][0]["citation"]["drawer_id"],
+        "brief_evidence_dimension_mismatch"
+    );
+    assert!(
+        brief["evidence"][0]["citation"]["source_file"]
+            .as_str()
+            .is_some_and(|source| !source.is_empty())
+    );
 }
 
 #[test]

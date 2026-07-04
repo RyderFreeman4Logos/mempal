@@ -14141,21 +14141,33 @@ quality_policy = "llm_required_for_keep"
         source_file: &str,
         importance: i32,
     ) {
+        insert_bootstrap_evidence_with_vector(
+            db_path,
+            BootstrapEvidenceArgs {
+                id: id.to_string(),
+                content: content.to_string(),
+                wing: wing.to_string(),
+                room: room.map(str::to_string),
+                source_file: Some(source_file.to_string()),
+                source_type: SourceType::AgentInference,
+                added_at: "1713000000".to_string(),
+                chunk_index: Some(0),
+                importance,
+            },
+            &[0.1, 0.2, 0.3],
+        );
+    }
+
+    fn insert_bootstrap_evidence_with_vector(
+        db_path: &Path,
+        args: BootstrapEvidenceArgs,
+        vector: &[f32],
+    ) {
+        let id = args.id.clone();
         let db = Database::open(db_path).expect("open db");
-        db.insert_drawer(&Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
-            id: id.to_string(),
-            content: content.to_string(),
-            wing: wing.to_string(),
-            room: room.map(str::to_string),
-            source_file: Some(source_file.to_string()),
-            source_type: SourceType::AgentInference,
-            added_at: "1713000000".to_string(),
-            chunk_index: Some(0),
-            importance,
-        }))
-        .expect("insert drawer");
-        db.insert_vector(id, &[0.1, 0.2, 0.3])
-            .expect("insert vector");
+        db.insert_drawer(&Drawer::new_bootstrap_evidence(args))
+            .expect("insert drawer");
+        db.insert_vector(&id, vector).expect("insert vector");
     }
 
     fn hold_daemon_writer_lease(db_path: &Path) -> RuntimeWriterLease {
@@ -17175,6 +17187,71 @@ prototypes = ["keep"]
             response.evidence[0].citation.drawer_id,
             "drawer_brief_bm25_deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_brief_embedding_dimension_mismatch_falls_back_to_bm25() {
+        let _config_guard = ConfigOverrideGuard::install(
+            "[search]\nbm25_fallback = true\n\n[embed.retry]\nsearch_deadline_secs = 5\n",
+        )
+        .await;
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("palace.db");
+        insert_bootstrap_evidence_with_vector(
+            &db_path,
+            BootstrapEvidenceArgs {
+                id: "drawer_brief_bm25_dimension_mismatch".to_string(),
+                content: "MCP synthetic dimension query evidence for BM25 fallback.".to_string(),
+                wing: "mempal".to_string(),
+                room: Some("brief".to_string()),
+                source_file: Some("tests://mcp/brief/dimension-mismatch".to_string()),
+                source_type: SourceType::AgentInference,
+                added_at: "1713000000".to_string(),
+                chunk_index: Some(0),
+                importance: 4,
+            },
+            &[0.9, 0.1],
+        );
+        let async_db = AsyncDb::open(&db_path, 4).expect("open async db fixture");
+        let server = MempalMcpServer::new_with_factory(
+            db_path,
+            Arc::new(StubEmbedderFactory {
+                vector: vec![0.1, 0.2, 0.3],
+            }),
+        )
+        .expect("create MCP server")
+        .with_async_db_for_test(async_db);
+
+        let response = server
+            .mempal_brief(Parameters(BriefMcpRequest {
+                query: "MCP synthetic dimension query".to_string(),
+                field: Some(anchor::DEFAULT_FIELD.to_string()),
+                domain: Some("project".to_string()),
+                cwd: None,
+                max_items: Some(3),
+                dao_tian_limit: None,
+            }))
+            .await
+            .expect("brief response")
+            .0;
+
+        assert_eq!(response.search_mode, "bm25_only");
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("dimension mismatch"))
+        );
+        assert!(response.system_warnings.iter().any(|warning| {
+            warning.source == "embedding" && warning.message.contains("dimension mismatch")
+        }));
+        assert!(!response.summary.narrative.is_empty());
+        assert_eq!(response.evidence.len(), 1);
+        assert_eq!(
+            response.evidence[0].citation.drawer_id,
+            "drawer_brief_bm25_dimension_mismatch"
+        );
+        assert!(!response.evidence[0].citation.source_file.is_empty());
     }
 
     #[tokio::test]
