@@ -12,6 +12,72 @@ use crate::db_path_identity::{DbFileIdentity, db_file_targets};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
+const DB_HOLDER_INSPECTION_TIMEOUT: &str =
+    "DB holder inspection exceeded time budget; results may be incomplete";
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct DbHolderInspectionDeadline {
+    expires_at: Option<Instant>,
+    #[cfg(test)]
+    fd_entries_remaining: Option<usize>,
+}
+
+#[cfg(target_os = "linux")]
+impl DbHolderInspectionDeadline {
+    fn none() -> Self {
+        Self {
+            expires_at: None,
+            #[cfg(test)]
+            fd_entries_remaining: None,
+        }
+    }
+
+    fn at(expires_at: Instant) -> Self {
+        Self {
+            expires_at: Some(expires_at),
+            #[cfg(test)]
+            fd_entries_remaining: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn after_fd_entries(fd_entries_remaining: usize) -> Self {
+        Self {
+            expires_at: None,
+            fd_entries_remaining: Some(fd_entries_remaining),
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| Instant::now() >= expires_at)
+    }
+
+    fn consume_fd_entry_budget(&mut self) -> bool {
+        if self.expired() {
+            return true;
+        }
+
+        #[cfg(test)]
+        if let Some(remaining) = self.fd_entries_remaining.as_mut() {
+            if *remaining == 0 {
+                return true;
+            }
+            *remaining -= 1;
+        }
+
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum OpenedDbFilesScan {
+    Complete(Vec<String>),
+    DeadlineExceeded,
+}
+
 /// Best-effort report of live processes that currently hold the mempal SQLite
 /// database, WAL, or shared-memory file open.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -411,7 +477,7 @@ fn inspect_db_holders_in_proc(
         now_secs,
         clock_ticks_per_second,
         true,
-        None,
+        DbHolderInspectionDeadline::none(),
     )
 }
 
@@ -429,7 +495,7 @@ fn inspect_db_holders_in_proc_with_deadline(
         now_secs,
         clock_ticks_per_second,
         true,
-        Some(deadline),
+        DbHolderInspectionDeadline::at(deadline),
     )
 }
 
@@ -446,7 +512,7 @@ fn inspect_db_holders_in_proc_for_startup_remediation(
         now_secs,
         clock_ticks_per_second,
         false,
-        None,
+        DbHolderInspectionDeadline::none(),
     )
 }
 
@@ -457,7 +523,7 @@ fn inspect_db_holders_in_proc_with_daemon_pid_protection(
     now_secs: u64,
     clock_ticks_per_second: u64,
     protect_daemon_pid: bool,
-    deadline: Option<Instant>,
+    mut deadline: DbHolderInspectionDeadline,
 ) -> DbHolderReport {
     let current_pid = std::process::id() as i32;
     let daemon_pid = read_daemon_pid(db_path);
@@ -480,22 +546,23 @@ fn inspect_db_holders_in_proc_with_daemon_pid_protection(
 
     let mut holders = Vec::new();
     for entry in entries.flatten() {
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return build_report(
-                db_path,
-                holders,
-                Some(
-                    "DB holder inspection exceeded time budget; results may be incomplete"
-                        .to_string(),
-                ),
-            );
+        if deadline.expired() {
+            return build_timeout_report(db_path, holders);
         }
         let file_name = entry.file_name();
         let Some(pid) = file_name.to_str().and_then(parse_pid) else {
             continue;
         };
         let pid_dir = entry.path();
-        let opened_files = opened_db_files(&pid_dir.join("fd"), &targets);
+        let opened_files = match opened_db_files(&pid_dir.join("fd"), &targets, &mut deadline) {
+            OpenedDbFilesScan::Complete(opened_files) => opened_files,
+            OpenedDbFilesScan::DeadlineExceeded => {
+                return build_timeout_report(db_path, holders);
+            }
+        };
+        if deadline.expired() {
+            return build_timeout_report(db_path, holders);
+        }
         if opened_files.is_empty() {
             continue;
         }
@@ -541,6 +608,15 @@ fn inspect_db_holders_in_proc_with_daemon_pid_protection(
     build_report(db_path, holders, None)
 }
 
+#[cfg(target_os = "linux")]
+fn build_timeout_report(db_path: &Path, holders: Vec<DbHolderProcess>) -> DbHolderReport {
+    build_report(
+        db_path,
+        holders,
+        Some(DB_HOLDER_INSPECTION_TIMEOUT.to_string()),
+    )
+}
+
 fn build_report(
     db_path: &Path,
     holders: Vec<DbHolderProcess>,
@@ -575,13 +651,20 @@ fn empty_report(db_path: &Path, error: Option<String>) -> DbHolderReport {
 }
 
 #[cfg(target_os = "linux")]
-fn opened_db_files(fd_dir: &Path, targets: &[(&'static str, DbFileIdentity)]) -> Vec<String> {
+fn opened_db_files(
+    fd_dir: &Path,
+    targets: &[(&'static str, DbFileIdentity)],
+    deadline: &mut DbHolderInspectionDeadline,
+) -> OpenedDbFilesScan {
     let entries = match fs::read_dir(fd_dir) {
         Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+        Err(_) => return OpenedDbFilesScan::Complete(Vec::new()),
     };
     let mut opened = Vec::new();
     for entry in entries.flatten() {
+        if deadline.consume_fd_entry_budget() {
+            return OpenedDbFilesScan::DeadlineExceeded;
+        }
         let fd_path = entry.path();
         let Ok(target) = fs::read_link(&fd_path) else {
             continue;
@@ -596,7 +679,7 @@ fn opened_db_files(fd_dir: &Path, targets: &[(&'static str, DbFileIdentity)]) ->
         }
     }
     opened.sort();
-    opened
+    OpenedDbFilesScan::Complete(opened)
 }
 
 #[cfg(target_os = "linux")]
@@ -1073,6 +1156,19 @@ mod tests {
             }
         }
 
+        fn opened_db_files_for_test(
+            fd_dir: &Path,
+            targets: &[(&'static str, DbFileIdentity)],
+        ) -> Vec<String> {
+            let mut deadline = DbHolderInspectionDeadline::none();
+            match opened_db_files(fd_dir, targets, &mut deadline) {
+                OpenedDbFilesScan::Complete(opened) => opened,
+                OpenedDbFilesScan::DeadlineExceeded => {
+                    panic!("unbounded test scan unexpectedly timed out")
+                }
+            }
+        }
+
         #[test]
         fn test_parse_cmdline_and_start_ticks() {
             assert_eq!(
@@ -1221,6 +1317,38 @@ mod tests {
                     .is_some_and(|error| error.contains("time budget")),
                 "{report:#?}"
             );
+            assert!(report.has_problem());
+        }
+
+        #[test]
+        fn test_inspect_db_holders_deadline_expires_during_fd_scan() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let proc_root = tmp.path().join("proc");
+            fs::create_dir_all(&proc_root).expect("create proc");
+            fs::write(proc_root.join("stat"), "cpu 0 0 0 0\nbtime 1000\n").expect("write stat");
+
+            let mempal_home = tmp.path().join(".mempal");
+            fs::create_dir_all(&mempal_home).expect("create mempal home");
+            let db_path = mempal_home.join("palace.db");
+            let other_path = mempal_home.join("other.db");
+            write_process(
+                &proc_root,
+                42,
+                &["mempal", "daemon", "--foreground"],
+                &[other_path.as_path(), db_path.as_path()],
+            );
+
+            let report = inspect_db_holders_in_proc_with_daemon_pid_protection(
+                &db_path,
+                &proc_root,
+                1100,
+                100,
+                true,
+                DbHolderInspectionDeadline::after_fd_entries(1),
+            );
+
+            assert_eq!(report.holder_count, 0);
+            assert_eq!(report.error.as_deref(), Some(DB_HOLDER_INSPECTION_TIMEOUT));
             assert!(report.has_problem());
         }
 
@@ -1419,7 +1547,7 @@ mod tests {
             write_process(&proc_root, 33, &["mempal", "serve"], &[db_path.as_path()]);
 
             let targets = db_file_targets_with_cwd(Path::new("palace.db"), tmp.path());
-            let opened = opened_db_files(&proc_root.join("33").join("fd"), &targets);
+            let opened = opened_db_files_for_test(&proc_root.join("33").join("fd"), &targets);
 
             assert_eq!(opened, vec!["db"]);
         }
@@ -1443,7 +1571,7 @@ mod tests {
             );
 
             let targets = db_file_targets(&linked_home.join("palace.db"));
-            let opened = opened_db_files(&proc_root.join("44").join("fd"), &targets);
+            let opened = opened_db_files_for_test(&proc_root.join("44").join("fd"), &targets);
 
             assert_eq!(opened, vec!["db"]);
         }
@@ -1467,7 +1595,7 @@ mod tests {
             );
 
             let targets = db_file_targets(&linked_db_path);
-            let opened = opened_db_files(&proc_root.join("55").join("fd"), &targets);
+            let opened = opened_db_files_for_test(&proc_root.join("55").join("fd"), &targets);
 
             assert_eq!(opened, vec!["db"]);
         }
