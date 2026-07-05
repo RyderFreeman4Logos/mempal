@@ -56,6 +56,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Changed
 
+- Default embedding, LLM, search, reranker, and daemon DB-holder scan timeouts
+  are more generous for quality-first local model deployments on edge hardware.
 - Scoped pre-push CHANGELOG guard that requires an `[Unreleased]` entry only
   when `src/**/*.rs` files changed on the branch.
 - Current architecture overview at `docs/architecture.md`, linked from README,

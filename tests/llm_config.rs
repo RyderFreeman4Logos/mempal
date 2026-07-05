@@ -6,8 +6,8 @@ fn test_llm_config_default_disabled() {
 
     assert!(!config.enabled);
     assert_eq!(config.backend, "openai_compat");
-    assert_eq!(config.request_timeout_secs, 30);
-    assert_eq!(config.health_probe_timeout_secs, 3);
+    assert_eq!(config.request_timeout_secs, 240);
+    assert_eq!(config.health_probe_timeout_secs, 10);
     assert_eq!(config.retry_interval_secs, 2);
     assert_eq!(config.max_concurrent, 16);
     assert_eq!(config.enabled_for, vec!["gating".to_string()]);
@@ -133,8 +133,8 @@ max_concurrent = 3
     assert_eq!(endpoints[0].base_url, "http://primary.local:8317/v1");
     assert_eq!(endpoints[0].model, "primary-model");
     assert_eq!(endpoints[0].priority, 10);
-    assert_eq!(endpoints[0].request_timeout_secs, 30);
-    assert_eq!(endpoints[0].health_probe_timeout_secs, 3);
+    assert_eq!(endpoints[0].request_timeout_secs, 240);
+    assert_eq!(endpoints[0].health_probe_timeout_secs, 10);
     assert_eq!(endpoints[0].retry_interval_secs, 2);
     assert_eq!(endpoints[0].max_concurrent, 16);
     assert_eq!(endpoints[1].id, "lan.backup-1");
@@ -213,7 +213,7 @@ max_concurrent = 2
     assert_eq!(endpoints[0].model, "Qwen/Qwen3-Embedding-8B");
     assert_eq!(endpoints[0].dimensions, 4096);
     assert_eq!(endpoints[0].priority, 0);
-    assert_eq!(endpoints[0].request_timeout_secs, 30);
+    assert_eq!(endpoints[0].request_timeout_secs, 240);
     assert_eq!(endpoints[0].retry_interval_secs, 2);
     assert_eq!(endpoints[0].max_concurrent, 4);
     assert_eq!(endpoints[1].id, "spark");
