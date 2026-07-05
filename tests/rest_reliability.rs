@@ -3,7 +3,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -470,7 +470,7 @@ async fn test_status_reports_schema_skew_restart_warning() {
     env.force_future_schema();
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
 
-    let (status, _headers, body) = get_json(state, "/api/status").await;
+    let (status, _headers, body) = get_json(state, "/api/status?diagnostic=true").await;
 
     assert_eq!(status, StatusCode::OK);
     let warnings = body["status_warnings"].as_array().expect("status warnings");
@@ -485,6 +485,86 @@ async fn test_status_reports_schema_skew_restart_warning() {
         "status warnings should surface schema skew: {body:#}"
     );
     assert_eq!(body["drawer_count"].as_i64(), Some(0));
+}
+
+#[tokio::test]
+async fn test_status_default_is_cheap_and_diagnostic_populates_db_snapshot() {
+    let _guard = TEST_LOCK.lock().await;
+    let env = TestEnv::new();
+    insert_search_drawer(&env.db());
+    let db_snapshot_calls = Arc::new(AtomicU64::new(0));
+    let state = env
+        .state(Arc::new(StaticEmbedderFactory { dim: 4 }))
+        .with_bounded_read_counter_for_test(Arc::clone(&db_snapshot_calls));
+
+    let (status, _headers, body) = get_json(state.clone(), "/api/status").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["diagnostic"].as_bool(), Some(false));
+    assert_eq!(
+        body["turn_storage"]["storage_mode"].as_str(),
+        Some("raw_evidence")
+    );
+    assert!(
+        body.get("drawer_count").is_none(),
+        "default cheap status must omit diagnostic drawer_count: {body:#}"
+    );
+    assert!(
+        body.get("taxonomy_count").is_none(),
+        "default cheap status must omit diagnostic taxonomy_count: {body:#}"
+    );
+    assert!(
+        body.get("db_size_bytes").is_none(),
+        "default cheap status must omit diagnostic db_size_bytes: {body:#}"
+    );
+    assert!(
+        body["turn_storage"].get("raw_turn_count").is_none(),
+        "default cheap status must omit diagnostic raw_turn_count: {body:#}"
+    );
+    assert!(
+        body.get("wings").is_none(),
+        "default cheap status must omit diagnostic scope counts: {body:#}"
+    );
+    assert!(
+        body.get("source_type_distribution").is_none(),
+        "default cheap status must omit diagnostic source type counts: {body:#}"
+    );
+    assert!(body.get("status_warnings").is_none());
+    assert_eq!(
+        db_snapshot_calls.load(Ordering::SeqCst),
+        0,
+        "default /api/status must not trigger the heavy bounded DB snapshot collector"
+    );
+
+    let (status, _headers, body) = get_json(state, "/api/status?diagnostic=true").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["diagnostic"].as_bool(), Some(true));
+    assert_eq!(body["drawer_count"].as_i64(), Some(1));
+    assert_eq!(body["taxonomy_count"].as_i64(), Some(0));
+    assert!(
+        body["db_size_bytes"].as_i64().is_some(),
+        "diagnostic status should include DB size: {body:#}"
+    );
+    assert_eq!(body["turn_storage"]["raw_turn_count"].as_i64(), Some(0));
+    assert_eq!(
+        db_snapshot_calls.load(Ordering::SeqCst),
+        1,
+        "diagnostic /api/status should run the DB snapshot collector exactly once"
+    );
+    assert_eq!(
+        body["turn_storage"]["storage_mode"].as_str(),
+        Some("raw_evidence")
+    );
+    assert!(
+        body["wings"]
+            .as_array()
+            .expect("diagnostic wings")
+            .iter()
+            .any(|scope| scope["wing"].as_str() == Some("test")
+                && scope["drawer_count"].as_i64() == Some(1)),
+        "diagnostic status should include DB scope counts: {body:#}"
+    );
 }
 
 #[tokio::test]
@@ -992,31 +1072,33 @@ async fn test_status_returns_telemetry_when_search_db_pool_is_saturated() {
     .expect("status should return before daemon status 2s timeout");
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["drawer_count"].as_i64(), Some(0));
-    assert_eq!(body["taxonomy_count"].as_i64(), Some(0));
-    assert_eq!(body["db_size_bytes"].as_u64(), Some(0));
-    assert_eq!(body["turn_storage"]["raw_turn_count"].as_i64(), Some(0));
     assert!(
-        body["wings"].as_array().expect("wings").is_empty(),
-        "partial status should not report stale scope counts"
+        body.get("drawer_count").is_none(),
+        "default cheap status must omit diagnostic drawer_count: {body:#}"
     );
     assert!(
-        body["source_type_distribution"]
-            .as_array()
-            .expect("source type distribution")
-            .is_empty(),
-        "partial status should not report stale source counts"
-    );
-    let warnings = body["status_warnings"].as_array().expect("status warnings");
-    assert_eq!(warnings.len(), 1);
-    let warning = warnings[0].as_str().expect("status warning");
-    assert!(
-        warning.contains("status database snapshot deadline exceeded after 1s"),
-        "warning={warning}"
+        body.get("taxonomy_count").is_none(),
+        "default cheap status must omit diagnostic taxonomy_count: {body:#}"
     );
     assert!(
-        !warning.contains("alpha"),
-        "status warning must not leak query text: {warning}"
+        body.get("db_size_bytes").is_none(),
+        "default cheap status must omit diagnostic db_size_bytes: {body:#}"
+    );
+    assert!(
+        body["turn_storage"].get("raw_turn_count").is_none(),
+        "default cheap status must omit diagnostic raw_turn_count: {body:#}"
+    );
+    assert!(
+        body.get("wings").is_none(),
+        "default cheap status must omit diagnostic scope counts: {body:#}"
+    );
+    assert!(
+        body.get("source_type_distribution").is_none(),
+        "default cheap status must omit diagnostic source counts: {body:#}"
+    );
+    assert!(
+        body.get("status_warnings").is_none(),
+        "default cheap status must not run the DB snapshot collector: {body:#}"
     );
     let telemetry = body["search_telemetry"]
         .as_object()
@@ -1039,6 +1121,28 @@ async fn test_status_returns_telemetry_when_search_db_pool_is_saturated() {
                 .is_some_and(|deadline_ms| deadline_ms >= 30_000)
         }),
         "active searches should retain the configured search deadline: {active_searches:#?}"
+    );
+
+    let (diagnostic_status, _headers, diagnostic_body) = tokio::time::timeout(
+        Duration::from_millis(1_800),
+        get_json(state.clone(), "/api/status?diagnostic=true"),
+    )
+    .await
+    .expect("diagnostic status should return before daemon status 2s timeout");
+
+    assert_eq!(diagnostic_status, StatusCode::OK);
+    let warnings = diagnostic_body["status_warnings"]
+        .as_array()
+        .expect("diagnostic status warnings");
+    assert_eq!(warnings.len(), 1);
+    let warning = warnings[0].as_str().expect("status warning");
+    assert!(
+        warning.contains("status database snapshot deadline exceeded after 1s"),
+        "warning={warning}"
+    );
+    assert!(
+        !warning.contains("alpha"),
+        "status warning must not leak query text: {warning}"
     );
 
     for request in requests {
@@ -1084,6 +1188,9 @@ async fn test_availability_check_without_embedder() {
     let (status, _headers, body) = get_json(state, "/api/status").await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body["db_size_bytes"].as_u64().is_some());
+    assert!(
+        body.get("db_size_bytes").is_none(),
+        "default status must omit diagnostic DB size: {body:#}"
+    );
     assert!(body["embedding_status"].as_str().is_some());
 }

@@ -25,6 +25,7 @@ pub struct ApiState {
     async_db: Arc<OnceCell<AsyncDb>>,
     write_queue: Arc<super::handlers::WriteQueue>,
     search_telemetry: Arc<SearchTelemetry>,
+    bounded_read_counter: Option<Arc<AtomicU64>>,
 }
 
 impl ApiState {
@@ -56,6 +57,7 @@ impl ApiState {
             async_db: Arc::new(OnceCell::new()),
             write_queue,
             search_telemetry: Arc::new(SearchTelemetry::default()),
+            bounded_read_counter: None,
         }
     }
 
@@ -84,6 +86,9 @@ impl ApiState {
         F: FnOnce(&crate::core::db::Database) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        if let Some(counter) = &self.bounded_read_counter {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
         let async_db = self.async_db().await?;
         match tokio::time::timeout(deadline, async_db.run_read_anyhow(f)).await {
             Ok(result) => result.map(Some),
@@ -96,6 +101,12 @@ impl ApiState {
         let cell = Arc::new(OnceCell::new());
         debug_assert!(cell.set(async_db).is_ok());
         self.async_db = cell;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_bounded_read_counter_for_test(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.bounded_read_counter = Some(counter);
         self
     }
 

@@ -33,6 +33,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **API**: Default `GET /api/status` now returns a cheap bounded snapshot. Expensive DB-wide status fields moved behind `?diagnostic=true` (#662)
 
 - `mempal doctor`, `mempal daemon status`, and the full smoke runner now expose
   embedding degraded/write-refused state, sanitized endpoint details, and queue
