@@ -162,8 +162,9 @@ The reported shape is small by row count but large by vector width:
 
 - Use project, wing, room, or typed filters when possible to keep vector
   candidates below the 4096 exact-scan cap.
-- Check `mempal status --json` or MCP `mempal_status` for the `vector_scan`
-  snapshot after a search; `mode = "knn"` and `candidate_count > 4096` indicates
-  the broad sqlite-vec path.
+- Check REST `GET /api/status` when REST is enabled, `mempal daemon status` when
+  it can fetch REST status, or MCP `mempal_status` in the same MCP server process
+  for the `vector_scan` snapshot after a search; `mode = "knn"` and
+  `candidate_count > 4096` indicates the broad sqlite-vec path.
 - Do not treat reranker top-k as the vector bottleneck. Reranking starts after
   hybrid retrieval has already paid the vector scan cost.
