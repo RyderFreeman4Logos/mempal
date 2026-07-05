@@ -519,9 +519,13 @@ fn validate_ingest_request(request: &IngestRequest) -> Result<ValidatedIngestReq
 
 #[derive(Debug, Serialize)]
 struct StatusResponse {
-    drawer_count: i64,
-    taxonomy_count: i64,
-    db_size_bytes: u64,
+    diagnostic: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drawer_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    taxonomy_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db_size_bytes: Option<i64>,
     embedding_status: String,
     embedding_endpoints: Vec<ApiEmbeddingEndpointStatus>,
     embed_status: ApiEmbedStatus,
@@ -535,8 +539,10 @@ struct StatusResponse {
     feature_flags: FeatureFlags,
     hermes_compat_version: String,
     search_decay_mode: String,
-    wings: Vec<ScopeCount>,
-    source_type_distribution: Vec<SourceTypeCount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wings: Option<Vec<ScopeCount>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_type_distribution: Option<Vec<SourceTypeCount>>,
     turn_storage: TurnStorageStatus,
     ingest_worker_backoff: crate::observability::IngestWorkerBackoffSnapshot,
     vector_scan: crate::observability::VectorScanSnapshot,
@@ -734,7 +740,8 @@ struct SourceTypeCount {
 struct TurnStorageStatus {
     storage_mode: String,
     default_importance: i32,
-    raw_turn_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_turn_count: Option<i64>,
     raw_turn_wings: Vec<String>,
     raw_turn_rooms: Vec<String>,
 }
@@ -743,7 +750,7 @@ struct TurnStorageStatus {
 struct StatusDbSnapshot {
     drawer_count: i64,
     taxonomy_count: i64,
-    db_size_bytes: u64,
+    db_size_bytes: i64,
     wings: Vec<ScopeCount>,
     source_type_distribution: Vec<SourceTypeCount>,
     raw_turn_count: i64,
@@ -1600,7 +1607,20 @@ async fn taxonomy_handler(
     Ok(Json(entries))
 }
 
-async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResponse>, ApiError> {
+#[derive(Debug, Default, Deserialize)]
+struct StatusQuery {
+    #[serde(default)]
+    diagnostic: bool,
+}
+
+/// Return a cheap bounded health/config snapshot by default.
+///
+/// `diagnostic=true` opts into the DB-wide snapshot fields that can scan large
+/// palace tables or vector metadata on production-sized databases.
+async fn status_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<StatusQuery>,
+) -> Result<Json<StatusResponse>, ApiError> {
     let config = ConfigHandle::current();
     let daemon_embed_config = config.daemon_embedder_config();
     let embed_snapshot = crate::embed::global_embed_status().snapshot();
@@ -1611,58 +1631,63 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         .collect::<std::collections::BTreeMap<_, _>>();
     let vector_search_circuit =
         VectorSearchCircuit::from_config_and_snapshot(config.as_ref(), &embed_snapshot);
-    let turns_config = config.turns.clone();
     let db_deadline = STATUS_DB_SNAPSHOT_DEADLINE;
     let search_telemetry = state.search_telemetry().snapshot();
-    let (db_snapshot, status_warnings) = match state
-        .run_read_anyhow_bounded(
-            move |db| {
-                let drawer_count = db.drawer_count()?;
-                let raw_turn_count = count_raw_turn_drawers(db, &turns_config)?;
-                let taxonomy_count = db.taxonomy_count()?;
-                let db_size_bytes = db.database_size_bytes()?;
-                let wings = db
-                    .scope_counts()?
-                    .into_iter()
-                    .map(|(wing, room, drawer_count)| ScopeCount {
-                        wing,
-                        room,
+    let (db_snapshot, status_warnings) = if query.diagnostic {
+        let turns_config = config.turns.clone();
+        match state
+            .run_read_anyhow_bounded(
+                move |db| {
+                    let drawer_count = db.drawer_count()?;
+                    let raw_turn_count = count_raw_turn_drawers(db, &turns_config)?;
+                    let taxonomy_count = db.taxonomy_count()?;
+                    let db_size_bytes =
+                        i64::try_from(db.database_size_bytes()?).unwrap_or(i64::MAX);
+                    let wings = db
+                        .scope_counts()?
+                        .into_iter()
+                        .map(|(wing, room, drawer_count)| ScopeCount {
+                            wing,
+                            room,
+                            drawer_count,
+                        })
+                        .collect();
+                    let source_type_distribution = db
+                        .source_type_counts()?
+                        .into_iter()
+                        .map(|(source_type, count)| SourceTypeCount {
+                            source_type: source_type.to_string(),
+                            count,
+                        })
+                        .collect();
+                    Ok(StatusDbSnapshot {
                         drawer_count,
+                        taxonomy_count,
+                        db_size_bytes,
+                        wings,
+                        source_type_distribution,
+                        raw_turn_count,
                     })
-                    .collect();
-                let source_type_distribution = db
-                    .source_type_counts()?
-                    .into_iter()
-                    .map(|(source_type, count)| SourceTypeCount {
-                        source_type: source_type.to_string(),
-                        count,
-                    })
-                    .collect();
-                Ok(StatusDbSnapshot {
-                    drawer_count,
-                    taxonomy_count,
-                    db_size_bytes,
-                    wings,
-                    source_type_distribution,
-                    raw_turn_count,
-                })
-            },
-            db_deadline,
-        )
-        .await
-    {
-        Ok(Some(snapshot)) => (snapshot, Vec::new()),
-        Ok(None) => (
-            StatusDbSnapshot::default(),
-            vec![rest_search_timeout_warning(
-                "status database snapshot",
+                },
                 db_deadline,
-            )],
-        ),
-        Err(error) => (
-            StatusDbSnapshot::default(),
-            vec![status_database_snapshot_error_warning(&error)],
-        ),
+            )
+            .await
+        {
+            Ok(Some(snapshot)) => (snapshot, Vec::new()),
+            Ok(None) => (
+                StatusDbSnapshot::default(),
+                vec![rest_search_timeout_warning(
+                    "status database snapshot",
+                    db_deadline,
+                )],
+            ),
+            Err(error) => (
+                StatusDbSnapshot::default(),
+                vec![status_database_snapshot_error_warning(&error)],
+            ),
+        }
+    } else {
+        (StatusDbSnapshot::default(), Vec::new())
     };
     let mut status_warnings = status_warnings;
     if current_executable_deleted() {
@@ -1769,10 +1794,31 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         last_success_at_unix_ms: embed_snapshot.last_success_at_unix_ms,
     };
 
+    let (
+        drawer_count,
+        taxonomy_count,
+        db_size_bytes,
+        wings,
+        source_type_distribution,
+        raw_turn_count,
+    ) = if query.diagnostic {
+        (
+            Some(db_snapshot.drawer_count),
+            Some(db_snapshot.taxonomy_count),
+            Some(db_snapshot.db_size_bytes),
+            Some(db_snapshot.wings),
+            Some(db_snapshot.source_type_distribution),
+            Some(db_snapshot.raw_turn_count),
+        )
+    } else {
+        (None, None, None, None, None, None)
+    };
+
     Ok(Json(StatusResponse {
-        drawer_count: db_snapshot.drawer_count,
-        taxonomy_count: db_snapshot.taxonomy_count,
-        db_size_bytes: db_snapshot.db_size_bytes,
+        diagnostic: query.diagnostic,
+        drawer_count,
+        taxonomy_count,
+        db_size_bytes,
         embedding_status: current_embedding_status(&embed_snapshot).to_string(),
         embedding_endpoints,
         embed_status,
@@ -1796,12 +1842,12 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         },
         hermes_compat_version: HERMES_COMPAT_VERSION.to_string(),
         search_decay_mode: config.search.decay.mode.to_string(),
-        wings: db_snapshot.wings,
-        source_type_distribution: db_snapshot.source_type_distribution,
+        wings,
+        source_type_distribution,
         turn_storage: TurnStorageStatus {
             storage_mode: config.turns.storage_mode.to_string(),
             default_importance: config.turns.default_importance,
-            raw_turn_count: db_snapshot.raw_turn_count,
+            raw_turn_count,
             raw_turn_wings: config.turns.raw_turn_wings.clone(),
             raw_turn_rooms: config.turns.raw_turn_rooms.clone(),
         },
