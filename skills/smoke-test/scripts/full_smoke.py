@@ -1595,13 +1595,20 @@ def validate_doctor_health(doc_json: Any) -> dict[str, Any]:
 
 def daemon_status_diagnostics(stdout: bytes) -> dict[str, Any]:
     text = stdout.decode('utf-8', errors='replace')
+    embedder_status_source: str | None = None
     embedder_degraded: bool | None = None
+    embedder_write_refused: bool | None = None
     queue_terminal_failures: int | None = None
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if line.startswith('rest.embedder_degraded:'):
+        if line.startswith('rest.embedder_status_source:'):
+            embedder_status_source = line.split(':', 1)[1].strip()
+        elif line.startswith('rest.embedder_degraded:'):
             value = line.split(':', 1)[1].strip().lower()
             embedder_degraded = value == 'true'
+        elif line.startswith('rest.embedder_write_refused:'):
+            value = line.split(':', 1)[1].strip().lower()
+            embedder_write_refused = value == 'true'
         elif line.startswith('queue.failed_terminal:') or line.startswith('rest.queue_terminal_failures:'):
             value = line.split(':', 1)[1].strip()
             try:
@@ -1609,7 +1616,9 @@ def daemon_status_diagnostics(stdout: bytes) -> dict[str, Any]:
             except ValueError:
                 queue_terminal_failures = None
     return {
+        'embedder_status_source': embedder_status_source,
         'embedder_degraded': embedder_degraded,
+        'embedder_write_refused': embedder_write_refused,
         'queue_terminal_failures': queue_terminal_failures,
     }
 

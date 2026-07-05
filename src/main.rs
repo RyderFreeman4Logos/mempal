@@ -76,7 +76,9 @@ use mempal::cowork::{
     SendOperation, SendRequest,
 };
 use mempal::crystallize::{CrystallizeOptions, CrystallizeSummary, run_crystallization};
-use mempal::doctor::{RestDoctorReport, build_doctor_report, build_rest_doctor_report};
+use mempal::doctor::{
+    RestDoctorReport, build_doctor_report_with_daemon_status, build_rest_doctor_report,
+};
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
 use mempal::field_taxonomy::{FieldTaxonomyEntry, field_taxonomy};
@@ -15770,19 +15772,31 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
         mempal::process_diagnostics::inspect_db_holders_bounded(db_path, Duration::from_secs(5));
     print_db_holder_report("db_holders", &db_holders, "");
     #[cfg(feature = "rest")]
-    if let Ok(config) = Config::load()
-        && config.api.enabled
-        && let Ok(Some(status)) = block_on_result(fetch_daemon_status(&config.api.addr))
     {
-        print_daemon_rest_embedder_cache(&status);
-        print_daemon_rest_resource_usage(&status);
-        print_daemon_rest_embedding_status(&status);
-        print_daemon_rest_queue_stats(&status);
-        print_daemon_rest_io_burst(&status);
-        print_daemon_ingest_worker_backoff(&status);
-        print_daemon_vector_scan(&status);
-        if let Some(telemetry) = status.get("search_telemetry") {
-            print_daemon_search_telemetry(telemetry);
+        let daemon_status = Config::load().ok().and_then(|config| {
+            config
+                .api
+                .enabled
+                .then(|| {
+                    block_on_result(fetch_daemon_status(&config.api.addr))
+                        .ok()
+                        .flatten()
+                })
+                .flatten()
+        });
+        if let Some(status) = daemon_status {
+            print_daemon_rest_embedder_cache(&status);
+            print_daemon_rest_resource_usage(&status);
+            print_daemon_rest_embedding_status(&status);
+            print_daemon_rest_queue_stats(&status);
+            print_daemon_rest_io_burst(&status);
+            print_daemon_ingest_worker_backoff(&status);
+            print_daemon_vector_scan(&status);
+            if let Some(telemetry) = status.get("search_telemetry") {
+                print_daemon_search_telemetry(telemetry);
+            }
+        } else {
+            println!("rest.embedder_status_source: unavailable");
         }
     }
     Ok(())
@@ -16031,12 +16045,21 @@ fn print_daemon_rest_resource_usage(status: &Value) {
 #[cfg(feature = "rest")]
 fn print_daemon_rest_embedding_status(status: &Value) {
     let Some(embed_status) = status.get("embed_status") else {
+        println!("rest.embedder_status_source: unavailable");
         return;
     };
+    println!("rest.embedder_status_source: daemon_rest");
     println!(
         "rest.embedder_degraded: {}",
         embed_status
             .get("degraded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    println!(
+        "rest.embedder_write_refused: {}",
+        embed_status
+            .get("write_refused")
             .and_then(Value::as_bool)
             .unwrap_or(false)
     );
@@ -23875,14 +23898,29 @@ fn doctor_command(format: String) -> Result<()> {
     if !matches!(format.as_str(), "plain" | "json") {
         bail!("unsupported doctor format: {format}");
     }
+    let config = Config::load().ok();
     // Best-effort: honor custom db_path from config when available.
     // Fall back to the default path so doctor remains functional when config is
     // absent or unparseable (doctor is the tool you run when the env is broken).
-    let db_path = Config::load()
-        .ok()
-        .map(|c| expand_home(&c.db_path))
+    let db_path = config
+        .as_ref()
+        .map(|config| expand_home(&config.db_path))
         .unwrap_or_else(|| mempal_home().join("palace.db"));
-    let report = build_doctor_report(&db_path);
+    #[cfg(feature = "rest")]
+    let daemon_status = config.as_ref().and_then(|config| {
+        config
+            .api
+            .enabled
+            .then(|| {
+                block_on_result(fetch_daemon_status(&config.api.addr))
+                    .ok()
+                    .flatten()
+            })
+            .flatten()
+    });
+    #[cfg(not(feature = "rest"))]
+    let daemon_status: Option<Value> = None;
+    let report = build_doctor_report_with_daemon_status(&db_path, daemon_status.as_ref());
     match format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&report)?),
         _ => {
@@ -23982,6 +24020,14 @@ fn doctor_command(format: String) -> Result<()> {
                 report.embedding.model.as_deref().unwrap_or("none")
             );
             println!("embedding_pool_capacity={}", report.embedding.pool_capacity);
+            println!(
+                "embedding_runtime_status_source={}",
+                report.embedding.runtime_status_source
+            );
+            println!(
+                "embedding_runtime_status_available={}",
+                report.embedding.runtime_status_available
+            );
             println!("embedding_degraded={}", report.embedding.degraded);
             println!(
                 "embedding_block_writes_when_degraded={}",

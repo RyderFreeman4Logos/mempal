@@ -186,12 +186,16 @@ class DoctorValidationTests(unittest.TestCase):
     def test_daemon_status_diagnostics_extracts_degraded_and_terminal_failures(self) -> None:
         stdout = (
             b"status: running\n"
+            b"rest.embedder_status_source: daemon_rest\n"
             b"rest.embedder_degraded: true\n"
+            b"rest.embedder_write_refused: true\n"
             b"queue.failed_terminal: 2\n"
             b"rest.queue_terminal_failures: 4\n"
         )
         result = self.smoke.daemon_status_diagnostics(stdout)
+        self.assertEqual(result["embedder_status_source"], "daemon_rest")
         self.assertTrue(result["embedder_degraded"])
+        self.assertTrue(result["embedder_write_refused"])
         self.assertEqual(result["queue_terminal_failures"], 4)
 
 

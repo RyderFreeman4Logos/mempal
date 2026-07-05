@@ -162,6 +162,14 @@ fn test_cli_doctor_reports_queue_failure_classes() {
     assert_eq!(value["embedding"]["queue"]["failed_terminal"], 1);
     assert_eq!(value["embedding"]["queue"]["failed_retryable_embed"], 1);
     assert_eq!(value["embedding"]["queue"]["failed_retryable_llm"], 0);
+    assert_eq!(
+        value["embedding"]["runtime_status_source"].as_str(),
+        Some("unavailable")
+    );
+    assert_eq!(
+        value["embedding"]["runtime_status_available"].as_bool(),
+        Some(false)
+    );
     assert_eq!(value["embedding"]["degraded"], false);
     assert_eq!(value["embedding"]["block_writes_when_degraded"], true);
     assert_eq!(value["embedding"]["write_refused"], false);
@@ -176,6 +184,14 @@ fn test_cli_doctor_reports_queue_failure_classes() {
     let out = stdout(&plain);
     assert!(
         out.contains("embedding_queue=pending:0 claimed:0 failed:2 retryable_model:1 terminal:1 retryable_embedding:1 retryable_llm:0 last_auto_requeue_at_unix_ms:none"),
+        "{out}"
+    );
+    assert!(
+        out.contains("embedding_runtime_status_source=unavailable"),
+        "{out}"
+    );
+    assert!(
+        out.contains("embedding_runtime_status_available=false"),
         "{out}"
     );
     assert!(out.contains("embedding_degraded=false"), "{out}");

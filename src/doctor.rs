@@ -101,6 +101,8 @@ pub struct DoctorEmbeddingReport {
     pub backend: String,
     pub model: Option<String>,
     pub pool_capacity: usize,
+    pub runtime_status_source: String,
+    pub runtime_status_available: bool,
     pub degraded: bool,
     pub block_writes_when_degraded: bool,
     pub write_refused: bool,
@@ -211,12 +213,19 @@ pub struct RestPortOwner {
 }
 
 pub fn build_doctor_report(db_path: &Path) -> DoctorReport {
+    build_doctor_report_with_daemon_status(db_path, None)
+}
+
+pub fn build_doctor_report_with_daemon_status(
+    db_path: &Path,
+    daemon_status: Option<&Value>,
+) -> DoctorReport {
     let db = inspect_db(db_path);
     let db_holders = inspect_db_holders(db_path);
     let daemon = inspect_daemon(db_path);
     let install = inspect_install();
     let config = Config::load().ok();
-    let embedding = build_embedding_report(config.as_ref(), db_path);
+    let embedding = build_embedding_report(config.as_ref(), db_path, daemon_status);
     let design_insights = inspect_design_insights(db_path);
     let restart_required_config_changes = ConfigHandle::restart_required_pending();
     let mut warnings = Vec::new();
@@ -309,9 +318,16 @@ fn inspect_design_insights(db_path: &Path) -> DoctorDesignInsightReport {
     }
 }
 
-fn build_embedding_report(config: Option<&Config>, db_path: &Path) -> DoctorEmbeddingReport {
+fn build_embedding_report(
+    config: Option<&Config>,
+    db_path: &Path,
+    daemon_status: Option<&Value>,
+) -> DoctorEmbeddingReport {
     let Some(config) = config else {
-        return DoctorEmbeddingReport::default();
+        return DoctorEmbeddingReport {
+            runtime_status_source: "unavailable".to_string(),
+            ..DoctorEmbeddingReport::default()
+        };
     };
     let embed_status = crate::embed::global_embed_status();
     let embed_snapshot = embed_status.snapshot();
@@ -376,10 +392,12 @@ fn build_embedding_report(config: Option<&Config>, db_path: &Path) -> DoctorEmbe
         .collect();
     let block_writes_when_degraded = config.embed.degradation.block_writes_when_degraded;
     let write_refused = embed_snapshot.degraded && block_writes_when_degraded;
-    DoctorEmbeddingReport {
+    let mut report = DoctorEmbeddingReport {
         backend: config.embed.backend.clone(),
         model: config.embed.effective_model_summary(),
         pool_capacity: config.embed.pool_capacity(),
+        runtime_status_source: "unavailable".to_string(),
+        runtime_status_available: false,
         degraded: embed_snapshot.degraded,
         block_writes_when_degraded,
         write_refused,
@@ -388,7 +406,43 @@ fn build_embedding_report(config: Option<&Config>, db_path: &Path) -> DoctorEmbe
         last_success_at_unix_ms: embed_snapshot.last_success_at_unix_ms,
         endpoints,
         queue,
+    };
+    overlay_daemon_embedding_status(&mut report, daemon_status);
+    report
+}
+
+fn overlay_daemon_embedding_status(
+    report: &mut DoctorEmbeddingReport,
+    daemon_status: Option<&Value>,
+) {
+    let Some(embed_status) = daemon_status.and_then(|status| status.get("embed_status")) else {
+        return;
+    };
+    report.runtime_status_source = "daemon_rest".to_string();
+    report.runtime_status_available = true;
+    if let Some(degraded) = embed_status.get("degraded").and_then(Value::as_bool) {
+        report.degraded = degraded;
     }
+    if let Some(block_writes_when_degraded) = embed_status
+        .get("block_writes_when_degraded")
+        .and_then(Value::as_bool)
+    {
+        report.block_writes_when_degraded = block_writes_when_degraded;
+    }
+    if let Some(write_refused) = embed_status.get("write_refused").and_then(Value::as_bool) {
+        report.write_refused = write_refused;
+    }
+    if let Some(fail_count) = embed_status.get("fail_count").and_then(Value::as_u64) {
+        report.fail_count = fail_count;
+    }
+    report.last_error = embed_status
+        .get("last_error")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .and_then(|error| sanitize_runtime_error(Some(error)));
+    report.last_success_at_unix_ms = embed_status
+        .get("last_success_at_unix_ms")
+        .and_then(Value::as_u64);
 }
 
 fn sanitize_runtime_error(error: Option<String>) -> Option<String> {
@@ -1165,7 +1219,8 @@ model = "Qwen/Qwen3-Embedding-8B"
         )
         .expect("parse config");
 
-        let report = build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"));
+        let report =
+            build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"), None);
 
         assert_eq!(report.endpoints.len(), 1);
         assert_eq!(report.endpoints[0].base_url, "http://127.0.0.1:18002");
@@ -1190,7 +1245,8 @@ api_key_env = "MEMPAL_SECRET_TOKEN_ENV"
         )
         .expect("parse config");
 
-        let report = build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"));
+        let report =
+            build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"), None);
         let rendered = serde_json::to_string(&report).expect("serialize report");
 
         assert_eq!(report.endpoints.len(), 1);
@@ -1231,7 +1287,8 @@ model = "text-embedding-3-large"
             ),
         );
 
-        let report = build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"));
+        let report =
+            build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"), None);
         let rendered = serde_json::to_string(&report).expect("serialize report");
 
         assert_eq!(report.endpoints.len(), 1);
@@ -1252,8 +1309,6 @@ model = "text-embedding-3-large"
 
     #[test]
     fn test_embedding_report_surfaces_degraded_write_refused_state() {
-        let status = crate::embed::global_embed_status();
-        status.reset_for_tests();
         let config = Config::parse(
             r#"
 [embed]
@@ -1269,15 +1324,26 @@ block_writes_when_degraded = true
 "#,
         )
         .expect("parse config");
-        for _ in 0..10 {
-            status.record_failure(
-                &"failed http://127.0.0.1:18002/v1/private-token-path?api_key=sk-secret-should-not-print",
-            );
-        }
+        let daemon_status = serde_json::json!({
+            "embed_status": {
+                "degraded": true,
+                "block_writes_when_degraded": true,
+                "write_refused": true,
+                "fail_count": 10,
+                "last_error": "failed http://127.0.0.1:18002/v1/private-token-path?api_key=sk-secret-should-not-print",
+                "last_success_at_unix_ms": null
+            }
+        });
 
-        let report = build_embedding_report(Some(&config), Path::new("/tmp/missing-palace.db"));
+        let report = build_embedding_report(
+            Some(&config),
+            Path::new("/tmp/missing-palace.db"),
+            Some(&daemon_status),
+        );
         let rendered = serde_json::to_string(&report).expect("serialize report");
 
+        assert_eq!(report.runtime_status_source, "daemon_rest");
+        assert!(report.runtime_status_available);
         assert!(report.degraded);
         assert!(report.block_writes_when_degraded);
         assert!(report.write_refused);
@@ -1288,7 +1354,6 @@ block_writes_when_degraded = true
             !rendered.contains("sk-secret-should-not-print"),
             "{rendered}"
         );
-        status.reset_for_tests();
     }
 
     #[cfg(target_os = "linux")]

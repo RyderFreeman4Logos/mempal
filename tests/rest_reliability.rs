@@ -681,7 +681,10 @@ async fn test_status_shows_degraded_mode() {
     let _guard = TEST_LOCK.lock().await;
     let env = TestEnv::new();
     for _ in 0..2 {
-        global_embed_status().record_failure(&EmbedError::Runtime("down".to_string()));
+        global_embed_status().record_failure(&EmbedError::Runtime(
+            "down http://user:pass@127.0.0.1:18002/v1/private-token-path?api_key=sk-secret-should-not-print"
+                .to_string(),
+        ));
     }
     let state = env.state(Arc::new(StaticEmbedderFactory { dim: 4 }));
 
@@ -690,6 +693,27 @@ async fn test_status_shows_degraded_mode() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["embedding_status"], "degraded");
     assert_eq!(body["search_mode"], "bm25_only");
+    assert_eq!(body["embed_status"]["degraded"], true);
+    assert_eq!(body["embed_status"]["block_writes_when_degraded"], true);
+    assert_eq!(body["embed_status"]["write_refused"], true);
+    assert_eq!(body["embed_status"]["fail_count"], 2);
+    assert_eq!(body["embed_status"]["failure_count"], 2);
+    assert_eq!(body["embed_status"]["failed_count"], 0);
+    assert!(
+        body["embed_status"]["last_error"]
+            .as_str()
+            .expect("last error")
+            .contains("http://127.0.0.1:18002")
+    );
+    let rendered = serde_json::to_string(&body["embed_status"]).expect("serialize embed status");
+    assert!(!rendered.contains("user:pass"), "{rendered}");
+    assert!(!rendered.contains("private-token-path"), "{rendered}");
+    assert!(!rendered.contains("api_key"), "{rendered}");
+    assert!(
+        !rendered.contains("sk-secret-should-not-print"),
+        "{rendered}"
+    );
+    assert_eq!(body["queue_stats"]["failed_retryable_embed"], 0);
     let circuit = body["embedder_circuit"]
         .as_object()
         .expect("embedder circuit");
