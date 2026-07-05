@@ -10,11 +10,13 @@ use std::{
 
 use crate::core::{
     anchor,
-    config::ConfigHandle,
+    config::{ConfigHandle, scrub_runtime_diagnostic_text},
     db::{Database, DbError, db_error_is_sqlite_lock},
     project::{ProjectSearchScope, resolve_project_id},
+    queue::{QueueStats, failure_headline_count, queue_stats_readonly},
     remote_calls::{
-        RemoteCallService, blocked_remote_endpoint_error, endpoint_policy_display_label,
+        RemoteCallService, endpoint_policy_display_label, endpoint_policy_global_runtime_error,
+        endpoint_policy_runtime_error,
     },
     strata::{count_raw_turn_drawers, is_raw_turn, raw_turn_importance, should_store_raw_turns},
     types::{
@@ -522,9 +524,11 @@ struct StatusResponse {
     db_size_bytes: u64,
     embedding_status: String,
     embedding_endpoints: Vec<ApiEmbeddingEndpointStatus>,
+    embed_status: ApiEmbedStatus,
     embedder_cache: crate::embed::SharedEmbedderRuntimeSnapshot,
     search_mode: String,
     embedder_circuit: EmbedderCircuitStatus,
+    queue_stats: ApiQueueStats,
     resource_usage: ResourceUsageStatus,
     io_burst: crate::observability::IoBurstSnapshot,
     write_queue: WriteQueueStats,
@@ -621,7 +625,7 @@ impl From<crate::observability::ResourceCounterSnapshot> for ResourceCounterStat
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ApiEmbeddingEndpointStatus {
     id: String,
     backend: String,
@@ -637,6 +641,54 @@ struct ApiEmbeddingEndpointStatus {
     last_failure_at_unix_ms: Option<u64>,
     last_success_at_unix_ms: Option<u64>,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiEmbedStatus {
+    backend: String,
+    base_url: Option<String>,
+    model: Option<String>,
+    endpoints: Vec<ApiEmbeddingEndpointStatus>,
+    max_concurrent: usize,
+    pending_count: u64,
+    claimed_count: u64,
+    failed_count: u64,
+    degraded: bool,
+    block_writes_when_degraded: bool,
+    write_refused: bool,
+    fail_count: u64,
+    failure_count: u64,
+    last_error: Option<String>,
+    last_success_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ApiQueueStats {
+    pending: u64,
+    claimed: u64,
+    failed: u64,
+    failed_retryable: u64,
+    failed_terminal: u64,
+    failed_retryable_embed: u64,
+    failed_retryable_llm: u64,
+}
+
+impl From<&QueueStats> for ApiQueueStats {
+    fn from(value: &QueueStats) -> Self {
+        Self {
+            pending: value.pending,
+            claimed: value.claimed,
+            failed: value.failed,
+            failed_retryable: value.failed_retryable,
+            failed_terminal: value.failed_terminal,
+            failed_retryable_embed: value.failed_retryable_embed,
+            failed_retryable_llm: value.failed_retryable_llm,
+        }
+    }
+}
+
+fn sanitize_api_runtime_error(error: Option<String>) -> Option<String> {
+    error.map(|message| scrub_runtime_diagnostic_text(&message))
 }
 
 #[derive(Debug, Serialize)]
@@ -1633,60 +1685,104 @@ async fn status_handler(State(state): State<ApiState>) -> Result<Json<StatusResp
         sqlite: sqlite_resource,
         counters: ResourceCounterStatus::from(crate::observability::resource_counters()),
     };
+    let embed_endpoints = daemon_embed_config
+        .embed
+        .effective_endpoints()
+        .unwrap_or_default();
+    let queue_stats = queue_stats_readonly(&state.db_path).ok();
+    let queue_stats_report = queue_stats
+        .as_ref()
+        .map(ApiQueueStats::from)
+        .unwrap_or_default();
+    let embed_failure_headline = queue_stats
+        .as_ref()
+        .map(|stats| failure_headline_count(embed_snapshot.fail_count, stats))
+        .unwrap_or(embed_snapshot.fail_count);
+    let block_writes_when_degraded = daemon_embed_config
+        .embed
+        .degradation
+        .block_writes_when_degraded;
+    let write_refused = embed_snapshot.degraded && block_writes_when_degraded;
+    let embedding_endpoints = embed_endpoints
+        .iter()
+        .map(|endpoint| {
+            let runtime = endpoint_runtime.get(&endpoint.id);
+            let last_error = sanitize_api_runtime_error(endpoint_policy_runtime_error(
+                &daemon_embed_config.privacy.remote_calls,
+                RemoteCallService::Embedding,
+                &endpoint.base_url,
+                runtime.and_then(|state| state.last_error.clone()),
+            ));
+            ApiEmbeddingEndpointStatus {
+                id: endpoint.id.clone(),
+                backend: endpoint.backend.clone(),
+                base_url: endpoint_policy_display_label(
+                    &daemon_embed_config.privacy.remote_calls,
+                    RemoteCallService::Embedding,
+                    &endpoint.base_url,
+                ),
+                model: endpoint.model.clone(),
+                priority: endpoint.priority,
+                retry_interval_secs: endpoint.retry_interval_secs,
+                request_timeout_secs: endpoint.request_timeout_secs,
+                max_concurrent: endpoint.max_concurrent,
+                dimensions: endpoint.dimensions,
+                cooldown_remaining_secs: runtime.and_then(|state| state.cooldown_remaining_secs),
+                cooldown_until_unix_ms: runtime.and_then(|state| state.cooldown_until_unix_ms),
+                last_failure_at_unix_ms: runtime.and_then(|state| state.last_failure_at_unix_ms),
+                last_success_at_unix_ms: runtime.and_then(|state| state.last_success_at_unix_ms),
+                last_error,
+            }
+        })
+        .collect::<Vec<_>>();
+    let embed_status = ApiEmbedStatus {
+        backend: daemon_embed_config.embed.backend.clone(),
+        base_url: daemon_embed_config
+            .embed
+            .resolved_openai_base_url()
+            .map(|base_url| {
+                endpoint_policy_display_label(
+                    &daemon_embed_config.privacy.remote_calls,
+                    RemoteCallService::Embedding,
+                    base_url,
+                )
+            }),
+        model: daemon_embed_config.embed.effective_model_summary(),
+        endpoints: embedding_endpoints.clone(),
+        max_concurrent: daemon_embed_config.embed.pool_capacity(),
+        pending_count: queue_stats_report.pending,
+        claimed_count: queue_stats_report.claimed,
+        failed_count: queue_stats_report.failed,
+        degraded: embed_snapshot.degraded,
+        block_writes_when_degraded,
+        write_refused,
+        fail_count: embed_failure_headline,
+        failure_count: embed_failure_headline,
+        last_error: sanitize_api_runtime_error(endpoint_policy_global_runtime_error(
+            &daemon_embed_config.privacy.remote_calls,
+            RemoteCallService::Embedding,
+            embed_endpoints
+                .iter()
+                .map(|endpoint| endpoint.base_url.as_str()),
+            embed_snapshot.last_error.clone(),
+        )),
+        last_success_at_unix_ms: embed_snapshot.last_success_at_unix_ms,
+    };
 
     Ok(Json(StatusResponse {
         drawer_count: db_snapshot.drawer_count,
         taxonomy_count: db_snapshot.taxonomy_count,
         db_size_bytes: db_snapshot.db_size_bytes,
         embedding_status: current_embedding_status(&embed_snapshot).to_string(),
-        embedding_endpoints: daemon_embed_config
-            .embed
-            .effective_endpoints()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|endpoint| {
-                let runtime = endpoint_runtime.get(&endpoint.id);
-                let blocked_remote_endpoint = blocked_remote_endpoint_error(
-                    &daemon_embed_config.privacy.remote_calls,
-                    RemoteCallService::Embedding,
-                    &endpoint.base_url,
-                )
-                .is_some();
-                ApiEmbeddingEndpointStatus {
-                    id: endpoint.id,
-                    backend: endpoint.backend,
-                    base_url: endpoint_policy_display_label(
-                        &daemon_embed_config.privacy.remote_calls,
-                        RemoteCallService::Embedding,
-                        &endpoint.base_url,
-                    ),
-                    model: endpoint.model,
-                    priority: endpoint.priority,
-                    retry_interval_secs: endpoint.retry_interval_secs,
-                    request_timeout_secs: endpoint.request_timeout_secs,
-                    max_concurrent: endpoint.max_concurrent,
-                    dimensions: endpoint.dimensions,
-                    cooldown_remaining_secs: runtime
-                        .and_then(|state| state.cooldown_remaining_secs),
-                    cooldown_until_unix_ms: runtime.and_then(|state| state.cooldown_until_unix_ms),
-                    last_failure_at_unix_ms: runtime
-                        .and_then(|state| state.last_failure_at_unix_ms),
-                    last_success_at_unix_ms: runtime
-                        .and_then(|state| state.last_success_at_unix_ms),
-                    last_error: if blocked_remote_endpoint {
-                        None
-                    } else {
-                        runtime.and_then(|state| state.last_error.clone())
-                    },
-                }
-            })
-            .collect(),
+        embedding_endpoints,
+        embed_status,
         embedder_cache: crate::embed::shared_embedder_runtime_snapshot(),
         search_mode: vector_search_circuit
             .vector_search_mode
             .as_str()
             .to_string(),
         embedder_circuit: vector_search_circuit.into(),
+        queue_stats: queue_stats_report,
         resource_usage,
         io_burst: crate::observability::io_burst_snapshot(),
         write_queue: state.write_queue().stats(),

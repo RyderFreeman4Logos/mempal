@@ -127,6 +127,8 @@ class DoctorValidationTests(unittest.TestCase):
             "db": {"schema_version": 20, "compatible": True},
             "warnings": [],
             "embedding": {
+                "degraded": False,
+                "write_refused": False,
                 "endpoints": [{"id": "primary", "cooldown_remaining_secs": None}],
                 "queue": {"failed_terminal": 0},
             },
@@ -152,6 +154,17 @@ class DoctorValidationTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["embedding_endpoint_cooldowns"], 1)
 
+    def test_embedding_degraded_fails_with_structured_fields(self) -> None:
+        report = self._base_report()
+        report["embedding"]["degraded"] = True
+        report["embedding"]["write_refused"] = True
+        report["embedding"]["queue"]["failed_terminal"] = 3
+        result = self.smoke.validate_doctor_health(report)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["embedder_degraded"])
+        self.assertTrue(result["embedding_write_refused"])
+        self.assertEqual(result["queue_terminal_failures"], 3)
+
     def test_critical_warning_fails(self) -> None:
         report = self._base_report()
         report["warnings"] = ["database is corrupt"]
@@ -169,6 +182,21 @@ class DoctorValidationTests(unittest.TestCase):
     def test_non_dict_input_fails(self) -> None:
         result = self.smoke.validate_doctor_health(None)
         self.assertFalse(result["ok"])
+
+    def test_daemon_status_diagnostics_extracts_degraded_and_terminal_failures(self) -> None:
+        stdout = (
+            b"status: running\n"
+            b"rest.embedder_status_source: daemon_rest\n"
+            b"rest.embedder_degraded: true\n"
+            b"rest.embedder_write_refused: true\n"
+            b"queue.failed_terminal: 2\n"
+            b"rest.queue_terminal_failures: 4\n"
+        )
+        result = self.smoke.daemon_status_diagnostics(stdout)
+        self.assertEqual(result["embedder_status_source"], "daemon_rest")
+        self.assertTrue(result["embedder_degraded"])
+        self.assertTrue(result["embedder_write_refused"])
+        self.assertEqual(result["queue_terminal_failures"], 4)
 
 
 class FailureLedgerTests(unittest.TestCase):

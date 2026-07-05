@@ -76,7 +76,9 @@ use mempal::cowork::{
     SendOperation, SendRequest,
 };
 use mempal::crystallize::{CrystallizeOptions, CrystallizeSummary, run_crystallization};
-use mempal::doctor::{RestDoctorReport, build_doctor_report, build_rest_doctor_report};
+use mempal::doctor::{
+    RestDoctorReport, build_doctor_report_with_daemon_status, build_rest_doctor_report,
+};
 use mempal::embed::build_backend_from_name;
 use mempal::embed::{ConfiguredEmbedderFactory, Embedder, global_embed_status};
 use mempal::field_taxonomy::{FieldTaxonomyEntry, field_taxonomy};
@@ -15732,6 +15734,12 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
                         println!("queue.pending: {}", stats.pending);
                         println!("queue.claimed: {}", stats.claimed);
                         println!("queue.failed: {}", stats.failed);
+                        println!("queue.failed_retryable: {}", stats.failed_retryable);
+                        println!("queue.failed_terminal: {}", stats.failed_terminal);
+                        println!(
+                            "queue.failed_retryable_model: embedding={} llm={}",
+                            stats.failed_retryable_embed, stats.failed_retryable_llm
+                        );
                     }
                 }
             } else if siblings.is_empty() {
@@ -15764,17 +15772,31 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
         mempal::process_diagnostics::inspect_db_holders_bounded(db_path, Duration::from_secs(5));
     print_db_holder_report("db_holders", &db_holders, "");
     #[cfg(feature = "rest")]
-    if let Ok(config) = Config::load()
-        && config.api.enabled
-        && let Ok(Some(status)) = block_on_result(fetch_daemon_status(&config.api.addr))
     {
-        print_daemon_rest_embedder_cache(&status);
-        print_daemon_rest_resource_usage(&status);
-        print_daemon_rest_io_burst(&status);
-        print_daemon_ingest_worker_backoff(&status);
-        print_daemon_vector_scan(&status);
-        if let Some(telemetry) = status.get("search_telemetry") {
-            print_daemon_search_telemetry(telemetry);
+        let daemon_status = Config::load().ok().and_then(|config| {
+            config
+                .api
+                .enabled
+                .then(|| {
+                    block_on_result(fetch_daemon_status(&config.api.addr))
+                        .ok()
+                        .flatten()
+                })
+                .flatten()
+        });
+        if let Some(status) = daemon_status {
+            print_daemon_rest_embedder_cache(&status);
+            print_daemon_rest_resource_usage(&status);
+            print_daemon_rest_embedding_status(&status);
+            print_daemon_rest_queue_stats(&status);
+            print_daemon_rest_io_burst(&status);
+            print_daemon_ingest_worker_backoff(&status);
+            print_daemon_vector_scan(&status);
+            if let Some(telemetry) = status.get("search_telemetry") {
+                print_daemon_search_telemetry(telemetry);
+            }
+        } else {
+            println!("rest.embedder_status_source: unavailable");
         }
     }
     Ok(())
@@ -16017,6 +16039,52 @@ fn print_daemon_rest_resource_usage(status: &Value) {
     println!(
         "rest.resource.access_writeback_failed_total: {}",
         json_u64(counters, "access_writeback_failed_total")
+    );
+}
+
+#[cfg(feature = "rest")]
+fn print_daemon_rest_embedding_status(status: &Value) {
+    let Some(embed_status) = status.get("embed_status") else {
+        println!("rest.embedder_status_source: unavailable");
+        return;
+    };
+    println!("rest.embedder_status_source: daemon_rest");
+    println!(
+        "rest.embedder_degraded: {}",
+        embed_status
+            .get("degraded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    println!(
+        "rest.embedder_write_refused: {}",
+        embed_status
+            .get("write_refused")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    println!(
+        "rest.embedder_fail_count: {}",
+        json_u64(embed_status, "fail_count")
+    );
+    if let Some(last_error) = embed_status.get("last_error").and_then(Value::as_str) {
+        println!("rest.embedder_last_error: {last_error}");
+    }
+}
+
+#[cfg(feature = "rest")]
+fn print_daemon_rest_queue_stats(status: &Value) {
+    let Some(queue_stats) = status.get("queue_stats") else {
+        return;
+    };
+    println!(
+        "rest.queue_terminal_failures: {}",
+        json_u64(queue_stats, "failed_terminal")
+    );
+    println!(
+        "rest.queue_retryable_model_failures: embedding={} llm={}",
+        json_u64(queue_stats, "failed_retryable_embed"),
+        json_u64(queue_stats, "failed_retryable_llm")
     );
 }
 
@@ -23830,14 +23898,29 @@ fn doctor_command(format: String) -> Result<()> {
     if !matches!(format.as_str(), "plain" | "json") {
         bail!("unsupported doctor format: {format}");
     }
+    let config = Config::load().ok();
     // Best-effort: honor custom db_path from config when available.
     // Fall back to the default path so doctor remains functional when config is
     // absent or unparseable (doctor is the tool you run when the env is broken).
-    let db_path = Config::load()
-        .ok()
-        .map(|c| expand_home(&c.db_path))
+    let db_path = config
+        .as_ref()
+        .map(|config| expand_home(&config.db_path))
         .unwrap_or_else(|| mempal_home().join("palace.db"));
-    let report = build_doctor_report(&db_path);
+    #[cfg(feature = "rest")]
+    let daemon_status = config.as_ref().and_then(|config| {
+        config
+            .api
+            .enabled
+            .then(|| {
+                block_on_result(fetch_daemon_status(&config.api.addr))
+                    .ok()
+                    .flatten()
+            })
+            .flatten()
+    });
+    #[cfg(not(feature = "rest"))]
+    let daemon_status: Option<Value> = None;
+    let report = build_doctor_report_with_daemon_status(&db_path, daemon_status.as_ref());
     match format.as_str() {
         "json" => println!("{}", serde_json::to_string_pretty(&report)?),
         _ => {
@@ -23937,6 +24020,32 @@ fn doctor_command(format: String) -> Result<()> {
                 report.embedding.model.as_deref().unwrap_or("none")
             );
             println!("embedding_pool_capacity={}", report.embedding.pool_capacity);
+            println!(
+                "embedding_runtime_status_source={}",
+                report.embedding.runtime_status_source
+            );
+            println!(
+                "embedding_runtime_status_available={}",
+                report.embedding.runtime_status_available
+            );
+            println!("embedding_degraded={}", report.embedding.degraded);
+            println!(
+                "embedding_block_writes_when_degraded={}",
+                report.embedding.block_writes_when_degraded
+            );
+            println!("embedding_write_refused={}", report.embedding.write_refused);
+            println!("embedding_fail_count={}", report.embedding.fail_count);
+            if let Some(last_error) = report.embedding.last_error.as_deref() {
+                println!("embedding_last_error={last_error}");
+            }
+            println!(
+                "embedding_last_success_at_unix_ms={}",
+                report
+                    .embedding
+                    .last_success_at_unix_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
             println!(
                 "embedding_queue=pending:{} claimed:{} failed:{} retryable_model:{} terminal:{} retryable_embedding:{} retryable_llm:{} last_auto_requeue_at_unix_ms:{}",
                 report.embedding.queue.pending,

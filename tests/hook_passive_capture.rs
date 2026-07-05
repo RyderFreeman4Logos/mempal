@@ -5,9 +5,9 @@ mod common;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::harness::{BootstrapObserver, DaemonSupervisor, FailMode, start as start_embed_mock};
 use mempal::bootstrap_events::BootstrapEvent;
@@ -100,6 +100,43 @@ log_path = "{}"
 
 fn queue_store(db_path: &Path) -> PendingMessageStore {
     PendingMessageStore::new(db_path).expect("pending store")
+}
+
+fn command_output_with_timeout(command: &mut Command, timeout: Duration, label: &str) -> Output {
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {label}: {error}"));
+    wait_child_output_timeout(child, timeout, label)
+}
+
+fn wait_child_output_timeout(mut child: Child, timeout: Duration, label: &str) -> Output {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("collect {label} output: {error}"));
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("collect timed-out {label} output: {error}"));
+                panic!(
+                    "{label} did not exit within {timeout:?}; stdout={}, stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => panic!("poll {label}: {error}"),
+        }
+    }
 }
 
 fn enqueue_envelope(db_path: &Path, envelope: &CapturedHookEnvelope) -> String {
@@ -801,11 +838,9 @@ async fn test_daemon_status_reports_state_and_queue() {
     )
     .expect("write daemon pid");
 
-    let output = Command::new(mempal_bin())
-        .arg("status")
-        .env("HOME", tmp.path())
-        .output()
-        .expect("run status");
+    let mut status_cmd = Command::new(mempal_bin());
+    status_cmd.arg("status").env("HOME", tmp.path());
+    let output = command_output_with_timeout(&mut status_cmd, Duration::from_secs(5), "status");
     assert!(output.status.success(), "status must succeed");
     let stdout = String::from_utf8(output.stdout).expect("status stdout utf8");
     assert!(stdout.contains("Daemon:"), "{stdout}");
@@ -814,6 +849,35 @@ async fn test_daemon_status_reports_state_and_queue() {
     assert!(stdout.contains("pending: 1"), "{stdout}");
     assert!(stdout.contains("claimed: 1"), "{stdout}");
     assert!(stdout.contains("last_heartbeat_unix_secs:"), "{stdout}");
+
+    let mut daemon_status_cmd = Command::new(mempal_bin());
+    daemon_status_cmd
+        .arg("daemon")
+        .arg("status")
+        .env("HOME", tmp.path());
+    let daemon_status = command_output_with_timeout(
+        &mut daemon_status_cmd,
+        Duration::from_secs(5),
+        "daemon status",
+    );
+    assert!(daemon_status.status.success(), "daemon status must succeed");
+    let daemon_stdout = String::from_utf8(daemon_status.stdout).expect("daemon status stdout utf8");
+    assert!(
+        daemon_stdout.contains("queue.pending: 1"),
+        "{daemon_stdout}"
+    );
+    assert!(
+        daemon_stdout.contains("queue.claimed: 1"),
+        "{daemon_stdout}"
+    );
+    assert!(
+        daemon_stdout.contains("queue.failed_terminal: 0"),
+        "{daemon_stdout}"
+    );
+    assert!(
+        daemon_stdout.contains("queue.failed_retryable_model: embedding=0 llm=0"),
+        "{daemon_stdout}"
+    );
 }
 
 #[test]

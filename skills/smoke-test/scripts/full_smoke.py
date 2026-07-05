@@ -1563,6 +1563,8 @@ def validate_doctor_health(doc_json: Any) -> dict[str, Any]:
         if isinstance(w, str) and any(k in w.lower() for k in _DOCTOR_CRITICAL_KEYWORDS)
     ]
     emb_info = doc_json.get('embedding') or {}
+    embedder_degraded = bool(emb_info.get('degraded')) if isinstance(emb_info, dict) else False
+    embedding_write_refused = bool(emb_info.get('write_refused')) if isinstance(emb_info, dict) else False
     emb_endpoints = emb_info.get('endpoints') if isinstance(emb_info, dict) else None
     emb_cooldowns = 0
     if isinstance(emb_endpoints, list):
@@ -1573,7 +1575,7 @@ def validate_doctor_health(doc_json: Any) -> dict[str, Any]:
     emb_terminal_failures = 0
     if isinstance(emb_queue, dict):
         emb_terminal_failures = int(emb_queue.get('failed_terminal') or 0)
-    embedding_ok = emb_cooldowns == 0
+    embedding_ok = emb_cooldowns == 0 and not embedder_degraded and not embedding_write_refused
     ok = bool(schema_matches) and len(critical_warnings) == 0 and embedding_ok
     return {
         'ok': ok,
@@ -1582,9 +1584,42 @@ def validate_doctor_health(doc_json: Any) -> dict[str, Any]:
         'schema_matches': bool(schema_matches),
         'total_warning_count': len(warnings),
         'critical_warning_count': len(critical_warnings),
+        'embedder_degraded': embedder_degraded,
+        'embedding_write_refused': embedding_write_refused,
         'embedding_endpoint_cooldowns': emb_cooldowns,
         'embedding_terminal_failures': emb_terminal_failures,
+        'queue_terminal_failures': emb_terminal_failures,
         'embedding_ok': embedding_ok,
+    }
+
+
+def daemon_status_diagnostics(stdout: bytes) -> dict[str, Any]:
+    text = stdout.decode('utf-8', errors='replace')
+    embedder_status_source: str | None = None
+    embedder_degraded: bool | None = None
+    embedder_write_refused: bool | None = None
+    queue_terminal_failures: int | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith('rest.embedder_status_source:'):
+            embedder_status_source = line.split(':', 1)[1].strip()
+        elif line.startswith('rest.embedder_degraded:'):
+            value = line.split(':', 1)[1].strip().lower()
+            embedder_degraded = value == 'true'
+        elif line.startswith('rest.embedder_write_refused:'):
+            value = line.split(':', 1)[1].strip().lower()
+            embedder_write_refused = value == 'true'
+        elif line.startswith('queue.failed_terminal:') or line.startswith('rest.queue_terminal_failures:'):
+            value = line.split(':', 1)[1].strip()
+            try:
+                queue_terminal_failures = int(value)
+            except ValueError:
+                queue_terminal_failures = None
+    return {
+        'embedder_status_source': embedder_status_source,
+        'embedder_degraded': embedder_degraded,
+        'embedder_write_refused': embedder_write_refused,
+        'queue_terminal_failures': queue_terminal_failures,
     }
 
 
@@ -1597,7 +1632,8 @@ def main() -> int:
     SUMMARY['io']['daemon_pid_before'] = daemon_pid_before
     start = time.monotonic()
     run_cli('version', ['mempal', '--version'], timeout=30)
-    run_cli('daemon_status_pre', ['mempal', 'daemon', 'status'], timeout=30)
+    _daemon_rc, daemon_stdout, _daemon_stderr, _daemon_parsed, _daemon_shape = run_cli('daemon_status_pre', ['mempal', 'daemon', 'status'], timeout=30)
+    SUMMARY['groups']['daemon_status_pre'].update(daemon_status_diagnostics(daemon_stdout))
     run_cli('doctor_rest', ['mempal', 'doctor', 'rest', '--format', 'json'], expect_json=True, timeout=60)
     _doc_rc, _doc_out, _doc_err, doc_parsed, _doc_shape = run_cli('doctor_json', ['mempal', 'doctor', '--format', 'json'], expect_json=True, timeout=60)
     doc_validation = validate_doctor_health(doc_parsed)
@@ -1640,4 +1676,10 @@ def main() -> int:
 
 
 if __name__ == '__main__':
+    if any(arg in ('-h', '--help') for arg in sys.argv[1:]):
+        print(
+            "usage: full_smoke.py\n\n"
+            "Runs the aggregate mempal CLI/MCP smoke suite and prints a JSON summary."
+        )
+        raise SystemExit(0)
     raise SystemExit(main())

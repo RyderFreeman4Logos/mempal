@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use mempal::core::queue::{PendingMessageStore, QueueFailureDisposition};
@@ -13,6 +14,7 @@ fn mempal_bin() -> String {
 }
 
 static LOAD_DOTENV: OnceLock<()> = OnceLock::new();
+const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Inject hermetic embed environment into a child Command.
 fn inject_embed_env(cmd: &mut Command) {
@@ -38,7 +40,7 @@ fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(mempal_bin());
     cmd.args(args).env("HOME", home.path());
     inject_embed_env(&mut cmd);
-    cmd.output().expect("run mempal")
+    command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal")
 }
 
 fn run_mempal_with_path(home: &TempDir, args: &[&str], path_value: &str) -> std::process::Output {
@@ -47,7 +49,44 @@ fn run_mempal_with_path(home: &TempDir, args: &[&str], path_value: &str) -> std:
         .env("HOME", home.path())
         .env("PATH", path_value);
     inject_embed_env(&mut cmd);
-    cmd.output().expect("run mempal")
+    command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal")
+}
+
+fn command_output_with_timeout(command: &mut Command, timeout: Duration, label: &str) -> Output {
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {label}: {error}"));
+    wait_child_output_timeout(child, timeout, label)
+}
+
+fn wait_child_output_timeout(mut child: Child, timeout: Duration, label: &str) -> Output {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("collect {label} output: {error}"));
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("collect timed-out {label} output: {error}"));
+                panic!(
+                    "{label} did not exit within {timeout:?}; stdout={}, stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => panic!("poll {label}: {error}"),
+        }
+    }
 }
 
 fn stdout(output: &std::process::Output) -> String {
@@ -163,6 +202,18 @@ fn test_cli_doctor_reports_queue_failure_classes() {
     assert_eq!(value["embedding"]["queue"]["failed_retryable_embed"], 1);
     assert_eq!(value["embedding"]["queue"]["failed_retryable_llm"], 0);
     assert_eq!(
+        value["embedding"]["runtime_status_source"].as_str(),
+        Some("unavailable")
+    );
+    assert_eq!(
+        value["embedding"]["runtime_status_available"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(value["embedding"]["degraded"], false);
+    assert_eq!(value["embedding"]["block_writes_when_degraded"], true);
+    assert_eq!(value["embedding"]["write_refused"], false);
+    assert_eq!(value["embedding"]["fail_count"], 2);
+    assert_eq!(
         value["embedding"]["queue"]["last_auto_requeue_at_unix_ms"],
         Value::Null
     );
@@ -172,6 +223,68 @@ fn test_cli_doctor_reports_queue_failure_classes() {
     let out = stdout(&plain);
     assert!(
         out.contains("embedding_queue=pending:0 claimed:0 failed:2 retryable_model:1 terminal:1 retryable_embedding:1 retryable_llm:0 last_auto_requeue_at_unix_ms:none"),
+        "{out}"
+    );
+    assert!(
+        out.contains("embedding_runtime_status_source=unavailable"),
+        "{out}"
+    );
+    assert!(
+        out.contains("embedding_runtime_status_available=false"),
+        "{out}"
+    );
+    assert!(out.contains("embedding_degraded=false"), "{out}");
+    assert!(
+        out.contains("embedding_block_writes_when_degraded=true"),
+        "{out}"
+    );
+    assert!(out.contains("embedding_write_refused=false"), "{out}");
+    assert!(out.contains("embedding_fail_count=2"), "{out}");
+}
+
+#[test]
+fn test_cli_daemon_status_reports_queue_failure_classes() {
+    let home = TempDir::new().expect("home");
+    fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
+    let db_path = palace_db_path(&home);
+    Database::open(&db_path).expect("open db");
+    let store = PendingMessageStore::new_without_reclaim(&db_path);
+
+    let retryable = store
+        .enqueue("hook_event", r#"{"n":1}"#)
+        .expect("enqueue retryable row");
+    let terminal = store
+        .enqueue("hook_event", r#"{"n":2}"#)
+        .expect("enqueue terminal row");
+    store
+        .mark_model_task_failed_retryable(&retryable, "429 Too Many Requests")
+        .expect("mark retryable failed");
+    let terminal_claim = store
+        .claim_next("terminal-worker", 60)
+        .expect("claim terminal row")
+        .expect("terminal row claimed");
+    assert_eq!(terminal_claim.id, terminal);
+    store
+        .mark_failed_with_disposition(
+            &terminal_claim,
+            "invalid payload",
+            QueueFailureDisposition::Terminal,
+        )
+        .expect("mark terminal failed");
+    fs::write(
+        home.path().join(".mempal/daemon.pid"),
+        std::process::id().to_string(),
+    )
+    .expect("write daemon pid");
+
+    let output = run_mempal(&home, &["daemon", "status"]);
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("queue.failed: 2"), "{out}");
+    assert!(out.contains("queue.failed_retryable: 1"), "{out}");
+    assert!(out.contains("queue.failed_terminal: 1"), "{out}");
+    assert!(
+        out.contains("queue.failed_retryable_model: embedding=1 llm=0"),
         "{out}"
     );
 }
@@ -256,7 +369,7 @@ fn test_cli_release_readiness_json() {
         .env("HOME", home.path())
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")));
     inject_embed_env(&mut cmd);
-    let output = cmd.output().expect("run mempal");
+    let output = command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal release-readiness");
     assert_success(&output);
     let value: Value = serde_json::from_str(&stdout(&output)).expect("release readiness json");
     assert_eq!(value["writes"], false);
@@ -292,7 +405,7 @@ fn test_cli_release_readiness_plain() {
         .env("HOME", home.path())
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")));
     inject_embed_env(&mut cmd);
-    let output = cmd.output().expect("run mempal");
+    let output = command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal release-readiness");
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("Release Readiness"), "{out}");
@@ -309,7 +422,7 @@ fn test_cli_release_readiness_rejects_invalid_format() {
         .env("HOME", home.path())
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")));
     inject_embed_env(&mut cmd);
-    let output = cmd.output().expect("run mempal");
+    let output = command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal release-readiness");
     assert!(!output.status.success());
     assert!(stderr(&output).contains("unsupported release-readiness format"));
 }

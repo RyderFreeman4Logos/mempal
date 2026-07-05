@@ -28,6 +28,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- `mempal doctor`, `mempal daemon status`, and the full smoke runner now expose
+  embedding degraded/write-refused state, sanitized endpoint details, and queue
+  terminal failure counts so stale OpenAI-compatible embedding endpoints are
+  actionable from standard diagnostics.
 - `mempal brief` and MCP `mempal_brief` now bound query embedding by
   `embed.retry.search_deadline_secs`, fall back to BM25-only briefs when
   configured, and return deterministic non-empty no-results briefs instead of

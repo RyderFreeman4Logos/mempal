@@ -1138,6 +1138,90 @@ pub(crate) fn scrub_sensitive_text(input: &str) -> String {
     content
 }
 
+pub(crate) fn scrub_runtime_diagnostic_text(input: &str) -> String {
+    scrub_sensitive_text(&redact_url_spans_from_text(input))
+}
+
+fn redact_url_spans_from_text(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = find_url_start(&input[cursor..]) {
+        let start = cursor + relative_start;
+        output.push_str(&input[cursor..start]);
+        let tail = &input[start..];
+        let relative_end = url_span_end(tail);
+        let end = start + relative_end;
+        let candidate = &input[start..end];
+        match diagnostic_url_origin_label(candidate) {
+            Some(label) => output.push_str(&label),
+            None => output.push_str(candidate),
+        }
+        cursor = end;
+    }
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn find_url_start(input: &str) -> Option<usize> {
+    match (input.find("http://"), input.find("https://")) {
+        (Some(http), Some(https)) => Some(http.min(https)),
+        (Some(http), None) => Some(http),
+        (None, Some(https)) => Some(https),
+        (None, None) => None,
+    }
+}
+
+fn url_span_end(tail: &str) -> usize {
+    let mut in_ipv6_authority = false;
+    for (index, ch) in tail.char_indices().skip(1) {
+        if ch == '[' && bracket_starts_ipv6_authority(tail, index) {
+            in_ipv6_authority = true;
+            continue;
+        }
+        if ch == ']' && in_ipv6_authority {
+            in_ipv6_authority = false;
+            continue;
+        }
+        if !in_ipv6_authority && is_url_span_terminator(ch) {
+            return index;
+        }
+    }
+    tail.len()
+}
+
+fn bracket_starts_ipv6_authority(url_tail: &str, bracket_index: usize) -> bool {
+    let Some(authority_start) = url_tail[..bracket_index]
+        .find("://")
+        .map(|scheme_end| scheme_end + 3)
+    else {
+        return false;
+    };
+    let authority_prefix = &url_tail[authority_start..bracket_index];
+    !authority_prefix.contains(['/', '?', '#'])
+}
+
+fn is_url_span_terminator(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+        )
+}
+
+fn diagnostic_url_origin_label(candidate: &str) -> Option<String> {
+    let url = Url::parse(candidate).ok()?;
+    let host = url.host_str()?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Some(match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    })
+}
+
 pub(crate) fn scrub_export_sensitive_text(input: &str) -> String {
     let mut redacted = scrub_sensitive_text(input);
     for regex in export_redaction_patterns() {
@@ -3129,7 +3213,10 @@ mod tests {
 
     #[cfg(feature = "model2vec")]
     use super::DAEMON_SMALL_LOCAL_EMBED_MODEL;
-    use super::{Config, DaemonEmbedderMode, DecayMode, endpoint_url_display_label};
+    use super::{
+        Config, DaemonEmbedderMode, DecayMode, endpoint_url_display_label,
+        scrub_runtime_diagnostic_text,
+    };
 
     // Serialize env-mutating tests to prevent flaky parallel interference.
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3543,5 +3630,59 @@ embedder_mode = "small_local"
         assert!(!display.contains("secret"));
         assert!(!display.contains("token-path"));
         assert!(!display.contains("api_key"));
+    }
+
+    #[test]
+    fn doctor_runtime_diagnostic_url_span_sanitizer_redacts_embedded_urls() {
+        let cases = [
+            (
+                "url=http://user:pass@127.0.0.1:18002/v1/private-token-path?api_key=sk-secret-should-not-print",
+                "url=http://127.0.0.1:18002",
+            ),
+            (
+                r#"{"url":"http://127.0.0.1:18002/v1/private-token-path?api_key=secret"}"#,
+                r#"{"url":"http://127.0.0.1:18002"}"#,
+            ),
+            (
+                "(endpoint=http://127.0.0.1:18002/v1/private-token-path?api_key=secret)",
+                "(endpoint=http://127.0.0.1:18002)",
+            ),
+            (
+                "failed http://127.0.0.1:18002/v1/private-token-path?api_key=secret",
+                "failed http://127.0.0.1:18002",
+            ),
+            (
+                "failed https://example.com:9443/v1/private-token-path?api_key=secret#fragment",
+                "failed https://example.com:9443",
+            ),
+            (
+                "http://[::1]:18002/v1/private-token-path?api_key=secret",
+                "http://[::1]:18002",
+            ),
+            (
+                "url=http://[::1]:18002/v1/private-token-path?api_key=secret",
+                "url=http://[::1]:18002",
+            ),
+            (
+                r#"{"url":"http://[::1]:18002/v1/private-token-path?api_key=secret"}"#,
+                r#"{"url":"http://[::1]:18002"}"#,
+            ),
+            (
+                "(endpoint=http://[2001:db8::1]:18002/v1/private-token-path?api_key=secret)",
+                "(endpoint=http://[2001:db8::1]:18002)",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let scrubbed = scrub_runtime_diagnostic_text(input);
+            assert_eq!(scrubbed, expected, "{input}");
+            assert!(!scrubbed.contains("user:pass"), "{scrubbed}");
+            assert!(!scrubbed.contains("private-token-path"), "{scrubbed}");
+            assert!(!scrubbed.contains("api_key"), "{scrubbed}");
+            assert!(
+                !scrubbed.contains("sk-secret-should-not-print"),
+                "{scrubbed}"
+            );
+        }
     }
 }
