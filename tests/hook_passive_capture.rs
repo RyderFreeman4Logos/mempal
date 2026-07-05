@@ -814,6 +814,31 @@ async fn test_daemon_status_reports_state_and_queue() {
     assert!(stdout.contains("pending: 1"), "{stdout}");
     assert!(stdout.contains("claimed: 1"), "{stdout}");
     assert!(stdout.contains("last_heartbeat_unix_secs:"), "{stdout}");
+
+    let daemon_status = Command::new(mempal_bin())
+        .arg("daemon")
+        .arg("status")
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run daemon status");
+    assert!(daemon_status.status.success(), "daemon status must succeed");
+    let daemon_stdout = String::from_utf8(daemon_status.stdout).expect("daemon status stdout utf8");
+    assert!(
+        daemon_stdout.contains("queue.pending: 1"),
+        "{daemon_stdout}"
+    );
+    assert!(
+        daemon_stdout.contains("queue.claimed: 1"),
+        "{daemon_stdout}"
+    );
+    assert!(
+        daemon_stdout.contains("queue.failed_terminal: 0"),
+        "{daemon_stdout}"
+    );
+    assert!(
+        daemon_stdout.contains("queue.failed_retryable_model: embedding=0 llm=0"),
+        "{daemon_stdout}"
+    );
 }
 
 #[test]

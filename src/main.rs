@@ -15732,6 +15732,12 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
                         println!("queue.pending: {}", stats.pending);
                         println!("queue.claimed: {}", stats.claimed);
                         println!("queue.failed: {}", stats.failed);
+                        println!("queue.failed_retryable: {}", stats.failed_retryable);
+                        println!("queue.failed_terminal: {}", stats.failed_terminal);
+                        println!(
+                            "queue.failed_retryable_model: embedding={} llm={}",
+                            stats.failed_retryable_embed, stats.failed_retryable_llm
+                        );
                     }
                 }
             } else if siblings.is_empty() {
@@ -15770,6 +15776,8 @@ fn run_daemon_status(db_path: &Path) -> Result<()> {
     {
         print_daemon_rest_embedder_cache(&status);
         print_daemon_rest_resource_usage(&status);
+        print_daemon_rest_embedding_status(&status);
+        print_daemon_rest_queue_stats(&status);
         print_daemon_rest_io_burst(&status);
         print_daemon_ingest_worker_backoff(&status);
         print_daemon_vector_scan(&status);
@@ -16017,6 +16025,43 @@ fn print_daemon_rest_resource_usage(status: &Value) {
     println!(
         "rest.resource.access_writeback_failed_total: {}",
         json_u64(counters, "access_writeback_failed_total")
+    );
+}
+
+#[cfg(feature = "rest")]
+fn print_daemon_rest_embedding_status(status: &Value) {
+    let Some(embed_status) = status.get("embed_status") else {
+        return;
+    };
+    println!(
+        "rest.embedder_degraded: {}",
+        embed_status
+            .get("degraded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    println!(
+        "rest.embedder_fail_count: {}",
+        json_u64(embed_status, "fail_count")
+    );
+    if let Some(last_error) = embed_status.get("last_error").and_then(Value::as_str) {
+        println!("rest.embedder_last_error: {last_error}");
+    }
+}
+
+#[cfg(feature = "rest")]
+fn print_daemon_rest_queue_stats(status: &Value) {
+    let Some(queue_stats) = status.get("queue_stats") else {
+        return;
+    };
+    println!(
+        "rest.queue_terminal_failures: {}",
+        json_u64(queue_stats, "failed_terminal")
+    );
+    println!(
+        "rest.queue_retryable_model_failures: embedding={} llm={}",
+        json_u64(queue_stats, "failed_retryable_embed"),
+        json_u64(queue_stats, "failed_retryable_llm")
     );
 }
 
@@ -23937,6 +23982,24 @@ fn doctor_command(format: String) -> Result<()> {
                 report.embedding.model.as_deref().unwrap_or("none")
             );
             println!("embedding_pool_capacity={}", report.embedding.pool_capacity);
+            println!("embedding_degraded={}", report.embedding.degraded);
+            println!(
+                "embedding_block_writes_when_degraded={}",
+                report.embedding.block_writes_when_degraded
+            );
+            println!("embedding_write_refused={}", report.embedding.write_refused);
+            println!("embedding_fail_count={}", report.embedding.fail_count);
+            if let Some(last_error) = report.embedding.last_error.as_deref() {
+                println!("embedding_last_error={last_error}");
+            }
+            println!(
+                "embedding_last_success_at_unix_ms={}",
+                report
+                    .embedding
+                    .last_success_at_unix_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
             println!(
                 "embedding_queue=pending:{} claimed:{} failed:{} retryable_model:{} terminal:{} retryable_embedding:{} retryable_llm:{} last_auto_requeue_at_unix_ms:{}",
                 report.embedding.queue.pending,
