@@ -25,6 +25,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   the distill tool before rejection. Ported from upstream P107 (3cb979a).
 - `upstream-sync` skill with `.upstream-sync.json` tracking file for
   selectively porting upstream features to the heavily diverged fork.
+- Full smoke conformance coverage for enabled search rerankers, including
+  endpoint reachability, scored reordering evidence, and fallback-warning
+  unit coverage.
 
 ### Fixed
 

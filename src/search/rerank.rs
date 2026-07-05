@@ -607,6 +607,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reranker_index_http_error_preserves_order_and_warns() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/rerank")
+            .with_status(503)
+            .with_body("reranker down")
+            .create_async()
+            .await;
+
+        let outcome = maybe_rerank_indices_with_config(
+            &config(Some(server.url())),
+            "query",
+            vec!["first candidate", "second candidate"],
+        )
+        .await;
+
+        mock.assert_async().await;
+        assert_eq!(outcome.order, vec![0, 1]);
+        let warnings = outcome.warnings.join("\n");
+        assert!(warnings.contains("reranker unavailable"));
+        assert!(warnings.contains("original search ranking"));
+        assert!(warnings.contains("503 Service Unavailable"));
+        assert!(!warnings.contains("reranker down"));
+    }
+
+    #[tokio::test]
     async fn reranker_http_error_body_echoing_candidate_is_not_warned() {
         let raw_drawer_content = "UNIQUE_RAW_DRAWER_CONTENT_SHOULD_NOT_LEAK";
         let mut server = mockito::Server::new_async().await;

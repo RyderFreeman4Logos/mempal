@@ -347,6 +347,51 @@ class ConformanceReportTests(unittest.TestCase):
         self.assertNotIn('raw drawer text', encoded)
         self.assertNotIn('raw preview', encoded)
 
+    def test_default_conformance_groups_include_reranker_probes(self) -> None:
+        group = self.smoke.CONFORMANCE_GROUPS['search_reranker_behavior']
+
+        self.assertEqual(
+            group['probes'],
+            [
+                'reranker_endpoint_reachable',
+                'reranker_reorders_results',
+                'reranker_fallback_warning',
+            ],
+        )
+        self.assertIn('search.reranker_reordering', group['features'])
+
+    def test_reranker_disabled_records_skipped_probe_shape(self) -> None:
+        self.smoke.probe_search_reranker_behavior(config_path=Path('/tmp/mempal-smoke-missing-config.toml'))
+
+        report = self.smoke.build_conformance_report({
+            'reranker': self.smoke.CONFORMANCE_GROUPS['search_reranker_behavior'],
+        })
+        group = report['groups']['reranker']
+
+        self.assertEqual(group['status'], 'skipped')
+        self.assertEqual(group['skipped_probe_count'], 3)
+        self.assertEqual(report['summary']['skipped'], 1)
+        for probe in self.smoke.RERANKER_PROBES:
+            self.assertEqual(self.smoke.SUMMARY['groups'][probe]['skipped'], 'reranker_disabled')
+
+    def test_reranker_response_shape_accepts_score_aliases(self) -> None:
+        payload = {
+            'results': [
+                {'index': 1, 'relevance_score': 0.92},
+                {'index': 0, 'score': 0.17},
+            ]
+        }
+
+        shape = self.smoke.reranker_response_shape(payload, document_count=2)
+        reorder = self.smoke.reranker_reorder_evidence(payload)
+
+        self.assertTrue(shape['ok'])
+        self.assertEqual(shape['valid_score_count'], 2)
+        self.assertTrue(shape['has_relevance_score'])
+        self.assertTrue(shape['has_score'])
+        self.assertTrue(reorder['ok'])
+        self.assertEqual(reorder['first_returned_index'], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
