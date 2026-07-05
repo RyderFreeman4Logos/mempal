@@ -28,6 +28,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Full smoke conformance coverage for enabled search rerankers, including
   endpoint reachability, scored reordering evidence, and fallback-warning
   unit coverage.
+- Search latency investigation note for Issue #652, documenting the current
+  hybrid search pipeline, sqlite-vec query shape, brute-force vector-scan
+  behavior, and prioritized optimization path.
 
 ### Fixed
 
