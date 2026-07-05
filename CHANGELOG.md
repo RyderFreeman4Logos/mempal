@@ -53,6 +53,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - `mempal daemon status` now uses a bounded 2-second DB-holder scan instead
   of an unbounded `/proc/*/fd` traversal, preventing spurious 30-second
   timeouts under a healthy singleton daemon.
+- The daemon-backed `mempal ingest --wait --json` regression test now
+  terminates its foreground daemon with deterministic SIGTERM/SIGKILL cleanup
+  and PID/log-tail diagnostics, reducing local-gates flakiness.
 
 ### Changed
 

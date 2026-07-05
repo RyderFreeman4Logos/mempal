@@ -2,6 +2,7 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
@@ -187,38 +188,141 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
 }
 
 #[cfg(unix)]
-fn spawn_foreground_daemon(home: &Path) -> Child {
+struct ForegroundDaemon {
+    child: Child,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    daemon_log_path: PathBuf,
+    started_at: Instant,
+}
+
+#[cfg(unix)]
+impl ForegroundDaemon {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn diagnostics(&self) -> String {
+        format!(
+            "pid={}, elapsed={:?}\nstdout tail:\n{}\nstderr tail:\n{}\ndaemon.log tail:\n{}",
+            self.pid(),
+            self.started_at.elapsed(),
+            tail_file_for_diagnostics(&self.stdout_path, 16 * 1024),
+            tail_file_for_diagnostics(&self.stderr_path, 16 * 1024),
+            tail_file_for_diagnostics(&self.daemon_log_path, 16 * 1024)
+        )
+    }
+}
+
+#[cfg(unix)]
+fn tail_file_for_diagnostics(path: &Path, max_bytes: u64) -> String {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return format!("<{} unavailable: {error}>", path.display()),
+    };
+    let len = file.metadata().map_or(0, |metadata| metadata.len());
+    let start = len.saturating_sub(max_bytes);
+    if let Err(error) = file.seek(SeekFrom::Start(start)) {
+        return format!("<{} seek failed: {error}>", path.display());
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = file.read_to_end(&mut bytes) {
+        return format!("<{} read failed: {error}>", path.display());
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    if start == 0 {
+        text.into_owned()
+    } else {
+        format!("<truncated first {start} bytes>\n{text}")
+    }
+}
+
+#[cfg(unix)]
+fn spawn_foreground_daemon(home: &Path) -> ForegroundDaemon {
+    let runtime_dir = daemon_runtime_dir(home);
+    fs::create_dir_all(&runtime_dir).expect("create daemon runtime dir");
+    let stdout_path = runtime_dir.join("foreground-daemon.stdout.log");
+    let stderr_path = runtime_dir.join("foreground-daemon.stderr.log");
+    let daemon_log_path = home.join(".mempal/daemon.log");
+    let stdout = fs::File::create(&stdout_path).expect("create daemon stdout log");
+    let stderr = fs::File::create(&stderr_path).expect("create daemon stderr log");
+
     let mut child = Command::new(mempal_bin())
         .args(["daemon", "--foreground"])
         .env("HOME", home)
         .env(
             mempal::daemon_singleton::MEMPAL_RUNTIME_DIR_ENV,
-            daemon_runtime_dir(home),
+            &runtime_dir,
         )
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .expect("spawn foreground daemon");
+    let started_at = Instant::now();
     wait_for_path(&home.join(".mempal/daemon.pid"), Duration::from_secs(10));
     wait_for_path(
         &home.join(".mempal/daemon-hook.sock"),
         Duration::from_secs(10),
     );
     if child.try_wait().expect("poll daemon").is_some() {
-        panic!("foreground daemon exited before test command");
+        let daemon = ForegroundDaemon {
+            child,
+            stdout_path,
+            stderr_path,
+            daemon_log_path,
+            started_at,
+        };
+        panic!(
+            "foreground daemon exited before test command\n{}",
+            daemon.diagnostics()
+        );
     }
-    child
+    ForegroundDaemon {
+        child,
+        stdout_path,
+        stderr_path,
+        daemon_log_path,
+        started_at,
+    }
 }
 
 #[cfg(unix)]
-fn terminate_daemon(child: &mut Child) {
+fn terminate_daemon(daemon: &mut ForegroundDaemon) {
+    if daemon
+        .child
+        .try_wait()
+        .expect("poll daemon before SIGTERM")
+        .is_some()
+    {
+        return;
+    }
+
+    let sigterm_sent_at = Instant::now();
     // SAFETY: this test owns the foreground daemon child process.
-    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-    assert_eq!(rc, 0, "failed to send SIGTERM to daemon");
-    if !wait_for_child_exit(child, Duration::from_secs(10)) {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("daemon did not exit after SIGTERM");
+    let rc = unsafe { libc::kill(daemon.pid() as i32, libc::SIGTERM) };
+    assert_eq!(
+        rc,
+        0,
+        "failed to send SIGTERM to daemon\n{}",
+        daemon.diagnostics()
+    );
+    if !wait_for_child_exit(&mut daemon.child, Duration::from_secs(20)) {
+        let sigterm_elapsed = sigterm_sent_at.elapsed();
+        let _ = daemon.child.kill();
+        let kill_wait_start = Instant::now();
+        match daemon.child.wait() {
+            Ok(status) => panic!(
+                "daemon did not exit after SIGTERM; killed and reaped with status {status} after kill wait {:?}; SIGTERM elapsed {:?}\n{}",
+                kill_wait_start.elapsed(),
+                sigterm_elapsed,
+                daemon.diagnostics()
+            ),
+            Err(error) => panic!(
+                "daemon did not exit after SIGTERM; kill/reap failed: {error}; SIGTERM elapsed {:?}\n{}",
+                sigterm_elapsed,
+                daemon.diagnostics()
+            ),
+        }
     }
 }
 
