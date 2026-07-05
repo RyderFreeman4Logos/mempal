@@ -454,6 +454,7 @@ mempal reindex
 
 - Current architecture overview: [`docs/architecture.md`](docs/architecture.md)
 - Product surface classification: [`docs/architecture.md#product-surface-classification`](docs/architecture.md#product-surface-classification)
+- Search latency investigation: [`docs/search-latency-investigation.md`](docs/search-latency-investigation.md)
 - Historical design baseline: [`docs/specs/2026-04-08-mempal-design.md`](docs/specs/2026-04-08-mempal-design.md) — useful for intent, but some package-layout details are implementation history; use the current package layout above for install/runtime facts.
 - Usage guide: [`docs/usage.md`](docs/usage.md)
 - AAAK dialect: [`docs/aaak-dialect.md`](docs/aaak-dialect.md)
