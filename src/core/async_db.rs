@@ -38,7 +38,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 
@@ -54,6 +54,16 @@ const PAGE_CACHE_BUDGET_MIB: i64 = 256;
 
 /// Conservative production reader count for daemon/MCP/REST read pools.
 pub const RESOURCE_BOUNDED_READERS: usize = 2;
+
+const SQLITE_PROGRESS_HANDLER_OPS: i32 = 1_000;
+
+#[derive(Debug, thiserror::Error)]
+#[error("database read deadline exceeded")]
+pub(crate) struct ReadDeadlineExceeded;
+
+pub(crate) fn anyhow_error_is_read_deadline_exceeded(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ReadDeadlineExceeded>().is_some()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AsyncDbResourceSnapshot {
@@ -234,7 +244,29 @@ impl AsyncDb {
         let delay = self.read_delay;
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
-        exec_anyhow(Arc::clone(&self.readers), delay, f).await
+        exec_anyhow(Arc::clone(&self.readers), delay, None, f).await
+    }
+
+    /// Run a read-only [`anyhow::Result`] closure with a cooperative SQLite
+    /// deadline.
+    ///
+    /// The deadline is installed on the checked-out reader connection via
+    /// SQLite's progress handler, so long-running SQL is interrupted inside the
+    /// blocking thread instead of continuing after the async caller times out.
+    pub(crate) async fn run_read_anyhow_until<F, R>(
+        &self,
+        deadline: Instant,
+        f: F,
+    ) -> anyhow::Result<R>
+    where
+        F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.read_delay;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay: Option<Duration> = None;
+        exec_anyhow(Arc::clone(&self.readers), delay, Some(deadline), f).await
     }
 
     /// Run a read-write closure against the single writer connection off the
@@ -266,7 +298,7 @@ impl AsyncDb {
         let delay = self.write_delay;
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
-        exec_anyhow(Arc::clone(&self.writer), delay, f).await
+        exec_anyhow(Arc::clone(&self.writer), delay, None, f).await
     }
 }
 
@@ -314,17 +346,34 @@ where
     }
 }
 
-async fn exec_anyhow<F, R>(pool: Arc<ConnPool>, delay: Option<Duration>, f: F) -> anyhow::Result<R>
+async fn exec_anyhow<F, R>(
+    pool: Arc<ConnPool>,
+    delay: Option<Duration>,
+    deadline: Option<Instant>,
+    f: F,
+) -> anyhow::Result<R>
 where
     F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
     R: Send + 'static,
 {
-    let permit = pool
-        .sem
-        .clone()
-        .acquire_owned()
+    let permit = if let Some(deadline) = deadline {
+        if Instant::now() >= deadline {
+            return Err(anyhow::Error::new(ReadDeadlineExceeded));
+        }
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            pool.sem.clone().acquire_owned(),
+        )
         .await
-        .map_err(|_| anyhow::anyhow!("connection pool semaphore closed"))?;
+        .map_err(|_| anyhow::Error::new(ReadDeadlineExceeded))?
+        .map_err(|_| anyhow::anyhow!("connection pool semaphore closed"))?
+    } else {
+        pool.sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("connection pool semaphore closed"))?
+    };
     let conn = pool.take_or_open()?;
     let checkin_pool = Arc::clone(&pool);
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -334,10 +383,24 @@ where
             if let Some(d) = delay {
                 std::thread::sleep(d);
             }
+            if let Some(deadline) = deadline {
+                conn.conn().progress_handler(
+                    SQLITE_PROGRESS_HANDLER_OPS,
+                    Some(move || Instant::now() >= deadline),
+                );
+            }
             let out = f(&conn);
+            if deadline.is_some() {
+                conn.conn().progress_handler(0, None::<fn() -> bool>);
+            }
             checkin_pool.checkin(conn);
             drop(permit);
-            out
+            match out {
+                Err(error) if should_map_read_deadline_error(deadline, &error) => {
+                    Err(anyhow::Error::new(ReadDeadlineExceeded))
+                }
+                other => other,
+            }
         })
     })
     .await;
@@ -345,6 +408,33 @@ where
         Ok(out) => out,
         Err(join_err) => Err(anyhow::anyhow!("blocking database task failed: {join_err}")),
     }
+}
+
+fn should_map_read_deadline_error(deadline: Option<Instant>, error: &anyhow::Error) -> bool {
+    deadline.is_some_and(|deadline| {
+        anyhow_error_contains_sqlite_interrupt(error) || Instant::now() >= deadline
+    })
+}
+
+fn anyhow_error_contains_sqlite_interrupt(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(rusqlite_error_is_sqlite_interrupt)
+            || matches!(
+                source.downcast_ref::<DbError>(),
+                Some(DbError::Sqlite(sqlite)) if rusqlite_error_is_sqlite_interrupt(sqlite)
+            )
+    })
+}
+
+fn rusqlite_error_is_sqlite_interrupt(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite, _)
+            if sqlite.code == rusqlite::ErrorCode::OperationInterrupted
+                || sqlite.extended_code == rusqlite::ffi::SQLITE_INTERRUPT
+    )
 }
 
 #[cfg(test)]
@@ -582,5 +672,52 @@ mod tests {
             .await
             .expect("reader recovers after cancelled blocking task returns");
         assert_eq!(out, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_anyhow_read_interrupts_sqlite_and_releases_reader() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let adb = AsyncDb::open(&tmp.path().join("palace.db"), 1).expect("open async db");
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(100);
+        let error = adb
+            .run_read_anyhow_until(deadline, |db| {
+                db.conn()
+                    .query_row(
+                        r#"
+                        WITH RECURSIVE seq(n) AS (
+                            SELECT 1
+                            UNION ALL
+                            SELECT n + 1 FROM seq WHERE n < 100000000
+                        )
+                        SELECT sum(n) FROM seq
+                        "#,
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|_| ())
+                    .map_err(anyhow::Error::new)
+            })
+            .await
+            .expect_err("deadline must interrupt the SQLite scan");
+        assert!(
+            anyhow_error_is_read_deadline_exceeded(&error),
+            "deadline error should be explicit, got {error:#}"
+        );
+        let interrupted_after = start.elapsed();
+        assert!(
+            interrupted_after >= Duration::from_millis(50),
+            "deadline must be reached by SQLite progress_handler, not the pre-deadline fast path; \
+             elapsed {interrupted_after:?}"
+        );
+
+        let recovery = tokio::time::timeout(
+            Duration::from_millis(100),
+            adb.run_read_anyhow(|_db| Ok(7_i64)),
+        )
+        .await
+        .expect("reader must be checked in as soon as SQLite is interrupted")
+        .expect("recovery read");
+        assert_eq!(recovery, 7);
     }
 }

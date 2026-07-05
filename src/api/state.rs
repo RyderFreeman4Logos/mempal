@@ -6,7 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::{
     AsyncDb,
-    async_db::{AsyncDbResourceSnapshot, RESOURCE_BOUNDED_READERS},
+    async_db::{
+        AsyncDbResourceSnapshot, RESOURCE_BOUNDED_READERS, anyhow_error_is_read_deadline_exceeded,
+    },
     config::ConfigHandle,
     db::DbError,
 };
@@ -17,6 +19,7 @@ use tokio::sync::OnceCell;
 const API_ASYNC_DB_READERS: usize = RESOURCE_BOUNDED_READERS;
 const MAX_SLOW_SEARCHES: usize = 10;
 const SLOW_SEARCH_THRESHOLD: Duration = Duration::from_secs(1);
+const SQLITE_INTERRUPT_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -90,8 +93,16 @@ impl ApiState {
             counter.fetch_add(1, Ordering::SeqCst);
         }
         let async_db = self.async_db().await?;
-        match tokio::time::timeout(deadline, async_db.run_read_anyhow(f)).await {
-            Ok(result) => result.map(Some),
+        let sqlite_deadline = Instant::now() + deadline;
+        match tokio::time::timeout(
+            deadline + SQLITE_INTERRUPT_GRACE,
+            async_db.run_read_anyhow_until(sqlite_deadline, f),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(Some(result)),
+            Ok(Err(error)) if anyhow_error_is_read_deadline_exceeded(&error) => Ok(None),
+            Ok(Err(error)) => Err(error),
             Err(_) => Ok(None),
         }
     }
