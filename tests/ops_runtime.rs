@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use mempal::core::db::{CURRENT_SCHEMA_VERSION, Database};
 use mempal::core::queue::{PendingMessageStore, QueueFailureDisposition};
@@ -13,6 +14,7 @@ fn mempal_bin() -> String {
 }
 
 static LOAD_DOTENV: OnceLock<()> = OnceLock::new();
+const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Inject hermetic embed environment into a child Command.
 fn inject_embed_env(cmd: &mut Command) {
@@ -38,7 +40,7 @@ fn run_mempal(home: &TempDir, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(mempal_bin());
     cmd.args(args).env("HOME", home.path());
     inject_embed_env(&mut cmd);
-    cmd.output().expect("run mempal")
+    command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal")
 }
 
 fn run_mempal_with_path(home: &TempDir, args: &[&str], path_value: &str) -> std::process::Output {
@@ -47,7 +49,44 @@ fn run_mempal_with_path(home: &TempDir, args: &[&str], path_value: &str) -> std:
         .env("HOME", home.path())
         .env("PATH", path_value);
     inject_embed_env(&mut cmd);
-    cmd.output().expect("run mempal")
+    command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal")
+}
+
+fn command_output_with_timeout(command: &mut Command, timeout: Duration, label: &str) -> Output {
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {label}: {error}"));
+    wait_child_output_timeout(child, timeout, label)
+}
+
+fn wait_child_output_timeout(mut child: Child, timeout: Duration, label: &str) -> Output {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("collect {label} output: {error}"));
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("collect timed-out {label} output: {error}"));
+                panic!(
+                    "{label} did not exit within {timeout:?}; stdout={}, stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => panic!("poll {label}: {error}"),
+        }
+    }
 }
 
 fn stdout(output: &std::process::Output) -> String {
@@ -330,7 +369,7 @@ fn test_cli_release_readiness_json() {
         .env("HOME", home.path())
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")));
     inject_embed_env(&mut cmd);
-    let output = cmd.output().expect("run mempal");
+    let output = command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal release-readiness");
     assert_success(&output);
     let value: Value = serde_json::from_str(&stdout(&output)).expect("release readiness json");
     assert_eq!(value["writes"], false);
@@ -366,7 +405,7 @@ fn test_cli_release_readiness_plain() {
         .env("HOME", home.path())
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")));
     inject_embed_env(&mut cmd);
-    let output = cmd.output().expect("run mempal");
+    let output = command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal release-readiness");
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("Release Readiness"), "{out}");
@@ -383,7 +422,7 @@ fn test_cli_release_readiness_rejects_invalid_format() {
         .env("HOME", home.path())
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")));
     inject_embed_env(&mut cmd);
-    let output = cmd.output().expect("run mempal");
+    let output = command_output_with_timeout(&mut cmd, CLI_TIMEOUT, "mempal release-readiness");
     assert!(!output.status.success());
     assert!(stderr(&output).contains("unsupported release-readiness format"));
 }

@@ -1149,10 +1149,7 @@ fn redact_url_spans_from_text(input: &str) -> String {
         let start = cursor + relative_start;
         output.push_str(&input[cursor..start]);
         let tail = &input[start..];
-        let relative_end = tail
-            .char_indices()
-            .find_map(|(index, ch)| (index > 0 && is_url_span_terminator(ch)).then_some(index))
-            .unwrap_or(tail.len());
+        let relative_end = url_span_end(tail);
         let end = start + relative_end;
         let candidate = &input[start..end];
         match diagnostic_url_origin_label(candidate) {
@@ -1172,6 +1169,35 @@ fn find_url_start(input: &str) -> Option<usize> {
         (None, Some(https)) => Some(https),
         (None, None) => None,
     }
+}
+
+fn url_span_end(tail: &str) -> usize {
+    let mut in_ipv6_authority = false;
+    for (index, ch) in tail.char_indices().skip(1) {
+        if ch == '[' && bracket_starts_ipv6_authority(tail, index) {
+            in_ipv6_authority = true;
+            continue;
+        }
+        if ch == ']' && in_ipv6_authority {
+            in_ipv6_authority = false;
+            continue;
+        }
+        if !in_ipv6_authority && is_url_span_terminator(ch) {
+            return index;
+        }
+    }
+    tail.len()
+}
+
+fn bracket_starts_ipv6_authority(url_tail: &str, bracket_index: usize) -> bool {
+    let Some(authority_start) = url_tail[..bracket_index]
+        .find("://")
+        .map(|scheme_end| scheme_end + 3)
+    else {
+        return false;
+    };
+    let authority_prefix = &url_tail[authority_start..bracket_index];
+    !authority_prefix.contains(['/', '?', '#'])
 }
 
 fn is_url_span_terminator(ch: char) -> bool {
@@ -3628,6 +3654,22 @@ embedder_mode = "small_local"
             (
                 "failed https://example.com:9443/v1/private-token-path?api_key=secret#fragment",
                 "failed https://example.com:9443",
+            ),
+            (
+                "http://[::1]:18002/v1/private-token-path?api_key=secret",
+                "http://[::1]:18002",
+            ),
+            (
+                "url=http://[::1]:18002/v1/private-token-path?api_key=secret",
+                "url=http://[::1]:18002",
+            ),
+            (
+                r#"{"url":"http://[::1]:18002/v1/private-token-path?api_key=secret"}"#,
+                r#"{"url":"http://[::1]:18002"}"#,
+            ),
+            (
+                "(endpoint=http://[2001:db8::1]:18002/v1/private-token-path?api_key=secret)",
+                "(endpoint=http://[2001:db8::1]:18002)",
             ),
         ];
 
