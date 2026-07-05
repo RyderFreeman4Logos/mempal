@@ -442,6 +442,91 @@ class ConformanceReportTests(unittest.TestCase):
             self.assertEqual(info['endpoint_host_kind'], 'hostname')
             self.assertEqual(info['endpoint_path_kind'], 'default_rerank')
 
+    def test_reranker_invalid_port_records_failure_without_network_call(self) -> None:
+        calls: list[tuple[Any, ...]] = []
+
+        def fail_if_called(*args: Any, **_kwargs: Any) -> tuple[Any | None, dict[str, Any]]:
+            calls.append(args)
+            self.fail('invalid reranker endpoint should not be called')
+
+        original_call = self.smoke.call_reranker_endpoint
+        self.smoke.call_reranker_endpoint = fail_if_called
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / 'config.toml'
+                config_path.write_text(
+                    '\n'.join([
+                        '[search.reranker]',
+                        'enabled = true',
+                        'endpoint = "https://rerank.example.com:bad/v1/rerank"',
+                        'model = "rerank"',
+                    ]),
+                    encoding='utf-8',
+                )
+
+                self.smoke.probe_search_reranker_behavior(config_path=config_path)
+        finally:
+            self.smoke.call_reranker_endpoint = original_call
+
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            self.smoke.SUMMARY['failures'],
+            ['reranker_endpoint_reachable', 'reranker_reorders_results'],
+        )
+        for probe in ('reranker_endpoint_reachable', 'reranker_reorders_results'):
+            info = self.smoke.SUMMARY['groups'][probe]
+            self.assertEqual(info['stage'], 'normalize_endpoint')
+            self.assertEqual(info['reason'], 'invalid_port')
+            self.assertEqual(info['error_type'], 'ValueError')
+
+    def test_reranker_policy_blocked_invalid_port_diagnostics_do_not_crash(self) -> None:
+        calls: list[tuple[Any, ...]] = []
+
+        def invalid_port_endpoint(_endpoint: str) -> str:
+            return 'https://rerank.example.com:bad/v1/rerank'
+
+        def fail_if_called(*args: Any, **_kwargs: Any) -> tuple[Any | None, dict[str, Any]]:
+            calls.append(args)
+            self.fail('policy-blocked remote reranker should not be called')
+
+        original_normalize = self.smoke.normalize_reranker_endpoint
+        original_call = self.smoke.call_reranker_endpoint
+        self.smoke.normalize_reranker_endpoint = invalid_port_endpoint
+        self.smoke.call_reranker_endpoint = fail_if_called
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / 'config.toml'
+                config_path.write_text(
+                    '\n'.join([
+                        '[search.reranker]',
+                        'enabled = true',
+                        'endpoint = "https://rerank.example.com/v1/rerank"',
+                        'model = "rerank"',
+                        '',
+                        '[privacy.remote_calls]',
+                        'fail_closed = true',
+                        'allow_rerank = false',
+                    ]),
+                    encoding='utf-8',
+                )
+
+                self.smoke.probe_search_reranker_behavior(config_path=config_path)
+        finally:
+            self.smoke.normalize_reranker_endpoint = original_normalize
+            self.smoke.call_reranker_endpoint = original_call
+
+        self.assertEqual(calls, [])
+        self.assertEqual(self.smoke.SUMMARY['failures'], [])
+        for probe in self.smoke.RERANKER_PROBES:
+            info = self.smoke.SUMMARY['groups'][probe]
+            self.assertEqual(info['skipped'], 'reranker_remote_blocked_by_policy')
+            self.assertTrue(info['remote_call_blocked'])
+            self.assertFalse(info['network_call'])
+            self.assertTrue(info['endpoint_has_port'])
+            self.assertFalse(info['endpoint_port_valid'])
+            self.assertEqual(info['endpoint_host_kind'], 'hostname')
+            self.assertEqual(info['endpoint_path_kind'], 'default_rerank')
+
     def test_reranker_policy_allows_local_private_endpoints(self) -> None:
         config = {'remote_calls': {'fail_closed': True, 'allow_rerank': False}}
 

@@ -823,6 +823,10 @@ def normalize_reranker_endpoint(endpoint: str) -> str:
         raise ValueError('userinfo_not_allowed')
     if parsed.query:
         raise ValueError('query_not_allowed')
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError('invalid_port') from exc
     path = parsed.path
     if not path or path == '/':
         path = '/v1/rerank'
@@ -842,10 +846,17 @@ def sanitized_reranker_endpoint_fields(endpoint: str) -> dict[str, Any]:
                 host_kind = 'private_lan'
         except ValueError:
             pass
+    endpoint_port_valid = True
+    try:
+        endpoint_has_port = parsed.port is not None
+    except ValueError:
+        endpoint_has_port = True
+        endpoint_port_valid = False
     return {
         'endpoint_scheme': parsed.scheme or None,
         'endpoint_host_kind': host_kind,
-        'endpoint_has_port': parsed.port is not None,
+        'endpoint_has_port': endpoint_has_port,
+        'endpoint_port_valid': endpoint_port_valid,
         'endpoint_path_kind': 'default_rerank' if parsed.path == '/v1/rerank' else 'custom',
     }
 
@@ -1043,8 +1054,21 @@ def probe_search_reranker_behavior(config_path: Path | None = None) -> None:
     try:
         endpoint = normalize_reranker_endpoint(str(config['endpoint']))
     except Exception as exc:
-        note('reranker_endpoint_reachable', False, error_type=type(exc).__name__, stage='normalize_endpoint')
-        note('reranker_reorders_results', False, error_type=type(exc).__name__, stage='normalize_endpoint')
+        reason = str(exc) or 'invalid_endpoint'
+        note(
+            'reranker_endpoint_reachable',
+            False,
+            error_type=type(exc).__name__,
+            reason=reason,
+            stage='normalize_endpoint',
+        )
+        note(
+            'reranker_reorders_results',
+            False,
+            error_type=type(exc).__name__,
+            reason=reason,
+            stage='normalize_endpoint',
+        )
         return
     if reranker_remote_call_blocked(config, endpoint):
         note_reranker_skipped(
