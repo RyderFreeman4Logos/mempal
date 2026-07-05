@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -373,6 +374,89 @@ class ConformanceReportTests(unittest.TestCase):
         self.assertEqual(report['summary']['skipped'], 1)
         for probe in self.smoke.RERANKER_PROBES:
             self.assertEqual(self.smoke.SUMMARY['groups'][probe]['skipped'], 'reranker_disabled')
+
+    def test_reranker_config_present_skips_without_stdlib_toml_parser(self) -> None:
+        original_parser = self.smoke.tomllib
+        self.smoke.tomllib = None
+        try:
+            configs = [
+                '[privacy.remote_calls]\nfail_closed = true\n',
+                '[search.reranker]\nenabled = false\n',
+            ]
+            for content in configs:
+                with self.subTest(content=content):
+                    self.smoke.SUMMARY['failures'] = []
+                    self.smoke.SUMMARY['groups'] = {}
+                    with tempfile.TemporaryDirectory() as tmp:
+                        config_path = Path(tmp) / 'config.toml'
+                        config_path.write_text(content, encoding='utf-8')
+
+                        self.smoke.probe_search_reranker_behavior(config_path=config_path)
+
+                    self.assertEqual(self.smoke.SUMMARY['failures'], [])
+                    for probe in self.smoke.RERANKER_PROBES:
+                        self.assertEqual(
+                            self.smoke.SUMMARY['groups'][probe]['skipped'],
+                            'reranker_disabled',
+                        )
+        finally:
+            self.smoke.tomllib = original_parser
+
+    def test_reranker_fail_closed_remote_policy_skips_without_network_call(self) -> None:
+        calls: list[tuple[Any, ...]] = []
+
+        def fail_if_called(*args: Any, **_kwargs: Any) -> tuple[Any | None, dict[str, Any]]:
+            calls.append(args)
+            self.fail('policy-blocked remote reranker should not be called')
+
+        original_call = self.smoke.call_reranker_endpoint
+        self.smoke.call_reranker_endpoint = fail_if_called
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / 'config.toml'
+                config_path.write_text(
+                    '\n'.join([
+                        '[search.reranker]',
+                        'enabled = true',
+                        'endpoint = "https://rerank.example.com/v1/rerank"',
+                        'model = "rerank"',
+                        '',
+                        '[privacy.remote_calls]',
+                        'fail_closed = true',
+                        'allow_rerank = false',
+                    ]),
+                    encoding='utf-8',
+                )
+
+                self.smoke.probe_search_reranker_behavior(config_path=config_path)
+        finally:
+            self.smoke.call_reranker_endpoint = original_call
+
+        self.assertEqual(calls, [])
+        self.assertEqual(self.smoke.SUMMARY['failures'], [])
+        for probe in self.smoke.RERANKER_PROBES:
+            info = self.smoke.SUMMARY['groups'][probe]
+            self.assertEqual(info['skipped'], 'reranker_remote_blocked_by_policy')
+            self.assertTrue(info['remote_call_blocked'])
+            self.assertFalse(info['network_call'])
+            self.assertEqual(info['endpoint_host_kind'], 'hostname')
+            self.assertEqual(info['endpoint_path_kind'], 'default_rerank')
+
+    def test_reranker_policy_allows_local_private_endpoints(self) -> None:
+        config = {'remote_calls': {'fail_closed': True, 'allow_rerank': False}}
+
+        self.assertFalse(
+            self.smoke.reranker_remote_call_blocked(config, 'http://127.0.0.1:18003/v1/rerank')
+        )
+        self.assertFalse(
+            self.smoke.reranker_remote_call_blocked(config, 'http://gb10:18003/v1/rerank')
+        )
+        self.assertFalse(
+            self.smoke.reranker_remote_call_blocked(config, 'http://192.168.1.20:18003/v1/rerank')
+        )
+        self.assertTrue(
+            self.smoke.reranker_remote_call_blocked(config, 'https://rerank.example.com/v1/rerank')
+        )
 
     def test_reranker_response_shape_accepts_score_aliases(self) -> None:
         payload = {

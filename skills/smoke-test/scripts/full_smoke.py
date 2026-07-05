@@ -25,7 +25,10 @@ from typing import Any
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.11+ has tomllib.
-    tomllib = None
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:  # pragma: no cover - fallback parser handles smoke fields.
+        tomllib = None
 
 REPO = Path(__file__).resolve().parents[3]
 MARKER = f"mempal-skill-smoke-{int(time.time())}-{os.getpid()}"
@@ -677,6 +680,96 @@ def mempal_config_path() -> Path:
     return Path(os.environ.get('HOME', '~')).expanduser() / '.mempal' / 'config.toml'
 
 
+def _strip_toml_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if in_double and char == '\\':
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == '#' and not in_single and not in_double:
+            return line[:index]
+    return line
+
+
+def _parse_smoke_toml_scalar(raw: str) -> Any:
+    value = raw.strip()
+    if value == 'true':
+        return True
+    if value == 'false':
+        return False
+    if value.startswith('"') and value.endswith('"'):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value[1:-1]
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1]
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _load_smoke_toml_fields_fallback(path: Path) -> dict[str, Any]:
+    root: dict[str, Any] = {}
+    current: dict[str, Any] | None = None
+    for raw_line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+        line = _strip_toml_comment(raw_line).strip()
+        if not line:
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            section = line[1:-1].strip()
+            if section in {'search.reranker', 'privacy.remote_calls'}:
+                current = root
+                for part in section.split('.'):
+                    nested = current.get(part)
+                    if not isinstance(nested, dict):
+                        nested = {}
+                        current[part] = nested
+                    current = nested
+            else:
+                current = None
+            continue
+        if current is None or '=' not in line:
+            continue
+        key, raw_value = line.split('=', 1)
+        value = _parse_smoke_toml_scalar(raw_value)
+        if value is not None:
+            current[key.strip()] = value
+    return root
+
+
+def _load_smoke_toml_fields(path: Path) -> dict[str, Any]:
+    if tomllib is not None:
+        try:
+            with path.open('rb') as handle:
+                return tomllib.load(handle)
+        except Exception:
+            return _load_smoke_toml_fields_fallback(path)
+    return _load_smoke_toml_fields_fallback(path)
+
+
+def _config_bool(values: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = values.get(key, default)
+    return value if isinstance(value, bool) else default
+
+
+def _config_positive_int(values: dict[str, Any], key: str, default: int) -> int:
+    value = values.get(key, default)
+    return value if type(value) is int and value > 0 else default
+
+
 def load_reranker_config(config_path: Path | None = None) -> dict[str, Any]:
     """Load only [search.reranker] fields needed by smoke.
 
@@ -694,23 +787,26 @@ def load_reranker_config(config_path: Path | None = None) -> dict[str, Any]:
             'top_k': DEFAULT_RERANKER_TOP_K,
             'source': 'default_missing_config',
         }
-    if tomllib is None:
-        raise RuntimeError('tomllib_unavailable')
-    with path.open('rb') as handle:
-        root = tomllib.load(handle)
+    root = _load_smoke_toml_fields(path)
     search = root.get('search') if isinstance(root, dict) else None
     reranker = search.get('reranker') if isinstance(search, dict) else None
     if not isinstance(reranker, dict):
         reranker = {}
+    privacy = root.get('privacy') if isinstance(root, dict) else None
+    remote_calls = privacy.get('remote_calls') if isinstance(privacy, dict) else None
+    if not isinstance(remote_calls, dict):
+        remote_calls = {}
 
-    timeout_secs = reranker.get('timeout_secs', DEFAULT_RERANKER_TIMEOUT_SECS)
-    top_k = reranker.get('top_k', DEFAULT_RERANKER_TOP_K)
     return {
-        'enabled': bool(reranker.get('enabled', False)),
+        'enabled': _config_bool(reranker, 'enabled'),
         'endpoint': reranker.get('endpoint') if isinstance(reranker.get('endpoint'), str) else None,
         'model': reranker.get('model') if isinstance(reranker.get('model'), str) else None,
-        'timeout_secs': timeout_secs if isinstance(timeout_secs, int) and timeout_secs > 0 else DEFAULT_RERANKER_TIMEOUT_SECS,
-        'top_k': top_k if isinstance(top_k, int) and top_k > 0 else DEFAULT_RERANKER_TOP_K,
+        'timeout_secs': _config_positive_int(reranker, 'timeout_secs', DEFAULT_RERANKER_TIMEOUT_SECS),
+        'top_k': _config_positive_int(reranker, 'top_k', DEFAULT_RERANKER_TOP_K),
+        'remote_calls': {
+            'fail_closed': _config_bool(remote_calls, 'fail_closed'),
+            'allow_rerank': _config_bool(remote_calls, 'allow_rerank'),
+        },
         'source': 'config',
     }
 
@@ -752,6 +848,29 @@ def sanitized_reranker_endpoint_fields(endpoint: str) -> dict[str, Any]:
         'endpoint_has_port': parsed.port is not None,
         'endpoint_path_kind': 'default_rerank' if parsed.path == '/v1/rerank' else 'custom',
     }
+
+
+def reranker_endpoint_is_local_or_private(endpoint: str) -> bool:
+    parsed = urllib.parse.urlparse(endpoint)
+    host = parsed.hostname or ''
+    if host.lower() == 'localhost' or '.' not in host or host.lower().endswith('.local'):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private
+    except ValueError:
+        return False
+
+
+def reranker_remote_call_blocked(config: dict[str, Any], endpoint: str) -> bool:
+    policy = config.get('remote_calls')
+    if not isinstance(policy, dict):
+        return False
+    return (
+        not reranker_endpoint_is_local_or_private(endpoint)
+        and policy.get('fail_closed') is True
+        and policy.get('allow_rerank') is not True
+    )
 
 
 def reranker_smoke_documents() -> tuple[str, list[str]]:
@@ -829,9 +948,9 @@ def reranker_reorder_evidence(value: Any) -> dict[str, Any]:
     }
 
 
-def note_reranker_skipped(reason: str) -> None:
+def note_reranker_skipped(reason: str, **fields: Any) -> None:
     for probe in RERANKER_PROBES:
-        note(probe, True, skipped=reason)
+        note(probe, True, skipped=reason, **fields)
 
 
 def call_reranker_endpoint(config: dict[str, Any], endpoint: str) -> tuple[Any | None, dict[str, Any]]:
@@ -926,6 +1045,14 @@ def probe_search_reranker_behavior(config_path: Path | None = None) -> None:
     except Exception as exc:
         note('reranker_endpoint_reachable', False, error_type=type(exc).__name__, stage='normalize_endpoint')
         note('reranker_reorders_results', False, error_type=type(exc).__name__, stage='normalize_endpoint')
+        return
+    if reranker_remote_call_blocked(config, endpoint):
+        note_reranker_skipped(
+            'reranker_remote_blocked_by_policy',
+            remote_call_blocked=True,
+            network_call=False,
+            **sanitized_reranker_endpoint_fields(endpoint),
+        )
         return
 
     parsed, info = call_reranker_endpoint(config, endpoint)
