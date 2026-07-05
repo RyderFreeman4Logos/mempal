@@ -446,44 +446,7 @@ fn overlay_daemon_embedding_status(
 }
 
 fn sanitize_runtime_error(error: Option<String>) -> Option<String> {
-    error.map(|message| {
-        crate::core::config::scrub_sensitive_text(&redact_url_paths_from_text(&message))
-    })
-}
-
-fn redact_url_paths_from_text(message: &str) -> String {
-    message
-        .split_whitespace()
-        .map(redact_url_token)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_url_token(token: &str) -> String {
-    let trimmed = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
-        )
-    });
-    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-        return token.to_string();
-    }
-    let Ok(url) = reqwest::Url::parse(trimmed) else {
-        return token.to_string();
-    };
-    let Some(host) = url.host_str() else {
-        return token.to_string();
-    };
-    let host = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    }
+    error.map(|message| crate::core::config::scrub_runtime_diagnostic_text(&message))
 }
 
 fn queue_report_from_stats(stats: QueueStats) -> DoctorEmbeddingQueueReport {
@@ -1330,7 +1293,7 @@ block_writes_when_degraded = true
                 "block_writes_when_degraded": true,
                 "write_refused": true,
                 "fail_count": 10,
-                "last_error": "failed http://127.0.0.1:18002/v1/private-token-path?api_key=sk-secret-should-not-print",
+                "last_error": r#"failed {"url":"http://127.0.0.1:18002/v1/private-token-path?api_key=sk-secret-should-not-print"}"#,
                 "last_success_at_unix_ms": null
             }
         });

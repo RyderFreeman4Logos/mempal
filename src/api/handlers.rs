@@ -10,7 +10,7 @@ use std::{
 
 use crate::core::{
     anchor,
-    config::{ConfigHandle, scrub_sensitive_text},
+    config::{ConfigHandle, scrub_runtime_diagnostic_text},
     db::{Database, DbError, db_error_is_sqlite_lock},
     project::{ProjectSearchScope, resolve_project_id},
     queue::{QueueStats, failure_headline_count, queue_stats_readonly},
@@ -688,42 +688,7 @@ impl From<&QueueStats> for ApiQueueStats {
 }
 
 fn sanitize_api_runtime_error(error: Option<String>) -> Option<String> {
-    error.map(|message| scrub_sensitive_text(&redact_url_paths_from_text(&message)))
-}
-
-fn redact_url_paths_from_text(message: &str) -> String {
-    message
-        .split_whitespace()
-        .map(redact_url_token)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_url_token(token: &str) -> String {
-    let trimmed = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
-        )
-    });
-    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-        return token.to_string();
-    }
-    let Ok(url) = reqwest::Url::parse(trimmed) else {
-        return token.to_string();
-    };
-    let Some(host) = url.host_str() else {
-        return token.to_string();
-    };
-    let host = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    }
+    error.map(|message| scrub_runtime_diagnostic_text(&message))
 }
 
 #[derive(Debug, Serialize)]

@@ -682,7 +682,7 @@ async fn test_status_shows_degraded_mode() {
     let env = TestEnv::new();
     for _ in 0..2 {
         global_embed_status().record_failure(&EmbedError::Runtime(
-            "down http://user:pass@127.0.0.1:18002/v1/private-token-path?api_key=sk-secret-should-not-print"
+            "down url=http://user:pass@127.0.0.1:18002/v1/private-token-path?api_key=sk-secret-should-not-print"
                 .to_string(),
         ));
     }
