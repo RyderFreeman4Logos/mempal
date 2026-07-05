@@ -167,6 +167,11 @@ fn test_cli_doctor_json_reports_schema_and_path() {
 fn test_cli_doctor_reports_queue_failure_classes() {
     let home = TempDir::new().expect("home");
     fs::create_dir_all(home.path().join(".mempal")).expect("create mempal home");
+    fs::write(
+        home.path().join(".mempal/config.toml"),
+        "[api]\nenabled = false\n",
+    )
+    .expect("write isolated doctor config");
     let db_path = palace_db_path(&home);
     Database::open(&db_path).expect("open db");
     let store = PendingMessageStore::new_without_reclaim(&db_path);
