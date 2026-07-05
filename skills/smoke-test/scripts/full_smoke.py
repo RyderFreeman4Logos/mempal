@@ -6,6 +6,8 @@ Exercises CLI and MCP CRUD without printing drawer content or raw command output
 from __future__ import annotations
 
 import json
+import ipaddress
+import math
 import os
 import select
 import signal
@@ -14,8 +16,19 @@ import sys
 import tempfile
 import time
 import resource
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.11+ has tomllib.
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:  # pragma: no cover - fallback parser handles smoke fields.
+        tomllib = None
 
 REPO = Path(__file__).resolve().parents[3]
 MARKER = f"mempal-skill-smoke-{int(time.time())}-{os.getpid()}"
@@ -41,6 +54,14 @@ OWNED_MCP_CHILDREN: dict[int, subprocess.Popen[Any]] = {}
 
 PROC_IO_KEYS = ('read_bytes', 'write_bytes', 'cancelled_write_bytes', 'rchar', 'wchar')
 CONFORMANCE_MATRIX_PATH = 'docs/conformance-matrix.md'
+DEFAULT_RERANKER_TIMEOUT_SECS = 60
+DEFAULT_RERANKER_TOP_K = 50
+MAX_RERANKER_SMOKE_TIMEOUT_SECS = 240
+RERANKER_PROBES = (
+    'reranker_endpoint_reachable',
+    'reranker_reorders_results',
+    'reranker_fallback_warning',
+)
 CONFORMANCE_GROUPS: dict[str, dict[str, Any]] = {
     'runtime_daemon_service': {
         'features': [
@@ -193,6 +214,15 @@ CONFORMANCE_GROUPS: dict[str, dict[str, Any]] = {
             'mcp_brief',
         ],
         'skipped_reason': 'embedding/search probes skipped because live create/search path was unavailable',
+    },
+    'search_reranker_behavior': {
+        'features': [
+            'search.reranker_endpoint',
+            'search.reranker_reordering',
+            'search.reranker_fallback_warning',
+        ],
+        'probes': list(RERANKER_PROBES),
+        'skipped_reason': 'search reranker probes skipped because search.reranker.enabled=false',
     },
     'privacy_cleanup_safety': {
         'features': [
@@ -644,6 +674,419 @@ def classify_stderr(data: bytes) -> str | None:
     if 'error:' in text:
         return 'error'
     return 'stderr_present'
+
+
+def mempal_config_path() -> Path:
+    return Path(os.environ.get('HOME', '~')).expanduser() / '.mempal' / 'config.toml'
+
+
+def _strip_toml_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if in_double and char == '\\':
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == '#' and not in_single and not in_double:
+            return line[:index]
+    return line
+
+
+def _parse_smoke_toml_scalar(raw: str) -> Any:
+    value = raw.strip()
+    if value == 'true':
+        return True
+    if value == 'false':
+        return False
+    if value.startswith('"') and value.endswith('"'):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value[1:-1]
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1]
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _load_smoke_toml_fields_fallback(path: Path) -> dict[str, Any]:
+    root: dict[str, Any] = {}
+    current: dict[str, Any] | None = None
+    for raw_line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+        line = _strip_toml_comment(raw_line).strip()
+        if not line:
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            section = line[1:-1].strip()
+            if section in {'search.reranker', 'privacy.remote_calls'}:
+                current = root
+                for part in section.split('.'):
+                    nested = current.get(part)
+                    if not isinstance(nested, dict):
+                        nested = {}
+                        current[part] = nested
+                    current = nested
+            else:
+                current = None
+            continue
+        if current is None or '=' not in line:
+            continue
+        key, raw_value = line.split('=', 1)
+        value = _parse_smoke_toml_scalar(raw_value)
+        if value is not None:
+            current[key.strip()] = value
+    return root
+
+
+def _load_smoke_toml_fields(path: Path) -> dict[str, Any]:
+    if tomllib is not None:
+        try:
+            with path.open('rb') as handle:
+                return tomllib.load(handle)
+        except Exception:
+            return _load_smoke_toml_fields_fallback(path)
+    return _load_smoke_toml_fields_fallback(path)
+
+
+def _config_bool(values: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = values.get(key, default)
+    return value if isinstance(value, bool) else default
+
+
+def _config_positive_int(values: dict[str, Any], key: str, default: int) -> int:
+    value = values.get(key, default)
+    return value if type(value) is int and value > 0 else default
+
+
+def load_reranker_config(config_path: Path | None = None) -> dict[str, Any]:
+    """Load only [search.reranker] fields needed by smoke.
+
+    Missing config follows mempal's default: reranker disabled. The returned
+    dict intentionally contains no raw endpoint diagnostics beyond fields
+    needed to make the probe request.
+    """
+    path = config_path or mempal_config_path()
+    if not path.exists():
+        return {
+            'enabled': False,
+            'endpoint': None,
+            'model': None,
+            'timeout_secs': DEFAULT_RERANKER_TIMEOUT_SECS,
+            'top_k': DEFAULT_RERANKER_TOP_K,
+            'source': 'default_missing_config',
+        }
+    root = _load_smoke_toml_fields(path)
+    search = root.get('search') if isinstance(root, dict) else None
+    reranker = search.get('reranker') if isinstance(search, dict) else None
+    if not isinstance(reranker, dict):
+        reranker = {}
+    privacy = root.get('privacy') if isinstance(root, dict) else None
+    remote_calls = privacy.get('remote_calls') if isinstance(privacy, dict) else None
+    if not isinstance(remote_calls, dict):
+        remote_calls = {}
+
+    return {
+        'enabled': _config_bool(reranker, 'enabled'),
+        'endpoint': reranker.get('endpoint') if isinstance(reranker.get('endpoint'), str) else None,
+        'model': reranker.get('model') if isinstance(reranker.get('model'), str) else None,
+        'timeout_secs': _config_positive_int(reranker, 'timeout_secs', DEFAULT_RERANKER_TIMEOUT_SECS),
+        'top_k': _config_positive_int(reranker, 'top_k', DEFAULT_RERANKER_TOP_K),
+        'remote_calls': {
+            'fail_closed': _config_bool(remote_calls, 'fail_closed'),
+            'allow_rerank': _config_bool(remote_calls, 'allow_rerank'),
+        },
+        'source': 'config',
+    }
+
+
+def normalize_reranker_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.strip()
+    if not endpoint:
+        raise ValueError('empty_endpoint')
+    raw = endpoint if endpoint.startswith(('http://', 'https://')) else f'http://{endpoint}'
+    parsed = urllib.parse.urlparse(raw)
+    if not parsed.hostname:
+        raise ValueError('missing_host')
+    if parsed.username or parsed.password:
+        raise ValueError('userinfo_not_allowed')
+    if parsed.query:
+        raise ValueError('query_not_allowed')
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError('invalid_port') from exc
+    path = parsed.path
+    if not path or path == '/':
+        path = '/v1/rerank'
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, '', '', '')).rstrip('/')
+
+
+def sanitized_reranker_endpoint_fields(endpoint: str) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(endpoint)
+    host = parsed.hostname or ''
+    host_kind = 'hostname'
+    if host in {'localhost', '127.0.0.1', '::1'}:
+        host_kind = 'loopback'
+    else:
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_private:
+                host_kind = 'private_lan'
+        except ValueError:
+            pass
+    endpoint_port_valid = True
+    try:
+        endpoint_has_port = parsed.port is not None
+    except ValueError:
+        endpoint_has_port = True
+        endpoint_port_valid = False
+    return {
+        'endpoint_scheme': parsed.scheme or None,
+        'endpoint_host_kind': host_kind,
+        'endpoint_has_port': endpoint_has_port,
+        'endpoint_port_valid': endpoint_port_valid,
+        'endpoint_path_kind': 'default_rerank' if parsed.path == '/v1/rerank' else 'custom',
+    }
+
+
+def reranker_endpoint_is_local_or_private(endpoint: str) -> bool:
+    parsed = urllib.parse.urlparse(endpoint)
+    host = parsed.hostname or ''
+    if host.lower() == 'localhost' or '.' not in host or host.lower().endswith('.local'):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private
+    except ValueError:
+        return False
+
+
+def reranker_remote_call_blocked(config: dict[str, Any], endpoint: str) -> bool:
+    policy = config.get('remote_calls')
+    if not isinstance(policy, dict):
+        return False
+    return (
+        not reranker_endpoint_is_local_or_private(endpoint)
+        and policy.get('fail_closed') is True
+        and policy.get('allow_rerank') is not True
+    )
+
+
+def reranker_smoke_documents() -> tuple[str, list[str]]:
+    return (
+        'Rust ownership borrow checker memory safety',
+        [
+            'A sourdough recipe with ripe bananas, cinnamon, and a warm oven.',
+            'Rust ownership, borrowing, lifetimes, and the borrow checker enforce memory safety.',
+        ],
+    )
+
+
+def reranker_response_items(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return []
+    raw_items = value.get('results')
+    if not isinstance(raw_items, list) or not raw_items:
+        raw_items = value.get('data')
+    if not isinstance(raw_items, list):
+        return []
+    return [item for item in raw_items if isinstance(item, dict)]
+
+
+def reranker_score(item: dict[str, Any]) -> float | None:
+    raw = item.get('relevance_score', item.get('score'))
+    if not isinstance(raw, (int, float)):
+        return None
+    score = float(raw)
+    return score if math.isfinite(score) else None
+
+
+def reranker_response_shape(value: Any, document_count: int) -> dict[str, Any]:
+    items = reranker_response_items(value)
+    valid_scores = 0
+    has_relevance_score = False
+    has_score = False
+    for item in items:
+        if 'relevance_score' in item:
+            has_relevance_score = True
+        if 'score' in item:
+            has_score = True
+        index = item.get('index')
+        score = reranker_score(item)
+        if isinstance(index, int) and 0 <= index < document_count and score is not None:
+            valid_scores += 1
+    return {
+        'ok': valid_scores > 0,
+        'result_count': len(items),
+        'valid_score_count': valid_scores,
+        'has_relevance_score': has_relevance_score or None,
+        'has_score': has_score or None,
+        'reason': None if valid_scores > 0 else 'missing_valid_scored_results',
+    }
+
+
+def reranker_reorder_evidence(value: Any) -> dict[str, Any]:
+    scores: dict[int, float] = {}
+    first_returned_index: int | None = None
+    for item in reranker_response_items(value):
+        index = item.get('index')
+        score = reranker_score(item)
+        if not isinstance(index, int) or score is None:
+            continue
+        if first_returned_index is None:
+            first_returned_index = index
+        scores[index] = score
+    score_delta = scores.get(1, float('-inf')) - scores.get(0, float('inf'))
+    later_document_score_higher = math.isfinite(score_delta) and score_delta > 0.01
+    return {
+        'ok': later_document_score_higher,
+        'first_returned_index': first_returned_index,
+        'later_document_score_higher': later_document_score_higher,
+        'score_delta_millis': int(score_delta * 1000) if math.isfinite(score_delta) else None,
+        'reason': None if later_document_score_higher else 'later_document_not_scored_higher',
+    }
+
+
+def note_reranker_skipped(reason: str, **fields: Any) -> None:
+    for probe in RERANKER_PROBES:
+        note(probe, True, skipped=reason, **fields)
+
+
+def call_reranker_endpoint(config: dict[str, Any], endpoint: str) -> tuple[Any | None, dict[str, Any]]:
+    query, documents = reranker_smoke_documents()
+    payload = {
+        'model': config['model'],
+        'query': query,
+        'documents': documents,
+        'top_n': len(documents),
+    }
+    timeout = min(max(int(config.get('timeout_secs') or DEFAULT_RERANKER_TIMEOUT_SECS), 1), MAX_RERANKER_SMOKE_TIMEOUT_SECS)
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode(),
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    start = time.monotonic()
+    endpoint_fields = sanitized_reranker_endpoint_fields(endpoint)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(64 * 1024 + 1)
+            latency_ms = int((time.monotonic() - start) * 1000)
+            if response.status != 200:
+                return None, {
+                    'ok': False,
+                    'reason': 'unexpected_http_status',
+                    'http_status': response.status,
+                    'latency_ms': latency_ms,
+                    **endpoint_fields,
+                }
+            if len(body) > 64 * 1024:
+                return None, {
+                    'ok': False,
+                    'reason': 'response_body_too_large',
+                    'latency_ms': latency_ms,
+                    **endpoint_fields,
+                }
+            parsed = json.loads(body.decode('utf-8'))
+            shape = reranker_response_shape(parsed, len(documents))
+            return parsed, {
+                'ok': bool(shape.get('ok')),
+                'http_status': response.status,
+                'latency_ms': latency_ms,
+                **without_ok(shape),
+                **endpoint_fields,
+            }
+    except urllib.error.HTTPError as exc:
+        return None, {
+            'ok': False,
+            'reason': 'http_error',
+            'http_status': exc.code,
+            'latency_ms': int((time.monotonic() - start) * 1000),
+            **endpoint_fields,
+        }
+    except Exception as exc:
+        return None, {
+            'ok': False,
+            'error_type': type(exc).__name__,
+            'latency_ms': int((time.monotonic() - start) * 1000),
+            **endpoint_fields,
+        }
+
+
+def probe_search_reranker_behavior(config_path: Path | None = None) -> None:
+    try:
+        config = load_reranker_config(config_path)
+    except Exception as exc:
+        for probe in RERANKER_PROBES:
+            note(probe, False, error_type=type(exc).__name__, stage='load_config')
+        return
+
+    if not config.get('enabled'):
+        note_reranker_skipped('reranker_disabled')
+        return
+
+    # The fallback warning path is covered by Rust unit tests; smoke records the
+    # conformance probe without forcing the live endpoint into failure mode.
+    note('reranker_fallback_warning', True, skipped='covered_by_rust_unit')
+
+    if not config.get('endpoint'):
+        note('reranker_endpoint_reachable', False, reason='missing_endpoint')
+        note('reranker_reorders_results', False, reason='missing_endpoint')
+        return
+    if not config.get('model'):
+        note('reranker_endpoint_reachable', False, reason='missing_model')
+        note('reranker_reorders_results', False, reason='missing_model')
+        return
+
+    try:
+        endpoint = normalize_reranker_endpoint(str(config['endpoint']))
+    except Exception as exc:
+        reason = str(exc) or 'invalid_endpoint'
+        note(
+            'reranker_endpoint_reachable',
+            False,
+            error_type=type(exc).__name__,
+            reason=reason,
+            stage='normalize_endpoint',
+        )
+        note(
+            'reranker_reorders_results',
+            False,
+            error_type=type(exc).__name__,
+            reason=reason,
+            stage='normalize_endpoint',
+        )
+        return
+    if reranker_remote_call_blocked(config, endpoint):
+        note_reranker_skipped(
+            'reranker_remote_blocked_by_policy',
+            remote_call_blocked=True,
+            network_call=False,
+            **sanitized_reranker_endpoint_fields(endpoint),
+        )
+        return
+
+    parsed, info = call_reranker_endpoint(config, endpoint)
+    note('reranker_endpoint_reachable', bool(info.get('ok')), **without_ok(info))
+    if not info.get('ok') or parsed is None:
+        note('reranker_reorders_results', False, reason='endpoint_probe_failed')
+        return
+
+    reorder = reranker_reorder_evidence(parsed)
+    note('reranker_reorders_results', bool(reorder.get('ok')), **without_ok(reorder))
 
 
 def receipt_dicts_from(value: Any) -> list[dict[str, Any]]:
@@ -1651,6 +2094,7 @@ def main() -> int:
     run_cli('patterns_json', ['mempal', 'patterns', 'list', '--json'], expect_json=True, timeout=60)
     run_cli('skills_json', ['mempal', 'skills', 'list', '--json'], expect_json=True, timeout=60)
     run_cli('repair_json', ['mempal', 'repair', 'list', '--json'], expect_json=True, timeout=60)
+    probe_search_reranker_behavior()
 
     cli_ids = cli_crud()
     mcp_ids = mcp_crud()
