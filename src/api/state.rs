@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,9 +10,12 @@ use crate::core::{
         AsyncDbResourceSnapshot, RESOURCE_BOUNDED_READERS, anyhow_error_is_read_deadline_exceeded,
     },
     config::ConfigHandle,
-    db::DbError,
+    db::{Database, DbError},
 };
 use crate::embed::EmbedderFactory;
+use crate::observability::{
+    OperationTelemetryRecord, OperationTelemetrySource, record_operation_telemetry,
+};
 use serde::Serialize;
 use tokio::sync::OnceCell;
 
@@ -107,6 +110,105 @@ impl ApiState {
         }
     }
 
+    pub(crate) async fn run_read_anyhow_bounded_with_telemetry<F, R>(
+        &self,
+        f: F,
+        deadline: Duration,
+        template: OperationTelemetryRecord,
+    ) -> anyhow::Result<Option<R>>
+    where
+        F: FnOnce(&crate::core::db::Database) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        if let Some(counter) = &self.bounded_read_counter {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        let async_db = self.async_db().await?;
+        let sqlite_deadline = Instant::now() + deadline;
+        let db_path = self.db_path.clone();
+        let started_at = Instant::now();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_task = Arc::clone(&completed);
+        let mut read = tokio::spawn(async move {
+            let result = async_db.run_read_anyhow_until(sqlite_deadline, f).await;
+            completed_for_task.store(true, Ordering::SeqCst);
+            result
+        });
+        match tokio::time::timeout(deadline + SQLITE_INTERRUPT_GRACE, &mut read).await {
+            Ok(Ok(Ok(result))) => {
+                record_bounded_read_telemetry(
+                    &db_path,
+                    template
+                        .with_duration_ms(duration_ms(started_at.elapsed()))
+                        .with_success(true)
+                        .with_timed_out(false)
+                        .with_detached_task_info(false, None),
+                );
+                Ok(Some(result))
+            }
+            Ok(Ok(Err(error))) if anyhow_error_is_read_deadline_exceeded(&error) => {
+                record_bounded_read_telemetry(
+                    &db_path,
+                    template
+                        .with_duration_ms(duration_ms(started_at.elapsed()))
+                        .with_error_class("read_timeout")
+                        .with_timed_out(true)
+                        .with_detached_task_info(false, None),
+                );
+                Ok(None)
+            }
+            Ok(Ok(Err(error))) => {
+                record_bounded_read_telemetry(
+                    &db_path,
+                    template
+                        .with_duration_ms(duration_ms(started_at.elapsed()))
+                        .with_error(error.to_string())
+                        .with_timed_out(false)
+                        .with_detached_task_info(false, None),
+                );
+                Err(error)
+            }
+            Ok(Err(join_error)) => {
+                let error = anyhow::anyhow!("blocking database task failed: {join_error}");
+                record_bounded_read_telemetry(
+                    &db_path,
+                    template
+                        .with_duration_ms(duration_ms(started_at.elapsed()))
+                        .with_error(error.to_string())
+                        .with_timed_out(false)
+                        .with_detached_task_info(false, None),
+                );
+                Err(error)
+            }
+            Err(_) => {
+                let detached_task_continued = !completed.load(Ordering::SeqCst);
+                let timeout_at = Instant::now();
+                let db_path_for_detached = db_path.clone();
+                tokio::spawn(async move {
+                    let result = read.await;
+                    let mut record = template
+                        .with_duration_ms(duration_ms(started_at.elapsed()))
+                        .with_timed_out(true)
+                        .with_detached_task_info(
+                            detached_task_continued,
+                            detached_task_continued.then(|| duration_ms(timeout_at.elapsed())),
+                        );
+                    record = match result {
+                        Ok(Ok(_)) => record.with_error_class("read_timeout"),
+                        Ok(Err(error)) if anyhow_error_is_read_deadline_exceeded(&error) => {
+                            record.with_error_class("read_timeout")
+                        }
+                        Ok(Err(error)) => record.with_error(error.to_string()),
+                        Err(join_error) => record
+                            .with_error(format!("blocking database task failed: {join_error}")),
+                    };
+                    record_bounded_read_telemetry(&db_path_for_detached, record);
+                });
+                Ok(None)
+            }
+        }
+    }
+
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_async_db_for_test(mut self, async_db: AsyncDb) -> Self {
         let cell = Arc::new(OnceCell::new());
@@ -132,6 +234,21 @@ impl ApiState {
 
     pub async fn drain_write_queue(&self) -> bool {
         self.write_queue.drain().await
+    }
+}
+
+fn record_bounded_read_telemetry(db_path: &std::path::Path, record: OperationTelemetryRecord) {
+    match Database::open_with_busy_timeout(db_path, Duration::from_millis(10)) {
+        Ok(db) => {
+            let _ = record_operation_telemetry(&db, record);
+        }
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                source = OperationTelemetrySource::Rest.as_str(),
+                "failed to open database for bounded read operation telemetry"
+            );
+        }
     }
 }
 
