@@ -15,7 +15,7 @@ use crate::context::assemble_context_with_vector;
 use crate::core::{
     AsyncDb,
     anchor::{self, DerivedAnchor},
-    async_db::RESOURCE_BOUNDED_READERS,
+    async_db::{RESOURCE_BOUNDED_READERS, anyhow_error_is_read_deadline_exceeded},
     config::{Config, ConfigHandle},
     db::{
         CURRENT_VECTOR_INDEX_VERSION, Database, NoveltyAuditInsert, VECTOR_DISTANCE_METRIC,
@@ -191,6 +191,7 @@ pub(super) const MCP_SEARCH_DB_DEADLINE: Duration = Duration::from_secs(60);
 const MCP_SEARCH_STALE_INDEX_DEADLINE: Duration = Duration::from_secs(2);
 const MCP_INGEST_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 const MCP_OPERATION_STATUS_DEADLINE: Duration = Duration::from_secs(5);
+const MCP_SQLITE_INTERRUPT_GRACE: Duration = Duration::from_millis(100);
 const MCP_INGEST_QUEUE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(5);
 const MCP_INGEST_SELF_HOLDER_QUEUE_LOCK_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 const MCP_DAEMON_INGEST_ENQUEUE_IPC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1966,37 +1967,76 @@ impl MempalMcpServer {
         F: FnOnce(&Database) -> std::result::Result<R, ErrorData> + Send + 'static,
         R: Send + 'static,
     {
-        #[cfg(any(test, feature = "db-test-seam"))]
-        if let Some(error) = self.async_db_open_error.as_deref() {
-            return Err(ErrorData::internal_error(
-                format!("{stage} failed to open database: {error}"),
-                None,
-            ));
-        }
-        #[cfg(any(test, feature = "db-test-seam"))]
-        let query_only_read_delay = self.query_only_read_delay;
-        let db_path = self.db_path.clone();
-        let read = tokio::task::spawn_blocking(move || {
-            #[cfg(any(test, feature = "db-test-seam"))]
-            if let Some(delay) = query_only_read_delay {
-                std::thread::sleep(delay);
-            }
-            let db = Database::open_query_only(&db_path).map_err(|error| {
-                ErrorData::internal_error(format!("{stage} failed to open database: {error}"), None)
-            })?;
-            f(&db)
-        });
-        match tokio::time::timeout(deadline, read).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(join_error)) => Err(ErrorData::internal_error(
-                format!("{stage} database task failed: {join_error}"),
-                None,
-            )),
-            Err(_) => Err(mcp_stage_timeout_error(
+        let read = self
+            .run_query_only_read_anyhow_bounded(
+                stage,
+                deadline,
+                self.query_only_read_delay_for_current_build(),
+                move |db| Ok(f(db)),
+            )
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+
+        match read {
+            Some(Ok(result)) => Ok(result),
+            Some(Err(error)) => Err(error),
+            None => Err(mcp_stage_timeout_error(
                 stage,
                 "query-only database read",
                 deadline,
             )),
+        }
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    fn query_only_read_delay_for_current_build(&self) -> Option<Duration> {
+        self.query_only_read_delay
+    }
+
+    #[cfg(not(any(test, feature = "db-test-seam")))]
+    fn query_only_read_delay_for_current_build(&self) -> Option<Duration> {
+        None
+    }
+
+    async fn run_query_only_read_anyhow_bounded<F, R>(
+        &self,
+        stage: &'static str,
+        deadline: Duration,
+        delay: Option<Duration>,
+        f: F,
+    ) -> anyhow::Result<Option<R>>
+    where
+        F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if let Some(error) = self.async_db_open_error.as_deref() {
+            return Err(anyhow::anyhow!("{stage} failed to open database: {error}"));
+        }
+
+        let async_db = self
+            .async_db()
+            .await
+            .map_err(|error| anyhow::anyhow!("{stage} failed to open database: {error}"))?;
+        let sqlite_deadline = Instant::now() + deadline;
+        let read = async_db.run_read_anyhow_until(sqlite_deadline, move |db| {
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
+            f(db)
+        });
+
+        match tokio::time::timeout(deadline + MCP_SQLITE_INTERRUPT_GRACE, read).await {
+            Ok(Ok(_)) if Instant::now() >= sqlite_deadline => Ok(None),
+            Ok(Ok(result)) => Ok(Some(result)),
+            Ok(Err(error))
+                if anyhow_error_is_read_deadline_exceeded(&error)
+                    || Instant::now() >= sqlite_deadline =>
+            {
+                Ok(None)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(None),
         }
     }
 
@@ -2680,8 +2720,16 @@ impl MempalMcpServer {
         R: Send + 'static,
     {
         let async_db = self.async_db().await?;
-        match tokio::time::timeout(deadline, async_db.run_read_anyhow(f)).await {
-            Ok(result) => result.map(Some),
+        let sqlite_deadline = Instant::now() + deadline;
+        match tokio::time::timeout(
+            deadline + MCP_SQLITE_INTERRUPT_GRACE,
+            async_db.run_read_anyhow_until(sqlite_deadline, f),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(Some(result)),
+            Ok(Err(error)) if anyhow_error_is_read_deadline_exceeded(&error) => Ok(None),
+            Ok(Err(error)) => Err(error),
             Err(_) => Ok(None),
         }
     }
@@ -2738,15 +2786,14 @@ impl MempalMcpServer {
                 error.as_ref(),
             ));
         }
-        let db_path = self.db_path.clone();
-        let read = tokio::task::spawn_blocking(move || {
-            let db = Database::open_query_only(&db_path)
-                .map_err(|error| anyhow::anyhow!("failed to open database read-only: {error}"))?;
-            Ok::<Vec<SystemWarning>, anyhow::Error>(system_warnings_with_stale_index(&db))
-        });
-        match tokio::time::timeout(deadline, read).await {
-            Ok(Ok(Ok(warnings))) => Ok(warnings),
-            Err(_) => {
+        match self
+            .run_query_only_read_anyhow_bounded("stale vector index check", deadline, None, |db| {
+                Ok(system_warnings_with_stale_index(db))
+            })
+            .await
+        {
+            Ok(Some(warnings)) => Ok(warnings),
+            Ok(None) => {
                 let mut warnings = current_system_warnings();
                 warnings.push(SystemWarning {
                     level: "warn".to_string(),
@@ -2755,22 +2802,12 @@ impl MempalMcpServer {
                 });
                 Ok(warnings)
             }
-            Ok(Ok(Err(error))) => Ok(database_warning_snapshot(
+            Err(error) => Ok(database_warning_snapshot(
                 current_system_warnings(),
                 &self.db_path,
                 "stale vector index check",
                 error.as_ref(),
             )),
-            Ok(Err(error)) => {
-                let error =
-                    anyhow::anyhow!("stale vector index check database task failed: {error}");
-                Ok(database_warning_snapshot(
-                    current_system_warnings(),
-                    &self.db_path,
-                    "stale vector index check",
-                    error.as_ref(),
-                ))
-            }
         }
     }
 
@@ -2788,21 +2825,21 @@ impl MempalMcpServer {
                 error.as_ref(),
             ));
         }
-        let db_path = self.db_path.clone();
         #[cfg(any(test, feature = "db-test-seam"))]
         let ingest_warning_snapshot_delay = self.ingest_warning_snapshot_delay;
-        let read = tokio::task::spawn_blocking(move || {
-            #[cfg(any(test, feature = "db-test-seam"))]
-            if let Some(delay) = ingest_warning_snapshot_delay {
-                std::thread::sleep(delay);
-            }
-            let db = Database::open_query_only(&db_path)
-                .map_err(|error| anyhow::anyhow!("failed to open database read-only: {error}"))?;
-            Ok::<Vec<SystemWarning>, anyhow::Error>(system_warnings_with_stale_index(&db))
-        });
-        match tokio::time::timeout(deadline, read).await {
-            Ok(Ok(Ok(warnings))) => Ok(warnings),
-            Err(_) => {
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let ingest_warning_snapshot_delay = None;
+        match self
+            .run_query_only_read_anyhow_bounded(
+                "stale vector index check",
+                deadline,
+                ingest_warning_snapshot_delay,
+                |db| Ok(system_warnings_with_stale_index(db)),
+            )
+            .await
+        {
+            Ok(Some(warnings)) => Ok(warnings),
+            Ok(None) => {
                 let mut warnings = current_system_warnings();
                 warnings.push(SystemWarning {
                     level: "warn".to_string(),
@@ -2811,22 +2848,12 @@ impl MempalMcpServer {
                 });
                 Ok(warnings)
             }
-            Ok(Ok(Err(error))) => Ok(database_warning_snapshot(
+            Err(error) => Ok(database_warning_snapshot(
                 current_system_warnings(),
                 &self.db_path,
                 "stale vector index check",
                 error.as_ref(),
             )),
-            Ok(Err(error)) => {
-                let error =
-                    anyhow::anyhow!("stale vector index check database task failed: {error}");
-                Ok(database_warning_snapshot(
-                    current_system_warnings(),
-                    &self.db_path,
-                    "stale vector index check",
-                    error.as_ref(),
-                ))
-            }
         }
     }
 
@@ -12943,7 +12970,7 @@ api_key = "sk-secret-should-not-print"
     }
 
     #[tokio::test]
-    async fn test_mcp_ingest_warning_snapshot_does_not_initialize_persistent_async_db_pool() {
+    async fn test_mcp_ingest_warning_snapshot_initializes_persistent_async_db_pool() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open database");
@@ -12962,8 +12989,8 @@ api_key = "sk-secret-should-not-print"
             .expect("warning snapshot");
 
         assert!(
-            server.async_db.get().is_none(),
-            "ingest admission warning snapshots must not keep a persistent MCP AsyncDb pool open"
+            server.async_db.get().is_some(),
+            "ingest admission warning snapshots use the persistent MCP AsyncDb pool for deadline-bounded reads"
         );
     }
 

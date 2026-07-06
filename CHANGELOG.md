@@ -33,6 +33,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **API/Core**: Bounded REST/MCP DB reads now cancel the underlying SQLite operation via `progress_handler` when the deadline fires, preventing detached `spawn_blocking` tasks from continuing to scan `palace.db` after the async timeout (#661)
 - **API**: Default `GET /api/status` now returns a cheap bounded snapshot. Expensive DB-wide status fields moved behind `?diagnostic=true` (#662)
 
 - `mempal doctor`, `mempal daemon status`, and the full smoke runner now expose
