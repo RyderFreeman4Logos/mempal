@@ -23,10 +23,15 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from ._backoff import SharedPluginBackoff
+
 logger = logging.getLogger(__name__)
 
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
+_DEGRADED_RESPONSE_SECS = 8.0
+_PREFETCH_TOP_K = 5
+_TURN_STORAGE_MODE_TTL = 60.0
 _WRITE_QUEUE_MAX = 1000
 _WRITE_DRAIN_TIMEOUT = 10.0
 _WRITE_RETRY_MAX = 3
@@ -427,6 +432,10 @@ class MempalMemoryProvider:
         self._prefetch_thread: Optional[threading.Thread] = None
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
+        self._backoff = SharedPluginBackoff(
+            threshold=_BREAKER_THRESHOLD,
+            cooldown_secs=_BREAKER_COOLDOWN_SECS,
+        )
         self._write_queue: queue.Queue = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
         self._write_worker: Optional[threading.Thread] = None
         self._write_stop = threading.Event()
@@ -437,6 +446,7 @@ class MempalMemoryProvider:
         self._pinned_facts_lock = threading.Lock()
         self._is_healthy = True
         self._last_health_at: float = 0.0
+        self._last_response_headers: Dict[str, str] = {}
         self._intelligence_mode = "deterministic"
         self._llm = _LLMClient({})
         self._enhancer: Optional[_IntelligenceEnhancer] = None
@@ -445,6 +455,8 @@ class MempalMemoryProvider:
         self._safe_context_budget_chars = _DEFAULT_SAFE_CONTEXT_BUDGET_CHARS
         self._safe_include_raw_turns = False
         self._safe_memory_kinds = set(_SAFE_MEMORY_KINDS)
+        self._turn_storage_mode_cache = ""
+        self._turn_storage_mode_fetched_at = 0.0
 
     def _configure_intelligence(self, cfg: dict) -> None:
         mi = cfg.get("memory_intelligence") or {}
@@ -532,6 +544,9 @@ class MempalMemoryProvider:
 
     def _process_write(self, item: Dict[str, Any]) -> None:
         op = item.get("op")
+        if op == "ingest" and self._is_breaker_open():
+            logger.debug("mempal ingest suppressed while breaker is open")
+            return
         if op == "ingest" and self._should_enhance() and self._enhancer:
             body = item["body"]
             content = body.get("content", "")
@@ -716,32 +731,111 @@ class MempalMemoryProvider:
         return "memory-mirror"
 
     def _turn_storage_mode(self):
+        now = time.monotonic()
+        if (
+            self._turn_storage_mode_cache
+            and now - self._turn_storage_mode_fetched_at < _TURN_STORAGE_MODE_TTL
+        ):
+            return self._turn_storage_mode_cache
         try:
             status = self._get("/api/status")
             mode = status.get("turn_storage", {}).get("storage_mode", "").strip()
             if mode:
+                self._turn_storage_mode_cache = mode
+                self._turn_storage_mode_fetched_at = now
                 return mode
         except Exception as exc:
             logger.debug("mempal status lookup for turn storage failed: %s", exc)
         cfg = _load_config(self._hermes_home)
-        return str(cfg.get("turn_storage_mode", "raw_evidence")).strip() or "raw_evidence"
+        mode = str(cfg.get("turn_storage_mode", "raw_evidence")).strip() or "raw_evidence"
+        self._turn_storage_mode_cache = mode
+        self._turn_storage_mode_fetched_at = now
+        return mode
 
     def _is_breaker_open(self):
-        if self._consecutive_failures < _BREAKER_THRESHOLD:
-            return False
-        if time.monotonic() >= self._breaker_open_until:
+        if self._consecutive_failures >= _BREAKER_THRESHOLD:
+            if time.monotonic() < self._breaker_open_until:
+                return True
             self._consecutive_failures = 0
-            return False
-        return True
+            self._breaker_open_until = 0.0
+        return self._backoff.is_open()
 
     def _record_success(self):
         self._consecutive_failures = 0
+        self._breaker_open_until = 0.0
+        self._backoff.record_success()
 
     def _record_failure(self):
-        self._consecutive_failures += 1
+        state = self._backoff.record_failure()
+        self._consecutive_failures = state.failure_count
+        if state.open_until_epoch:
+            remaining = max(0.0, state.open_until_epoch - time.time())
+            self._breaker_open_until = time.monotonic() + remaining
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
             self._breaker_open_until = time.monotonic() + _BREAKER_COOLDOWN_SECS
             logger.warning("mempal circuit breaker tripped after %d failures. Pausing %ds.", self._consecutive_failures, _BREAKER_COOLDOWN_SECS)
+
+    @staticmethod
+    def _search_results_payload(response):
+        if isinstance(response, list):
+            return response
+        if isinstance(response, dict):
+            results = response.get("results")
+            if isinstance(results, list):
+                return results
+        return []
+
+    @staticmethod
+    def _search_degraded_reason(response, elapsed_secs):
+        if elapsed_secs > _DEGRADED_RESPONSE_SECS:
+            return f"slow_response>{_DEGRADED_RESPONSE_SECS}s"
+        if isinstance(response, list):
+            for item in response:
+                if not isinstance(item, dict):
+                    continue
+                warnings = item.get("warnings")
+                if isinstance(warnings, list) and warnings:
+                    return str(warnings[0] or "warnings")
+            return ""
+        if not isinstance(response, dict):
+            return ""
+        if response.get("deadline_hit"):
+            return "deadline_hit"
+        warning = response.get("warning")
+        if warning:
+            return str(warning)
+        warnings = response.get("system_warnings")
+        if warnings:
+            return "system_warnings"
+        return ""
+
+    @staticmethod
+    def _search_header_degraded_reason(headers):
+        if not headers:
+            return ""
+        normalized = {
+            str(key).lower(): str(value)
+            for key, value in dict(headers).items()
+            if value is not None
+        }
+        degraded = normalized.get("degraded", "").strip().lower()
+        if degraded in {"1", "true", "yes"}:
+            return "degraded"
+        warning = normalized.get("mempal-warnings", "").strip()
+        if warning:
+            return warning
+        return ""
+
+    def _get_search(self, params):
+        started = time.monotonic()
+        self._last_response_headers = {}
+        response = self._get("/api/search", params)
+        elapsed = time.monotonic() - started
+        reason = (
+            self._search_degraded_reason(response, elapsed)
+            or self._search_header_degraded_reason(self._last_response_headers)
+        )
+        return self._search_results_payload(response), reason
 
     def _get(self, path, params=None):
         import urllib.request
@@ -749,6 +843,7 @@ class MempalMemoryProvider:
         if params:
             url += "?" + _encode_query_params(params)
         with urllib.request.urlopen(url, timeout=10) as resp:
+            self._last_response_headers = dict(resp.headers.items())
             return json.loads(resp.read().decode())
 
     def _post(self, path, body):
@@ -834,10 +929,16 @@ class MempalMemoryProvider:
         key = self._session_key(session_id)
         wing = self._wing
         generation = self._prefetch_generation
-        params = self._retrieval_params({"q": query, "wing": wing, "top_k": 8})
+        params = self._retrieval_params({
+            "q": query,
+            "wing": wing,
+            "top_k": _PREFETCH_TOP_K,
+        })
+        # REST currently supports cheaper prefetch only through top_k reduction.
+        # Rerank bypass needs REST-side query support before the plugin can send it.
         def _run():
             try:
-                results = self._get("/api/search", params)
+                results, degraded_reason = self._get_search(params)
                 if results:
                     lines = []
                     used = 0
@@ -862,7 +963,11 @@ class MempalMemoryProvider:
                             self._prefetch_results[key] = result
                             if key == self._session_id:
                                 self._prefetch_result = result
-                self._record_success()
+                if degraded_reason:
+                    self._record_failure()
+                    logger.debug("mempal prefetch degraded: %s", degraded_reason)
+                else:
+                    self._record_success()
             except Exception as exc:
                 self._record_failure()
                 logger.debug("mempal prefetch failed: %s", exc)
@@ -932,8 +1037,12 @@ class MempalMemoryProvider:
             except (ValueError, TypeError):
                 top_k = 10
             try:
-                results = self._get("/api/search", self._retrieval_params({"q": q, "wing": self._wing, "top_k": top_k}))
-                self._record_success()
+                results, degraded_reason = self._get_search(self._retrieval_params({"q": q, "wing": self._wing, "top_k": top_k}))
+                if degraded_reason:
+                    self._record_failure()
+                    logger.debug("mempal search degraded: %s", degraded_reason)
+                else:
+                    self._record_success()
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
                 items = [_strip_none({"memory": r.get("content", ""), "score": r.get("similarity", 0), "drawer_id": r.get("drawer_id"), "source": r.get("source"), "source_type": r.get("source_type"), "provenance": r.get("provenance"), "status": r.get("status"), "memory_kind": r.get("memory_kind"), "domain": r.get("domain"), "field": r.get("field"), "importance": r.get("importance"), "is_pinned": r.get("is_pinned"), "confidence": r.get("confidence"), "authority": self._memory_authority_label(r)}) for r in self._safe_filter_items(results)]

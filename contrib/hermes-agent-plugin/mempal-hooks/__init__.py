@@ -21,6 +21,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ _OBSERVE_MIN_RESULT_LEN = 50
 _OBSERVE_MAX_CONTENT_LEN = 2000
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
+_DEGRADED_RESPONSE_SECS = 8.0
 _OBSERVE_TOOL_ALLOWLIST = {
     "bash", "shell", "run_command", "execute",
     "web_search", "search", "browse",
@@ -49,6 +51,114 @@ _OBSERVE_TOOL_DENYLIST = {
     "mempal_pinned_facts", "mempal_fact_check", "mempal_peek_partner",
     "mempal_cowork_push", "mempal_phase3", "mempal_search",
 }
+
+
+class BackoffState:
+    def __init__(self, failure_count: int = 0, open_until_epoch: float = 0.0) -> None:
+        self.failure_count = failure_count
+        self.open_until_epoch = open_until_epoch
+
+    @property
+    def is_open(self) -> bool:
+        return self.failure_count > 0 and time.time() < self.open_until_epoch
+
+
+class SharedPluginBackoff:
+    """Small file-backed breaker shared by mempal plugins via a common path."""
+
+    def __init__(
+        self,
+        *,
+        path: Optional[str] = None,
+        threshold: int = 5,
+        cooldown_secs: float = 120.0,
+    ) -> None:
+        self._path = path or self._default_path()
+        self._threshold = threshold
+        self._cooldown_secs = cooldown_secs
+        self._write_lock = threading.Lock()
+
+    @staticmethod
+    def _default_path() -> str:
+        configured = os.environ.get("MEMPAL_PLUGIN_BACKOFF_PATH", "").strip()
+        if configured:
+            return configured
+        return os.path.join(os.path.expanduser("~"), ".mempal", ".plugin_backoff")
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def is_open(self) -> bool:
+        state = self._read_state()
+        if state.failure_count < self._threshold:
+            return False
+        if time.time() >= state.open_until_epoch:
+            self.record_success()
+            return False
+        return True
+
+    def record_success(self) -> BackoffState:
+        state = BackoffState()
+        self._write_state(state)
+        return state
+
+    def record_failure(self) -> BackoffState:
+        state = self._read_state()
+        failure_count = state.failure_count + 1
+        open_until_epoch = state.open_until_epoch
+        if failure_count >= self._threshold:
+            open_until_epoch = time.time() + self._cooldown_secs
+        next_state = BackoffState(
+            failure_count=failure_count,
+            open_until_epoch=open_until_epoch,
+        )
+        self._write_state(next_state)
+        return next_state
+
+    def _read_state(self) -> BackoffState:
+        try:
+            with open(self._path, encoding="utf-8") as handle:
+                raw = json.loads(handle.read() or "{}")
+        except (OSError, json.JSONDecodeError, ValueError):
+            return BackoffState()
+        if not isinstance(raw, dict):
+            return BackoffState()
+        return BackoffState(
+            failure_count=self._positive_int(raw.get("failure_count")),
+            open_until_epoch=self._positive_float(raw.get("open_until_epoch")),
+        )
+
+    def _write_state(self, state: BackoffState) -> None:
+        with self._write_lock:
+            directory = os.path.dirname(self._path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp_path = f"{self._path}.tmp.{uuid.uuid4().hex}"
+            payload: Dict[str, Any] = {
+                "failure_count": state.failure_count,
+                "open_until_epoch": state.open_until_epoch,
+                "updated_at_epoch": time.time(),
+            }
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+            os.replace(tmp_path, self._path)
+
+    @staticmethod
+    def _positive_int(value: Any) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, parsed)
+
+    @staticmethod
+    def _positive_float(value: Any) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, parsed)
 
 
 def _load_config(hermes_home: str = "") -> dict:
@@ -89,6 +199,11 @@ class _MempalHooks:
         self._hermes_home = ""
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
+        self._backoff = SharedPluginBackoff(
+            threshold=_BREAKER_THRESHOLD,
+            cooldown_secs=_BREAKER_COOLDOWN_SECS,
+        )
+        self._last_response_headers: Dict[str, str] = {}
         self._initialized = False
         self._init_lock = threading.Lock()
 
@@ -108,18 +223,24 @@ class _MempalHooks:
             self._initialized = True
 
     def _is_breaker_open(self) -> bool:
-        if self._consecutive_failures < _BREAKER_THRESHOLD:
-            return False
-        if time.monotonic() >= self._breaker_open_until:
+        if self._consecutive_failures >= _BREAKER_THRESHOLD:
+            if time.monotonic() < self._breaker_open_until:
+                return True
             self._consecutive_failures = 0
-            return False
-        return True
+            self._breaker_open_until = 0.0
+        return self._backoff.is_open()
 
     def _record_success(self) -> None:
         self._consecutive_failures = 0
+        self._breaker_open_until = 0.0
+        self._backoff.record_success()
 
     def _record_failure(self) -> None:
-        self._consecutive_failures += 1
+        state = self._backoff.record_failure()
+        self._consecutive_failures = state.failure_count
+        if state.open_until_epoch:
+            remaining = max(0.0, state.open_until_epoch - time.time())
+            self._breaker_open_until = time.monotonic() + remaining
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
             self._breaker_open_until = time.monotonic() + _BREAKER_COOLDOWN_SECS
             logger.warning(
@@ -134,6 +255,7 @@ class _MempalHooks:
         if params:
             url += "?" + _encode_query_params(params)
         with urllib.request.urlopen(url, timeout=10) as resp:
+            self._last_response_headers = dict(resp.headers.items())
             return json.loads(resp.read().decode())
 
     def _post(self, path: str, body: Dict[str, Any]) -> Any:
@@ -147,6 +269,68 @@ class _MempalHooks:
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode())
+
+    @staticmethod
+    def _search_results_payload(response: Any) -> List[Dict[str, Any]]:
+        if isinstance(response, list):
+            return response
+        if isinstance(response, dict):
+            results = response.get("results")
+            if isinstance(results, list):
+                return results
+        return []
+
+    @staticmethod
+    def _search_degraded_reason(response: Any, elapsed_secs: float) -> str:
+        if elapsed_secs > _DEGRADED_RESPONSE_SECS:
+            return f"slow_response>{_DEGRADED_RESPONSE_SECS}s"
+        if isinstance(response, list):
+            for item in response:
+                if not isinstance(item, dict):
+                    continue
+                warnings = item.get("warnings")
+                if isinstance(warnings, list) and warnings:
+                    return str(warnings[0] or "warnings")
+            return ""
+        if not isinstance(response, dict):
+            return ""
+        if response.get("deadline_hit"):
+            return "deadline_hit"
+        warning = response.get("warning")
+        if warning:
+            return str(warning)
+        warnings = response.get("system_warnings")
+        if warnings:
+            return "system_warnings"
+        return ""
+
+    @staticmethod
+    def _search_header_degraded_reason(headers: Any) -> str:
+        if not headers:
+            return ""
+        normalized = {
+            str(key).lower(): str(value)
+            for key, value in dict(headers).items()
+            if value is not None
+        }
+        degraded = normalized.get("degraded", "").strip().lower()
+        if degraded in {"1", "true", "yes"}:
+            return "degraded"
+        warning = normalized.get("mempal-warnings", "").strip()
+        if warning:
+            return warning
+        return ""
+
+    def _get_search(self, params: Dict[str, Any]) -> tuple[List[Dict[str, Any]], str]:
+        started = time.monotonic()
+        self._last_response_headers = {}
+        response = self._get("/api/search", params)
+        elapsed = time.monotonic() - started
+        return (
+            self._search_results_payload(response),
+            self._search_degraded_reason(response, elapsed)
+            or self._search_header_degraded_reason(self._last_response_headers),
+        )
 
     # ── pre_llm_call: inject deep context ────────────────────────
 
@@ -164,8 +348,7 @@ class _MempalHooks:
             return None
 
         try:
-            results = self._get(
-                "/api/search",
+            results, degraded_reason = self._get_search(
                 {
                     "q": user_message,
                     "wing": self._wing,
@@ -173,7 +356,11 @@ class _MempalHooks:
                     "include_raw_turns": False,
                 },
             )
-            self._record_success()
+            if degraded_reason:
+                self._record_failure()
+                logger.debug("mempal-hooks pre_llm_call search degraded: %s", degraded_reason)
+            else:
+                self._record_success()
         except Exception as exc:
             self._record_failure()
             logger.debug("mempal-hooks pre_llm_call search failed: %s", exc)
@@ -214,6 +401,7 @@ class _MempalHooks:
     ) -> None:
         self._ensure_init(**kwargs)
         if self._is_breaker_open():
+            logger.debug("mempal-hooks observation ingest suppressed while breaker is open")
             return
 
         if tool_name in _OBSERVE_TOOL_DENYLIST:
