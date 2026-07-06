@@ -13,7 +13,7 @@ use crate::brief::{
 };
 use crate::context::assemble_context_with_vector;
 use crate::core::{
-    AsyncDb,
+    AsyncDb, QueryOnlyAsyncDb,
     anchor::{self, DerivedAnchor},
     async_db::{RESOURCE_BOUNDED_READERS, anyhow_error_is_read_deadline_exceeded},
     config::{Config, ConfigHandle},
@@ -256,6 +256,7 @@ pub struct MempalMcpServer {
     db_path: PathBuf,
     initial_config: Arc<Config>,
     async_db: Arc<OnceCell<AsyncDb>>,
+    query_only_async_db: Arc<OnceCell<QueryOnlyAsyncDb>>,
     async_queue: AsyncPendingMessageStore,
     gating_runtime: Arc<GatingRuntime>,
     embedder_factory: Arc<dyn EmbedderFactory>,
@@ -285,6 +286,8 @@ pub struct MempalMcpServer {
     query_only_read_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
     async_db_open_error: Option<String>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    query_only_async_db_open_error: Option<String>,
     #[cfg(any(test, feature = "db-test-seam"))]
     daemon_writer_lease_check_error: Option<String>,
     #[cfg(any(test, feature = "db-test-seam"))]
@@ -534,6 +537,7 @@ impl MempalMcpServer {
             db_path,
             initial_config,
             async_db: Arc::new(OnceCell::new()),
+            query_only_async_db: Arc::new(OnceCell::new()),
             async_queue,
             gating_runtime: Arc::new(GatingRuntime::new(config, Arc::clone(&embedder_factory))),
             embedder_factory,
@@ -559,6 +563,8 @@ impl MempalMcpServer {
             query_only_read_delay: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             async_db_open_error: None,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            query_only_async_db_open_error: None,
             #[cfg(any(test, feature = "db-test-seam"))]
             daemon_writer_lease_check_error: None,
             #[cfg(any(test, feature = "db-test-seam"))]
@@ -599,6 +605,14 @@ impl MempalMcpServer {
     }
 
     #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_query_only_async_db_for_test(mut self, async_db: QueryOnlyAsyncDb) -> Self {
+        let cell = Arc::new(OnceCell::new());
+        debug_assert!(cell.set(async_db).is_ok());
+        self.query_only_async_db = cell;
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_async_queue_for_test(mut self, async_queue: AsyncPendingMessageStore) -> Self {
         self.async_queue = async_queue;
         self
@@ -631,6 +645,15 @@ impl MempalMcpServer {
     #[cfg(any(test, feature = "db-test-seam"))]
     pub fn with_async_db_open_error_for_test(mut self, error: impl Into<String>) -> Self {
         self.async_db_open_error = Some(error.into());
+        self
+    }
+
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_query_only_async_db_open_error_for_test(
+        mut self,
+        error: impl Into<String>,
+    ) -> Self {
+        self.query_only_async_db_open_error = Some(error.into());
         self
     }
 
@@ -2009,13 +2032,8 @@ impl MempalMcpServer {
         F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
-        #[cfg(any(test, feature = "db-test-seam"))]
-        if let Some(error) = self.async_db_open_error.as_deref() {
-            return Err(anyhow::anyhow!("{stage} failed to open database: {error}"));
-        }
-
         let async_db = self
-            .async_db()
+            .query_only_async_db()
             .await
             .map_err(|error| anyhow::anyhow!("{stage} failed to open database: {error}"))?;
         let sqlite_deadline = Instant::now() + deadline;
@@ -2071,6 +2089,30 @@ impl MempalMcpServer {
                 false
             }
         }
+    }
+
+    async fn query_only_async_db(&self) -> anyhow::Result<QueryOnlyAsyncDb> {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        if let Some(error) = self.query_only_async_db_open_error.as_deref() {
+            anyhow::bail!("{error}");
+        }
+        let db_path = self.db_path.clone();
+        let async_db = self
+            .query_only_async_db
+            .get_or_try_init(|| async move {
+                let display_path = db_path.display().to_string();
+                tokio::task::spawn_blocking(move || {
+                    QueryOnlyAsyncDb::open(&db_path, RESOURCE_BOUNDED_READERS).with_context(|| {
+                        format!(
+                            "failed to open MCP query-only async database pool for {display_path}"
+                        )
+                    })
+                })
+                .await
+                .context("blocking MCP query-only async database pool open failed")?
+            })
+            .await?;
+        Ok(async_db.clone())
     }
 
     async fn async_db(&self) -> anyhow::Result<AsyncDb> {
@@ -12401,6 +12443,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_query_only_read_bypasses_writer_capable_async_db_open_failure() {
+        let (_tempdir, _db_path, server) = setup_server();
+        let server = server.with_async_db_open_error_for_test(
+            "failed to open MCP async database pool: database is locked",
+        );
+
+        let query_only = server
+            .run_query_only_read_bounded("test_query_only_read", Duration::from_secs(1), |db| {
+                db.conn()
+                    .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                    .map_err(db_error)
+            })
+            .await
+            .expect("query-only read should not open writer-capable async db");
+
+        assert_eq!(query_only, 1);
+    }
+
+    #[tokio::test]
     async fn test_daemon_writer_lease_check_failure_does_not_prove_daemon_ownership() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let missing_db_path = tempdir.path().join("missing-parent/palace.db");
@@ -12970,7 +13031,7 @@ api_key = "sk-secret-should-not-print"
     }
 
     #[tokio::test]
-    async fn test_mcp_ingest_warning_snapshot_initializes_persistent_async_db_pool() {
+    async fn test_mcp_ingest_warning_snapshot_uses_query_only_async_db_pool() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("palace.db");
         Database::open(&db_path).expect("open database");
@@ -12989,8 +13050,12 @@ api_key = "sk-secret-should-not-print"
             .expect("warning snapshot");
 
         assert!(
-            server.async_db.get().is_some(),
-            "ingest admission warning snapshots use the persistent MCP AsyncDb pool for deadline-bounded reads"
+            server.query_only_async_db.get().is_some(),
+            "ingest admission warning snapshots should use the persistent query-only async DB pool for deadline-bounded reads"
+        );
+        assert!(
+            server.async_db.get().is_none(),
+            "ingest admission warning snapshots must not open the writer-capable MCP AsyncDb pool"
         );
     }
 
@@ -14183,6 +14248,55 @@ quality_policy = "llm_required_for_keep"
             },
             &[0.1, 0.2, 0.3],
         );
+    }
+
+    fn insert_statement_knowledge_drawer(
+        db_path: &Path,
+        id: &str,
+        raw_content: &str,
+        statement: &str,
+        source_file: &str,
+    ) {
+        let source_type = SourceType::AgentInference;
+        let drawer = Drawer {
+            id: id.to_string(),
+            content: raw_content.to_string(),
+            wing: "mempal".to_string(),
+            room: Some("context".to_string()),
+            source_file: Some(source_file.to_string()),
+            source_type,
+            confidence: crate::core::types::default_confidence(source_type),
+            added_at: "1713000000".to_string(),
+            chunk_index: Some(0),
+            importance: 4,
+            normalize_version: 1,
+            effective_importance: 4.0,
+            memory_kind: MemoryKind::Knowledge,
+            domain: MemoryDomain::Project,
+            field: anchor::DEFAULT_FIELD.to_string(),
+            anchor_kind: AnchorKind::Repo,
+            anchor_id: anchor::LEGACY_REPO_ANCHOR_ID.to_string(),
+            parent_anchor_id: None,
+            provenance: None,
+            statement: Some(statement.to_string()),
+            tier: Some(KnowledgeTier::Qi),
+            status: Some(KnowledgeStatus::Promoted),
+            supporting_refs: vec!["drawer_supporting_ev".to_string()],
+            counterexample_refs: Vec::new(),
+            teaching_refs: Vec::new(),
+            verification_refs: Vec::new(),
+            scope_constraints: None,
+            trigger_hints: None,
+            is_pinned: false,
+            pin_order: None,
+            supersedes: None,
+            compacted_into: None,
+        };
+
+        let db = Database::open(db_path).expect("open db");
+        db.insert_drawer(&drawer).expect("insert knowledge drawer");
+        db.insert_vector(id, &[0.1, 0.2, 0.3])
+            .expect("insert knowledge vector");
     }
 
     fn insert_bootstrap_evidence_with_vector(
@@ -17314,46 +17428,99 @@ prototypes = ["keep"]
     }
 
     #[tokio::test]
-    async fn test_mcp_context_surfaces_transient_query_lock_error() {
-        let (_tempdir, _db_path, server) = setup_server();
-        let server = server.with_async_db_open_error_for_test("database is locked");
+    async fn test_mcp_context_uses_reader_only_pool_when_writer_pool_open_fails() {
+        let (_tempdir, db_path, server) = setup_server();
+        let query = "context-writer-pool-failure-670";
+        let drawer_id = "drawer-context-writer-pool-failure-670";
+        let source_file = "context-writer-pool-failure-670.md";
+        let raw_marker = "raw-marker-context-writer-pool-failure-670";
+        insert_statement_knowledge_drawer(
+            &db_path,
+            drawer_id,
+            &format!("{query} {raw_marker}"),
+            "context writer pool failure statement",
+            source_file,
+        );
+        let server = server.with_async_db_open_error_for_test(
+            "failed to open MCP async database pool: database is locked",
+        );
 
-        let error = server
+        let response = server
             .context_json_for_test(serde_json::json!({
-                "query": "debug",
+                "query": query,
                 "max_items": 3
             }))
             .await
-            .expect_err("context must not hide transient database lock failures");
+            .expect("context should use reader-only pool");
 
-        let error_text = error.to_string();
-        assert!(error_text.contains("failed to open database"));
-        assert!(error_text.contains("database is locked"));
+        let response_text = serde_json::to_string(&response).expect("serialize context response");
+        assert_eq!(response.query, query);
+        assert!(
+            response_text.contains(drawer_id) && response_text.contains(source_file),
+            "context response must cite the drawer whose raw content carries the leak marker: {response_text}"
+        );
+        assert!(
+            !response_text.contains("failed to open MCP async database pool"),
+            "context must not depend on writer-capable async DB open: {response_text}"
+        );
+        assert!(
+            !response_text.contains(raw_marker),
+            "context regression response must not leak raw drawer content marker"
+        );
     }
 
     #[tokio::test]
-    async fn test_mcp_brief_surfaces_transient_query_lock_error() {
-        let (_tempdir, _db_path, server) = setup_server();
-        let server = server.with_async_db_open_error_for_test("database is locked");
+    async fn test_mcp_brief_uses_reader_only_pool_when_writer_pool_open_fails() {
+        let (_tempdir, db_path, server) = setup_server();
+        let query = "brief-writer-pool-failure-670";
+        let drawer_id = "drawer-brief-writer-pool-failure-670";
+        let source_file = "brief-writer-pool-failure-670.md";
+        let raw_marker = "raw-marker-brief-writer-pool-failure-670";
+        insert_statement_knowledge_drawer(
+            &db_path,
+            drawer_id,
+            &format!("{query} {raw_marker}"),
+            "brief writer pool failure statement",
+            source_file,
+        );
+        let server = server.with_async_db_open_error_for_test(
+            "failed to open MCP async database pool: database is locked",
+        );
 
-        let error = match server
+        let response = server
             .mempal_brief(Parameters(BriefMcpRequest {
-                query: "debug".to_string(),
-                field: Some("smoke".to_string()),
+                query: query.to_string(),
+                field: Some(anchor::DEFAULT_FIELD.to_string()),
                 domain: Some("project".to_string()),
                 cwd: None,
                 max_items: Some(3),
                 dao_tian_limit: None,
             }))
             .await
-        {
-            Ok(_) => panic!("brief must not hide transient database lock failures"),
-            Err(error) => error,
-        };
+            .expect("brief should use reader-only pool")
+            .0;
 
-        let error_text = error.to_string();
-        assert!(error_text.contains("failed to open database"));
-        assert!(error_text.contains("database is locked"));
+        let response_text = serde_json::to_string(&response).expect("serialize brief response");
+        assert_eq!(response.search_mode, "hybrid");
+        assert!(
+            response_text.contains(drawer_id) && response_text.contains(source_file),
+            "brief response must cite the drawer whose raw content carries the leak marker: {response_text}"
+        );
+        assert!(
+            !response_text.contains("failed to open MCP async database pool"),
+            "brief must not depend on writer-capable async DB open: {response_text}"
+        );
+        assert!(
+            !response_text.contains(raw_marker),
+            "brief regression response must not leak raw drawer content marker"
+        );
+        assert!(
+            !response.summary.narrative.is_empty()
+                || !response.evidence.is_empty()
+                || !response.warnings.is_empty()
+                || !response.system_warnings.is_empty(),
+            "brief must return a structured response"
+        );
     }
 
     #[tokio::test]
@@ -17425,7 +17592,7 @@ prototypes = ["keep"]
     #[tokio::test]
     async fn test_mcp_context_surfaces_non_transient_query_open_error() {
         let (_tempdir, _db_path, server) = setup_server();
-        let server = server.with_async_db_open_error_for_test("permission denied");
+        let server = server.with_query_only_async_db_open_error_for_test("permission denied");
 
         let error = match server
             .context_json_for_test(serde_json::json!({
@@ -17446,7 +17613,7 @@ prototypes = ["keep"]
     #[tokio::test]
     async fn test_mcp_brief_surfaces_non_transient_query_open_error() {
         let (_tempdir, _db_path, server) = setup_server();
-        let server = server.with_async_db_open_error_for_test("permission denied");
+        let server = server.with_query_only_async_db_open_error_for_test("permission denied");
 
         let error = match server
             .mempal_brief(Parameters(BriefMcpRequest {

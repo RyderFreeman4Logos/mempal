@@ -11,9 +11,12 @@
 //! [`AsyncDb`] removes that pathology by running every `Database` call on a
 //! dedicated blocking thread (via [`tokio::task::spawn_blocking`]) over a small
 //! bounded pool of pre-opened connections: `n_read` `query_only` readers and
-//! exactly one writer. The tokio worker is never the thread that blocks on disk,
-//! and a connection is never held across an unrelated `.await` — each closure is
-//! self-contained and returns before the connection is checked back in.
+//! exactly one writer. [`QueryOnlyAsyncDb`] uses the same off-runtime read pool
+//! without opening a writer connection, for MCP/read-only surfaces that must stay
+//! available while a daemon owns the writer lease. The tokio worker is never the
+//! thread that blocks on disk, and a connection is never held across an unrelated
+//! `.await` — each closure is self-contained and returns before the connection is
+//! checked back in.
 //!
 //! ## Connection model
 //!
@@ -147,6 +150,18 @@ pub struct AsyncDb {
     read_delay: Option<Duration>,
     #[cfg(any(test, feature = "db-test-seam"))]
     write_delay: Option<Duration>,
+}
+
+/// Off-runtime async facade for bounded read-only database work.
+///
+/// Unlike [`AsyncDb`], this facade never opens a writer connection. It is for
+/// MCP/query surfaces that should continue to read while the daemon is the
+/// singleton writer.
+#[derive(Clone)]
+pub struct QueryOnlyAsyncDb {
+    readers: Arc<ConnPool>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    read_delay: Option<Duration>,
 }
 
 impl AsyncDb {
@@ -299,6 +314,102 @@ impl AsyncDb {
         #[cfg(not(any(test, feature = "db-test-seam")))]
         let delay: Option<Duration> = None;
         exec_anyhow(Arc::clone(&self.writer), delay, None, f).await
+    }
+}
+
+impl QueryOnlyAsyncDb {
+    /// Open a query-only async facade backed by `n_read` read-only connections.
+    ///
+    /// Rejects pools whose aggregate page cache would exceed
+    /// [`PAGE_CACHE_BUDGET_MIB`]. `n_read` is clamped up to at least 1 so the
+    /// read pool always has a connection to hand out.
+    pub fn open(path: &Path, n_read: usize) -> Result<Self, DbError> {
+        let n_read = n_read.max(1);
+        let per_conn_mib = (-SQLITE_CACHE_SIZE_KIB_DEFAULT) / 1024;
+        let requested_mib = (n_read as i64) * per_conn_mib;
+        if requested_mib > PAGE_CACHE_BUDGET_MIB {
+            return Err(DbError::PoolCacheBudgetExceeded {
+                conns: n_read,
+                requested_mib,
+                budget_mib: PAGE_CACHE_BUDGET_MIB,
+            });
+        }
+
+        let readers = ConnPool::open(path, n_read, true)?;
+        Ok(Self {
+            readers: Arc::new(readers),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            read_delay: None,
+        })
+    }
+
+    pub fn resource_snapshot(&self) -> AsyncDbResourceSnapshot {
+        let reader_connections = self.readers.count;
+        let writer_connections = 0;
+        let total_connections = reader_connections;
+        let per_connection_cache_bytes = sqlite_cache_size_bytes(SQLITE_CACHE_SIZE_KIB_DEFAULT);
+        AsyncDbResourceSnapshot {
+            reader_connections,
+            writer_connections,
+            total_connections,
+            per_connection_cache_kib: SQLITE_CACHE_SIZE_KIB_DEFAULT,
+            per_connection_cache_bytes,
+            configured_page_cache_bytes: per_connection_cache_bytes
+                .saturating_mul(total_connections as u64),
+            page_cache_budget_bytes: (PAGE_CACHE_BUDGET_MIB as u64) * 1024 * 1024,
+        }
+    }
+
+    /// Inject a synthetic cold-read delay into every read (tests only).
+    #[cfg(any(test, feature = "db-test-seam"))]
+    pub fn with_read_delay(mut self, delay: Duration) -> Self {
+        self.read_delay = Some(delay);
+        self
+    }
+
+    /// Run a read-only closure against a pooled reader connection off the
+    /// runtime.
+    pub async fn run_read<F, R>(&self, f: F) -> Result<R, DbError>
+    where
+        F: FnOnce(&Database) -> Result<R, DbError> + Send + 'static,
+        R: Send + 'static,
+    {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.read_delay;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay: Option<Duration> = None;
+        exec(Arc::clone(&self.readers), delay, f).await
+    }
+
+    /// Run a read-only closure that returns [`anyhow::Result`] off the runtime.
+    pub async fn run_read_anyhow<F, R>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.read_delay;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay: Option<Duration> = None;
+        exec_anyhow(Arc::clone(&self.readers), delay, None, f).await
+    }
+
+    /// Run a read-only [`anyhow::Result`] closure with a cooperative SQLite
+    /// deadline.
+    pub(crate) async fn run_read_anyhow_until<F, R>(
+        &self,
+        deadline: Instant,
+        f: F,
+    ) -> anyhow::Result<R>
+    where
+        F: FnOnce(&Database) -> anyhow::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        #[cfg(any(test, feature = "db-test-seam"))]
+        let delay = self.read_delay;
+        #[cfg(not(any(test, feature = "db-test-seam")))]
+        let delay: Option<Duration> = None;
+        exec_anyhow(Arc::clone(&self.readers), delay, Some(deadline), f).await
     }
 }
 
@@ -592,6 +703,49 @@ mod tests {
             48 * 1024 * 1024,
             "daemon/MCP/API default async DB pool must stay well below old GiB-scale cache"
         );
+    }
+
+    #[test]
+    fn reader_only_async_pool_does_not_open_writer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("palace.db");
+        Database::open(&path).expect("create database");
+        let adb = QueryOnlyAsyncDb::open(&path, RESOURCE_BOUNDED_READERS)
+            .expect("open query-only async db");
+
+        let snapshot = adb.resource_snapshot();
+
+        assert_eq!(snapshot.reader_connections, RESOURCE_BOUNDED_READERS);
+        assert_eq!(
+            snapshot.writer_connections, 0,
+            "reader-only async pool must not open a writer connection"
+        );
+        assert_eq!(snapshot.total_connections, RESOURCE_BOUNDED_READERS);
+        assert_eq!(
+            snapshot.configured_page_cache_bytes,
+            32 * 1024 * 1024,
+            "query-only MCP pool should budget only reader page caches"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_only_async_pool_runs_bounded_read_without_writer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("palace.db");
+        Database::open(&path).expect("create database");
+        let adb = QueryOnlyAsyncDb::open(&path, 1).expect("open query-only async db");
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let query_only = adb
+            .run_read_anyhow_until(deadline, |db| {
+                db.conn()
+                    .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                    .map_err(anyhow::Error::new)
+            })
+            .await
+            .expect("bounded read");
+
+        assert_eq!(query_only, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -6,7 +6,7 @@ pub mod case_skill;
 pub mod compaction;
 pub mod config;
 pub mod db;
-pub use async_db::AsyncDb;
+pub use async_db::{AsyncDb, QueryOnlyAsyncDb};
 pub mod decay;
 pub mod design_insights;
 pub mod foresight;
