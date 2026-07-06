@@ -3,6 +3,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -18,6 +19,7 @@ from mempal import (  # noqa: E402
     _LLMClient,
     _IntelligenceEnhancer,
     _encode_query_params,
+    SharedPluginBackoff,
 )
 
 
@@ -49,10 +51,32 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("include_raw_turns=false", encoded)
         self.assertIn("active=true", encoded)
 
+    def test_hooks_plugin_loads_without_mempal_package_import(self) -> None:
+        hooks_path = os.path.join(PLUGIN_DIR, "mempal-hooks", "__init__.py")
+        original_path = list(sys.path)
+        original_mempal = sys.modules.pop("mempal", None)
+        try:
+            sys.path = [path for path in sys.path if path != PLUGIN_DIR]
+            spec = importlib.util.spec_from_file_location("mempal_hooks_standalone_test", hooks_path)
+            if spec is None or spec.loader is None:
+                self.fail("failed to load mempal-hooks plugin module")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            self.assertTrue(hasattr(module, "SharedPluginBackoff"))
+        finally:
+            sys.path = original_path
+            if original_mempal is not None:
+                sys.modules["mempal"] = original_mempal
+
 
 class RecordingProvider(MempalMemoryProvider):
     def __init__(self) -> None:
         super().__init__()
+        self._backoff_dir = tempfile.TemporaryDirectory()
+        self._backoff = SharedPluginBackoff(
+            path=os.path.join(self._backoff_dir.name, ".plugin_backoff")
+        )
         self.gets: List[Tuple[str, Optional[Dict[str, Any]]]] = []
         self.posts: List[Tuple[str, Dict[str, Any]]] = []
         self.responses: Dict[str, Any] = {}
@@ -70,6 +94,31 @@ class RecordingProvider(MempalMemoryProvider):
 
     def _drain_writes(self) -> None:
         self._write_queue.join()
+
+    def __del__(self) -> None:
+        cleanup = getattr(self, "_backoff_dir", None)
+        if cleanup is not None:
+            cleanup.cleanup()
+
+
+class StatusRecordingProvider(MempalMemoryProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self._backoff_dir = tempfile.TemporaryDirectory()
+        self._backoff = SharedPluginBackoff(
+            path=os.path.join(self._backoff_dir.name, ".plugin_backoff")
+        )
+        self.gets: List[Tuple[str, Optional[Dict[str, Any]]]] = []
+        self.responses: Dict[str, Any] = {}
+
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        self.gets.append((path, dict(params or {})))
+        return self.responses.get(path, {})
+
+    def __del__(self) -> None:
+        cleanup = getattr(self, "_backoff_dir", None)
+        if cleanup is not None:
+            cleanup.cleanup()
 
 
 class FailingPostProvider(RecordingProvider):
@@ -466,6 +515,178 @@ class SafeModeTests(unittest.TestCase):
 
             self.assertEqual(result["results"][0]["drawer_id"], "raw1")
             self.assertTrue(provider.gets[-1][1]["include_raw_turns"])
+
+
+class PluginBackoffTests(unittest.TestCase):
+    def test_degraded_prefetch_response_records_failure(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.responses["/api/search"] = [
+            {
+                "content": "partial memory",
+                "drawer_id": "d1",
+                "source": "source-a",
+                "importance": 4,
+                "warnings": ["deadline_hit"],
+            },
+        ]
+
+        provider.queue_prefetch("memory", session_id="session-a")
+        block = provider.prefetch("memory", session_id="session-a")
+
+        self.assertIn("partial memory", block)
+        self.assertEqual(provider._consecutive_failures, 1)
+
+    def test_degraded_prefetch_responses_open_breaker(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.responses["/api/search"] = [
+            {"content": "partial memory", "importance": 4, "warnings": ["deadline_hit"]},
+        ]
+
+        for _ in range(5):
+            provider.queue_prefetch("memory", session_id="session-a")
+            provider.prefetch("memory", session_id="session-a")
+
+        self.assertTrue(provider._is_breaker_open())
+
+    def test_prefetch_uses_supported_retrieval_params(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+        provider.responses["/api/search"] = [
+            {"content": "cheap memory", "drawer_id": "d1", "source": "source-a", "importance": 4},
+        ]
+
+        provider.queue_prefetch("memory", session_id="session-a")
+        provider.prefetch("memory", session_id="session-a")
+
+        params = provider.gets[-1][1]
+        self.assertEqual(params["top_k"], 5)
+        self.assertNotIn("mode", params)
+        self.assertNotIn("rerank", params)
+
+    def test_search_warning_header_records_failure(self) -> None:
+        provider = RecordingProvider()
+        provider.initialize("session-a", user_id="alice", profile="work")
+
+        def get_with_warning_header(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+            provider.gets.append((path, dict(params or {})))
+            provider._last_response_headers = {
+                "degraded": "true",
+                "mempal-warnings": "embedding deadline exceeded after 5s",
+            }
+            return [{"content": "partial memory", "importance": 4}]
+
+        provider._get = get_with_warning_header
+
+        provider.queue_prefetch("memory", session_id="session-a")
+        block = provider.prefetch("memory", session_id="session-a")
+
+        self.assertIn("partial memory", block)
+        self.assertEqual(provider._consecutive_failures, 1)
+
+    def test_shared_breaker_suppresses_hooks_ingest(self) -> None:
+        hooks_path = os.path.join(PLUGIN_DIR, "mempal-hooks", "__init__.py")
+        spec = importlib.util.spec_from_file_location("mempal_hooks_backoff_test", hooks_path)
+        if spec is None or spec.loader is None:
+            self.fail("failed to load mempal-hooks plugin module")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backoff = SharedPluginBackoff(path=os.path.join(tmpdir, ".plugin_backoff"))
+            for _ in range(5):
+                backoff.record_failure()
+
+            hooks = module._MempalHooks()
+            hooks._initialized = True
+            hooks._backoff = SharedPluginBackoff(path=backoff.path)
+            posts: List[Tuple[str, Dict[str, Any]]] = []
+            hooks._post = lambda path, body: posts.append((path, dict(body)))
+
+            hooks.post_tool_call("bash", {}, "x" * 80)
+
+            self.assertEqual(posts, [])
+
+    def test_shared_breaker_concurrent_writes_use_unique_temp_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, ".plugin_backoff")
+            errors: List[BaseException] = []
+
+            def write_backoff() -> None:
+                try:
+                    SharedPluginBackoff(path=path).record_failure()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=write_backoff) for _ in range(20)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self.assertIn("failure_count", payload)
+            leftovers = [name for name in os.listdir(tmpdir) if name.startswith(".plugin_backoff.tmp.")]
+            self.assertEqual(leftovers, [])
+
+    def test_hooks_degraded_search_response_records_failure(self) -> None:
+        hooks_path = os.path.join(PLUGIN_DIR, "mempal-hooks", "__init__.py")
+        spec = importlib.util.spec_from_file_location("mempal_hooks_degraded_test", hooks_path)
+        if spec is None or spec.loader is None:
+            self.fail("failed to load mempal-hooks plugin module")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hooks = module._MempalHooks()
+            hooks._initialized = True
+            hooks._wing = "hermes-user/alice/work"
+            hooks._backoff = SharedPluginBackoff(path=os.path.join(tmpdir, ".plugin_backoff"))
+            hooks._get = lambda path, params=None: [
+                {
+                    "content": "partial hooks memory",
+                    "importance": 4,
+                    "warnings": ["deadline_hit"],
+                },
+            ]
+
+            result = hooks.pre_llm_call("session-a", "memory")
+
+            self.assertIsNotNone(result)
+            self.assertEqual(hooks._consecutive_failures, 1)
+
+    def test_shared_breaker_allows_operation_after_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, ".plugin_backoff")
+            backoff = SharedPluginBackoff(path=path)
+            for _ in range(5):
+                backoff.record_failure()
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"failure_count": 5, "open_until_epoch": time.time() - 1}, handle)
+
+            provider = RecordingProvider()
+            provider._backoff = SharedPluginBackoff(path=path)
+            provider.initialize("session-a", user_id="alice", profile="work")
+            provider.responses["/api/search"] = [{"content": "found after cooldown", "importance": 4}]
+
+            result = json.loads(provider.handle_tool_call("mempal_search", {"query": "test"}))
+
+            self.assertIn("results", result)
+            self.assertEqual(result["results"][0]["memory"], "found after cooldown")
+
+    def test_turn_storage_mode_is_cached(self) -> None:
+        provider = StatusRecordingProvider()
+        provider.responses["/api/status"] = {
+            "turn_storage": {"storage_mode": "raw_evidence"},
+        }
+
+        self.assertEqual(provider._turn_storage_mode(), "raw_evidence")
+        self.assertEqual(provider._turn_storage_mode(), "raw_evidence")
+
+        self.assertEqual(provider.gets, [("/api/status", {})])
 
 
 class PinnedFactsTests(unittest.TestCase):
