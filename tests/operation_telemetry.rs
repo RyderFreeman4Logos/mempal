@@ -1,8 +1,30 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+use std::sync::Arc;
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+use std::time::Duration;
 
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+use async_trait::async_trait;
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+use mempal::api::ApiState;
 use mempal::core::db::{Database, set_fork_ext_version};
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+use mempal::core::{
+    AsyncDb,
+    config::ConfigHandle,
+    types::{BootstrapEvidenceArgs, Drawer, SourceType},
+    utils::iso_timestamp,
+};
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+use mempal::embed::{EmbedError, Embedder, EmbedderFactory, global_embed_status};
 use mempal::observability::{
     OperationTelemetryFormat, OperationTelemetryIo, OperationTelemetryRecord,
     OperationTelemetrySource, OperationTelemetrySummaryOptions, operation_telemetry_summary,
@@ -11,6 +33,8 @@ use mempal::observability::{
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tempfile::TempDir;
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+use tower::ServiceExt;
 
 fn mempal_bin() -> String {
     env!("CARGO_BIN_EXE_mempal").to_string()
@@ -75,6 +99,27 @@ fn count_table_rows(db_path: &Path, table: &str) -> i64 {
         .expect("count table rows")
 }
 
+fn operation_metadata_values(db_path: &Path, operation: &str, call_site: &str) -> Vec<Value> {
+    let conn = Connection::open(db_path).expect("open sqlite connection");
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT metadata_json
+            FROM operation_telemetry
+            WHERE operation = ?1 AND call_site = ?2
+            ORDER BY started_at_unix_ms DESC
+            "#,
+        )
+        .expect("prepare metadata query");
+    stmt.query_map([operation, call_site], |row| row.get::<_, String>(0))
+        .expect("query metadata rows")
+        .map(|row| {
+            let metadata_json = row.expect("metadata row");
+            serde_json::from_str(&metadata_json).expect("metadata JSON")
+        })
+        .collect()
+}
+
 fn assert_cli_command_does_not_record_operation_telemetry(args: &[&str]) {
     let (home, db_path) = setup_home();
     assert_eq!(count_table_rows(&db_path, "operation_telemetry"), 0);
@@ -96,6 +141,143 @@ fn assert_cli_command_does_not_record_operation_telemetry(args: &[&str]) {
         0,
         "mempal {args:?} must not record CLI operation telemetry"
     );
+}
+
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+struct RestTelemetryEnv {
+    _tmp: TempDir,
+    db_path: PathBuf,
+    config_path: PathBuf,
+}
+
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+impl RestTelemetryEnv {
+    fn new_with_api_search_deadline_secs(api_search_deadline_secs: u64) -> Self {
+        let tmp = TempDir::new().expect("tempdir");
+        let mempal_home = tmp.path().join(".mempal");
+        fs::create_dir_all(&mempal_home).expect("create mempal home");
+        let db_path = mempal_home.join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let config_path = mempal_home.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+db_path = "{}"
+
+[config_hot_reload]
+enabled = false
+
+[search]
+bm25_fallback = true
+
+[embed.retry]
+search_deadline_secs = 5
+
+[embed.degradation]
+degrade_after_n_failures = 2
+block_writes_when_degraded = true
+
+[api]
+write_queue_capacity = 10
+write_drain_timeout_secs = 2
+search_db_deadline_secs = {api_search_deadline_secs}
+"#,
+                db_path.display()
+            ),
+        )
+        .expect("write config");
+        ConfigHandle::bootstrap(&config_path).expect("bootstrap config");
+        global_embed_status().reset_for_tests();
+        Self {
+            _tmp: tmp,
+            db_path,
+            config_path,
+        }
+    }
+
+    fn db(&self) -> Database {
+        Database::open(&self.db_path).expect("open db")
+    }
+
+    fn state(&self, factory: Arc<dyn EmbedderFactory>) -> ApiState {
+        ApiState::with_write_queue_config(self.db_path.clone(), factory, 10, Duration::from_secs(2))
+    }
+}
+
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+impl Drop for RestTelemetryEnv {
+    fn drop(&mut self) {
+        global_embed_status().reset_for_tests();
+        let _ = ConfigHandle::bootstrap(&self.config_path);
+    }
+}
+
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+#[derive(Clone)]
+struct FailingEmbedderFactory;
+
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+struct FailingEmbedder;
+
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+#[async_trait]
+impl EmbedderFactory for FailingEmbedderFactory {
+    async fn build(&self) -> Result<Box<dyn Embedder>, EmbedError> {
+        Ok(Box::new(FailingEmbedder))
+    }
+}
+
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+#[async_trait]
+impl Embedder for FailingEmbedder {
+    async fn embed(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Err(EmbedError::Runtime("embedder down".to_string()))
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    fn name(&self) -> &str {
+        "failing-operation-telemetry-test"
+    }
+}
+
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+fn insert_search_drawer(db: &Database) {
+    let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
+        id: "drawer_operation_telemetry_bm25_timeout".to_string(),
+        content: "alpha operation telemetry timeout memory".to_string(),
+        wing: "test".to_string(),
+        room: Some("search".to_string()),
+        source_file: Some("tests://operation-telemetry".to_string()),
+        source_type: SourceType::AgentInference,
+        added_at: iso_timestamp(),
+        chunk_index: Some(0),
+        importance: 3,
+    });
+    db.insert_drawer(&drawer).expect("insert drawer");
+}
+
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+async fn get_json(state: ApiState, uri: &str) -> (StatusCode, Value) {
+    let response = mempal::api::router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("REST request");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body = serde_json::from_slice(&bytes).expect("parse json");
+    (status, body)
 }
 
 #[test]
@@ -200,6 +382,128 @@ fn test_operation_telemetry_records_all_public_operation_sources_and_io_classes(
     assert_eq!(cli.logical_read_bytes_total, 100);
     assert_eq!(cli.physical_write_bytes_total, 7);
     assert_eq!(cli.logical_write_bytes_total, 11);
+}
+
+#[test]
+fn test_operation_telemetry_serializes_stage_and_search_mode_metadata() {
+    let (_home, db_path) = setup_home();
+    let db = Database::open(&db_path).expect("open db");
+    let record = OperationTelemetryRecord::new(
+        OperationTelemetrySource::Rest,
+        "GET /api/search",
+        "rest.search.read",
+    )
+    .with_stage("hybrid_db")
+    .with_search_mode("hybrid")
+    .with_timed_out(false)
+    .with_detached_task_info(false, None);
+
+    record_operation_telemetry(&db, record).expect("record telemetry");
+
+    let metadata = operation_metadata_values(&db_path, "GET /api/search", "rest.search.read")
+        .into_iter()
+        .next()
+        .expect("metadata row");
+    assert_eq!(
+        metadata.get("stage").and_then(Value::as_str),
+        Some("hybrid_db")
+    );
+    assert_eq!(
+        metadata.get("search_mode").and_then(Value::as_str),
+        Some("hybrid")
+    );
+    assert_eq!(
+        metadata.get("timed_out").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        metadata
+            .get("detached_task_continued")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(metadata.get("detached_task_duration_ms").is_none());
+}
+
+#[test]
+fn test_operation_telemetry_serializes_timed_out_metadata() {
+    let (_home, db_path) = setup_home();
+    let db = Database::open(&db_path).expect("open db");
+    let record = OperationTelemetryRecord::new(
+        OperationTelemetrySource::Rest,
+        "GET /api/search",
+        "rest.search.read",
+    )
+    .with_stage("bm25_db")
+    .with_search_mode("bm25_only")
+    .with_timed_out(true)
+    .with_detached_task_info(true, Some(37));
+
+    record_operation_telemetry(&db, record).expect("record telemetry");
+
+    let metadata = operation_metadata_values(&db_path, "GET /api/search", "rest.search.read")
+        .into_iter()
+        .next()
+        .expect("metadata row");
+    assert_eq!(
+        metadata.get("stage").and_then(Value::as_str),
+        Some("bm25_db")
+    );
+    assert_eq!(
+        metadata.get("search_mode").and_then(Value::as_str),
+        Some("bm25_only")
+    );
+    assert_eq!(
+        metadata.get("timed_out").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        metadata
+            .get("detached_task_continued")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        metadata
+            .get("detached_task_duration_ms")
+            .and_then(Value::as_u64),
+        Some(37)
+    );
+}
+
+#[cfg(all(feature = "rest", feature = "db-test-seam"))]
+#[tokio::test]
+async fn test_timed_out_bounded_read_records_timed_out_metadata() {
+    let env = RestTelemetryEnv::new_with_api_search_deadline_secs(1);
+    insert_search_drawer(&env.db());
+    let async_db = AsyncDb::open(&env.db_path, 4)
+        .expect("open async db")
+        .with_read_delay(Duration::from_millis(1_500));
+    let state = env
+        .state(Arc::new(FailingEmbedderFactory))
+        .with_async_db_for_test(async_db);
+
+    let (status, body) = get_json(state, "/api/search?q=alpha&scope=global&top_k=5").await;
+
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let metadata_values =
+        operation_metadata_values(&env.db_path, "GET /api/search", "rest.search.read");
+    assert!(
+        metadata_values.iter().any(|metadata| {
+            metadata.get("timed_out").and_then(Value::as_bool) == Some(true)
+                && metadata
+                    .get("detached_task_continued")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && metadata
+                    .get("detached_task_duration_ms")
+                    .and_then(Value::as_u64)
+                    .is_some()
+        }),
+        "missing timed-out bounded read metadata: {metadata_values:#?}"
+    );
 }
 
 #[test]

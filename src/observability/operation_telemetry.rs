@@ -76,6 +76,11 @@ pub struct OperationTelemetryRecord {
     retry_count: u64,
     result_count: u64,
     io: OperationTelemetryIo,
+    stage: Option<String>,
+    search_mode: Option<String>,
+    timed_out: Option<bool>,
+    detached_task_continued: Option<bool>,
+    detached_task_duration_ms: Option<u64>,
 }
 
 impl OperationTelemetryRecord {
@@ -100,6 +105,11 @@ impl OperationTelemetryRecord {
             retry_count: 0,
             result_count: 0,
             io: OperationTelemetryIo::default(),
+            stage: None,
+            search_mode: None,
+            timed_out: None,
+            detached_task_continued: None,
+            detached_task_duration_ms: None,
         }
     }
 
@@ -166,6 +176,54 @@ impl OperationTelemetryRecord {
     pub fn with_io(mut self, io: OperationTelemetryIo) -> Self {
         self.io = io;
         self
+    }
+
+    pub fn with_stage(mut self, stage: impl AsRef<str>) -> Self {
+        self.stage = Some(bounded_label(stage.as_ref()));
+        self
+    }
+
+    pub fn with_search_mode(mut self, search_mode: impl AsRef<str>) -> Self {
+        self.search_mode = Some(bounded_label(search_mode.as_ref()));
+        self
+    }
+
+    pub fn with_timed_out(mut self, timed_out: bool) -> Self {
+        self.timed_out = Some(timed_out);
+        self
+    }
+
+    pub fn with_detached_task_info(mut self, continued: bool, duration_ms: Option<u64>) -> Self {
+        self.detached_task_continued = Some(continued);
+        self.detached_task_duration_ms = duration_ms;
+        self
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct OperationTelemetryMetadata<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timed_out: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detached_task_continued: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detached_task_duration_ms: Option<u64>,
+}
+
+impl OperationTelemetryRecord {
+    fn metadata_json(&self) -> Result<String> {
+        serde_json::to_string(&OperationTelemetryMetadata {
+            stage: self.stage.as_deref(),
+            search_mode: self.search_mode.as_deref(),
+            timed_out: self.timed_out,
+            detached_task_continued: self.detached_task_continued,
+            detached_task_duration_ms: self.detached_task_duration_ms,
+        })
+        .context("failed to serialize operation telemetry metadata")
     }
 }
 
@@ -624,6 +682,7 @@ fn record_operation_telemetry_path(path: &Path, record: OperationTelemetryRecord
 
 fn insert_operation_telemetry(conn: &Connection, record: OperationTelemetryRecord) -> Result<()> {
     let id = next_telemetry_id(&record);
+    let metadata_json = record.metadata_json()?;
     conn.execute(
         r#"
         INSERT INTO operation_telemetry (
@@ -646,8 +705,9 @@ fn insert_operation_telemetry(conn: &Connection, record: OperationTelemetryRecor
             physical_write_bytes,
             logical_read_bytes,
             logical_write_bytes,
-            cancelled_write_bytes
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+            cancelled_write_bytes,
+            metadata_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
         "#,
         params![
             id,
@@ -670,6 +730,7 @@ fn insert_operation_telemetry(conn: &Connection, record: OperationTelemetryRecor
             u64_to_i64(record.io.logical_read_bytes),
             u64_to_i64(record.io.logical_write_bytes),
             u64_to_i64(record.io.cancelled_write_bytes),
+            metadata_json,
         ],
     )
     .context("failed to insert operation telemetry")?;

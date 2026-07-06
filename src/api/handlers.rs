@@ -36,11 +36,11 @@ use crate::observability::{
 };
 use crate::process_diagnostics::inspect_process_memory;
 use crate::search::{
-    SearchMode, SearchOptions, VectorSearchCircuit, bm25_fallback_warning_degraded,
-    bm25_fallback_warning_dimension_mismatch, bm25_fallback_warning_embed_error,
-    bm25_fallback_warning_missing_query_vector, bm25_fallback_warning_timeout,
-    maybe_rerank_search_results, resolve_route, search_bm25_only_with_options,
-    search_with_vector_and_scope_options,
+    SearchMode, SearchOptions, SearchTelemetryStage, VectorSearchCircuit,
+    bm25_fallback_warning_degraded, bm25_fallback_warning_dimension_mismatch,
+    bm25_fallback_warning_embed_error, bm25_fallback_warning_missing_query_vector,
+    bm25_fallback_warning_timeout, maybe_rerank_search_results, resolve_route,
+    search_bm25_only_with_options, search_with_vector_and_scope_options,
 };
 use axum::{
     Json, Router,
@@ -926,28 +926,48 @@ fn attach_search_headers(response: &mut Response, search_mode: SearchMode, warni
 
 async fn run_rest_bm25_search_bounded(
     state: &ApiState,
+    request: RestBm25SearchRequest,
+) -> anyhow::Result<Option<crate::search::Result<Vec<SearchResult>>>> {
+    state
+        .run_read_anyhow_bounded_with_telemetry(
+            move |db| {
+                Ok(search_bm25_only_with_options(
+                    db,
+                    &request.query,
+                    request.route,
+                    &request.scope,
+                    request.search_options,
+                    request.top_k,
+                ))
+            },
+            request.deadline,
+            rest_search_read_telemetry(request.stage, request.search_mode),
+        )
+        .await
+}
+
+struct RestBm25SearchRequest {
     query: String,
     route: RouteDecision,
     scope: ProjectSearchScope,
     search_options: SearchOptions,
     top_k: usize,
     deadline: Duration,
-) -> anyhow::Result<Option<crate::search::Result<Vec<SearchResult>>>> {
-    state
-        .run_read_anyhow_bounded(
-            move |db| {
-                Ok(search_bm25_only_with_options(
-                    db,
-                    &query,
-                    route,
-                    &scope,
-                    search_options,
-                    top_k,
-                ))
-            },
-            deadline,
-        )
-        .await
+    stage: SearchTelemetryStage,
+    search_mode: SearchMode,
+}
+
+fn rest_search_read_telemetry(
+    stage: SearchTelemetryStage,
+    search_mode: SearchMode,
+) -> OperationTelemetryRecord {
+    OperationTelemetryRecord::new(
+        OperationTelemetrySource::Rest,
+        "GET /api/search",
+        "rest.search.read",
+    )
+    .with_stage(stage.as_str())
+    .with_search_mode(search_mode.as_str())
 }
 
 async fn search_handler(
@@ -987,7 +1007,7 @@ async fn search_handler(
         ));
         None
     } else {
-        telemetry.set_stage("embedding");
+        telemetry.set_stage(SearchTelemetryStage::Embedding.as_str());
         let embed_started = Instant::now();
         match state.embedder_factory.build().await {
             Ok(embedder) => match tokio::time::timeout(
@@ -1054,7 +1074,7 @@ async fn search_handler(
         }
     };
 
-    telemetry.set_stage("routing");
+    telemetry.set_stage(SearchTelemetryStage::Routing.as_str());
     let route_started = Instant::now();
     let fallback_route = RouteDecision {
         wing: query.wing.clone(),
@@ -1070,7 +1090,7 @@ async fn search_handler(
     let route_wing = query.wing.clone();
     let route_room = query.room.clone();
     let route = match state
-        .run_read_anyhow_bounded(
+        .run_read_anyhow_bounded_with_telemetry(
             move |db| {
                 Ok(resolve_route(
                     db,
@@ -1080,6 +1100,7 @@ async fn search_handler(
                 ))
             },
             db_deadline,
+            rest_search_read_telemetry(SearchTelemetryStage::Routing, search_mode),
         )
         .await
     {
@@ -1098,14 +1119,14 @@ async fn search_handler(
     };
 
     let results = if let Some(query_vector) = query_vector {
-        telemetry.set_stage("hybrid_db");
+        telemetry.set_stage(SearchTelemetryStage::HybridDb.as_str());
         let search_started = Instant::now();
         let hybrid_query = query.q.clone();
         let hybrid_route = route.clone();
         let hybrid_scope = scope.clone();
         let hybrid_options = search_options.clone();
         match state
-            .run_read_anyhow_bounded(
+            .run_read_anyhow_bounded_with_telemetry(
                 move |db| {
                     Ok(search_with_vector_and_scope_options(
                         db,
@@ -1118,6 +1139,7 @@ async fn search_handler(
                     ))
                 },
                 db_deadline,
+                rest_search_read_telemetry(SearchTelemetryStage::HybridDb, search_mode),
             )
             .await
         {
@@ -1135,16 +1157,20 @@ async fn search_handler(
                     new_dim,
                     current_dim,
                 ));
-                telemetry.set_stage("bm25_fallback_db");
+                telemetry.set_stage(SearchTelemetryStage::Bm25FallbackDb.as_str());
                 let bm25_started = Instant::now();
                 match run_rest_bm25_search_bounded(
                     &state,
-                    query.q.clone(),
-                    route,
-                    scope,
-                    search_options,
-                    top_k,
-                    db_deadline,
+                    RestBm25SearchRequest {
+                        query: query.q.clone(),
+                        route,
+                        scope,
+                        search_options,
+                        top_k,
+                        deadline: db_deadline,
+                        stage: SearchTelemetryStage::Bm25FallbackDb,
+                        search_mode: SearchMode::Bm25Only,
+                    },
                 )
                 .await
                 {
@@ -1168,16 +1194,20 @@ async fn search_handler(
                 search_mode = SearchMode::Bm25Only;
                 partial = true;
                 warnings.push(rest_search_timeout_warning("hybrid search", db_deadline));
-                telemetry.set_stage("bm25_fallback_db");
+                telemetry.set_stage(SearchTelemetryStage::Bm25FallbackDb.as_str());
                 let bm25_started = Instant::now();
                 match run_rest_bm25_search_bounded(
                     &state,
-                    query.q.clone(),
-                    route,
-                    scope,
-                    search_options,
-                    top_k,
-                    db_deadline,
+                    RestBm25SearchRequest {
+                        query: query.q.clone(),
+                        route,
+                        scope,
+                        search_options,
+                        top_k,
+                        deadline: db_deadline,
+                        stage: SearchTelemetryStage::Bm25FallbackDb,
+                        search_mode: SearchMode::Bm25Only,
+                    },
                 )
                 .await
                 {
@@ -1204,16 +1234,20 @@ async fn search_handler(
             Err(error) => return Err(internal_error(error)),
         }
     } else {
-        telemetry.set_stage("bm25_db");
+        telemetry.set_stage(SearchTelemetryStage::Bm25Db.as_str());
         let bm25_started = Instant::now();
         match run_rest_bm25_search_bounded(
             &state,
-            query.q.clone(),
-            route,
-            scope,
-            search_options,
-            top_k,
-            db_deadline,
+            RestBm25SearchRequest {
+                query: query.q.clone(),
+                route,
+                scope,
+                search_options,
+                top_k,
+                deadline: db_deadline,
+                stage: SearchTelemetryStage::Bm25Db,
+                search_mode,
+            },
         )
         .await
         {
@@ -1231,7 +1265,7 @@ async fn search_handler(
             Err(error) => return Err(internal_error(error)),
         }
     };
-    telemetry.set_stage("rerank");
+    telemetry.set_stage(SearchTelemetryStage::Rerank.as_str());
     let rerank_started = Instant::now();
     let rerank_outcome = maybe_rerank_search_results(&query.q, results).await;
     let rerank_elapsed = rerank_started.elapsed();

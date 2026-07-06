@@ -83,6 +83,29 @@ impl SearchMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchTelemetryStage {
+    Embedding,
+    Routing,
+    HybridDb,
+    Bm25FallbackDb,
+    Bm25Db,
+    Rerank,
+}
+
+impl SearchTelemetryStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedding => "embedding",
+            Self::Routing => "routing",
+            Self::HybridDb => "hybrid_db",
+            Self::Bm25FallbackDb => "bm25_fallback_db",
+            Self::Bm25Db => "bm25_db",
+            Self::Rerank => "rerank",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorSearchCircuit {
     /// True when the sticky embedder circuit is open and vector search falls
     /// back to BM25 unless fallback is disabled.
