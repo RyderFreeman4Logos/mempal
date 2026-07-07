@@ -675,7 +675,7 @@ fn spawn_hook_worker(
     poll_interval: Duration,
 ) {
     state.worker_id = format!("{}-hook-{worker_index}", state.worker_id);
-    state.store = state.store.fork_claim_connection_cache();
+    state.store = state.store.fork_connection_cache();
     hook_workers.spawn(async move {
         run_hook_worker(state, claim_ttl_secs, poll_interval).await;
     });

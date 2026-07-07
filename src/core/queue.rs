@@ -198,25 +198,33 @@ pub struct QueueConfig {
 }
 
 #[derive(Clone)]
-struct ClaimConnectionCache {
-    connection: Arc<Mutex<Option<Connection>>>,
+struct ConnectionCache {
+    claim_writer: Arc<Mutex<Option<Connection>>>,
+    writer: Arc<Mutex<Option<Connection>>>,
+    reader: Arc<Mutex<Option<Connection>>>,
     #[cfg(any(test, feature = "db-test-seam"))]
-    open_count: Arc<AtomicUsize>,
+    claim_open_count: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    writer_open_count: Arc<AtomicUsize>,
 }
 
-impl ClaimConnectionCache {
+impl ConnectionCache {
     fn new() -> Self {
         Self {
-            connection: Arc::new(Mutex::new(None)),
+            claim_writer: Arc::new(Mutex::new(None)),
+            writer: Arc::new(Mutex::new(None)),
+            reader: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "db-test-seam"))]
-            open_count: Arc::new(AtomicUsize::new(0)),
+            claim_open_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            writer_open_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 
-impl std::fmt::Debug for ClaimConnectionCache {
+impl std::fmt::Debug for ConnectionCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClaimConnectionCache").finish()
+        f.debug_struct("ConnectionCache").finish()
     }
 }
 
@@ -246,7 +254,7 @@ impl Default for QueueConfig {
 pub struct PendingMessageStore {
     db_path: PathBuf,
     config: QueueConfig,
-    claim_connection: ClaimConnectionCache,
+    connection_cache: ConnectionCache,
 }
 
 /// Bounded async facade for [`PendingMessageStore`].
@@ -303,9 +311,9 @@ impl AsyncPendingMessageStore {
         }
     }
 
-    pub(crate) fn fork_claim_connection_cache(&self) -> Self {
+    pub(crate) fn fork_connection_cache(&self) -> Self {
         Self {
-            inner: self.inner.fork_claim_connection_cache(),
+            inner: self.inner.fork_connection_cache(),
             permits: Arc::clone(&self.permits),
             #[cfg(any(test, feature = "db-test-seam"))]
             blocking_delay: self.blocking_delay,
@@ -695,7 +703,7 @@ impl PendingMessageStore {
         Self {
             db_path: path.as_ref().to_path_buf(),
             config: QueueConfig::default(),
-            claim_connection: ClaimConnectionCache::new(),
+            connection_cache: ConnectionCache::new(),
         }
     }
 
@@ -703,23 +711,32 @@ impl PendingMessageStore {
         let store = Self {
             db_path: path.as_ref().to_path_buf(),
             config,
-            claim_connection: ClaimConnectionCache::new(),
+            connection_cache: ConnectionCache::new(),
         };
         store.reclaim_stale(STARTUP_RECLAIM_STALE_SECS)?;
         Ok(store)
     }
 
-    fn fork_claim_connection_cache(&self) -> Self {
+    fn fork_connection_cache(&self) -> Self {
         Self {
             db_path: self.db_path.clone(),
             config: self.config,
-            claim_connection: ClaimConnectionCache::new(),
+            connection_cache: ConnectionCache::new(),
         }
     }
 
     #[cfg(test)]
     fn claim_connection_open_count(&self) -> usize {
-        self.claim_connection.open_count.load(Ordering::SeqCst)
+        self.connection_cache
+            .claim_open_count
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn writer_open_count(&self) -> usize {
+        self.connection_cache
+            .writer_open_count
+            .load(Ordering::SeqCst)
     }
 
     pub fn idempotent_message_id(kind: &str, idempotency_key: &str) -> String {
@@ -797,51 +814,52 @@ impl PendingMessageStore {
             }
         };
 
-        let conn = self.open_connection_with_busy_timeout(busy_timeout)?;
-        match identity {
-            EnqueueIdentity::Fresh => {
-                conn.execute(
-                    r#"
-                    INSERT INTO pending_messages (
-                        id,
-                        kind,
-                        source_hash,
-                        status,
-                        payload,
-                        created_at,
-                        next_attempt_at
-                    )
-                    VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?5)
-                    "#,
-                    params![id, kind, source_hash, payload, created_at],
-                )?;
+        self.with_connection_with_busy_timeout(busy_timeout, |conn| {
+            match identity {
+                EnqueueIdentity::Fresh => {
+                    conn.execute(
+                        r#"
+                        INSERT INTO pending_messages (
+                            id,
+                            kind,
+                            source_hash,
+                            status,
+                            payload,
+                            created_at,
+                            next_attempt_at
+                        )
+                        VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?5)
+                        "#,
+                        params![id, kind, source_hash, payload, created_at],
+                    )?;
+                }
+                EnqueueIdentity::SourceHash | EnqueueIdentity::ExplicitKey(_) => {
+                    conn.execute(
+                        r#"
+                        INSERT INTO pending_messages (
+                            id,
+                            kind,
+                            source_hash,
+                            status,
+                            payload,
+                            created_at,
+                            next_attempt_at
+                        )
+                        SELECT ?1, ?2, ?3, 'pending', ?4, ?5, ?5
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM pending_message_completions
+                            WHERE message_id = ?1
+                        )
+                        ON CONFLICT(id) DO NOTHING
+                        "#,
+                        params![id, kind, source_hash, payload, created_at],
+                    )?;
+                }
             }
-            EnqueueIdentity::SourceHash | EnqueueIdentity::ExplicitKey(_) => {
-                conn.execute(
-                    r#"
-                    INSERT INTO pending_messages (
-                        id,
-                        kind,
-                        source_hash,
-                        status,
-                        payload,
-                        created_at,
-                        next_attempt_at
-                    )
-                    SELECT ?1, ?2, ?3, 'pending', ?4, ?5, ?5
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM pending_message_completions
-                        WHERE message_id = ?1
-                    )
-                    ON CONFLICT(id) DO NOTHING
-                    "#,
-                    params![id, kind, source_hash, payload, created_at],
-                )?;
-            }
-        }
 
-        Ok(id)
+            Ok(id)
+        })
     }
 
     pub fn claim_next(
@@ -1108,11 +1126,12 @@ impl PendingMessageStore {
     }
 
     pub fn confirm(&self, claim: &ClaimedMessage) -> Result<()> {
-        let mut conn = self.open_connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        confirm_in_tx(&tx, claim, "completed")?;
-        tx.commit()?;
-        Ok(())
+        self.with_connection(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            confirm_in_tx(&tx, claim, "completed")?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     pub fn complete_operation(
@@ -1143,46 +1162,48 @@ impl PendingMessageStore {
         completion: PendingOperationCompletion,
         busy_timeout: Option<Duration>,
     ) -> Result<()> {
-        let mut conn = self.open_connection_with_busy_timeout(busy_timeout)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result_drawer_id = completion.result_drawer_id.as_deref();
-        let rejected_reason = completion.rejected_reason.as_deref();
-        let failure_detail = completion.failure_detail.as_deref();
-        let result_json = completion.result_json.as_deref();
-        let updated = tx.execute(
-            r#"
-            UPDATE pending_messages
-            SET op_state = ?2,
-                result_drawer_id = ?3,
-                rejected_reason = ?4,
-                failure_detail = ?5,
-                result_json = ?6
-            WHERE id = ?1 AND status = 'claimed' AND claim_token = ?7
-            "#,
-            params![
-                claim.id,
-                completion.op_state,
-                result_drawer_id,
-                rejected_reason,
-                failure_detail,
-                result_json,
-                claim.claim_token
-            ],
-        )?;
-        if updated == 0 {
-            return Err(claim_miss_error(&tx, &claim.id)?);
-        }
-        confirm_in_tx(&tx, claim, &completion.op_state)?;
-        tx.commit()?;
-        Ok(())
+        self.with_connection_with_busy_timeout(busy_timeout, |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let result_drawer_id = completion.result_drawer_id.as_deref();
+            let rejected_reason = completion.rejected_reason.as_deref();
+            let failure_detail = completion.failure_detail.as_deref();
+            let result_json = completion.result_json.as_deref();
+            let updated = tx.execute(
+                r#"
+                UPDATE pending_messages
+                SET op_state = ?2,
+                    result_drawer_id = ?3,
+                    rejected_reason = ?4,
+                    failure_detail = ?5,
+                    result_json = ?6
+                WHERE id = ?1 AND status = 'claimed' AND claim_token = ?7
+                "#,
+                params![
+                    claim.id,
+                    completion.op_state,
+                    result_drawer_id,
+                    rejected_reason,
+                    failure_detail,
+                    result_json,
+                    claim.claim_token
+                ],
+            )?;
+            if updated == 0 {
+                return Err(claim_miss_error(&tx, &claim.id)?);
+            }
+            confirm_in_tx(&tx, claim, &completion.op_state)?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     pub fn operation_status(&self, id: &str) -> Result<Option<PendingOperationRecord>> {
-        let conn = self.open_query_connection()?;
-        if let Some(record) = operation_status_from_pending(&conn, id)? {
-            return Ok(Some(record));
-        }
-        operation_status_from_completion(&conn, id)
+        self.with_query_connection(|conn| {
+            if let Some(record) = operation_status_from_pending(conn, id)? {
+                return Ok(Some(record));
+            }
+            operation_status_from_completion(conn, id)
+        })
     }
 
     pub fn mark_failed(&self, claim: &ClaimedMessage, error: &str) -> Result<()> {
@@ -1196,124 +1217,127 @@ impl PendingMessageStore {
         error: &str,
         disposition: QueueFailureDisposition,
     ) -> Result<()> {
-        let mut conn = self.open_connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let redacted_error = sanitize_last_error(error);
-        let current_retry = match tx
-            .query_row(
+        self.with_connection(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let redacted_error = sanitize_last_error(error);
+            let current_retry = match tx
+                .query_row(
+                    r#"
+                    SELECT retry_count
+                    FROM pending_messages
+                    WHERE id = ?1 AND status = 'claimed' AND claim_token = ?2
+                    "#,
+                    params![claim.id, claim.claim_token],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                Some(retry_count) => retry_count,
+                None => return Err(claim_miss_error(&tx, &claim.id)?),
+            };
+            let next_retry = current_retry.saturating_add(1);
+            let next_retry_u32 =
+                u32::try_from(next_retry).map_err(|_| QueueError::RetryCountOverflow {
+                    id: claim.id.clone(),
+                })?;
+            let terminal = matches!(disposition, QueueFailureDisposition::Terminal);
+            let backoff_ms = match disposition {
+                QueueFailureDisposition::Terminal => 0,
+                QueueFailureDisposition::Retryable => self.compute_backoff_ms(next_retry_u32),
+                QueueFailureDisposition::RetryableAfter { delay_ms } => delay_ms.max(0),
+            };
+            let next_attempt_at = if terminal {
+                now_secs()
+            } else {
+                now_secs().saturating_add(div_ceil(backoff_ms, 1_000))
+            };
+            let status = if terminal { "failed" } else { "pending" };
+
+            let updated = tx.execute(
                 r#"
-                SELECT retry_count
-                FROM pending_messages
-                WHERE id = ?1 AND status = 'claimed' AND claim_token = ?2
+                UPDATE pending_messages
+                SET retry_count = ?2,
+                    retry_backoff_ms = ?3,
+                    next_attempt_at = ?4,
+                    status = ?5,
+                    op_state = CASE WHEN ?5 = 'failed' THEN 'failed' ELSE 'queued' END,
+                    failure_class = CASE WHEN ?5 = 'failed' THEN 'terminal' ELSE NULL END,
+                    claim_token = NULL,
+                    claimed_at = NULL,
+                    heartbeat_at = NULL,
+                    last_error = ?6
+                WHERE id = ?1 AND status = 'claimed' AND claim_token = ?7
                 "#,
-                params![claim.id, claim.claim_token],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        {
-            Some(retry_count) => retry_count,
-            None => return Err(claim_miss_error(&tx, &claim.id)?),
-        };
-        let next_retry = current_retry.saturating_add(1);
-        let next_retry_u32 =
-            u32::try_from(next_retry).map_err(|_| QueueError::RetryCountOverflow {
-                id: claim.id.clone(),
-            })?;
-        let terminal = matches!(disposition, QueueFailureDisposition::Terminal);
-        let backoff_ms = match disposition {
-            QueueFailureDisposition::Terminal => 0,
-            QueueFailureDisposition::Retryable => self.compute_backoff_ms(next_retry_u32),
-            QueueFailureDisposition::RetryableAfter { delay_ms } => delay_ms.max(0),
-        };
-        let next_attempt_at = if terminal {
-            now_secs()
-        } else {
-            now_secs().saturating_add(div_ceil(backoff_ms, 1_000))
-        };
-        let status = if terminal { "failed" } else { "pending" };
+                params![
+                    claim.id,
+                    next_retry,
+                    backoff_ms,
+                    next_attempt_at,
+                    status,
+                    redacted_error,
+                    claim.claim_token
+                ],
+            )?;
+            if updated == 0 {
+                return Err(claim_miss_error(&tx, &claim.id)?);
+            }
 
-        let updated = tx.execute(
-            r#"
-            UPDATE pending_messages
-            SET retry_count = ?2,
-                retry_backoff_ms = ?3,
-                next_attempt_at = ?4,
-                status = ?5,
-                op_state = CASE WHEN ?5 = 'failed' THEN 'failed' ELSE 'queued' END,
-                failure_class = CASE WHEN ?5 = 'failed' THEN 'terminal' ELSE NULL END,
-                claim_token = NULL,
-                claimed_at = NULL,
-                heartbeat_at = NULL,
-                last_error = ?6
-            WHERE id = ?1 AND status = 'claimed' AND claim_token = ?7
-            "#,
-            params![
-                claim.id,
-                next_retry,
-                backoff_ms,
-                next_attempt_at,
-                status,
-                redacted_error,
-                claim.claim_token
-            ],
-        )?;
-        if updated == 0 {
-            return Err(claim_miss_error(&tx, &claim.id)?);
-        }
-
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Mark a model-backed task as failed but retryable once the corresponding endpoint recovers.
     pub fn mark_model_task_failed_retryable(&self, id: &str, error: &str) -> Result<()> {
         let now = now_secs();
         let redacted_error = sanitize_last_error(error);
-        let conn = self.open_connection()?;
-        let updated = conn.execute(
-            r#"
-            UPDATE pending_messages
-            SET status = 'failed',
-                retry_count = 0,
-                retry_backoff_ms = 0,
-                next_attempt_at = ?2,
-                claim_token = NULL,
-                claimed_at = NULL,
-                heartbeat_at = NULL,
-                last_error = ?3,
-                op_state = 'failed',
-                failure_class = 'retryable_model'
-            WHERE id = ?1
-            "#,
-            params![id, now, redacted_error],
-        )?;
-        if updated == 0 {
-            return Err(QueueError::MessageNotFound(id.to_string()));
-        }
-        Ok(())
+        self.with_connection(|conn| {
+            let updated = conn.execute(
+                r#"
+                UPDATE pending_messages
+                SET status = 'failed',
+                    retry_count = 0,
+                    retry_backoff_ms = 0,
+                    next_attempt_at = ?2,
+                    claim_token = NULL,
+                    claimed_at = NULL,
+                    heartbeat_at = NULL,
+                    last_error = ?3,
+                    op_state = 'failed',
+                    failure_class = 'retryable_model'
+                WHERE id = ?1
+                "#,
+                params![id, now, redacted_error],
+            )?;
+            if updated == 0 {
+                return Err(QueueError::MessageNotFound(id.to_string()));
+            }
+            Ok(())
+        })
     }
 
     /// Requeue retryable failed model tasks for the recovered model family.
     pub fn auto_requeue_failed_model_tasks(&self, model_kind: &str) -> Result<u64> {
         let now = now_secs();
-        let conn = self.open_connection()?;
-        let updated = match model_kind {
-            "embedding" => requeue_failed_model_tasks(&conn, now, "embedding")?,
-            "llm" => requeue_failed_model_tasks(&conn, now, "llm")?,
-            other => return Err(QueueError::UnsupportedModelTaskKind(other.to_string())),
-        };
-        if updated > 0 {
-            let now_ms = now_millis().to_string();
-            conn.execute(
-                r#"
-                INSERT INTO fork_ext_meta (key, value)
-                VALUES ('queue.auto_requeue.last_at_unix_ms', ?1)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                "#,
-                [now_ms],
-            )?;
-        }
-        Ok(updated)
+        self.with_connection(|conn| {
+            let updated = match model_kind {
+                "embedding" => requeue_failed_model_tasks(conn, now, "embedding")?,
+                "llm" => requeue_failed_model_tasks(conn, now, "llm")?,
+                other => return Err(QueueError::UnsupportedModelTaskKind(other.to_string())),
+            };
+            if updated > 0 {
+                let now_ms = now_millis().to_string();
+                conn.execute(
+                    r#"
+                    INSERT INTO fork_ext_meta (key, value)
+                    VALUES ('queue.auto_requeue.last_at_unix_ms', ?1)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    "#,
+                    [now_ms],
+                )?;
+            }
+            Ok(updated)
+        })
     }
 
     /// Return dead-lettered embed-queue messages to pending for a targeted retry.
@@ -1325,165 +1349,19 @@ impl PendingMessageStore {
     /// they are intentionally left untouched.
     pub fn retry_failed_embed_messages(&self) -> Result<u64> {
         let now = now_secs();
-        let conn = self.open_connection()?;
-        let updated = conn.execute(
-            r#"
-            UPDATE pending_messages
-            SET status = 'pending',
-                retry_count = 0,
-                retry_backoff_ms = 0,
-                next_attempt_at = MIN(created_at, ?1),
-                claim_token = NULL,
-                claimed_at = NULL,
-                heartbeat_at = NULL,
-                last_error = NULL,
-                op_state = 'queued',
-                result_drawer_id = CASE
-                    WHEN kind = 'ingest_async' THEN NULL
-                    ELSE result_drawer_id
-                END,
-                rejected_reason = CASE
-                    WHEN kind = 'ingest_async' THEN NULL
-                    ELSE rejected_reason
-                END,
-                failure_detail = CASE
-                    WHEN kind = 'ingest_async' THEN NULL
-                    ELSE failure_detail
-                END,
-                result_json = CASE
-                    WHEN kind = 'ingest_async' THEN NULL
-                    ELSE result_json
-                END
-            WHERE status = 'failed'
-              AND failure_class = 'retryable_model'
-              AND kind != 'llm_task'
-            "#,
-            [now],
-        )?;
-        Ok(updated as u64)
-    }
-
-    /// Return a claimed message to pending without counting it as a failure.
-    ///
-    /// Used by LLM workers cancelled due to a config hot-reload so the task is
-    /// retried with the new configuration rather than charged a retry.
-    pub fn release_claim(&self, claim: &ClaimedMessage) -> Result<()> {
-        self.release_claim_with_busy_timeout(claim, None)
-    }
-
-    fn release_claim_with_busy_timeout(
-        &self,
-        claim: &ClaimedMessage,
-        busy_timeout: Option<Duration>,
-    ) -> Result<()> {
-        let mut conn = self.open_connection_with_busy_timeout(busy_timeout)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let updated = tx.execute(
-            r#"
-            UPDATE pending_messages
-            SET status = 'pending',
-                claim_token = NULL,
-                claimed_at = NULL,
-                heartbeat_at = NULL,
-                op_state = 'queued',
-                result_drawer_id = CASE
-                    WHEN kind = 'ingest_async' THEN NULL
-                    ELSE result_drawer_id
-                END,
-                rejected_reason = CASE
-                    WHEN kind = 'ingest_async' THEN NULL
-                    ELSE rejected_reason
-                END,
-                failure_detail = CASE
-                    WHEN kind = 'ingest_async' THEN NULL
-                    ELSE failure_detail
-                END,
-                result_json = CASE
-                    WHEN kind = 'ingest_async' THEN NULL
-                    ELSE result_json
-                END
-            WHERE id = ?1 AND status = 'claimed' AND claim_token = ?2
-            "#,
-            params![claim.id, claim.claim_token],
-        )?;
-        if updated == 0 {
-            return Err(claim_miss_error(&tx, &claim.id)?);
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn refresh_heartbeat(&self, id: &str, worker_id: &str) -> Result<()> {
-        let claim_prefix = format!("{worker_id}:");
-        let now = now_secs();
-        let conn = self.open_connection()?;
-        let updated = conn.execute(
-            r#"
-            UPDATE pending_messages
-            SET heartbeat_at = ?2
-            WHERE id = ?1
-              AND status = 'claimed'
-              AND claim_token LIKE ?3
-            "#,
-            params![id, now, format!("{claim_prefix}%")],
-        )?;
-        if updated == 0 {
-            return Err(QueueError::MessageNotFound(id.to_string()));
-        }
-        Ok(())
-    }
-
-    pub fn reclaim_stale(&self, stale_secs: i64) -> Result<u64> {
-        let conn = self.open_connection()?;
-        let reclaimed = reclaim_stale_conn(&conn, saturating_cutoff(now_secs(), stale_secs))?;
-        Ok(reclaimed)
-    }
-
-    pub fn stats(&self) -> Result<QueueStats> {
-        let conn = self.open_query_connection()?;
-        compute_queue_stats(&conn)
-    }
-
-    pub fn preview_failed_action(
-        &self,
-        filter: QueueFailureFilter,
-    ) -> Result<QueueFailureActionPreview> {
-        ensure_explicit_filter(&filter)?;
-        let conn = self.open_query_connection()?;
-        let rows = matching_failed_rows(&conn, &filter)?;
-        Ok(QueueFailureActionPreview {
-            filter,
-            matched: rows.len() as u64,
-            buckets: buckets_from_rows(rows.iter()),
-        })
-    }
-
-    pub fn retry_failed_messages(
-        &self,
-        filter: QueueFailureFilter,
-    ) -> Result<QueueFailureActionOutcome> {
-        ensure_explicit_filter(&filter)?;
-        let mut conn = self.open_connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows = matching_failed_rows(&tx, &filter)?;
-        let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-
-        let now = now_secs();
-        let mut changed = 0u64;
-        for id in &ids {
-            let updated = tx.execute(
+        self.with_connection(|conn| {
+            let updated = conn.execute(
                 r#"
                 UPDATE pending_messages
                 SET status = 'pending',
                     retry_count = 0,
                     retry_backoff_ms = 0,
-                    next_attempt_at = MIN(created_at, ?2),
+                    next_attempt_at = MIN(created_at, ?1),
                     claim_token = NULL,
                     claimed_at = NULL,
                     heartbeat_at = NULL,
                     last_error = NULL,
                     op_state = 'queued',
-                    failure_class = NULL,
                     result_drawer_id = CASE
                         WHEN kind = 'ingest_async' THEN NULL
                         ELSE result_drawer_id
@@ -1500,18 +1378,172 @@ impl PendingMessageStore {
                         WHEN kind = 'ingest_async' THEN NULL
                         ELSE result_json
                     END
-                WHERE id = ?1 AND status = 'failed'
+                WHERE status = 'failed'
+                  AND failure_class = 'retryable_model'
+                  AND kind != 'llm_task'
                 "#,
-                params![id, now],
+                [now],
             )?;
-            changed = changed.saturating_add(updated as u64);
-        }
-        tx.commit()?;
-        Ok(QueueFailureActionOutcome {
-            filter,
-            matched: rows.len() as u64,
-            changed,
-            buckets: buckets_from_rows(rows.iter()),
+            Ok(updated as u64)
+        })
+    }
+
+    /// Return a claimed message to pending without counting it as a failure.
+    ///
+    /// Used by LLM workers cancelled due to a config hot-reload so the task is
+    /// retried with the new configuration rather than charged a retry.
+    pub fn release_claim(&self, claim: &ClaimedMessage) -> Result<()> {
+        self.release_claim_with_busy_timeout(claim, None)
+    }
+
+    fn release_claim_with_busy_timeout(
+        &self,
+        claim: &ClaimedMessage,
+        busy_timeout: Option<Duration>,
+    ) -> Result<()> {
+        self.with_connection(|conn| {
+            if let Some(timeout) = busy_timeout {
+                conn.busy_timeout(timeout)?;
+            }
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let updated = tx.execute(
+                r#"
+                UPDATE pending_messages
+                SET status = 'pending',
+                    claim_token = NULL,
+                    claimed_at = NULL,
+                    heartbeat_at = NULL,
+                    op_state = 'queued',
+                    result_drawer_id = CASE
+                        WHEN kind = 'ingest_async' THEN NULL
+                        ELSE result_drawer_id
+                    END,
+                    rejected_reason = CASE
+                        WHEN kind = 'ingest_async' THEN NULL
+                        ELSE rejected_reason
+                    END,
+                    failure_detail = CASE
+                        WHEN kind = 'ingest_async' THEN NULL
+                        ELSE failure_detail
+                    END,
+                    result_json = CASE
+                        WHEN kind = 'ingest_async' THEN NULL
+                        ELSE result_json
+                    END
+                WHERE id = ?1 AND status = 'claimed' AND claim_token = ?2
+                "#,
+                params![claim.id, claim.claim_token],
+            )?;
+            if updated == 0 {
+                return Err(claim_miss_error(&tx, &claim.id)?);
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn refresh_heartbeat(&self, id: &str, worker_id: &str) -> Result<()> {
+        let claim_prefix = format!("{worker_id}:");
+        let now = now_secs();
+        self.with_connection(|conn| {
+            let updated = conn.execute(
+                r#"
+                UPDATE pending_messages
+                SET heartbeat_at = ?2
+                WHERE id = ?1
+                  AND status = 'claimed'
+                  AND claim_token LIKE ?3
+                "#,
+                params![id, now, format!("{claim_prefix}%")],
+            )?;
+            if updated == 0 {
+                return Err(QueueError::MessageNotFound(id.to_string()));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn reclaim_stale(&self, stale_secs: i64) -> Result<u64> {
+        self.with_connection(|conn| {
+            let reclaimed = reclaim_stale_conn(conn, saturating_cutoff(now_secs(), stale_secs))?;
+            Ok(reclaimed)
+        })
+    }
+
+    pub fn stats(&self) -> Result<QueueStats> {
+        self.with_query_connection(compute_queue_stats)
+    }
+
+    pub fn preview_failed_action(
+        &self,
+        filter: QueueFailureFilter,
+    ) -> Result<QueueFailureActionPreview> {
+        ensure_explicit_filter(&filter)?;
+        self.with_query_connection(|conn| {
+            let rows = matching_failed_rows(conn, &filter)?;
+            Ok(QueueFailureActionPreview {
+                filter,
+                matched: rows.len() as u64,
+                buckets: buckets_from_rows(rows.iter()),
+            })
+        })
+    }
+
+    pub fn retry_failed_messages(
+        &self,
+        filter: QueueFailureFilter,
+    ) -> Result<QueueFailureActionOutcome> {
+        ensure_explicit_filter(&filter)?;
+        self.with_connection(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let rows = matching_failed_rows(&tx, &filter)?;
+            let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+
+            let now = now_secs();
+            let mut changed = 0u64;
+            for id in &ids {
+                let updated = tx.execute(
+                    r#"
+                    UPDATE pending_messages
+                    SET status = 'pending',
+                        retry_count = 0,
+                        retry_backoff_ms = 0,
+                        next_attempt_at = MIN(created_at, ?2),
+                        claim_token = NULL,
+                        claimed_at = NULL,
+                        heartbeat_at = NULL,
+                        last_error = NULL,
+                        op_state = 'queued',
+                        failure_class = NULL,
+                        result_drawer_id = CASE
+                            WHEN kind = 'ingest_async' THEN NULL
+                            ELSE result_drawer_id
+                        END,
+                        rejected_reason = CASE
+                            WHEN kind = 'ingest_async' THEN NULL
+                            ELSE rejected_reason
+                        END,
+                        failure_detail = CASE
+                            WHEN kind = 'ingest_async' THEN NULL
+                            ELSE failure_detail
+                        END,
+                        result_json = CASE
+                            WHEN kind = 'ingest_async' THEN NULL
+                            ELSE result_json
+                        END
+                    WHERE id = ?1 AND status = 'failed'
+                    "#,
+                    params![id, now],
+                )?;
+                changed = changed.saturating_add(updated as u64);
+            }
+            tx.commit()?;
+            Ok(QueueFailureActionOutcome {
+                filter,
+                matched: rows.len() as u64,
+                changed,
+                buckets: buckets_from_rows(rows.iter()),
+            })
         })
     }
 
@@ -1521,66 +1553,67 @@ impl PendingMessageStore {
     ) -> Result<QueueFailureActionOutcome> {
         ensure_explicit_filter(&filter)?;
         let completed_at = now_millis();
-        let mut conn = self.open_connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows = matching_failed_rows(&tx, &filter)?;
-        let mut changed = 0u64;
-        for row in &rows {
-            let archive_reason = format!("queue_archive:{}", row.reason_code);
-            tx.execute(
-                r#"
-                INSERT INTO pending_message_completions (
-                    message_id,
-                    kind,
-                    created_at,
-                    claimed_at,
-                    completed_at,
-                    processing_ms,
-                    result_drawer_id,
-                    op_state,
-                    rejected_reason,
-                    failure_detail,
-                    result_json
-                )
-                SELECT id,
-                       kind,
-                       created_at * 1000,
-                       claimed_at,
-                       ?2,
-                       NULL,
-                       result_drawer_id,
-                       'failed',
-                       ?3,
-                       last_error,
-                       result_json
-                FROM pending_messages
-                WHERE id = ?1 AND status = 'failed'
-                ON CONFLICT(message_id) DO UPDATE SET
-                    kind = excluded.kind,
-                    created_at = excluded.created_at,
-                    claimed_at = excluded.claimed_at,
-                    completed_at = excluded.completed_at,
-                    processing_ms = excluded.processing_ms,
-                    result_drawer_id = excluded.result_drawer_id,
-                    op_state = excluded.op_state,
-                    rejected_reason = excluded.rejected_reason,
-                    failure_detail = excluded.failure_detail,
-                    result_json = excluded.result_json
-                "#,
-                params![row.id.as_str(), completed_at, archive_reason.as_str()],
-            )?;
-            let deleted = tx.execute(
-                "DELETE FROM pending_messages WHERE id = ?1 AND status = 'failed'",
-                [row.id.as_str()],
-            )?;
-            changed = changed.saturating_add(deleted as u64);
-        }
-        tx.commit()?;
-        Ok(QueueFailureActionOutcome {
-            filter,
-            matched: rows.len() as u64,
-            changed,
-            buckets: buckets_from_rows(rows.iter()),
+        self.with_connection(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let rows = matching_failed_rows(&tx, &filter)?;
+            let mut changed = 0u64;
+            for row in &rows {
+                let archive_reason = format!("queue_archive:{}", row.reason_code);
+                tx.execute(
+                    r#"
+                    INSERT INTO pending_message_completions (
+                        message_id,
+                        kind,
+                        created_at,
+                        claimed_at,
+                        completed_at,
+                        processing_ms,
+                        result_drawer_id,
+                        op_state,
+                        rejected_reason,
+                        failure_detail,
+                        result_json
+                    )
+                    SELECT id,
+                           kind,
+                           created_at * 1000,
+                           claimed_at,
+                           ?2,
+                           NULL,
+                           result_drawer_id,
+                           'failed',
+                           ?3,
+                           last_error,
+                           result_json
+                    FROM pending_messages
+                    WHERE id = ?1 AND status = 'failed'
+                    ON CONFLICT(message_id) DO UPDATE SET
+                        kind = excluded.kind,
+                        created_at = excluded.created_at,
+                        claimed_at = excluded.claimed_at,
+                        completed_at = excluded.completed_at,
+                        processing_ms = excluded.processing_ms,
+                        result_drawer_id = excluded.result_drawer_id,
+                        op_state = excluded.op_state,
+                        rejected_reason = excluded.rejected_reason,
+                        failure_detail = excluded.failure_detail,
+                        result_json = excluded.result_json
+                    "#,
+                    params![row.id.as_str(), completed_at, archive_reason.as_str()],
+                )?;
+                let deleted = tx.execute(
+                    "DELETE FROM pending_messages WHERE id = ?1 AND status = 'failed'",
+                    [row.id.as_str()],
+                )?;
+                changed = changed.saturating_add(deleted as u64);
+            }
+            tx.commit()?;
+            Ok(QueueFailureActionOutcome {
+                filter,
+                matched: rows.len() as u64,
+                changed,
+                buckets: buckets_from_rows(rows.iter()),
+            })
         })
     }
 
@@ -1588,17 +1621,65 @@ impl PendingMessageStore {
         self.open_connection_with_busy_timeout(None)
     }
 
+    fn with_connection<T>(&self, op: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        self.with_connection_with_busy_timeout(None, op)
+    }
+
+    fn with_connection_with_busy_timeout<T>(
+        &self,
+        busy_timeout: Option<Duration>,
+        op: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
+        let mut guard = self
+            .connection_cache
+            .writer
+            .lock()
+            .map_err(|_| QueueError::ClaimConnectionMutexPoisoned)?;
+        if guard.is_none() {
+            let conn = match busy_timeout {
+                Some(timeout) => self.open_connection_with_busy_timeout(Some(timeout))?,
+                None => self.open_connection()?,
+            };
+            #[cfg(any(test, feature = "db-test-seam"))]
+            self.connection_cache
+                .writer_open_count
+                .fetch_add(1, Ordering::SeqCst);
+            *guard = Some(conn);
+        }
+        let Some(conn) = guard.as_mut() else {
+            return Err(QueueError::ClaimConnectionUnavailable);
+        };
+        conn.busy_timeout(busy_timeout.unwrap_or(DEFAULT_BUSY_TIMEOUT))?;
+        op(conn)
+    }
+
+    fn with_query_connection<T>(&self, op: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let mut guard = self
+            .connection_cache
+            .reader
+            .lock()
+            .map_err(|_| QueueError::ClaimConnectionMutexPoisoned)?;
+        if guard.is_none() {
+            let conn = self.open_query_connection()?;
+            *guard = Some(conn);
+        }
+        let Some(conn) = guard.as_ref() else {
+            return Err(QueueError::ClaimConnectionUnavailable);
+        };
+        op(conn)
+    }
+
     fn with_claim_connection<T>(&self, op: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         let mut guard = self
-            .claim_connection
-            .connection
+            .connection_cache
+            .claim_writer
             .lock()
             .map_err(|_| QueueError::ClaimConnectionMutexPoisoned)?;
         if guard.is_none() {
             let conn = self.open_connection_with_busy_timeout(Some(CLAIM_BUSY_TIMEOUT))?;
             #[cfg(any(test, feature = "db-test-seam"))]
-            self.claim_connection
-                .open_count
+            self.connection_cache
+                .claim_open_count
                 .fetch_add(1, Ordering::SeqCst);
             *guard = Some(conn);
         }
@@ -2651,6 +2732,28 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.claim_connection_open_count(), 1);
+    }
+
+    #[test]
+    fn confirm_and_enqueue_reuse_cached_writer_connection() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new_without_reclaim(&db_path);
+
+        assert_eq!(store.writer_open_count(), 0);
+        let id = store
+            .enqueue("hook_user_prompt", r#"{"event":"UserPromptSubmit"}"#)
+            .expect("enqueue hook");
+        assert_eq!(store.writer_open_count(), 1);
+
+        let claim = store
+            .claim_next("hook-worker", 60)
+            .expect("claim hook")
+            .expect("hook row should be claimed");
+        assert_eq!(claim.id, id);
+        store.confirm(&claim).expect("confirm hook");
+        assert_eq!(store.writer_open_count(), 1);
     }
 
     #[test]
