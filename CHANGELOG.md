@@ -33,6 +33,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **Daemon/Queue**: idle hook and LLM workers now reuse claim SQLite
+  connections and exponentially back off empty queue polls, reducing idle
+  daemon `rchar` from connection churn (#672).
 - **MCP**: `mempal_context` and `mempal_brief` now use a reader-only async
   database pool, so read-only MCP surfaces stay available while the daemon owns
   the writer-capable pool (#670).

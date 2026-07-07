@@ -56,6 +56,7 @@ const SESSION_REVIEW_REJECTED_TOTAL_KEY: &str = "session_review.rejected.total";
 /// Coupled to the orphan reaper grace period in `src/main.rs`.
 pub const DAEMON_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 const DAEMON_HOOK_WORKER_LIMIT: usize = 4;
+const MAX_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const ENDPOINT_RECOVERY_REQUEUE_INTERVAL: Duration = Duration::from_secs(30);
 const AUTOMATIC_HOOK_LLM_GATE_MAX_SECS: u64 = 30;
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
@@ -674,12 +675,14 @@ fn spawn_hook_worker(
     poll_interval: Duration,
 ) {
     state.worker_id = format!("{}-hook-{worker_index}", state.worker_id);
+    state.store = state.store.fork_claim_connection_cache();
     hook_workers.spawn(async move {
         run_hook_worker(state, claim_ttl_secs, poll_interval).await;
     });
 }
 
 async fn run_hook_worker(state: HookWorkerState, claim_ttl_secs: i64, poll_interval: Duration) {
+    let mut idle_count = 0_u32;
     loop {
         if shutdown_requested() {
             break;
@@ -691,20 +694,36 @@ async fn run_hook_worker(state: HookWorkerState, claim_ttl_secs: i64, poll_inter
         .await
         {
             ClaimPollResult::Claimed(message) => {
+                idle_count = 0;
                 process_hook_worker_message(state.clone(), message, claim_ttl_secs).await;
             }
             ClaimPollResult::Idle => {
+                let effective_interval = idle_poll_interval(poll_interval, idle_count);
+                idle_count = idle_count.saturating_add(1);
                 #[cfg(test)]
                 let idle_observer = state.idle_observer.clone();
-                wait_for_shutdown_or_sleep_after(poll_interval, move || {
+                wait_for_shutdown_or_sleep_after(effective_interval, move || {
                     #[cfg(test)]
                     notify_hook_worker_idle(idle_observer);
                 })
                 .await;
             }
-            ClaimPollResult::RetryAfterError => continue,
+            ClaimPollResult::RetryAfterError => {
+                idle_count = 0;
+                continue;
+            }
         }
     }
+}
+
+fn idle_poll_interval(base_interval: Duration, idle_count: u32) -> Duration {
+    let multiplier = 1_u32
+        .checked_shl(idle_count.min(u32::BITS - 1))
+        .unwrap_or(u32::MAX);
+    base_interval
+        .checked_mul(multiplier)
+        .unwrap_or(MAX_IDLE_POLL_INTERVAL)
+        .min(MAX_IDLE_POLL_INTERVAL)
 }
 
 async fn wait_for_shutdown_or_sleep(duration: Duration) {
@@ -3638,6 +3657,21 @@ mod tests {
         request_shutdown, reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick,
         wing_from_cwd,
     };
+
+    #[test]
+    fn idle_poll_interval_backs_off_exponentially_and_caps() {
+        let base = Duration::from_millis(500);
+
+        assert_eq!(
+            super::idle_poll_interval(base, 0),
+            Duration::from_millis(500)
+        );
+        assert_eq!(super::idle_poll_interval(base, 1), Duration::from_secs(1));
+        assert_eq!(super::idle_poll_interval(base, 2), Duration::from_secs(2));
+        assert_eq!(super::idle_poll_interval(base, 3), Duration::from_secs(4));
+        assert_eq!(super::idle_poll_interval(base, 4), Duration::from_secs(5));
+        assert_eq!(super::idle_poll_interval(base, 20), Duration::from_secs(5));
+    }
 
     #[test]
     fn queue_failure_disposition_dead_letters_non_retryable_llm_errors() {

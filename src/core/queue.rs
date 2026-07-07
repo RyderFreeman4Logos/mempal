@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 #[cfg(any(test, feature = "db-test-seam"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
@@ -39,6 +39,10 @@ pub enum QueueError {
     UnsupportedModelTaskKind(String),
     #[error("queue failed-row mutation requires at least one explicit kind/class/reason filter")]
     UnsafeUnfilteredQueueMutation,
+    #[error("pending message claim connection mutex poisoned")]
+    ClaimConnectionMutexPoisoned,
+    #[error("pending message claim connection unavailable after initialization")]
+    ClaimConnectionUnavailable,
 }
 
 impl QueueError {
@@ -193,6 +197,29 @@ pub struct QueueConfig {
     pub max_retries: u32,
 }
 
+#[derive(Clone)]
+struct ClaimConnectionCache {
+    connection: Arc<Mutex<Option<Connection>>>,
+    #[cfg(any(test, feature = "db-test-seam"))]
+    open_count: Arc<AtomicUsize>,
+}
+
+impl ClaimConnectionCache {
+    fn new() -> Self {
+        Self {
+            connection: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            open_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl std::fmt::Debug for ClaimConnectionCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimConnectionCache").finish()
+    }
+}
+
 /// Controls whether a processing failure is retried or dead-lettered immediately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueFailureDisposition {
@@ -219,6 +246,7 @@ impl Default for QueueConfig {
 pub struct PendingMessageStore {
     db_path: PathBuf,
     config: QueueConfig,
+    claim_connection: ClaimConnectionCache,
 }
 
 /// Bounded async facade for [`PendingMessageStore`].
@@ -272,6 +300,25 @@ impl AsyncPendingMessageStore {
             release_lock_failures: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "db-test-seam"))]
             complete_lock_failures: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub(crate) fn fork_claim_connection_cache(&self) -> Self {
+        Self {
+            inner: self.inner.fork_claim_connection_cache(),
+            permits: Arc::clone(&self.permits),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            blocking_delay: self.blocking_delay,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            enqueue_lock_failures: Arc::clone(&self.enqueue_lock_failures),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            claim_lock_failures: Arc::clone(&self.claim_lock_failures),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            claim_blocking_delay: self.claim_blocking_delay,
+            #[cfg(any(test, feature = "db-test-seam"))]
+            release_lock_failures: Arc::clone(&self.release_lock_failures),
+            #[cfg(any(test, feature = "db-test-seam"))]
+            complete_lock_failures: Arc::clone(&self.complete_lock_failures),
         }
     }
 
@@ -648,6 +695,7 @@ impl PendingMessageStore {
         Self {
             db_path: path.as_ref().to_path_buf(),
             config: QueueConfig::default(),
+            claim_connection: ClaimConnectionCache::new(),
         }
     }
 
@@ -655,9 +703,23 @@ impl PendingMessageStore {
         let store = Self {
             db_path: path.as_ref().to_path_buf(),
             config,
+            claim_connection: ClaimConnectionCache::new(),
         };
         store.reclaim_stale(STARTUP_RECLAIM_STALE_SECS)?;
         Ok(store)
+    }
+
+    fn fork_claim_connection_cache(&self) -> Self {
+        Self {
+            db_path: self.db_path.clone(),
+            config: self.config,
+            claim_connection: ClaimConnectionCache::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn claim_connection_open_count(&self) -> usize {
+        self.claim_connection.open_count.load(Ordering::SeqCst)
     }
 
     pub fn idempotent_message_id(kind: &str, idempotency_key: &str) -> String {
@@ -795,70 +857,71 @@ impl PendingMessageStore {
         worker_id: &str,
         claim_ttl_secs: i64,
     ) -> Result<Option<ClaimedMessage>> {
-        let mut conn = self.open_claim_connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+        self.with_claim_connection(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
-        let now = now_secs();
-        let row = tx
-            .query_row(
+            let now = now_secs();
+            let row = tx
+                .query_row(
+                    r#"
+                    SELECT id, kind, payload, retry_count, source_hash, created_at
+                    FROM pending_messages
+                    WHERE status = 'pending' AND next_attempt_at <= ?1
+                      AND kind NOT IN ('llm_task', 'ingest_async')
+                    ORDER BY next_attempt_at ASC, id ASC
+                    LIMIT 1
+                    "#,
+                    [now],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            let Some((id, kind, payload, retry_count_i64, source_hash, created_at)) = row else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let retry_count = u32::try_from(retry_count_i64)
+                .map_err(|_| QueueError::RetryCountOverflow { id: id.clone() })?;
+            let claim_token = format!("{worker_id}:{}", next_id("claim"));
+            let updated = tx.execute(
                 r#"
-                SELECT id, kind, payload, retry_count, source_hash, created_at
-                FROM pending_messages
-                WHERE status = 'pending' AND next_attempt_at <= ?1
-                  AND kind NOT IN ('llm_task', 'ingest_async')
-                ORDER BY next_attempt_at ASC, id ASC
-                LIMIT 1
+                UPDATE pending_messages
+                SET status = 'claimed',
+                    claim_token = ?2,
+                    claimed_at = ?3,
+                    heartbeat_at = ?3,
+                    op_state = 'running'
+                WHERE id = ?1 AND status = 'pending'
                 "#,
-                [now],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )
-            .optional()?;
+                params![id, claim_token, now],
+            )?;
+            if updated == 0 {
+                tx.commit()?;
+                return Ok(None);
+            }
 
-        let Some((id, kind, payload, retry_count_i64, source_hash, created_at)) = row else {
             tx.commit()?;
-            return Ok(None);
-        };
-        let retry_count = u32::try_from(retry_count_i64)
-            .map_err(|_| QueueError::RetryCountOverflow { id: id.clone() })?;
-        let claim_token = format!("{worker_id}:{}", next_id("claim"));
-        let updated = tx.execute(
-            r#"
-            UPDATE pending_messages
-            SET status = 'claimed',
-                claim_token = ?2,
-                claimed_at = ?3,
-                heartbeat_at = ?3,
-                op_state = 'running'
-            WHERE id = ?1 AND status = 'pending'
-            "#,
-            params![id, claim_token, now],
-        )?;
-        if updated == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-
-        tx.commit()?;
-        Ok(Some(ClaimedMessage {
-            id,
-            kind,
-            payload,
-            retry_count,
-            claim_token,
-            source_hash,
-            created_at,
-            claimed_at: now,
-        }))
+            Ok(Some(ClaimedMessage {
+                id,
+                kind,
+                payload,
+                retry_count,
+                claim_token,
+                source_hash,
+                created_at,
+                claimed_at: now,
+            }))
+        })
     }
 
     pub fn claim_next_by_kind(
@@ -878,69 +941,70 @@ impl PendingMessageStore {
         claim_ttl_secs: i64,
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
-        let mut conn = self.open_claim_connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+        self.with_claim_connection(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
-        let now = now_secs();
-        let row = tx
-            .query_row(
+            let now = now_secs();
+            let row = tx
+                .query_row(
+                    r#"
+                    SELECT id, kind, payload, retry_count, source_hash, created_at
+                    FROM pending_messages
+                    WHERE status = 'pending' AND next_attempt_at <= ?1 AND kind = ?2
+                    ORDER BY next_attempt_at ASC, id ASC
+                    LIMIT 1
+                    "#,
+                    params![now, kind_filter],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            let Some((id, kind, payload, retry_count_i64, source_hash, created_at)) = row else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let retry_count = u32::try_from(retry_count_i64)
+                .map_err(|_| QueueError::RetryCountOverflow { id: id.clone() })?;
+            let claim_token = format!("{worker_id}:{}", next_id("claim"));
+            let updated = tx.execute(
                 r#"
-                SELECT id, kind, payload, retry_count, source_hash, created_at
-                FROM pending_messages
-                WHERE status = 'pending' AND next_attempt_at <= ?1 AND kind = ?2
-                ORDER BY next_attempt_at ASC, id ASC
-                LIMIT 1
+                UPDATE pending_messages
+                SET status = 'claimed',
+                    claim_token = ?2,
+                    claimed_at = ?3,
+                    heartbeat_at = ?3,
+                    op_state = 'running'
+                WHERE id = ?1 AND status = 'pending'
                 "#,
-                params![now, kind_filter],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )
-            .optional()?;
+                params![id, claim_token, now],
+            )?;
+            if updated == 0 {
+                tx.commit()?;
+                return Ok(None);
+            }
 
-        let Some((id, kind, payload, retry_count_i64, source_hash, created_at)) = row else {
             tx.commit()?;
-            return Ok(None);
-        };
-        let retry_count = u32::try_from(retry_count_i64)
-            .map_err(|_| QueueError::RetryCountOverflow { id: id.clone() })?;
-        let claim_token = format!("{worker_id}:{}", next_id("claim"));
-        let updated = tx.execute(
-            r#"
-            UPDATE pending_messages
-            SET status = 'claimed',
-                claim_token = ?2,
-                claimed_at = ?3,
-                heartbeat_at = ?3,
-                op_state = 'running'
-            WHERE id = ?1 AND status = 'pending'
-            "#,
-            params![id, claim_token, now],
-        )?;
-        if updated == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-
-        tx.commit()?;
-        Ok(Some(ClaimedMessage {
-            id,
-            kind,
-            payload,
-            retry_count,
-            claim_token,
-            source_hash,
-            created_at,
-            claimed_at: now,
-        }))
+            Ok(Some(ClaimedMessage {
+                id,
+                kind,
+                payload,
+                retry_count,
+                claim_token,
+                source_hash,
+                created_at,
+                claimed_at: now,
+            }))
+        })
     }
 
     pub fn claim_by_id_and_kind(
@@ -975,71 +1039,72 @@ impl PendingMessageStore {
         id_filter: &str,
         kind_filter: &str,
     ) -> Result<Option<ClaimedMessage>> {
-        let mut conn = self.open_claim_connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
+        self.with_claim_connection(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            reclaim_stale_tx(&tx, saturating_cutoff(now_secs(), claim_ttl_secs))?;
 
-        let now = now_secs();
-        let row = tx
-            .query_row(
+            let now = now_secs();
+            let row = tx
+                .query_row(
+                    r#"
+                    SELECT id, kind, payload, retry_count, source_hash, created_at
+                    FROM pending_messages
+                    WHERE id = ?1
+                      AND status = 'pending'
+                      AND next_attempt_at <= ?2
+                      AND kind = ?3
+                    LIMIT 1
+                    "#,
+                    params![id_filter, now, kind_filter],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            let Some((id, kind, payload, retry_count_i64, source_hash, created_at)) = row else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let retry_count = u32::try_from(retry_count_i64)
+                .map_err(|_| QueueError::RetryCountOverflow { id: id.clone() })?;
+            let claim_token = format!("{worker_id}:{}", next_id("claim"));
+            let updated = tx.execute(
                 r#"
-                SELECT id, kind, payload, retry_count, source_hash, created_at
-                FROM pending_messages
-                WHERE id = ?1
-                  AND status = 'pending'
-                  AND next_attempt_at <= ?2
-                  AND kind = ?3
-                LIMIT 1
+                UPDATE pending_messages
+                SET status = 'claimed',
+                    claim_token = ?2,
+                    claimed_at = ?3,
+                    heartbeat_at = ?3,
+                    op_state = 'running'
+                WHERE id = ?1 AND status = 'pending' AND kind = ?4
                 "#,
-                params![id_filter, now, kind_filter],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )
-            .optional()?;
+                params![id, claim_token, now, kind_filter],
+            )?;
+            if updated == 0 {
+                tx.commit()?;
+                return Ok(None);
+            }
 
-        let Some((id, kind, payload, retry_count_i64, source_hash, created_at)) = row else {
             tx.commit()?;
-            return Ok(None);
-        };
-        let retry_count = u32::try_from(retry_count_i64)
-            .map_err(|_| QueueError::RetryCountOverflow { id: id.clone() })?;
-        let claim_token = format!("{worker_id}:{}", next_id("claim"));
-        let updated = tx.execute(
-            r#"
-            UPDATE pending_messages
-            SET status = 'claimed',
-                claim_token = ?2,
-                claimed_at = ?3,
-                heartbeat_at = ?3,
-                op_state = 'running'
-            WHERE id = ?1 AND status = 'pending' AND kind = ?4
-            "#,
-            params![id, claim_token, now, kind_filter],
-        )?;
-        if updated == 0 {
-            tx.commit()?;
-            return Ok(None);
-        }
-
-        tx.commit()?;
-        Ok(Some(ClaimedMessage {
-            id,
-            kind,
-            payload,
-            retry_count,
-            claim_token,
-            source_hash,
-            created_at,
-            claimed_at: now,
-        }))
+            Ok(Some(ClaimedMessage {
+                id,
+                kind,
+                payload,
+                retry_count,
+                claim_token,
+                source_hash,
+                created_at,
+                claimed_at: now,
+            }))
+        })
     }
 
     pub fn confirm(&self, claim: &ClaimedMessage) -> Result<()> {
@@ -1523,8 +1588,24 @@ impl PendingMessageStore {
         self.open_connection_with_busy_timeout(None)
     }
 
-    fn open_claim_connection(&self) -> Result<Connection> {
-        self.open_connection_with_busy_timeout(Some(CLAIM_BUSY_TIMEOUT))
+    fn with_claim_connection<T>(&self, op: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        let mut guard = self
+            .claim_connection
+            .connection
+            .lock()
+            .map_err(|_| QueueError::ClaimConnectionMutexPoisoned)?;
+        if guard.is_none() {
+            let conn = self.open_connection_with_busy_timeout(Some(CLAIM_BUSY_TIMEOUT))?;
+            #[cfg(any(test, feature = "db-test-seam"))]
+            self.claim_connection
+                .open_count
+                .fetch_add(1, Ordering::SeqCst);
+            *guard = Some(conn);
+        }
+        let Some(conn) = guard.as_mut() else {
+            return Err(QueueError::ClaimConnectionUnavailable);
+        };
+        op(conn)
     }
 
     fn with_claim_lock_retry<T>(&self, op: impl FnMut() -> Result<T>) -> Result<T> {
@@ -2534,6 +2615,42 @@ mod tests {
             .expect("async ingest row remains visible");
         assert_eq!(ingest_status.op_state, "queued");
         assert!(ingest_status.claimed_at.is_none());
+    }
+
+    #[test]
+    fn claim_next_reuses_persistent_claim_connection_across_polls() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("palace.db");
+        Database::open(&db_path).expect("open db");
+        let store = PendingMessageStore::new(&db_path).expect("open queue");
+        let cloned_store = store.clone();
+
+        assert_eq!(store.claim_connection_open_count(), 0);
+        assert!(
+            cloned_store
+                .claim_next("hook-worker", 60)
+                .expect("first idle claim")
+                .is_none()
+        );
+        assert_eq!(store.claim_connection_open_count(), 1);
+
+        let hook_id = store
+            .enqueue("hook_user_prompt", r#"{"event":"UserPromptSubmit"}"#)
+            .expect("enqueue hook");
+        let claimed = cloned_store
+            .claim_next("hook-worker", 60)
+            .expect("claim hook")
+            .expect("hook row should be claimed");
+
+        assert_eq!(claimed.id, hook_id);
+        assert_eq!(store.claim_connection_open_count(), 1);
+        assert!(
+            cloned_store
+                .claim_next("hook-worker", 60)
+                .expect("second idle claim")
+                .is_none()
+        );
+        assert_eq!(store.claim_connection_open_count(), 1);
     }
 
     #[test]
