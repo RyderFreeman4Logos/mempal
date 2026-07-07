@@ -186,7 +186,7 @@ pub async fn run_llm_worker(
     let idx = WORKER_INDEX.fetch_add(1, Ordering::SeqCst);
     let worker_id = format!("llm-worker-{}-{idx}", std::process::id());
     tracing::info!("LLM worker started: {worker_id}");
-    let store = Arc::new(store.fork_claim_connection_cache());
+    let store = Arc::new(store.fork_connection_cache());
 
     if idx == 0 {
         let reclaimed = store

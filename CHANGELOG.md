@@ -33,6 +33,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **Queue**: `PendingMessageStore` now reuses cached writer and reader SQLite
+  connections across enqueue, confirm, status, retry, and archive paths,
+  eliminating non-claim connection churn under WAL mode (#674).
 - **Daemon/Queue**: idle hook and LLM workers now reuse claim SQLite
   connections and exponentially back off empty queue polls, reducing idle
   daemon `rchar` from connection churn (#672).
