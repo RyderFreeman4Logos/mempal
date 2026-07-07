@@ -21,6 +21,7 @@ use super::status::LlmStatus;
 const LLM_TASK_KIND: &str = "llm_task";
 const LLM_CLAIM_TTL_SECS: i64 = 300;
 const LLM_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const LLM_MAX_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LLM_VERDICT_KEEP: &str = "keep";
 const LLM_VERDICT_REJECT: &str = "reject";
 
@@ -185,6 +186,7 @@ pub async fn run_llm_worker(
     let idx = WORKER_INDEX.fetch_add(1, Ordering::SeqCst);
     let worker_id = format!("llm-worker-{}-{idx}", std::process::id());
     tracing::info!("LLM worker started: {worker_id}");
+    let store = Arc::new(store.fork_claim_connection_cache());
 
     if idx == 0 {
         let reclaimed = store
@@ -201,6 +203,7 @@ pub async fn run_llm_worker(
     // is bumped and any in-flight task is cancelled so the worker restarts
     // with the new config.
     let mut llm_gen_rx = ConfigHandle::subscribe_llm_gen();
+    let mut idle_count = 0_u32;
 
     loop {
         if crate::daemon::shutdown_requested() {
@@ -213,6 +216,7 @@ pub async fn run_llm_worker(
         // only after a task is claimed, using the then-current LLM generation.
         let config = ConfigHandle::current();
         if !crate::daemon::llm_worker_claim_enabled(config.as_ref()) {
+            idle_count = 0;
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -227,15 +231,19 @@ pub async fn run_llm_worker(
         {
             Ok(Some(msg)) => msg,
             Ok(None) => {
-                tokio::time::sleep(LLM_POLL_INTERVAL).await;
+                let effective_interval = llm_idle_poll_interval(LLM_POLL_INTERVAL, idle_count);
+                idle_count = idle_count.saturating_add(1);
+                tokio::time::sleep(effective_interval).await;
                 continue;
             }
             Err(error) => {
+                idle_count = 0;
                 tracing::warn!(?error, "LLM worker claim_next failed");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };
+        idle_count = 0;
 
         let (router, config) =
             match client_for_claimed_generation(&client_runtime, &mut llm_gen_rx).await {
@@ -334,6 +342,16 @@ pub async fn run_llm_worker(
     }
 
     Ok(())
+}
+
+fn llm_idle_poll_interval(base_interval: Duration, idle_count: u32) -> Duration {
+    let multiplier = 1_u32
+        .checked_shl(idle_count.min(u32::BITS - 1))
+        .unwrap_or(u32::MAX);
+    base_interval
+        .checked_mul(multiplier)
+        .unwrap_or(LLM_MAX_IDLE_POLL_INTERVAL)
+        .min(LLM_MAX_IDLE_POLL_INTERVAL)
 }
 
 /// Confirm a completed LLM task in the pending-message store.
@@ -782,6 +800,34 @@ mod tests {
         assert!(
             observed >= 5,
             "{label} advanced ticker {observed} times; LLM DB verdict work must not block Tokio worker"
+        );
+    }
+
+    #[test]
+    fn llm_idle_poll_interval_backs_off_exponentially_and_caps() {
+        assert_eq!(
+            super::llm_idle_poll_interval(LLM_POLL_INTERVAL, 0),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            super::llm_idle_poll_interval(LLM_POLL_INTERVAL, 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            super::llm_idle_poll_interval(LLM_POLL_INTERVAL, 2),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            super::llm_idle_poll_interval(LLM_POLL_INTERVAL, 3),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            super::llm_idle_poll_interval(LLM_POLL_INTERVAL, 4),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            super::llm_idle_poll_interval(LLM_POLL_INTERVAL, 20),
+            Duration::from_secs(5)
         );
     }
 
