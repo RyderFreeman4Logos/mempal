@@ -33,6 +33,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   behavior, and prioritized optimization path.
 
 ### Fixed
+- **Daemon**: writer-lease recovery now binds daemon PIDs to process-start
+  identities on every liveness path. Embedder status validates the Linux
+  process-start identity plus daemon pidfile and fails closed elsewhere (#685).
 - **MCP**: `mempal_ingest` now performs bounded synchronous self-recovery when
   queue admission is blocked by the current MCP server's own SQLite holder,
   avoiding self-deadlock without inventing a durable operation row (#681).

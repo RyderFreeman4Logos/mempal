@@ -1130,6 +1130,7 @@ mod tests {
             running: true,
             embedder: Some(DaemonEmbedderRuntimeStatus {
                 pid: 42,
+                process_identity: "test-process".to_string(),
                 updated_at_unix_secs: 123,
                 cache_loaded: true,
                 mode: "configured".to_string(),

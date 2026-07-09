@@ -12,6 +12,8 @@ pub const DAEMON_EMBEDDER_STATUS_FILE: &str = "daemon-embedder-status.json";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonEmbedderRuntimeStatus {
     pub pid: u32,
+    #[serde(default)]
+    pub process_identity: String,
     pub updated_at_unix_secs: u64,
     pub cache_loaded: bool,
     pub mode: String,
@@ -31,6 +33,7 @@ impl DaemonEmbedderRuntimeStatus {
         let model = daemon_config.embed.effective_model_summary();
         Self {
             pid: std::process::id(),
+            process_identity: crate::core::process_identity::current_process_identity().to_string(),
             updated_at_unix_secs: unix_secs(),
             cache_loaded: false,
             mode: config.daemon.embedder_mode.as_str().to_string(),
@@ -52,6 +55,7 @@ impl DaemonEmbedderRuntimeStatus {
         let model = daemon_config.embed.effective_model_summary();
         Self {
             pid: std::process::id(),
+            process_identity: crate::core::process_identity::current_process_identity().to_string(),
             updated_at_unix_secs: unix_secs(),
             cache_loaded: true,
             mode: config.daemon.embedder_mode.as_str().to_string(),
@@ -98,10 +102,40 @@ pub fn read_embedder_status(mempal_home: &Path) -> io::Result<Option<DaemonEmbed
     };
     let status =
         serde_json::from_slice::<DaemonEmbedderRuntimeStatus>(&bytes).map_err(io::Error::other)?;
-    Ok(process_is_running(status.pid).then_some(status))
+    let Some(daemon_pid) = read_daemon_pid(mempal_home)? else {
+        return Ok(None);
+    };
+    if daemon_pid != status.pid || status.process_identity.is_empty() {
+        return Ok(None);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !process_is_running(status.pid)
+            || !crate::core::process_identity::process_identity_matches(
+                status.pid,
+                &status.process_identity,
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(status))
+    }
 }
 
-#[cfg(unix)]
+fn read_daemon_pid(mempal_home: &Path) -> io::Result<Option<u32>> {
+    let content = match fs::read_to_string(mempal_home.join("daemon.pid")) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(content.trim().parse::<u32>().ok().filter(|pid| *pid > 0))
+}
+
+#[cfg(target_os = "linux")]
 fn process_is_running(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -117,11 +151,6 @@ fn process_is_running(pid: u32) -> bool {
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
-fn process_is_running(pid: u32) -> bool {
-    pid == std::process::id()
-}
-
 fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -133,11 +162,13 @@ fn unix_secs() -> u64 {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_daemon_embedder_status_round_trips_without_raw_content() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let status = DaemonEmbedderRuntimeStatus {
             pid: std::process::id(),
+            process_identity: crate::core::process_identity::current_process_identity().to_string(),
             updated_at_unix_secs: 123,
             cache_loaded: true,
             mode: "remote".to_string(),
@@ -148,6 +179,11 @@ mod tests {
             source: "daemon-rest".to_string(),
         };
 
+        std::fs::write(
+            tmp.path().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("write pidfile");
         write_embedder_status_atomic(tmp.path(), &status).expect("write status");
         let read = read_embedder_status(tmp.path())
             .expect("read status")
@@ -164,6 +200,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let status = DaemonEmbedderRuntimeStatus {
             pid: u32::MAX,
+            process_identity: "missing-process".to_string(),
             updated_at_unix_secs: 123,
             cache_loaded: true,
             mode: "remote".to_string(),
@@ -174,10 +211,90 @@ mod tests {
             source: "daemon-rest".to_string(),
         };
 
+        std::fs::write(tmp.path().join("daemon.pid"), u32::MAX.to_string())
+            .expect("write stale pidfile");
         write_embedder_status_atomic(tmp.path(), &status).expect("write stale status");
 
         assert_eq!(
             read_embedder_status(tmp.path()).expect("read stale status"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_reused_pid_with_different_start_identity_is_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pid = std::process::id();
+        std::fs::write(tmp.path().join("daemon.pid"), pid.to_string()).expect("write pidfile");
+        let status = serde_json::json!({
+            "pid": pid,
+            "process_identity": "previous-process-start",
+            "updated_at_unix_secs": 123,
+            "cache_loaded": true,
+            "mode": "remote",
+            "backend": "openai_compat",
+            "model": "legacy=Qwen/Qwen3-Embedding-8B",
+            "dimensions": 4096,
+            "fallback": null,
+            "source": "daemon-rest"
+        });
+        std::fs::write(
+            embedder_status_path(tmp.path()),
+            serde_json::to_vec_pretty(&status).expect("serialize stale status"),
+        )
+        .expect("write stale status");
+
+        assert_eq!(
+            read_embedder_status(tmp.path()).expect("read reused-pid status"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_status_without_matching_daemon_pidfile_is_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let status = DaemonEmbedderRuntimeStatus {
+            pid: std::process::id(),
+            process_identity: crate::core::process_identity::current_process_identity().to_string(),
+            updated_at_unix_secs: 123,
+            cache_loaded: true,
+            mode: "remote".to_string(),
+            backend: "openai_compat".to_string(),
+            model: None,
+            dimensions: Some(4096),
+            fallback: None,
+            source: "daemon-rest".to_string(),
+        };
+        write_embedder_status_atomic(tmp.path(), &status).expect("write status");
+
+        assert_eq!(
+            read_embedder_status(tmp.path()).expect("read status without pidfile"),
+            None
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_status_fails_closed_without_process_birth_verification() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let status = DaemonEmbedderRuntimeStatus {
+            pid: 42,
+            process_identity: "unverifiable-process".to_string(),
+            updated_at_unix_secs: 123,
+            cache_loaded: true,
+            mode: "remote".to_string(),
+            backend: "openai_compat".to_string(),
+            model: None,
+            dimensions: Some(4096),
+            fallback: None,
+            source: "daemon-rest".to_string(),
+        };
+        std::fs::write(tmp.path().join("daemon.pid"), "42").expect("write pidfile");
+        write_embedder_status_atomic(tmp.path(), &status).expect("write status");
+
+        assert_eq!(
+            read_embedder_status(tmp.path()).expect("read unverifiable status"),
             None
         );
     }

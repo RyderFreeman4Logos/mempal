@@ -890,7 +890,7 @@ fn read_boot_time(proc_root: &Path) -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn read_start_ticks(path: &Path) -> Option<u64> {
     let content = fs::read(path).ok()?;
-    parse_start_ticks(&content)
+    crate::core::process_identity::parse_start_ticks(&content)
 }
 
 #[cfg(target_os = "linux")]
@@ -907,27 +907,6 @@ fn parse_parent_pid(stat: &[u8]) -> Option<i32> {
         .filter(|field| !field.is_empty())
         .nth(1)?;
     std::str::from_utf8(parent_pid).ok()?.parse::<i32>().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn parse_start_ticks(stat: &[u8]) -> Option<u64> {
-    let close = stat.windows(2).rposition(|window| window == b") ")?;
-    let start_ticks = stat[close + 2..]
-        .split(u8::is_ascii_whitespace)
-        .filter(|field| !field.is_empty())
-        .nth(19)?
-        .iter()
-        .try_fold(0_u64, |value, digit| {
-            digit
-                .checked_sub(b'0')
-                .filter(|digit| *digit <= 9)
-                .and_then(|digit| {
-                    value
-                        .checked_mul(10)
-                        .and_then(|value| value.checked_add(u64::from(digit)))
-                })
-        })?;
-    Some(start_ticks)
 }
 
 #[cfg(target_os = "linux")]
@@ -1193,7 +1172,10 @@ mod tests {
                 "--mcp".to_string()
             ]));
             let stat = b"123 (mempal worker) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 98765";
-            assert_eq!(parse_start_ticks(stat), Some(98765));
+            assert_eq!(
+                crate::core::process_identity::parse_start_ticks(stat),
+                Some(98765)
+            );
         }
 
         #[test]

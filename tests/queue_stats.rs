@@ -910,38 +910,40 @@ fn test_daemon_start_requeues_previous_identity_writer_lease_failures() {
     let id = store
         .enqueue("hook_post_tool", r#"{"event":"PostToolUse"}"#)
         .expect("enqueue hook");
+    let previous_owner = "mempal-daemon-1000-previous-start";
+    let current_owner = "mempal-daemon-1000-current-start";
     let claim = store
-        .claim_next("mempal-daemon-1000", 60)
+        .claim_next(previous_owner, 60)
         .expect("claim hook")
         .expect("hook available");
     store
         .mark_failed(
             &claim,
-            "SQLite writer lease `sqlite-writer` for mempal-daemon-1000 was lost before build daemon hook drawer records",
+            "SQLite writer lease `sqlite-writer` for mempal-daemon-1000-previous-start was lost before build daemon hook drawer records",
         )
         .expect("record previous identity lease loss");
     store
         .enqueue("hook_post_tool", r#"{"event":"PostToolUseCurrent"}"#)
         .expect("enqueue current daemon hook");
     let current_claim = store
-        .claim_next("mempal-daemon-2000", 60)
+        .claim_next(current_owner, 60)
         .expect("claim current daemon hook")
         .expect("current daemon hook available");
     store
         .mark_failed(
             &current_claim,
-            "SQLite writer lease `sqlite-writer` for mempal-daemon-2000 was lost before build daemon hook drawer records",
+            "SQLite writer lease `sqlite-writer` for mempal-daemon-1000-current-start was lost before build daemon hook drawer records",
         )
         .expect("record current identity lease loss");
 
     assert_eq!(
         store
-            .requeue_writer_lease_failures_for_daemon_start("mempal-daemon-2000")
+            .requeue_writer_lease_failures_for_daemon_start(current_owner)
             .expect("requeue previous identity failures"),
         1
     );
     let reclaimed = store
-        .claim_next("mempal-daemon-2000", 60)
+        .claim_next(current_owner, 60)
         .expect("claim rebound hook")
         .expect("rebound hook must be runnable immediately");
     assert_eq!(reclaimed.id, id);

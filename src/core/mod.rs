@@ -14,6 +14,7 @@ pub mod hot_reload;
 pub mod patterns;
 pub mod phase3;
 pub mod priming;
+pub(crate) mod process_identity;
 pub mod project;
 pub mod protocol;
 pub mod queue;
