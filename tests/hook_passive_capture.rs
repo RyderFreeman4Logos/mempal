@@ -4,6 +4,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -109,6 +110,24 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration, label: 
         .spawn()
         .unwrap_or_else(|error| panic!("spawn {label}: {error}"));
     wait_child_output_timeout(child, timeout, label)
+}
+
+fn run_hook(home: &Path, command: &str, payload: &[u8]) -> Output {
+    let mut child = Command::new(mempal_bin())
+        .args(["hook", command])
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook command");
+    child
+        .stdin
+        .as_mut()
+        .expect("hook stdin")
+        .write_all(payload)
+        .expect("write hook payload");
+    child.wait_with_output().expect("wait hook")
 }
 
 fn wait_child_output_timeout(mut child: Child, timeout: Duration, label: &str) -> Output {
@@ -478,6 +497,95 @@ async fn test_daemon_processes_hook_post_tool_to_drawer() {
         "privacy scrub must affect stored preview: {body}"
     );
     assert!(!body.contains(raw_secret), "raw secret leaked into drawer");
+
+    daemon.sigterm();
+    let status = daemon.wait().await.expect("wait daemon");
+    assert!(status.success(), "daemon exited with {status:?}");
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_daemon_promotes_spooled_hook_payload_to_raw_mirror_and_cleans_spool() {
+    let _guard = test_guard().await;
+    let (tmp, mempal_home, db_path, config_path) = setup_home();
+    let (addr, handle) = start_embed_mock(0).await.expect("start embed mock");
+    write_config(
+        &config_path,
+        &db_path,
+        true,
+        50,
+        60,
+        Some(&format!("http://{addr}/v1")),
+    );
+    let raw_marker = "MEDIUM_DAEMON_RAW_MARKER";
+    let raw_payload = serde_json::json!({
+        "session_id": "sess-spooled-daemon",
+        "tool_name": "Bash",
+        "input": "printf medium",
+        "output": raw_marker.repeat(4 * 1024),
+        "exit_code": 0
+    })
+    .to_string();
+    assert!(raw_payload.len() > mempal::hook::MAX_ENVELOPE_INLINE_PAYLOAD_BYTES);
+    assert!(raw_payload.len() < mempal::hook::MAX_INLINE_PAYLOAD_BYTES);
+
+    let output = run_hook(tmp.path(), "hook_post_tool", raw_payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty(), "spooled hook should stay quiet");
+    let queued_payload: String = Connection::open(&db_path)
+        .expect("open sqlite")
+        .query_row(
+            "SELECT payload FROM pending_messages ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("queued payload");
+    assert!(
+        !queued_payload.contains(raw_marker),
+        "queue payload must carry handle only"
+    );
+    let queued_json: serde_json::Value =
+        serde_json::from_str(&queued_payload).expect("queued envelope");
+    let spool_path = PathBuf::from(
+        queued_json["payload_path"]
+            .as_str()
+            .expect("spooled payload path"),
+    );
+    assert!(
+        spool_path.exists(),
+        "spool must exist before daemon consumes it"
+    );
+    assert!(spool_path.starts_with(mempal_home.join(mempal::hook::HOOK_SPOOL_DIR)));
+
+    let mut daemon = DaemonSupervisor::spawn(
+        HashMap::from([("HOME".to_string(), tmp.path().display().to_string())]),
+        vec!["--foreground".to_string()],
+    )
+    .await
+    .expect("spawn daemon");
+    daemon
+        .wait_ready(Duration::from_secs(5))
+        .await
+        .expect("wait ready");
+    wait_for_condition(Duration::from_secs(10), || drawer_count(&db_path) > 0).await;
+
+    let (wing, room, content, source_file) = latest_drawer_row(&db_path);
+    assert_eq!(wing, "hooks-raw");
+    assert_eq!(room, "Bash");
+    assert!(content.contains("\"preview\""), "{content}");
+    assert_eq!(
+        fs::read_to_string(&source_file).expect("read promoted raw mirror"),
+        raw_payload
+    );
+    assert!(
+        !spool_path.exists(),
+        "successful daemon processing must remove temporary hook spool"
+    );
+    assert!(
+        Path::new(&source_file).starts_with(mempal_home.join("hook-payloads")),
+        "raw mirror must use existing hook-payloads layout"
+    );
 
     daemon.sigterm();
     let status = daemon.wait().await.expect("wait daemon");

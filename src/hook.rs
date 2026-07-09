@@ -1,6 +1,8 @@
 use std::env;
-use std::io::{self, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::{
     config::{Config, ConfigHandle, TurnStorageMode, default_config_path},
@@ -20,7 +22,14 @@ use crate::hook_install::{self, HookInstallTarget};
 /// The hook process reads at most one byte past this limit so oversized streams
 /// can be detected without draining or buffering unbounded stdin.
 pub const MAX_INLINE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum payload admitted directly into the JSON hook envelope.
+///
+/// Larger accepted payloads, still capped by [`MAX_INLINE_PAYLOAD_BYTES`], are
+/// written once to `hook-spool/` and queued by handle so IPC/SQLite do not carry
+/// near-10 MiB raw bodies through every stage.
+pub const MAX_ENVELOPE_INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_STDIN_READ_BYTES: usize = MAX_INLINE_PAYLOAD_BYTES + 1;
+pub const HOOK_SPOOL_DIR: &str = "hook-spool";
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum HookCommands {
@@ -107,6 +116,11 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
     let event_name = event.display_name();
 
     let captured = capture_stdin_payload(stdin, &mempal_home)?;
+    let was_spooled = captured.payload_path.is_some() && captured.inline_payload.is_none();
+    let payload_path = captured
+        .payload_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
     let envelope = CapturedHookEnvelope {
         event: event.display_name().to_string(),
         kind: event.queue_kind().to_string(),
@@ -119,9 +133,7 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
         captured_at: current_timestamp(),
         claude_cwd: current_working_directory(),
         payload: captured.inline_payload,
-        payload_path: captured
-            .payload_path
-            .map(|path| path.to_string_lossy().to_string()),
+        payload_path,
         payload_preview: captured.preview,
         original_size_bytes: captured.original_size_bytes,
         truncated: captured.truncated,
@@ -143,6 +155,15 @@ pub fn enqueue_from_stdin(event: HookEvent) -> Result<()> {
             &crate::hook_diagnostics::HookOutcome::Truncated {
                 lower_bound_bytes: envelope.original_size_bytes as u64,
                 inline_limit_bytes: MAX_INLINE_PAYLOAD_BYTES as u64,
+            },
+        );
+    } else if was_spooled {
+        crate::hook_diagnostics::log_hook_failure(
+            &mempal_home,
+            event_name,
+            &crate::hook_diagnostics::HookOutcome::Spooled {
+                size_bytes: envelope.original_size_bytes as u64,
+                inline_threshold_bytes: MAX_ENVELOPE_INLINE_PAYLOAD_BYTES as u64,
             },
         );
     }
@@ -323,11 +344,23 @@ struct CapturedPayload {
     truncated: bool,
 }
 
-fn capture_stdin_payload(bytes: Vec<u8>, _mempal_home: &Path) -> Result<CapturedPayload> {
+fn capture_stdin_payload(bytes: Vec<u8>, mempal_home: &Path) -> Result<CapturedPayload> {
     let original_size_bytes = bytes.len();
-    if original_size_bytes <= MAX_INLINE_PAYLOAD_BYTES {
+    if original_size_bytes > MAX_INLINE_PAYLOAD_BYTES {
         return Ok(CapturedPayload {
-            inline_payload: Some(decode_stdin_bytes(&bytes)),
+            inline_payload: None,
+            payload_path: None,
+            preview: None,
+            original_size_bytes: MAX_STDIN_READ_BYTES,
+            original_size_is_lower_bound: true,
+            truncated: true,
+        });
+    }
+
+    let payload = decode_stdin_bytes(&bytes);
+    if original_size_bytes <= MAX_ENVELOPE_INLINE_PAYLOAD_BYTES {
+        return Ok(CapturedPayload {
+            inline_payload: Some(payload),
             payload_path: None,
             preview: None,
             original_size_bytes,
@@ -336,14 +369,47 @@ fn capture_stdin_payload(bytes: Vec<u8>, _mempal_home: &Path) -> Result<Captured
         });
     }
 
+    let payload_path = spool_hook_payload(&payload, mempal_home)?;
     Ok(CapturedPayload {
         inline_payload: None,
-        payload_path: None,
+        payload_path: Some(payload_path),
         preview: None,
-        original_size_bytes: MAX_STDIN_READ_BYTES,
-        original_size_is_lower_bound: true,
-        truncated: true,
+        original_size_bytes,
+        original_size_is_lower_bound: false,
+        truncated: false,
     })
+}
+
+fn spool_hook_payload(raw_payload: &str, mempal_home: &Path) -> Result<PathBuf> {
+    let digest = blake3::hash(raw_payload.as_bytes()).to_hex().to_string();
+    let spool_dir = mempal_home.join(HOOK_SPOOL_DIR);
+    fs::create_dir_all(&spool_dir)
+        .with_context(|| format!("failed to create {}", spool_dir.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = spool_dir.join(format!("{}.{}.{}.json", digest, std::process::id(), nonce));
+    let tmp_path = spool_dir.join(format!("{digest}.{}.{}.tmp", std::process::id(), nonce));
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+        file.write_all(raw_payload.as_bytes())
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("failed to flush {}", tmp_path.display()))?;
+    }
+
+    match fs::rename(&tmp_path, &path) {
+        Ok(()) => Ok(path),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to publish hook spool {}", path.display()))
+        }
+    }
 }
 
 fn decode_stdin_bytes(bytes: &[u8]) -> String {
@@ -509,5 +575,27 @@ mod tests {
         assert!(captured.preview.is_none());
         assert!(!captured.original_size_is_lower_bound);
         assert!(!captured.truncated);
+    }
+
+    #[test]
+    fn test_medium_capture_spools_payload_by_handle() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let payload = format!(
+            r#"{{"prompt":"{}"}}"#,
+            "medium-payload-marker".repeat(4 * 1024)
+        );
+
+        let captured = capture_stdin_payload(payload.as_bytes().to_vec(), tmp.path())
+            .expect("capture medium payload");
+
+        assert!(captured.inline_payload.is_none());
+        assert!(!captured.truncated);
+        assert_eq!(captured.original_size_bytes, payload.len());
+        let payload_path = captured.payload_path.expect("spooled path");
+        assert!(payload_path.starts_with(tmp.path().join(HOOK_SPOOL_DIR)));
+        assert_eq!(
+            std::fs::read_to_string(payload_path).expect("read spooled payload"),
+            payload
+        );
     }
 }

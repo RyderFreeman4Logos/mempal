@@ -609,6 +609,62 @@ fn test_hook_envelopes_oversized_payload() {
 }
 
 #[test]
+fn test_hook_spools_medium_payload_without_queueing_raw_body() {
+    let (home, db_path) = setup_home();
+    let raw_marker = "MEDIUM_QUEUE_BODY_MARKER";
+    let payload = format!(
+        r#"{{"tool_name":"Bash","input":"printf medium","output":"{}","exit_code":0}}"#,
+        raw_marker.repeat(4 * 1024)
+    );
+    assert!(payload.len() < mempal::hook::MAX_INLINE_PAYLOAD_BYTES);
+    assert!(payload.len() > mempal::hook::MAX_ENVELOPE_INLINE_PAYLOAD_BYTES);
+
+    let output = run_hook(&home, "hook_post_tool", payload.as_bytes());
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(
+        output.stderr.is_empty(),
+        "spooled hook admission should stay quiet"
+    );
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    let envelope: String = conn
+        .query_row(
+            "SELECT payload FROM pending_messages ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query queue");
+    let envelope_json: Value = serde_json::from_str(&envelope).expect("envelope json");
+
+    assert_eq!(envelope_json["truncated"], false);
+    assert!(envelope_json["payload"].is_null());
+    assert_eq!(
+        envelope_json["original_size_bytes"].as_u64(),
+        Some(payload.len() as u64)
+    );
+    assert!(
+        !envelope.contains(raw_marker),
+        "queue envelope must not contain raw medium body"
+    );
+    let payload_path = envelope_json["payload_path"]
+        .as_str()
+        .expect("spool payload path");
+    assert!(payload_path.contains(mempal::hook::HOOK_SPOOL_DIR));
+    assert_eq!(
+        fs::read_to_string(payload_path).expect("read spooled payload"),
+        payload
+    );
+
+    let stats = mempal::hook_diagnostics::hook_admission_stats(
+        &home.path().join(".mempal"),
+        mempal::hook::MAX_INLINE_PAYLOAD_BYTES as u64,
+    );
+    assert_eq!(stats.spooled_count, 1);
+}
+
+#[test]
 fn test_hook_storage_mode_off_skips_raw_turn_enqueue() {
     let (home, db_path) = setup_home_with_extra_config(
         r#"

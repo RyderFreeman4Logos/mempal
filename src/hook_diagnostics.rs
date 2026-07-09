@@ -23,6 +23,10 @@ pub enum HookOutcome {
         lower_bound_bytes: u64,
         inline_limit_bytes: u64,
     },
+    Spooled {
+        size_bytes: u64,
+        inline_threshold_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -67,6 +71,14 @@ fn try_log(path: &Path, event: &str, outcome: &HookOutcome) -> std::io::Result<(
         } => {
             format!(
                 "{now} TRUNCATED event={event} lower_bound_bytes={lower_bound_bytes} inline_limit_bytes={inline_limit_bytes}\n"
+            )
+        }
+        HookOutcome::Spooled {
+            size_bytes,
+            inline_threshold_bytes,
+        } => {
+            format!(
+                "{now} SPOOLED event={event} size_bytes={size_bytes} inline_threshold_bytes={inline_threshold_bytes}\n"
             )
         }
     };
@@ -121,6 +133,8 @@ pub fn hook_admission_stats(mempal_home: &Path, inline_limit_bytes: u64) -> Hook
             stats.oversize_truncated_count = stats.oversize_truncated_count.saturating_add(1);
             stats.last_lower_bound_bytes = field_u64(line, "lower_bound_bytes=");
             stats.last_error_class = Some("oversize_truncated".to_string());
+        } else if line.contains(" SPOOLED ") {
+            stats.spooled_count = stats.spooled_count.saturating_add(1);
         } else if line.contains(" DROPPED ") {
             stats.last_error_class = field_str(line, "stage=")
                 .map(|stage| format!("dropped:{stage}"))
@@ -228,6 +242,31 @@ mod tests {
             stats.last_error_class.as_deref(),
             Some("oversize_truncated")
         );
+    }
+
+    #[test]
+    fn test_hook_admission_stats_counts_spooled_without_content() {
+        let tmp = TempDir::new().unwrap();
+        log_hook_failure(
+            tmp.path(),
+            "PostToolUse",
+            &HookOutcome::Spooled {
+                size_bytes: 131_072,
+                inline_threshold_bytes: 65_536,
+            },
+        );
+        let content = fs::read_to_string(tmp.path().join(LOG_FILENAME)).unwrap();
+        assert!(content.contains("SPOOLED"));
+        assert!(content.contains("size_bytes=131072"));
+        assert!(content.contains("inline_threshold_bytes=65536"));
+        assert!(!content.contains("payload"));
+        assert!(!content.contains("Authorization"));
+
+        let stats = hook_admission_stats(tmp.path(), 10_485_760);
+
+        assert_eq!(stats.spooled_count, 1);
+        assert_eq!(stats.oversize_truncated_count, 0);
+        assert_eq!(stats.last_error_class, None);
     }
 
     #[test]

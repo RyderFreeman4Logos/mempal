@@ -59,6 +59,7 @@ const DAEMON_HOOK_WORKER_LIMIT: usize = 4;
 const MAX_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const ENDPOINT_RECOVERY_REQUEUE_INTERVAL: Duration = Duration::from_secs(30);
 const AUTOMATIC_HOOK_LLM_GATE_MAX_SECS: u64 = 30;
+const MAX_AUTOMATIC_HOOK_LLM_GATE_CONTENT_BYTES: usize = 16 * 1024;
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const DAEMON_WRITER_LEASE_TTL_SECS: u64 = 120;
 const DAEMON_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
@@ -1294,6 +1295,13 @@ struct DrawerIngestContext<'a, E: Embedder + ?Sized> {
     embedder: &'a E,
     daemon: &'a DaemonIngestContext<'a>,
     envelope: &'a CapturedHookEnvelope,
+    hook_payload: &'a HookPayloadBody,
+}
+
+#[derive(Debug, Clone)]
+struct HookPayloadBody {
+    raw_payload: Option<String>,
+    spool_path: Option<PathBuf>,
 }
 
 async fn poll_claim_next<'a, S>(
@@ -1326,8 +1334,10 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
 ) -> Result<String> {
     let envelope: CapturedHookEnvelope =
         serde_json::from_str(&message.payload).context("failed to decode queued hook envelope")?;
+    let hook_payload = load_hook_payload_body(&envelope, context.mempal_home)?;
     let records = {
         let envelope = envelope.clone();
+        let hook_payload = hook_payload.clone();
         let config = (*context.config).clone();
         let mempal_home = context.mempal_home.to_path_buf();
         let runtime_writer_lease = context.runtime_writer_lease.cloned();
@@ -1337,7 +1347,7 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
                 runtime_writer_lease.as_ref(),
                 "build daemon hook drawer records",
             )?;
-            build_drawer_records(db, &envelope, &config, &mempal_home)
+            build_drawer_records(db, &envelope, &hook_payload, &config, &mempal_home)
         })
         .await?
     };
@@ -1349,6 +1359,7 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         embedder,
         daemon: &context,
         envelope: &envelope,
+        hook_payload: &hook_payload,
     };
     let mut last_drawer_id = None;
     for record in records {
@@ -1374,10 +1385,7 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         last_drawer_id = Some(drawer_id);
     }
 
-    if let Some(stats) =
-        auto_ingest_hermes_session_end(db, store, worker_id, message, embedder, &context, &envelope)
-            .await?
-    {
+    if let Some(stats) = auto_ingest_hermes_session_end(&drawer_context).await? {
         tracing::info!(
             turns_parsed = stats.turns_parsed,
             turns_inserted = stats.turns_inserted,
@@ -1388,18 +1396,117 @@ pub async fn process_claimed_message_with_embedder<E: Embedder + ?Sized>(
         );
     }
 
+    cleanup_hook_spool_payload(&hook_payload)?;
     Ok(last_drawer_id.unwrap_or_else(|| message.id.clone()))
+}
+
+fn load_hook_payload_body(
+    envelope: &CapturedHookEnvelope,
+    mempal_home: &Path,
+) -> Result<HookPayloadBody> {
+    if envelope.truncated {
+        return Ok(HookPayloadBody {
+            raw_payload: None,
+            spool_path: None,
+        });
+    }
+    if let Some(payload) = envelope.payload.clone() {
+        return Ok(HookPayloadBody {
+            raw_payload: Some(payload),
+            spool_path: None,
+        });
+    }
+    let Some(payload_path) = envelope.payload_path.as_deref() else {
+        return Ok(HookPayloadBody {
+            raw_payload: Some(String::new()),
+            spool_path: None,
+        });
+    };
+    let payload_path = validated_hook_payload_path(payload_path, mempal_home)?;
+    let raw_payload = fs::read_to_string(&payload_path).with_context(|| {
+        format!(
+            "failed to read hook payload handle {}",
+            payload_path.display()
+        )
+    })?;
+    let spool_path = is_hook_spool_path(&payload_path, mempal_home).then_some(payload_path);
+    Ok(HookPayloadBody {
+        raw_payload: Some(raw_payload),
+        spool_path,
+    })
+}
+
+fn validated_hook_payload_path(payload_path: &str, mempal_home: &Path) -> Result<PathBuf> {
+    let path = Path::new(payload_path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        mempal_home.join(path)
+    };
+    let canonical_home = fs::canonicalize(mempal_home)
+        .with_context(|| format!("failed to canonicalize {}", mempal_home.display()))?;
+    let canonical_path = fs::canonicalize(&path).with_context(|| {
+        format!(
+            "failed to canonicalize hook payload handle {}",
+            path.display()
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_home) {
+        anyhow::bail!(
+            "hook payload handle {} escapes mempal home {}",
+            canonical_path.display(),
+            canonical_home.display()
+        );
+    }
+    Ok(canonical_path)
+}
+
+fn is_hook_spool_path(path: &Path, mempal_home: &Path) -> bool {
+    fs::canonicalize(mempal_home.join(crate::hook::HOOK_SPOOL_DIR))
+        .is_ok_and(|spool_root| path.starts_with(spool_root))
+}
+
+fn cleanup_hook_spool_payload(payload: &HookPayloadBody) -> Result<()> {
+    let Some(spool_path) = payload.spool_path.as_deref() else {
+        return Ok(());
+    };
+    match fs::remove_file(spool_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to remove hook spool {}", spool_path.display())),
+    }
+}
+
+fn bounded_hook_gate_content(content: &str, original_size_bytes: usize) -> String {
+    if content.len() <= MAX_AUTOMATIC_HOOK_LLM_GATE_CONTENT_BYTES {
+        return content.to_string();
+    }
+    let mut end = 0;
+    for (index, ch) in content.char_indices() {
+        let next = index + ch.len_utf8();
+        if next > MAX_AUTOMATIC_HOOK_LLM_GATE_CONTENT_BYTES {
+            break;
+        }
+        end = next;
+    }
+    format!(
+        "{}\n\n[hook payload truncated for LLM gate; original_size_bytes={}]",
+        &content[..end],
+        original_size_bytes
+    )
 }
 
 fn build_gating_candidate(
     envelope: &CapturedHookEnvelope,
     record: &DrawerRecord,
+    hook_payload: &HookPayloadBody,
 ) -> IngestCandidate {
     let mut tool_name = None;
     let mut exit_code = None;
 
     if envelope.event == crate::hook::HookEvent::PostToolUse.display_name()
-        && let Some(payload) = envelope.payload.as_deref()
+        && let Some(payload) = hook_payload.raw_payload.as_deref()
         && let Ok(value) = serde_json::from_str::<Value>(payload)
     {
         tool_name = value
@@ -1412,8 +1519,16 @@ fn build_gating_candidate(
             .and_then(|value| i32::try_from(value).ok());
     }
 
+    let content = if hook_payload.spool_path.is_some() {
+        bounded_hook_gate_content(
+            analysis_content(&record.content),
+            envelope.original_size_bytes,
+        )
+    } else {
+        analysis_content(&record.content).to_string()
+    };
     IngestCandidate {
-        content: analysis_content(&record.content).to_string(),
+        content,
         event: Some(envelope.event.clone()),
         tool_name,
         exit_code,
@@ -1437,20 +1552,23 @@ async fn embed_text_with_heartbeat<E: Embedder + ?Sized>(
 }
 
 async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
-    db: &AsyncDb,
-    store: &AsyncPendingMessageStore,
-    worker_id: &str,
-    message: &ClaimedMessage,
-    embedder: &E,
-    context: &DaemonIngestContext<'_>,
-    envelope: &CapturedHookEnvelope,
+    ingest_context: &DrawerIngestContext<'_, E>,
 ) -> Result<Option<crate::xurl::ingest::IngestStats>> {
+    let db = ingest_context.db;
+    let store = ingest_context.store;
+    let worker_id = ingest_context.worker_id;
+    let message = ingest_context.message;
+    let embedder = ingest_context.embedder;
+    let daemon = ingest_context.daemon;
+    let envelope = ingest_context.envelope;
+    let hook_payload = ingest_context.hook_payload;
+
     if envelope.event != crate::hook::HookEvent::SessionEnd.display_name()
-        || !context.config.hooks.session_end.auto_ingest_conversation
+        || !daemon.config.hooks.session_end.auto_ingest_conversation
     {
         return Ok(None);
     }
-    if !context.config.ingest_gating.enabled {
+    if !daemon.config.ingest_gating.enabled {
         tracing::warn!(
             "SessionEnd Hermes auto-ingest skipped because ingest_gating.enabled is false; \
              automatic conversation import requires a pre-insert gate"
@@ -1458,7 +1576,8 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
         return Ok(Some(crate::xurl::ingest::IngestStats::default()));
     }
 
-    let Some(session_id) = hermes_session_id_from_envelope(envelope) else {
+    let Some(session_id) = hermes_session_id_from_payload(hook_payload.raw_payload.as_deref())
+    else {
         tracing::warn!(
             event = %envelope.event,
             agent = %envelope.agent,
@@ -1466,7 +1585,7 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
         );
         return Ok(Some(crate::xurl::ingest::IngestStats::default()));
     };
-    let profile = context.config.hooks.session_end.hermes_profile.trim();
+    let profile = daemon.config.hooks.session_end.hermes_profile.trim();
     let profile = if profile.is_empty() {
         "default"
     } else {
@@ -1474,7 +1593,7 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
     };
     let hermes_db = crate::xurl::ingest::default_hermes_db_path(
         profile,
-        context.config.hooks.session_end.hermes_home.as_deref(),
+        daemon.config.hooks.session_end.hermes_home.as_deref(),
     );
     if !hermes_db.exists() {
         tracing::warn!(
@@ -1535,10 +1654,10 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
         Ok(())
     };
 
-    let project_id = resolve_hook_project_id(envelope, context.config)?;
+    let project_id = resolve_hook_project_id(envelope, daemon.config)?;
     let mut kept_turns = Vec::new();
     for mut turn in parsed_turns {
-        turn.content = context.config.scrub_content(&turn.content);
+        turn.content = daemon.config.scrub_content(&turn.content);
         if turn.content.trim().is_empty() {
             continue;
         }
@@ -1546,7 +1665,7 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
         if gate_automatic_hermes_turn(
             db,
             embedder,
-            context,
+            daemon,
             AutomaticHermesTurnGateInput {
                 turn: &turn,
                 candidate_hash: &candidate_hash,
@@ -1571,7 +1690,7 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
         }));
     }
 
-    let runtime_writer_lease = context.runtime_writer_lease.cloned();
+    let runtime_writer_lease = daemon.runtime_writer_lease.cloned();
     let insert_stats = db
         .run_write_anyhow(move |db| {
             ensure_daemon_runtime_writer_lease_active(
@@ -1588,8 +1707,8 @@ async fn auto_ingest_hermes_session_end<E: Embedder + ?Sized>(
         db,
         embedder,
         &turn_ids,
-        context.config,
-        context.runtime_writer_lease,
+        daemon.config,
+        daemon.runtime_writer_lease,
         Some(&embed_heartbeat),
     )
     .await
@@ -1856,8 +1975,8 @@ async fn gate_automatic_hermes_turn<E: Embedder + ?Sized>(
     Ok(keep)
 }
 
-fn hermes_session_id_from_envelope(envelope: &CapturedHookEnvelope) -> Option<String> {
-    let payload = envelope.payload.as_deref()?;
+fn hermes_session_id_from_payload(payload: Option<&str>) -> Option<String> {
+    let payload = payload?;
     let value = serde_json::from_str::<Value>(payload).ok()?;
     json_string_at(&value, &["session_id"])
         .or_else(|| json_string_at(&value, &["sessionId"]))
@@ -1930,21 +2049,25 @@ struct DrawerRecord {
     bypass_novelty: bool,
     project_id: Option<String>,
     deferred_raw_payload: Option<String>,
+    deferred_raw_payload_path: Option<PathBuf>,
 }
 
 fn build_drawer_records(
     db: &Database,
     envelope: &CapturedHookEnvelope,
+    hook_payload: &HookPayloadBody,
     config: &crate::core::config::Config,
     mempal_home: &Path,
 ) -> Result<Vec<DrawerRecord>> {
-    let mut audit_record = build_audit_drawer_record(envelope, config, mempal_home)?;
+    let mut audit_record = build_audit_drawer_record(envelope, hook_payload, config, mempal_home)?;
     apply_turn_strata(&mut audit_record, config);
     let mut records = Vec::new();
     if should_keep_drawer_record(&audit_record, config) {
         records.push(audit_record.clone());
     }
-    if let Some(record) = build_user_prompt_project_record(db, envelope, config, &audit_record)? {
+    if let Some(record) =
+        build_user_prompt_project_record(db, envelope, hook_payload, config, &audit_record)?
+    {
         let mut record = record;
         apply_turn_strata(&mut record, config);
         if should_keep_drawer_record(&record, config) {
@@ -1953,7 +2076,7 @@ fn build_drawer_records(
     }
     if envelope.event == crate::hook::HookEvent::SessionEnd.display_name() {
         let session_review_payload = if config.hooks.session_end.extract_self_review {
-            load_session_review_payload(envelope)?
+            load_session_review_payload(envelope, hook_payload)?
         } else {
             None
         };
@@ -1990,6 +2113,7 @@ fn build_drawer_records(
                         bypass_novelty: true,
                         project_id,
                         deferred_raw_payload: None,
+                        deferred_raw_payload_path: None,
                     }))
                 }
                 SessionReviewOutcome::Skipped(reason) => {
@@ -2054,6 +2178,7 @@ fn wing_from_cwd(cwd: &str) -> Option<String> {
 fn build_user_prompt_project_record(
     db: &Database,
     envelope: &CapturedHookEnvelope,
+    hook_payload: &HookPayloadBody,
     config: &crate::core::config::Config,
     audit_record: &DrawerRecord,
 ) -> Result<Option<DrawerRecord>> {
@@ -2064,7 +2189,7 @@ fn build_user_prompt_project_record(
         return Ok(None);
     }
 
-    let raw_payload = envelope.payload.as_deref().unwrap_or_default();
+    let raw_payload = hook_payload.raw_payload.as_deref().unwrap_or_default();
     let content = config.scrub_content(&user_prompt_content(raw_payload));
     if content.trim().is_empty() {
         return Ok(None);
@@ -2092,6 +2217,7 @@ fn build_user_prompt_project_record(
         bypass_novelty: false,
         project_id,
         deferred_raw_payload: audit_record.deferred_raw_payload.clone(),
+        deferred_raw_payload_path: audit_record.deferred_raw_payload_path.clone(),
     }))
 }
 
@@ -2113,28 +2239,24 @@ fn record_session_review_rejection(db: &Database) {
     }
 }
 
-fn load_session_review_payload(envelope: &CapturedHookEnvelope) -> Result<Option<String>> {
+fn load_session_review_payload(
+    envelope: &CapturedHookEnvelope,
+    hook_payload: &HookPayloadBody,
+) -> Result<Option<String>> {
     if !envelope.truncated {
-        return Ok(envelope.payload.clone());
+        return Ok(hook_payload.raw_payload.clone());
     }
 
-    let Some(payload_path) = envelope.payload_path.as_deref() else {
-        tracing::info!(
-            original_size_bytes = envelope.original_size_bytes,
-            "truncated session_end omitted raw payload before LLM gate; skipping self-review extraction"
-        );
-        return Ok(None);
-    };
-    fs::read_to_string(payload_path).map(Some).with_context(|| {
-        format!(
-            "failed to read truncated session_end payload {}",
-            payload_path
-        )
-    })
+    tracing::info!(
+        original_size_bytes = envelope.original_size_bytes,
+        "truncated session_end omitted raw payload before LLM gate; skipping self-review extraction"
+    );
+    Ok(None)
 }
 
 fn build_audit_drawer_record(
     envelope: &CapturedHookEnvelope,
+    hook_payload: &HookPayloadBody,
     config: &crate::core::config::Config,
     mempal_home: &Path,
 ) -> Result<DrawerRecord> {
@@ -2177,22 +2299,33 @@ fn build_audit_drawer_record(
             bypass_novelty: false,
             project_id,
             deferred_raw_payload: None,
+            deferred_raw_payload_path: None,
         });
     }
 
-    let raw_payload = envelope.payload.as_deref().unwrap_or_default();
+    let raw_payload = hook_payload.raw_payload.as_deref().unwrap_or_default();
     let (wing, room) = audit_target_for_event(&envelope.event, raw_payload, config);
     let preview = config.scrub_content(&preview_for_event(&envelope.event, raw_payload));
-    let (payload_path, deferred_raw_payload) = if raw_turn_storage_disabled(&wing, &room, config) {
-        (synthetic_source_file("hook-payload-skipped"), None)
-    } else {
-        (
-            raw_payload_storage_path(raw_payload, mempal_home)
-                .to_string_lossy()
-                .to_string(),
-            Some(raw_payload.to_string()),
-        )
-    };
+    let (payload_path, deferred_raw_payload, deferred_raw_payload_path) =
+        if raw_turn_storage_disabled(&wing, &room, config) {
+            (synthetic_source_file("hook-payload-skipped"), None, None)
+        } else if let Some(spool_path) = hook_payload.spool_path.clone() {
+            (
+                raw_payload_storage_path(raw_payload, mempal_home)
+                    .to_string_lossy()
+                    .to_string(),
+                None,
+                Some(spool_path),
+            )
+        } else {
+            (
+                raw_payload_storage_path(raw_payload, mempal_home)
+                    .to_string_lossy()
+                    .to_string(),
+                Some(raw_payload.to_string()),
+                None,
+            )
+        };
     let content = serde_json::to_string(&json!({
         "event": envelope.event,
         "agent": envelope.agent,
@@ -2221,6 +2354,7 @@ fn build_audit_drawer_record(
         bypass_novelty: false,
         project_id,
         deferred_raw_payload,
+        deferred_raw_payload_path,
     })
 }
 
@@ -2299,7 +2433,7 @@ async fn ingest_drawer_record<E: Embedder + ?Sized>(
         return Ok(drawer_id);
     }
 
-    let candidate = build_gating_candidate(context.envelope, &record);
+    let candidate = build_gating_candidate(context.envelope, &record, context.hook_payload);
     let mut gating_decision = evaluate_tier1(&candidate, &context.daemon.config.ingest_gating);
     if gating_decision.is_none()
         && context.daemon.config.ingest_gating.enabled
@@ -3121,10 +3255,53 @@ fn raw_payload_storage_path(raw_payload: &str, mempal_home: &Path) -> PathBuf {
 }
 
 fn persist_deferred_raw_payload(record: &DrawerRecord) -> Result<()> {
+    if let Some(spool_path) = record.deferred_raw_payload_path.as_deref() {
+        return persist_raw_payload_from_path(spool_path, Path::new(&record.source_file));
+    }
     let Some(raw_payload) = record.deferred_raw_payload.as_deref() else {
         return Ok(());
     };
     persist_raw_payload_at(raw_payload, Path::new(&record.source_file))
+}
+
+fn persist_raw_payload_from_path(source: &Path, target: &Path) -> Result<()> {
+    let payload_dir = target.parent().ok_or_else(|| {
+        anyhow::anyhow!("raw hook payload path has no parent: {}", target.display())
+    })?;
+    fs::create_dir_all(payload_dir)
+        .with_context(|| format!("failed to create {}", payload_dir.display()))?;
+    if target.exists() {
+        return Ok(());
+    }
+    match fs::rename(source, target) {
+        Ok(()) => return Ok(()),
+        Err(_error) if target.exists() => return Ok(()),
+        Err(error) => {
+            if !source.exists() {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to promote hook spool {} to {}",
+                        source.display(),
+                        target.display()
+                    )
+                });
+            }
+        }
+    }
+    fs::copy(source, target).with_context(|| {
+        format!(
+            "failed to copy hook spool {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    match fs::remove_file(source) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove hook spool {}", source.display()))
+        }
+    }
 }
 
 fn persist_raw_payload_at(raw_payload: &str, path: &Path) -> Result<()> {
@@ -3657,11 +3834,11 @@ mod tests {
     use super::{
         AutomaticHookLlmGateTerminalFailure, ClaimNextSource, ClaimPollResult, DaemonEmbedder,
         DaemonIngestContext, EndpointRecoveryConfigProvider, EndpointRecoveryRequeuePlan,
-        EndpointRecoveryRequeueState, HookWorkerState, automatic_hook_llm_gate_deadline,
-        build_drawer_records, compile_classifier_from_embedder, llm_worker_claim_enabled,
-        poll_claim_next, process_claimed_message_with_embedder, queue_failure_disposition,
-        request_shutdown, reset_shutdown_request, run_hook_worker, wait_for_hook_worker_or_tick,
-        wing_from_cwd,
+        EndpointRecoveryRequeueState, HookPayloadBody, HookWorkerState,
+        automatic_hook_llm_gate_deadline, build_drawer_records, compile_classifier_from_embedder,
+        llm_worker_claim_enabled, poll_claim_next, process_claimed_message_with_embedder,
+        queue_failure_disposition, request_shutdown, reset_shutdown_request, run_hook_worker,
+        wait_for_hook_worker_or_tick, wing_from_cwd,
     };
 
     #[test]
@@ -6156,8 +6333,12 @@ mod tests {
         config.turns.raw_turn_wings = vec!["hooks-raw".to_string()];
         config.turns.raw_turn_rooms = Vec::new();
 
-        let records =
-            build_drawer_records(&db, &envelope, &config, &mempal_home).expect("drawer records");
+        let hook_payload = HookPayloadBody {
+            raw_payload: envelope.payload.clone(),
+            spool_path: None,
+        };
+        let records = build_drawer_records(&db, &envelope, &hook_payload, &config, &mempal_home)
+            .expect("drawer records");
 
         assert!(records.is_empty());
         assert!(
