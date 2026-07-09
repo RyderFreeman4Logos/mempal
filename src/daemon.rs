@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -60,6 +60,7 @@ const MAX_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const ENDPOINT_RECOVERY_REQUEUE_INTERVAL: Duration = Duration::from_secs(30);
 const AUTOMATIC_HOOK_LLM_GATE_MAX_SECS: u64 = 30;
 const MAX_AUTOMATIC_HOOK_LLM_GATE_CONTENT_BYTES: usize = 16 * 1024;
+const MAX_HOOK_HANDLE_READ_BYTES: usize = crate::hook::MAX_INLINE_PAYLOAD_BYTES + 1;
 const SQLITE_WRITER_LEASE_NAME: &str = "sqlite-writer";
 const DAEMON_WRITER_LEASE_TTL_SECS: u64 = 120;
 const DAEMON_WRITER_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
@@ -1423,13 +1424,8 @@ fn load_hook_payload_body(
         });
     };
     let payload_path = validated_hook_payload_path(payload_path, mempal_home)?;
-    let raw_payload = fs::read_to_string(&payload_path).with_context(|| {
-        format!(
-            "failed to read hook payload handle {}",
-            payload_path.display()
-        )
-    })?;
-    let spool_path = is_hook_spool_path(&payload_path, mempal_home).then_some(payload_path);
+    let raw_payload = read_bounded_hook_payload_handle(&payload_path)?;
+    let spool_path = Some(payload_path);
     Ok(HookPayloadBody {
         raw_payload: Some(raw_payload),
         spool_path,
@@ -1443,27 +1439,34 @@ fn validated_hook_payload_path(payload_path: &str, mempal_home: &Path) -> Result
     } else {
         mempal_home.join(path)
     };
-    let canonical_home = fs::canonicalize(mempal_home)
-        .with_context(|| format!("failed to canonicalize {}", mempal_home.display()))?;
-    let canonical_path = fs::canonicalize(&path).with_context(|| {
-        format!(
-            "failed to canonicalize hook payload handle {}",
-            path.display()
-        )
-    })?;
-    if !canonical_path.starts_with(&canonical_home) {
-        anyhow::bail!(
-            "hook payload handle {} escapes mempal home {}",
-            canonical_path.display(),
-            canonical_home.display()
-        );
+    let spool_root = fs::canonicalize(mempal_home.join(crate::hook::HOOK_SPOOL_DIR))
+        .context("failed to canonicalize hook spool root")?;
+    let canonical_path = fs::canonicalize(&path)
+        .context("failed to canonicalize hook payload handle; path is missing or unreadable")?;
+    if !canonical_path.starts_with(&spool_root) {
+        anyhow::bail!("hook payload handle escapes hook spool root");
     }
     Ok(canonical_path)
 }
 
-fn is_hook_spool_path(path: &Path, mempal_home: &Path) -> bool {
-    fs::canonicalize(mempal_home.join(crate::hook::HOOK_SPOOL_DIR))
-        .is_ok_and(|spool_root| path.starts_with(spool_root))
+fn read_bounded_hook_payload_handle(path: &Path) -> Result<String> {
+    let file = fs::File::open(path).context("failed to open hook payload handle")?;
+    read_bounded_hook_payload_handle_from(file)
+}
+
+fn read_bounded_hook_payload_handle_from(reader: impl Read) -> Result<String> {
+    let mut raw_payload = String::new();
+    reader
+        .take(MAX_HOOK_HANDLE_READ_BYTES as u64)
+        .read_to_string(&mut raw_payload)
+        .context("failed to read hook payload handle")?;
+    if raw_payload.len() > crate::hook::MAX_INLINE_PAYLOAD_BYTES {
+        anyhow::bail!(
+            "hook payload handle exceeds inline admission limit; raw body omitted (>= {} bytes)",
+            crate::hook::MAX_INLINE_PAYLOAD_BYTES
+        );
+    }
+    Ok(raw_payload)
 }
 
 fn cleanup_hook_spool_payload(payload: &HookPayloadBody) -> Result<()> {
@@ -3803,8 +3806,11 @@ fn write_daemon_embedder_status_path(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
+    use std::io::{self, Read};
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -3881,6 +3887,147 @@ mod tests {
             queue_failure_disposition(&timeout_error),
             QueueFailureDisposition::Terminal
         );
+    }
+
+    fn test_envelope_with_payload_path(payload_path: impl Into<String>) -> CapturedHookEnvelope {
+        CapturedHookEnvelope {
+            event: HookEvent::PostToolUse.display_name().to_string(),
+            kind: HookEvent::PostToolUse.queue_kind().to_string(),
+            agent: "codex".to_string(),
+            captured_at: "2026-05-01T12:34:56Z".to_string(),
+            claude_cwd: "/tmp/mempal-test".to_string(),
+            payload: None,
+            payload_path: Some(payload_path.into()),
+            payload_preview: None,
+            original_size_bytes: crate::hook::MAX_INLINE_PAYLOAD_BYTES,
+            truncated: false,
+        }
+    }
+
+    struct CountingHookPayloadReader {
+        remaining: usize,
+        read_bytes: Rc<Cell<usize>>,
+    }
+
+    impl Read for CountingHookPayloadReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let len = buf.len().min(self.remaining);
+            buf[..len].fill(b'x');
+            self.remaining -= len;
+            self.read_bytes.set(self.read_bytes.get() + len);
+            Ok(len)
+        }
+    }
+
+    #[test]
+    fn read_bounded_hook_payload_handle_stops_at_inline_limit_sentinel() {
+        let read_bytes = Rc::new(Cell::new(0));
+        let reader = CountingHookPayloadReader {
+            remaining: super::MAX_HOOK_HANDLE_READ_BYTES + (1024 * 1024),
+            read_bytes: Rc::clone(&read_bytes),
+        };
+
+        let error = super::read_bounded_hook_payload_handle_from(reader)
+            .expect_err("oversize handle reader must stop at sentinel");
+        let message = format!("{error:#}");
+
+        assert_eq!(read_bytes.get(), super::MAX_HOOK_HANDLE_READ_BYTES);
+        assert!(message.contains("exceeds inline admission limit"));
+        assert!(message.contains(&format!(
+            ">= {} bytes",
+            crate::hook::MAX_INLINE_PAYLOAD_BYTES
+        )));
+    }
+
+    #[test]
+    fn load_hook_payload_body_accepts_spool_handle_verbatim() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mempal_home = tmp.path().join(".mempal");
+        let spool_root = mempal_home.join(crate::hook::HOOK_SPOOL_DIR);
+        std::fs::create_dir_all(&spool_root).expect("create hook spool");
+        let payload_path = spool_root.join("accepted.json");
+        let payload = r#"{"tool_name":"Bash","output":"verbatim spool payload"}"#;
+        std::fs::write(&payload_path, payload).expect("write spool payload");
+        let envelope = test_envelope_with_payload_path(payload_path.display().to_string());
+
+        let hook_payload =
+            super::load_hook_payload_body(&envelope, &mempal_home).expect("load spool payload");
+        let canonical_payload_path =
+            std::fs::canonicalize(&payload_path).expect("canonical spool path");
+
+        assert_eq!(hook_payload.raw_payload.as_deref(), Some(payload));
+        assert_eq!(
+            hook_payload.spool_path.as_deref(),
+            Some(canonical_payload_path.as_path())
+        );
+    }
+
+    #[test]
+    fn load_hook_payload_body_rejects_oversize_spool_handle_with_aggregate_error() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mempal_home = tmp.path().join(".mempal");
+        let spool_root = mempal_home.join(crate::hook::HOOK_SPOOL_DIR);
+        std::fs::create_dir_all(&spool_root).expect("create hook spool");
+        let payload_path = spool_root.join("oversize.json");
+        let file = std::fs::File::create(&payload_path).expect("create oversized spool payload");
+        file.set_len(super::MAX_HOOK_HANDLE_READ_BYTES as u64)
+            .expect("size oversized spool payload");
+        let envelope = test_envelope_with_payload_path(payload_path.display().to_string());
+
+        let error = super::load_hook_payload_body(&envelope, &mempal_home)
+            .expect_err("oversize spool handle must be rejected");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("exceeds inline admission limit"));
+        assert!(message.contains(&format!(
+            ">= {} bytes",
+            crate::hook::MAX_INLINE_PAYLOAD_BYTES
+        )));
+        assert!(
+            !message.contains(&payload_path.display().to_string()),
+            "diagnostic must not echo untrusted handle paths"
+        );
+    }
+
+    #[test]
+    fn load_hook_payload_body_rejects_path_traversal_outside_spool_root() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mempal_home = tmp.path().join(".mempal");
+        std::fs::create_dir_all(mempal_home.join(crate::hook::HOOK_SPOOL_DIR))
+            .expect("create hook spool");
+        let outside_path = tmp.path().join("outside.json");
+        std::fs::write(&outside_path, r#"{"output":"outside spool"}"#)
+            .expect("write outside payload");
+        let envelope = test_envelope_with_payload_path("../outside.json");
+
+        let error = super::load_hook_payload_body(&envelope, &mempal_home)
+            .expect_err("outside spool handle must be rejected");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("escapes hook spool root"));
+        assert!(
+            !message.contains("outside spool"),
+            "diagnostic must not include rejected payload body"
+        );
+    }
+
+    #[test]
+    fn load_hook_payload_body_rejects_missing_spool_handle_closed() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mempal_home = tmp.path().join(".mempal");
+        let spool_root = mempal_home.join(crate::hook::HOOK_SPOOL_DIR);
+        std::fs::create_dir_all(&spool_root).expect("create hook spool");
+        let missing_path = spool_root.join("missing.json");
+        let envelope = test_envelope_with_payload_path(missing_path.display().to_string());
+
+        let error = super::load_hook_payload_body(&envelope, &mempal_home)
+            .expect_err("missing spool handle must fail closed");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("missing or unreadable"));
     }
 
     #[test]
